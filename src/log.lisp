@@ -8,6 +8,9 @@
 ;;; Timestamps on every line.
 ;;; ===========================================================================
 
+(defvar *log-lock* (sb-thread:make-mutex :name "log")
+  "Serializes log output so lines from concurrent threads don't interleave.")
+
 (defparameter *log-levels* '(:debug :info :warn :error)
   "Ordered from least to most severe.")
 
@@ -31,11 +34,12 @@
 (defun log-msg (level format-string &rest args)
   "Log a message at LEVEL. Suppressed if below *log-level*."
   (when (>= (log-level-value level) (log-level-value *log-level*))
-    (format *log-stream* "~a [~a] ~?~%"
-            (timestamp)
-            (string-upcase (symbol-name level))
-            format-string args)
-    (force-output *log-stream*)))
+    (sb-thread:with-mutex (*log-lock*)
+      (format *log-stream* "~a [~a] ~?~%"
+              (timestamp)
+              (string-upcase (symbol-name level))
+              format-string args)
+      (force-output *log-stream*))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))

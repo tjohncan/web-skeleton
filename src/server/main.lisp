@@ -245,13 +245,16 @@
     (unwind-protect
         (handler-case
             (loop
-              (let ((conn (make-client-connection
-                           (sb-bsd-sockets:socket-accept listener))))
-                (log-debug "connection accepted")
-                (unwind-protect
-                    (handle-connection conn)
-                  (connection-close conn)
-                  (log-debug "connection closed"))))
+              (let ((client-socket (sb-bsd-sockets:socket-accept listener)))
+                (sb-thread:make-thread
+                 (lambda ()
+                   (let ((conn (make-client-connection client-socket)))
+                     (log-debug "connection accepted")
+                     (unwind-protect
+                         (handle-connection conn)
+                       (connection-close conn)
+                       (log-debug "connection closed"))))
+                 :name "web-skeleton-worker")))
           (sb-sys:interactive-interrupt ()
             (format t "~%")
             (log-info "interrupted — shutting down")))
