@@ -3,7 +3,8 @@
 ;;; ===========================================================================
 ;;; WebSocket Protocol (RFC 6455)
 ;;;
-;;; Handshake, frame parser, frame writer, and connection loop.
+;;; Handshake, frame parser, frame writer, and connection handler.
+;;; All I/O uses non-blocking fd operations via the connection's buffers.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
@@ -13,10 +14,12 @@
 (defparameter *websocket-guid* "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
   "Magic GUID from RFC 6455 §4.2.2, used in the opening handshake.")
 
-(defparameter *ws-op-text*  #x1)
-(defparameter *ws-op-close* #x8)
-(defparameter *ws-op-ping*  #x9)
-(defparameter *ws-op-pong*  #xA)
+(defconstant +ws-op-continuation+ #x0)
+(defconstant +ws-op-text+  #x1)
+(defconstant +ws-op-binary+ #x2)
+(defconstant +ws-op-close+ #x8)
+(defconstant +ws-op-ping+  #x9)
+(defconstant +ws-op-pong+  #xA)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handshake
@@ -65,135 +68,184 @@
   (payload #() :type (vector (unsigned-byte 8))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Frame reader
+;;; Incremental frame reader
+;;;
+;;; Tries to parse a complete frame from the connection's read buffer.
+;;; Returns a WS-FRAME if one is complete, or NIL if more data needed.
 ;;;
 ;;; Wire format (RFC 6455 §5.2):
-;;;
 ;;;   Byte 0:  [FIN:1][RSV:3][OPCODE:4]
 ;;;   Byte 1:  [MASK:1][PAYLOAD-LEN:7]
 ;;;   Extended payload length (0, 2, or 8 bytes depending on len)
 ;;;   Masking key (4 bytes, present if MASK=1)
 ;;;   Payload data
-;;;
-;;; Client-to-server frames MUST be masked. We reject unmasked frames.
 ;;; ---------------------------------------------------------------------------
 
-(defun read-n-bytes (stream n)
-  "Read exactly N bytes from STREAM. Returns a byte vector."
-  (let ((buf (make-array n :element-type '(unsigned-byte 8))))
-    (let ((got (read-sequence buf stream)))
-      (when (< got n)
-        (error "WebSocket: connection closed mid-frame (got ~d of ~d bytes)" got n)))
-    buf))
-
-(defun read-websocket-frame (stream)
-  "Read a single WebSocket frame from STREAM. Returns a WS-FRAME."
-  ;; Byte 0: FIN + opcode
-  (let* ((b0 (read-byte stream))
-         (fin (logbitp 7 b0))
-         (opcode (logand b0 #x0F))
-         ;; Byte 1: MASK + payload length
-         (b1 (read-byte stream))
-         (masked (logbitp 7 b1))
-         (len7 (logand b1 #x7F))
-         ;; Extended length
-         (payload-length
-           (cond
-             ((<= len7 125) len7)
-             ((= len7 126)
-              (let ((ext (read-n-bytes stream 2)))
-                (logior (ash (aref ext 0) 8)
-                        (aref ext 1))))
-             ((= len7 127)
-              (let ((ext (read-n-bytes stream 8)))
-                (loop for i from 0 below 8
-                      sum (ash (aref ext i) (* 8 (- 7 i))))))))
-         ;; Masking key (4 bytes if masked)
-         (mask-key (when masked (read-n-bytes stream 4)))
-         ;; Payload
-         (payload (read-n-bytes stream payload-length)))
-    ;; Client frames must be masked
-    (unless masked
-      (error "WebSocket: received unmasked client frame"))
-    ;; Unmask the payload: payload[i] XOR mask-key[i mod 4]
-    (loop for i from 0 below payload-length
-          do (setf (aref payload i)
-                   (logxor (aref payload i)
-                           (aref mask-key (mod i 4)))))
-    (make-ws-frame :fin fin :opcode opcode :payload payload)))
+(defun try-parse-ws-frame (buf start end)
+  "Try to parse a WebSocket frame from BUF[START..END).
+   Returns (values frame bytes-consumed) if complete, or (values NIL 0)."
+  (let ((available (- end start)))
+    ;; Need at least 2 bytes for the header
+    (when (< available 2)
+      (return-from try-parse-ws-frame (values nil 0)))
+    (let* ((b0 (aref buf start))
+           (b1 (aref buf (+ start 1)))
+           (fin (logbitp 7 b0))
+           (opcode (logand b0 #x0F))
+           (masked (logbitp 7 b1))
+           (len7 (logand b1 #x7F))
+           (header-size 2)
+           payload-length)
+      ;; Determine payload length and header size
+      (cond
+        ((<= len7 125)
+         (setf payload-length len7))
+        ((= len7 126)
+         (when (< available 4)
+           (return-from try-parse-ws-frame (values nil 0)))
+         (setf payload-length (logior (ash (aref buf (+ start 2)) 8)
+                                      (aref buf (+ start 3)))
+               header-size 4))
+        ((= len7 127)
+         (when (< available 10)
+           (return-from try-parse-ws-frame (values nil 0)))
+         (setf payload-length
+               (loop for i from 0 below 8
+                     sum (ash (aref buf (+ start 2 i)) (* 8 (- 7 i))))
+               header-size 10)))
+      ;; Account for mask key
+      (when masked (incf header-size 4))
+      ;; Check if we have the full frame
+      (let ((frame-size (+ header-size payload-length)))
+        (when (< available frame-size)
+          (return-from try-parse-ws-frame (values nil 0)))
+        ;; Client frames must be masked
+        (unless masked
+          (error "WebSocket: received unmasked client frame"))
+        ;; Extract mask key and payload
+        (let* ((mask-offset (- header-size 4))
+               (mask-key (subseq buf (+ start mask-offset)
+                                     (+ start mask-offset 4)))
+               (payload-start (+ start header-size))
+               (payload (make-array payload-length
+                                    :element-type '(unsigned-byte 8))))
+          ;; Copy and unmask
+          (loop for i from 0 below payload-length
+                do (setf (aref payload i)
+                         (logxor (aref buf (+ payload-start i))
+                                 (aref mask-key (mod i 4)))))
+          (values (make-ws-frame :fin fin :opcode opcode :payload payload)
+                  frame-size))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Frame writer
 ;;;
 ;;; Server-to-client frames are NOT masked (per spec).
+;;; Returns a byte vector ready to write.
 ;;; ---------------------------------------------------------------------------
 
-(defun write-websocket-frame (stream opcode payload)
-  "Write a WebSocket frame to STREAM. PAYLOAD is a byte vector."
-  (let ((len (length payload)))
+(defun build-ws-frame (opcode payload)
+  "Build a WebSocket frame as a byte vector. PAYLOAD is a byte vector."
+  (let* ((len (length payload))
+         (header-size (cond ((<= len 125) 2)
+                            ((<= len 65535) 4)
+                            (t 10)))
+         (frame (make-array (+ header-size len)
+                            :element-type '(unsigned-byte 8))))
     ;; Byte 0: FIN=1, opcode
-    (write-byte (logior #x80 opcode) stream)
-    ;; Byte 1+: payload length (no mask bit — server frames are unmasked)
+    (setf (aref frame 0) (logior #x80 opcode))
+    ;; Length encoding (no mask bit — server frames are unmasked)
     (cond
       ((<= len 125)
-       (write-byte len stream))
+       (setf (aref frame 1) len))
       ((<= len 65535)
-       (write-byte 126 stream)
-       (write-byte (logand #xFF (ash len -8)) stream)
-       (write-byte (logand #xFF len) stream))
+       (setf (aref frame 1) 126
+             (aref frame 2) (logand #xFF (ash len -8))
+             (aref frame 3) (logand #xFF len)))
       (t
-       (write-byte 127 stream)
-       (loop for i from 7 downto 0
-             do (write-byte (logand #xFF (ash len (* -8 i))) stream))))
+       (setf (aref frame 1) 127)
+       (loop for i from 0 below 8
+             do (setf (aref frame (+ 2 i))
+                      (logand #xFF (ash len (* -8 (- 7 i))))))))
     ;; Payload
-    (write-sequence payload stream)
-    (force-output stream)))
+    (replace frame payload :start1 header-size)
+    frame))
 
-(defun send-ws-text (stream text)
-  "Send a text message over a WebSocket connection."
-  (write-websocket-frame stream *ws-op-text*
-                         (sb-ext:string-to-octets text :external-format :utf-8)))
+(defun build-ws-text (text)
+  "Build a text frame for TEXT."
+  (build-ws-frame +ws-op-text+
+                  (sb-ext:string-to-octets text :external-format :utf-8)))
 
-(defun send-ws-close (stream &optional (code 1000))
-  "Send a close frame with a status code."
+(defun build-ws-close (&optional (code 1000))
+  "Build a close frame with a status code."
   (let ((payload (make-array 2 :element-type '(unsigned-byte 8))))
-    (setf (aref payload 0) (logand #xFF (ash code -8)))
-    (setf (aref payload 1) (logand #xFF code))
-    (write-websocket-frame stream *ws-op-close* payload)))
+    (setf (aref payload 0) (logand #xFF (ash code -8))
+          (aref payload 1) (logand #xFF code))
+    (build-ws-frame +ws-op-close+ payload)))
+
+(defun build-ws-pong (payload)
+  "Build a pong frame echoing PAYLOAD."
+  (build-ws-frame +ws-op-pong+ payload))
 
 ;;; ---------------------------------------------------------------------------
-;;; Connection loop
+;;; WebSocket event handler
+;;;
+;;; Called by the event loop when a WebSocket connection is readable.
+;;; Parses frames from the read buffer and returns response bytes to write,
+;;; or :CLOSE if the connection should be shut down.
 ;;; ---------------------------------------------------------------------------
 
-(defun websocket-loop (stream)
-  "Main WebSocket loop. Reads frames, handles control messages, echoes text."
-  (log-info "ws connection established")
-  (handler-case
-      (loop
-        (let ((frame (read-websocket-frame stream)))
-          (cond
-            ;; Text frame — echo it back
-            ((= (ws-frame-opcode frame) *ws-op-text*)
-             (let ((text (sb-ext:octets-to-string
-                          (ws-frame-payload frame)
-                          :external-format :utf-8)))
-               (log-debug "ws recv: ~a" text)
-               (send-ws-text stream text)
-               (log-debug "ws sent: ~a" text)))
-            ;; Ping — respond with pong (same payload)
-            ((= (ws-frame-opcode frame) *ws-op-ping*)
-             (log-debug "ws ping received")
-             (write-websocket-frame stream *ws-op-pong*
-                                    (ws-frame-payload frame)))
-            ;; Close — send close back, exit loop
-            ((= (ws-frame-opcode frame) *ws-op-close*)
-             (log-info "ws close requested")
-             (send-ws-close stream)
-             (return))
-            ;; Anything else — log and ignore
-            (t
-             (log-warn "ws unhandled opcode: ~d" (ws-frame-opcode frame))))))
-    (end-of-file ()
-      (log-info "ws client disconnected"))
-    (error (e)
-      (log-error "ws error: ~a" e))))
+(defun websocket-on-read (conn)
+  "Process WebSocket frames from CONN's read buffer.
+   Returns a byte vector to write back, :CLOSE, or NIL (no response needed)."
+  (let ((buf (connection-read-buf conn))
+        (pos 0)
+        (end (connection-read-pos conn))
+        (responses nil))
+    (loop
+      (multiple-value-bind (frame consumed)
+          (try-parse-ws-frame buf pos end)
+        (unless frame
+          ;; No complete frame — shift unconsumed bytes to start of buffer
+          (when (> pos 0)
+            (let ((remaining (- end pos)))
+              (when (> remaining 0)
+                (replace buf buf :start1 0 :start2 pos :end2 end))
+              (setf (connection-read-pos conn) remaining)))
+          (return))
+        ;; Advance past this frame
+        (incf pos consumed)
+        ;; Handle the frame
+        (cond
+          ((= (ws-frame-opcode frame) +ws-op-text+)
+           (let ((text (sb-ext:octets-to-string
+                        (ws-frame-payload frame)
+                        :external-format :utf-8)))
+             (log-debug "ws recv: ~a" text)
+             (push (build-ws-text text) responses)))
+          ((= (ws-frame-opcode frame) +ws-op-ping+)
+           (log-debug "ws ping")
+           (push (build-ws-pong (ws-frame-payload frame)) responses))
+          ((= (ws-frame-opcode frame) +ws-op-close+)
+           (log-info "ws close requested on fd ~d" (connection-fd conn))
+           ;; Shift buffer, then signal close
+           (let ((remaining (- end pos)))
+             (when (> remaining 0)
+               (replace buf buf :start1 0 :start2 pos :end2 end))
+             (setf (connection-read-pos conn) remaining))
+           (return-from websocket-on-read
+             (values :close (build-ws-close))))
+          (t
+           (log-warn "ws unhandled opcode: ~d" (ws-frame-opcode frame))))))
+    ;; Concatenate response frames into a single write buffer
+    (when responses
+      (setf responses (nreverse responses))
+      (if (= (length responses) 1)
+          (first responses)
+          (let* ((total (reduce #'+ responses :key #'length))
+                 (out (make-array total :element-type '(unsigned-byte 8)))
+                 (offset 0))
+            (dolist (r responses)
+              (replace out r :start1 offset)
+              (incf offset (length r)))
+            out)))))

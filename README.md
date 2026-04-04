@@ -13,7 +13,7 @@ Minimal external dependencies beyond SBCL's built-in libraries.
 - Linux
 
 SBCL built-ins used: `sb-bsd-sockets` (TCP), `sb-ext` (byte conversion),
-`sb-alien` (epoll FFI — planned), `sb-thread` (worker pool — planned).
+`sb-alien` (epoll/fcntl/read/write FFI), `sb-thread` (log mutex; worker pool — planned).
 ASDF ships with SBCL.
 
 ## Running
@@ -74,14 +74,15 @@ run-tests.lisp               Entry point — load system and run test suite
 src/
   package.lisp               Package (namespace) declaration
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, timestamps)
+  epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   algorithms/
     sha1.lisp                SHA-1 digest (FIPS 180-4) — pure Lisp
     base64.lisp              Base64 encoder (RFC 4648) — pure Lisp
   server/
-    connection.lisp          Per-connection state object
+    connection.lisp          Connection state machine, read/write buffers
     http.lisp                HTTP request parser + response builder
-    websocket.lisp           WebSocket handshake and frame protocol
-    main.lisp                TCP listener, routing, server loop
+    websocket.lisp           WebSocket handshake and incremental frame protocol
+    main.lisp                epoll event loop, routing, server entry point
 tests/
   run.lisp                   Test utilities and combined runner
   test-algorithms.lisp       SHA-1 and Base64 test vectors (FIPS, RFC)
@@ -90,6 +91,10 @@ tests/
 
 ## What's implemented
 
+- **epoll event loop** — single-threaded, edge-triggered, non-blocking I/O
+  via `sb-alien` FFI to Linux epoll, fcntl, read, write
+- **Connection state machine** — per-connection read/write buffers, tracks
+  protocol state (HTTP request parsing, response writing, WebSocket framing)
 - **TCP listener** — binds a socket, accepts connections, clean shutdown on Ctrl-C
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
@@ -98,8 +103,8 @@ tests/
 - **SHA-1** — complete implementation per FIPS 180-4
 - **Base64** — encoder per RFC 4648
 - **WebSocket handshake** — validates upgrade request, computes accept key
-- **WebSocket frame protocol** — reads/writes frames per RFC 6455, handles
-  text, ping/pong, and close frames
+- **WebSocket frame protocol** — incremental frame parser and builder per
+  RFC 6455, handles text, ping/pong, and close frames
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors (FIPS, RFC) and HTTP parser tests
 
@@ -120,8 +125,7 @@ The `port` is passed as a keyword argument: `(start-server :port 8081)`.
 
 ## Roadmap
 
-- **epoll event loop** — replace blocking I/O with edge-triggered epoll via `sb-alien` FFI
-- **Worker thread pool** — one thread per CPU core, kernel load balancing via `SO_REUSEPORT`
+- **Worker thread pool** — one event loop per CPU core, kernel load balancing via `SO_REUSEPORT`
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
 - **PostgreSQL wire protocol** — connect to Postgres without external libraries

@@ -38,17 +38,37 @@
            #:sha1
            #:sha1-hex
            #:base64-encode
+           ;; epoll FFI
+           #:epoll-create
+           #:epoll-add
+           #:epoll-modify
+           #:epoll-remove
+           #:epoll-wait
+           #:+epollin+
+           #:+epollout+
+           #:+epollerr+
+           #:+epollhup+
+           #:+epollet+
+           #:set-nonblocking
+           #:socket-fd
+           #:nb-read
+           #:nb-write
            ;; Connection
            #:connection
            #:make-client-connection
            #:connection-close
+           #:connection-fd
            #:connection-socket
-           #:connection-stream
            #:connection-state
            #:connection-request
+           #:connection-on-read
+           #:connection-on-write
+           #:connection-queue-write
+           #:connection-reset-read
+           #:connection-parse-request
            ;; WebSocket
            #:websocket-upgrade-p
-           #:websocket-loop
+           #:websocket-on-read
            ;; Tests
            #:test
            #:test-algorithms
