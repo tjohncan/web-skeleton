@@ -64,7 +64,6 @@
            #:connection-on-read
            #:connection-on-write
            #:connection-queue-write
-           #:connection-reset-read
            #:connection-parse-request
            ;; WebSocket
            #:websocket-upgrade-p

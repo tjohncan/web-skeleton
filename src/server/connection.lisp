@@ -26,9 +26,10 @@
   ;; Protocol state
   ;;   :read-http       — accumulating HTTP request bytes
   ;;   :read-body       — have headers, reading Content-Length body
-  ;;   :write-response  — sending HTTP response bytes
-  ;;   :websocket       — upgraded, reading/writing WebSocket frames
-  ;;   :closing         — connection is shutting down
+  ;;   :write-response  — sending HTTP response (close when done)
+  ;;   :ws-upgrade      — sending WebSocket handshake (switch to :websocket when done)
+  ;;   :websocket       — reading/writing WebSocket frames
+  ;;   :closing         — sending close frame (disconnect when done)
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes
   (read-buf  (make-array +read-buf-size+
@@ -78,19 +79,21 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-read-available (conn)
-  "Read available bytes from the connection's fd into its read buffer.
-   Returns :OK, :EOF, or :AGAIN."
-  (let* ((buf (connection-read-buf conn))
-         (pos (connection-read-pos conn))
-         (space (- (length buf) pos)))
-    (when (<= space 0)
-      (return-from connection-read-available :full))
-    (let ((result (nb-read (connection-fd conn) buf pos space)))
-      (cond
-        ((eq result :eof)   :eof)
-        ((eq result :again) :again)
-        (t (incf (connection-read-pos conn) result)
-           :ok)))))
+  "Drain all available bytes from fd into read buffer (edge-triggered).
+   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
+  (let ((any-read nil))
+    (loop
+      (let* ((buf (connection-read-buf conn))
+             (pos (connection-read-pos conn))
+             (space (- (length buf) pos)))
+        (when (<= space 0)
+          (return (if any-read :ok :full)))
+        (let ((result (nb-read (connection-fd conn) buf pos space)))
+          (cond
+            ((eq result :eof)   (return :eof))
+            ((eq result :again) (return (if any-read :ok :again)))
+            (t (incf (connection-read-pos conn) result)
+               (setf any-read t))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CRLFCRLF scanner
@@ -205,19 +208,17 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-queue-write (conn bytes)
-  "Queue BYTES for writing. Switches state to :WRITE-RESPONSE."
+  "Queue BYTES for writing. Caller is responsible for setting state."
   (setf (connection-write-buf conn) bytes
         (connection-write-pos conn) 0
-        (connection-write-end conn) (length bytes)
-        (connection-state conn) :write-response))
+        (connection-write-end conn) (length bytes)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write
 ;;;
 ;;; Returns:
 ;;;   :CONTINUE — more bytes to write, keep watching EPOLLOUT
-;;;   :DONE     — response fully sent, connection can be closed
-;;;   :UPGRADE  — response sent and this was a WebSocket upgrade
+;;;   :DONE     — all bytes sent; caller checks state to decide next action
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-on-write (conn)
@@ -233,17 +234,5 @@
         (t
          (incf (connection-write-pos conn) result)
          (if (>= (connection-write-pos conn) (connection-write-end conn))
-             ;; All bytes sent
-             (if (eq (connection-state conn) :websocket)
-                 :upgrade
-                 :done)
-             ;; More to go
+             :done
              :continue))))))
-
-;;; ---------------------------------------------------------------------------
-;;; Reset for WebSocket frame reads
-;;; ---------------------------------------------------------------------------
-
-(defun connection-reset-read (conn)
-  "Clear the read buffer for the next read cycle."
-  (setf (connection-read-pos conn) 0))

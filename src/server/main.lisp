@@ -201,11 +201,8 @@
                   ;; Queue the response for writing
                   (let ((bytes (format-response response)))
                     (connection-queue-write conn bytes)
-                    (when upgrade-p
-                      ;; Mark as websocket AFTER the handshake response is queued
-                      ;; connection-on-write will see :websocket state after flush
-                      (setf (connection-state conn) :websocket))
-                    ;; Watch for writability
+                    (setf (connection-state conn)
+                          (if upgrade-p :ws-upgrade :write-response))
                     (epoll-modify epoll-fd (connection-fd conn)
                                  (logior +epollout+ +epollet+))))))
              (:close
@@ -258,18 +255,24 @@
       (let ((result (connection-on-write conn)))
         (case result
           (:done
-           ;; Response fully sent
-           (if (eq (connection-state conn) :closing)
-               ;; Was a WebSocket close — disconnect
-               (close-connection conn epoll-fd)
-               ;; Normal HTTP — close (no keep-alive yet)
-               (close-connection conn epoll-fd)))
-          (:upgrade
-           ;; WebSocket handshake sent — switch to reading frames
-           (connection-reset-read conn)
-           (setf (connection-state conn) :websocket)
-           (epoll-modify epoll-fd (connection-fd conn)
-                         (logior +epollin+ +epollet+)))
+           ;; All bytes sent — next action depends on state
+           (ecase (connection-state conn)
+             (:write-response
+              ;; Normal HTTP — close (no keep-alive yet)
+              (close-connection conn epoll-fd))
+             (:ws-upgrade
+              ;; WebSocket handshake sent — switch to reading frames
+              (setf (connection-read-pos conn) 0
+                    (connection-state conn) :websocket)
+              (epoll-modify epoll-fd (connection-fd conn)
+                           (logior +epollin+ +epollet+)))
+             (:websocket
+              ;; WebSocket frame response sent — back to reading
+              (epoll-modify epoll-fd (connection-fd conn)
+                           (logior +epollin+ +epollet+)))
+             (:closing
+              ;; Close frame sent — disconnect
+              (close-connection conn epoll-fd))))
           ;; :continue — more bytes to write
           (:continue nil)))
     (error (e)
@@ -289,30 +292,31 @@
     (loop
       (let ((events (epoll-wait epoll-fd *max-events* -1)))
         (dolist (event events)
-          (let ((fd     (car event))
-                (flags  (cdr event)))
-            (cond
-              ;; New connection on the listener
-              ((= fd listener-fd)
-               ;; Edge-triggered: accept in a loop until none pending
-               (loop (unless (accept-connection listener-socket epoll-fd)
-                       (return))))
-              ;; Event on a client connection
-              (t
-               (let ((conn (lookup-connection fd)))
-                 (when conn
-                   ;; Error or hangup
-                   (when (or (logtest flags +epollerr+)
-                             (logtest flags +epollhup+))
-                     (close-connection conn epoll-fd)
-                     (return))    ; skip to next event
-                   ;; Readable
-                   (when (logtest flags +epollin+)
-                     (handle-client-read conn epoll-fd))
-                   ;; Writable (check conn still alive after read handling)
-                   (when (and (logtest flags +epollout+)
-                              (lookup-connection fd))
-                     (handle-client-write conn epoll-fd))))))))))))
+          (block handle-event
+            (let ((fd     (car event))
+                  (flags  (cdr event)))
+              (cond
+                ;; New connection on the listener
+                ((= fd listener-fd)
+                 ;; Edge-triggered: accept in a loop until none pending
+                 (loop (unless (accept-connection listener-socket epoll-fd)
+                         (return))))
+                ;; Event on a client connection
+                (t
+                 (let ((conn (lookup-connection fd)))
+                   (when conn
+                     ;; Error or hangup — close and skip to next event
+                     (when (or (logtest flags +epollerr+)
+                               (logtest flags +epollhup+))
+                       (close-connection conn epoll-fd)
+                       (return-from handle-event))
+                     ;; Readable
+                     (when (logtest flags +epollin+)
+                       (handle-client-read conn epoll-fd))
+                     ;; Writable (check conn still alive after read handling)
+                     (when (and (logtest flags +epollout+)
+                                (lookup-connection fd))
+                       (handle-client-write conn epoll-fd)))))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
