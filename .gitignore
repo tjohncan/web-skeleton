@@ -1,0 +1,18 @@
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# SBCL compiled artifacts
+*.fasl
+*.lx64fsl
+*.dx64fsl
+*.core
+
+# Compiled binary
+web-skeleton
+
+# Config / secrets
+*.conf
+.env
