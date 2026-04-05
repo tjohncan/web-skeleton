@@ -90,9 +90,36 @@
 (sb-alien:define-alien-routine ("close" %close) sb-alien:int
   (fd sb-alien:int))
 
+(sb-alien:define-alien-routine ("setsockopt" %setsockopt) sb-alien:int
+  (sockfd sb-alien:int)
+  (level sb-alien:int)
+  (optname sb-alien:int)
+  (optval (sb-alien:* t))
+  (optlen sb-alien:unsigned-int))
+
 ;;; ===========================================================================
 ;;; Lisp wrappers — these are the public interface
 ;;; ===========================================================================
+
+;;; ---------------------------------------------------------------------------
+;;; Byte packing (little-endian, for struct fields)
+;;; ---------------------------------------------------------------------------
+
+(declaim (inline pack-le-u32 unpack-le-u32))
+
+(defun pack-le-u32 (buf offset value)
+  "Write a 32-bit VALUE into BUF at OFFSET as little-endian."
+  (setf (aref buf offset)       (logand value #xFF)
+        (aref buf (+ offset 1)) (logand (ash value -8) #xFF)
+        (aref buf (+ offset 2)) (logand (ash value -16) #xFF)
+        (aref buf (+ offset 3)) (logand (ash value -24) #xFF)))
+
+(defun unpack-le-u32 (buf offset)
+  "Read a 32-bit little-endian value from BUF at OFFSET."
+  (logior (aref buf offset)
+          (ash (aref buf (+ offset 1)) 8)
+          (ash (aref buf (+ offset 2)) 16)
+          (ash (aref buf (+ offset 3)) 24)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; epoll
@@ -111,14 +138,8 @@
                               :initial-element 0)))
     ;; struct epoll_event: uint32_t events + epoll_data_t data
     ;; We store the fd in the data union (offset 4, as int32)
-    (setf (aref event 0) (logand events #xFF)
-          (aref event 1) (logand (ash events -8) #xFF)
-          (aref event 2) (logand (ash events -16) #xFF)
-          (aref event 3) (logand (ash events -24) #xFF)
-          (aref event 4) (logand fd #xFF)
-          (aref event 5) (logand (ash fd -8) #xFF)
-          (aref event 6) (logand (ash fd -16) #xFF)
-          (aref event 7) (logand (ash fd -24) #xFF))
+    (pack-le-u32 event 0 events)
+    (pack-le-u32 event 4 fd)
     (sb-sys:with-pinned-objects (event)
       (let ((result (%epoll-ctl epoll-fd +epoll-ctl-add+ fd
                                 (sb-sys:vector-sap event))))
@@ -129,14 +150,8 @@
   "Modify the events watched for FD on EPOLL-FD."
   (let ((event (make-array 12 :element-type '(unsigned-byte 8)
                               :initial-element 0)))
-    (setf (aref event 0) (logand events #xFF)
-          (aref event 1) (logand (ash events -8) #xFF)
-          (aref event 2) (logand (ash events -16) #xFF)
-          (aref event 3) (logand (ash events -24) #xFF)
-          (aref event 4) (logand fd #xFF)
-          (aref event 5) (logand (ash fd -8) #xFF)
-          (aref event 6) (logand (ash fd -16) #xFF)
-          (aref event 7) (logand (ash fd -24) #xFF))
+    (pack-le-u32 event 0 events)
+    (pack-le-u32 event 4 fd)
     (sb-sys:with-pinned-objects (event)
       (let ((result (%epoll-ctl epoll-fd +epoll-ctl-mod+ fd
                                 (sb-sys:vector-sap event))))
@@ -164,23 +179,31 @@
           ((> n 0)
            (loop for i from 0 below n
                  for offset = (* i event-size)
-                 collect (cons
-                          ;; fd from data union (offset +4)
-                          (logior (aref buf (+ offset 4))
-                                  (ash (aref buf (+ offset 5)) 8)
-                                  (ash (aref buf (+ offset 6)) 16)
-                                  (ash (aref buf (+ offset 7)) 24))
-                          ;; events bitmask (offset +0)
-                          (logior (aref buf offset)
-                                  (ash (aref buf (+ offset 1)) 8)
-                                  (ash (aref buf (+ offset 2)) 16)
-                                  (ash (aref buf (+ offset 3)) 24)))))
+                 collect (cons (unpack-le-u32 buf (+ offset 4))   ; fd
+                               (unpack-le-u32 buf offset))))
           ((zerop n) nil)   ; timeout, no events
           (t
            (let ((err (get-errno)))
              (if (= err +eintr+)
                  nil        ; interrupted by signal, caller can retry
                  (error "epoll_wait failed: errno ~d" err)))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Socket options
+;;; ---------------------------------------------------------------------------
+
+;;; setsockopt constants
+(defconstant +sol-socket+    1)
+(defconstant +so-reuseport+ 15)
+
+(defun set-socket-option-int (fd level optname value)
+  "Set an integer-valued socket option."
+  (let ((buf (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (pack-le-u32 buf 0 value)
+    (sb-sys:with-pinned-objects (buf)
+      (let ((result (%setsockopt fd level optname (sb-sys:vector-sap buf) 4)))
+        (when (< result 0)
+          (error "setsockopt failed: errno ~d" (get-errno)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-blocking socket setup

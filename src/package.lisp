@@ -50,6 +50,9 @@
            #:+epollhup+
            #:+epollet+
            #:set-nonblocking
+           #:set-socket-option-int
+           #:+sol-socket+
+           #:+so-reuseport+
            #:socket-fd
            #:nb-read
            #:nb-write

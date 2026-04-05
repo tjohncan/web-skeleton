@@ -1,12 +1,11 @@
 (in-package :web-skeleton)
 
 ;;; ===========================================================================
-;;; epoll event loop and server entry point
+;;; Worker pool and server entry point
 ;;;
-;;; Single-threaded event loop using epoll.  All connections are
-;;; non-blocking; the loop multiplexes across them.
-;;;
-;;; TODO: SO_REUSEPORT + worker thread pool (one event loop per core).
+;;; N worker threads, each with its own listener socket (SO_REUSEPORT),
+;;; epoll fd, and connection table.  The kernel distributes incoming
+;;; connections across workers.  Zero shared state in the hot path.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
@@ -15,11 +14,13 @@
 
 (defun make-tcp-listener (port)
   "Create a TCP socket, bind to 0.0.0.0:PORT, listen with a backlog of 128.
-   Sets the socket to non-blocking. Returns the socket."
+   Sets SO_REUSEADDR, SO_REUSEPORT, and non-blocking. Returns the socket."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                :type :stream
                                :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
+    (set-socket-option-int (socket-fd socket)
+                           +sol-socket+ +so-reuseport+ 1)
     (sb-bsd-sockets:socket-bind socket #(0 0 0 0) port)
     (sb-bsd-sockets:socket-listen socket 128)
     (set-nonblocking (socket-fd socket))
@@ -101,11 +102,15 @@
 </html>")
 
 ;;; ---------------------------------------------------------------------------
-;;; Connection table — maps fd → connection
+;;; Per-worker connection table
+;;;
+;;; Each worker thread binds *connections* in its own dynamic scope.
+;;; All connection functions use whatever binding is current —
+;;; no locks, no shared state.
 ;;; ---------------------------------------------------------------------------
 
 (defvar *connections* (make-hash-table :test #'eql)
-  "Maps file descriptor → connection object.")
+  "Maps file descriptor → connection object. Bound per-worker.")
 
 (defun register-connection (conn)
   (setf (gethash (connection-fd conn) *connections*) conn))
@@ -115,6 +120,13 @@
 
 (defun lookup-connection (fd)
   (gethash fd *connections*))
+
+;;; ---------------------------------------------------------------------------
+;;; Shutdown flag
+;;; ---------------------------------------------------------------------------
+
+(defvar *shutdown* nil
+  "Set to T to signal all workers to exit.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request routing
@@ -287,10 +299,11 @@
   "Maximum events to process per epoll_wait call.")
 
 (defun run-event-loop (listener-socket epoll-fd)
-  "Main event loop. Blocks on epoll_wait, dispatches events."
+  "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd (socket-fd listener-socket)))
     (loop
-      (let ((events (epoll-wait epoll-fd *max-events* -1)))
+      (when *shutdown* (return))
+      (let ((events (epoll-wait epoll-fd *max-events* 1000)))
         (dolist (event events)
           (block handle-event
             (let ((fd     (car event))
@@ -319,32 +332,69 @@
                        (handle-client-write conn epoll-fd)))))))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Worker
+;;; ---------------------------------------------------------------------------
+
+(defun run-worker (port worker-id)
+  "Run a single worker: own listener, own epoll fd, own connections."
+  (let ((*connections* (make-hash-table :test #'eql)))
+    (let* ((listener (make-tcp-listener port))
+           (epoll-fd (epoll-create)))
+      (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
+      (epoll-add epoll-fd (socket-fd listener)
+                 (logior +epollin+ +epollet+))
+      (unwind-protect
+          (run-event-loop listener epoll-fd)
+        ;; Cleanup: close all connections, listener, epoll fd
+        (maphash (lambda (fd conn)
+                   (declare (ignore fd))
+                   (connection-close conn))
+                 *connections*)
+        (sb-bsd-sockets:socket-close listener)
+        (%close epoll-fd)
+        (log-info "worker ~d stopped" worker-id)))))
+
+;;; ---------------------------------------------------------------------------
+;;; CPU count
+;;; ---------------------------------------------------------------------------
+
+(defun cpu-count ()
+  "Return the number of online CPU cores."
+  (handler-case
+      (with-open-file (s "/sys/devices/system/cpu/online")
+        (let* ((line (read-line s))
+               (dash (position #\- line)))
+          (if dash
+              (1+ (parse-integer (subseq line (1+ dash))))
+              1)))
+    (error () 1)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
-(defun start-server (&key (port 8081))
-  "Start the epoll-based server on PORT. Ctrl-C shuts down cleanly."
-  (clrhash *connections*)
-  (let* ((listener (make-tcp-listener port))
-         (listener-fd (socket-fd listener))
-         (epoll-fd (epoll-create)))
-    (log-info "listening on port ~d (epoll fd ~d)" port epoll-fd)
-    ;; Register the listener socket with epoll
-    (epoll-add epoll-fd listener-fd (logior +epollin+ +epollet+))
+(defun start-server (&key (port 8081) (workers (cpu-count)))
+  "Start the server with WORKERS event loops on PORT.
+   Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
+   and connection table. Ctrl-C shuts down all workers."
+  (setf *shutdown* nil)
+  (log-info "starting ~d worker~:p on port ~d" workers port)
+  (let ((threads (loop for i from 0 below workers
+                       collect (sb-thread:make-thread
+                                (let ((id i))
+                                  (lambda () (run-worker port id)))
+                                :name (format nil "web-skeleton-~d" i)))))
     (unwind-protect
         (handler-case
-            (run-event-loop listener epoll-fd)
+            ;; Main thread waits for interrupt
+            (loop (sleep 1))
           (sb-sys:interactive-interrupt ()
             (format t "~%")
             (log-info "interrupted — shutting down")))
-      ;; Cleanup: close all connections, listener, epoll fd
-      (maphash (lambda (fd conn)
-                 (declare (ignore fd))
-                 (connection-close conn))
-               *connections*)
-      (clrhash *connections*)
-      (sb-bsd-sockets:socket-close listener)
-      (%close epoll-fd)
+      ;; Signal workers to stop and wait for them
+      (setf *shutdown* t)
+      (dolist (thread threads)
+        (ignore-errors (sb-thread:join-thread thread :timeout 5)))
       (log-info "stopped"))))
 
 (defun main ()

@@ -91,8 +91,11 @@ tests/
 
 ## What's implemented
 
-- **epoll event loop** — single-threaded, edge-triggered, non-blocking I/O
-  via `sb-alien` FFI to Linux epoll, fcntl, read, write
+- **Worker thread pool** — one event loop per CPU core, each with its own
+  listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
+  Kernel distributes accepts across workers. Zero shared state in the hot path
+- **epoll event loop** — edge-triggered, non-blocking I/O via `sb-alien`
+  FFI to Linux epoll, fcntl, read, write
 - **Connection state machine** — per-connection read/write buffers, tracks
   protocol state (HTTP request parsing, response writing, WebSocket framing)
 - **TCP listener** — binds a socket, accepts connections, clean shutdown on Ctrl-C
@@ -121,11 +124,11 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
 
-The `port` is passed as a keyword argument: `(start-server :port 8081)`.
+The `port` and `workers` are passed as keyword arguments:
+`(start-server :port 8081 :workers 4)`. Workers defaults to the number of
+CPU cores.
 
 ## Roadmap
-
-- **Worker thread pool** — one event loop per CPU core, kernel load balancing via `SO_REUSEPORT`
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
 - **PostgreSQL wire protocol** — connect to Postgres without external libraries
