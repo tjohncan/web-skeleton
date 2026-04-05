@@ -160,13 +160,27 @@
                                     (connection-read-buf conn) header-end)))
                (if (and content-length (> content-length 0))
                    ;; Need to read a body
-                   (let ((body-available (- (connection-read-pos conn) body-start)))
-                     (setf (connection-state conn) :read-body
-                           (connection-body-expected conn) content-length
-                           (connection-header-end conn) header-end)
-                     (if (>= body-available content-length)
-                         :dispatch     ; already have the full body
-                         :continue))   ; need more bytes
+                   (progn
+                     ;; Reject oversized bodies before allocating
+                     (when (> content-length *max-body-size*)
+                       (http-parse-error "body too large (~d bytes, max ~d)"
+                                         content-length *max-body-size*))
+                     ;; Grow read buffer if needed
+                     (let ((total-needed (+ body-start content-length)))
+                       (when (> total-needed (length (connection-read-buf conn)))
+                         (let ((new-buf (make-array total-needed
+                                                    :element-type '(unsigned-byte 8)
+                                                    :initial-element 0)))
+                           (replace new-buf (connection-read-buf conn)
+                                    :end2 (connection-read-pos conn))
+                           (setf (connection-read-buf conn) new-buf))))
+                     (let ((body-available (- (connection-read-pos conn) body-start)))
+                       (setf (connection-state conn) :read-body
+                             (connection-body-expected conn) content-length
+                             (connection-header-end conn) header-end)
+                       (if (>= body-available content-length)
+                           :dispatch     ; already have the full body
+                           :continue)))  ; need more bytes
                    ;; No body — request is complete
                    (progn
                      (setf (connection-header-end conn) header-end)
