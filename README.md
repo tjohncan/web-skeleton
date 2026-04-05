@@ -123,6 +123,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-count*` | `100` | Max number of headers per request |
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
+| `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB) |
 
 The `port` and `workers` are passed as keyword arguments:
 `(start-server :port 8081 :workers 4)`. Workers defaults to the number of

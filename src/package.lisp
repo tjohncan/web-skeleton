@@ -81,4 +81,5 @@
            #:*max-request-line-length*
            #:*max-header-count*
            #:*max-header-line-length*
-           #:*max-body-size*))
+           #:*max-body-size*
+           #:*max-ws-payload-size*))

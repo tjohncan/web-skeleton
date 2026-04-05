@@ -21,6 +21,9 @@
 (defconstant +ws-op-ping+  #x9)
 (defconstant +ws-op-pong+  #xA)
 
+(defparameter *max-ws-payload-size* 65536
+  "Maximum WebSocket frame payload size in bytes. Default 64KB.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Handshake
 ;;; ---------------------------------------------------------------------------
@@ -113,6 +116,10 @@
                (loop for i from 0 below 8
                      sum (ash (aref buf (+ start 2 i)) (* 8 (- 7 i))))
                header-size 10)))
+      ;; Reject oversized frames early
+      (when (> payload-length *max-ws-payload-size*)
+        (error "WebSocket: frame too large (~d bytes, max ~d)"
+               payload-length *max-ws-payload-size*))
       ;; Account for mask key
       (when masked (incf header-size 4))
       ;; Check if we have the full frame
