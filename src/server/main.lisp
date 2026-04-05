@@ -273,9 +273,15 @@
               ;; Normal HTTP — close (no keep-alive yet)
               (close-connection conn epoll-fd))
              (:ws-upgrade
-              ;; WebSocket handshake sent — switch to reading frames
-              (setf (connection-read-pos conn) 0
-                    (connection-state conn) :websocket)
+              ;; WebSocket handshake sent — preserve any data past the HTTP request
+              (let* ((http-end (+ (connection-header-end conn) 4))
+                     (buffered (connection-read-pos conn))
+                     (extra (- buffered http-end)))
+                (when (> extra 0)
+                  (replace (connection-read-buf conn) (connection-read-buf conn)
+                           :start1 0 :start2 http-end :end2 buffered))
+                (setf (connection-read-pos conn) (max extra 0)
+                      (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+)))
              (:websocket
