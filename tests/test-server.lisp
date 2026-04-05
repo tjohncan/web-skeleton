@@ -13,9 +13,9 @@
   (with-output-to-string (s)
     (loop for (str . rest) on strings
           do (write-string str s)
-          when rest do (write-string +crlf+ s))
-    (write-string +crlf+ s)
-    (write-string +crlf+ s)))
+          when rest do (write-string *crlf* s))
+    (write-string *crlf* s)
+    (write-string *crlf* s)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP request parser tests
@@ -40,10 +40,10 @@
   ;; POST with body
   (let* ((body "name=test&value=123")
          (raw (concatenate 'string
-                "POST /submit HTTP/1.1" +crlf+
-                "Host: localhost" +crlf+
-                "Content-Length: " (write-to-string (length body)) +crlf+
-                +crlf+
+                "POST /submit HTTP/1.1" *crlf*
+                "Host: localhost" *crlf*
+                "Content-Length: " (write-to-string (length body)) *crlf*
+                *crlf*
                 body))
          (req (parse-request raw)))
     (check "POST method" (http-request-method req) :POST)
@@ -78,7 +78,7 @@
 
   ;; Empty request line
   (check-error "empty request line"
-               (parse-request (concatenate 'string +crlf+ +crlf+)))
+               (parse-request (concatenate 'string *crlf* *crlf*)))
 
   ;; Bad method
   (check-error "invalid method"

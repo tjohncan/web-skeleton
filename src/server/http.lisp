@@ -79,8 +79,8 @@
 ;;; CRLF utilities
 ;;; ---------------------------------------------------------------------------
 
-(defvar +crlf+ (coerce '(#\Return #\Newline) 'string))
-(defvar +crlf-crlf+ (concatenate 'string +crlf+ +crlf+))
+(defvar *crlf* (coerce '(#\Return #\Newline) 'string))
+(defvar *crlf-crlf* (concatenate 'string *crlf* *crlf*))
 
 (defun crlf-split (text)
   "Split TEXT on CRLF boundaries. Returns a list of strings."
@@ -89,7 +89,7 @@
         (crlf-len 2)
         (len (length text)))
     (loop
-      (let ((pos (search +crlf+ text :start2 start)))
+      (let ((pos (search *crlf* text :start2 start)))
         (if pos
             (progn
               (push (subseq text start pos) lines)
@@ -213,7 +213,7 @@
 (defun find-header-end (data)
   "Find the position of the CRLFCRLF that terminates the header block.
    Returns the index of the first CR, or NIL if not found."
-  (search +crlf-crlf+ data))
+  (search *crlf-crlf* data))
 
 (defun parse-request (raw-data)
   "Parse a raw HTTP request string into an HTTP-REQUEST struct.
@@ -225,7 +225,7 @@
     (let* ((header-section (subseq raw-data 0 header-end))
            (body-start     (+ header-end 4))   ; skip past CRLFCRLF
            ;; Split request line from header block
-           (first-crlf (search +crlf+ header-section))
+           (first-crlf (search *crlf* header-section))
            (request-line (if first-crlf
                              (subseq header-section 0 first-crlf)
                              header-section))
@@ -341,10 +341,10 @@
          ;; Build the header block
          (header-str
            (with-output-to-string (s)
-             (format s "HTTP/1.1 ~d ~a~a" status reason +crlf+)
+             (format s "HTTP/1.1 ~d ~a~a" status reason *crlf*)
              (dolist (h headers)
-               (format s "~a: ~a~a" (car h) (cdr h) +crlf+))
-             (write-string +crlf+ s))))
+               (format s "~a: ~a~a" (car h) (cdr h) *crlf*))
+             (write-string *crlf* s))))
     (let ((header-bytes (sb-ext:string-to-octets header-str
                                                   :external-format :ascii)))
       (if body-bytes
