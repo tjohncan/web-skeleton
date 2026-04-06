@@ -143,7 +143,9 @@
       (:full  (log-warn "read buffer full on fd ~d" (connection-fd conn))
               (return-from connection-on-read :close))
       (:again (return-from connection-on-read :continue)))
-    ;; We have new data — check state
+    ;; We have new data — check state.
+    ;; Only :read-http, :read-body, and :websocket watch EPOLLIN.
+    ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.
     (ecase (connection-state conn)
       (:read-http
        (let ((header-end (scan-header-end (connection-read-buf conn)
