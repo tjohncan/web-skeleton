@@ -132,31 +132,31 @@
       (error "epoll_create1 failed: errno ~d" (get-errno)))
     fd))
 
-(defun epoll-add (epoll-fd fd events)
-  "Register FD with EPOLL-FD, watching for EVENTS (bitmask)."
-  (let ((event (make-array 12 :element-type '(unsigned-byte 8)
-                              :initial-element 0)))
+(defvar *epoll-ctl-buf* nil
+  "Pre-allocated 12-byte buffer for epoll_ctl calls. Bound per-worker.")
+
+(defun %epoll-ctl-call (epoll-fd op fd events)
+  "Internal: populate the ctl buffer and call epoll_ctl."
+  (let ((event (or *epoll-ctl-buf*
+                   (make-array 12 :element-type '(unsigned-byte 8)))))
     ;; struct epoll_event: uint32_t events + epoll_data_t data
     ;; We store the fd in the data union (offset 4, as int32)
     (pack-le-u32 event 0 events)
     (pack-le-u32 event 4 fd)
+    (pack-le-u32 event 8 0)
     (sb-sys:with-pinned-objects (event)
-      (let ((result (%epoll-ctl epoll-fd +epoll-ctl-add+ fd
+      (let ((result (%epoll-ctl epoll-fd op fd
                                 (sb-sys:vector-sap event))))
         (when (< result 0)
-          (error "epoll_ctl ADD failed: errno ~d" (get-errno)))))))
+          (error "epoll_ctl failed: errno ~d" (get-errno)))))))
+
+(defun epoll-add (epoll-fd fd events)
+  "Register FD with EPOLL-FD, watching for EVENTS (bitmask)."
+  (%epoll-ctl-call epoll-fd +epoll-ctl-add+ fd events))
 
 (defun epoll-modify (epoll-fd fd events)
   "Modify the events watched for FD on EPOLL-FD."
-  (let ((event (make-array 12 :element-type '(unsigned-byte 8)
-                              :initial-element 0)))
-    (pack-le-u32 event 0 events)
-    (pack-le-u32 event 4 fd)
-    (sb-sys:with-pinned-objects (event)
-      (let ((result (%epoll-ctl epoll-fd +epoll-ctl-mod+ fd
-                                (sb-sys:vector-sap event))))
-        (when (< result 0)
-          (error "epoll_ctl MOD failed: errno ~d" (get-errno)))))))
+  (%epoll-ctl-call epoll-fd +epoll-ctl-mod+ fd events))
 
 (defun epoll-remove (epoll-fd fd)
   "Remove FD from EPOLL-FD."

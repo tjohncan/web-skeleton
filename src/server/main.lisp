@@ -347,7 +347,8 @@
 
 (defun run-worker (port worker-id handler ws-handler)
   "Run a single worker: own listener, own epoll fd, own connections."
-  (let ((*connections* (make-hash-table :test #'eql)))
+  (let ((*connections* (make-hash-table :test #'eql))
+        (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8))))
     (let* ((listener (make-tcp-listener port))
            (epoll-fd (epoll-create)))
       (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
