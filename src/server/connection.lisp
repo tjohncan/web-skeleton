@@ -109,21 +109,43 @@
 ;;; Extract Content-Length from raw header bytes
 ;;; ---------------------------------------------------------------------------
 
-(defun scan-content-length (buf header-end-pos)
-  "Scan the header bytes in BUF for a Content-Length value.
-   Returns the integer value, or 0 if not found."
-  (let* ((header-str (sb-ext:octets-to-string buf :end header-end-pos
-                                               :external-format :utf-8))
-         (lower (string-downcase header-str))
-         (cl-pos (search "content-length:" lower)))
-    (if cl-pos
-        (let* ((val-start (+ cl-pos (length "content-length:")))
-               (val-end (or (position #\Return lower :start val-start)
-                            (length lower)))
-               (val (string-trim '(#\Space #\Tab)
-                                 (subseq header-str val-start val-end))))
-          (or (parse-integer val :junk-allowed t) 0))
-        0)))
+(defun scan-content-length (buf end)
+  "Scan BUF[0..END) for a Content-Length header value.
+   Returns the integer value, or 0 if not found.
+   Operates on bytes directly — no string allocation."
+  (let ((name (load-time-value
+               (sb-ext:string-to-octets "content-length:"
+                                         :external-format :ascii))))
+    (loop for i from 0 below end
+          do (when (and ;; Only match at start of a header line (BOF or after CRLF)
+                        (or (zerop i)
+                            (and (>= i 2)
+                                 (= (aref buf (- i 2)) 13)
+                                 (= (aref buf (- i 1)) 10)))
+                        ;; Case-insensitive match of "content-length:"
+                        (<= (+ i (length name)) end)
+                        (loop for j below (length name)
+                              for b = (aref buf (+ i j))
+                              for n = (aref name j)
+                              always (or (= b n)
+                                         (and (<= 97 n 122)
+                                              (= b (- n 32))))))
+               ;; Found — parse digits after optional whitespace
+               (let ((pos (+ i (length name))))
+                 ;; Skip OWS (spaces and tabs)
+                 (loop while (and (< pos end)
+                                  (or (= (aref buf pos) 32)
+                                      (= (aref buf pos) 9)))
+                       do (incf pos))
+                 ;; Parse decimal digits
+                 (let ((value 0) (found nil))
+                   (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
+                         do (setf value (+ (* value 10) (- (aref buf pos) 48))
+                                  found t)
+                            (incf pos))
+                   (return-from scan-content-length
+                     (if found value 0))))))
+    0))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-read
