@@ -100,20 +100,6 @@
                (setf any-read t))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; CRLFCRLF scanner
-;;; ---------------------------------------------------------------------------
-
-(defun scan-header-end (buf end)
-  "Scan BUF[0..END) for the CRLFCRLF sequence (13 10 13 10).
-   Returns the index of the first CR, or NIL."
-  (loop for i from 0 to (- end 4)
-        when (and (= (aref buf i)       13)
-                  (= (aref buf (+ i 1)) 10)
-                  (= (aref buf (+ i 2)) 13)
-                  (= (aref buf (+ i 3)) 10))
-          return i))
-
-;;; ---------------------------------------------------------------------------
 ;;; Extract Content-Length from raw header bytes
 ;;; ---------------------------------------------------------------------------
 
@@ -184,8 +170,8 @@
     ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.
     (ecase (connection-state conn)
       (:read-http
-       (let ((header-end (scan-header-end (connection-read-buf conn)
-                                          (connection-read-pos conn))))
+       (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
+                                          0 (connection-read-pos conn))))
          (if header-end
              ;; Found CRLFCRLF — check if there's a body to read
              (let* ((body-start (+ header-end 4))
