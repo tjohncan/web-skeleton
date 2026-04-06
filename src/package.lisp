@@ -43,6 +43,9 @@
            #:epoll-modify
            #:epoll-remove
            #:epoll-wait
+           #:epoll-event-fd
+           #:epoll-event-flags
+           #:make-epoll-event-buf
            #:+epollin+
            #:+epollout+
            #:+epollerr+

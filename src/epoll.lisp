@@ -165,28 +165,36 @@
     (when (< result 0)
       (error "epoll_ctl DEL failed: errno ~d" (get-errno)))))
 
-(defun epoll-wait (epoll-fd max-events timeout-ms)
-  "Wait for events on EPOLL-FD.  Returns a list of (fd . events) pairs.
-   TIMEOUT-MS: milliseconds to wait (-1 = block indefinitely, 0 = return immediately)."
-  (let* ((event-size 12)    ; sizeof(struct epoll_event) on x86-64
-         (buf (make-array (* max-events event-size)
-                          :element-type '(unsigned-byte 8)
-                          :initial-element 0)))
-    (sb-sys:with-pinned-objects (buf)
-      (let ((n (%epoll-wait epoll-fd (sb-sys:vector-sap buf)
-                            max-events timeout-ms)))
-        (cond
-          ((> n 0)
-           (loop for i from 0 below n
-                 for offset = (* i event-size)
-                 collect (cons (unpack-le-u32 buf (+ offset 4))   ; fd
-                               (unpack-le-u32 buf offset))))
-          ((zerop n) nil)   ; timeout, no events
-          (t
-           (let ((err (get-errno)))
-             (if (= err +eintr+)
-                 nil        ; interrupted by signal, caller can retry
-                 (error "epoll_wait failed: errno ~d" err)))))))))
+(defun epoll-wait (epoll-fd event-buf max-events timeout-ms)
+  "Wait for events on EPOLL-FD into pre-allocated EVENT-BUF.
+   EVENT-BUF must be at least (* MAX-EVENTS 12) bytes.
+   Returns the number of events ready (0 on timeout or interrupt).
+   Caller reads events via EPOLL-EVENT-FD and EPOLL-EVENT-FLAGS."
+  (sb-sys:with-pinned-objects (event-buf)
+    (let ((n (%epoll-wait epoll-fd (sb-sys:vector-sap event-buf)
+                          max-events timeout-ms)))
+      (cond
+        ((> n 0) n)
+        ((zerop n) 0)
+        (t
+         (let ((err (get-errno)))
+           (if (= err +eintr+)
+               0
+               (error "epoll_wait failed: errno ~d" err))))))))
+
+(declaim (inline epoll-event-fd epoll-event-flags))
+
+(defun epoll-event-fd (event-buf index)
+  "Read the fd from event at INDEX in EVENT-BUF."
+  (unpack-le-u32 event-buf (+ (* index 12) 4)))
+
+(defun epoll-event-flags (event-buf index)
+  "Read the event flags from event at INDEX in EVENT-BUF."
+  (unpack-le-u32 event-buf (* index 12)))
+
+(defun make-epoll-event-buf (max-events)
+  "Allocate a reusable event buffer for MAX-EVENTS."
+  (make-array (* max-events 12) :element-type '(unsigned-byte 8)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Socket options

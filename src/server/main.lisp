@@ -303,36 +303,37 @@
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler)
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd (socket-fd listener-socket))
-        (last-ping-time (get-universal-time)))
+        (last-ping-time (get-universal-time))
+        (event-buf (make-epoll-event-buf *max-events*)))
     (loop
       (when *shutdown* (return))
-      (let ((events (epoll-wait epoll-fd *max-events* 1000)))
-        (dolist (event events)
-          (block handle-event
-            (let ((fd     (car event))
-                  (flags  (cdr event)))
-              (cond
-                ;; New connection on the listener
-                ((= fd listener-fd)
-                 ;; Edge-triggered: accept in a loop until none pending
-                 (loop (unless (accept-connection listener-socket epoll-fd)
-                         (return))))
-                ;; Event on a client connection
-                (t
-                 (let ((conn (lookup-connection fd)))
-                   (when conn
-                     ;; Error or hangup — close and skip to next event
-                     (when (or (logtest flags +epollerr+)
-                               (logtest flags +epollhup+))
-                       (close-connection conn epoll-fd)
-                       (return-from handle-event))
-                     ;; Readable
-                     (when (logtest flags +epollin+)
-                       (handle-client-read conn epoll-fd handler ws-handler))
-                     ;; Writable (check conn still alive after read handling)
-                     (when (and (logtest flags +epollout+)
-                                (lookup-connection fd))
-                       (handle-client-write conn epoll-fd))))))))))
+      (let ((n (epoll-wait epoll-fd event-buf *max-events* 1000)))
+        (loop for i from 0 below n
+              do (block handle-event
+                   (let ((fd    (epoll-event-fd event-buf i))
+                         (flags (epoll-event-flags event-buf i)))
+                     (cond
+                       ;; New connection on the listener
+                       ((= fd listener-fd)
+                        ;; Edge-triggered: accept in a loop until none pending
+                        (loop (unless (accept-connection listener-socket epoll-fd)
+                                (return))))
+                       ;; Event on a client connection
+                       (t
+                        (let ((conn (lookup-connection fd)))
+                          (when conn
+                            ;; Error or hangup — close and skip to next event
+                            (when (or (logtest flags +epollerr+)
+                                      (logtest flags +epollhup+))
+                              (close-connection conn epoll-fd)
+                              (return-from handle-event))
+                            ;; Readable
+                            (when (logtest flags +epollin+)
+                              (handle-client-read conn epoll-fd handler ws-handler))
+                            ;; Writable (check conn still alive after read handling)
+                            (when (and (logtest flags +epollout+)
+                                       (lookup-connection fd))
+                              (handle-client-write conn epoll-fd))))))))))
       ;; Periodic maintenance
       (let ((now (get-universal-time)))
         (sweep-idle-connections epoll-fd now)
