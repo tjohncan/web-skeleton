@@ -121,11 +121,11 @@
 ;;; Request dispatch
 ;;; ---------------------------------------------------------------------------
 
-(defun dispatch-request (request)
-  "Route an HTTP request via *handler*. Returns (values response upgrade-p).
+(defun dispatch-request (request handler)
+  "Route an HTTP request via HANDLER. Returns (values response upgrade-p).
    If the handler returns :UPGRADE, validates the WebSocket handshake."
-  (let ((response (if *handler*
-                      (funcall *handler* request)
+  (let ((response (if handler
+                      (funcall handler request)
                       (make-error-response 501))))
     (cond
       ;; Handler signals WebSocket upgrade
@@ -188,7 +188,7 @@
 ;;; Handle readable event on a client fd
 ;;; ---------------------------------------------------------------------------
 
-(defun handle-client-read (conn epoll-fd)
+(defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection."
   (handler-case
       (ecase (connection-state conn)
@@ -205,7 +205,7 @@
                            (http-request-query request)
                            (http-request-version request))
                 (multiple-value-bind (response upgrade-p)
-                    (dispatch-request request)
+                    (dispatch-request request handler)
                   ;; Queue the response for writing
                   (let ((bytes (format-response response)))
                     (connection-queue-write conn bytes)
@@ -223,7 +223,7 @@
            (case result
              (:websocket
               (multiple-value-bind (response close-frame)
-                  (websocket-on-read conn)
+                  (websocket-on-read conn ws-handler)
                 (cond
                   ;; Close requested — send close frame back, then shut down
                   ((eq response :close)
@@ -300,7 +300,7 @@
 (defparameter *max-events* 64
   "Maximum events to process per epoll_wait call.")
 
-(defun run-event-loop (listener-socket epoll-fd)
+(defun run-event-loop (listener-socket epoll-fd handler ws-handler)
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd (socket-fd listener-socket))
         (last-ping-time (get-universal-time)))
@@ -328,7 +328,7 @@
                        (return-from handle-event))
                      ;; Readable
                      (when (logtest flags +epollin+)
-                       (handle-client-read conn epoll-fd))
+                       (handle-client-read conn epoll-fd handler ws-handler))
                      ;; Writable (check conn still alive after read handling)
                      (when (and (logtest flags +epollout+)
                                 (lookup-connection fd))
@@ -344,7 +344,7 @@
 ;;; Worker
 ;;; ---------------------------------------------------------------------------
 
-(defun run-worker (port worker-id)
+(defun run-worker (port worker-id handler ws-handler)
   "Run a single worker: own listener, own epoll fd, own connections."
   (let ((*connections* (make-hash-table :test #'eql)))
     (let* ((listener (make-tcp-listener port))
@@ -353,7 +353,7 @@
       (epoll-add epoll-fd (socket-fd listener)
                  (logior +epollin+ +epollet+))
       (unwind-protect
-          (run-event-loop listener epoll-fd)
+          (run-event-loop listener epoll-fd handler ws-handler)
         ;; Cleanup: close all connections, listener, epoll fd
         (maphash (lambda (fd conn)
                    (declare (ignore fd))
@@ -389,14 +389,12 @@
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
-  (setf *handler* handler
-        *ws-handler* ws-handler
-        *shutdown* nil)
+  (setf *shutdown* nil)
   (log-info "starting ~d worker~:p on port ~d" workers port)
   (let ((threads (loop for i from 0 below workers
                        collect (sb-thread:make-thread
                                 (let ((id i))
-                                  (lambda () (run-worker port id)))
+                                  (lambda () (run-worker port id handler ws-handler)))
                                 :name (format nil "web-skeleton-~d" i)))))
     (unwind-protect
         (handler-case

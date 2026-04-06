@@ -150,7 +150,7 @@ The `port`, `workers`, `handler`, and `ws-handler` are passed as keyword argumen
               :ws-handler #'my-app:handle-ws-message)
 ```
 
-Workers defaults to the number of CPU cores.
+The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
 
 ## Roadmap

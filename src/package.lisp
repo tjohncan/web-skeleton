@@ -91,9 +91,6 @@
            #:*max-header-line-length*
            #:*max-body-size*
            #:*max-ws-payload-size*
-           ;; Application handlers
-           #:*handler*
-           #:*ws-handler*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*

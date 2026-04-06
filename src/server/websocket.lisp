@@ -207,7 +207,7 @@
 ;;; or :CLOSE if the connection should be shut down.
 ;;; ---------------------------------------------------------------------------
 
-(defun websocket-on-read (conn)
+(defun websocket-on-read (conn ws-handler)
   "Process WebSocket frames from CONN's read buffer.
    Returns a byte vector to write back, :CLOSE, or NIL (no response needed)."
   (let ((buf (connection-read-buf conn))
@@ -237,8 +237,8 @@
                       (connection-fd conn))
            ;; Application frame — counts as activity
            (setf (connection-last-active conn) (get-universal-time))
-           (when *ws-handler*
-             (let ((response (funcall *ws-handler* conn frame)))
+           (when ws-handler
+             (let ((response (funcall ws-handler conn frame)))
                (when response (push response responses)))))
           ((= (ws-frame-opcode frame) +ws-op-ping+)
            (log-debug "ws ping from client fd ~d" (connection-fd conn))
