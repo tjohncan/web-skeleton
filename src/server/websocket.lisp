@@ -67,7 +67,8 @@
 (defstruct ws-frame
   (fin    t   :type boolean)
   (opcode 0   :type (unsigned-byte 4))
-  (payload #() :type (vector (unsigned-byte 8))))
+  (payload (make-array 0 :element-type '(unsigned-byte 8))
+          :type (simple-array (unsigned-byte 8) (*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Incremental frame reader
