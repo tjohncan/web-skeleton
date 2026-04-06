@@ -1,4 +1,4 @@
-(in-package :web-skeleton)
+(in-package :web-skeleton-tests)
 
 ;;; ===========================================================================
 ;;; Algorithm tests — SHA-1 and Base64

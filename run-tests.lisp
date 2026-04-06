@@ -1,5 +1,5 @@
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
-(asdf:load-system "web-skeleton")
-(unless (web-skeleton:test)
+(asdf:load-system "web-skeleton-tests")
+(unless (web-skeleton-tests:test)
   (sb-ext:exit :code 1))

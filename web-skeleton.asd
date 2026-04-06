@@ -24,11 +24,4 @@
                                                        "src/epoll"
                                                        "src/server/http"
                                                        "src/server/connection"
-                                                       "src/server/websocket"))
-               ;; Tests
-               (:file "tests/run" :depends-on ("src/package"))
-               (:file "tests/test-algorithms" :depends-on ("tests/run"
-                                                            "src/algorithms/sha1"
-                                                            "src/algorithms/base64"))
-               (:file "tests/test-server" :depends-on ("tests/run"
-                                                        "src/server/http"))))
+                                                       "src/server/websocket"))))

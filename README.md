@@ -58,10 +58,10 @@ sbcl
 ```lisp
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
-(asdf:load-system "web-skeleton")
-(web-skeleton:test)             ; run all tests
-(web-skeleton:test-algorithms)  ; SHA-1 and Base64 only
-(web-skeleton:test-server)      ; HTTP parser and response builder only
+(asdf:load-system "web-skeleton-tests")
+(web-skeleton-tests:test)             ; run all tests
+(web-skeleton-tests:test-algorithms)  ; SHA-1 and Base64 only
+(web-skeleton-tests:test-server)      ; HTTP parser and response builder only
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
 ```
@@ -70,10 +70,11 @@ sbcl
 
 ```
 web-skeleton.asd             ASDF system definition (the framework)
+web-skeleton-tests.asd       ASDF system definition (test suite)
 web-skeleton-demo.asd        ASDF system definition (demo app)
 build.lisp                   Build standalone demo binary via save-lisp-and-die
 run-server.lisp              Entry point — load demo system and start server
-run-tests.lisp               Entry point — load framework and run test suite
+run-tests.lisp               Entry point — load test suite and run
 src/
   package.lisp               Package (namespace) declaration
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
@@ -90,6 +91,7 @@ demo/
   package.lisp               Demo package declaration
   handler.lisp               Test page, echo WebSocket handler, demo entry point
 tests/
+  package.lisp               Test package declaration
   run.lisp                   Test utilities and combined runner
   test-algorithms.lisp       SHA-1 and Base64 test vectors (FIPS, RFC)
   test-server.lisp           HTTP parser and response builder tests

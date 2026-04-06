@@ -1,4 +1,4 @@
-(in-package :web-skeleton)
+(in-package :web-skeleton-tests)
 
 ;;; ===========================================================================
 ;;; Server tests — HTTP parser and response builder

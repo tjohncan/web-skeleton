@@ -79,10 +79,6 @@
            #:build-ws-text
            #:build-ws-frame
            #:build-ws-close
-           ;; Tests
-           #:test
-           #:test-algorithms
-           #:test-server
            ;; Conditions
            #:http-parse-error
            ;; Limits

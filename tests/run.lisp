@@ -1,8 +1,11 @@
-(in-package :web-skeleton)
+(in-package :web-skeleton-tests)
 
 ;;; ===========================================================================
 ;;; Test utilities and runner
 ;;; ===========================================================================
+
+(defvar *crlf* (coerce '(#\Return #\Newline) 'string)
+  "CRLF string for constructing test request data.")
 
 (defvar *tests-passed* 0)
 (defvar *tests-failed* 0)
