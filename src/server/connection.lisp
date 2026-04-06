@@ -231,14 +231,16 @@
   (let* ((header-end (connection-header-end conn))
          (body-start (+ header-end 4))
          (content-length (connection-body-expected conn))
-         (total-bytes (if (> content-length 0)
-                          (+ body-start content-length)
-                          (+ header-end 4)))  ; just headers + CRLFCRLF
-         (raw-str (sb-ext:octets-to-string
-                   (connection-read-buf conn)
-                   :end total-bytes
-                   :external-format :utf-8)))
-    (let ((request (parse-request raw-str)))
+         ;; Convert only headers to string — body stays as raw bytes
+         (header-str (sb-ext:octets-to-string
+                      (connection-read-buf conn)
+                      :end body-start
+                      :external-format :utf-8)))
+    (let ((request (parse-request header-str)))
+      (when (> content-length 0)
+        (setf (http-request-body request)
+              (subseq (connection-read-buf conn) body-start
+                      (+ body-start content-length))))
       (setf (connection-request conn) request)
       request)))
 

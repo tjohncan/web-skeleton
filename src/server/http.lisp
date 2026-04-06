@@ -58,7 +58,8 @@
   (query    nil :type (or null string))     ; "a=1&b=2" or nil
   (version  "1.1" :type string)             ; "1.0" or "1.1"
   (headers  nil :type list)                 ; alist — ((name . value) ...)
-  (body     nil :type (or null string)))    ; body text or nil
+  (body     nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+                                              ; raw body bytes or nil
 
 ;;; ---------------------------------------------------------------------------
 ;;; Header access
@@ -219,14 +220,13 @@
   (search *crlf-crlf* data))
 
 (defun parse-request (raw-data)
-  "Parse a raw HTTP request string into an HTTP-REQUEST struct.
-   RAW-DATA must contain at least the complete headers (terminated by CRLFCRLF).
-   Body is extracted based on Content-Length if present."
+  "Parse a raw HTTP request header string into an HTTP-REQUEST struct.
+   RAW-DATA must contain the complete headers (terminated by CRLFCRLF).
+   Body is not extracted here — callers provide it separately via the body slot."
   (let ((header-end (find-header-end raw-data)))
     (unless header-end
       (http-parse-error "incomplete headers (no CRLFCRLF terminator)"))
     (let* ((header-section (subseq raw-data 0 header-end))
-           (body-start     (+ header-end 4))   ; skip past CRLFCRLF
            ;; Split request line from header block
            (first-crlf (search *crlf* header-section))
            (request-line (if first-crlf
@@ -239,34 +239,13 @@
       ;; Parse the components
       (multiple-value-bind (method path query version)
           (parse-request-line request-line)
-        (let* ((headers (parse-headers header-text))
-               ;; Determine body
-               (cl-value (cdr (assoc "content-length" headers :test #'string=)))
-               (content-length (when cl-value
-                                 (let ((n (parse-integer cl-value :junk-allowed t)))
-                                   (unless n
-                                     (http-parse-error "invalid Content-Length: ~s" cl-value))
-                                   (when (< n 0)
-                                     (http-parse-error "negative Content-Length: ~d" n))
-                                   n)))
-               (body (when (and content-length (> content-length 0))
-                       (when (> content-length *max-body-size*)
-                         (http-parse-error "body too large (~d bytes, max ~d)"
-                                           content-length *max-body-size*))
-                       (let ((available (- (length raw-data) body-start)))
-                         (if (>= available content-length)
-                             (subseq raw-data body-start
-                                     (+ body-start content-length))
-                             (http-parse-error
-                              "incomplete body (got ~d bytes, Content-Length: ~d)"
-                              available content-length))))))
+        (let ((headers (parse-headers header-text)))
           (make-http-request
            :method method
            :path path
            :query query
            :version version
-           :headers headers
-           :body body))))))
+           :headers headers))))))
 
 ;;; ===========================================================================
 ;;; HTTP Response Builder

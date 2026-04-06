@@ -37,7 +37,7 @@
     (check "query path"   (http-request-path req)  "/search")
     (check "query string" (http-request-query req) "q=lisp&page=1"))
 
-  ;; POST with body
+  ;; POST with Content-Length (body extraction happens at connection level)
   (let* ((body "name=test&value=123")
          (raw (concatenate 'string
                 "POST /submit HTTP/1.1" *crlf*
@@ -48,7 +48,8 @@
          (req (parse-request raw)))
     (check "POST method" (http-request-method req) :POST)
     (check "POST path"   (http-request-path req)   "/submit")
-    (check "POST body"   (http-request-body req)   body))
+    (check "POST content-length" (get-header req "content-length")
+           (write-to-string (length body))))
 
   ;; Multiple headers with same name
   (let ((req (parse-request (crlf "GET / HTTP/1.1"
