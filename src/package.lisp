@@ -1,7 +1,6 @@
 (defpackage :web-skeleton
   (:use :cl)
   (:export ;; Server
-           #:main
            #:start-server
            ;; HTTP request
            #:http-request
@@ -71,6 +70,15 @@
            ;; WebSocket
            #:websocket-upgrade-p
            #:websocket-on-read
+           #:ws-frame
+           #:ws-frame-fin
+           #:ws-frame-opcode
+           #:ws-frame-payload
+           #:+ws-op-text+
+           #:+ws-op-binary+
+           #:build-ws-text
+           #:build-ws-frame
+           #:build-ws-close
            ;; Tests
            #:test
            #:test-algorithms
@@ -83,6 +91,9 @@
            #:*max-header-line-length*
            #:*max-body-size*
            #:*max-ws-payload-size*
+           ;; Application handlers
+           #:*handler*
+           #:*ws-handler*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*

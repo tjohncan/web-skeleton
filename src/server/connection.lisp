@@ -45,6 +45,19 @@
   (missed-pongs  0 :type fixnum))
 
 ;;; ---------------------------------------------------------------------------
+;;; Application handlers (set by start-server)
+;;; ---------------------------------------------------------------------------
+
+(defvar *handler* nil
+  "HTTP request handler function.
+   Called with (request). Returns an HTTP-RESPONSE or :UPGRADE for WebSocket.")
+
+(defvar *ws-handler* nil
+  "WebSocket message handler function.
+   Called with (connection frame) for text and binary frames.
+   Returns a byte vector (frame) to send back, or NIL for no response.")
+
+;;; ---------------------------------------------------------------------------
 ;;; Constructor
 ;;; ---------------------------------------------------------------------------
 

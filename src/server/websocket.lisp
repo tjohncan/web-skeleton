@@ -229,14 +229,17 @@
         (incf pos consumed)
         ;; Handle the frame
         (cond
-          ((= (ws-frame-opcode frame) +ws-op-text+)
-           (let ((text (sb-ext:octets-to-string
-                        (ws-frame-payload frame)
-                        :external-format :utf-8)))
-             (log-debug "ws recv: ~a" text)
-             ;; Real application frame — counts as activity
-             (setf (connection-last-active conn) (get-universal-time))
-             (push (build-ws-text text) responses)))
+          ((or (= (ws-frame-opcode frame) +ws-op-text+)
+               (= (ws-frame-opcode frame) +ws-op-binary+))
+           (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
+                      (ws-frame-opcode frame)
+                      (length (ws-frame-payload frame))
+                      (connection-fd conn))
+           ;; Application frame — counts as activity
+           (setf (connection-last-active conn) (get-universal-time))
+           (when *ws-handler*
+             (let ((response (funcall *ws-handler* conn frame)))
+               (when response (push response responses)))))
           ((= (ws-frame-opcode frame) +ws-op-ping+)
            (log-debug "ws ping from client fd ~d" (connection-fd conn))
            (push (build-ws-pong (ws-frame-payload frame)) responses))

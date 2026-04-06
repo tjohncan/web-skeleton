@@ -62,19 +62,21 @@ sbcl
 (web-skeleton:test)             ; run all tests
 (web-skeleton:test-algorithms)  ; SHA-1 and Base64 only
 (web-skeleton:test-server)      ; HTTP parser and response builder only
-(web-skeleton:start-server)   ; run the demo server
+(asdf:load-system "web-skeleton-demo")
+(web-skeleton-demo:start-demo)  ; run the demo server
 ```
 
 ## Project structure
 
 ```
-web-skeleton.asd             ASDF system definition
-build.lisp                   Build standalone binary via save-lisp-and-die
-run-server.lisp              Entry point — load system and start demo server
-run-tests.lisp               Entry point — load system and run test suite
+web-skeleton.asd             ASDF system definition (the framework)
+web-skeleton-demo.asd        ASDF system definition (demo app)
+build.lisp                   Build standalone demo binary via save-lisp-and-die
+run-server.lisp              Entry point — load demo system and start server
+run-tests.lisp               Entry point — load framework and run test suite
 src/
   package.lisp               Package (namespace) declaration
-  log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, timestamps)
+  log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   algorithms/
     sha1.lisp                SHA-1 digest (FIPS 180-4)
@@ -83,7 +85,10 @@ src/
     connection.lisp          Connection state machine, read/write buffers
     http.lisp                HTTP request parser + response builder
     websocket.lisp           WebSocket handshake and incremental frame protocol
-    main.lisp                epoll event loop, routing, server entry point
+    main.lisp                epoll event loop, handler dispatch, server entry point
+demo/
+  package.lisp               Demo package declaration
+  handler.lisp               Test page, echo WebSocket handler, demo entry point
 tests/
   run.lisp                   Test utilities and combined runner
   test-algorithms.lisp       SHA-1 and Base64 test vectors (FIPS, RFC)
@@ -92,6 +97,9 @@ tests/
 
 ## What's implemented
 
+- **Handler abstraction** — `start-server` accepts `:handler` and `:ws-handler`
+  functions. The framework handles sockets, HTTP, and WebSocket protocol;
+  the application provides routing and message handling
 - **Worker thread pool** — one event loop per CPU core, each with its own
   listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
   Kernel distributes accepts across workers. Zero shared state in the hot path
@@ -99,18 +107,21 @@ tests/
   FFI to Linux epoll, fcntl, read, write
 - **Connection state machine** — per-connection read/write buffers, tracks
   protocol state (HTTP request parsing, response writing, WebSocket framing)
+- **Connection lifecycle** — idle timeout for HTTP (slowloris protection),
+  server-initiated ping/pong for dead WebSocket detection, configurable
+  idle timeout for inactive WebSocket connections
 - **TCP listener** — binds a socket, accepts connections, clean shutdown on Ctrl-C
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
 - **HTTP response builder** — status codes, headers, body serialization
-- **Routing** — serves the demo page on `GET /`, upgrades `/ws` to WebSocket
 - **SHA-1** — complete implementation per FIPS 180-4
 - **Base64** — encoder per RFC 4648
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
-  handles text, ping/pong, and close frames
+  handles text, binary, ping/pong, and close frames
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors and HTTP parser tests
+- **Demo application** — separate ASDF system with test page and echo server
 
 ## Configuration
 
@@ -125,17 +136,27 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
 | `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB) |
+| `*idle-timeout*` | `30` | Seconds before an idle HTTP connection is closed |
+| `*ws-idle-timeout*` | `86400` | Seconds before an inactive WebSocket is closed |
+| `*ws-ping-interval*` | `30` | Seconds between server-initiated WebSocket pings |
+| `*ws-max-missed-pongs*` | `3` | Missed pongs before a WebSocket is declared dead |
 
-The `port` and `workers` are passed as keyword arguments:
-`(start-server :port 8081 :workers 4)`.
+The `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
+
+```lisp
+(start-server :port 8081
+              :workers 4
+              :handler #'my-app:handle-request
+              :ws-handler #'my-app:handle-ws-message)
+```
+
 Workers defaults to the number of CPU cores.
+Without a handler, the server returns 501 for all requests.
 
 ## Roadmap
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
-- **PostgreSQL wire protocol** — connect to Postgres without external libraries
+- **Static file serving** — serve files from a directory
 - **Session management** — map authenticated users to WebSocket connections
 - **Broadcast / room abstraction** — send to all connections in a group
-- **Binary WebSocket frames** — opcode 0x2 support
-- **Static file serving** — serve files from a directory
 - **Graceful shutdown** — drain active connections on SIGTERM

@@ -27,81 +27,6 @@
     socket))
 
 ;;; ---------------------------------------------------------------------------
-;;; Test page
-;;; ---------------------------------------------------------------------------
-
-(defparameter *test-page*
-  "<!DOCTYPE html>
-<html>
-<head>
-<meta charset=\"utf-8\">
-<title>web-skeleton</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: monospace; background: #111; color: #eee; padding: 2em; }
-  h1 { margin-bottom: 1em; color: #0f0; }
-  #log { background: #000; padding: 1em; height: 400px; overflow-y: auto;
-         border: 1px solid #333; margin-bottom: 1em; white-space: pre-wrap; }
-  .status { color: #0ff; }
-  .sent { color: #888; }
-  .recv { color: #0f0; }
-  .err { color: #f00; }
-  form { display: flex; gap: 0.5em; }
-  input { flex: 1; padding: 0.5em; font-family: monospace; font-size: 1em;
-          background: #222; color: #eee; border: 1px solid #333; }
-  button { padding: 0.5em 1.5em; font-family: monospace; font-size: 1em;
-           background: #333; color: #eee; border: 1px solid #555; cursor: pointer; }
-</style>
-</head>
-<body>
-<h1>web-skeleton</h1>
-<div id=\"log\"></div>
-<form id=\"form\">
-  <input id=\"msg\" type=\"text\" placeholder=\"type a message...\" autofocus>
-  <button type=\"submit\">send</button>
-</form>
-<script>
-  const log = document.getElementById('log');
-  const form = document.getElementById('form');
-  const msg = document.getElementById('msg');
-
-  function appendLog(text, cls) {
-    const line = document.createElement('div');
-    line.className = cls;
-    line.textContent = text;
-    log.appendChild(line);
-    log.scrollTop = log.scrollHeight;
-  }
-
-  appendLog('[status] connecting...', 'status');
-  const ws = new WebSocket('ws://' + location.host + '/ws');
-
-  ws.onopen = function() {
-    appendLog('[status] connected', 'status');
-  };
-  ws.onmessage = function(e) {
-    appendLog('[recv] ' + e.data, 'recv');
-  };
-  ws.onclose = function() {
-    appendLog('[status] disconnected', 'status');
-  };
-  ws.onerror = function() {
-    appendLog('[error] connection error', 'err');
-  };
-
-  form.onsubmit = function(e) {
-    e.preventDefault();
-    const text = msg.value;
-    if (!text) return;
-    ws.send(text);
-    appendLog('[sent] ' + text, 'sent');
-    msg.value = '';
-  };
-</script>
-</body>
-</html>")
-
-;;; ---------------------------------------------------------------------------
 ;;; Per-worker connection table
 ;;;
 ;;; Each worker thread binds *connections* in its own dynamic scope.
@@ -193,29 +118,36 @@
   "Set to T to signal all workers to exit.")
 
 ;;; ---------------------------------------------------------------------------
-;;; Request routing
+;;; Request dispatch
 ;;; ---------------------------------------------------------------------------
 
-(defun route-request (conn)
-  "Route a parsed HTTP request. Returns (values response upgrade-p).
-   UPGRADE-P is true if this is a WebSocket upgrade."
-  (let* ((request (connection-request conn))
-         (method  (http-request-method request))
-         (path    (http-request-path request)))
+(defun dispatch-request (request)
+  "Route an HTTP request via *handler*. Returns (values response upgrade-p).
+   If the handler returns :UPGRADE, validates the WebSocket handshake."
+  (let ((response (if *handler*
+                      (funcall *handler* request)
+                      (make-error-response 501))))
     (cond
-      ;; Serve test page
-      ((and (eq method :GET) (string= path "/"))
-       (log-debug "~a ~a -> 200" method path)
-       (values (make-html-response 200 *test-page*) nil))
-      ;; WebSocket upgrade
-      ((and (eq method :GET) (string= path "/ws")
-            (websocket-upgrade-p request))
-       (log-info "~a ~a -> 101 switching protocols" method path)
-       (values (make-websocket-handshake-response request) t))
-      ;; Everything else
+      ;; Handler signals WebSocket upgrade
+      ((eq response :upgrade)
+       (if (websocket-upgrade-p request)
+           (progn
+             (log-info "~a ~a -> 101 upgrade"
+                       (http-request-method request)
+                       (http-request-path request))
+             (values (make-websocket-handshake-response request) t))
+           (progn
+             (log-warn "~a ~a -> 400 bad upgrade"
+                       (http-request-method request)
+                       (http-request-path request))
+             (values (make-error-response 400) nil))))
+      ;; Normal HTTP response
       (t
-       (log-debug "~a ~a -> 404" method path)
-       (values (make-error-response 404) nil)))))
+       (log-debug "~a ~a -> ~d"
+                  (http-request-method request)
+                  (http-request-path request)
+                  (http-response-status response))
+       (values response nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Accept a new connection
@@ -265,7 +197,7 @@
          (let ((result (connection-on-read conn)))
            (case result
              (:dispatch
-              ;; Full request — parse and route
+              ;; Full request — parse and dispatch
               (let ((request (connection-parse-request conn)))
                 (log-debug "~a ~a~@[?~a~] HTTP/~a"
                            (http-request-method request)
@@ -273,7 +205,7 @@
                            (http-request-query request)
                            (http-request-version request))
                 (multiple-value-bind (response upgrade-p)
-                    (route-request conn)
+                    (dispatch-request request)
                   ;; Queue the response for writing
                   (let ((bytes (format-response response)))
                     (connection-queue-write conn bytes)
@@ -450,11 +382,16 @@
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
-(defun start-server (&key (port 8081) (workers (cpu-count)))
+(defun start-server (&key (port 8081) (workers (cpu-count))
+                          handler ws-handler)
   "Start the server with WORKERS event loops on PORT.
+   HANDLER: function (request) -> response or :UPGRADE.
+   WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
-  (setf *shutdown* nil)
+  (setf *handler* handler
+        *ws-handler* ws-handler
+        *shutdown* nil)
   (log-info "starting ~d worker~:p on port ~d" workers port)
   (let ((threads (loop for i from 0 below workers
                        collect (sb-thread:make-thread
@@ -473,6 +410,3 @@
       (dolist (thread threads)
         (ignore-errors (sb-thread:join-thread thread :timeout 5)))
       (log-info "stopped"))))
-
-(defun main ()
-  (start-server :port 8081))
