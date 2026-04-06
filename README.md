@@ -1,9 +1,11 @@
-# web-skeleton
+# Web Skeleton
 
-SBCL web server framework for Linux. Provides the network and protocol layer —
-TCP socket management, HTTP request parsing and response building, WebSocket
-handshake and framing — as a reusable foundation for web services and
-real-time applications.
+SBCL web server framework for Linux.
+Provides the network and protocol layer
+ (TCP socket management,
+ HTTP request parsing and response building,
+ WebSocket handshake and framing)
+as a reusable foundation for web services and real-time applications.
 
 Minimal external dependencies beyond SBCL's built-in libraries.
 
@@ -12,8 +14,11 @@ Minimal external dependencies beyond SBCL's built-in libraries.
 - SBCL (Steel Bank Common Lisp)
 - Linux
 
-SBCL built-ins used: `sb-bsd-sockets` (TCP), `sb-ext` (byte conversion),
-`sb-alien` (epoll/fcntl/read/write FFI), `sb-thread` (log mutex; worker pool — planned).
+SBCL built-ins used:
+ `sb-bsd-sockets` (TCP),
+ `sb-ext` (byte conversion),
+ `sb-alien` (epoll/fcntl/read/write FFI),
+ `sb-thread` (log mutex; worker pool).
 ASDF ships with SBCL.
 
 ## Running
@@ -22,9 +27,9 @@ ASDF ships with SBCL.
 sbcl --non-interactive --load run-server.lisp
 ```
 
-Starts the demo server on port 8081. Open `http://localhost:8081/` in a
-browser — the built-in test page opens a WebSocket connection and echoes
-messages back. Ctrl-C shuts down cleanly.
+Starts the demo server on port 8081. 
+The built-in test page (load `http://localhost:8081/` in a browser) 
+opens a WebSocket connection and echoes messages back. Ctrl-C shuts down cleanly.
 
 ## Building
 
@@ -54,15 +59,11 @@ sbcl
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton")
-(web-skeleton:start-server)         ; run the demo server
-(web-skeleton:test)                 ; run all tests
-(web-skeleton:test-algorithms)      ; SHA-1 and Base64 only
-(web-skeleton:test-server)          ; HTTP parser and response builder only
+(web-skeleton:test)             ; run all tests
+(web-skeleton:test-algorithms)  ; SHA-1 and Base64 only
+(web-skeleton:test-server)      ; HTTP parser and response builder only
+(web-skeleton:start-server)   ; run the demo server
 ```
-
-After editing existing files, `(asdf:load-system "web-skeleton")` recompiles
-only what changed. A fresh SBCL session is only needed when adding new files
-or hitting symbol conflicts.
 
 ## Project structure
 
@@ -76,8 +77,8 @@ src/
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   algorithms/
-    sha1.lisp                SHA-1 digest (FIPS 180-4) — pure Lisp
-    base64.lisp              Base64 encoder (RFC 4648) — pure Lisp
+    sha1.lisp                SHA-1 digest (FIPS 180-4)
+    base64.lisp              Base64 encoder (RFC 4648)
   server/
     connection.lisp          Connection state machine, read/write buffers
     http.lisp                HTTP request parser + response builder
@@ -106,10 +107,10 @@ tests/
 - **SHA-1** — complete implementation per FIPS 180-4
 - **Base64** — encoder per RFC 4648
 - **WebSocket handshake** — validates upgrade request, computes accept key
-- **WebSocket frame protocol** — incremental frame parser and builder per
-  RFC 6455, handles text, ping/pong, and close frames
+- **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
+  handles text, ping/pong, and close frames
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
-- **Test suite** — algorithm test vectors (FIPS, RFC) and HTTP parser tests
+- **Test suite** — algorithm test vectors and HTTP parser tests
 
 ## Configuration
 
@@ -126,8 +127,8 @@ All configurable via `setf` before calling `start-server`.
 | `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB) |
 
 The `port` and `workers` are passed as keyword arguments:
-`(start-server :port 8081 :workers 4)`. Workers defaults to the number of
-CPU cores.
+`(start-server :port 8081 :workers 4)`.
+Workers defaults to the number of CPU cores.
 
 ## Roadmap
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
