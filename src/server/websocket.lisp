@@ -158,18 +158,15 @@
         ;; Client frames must be masked
         (unless masked
           (error "WebSocket: received unmasked client frame"))
-        ;; Extract mask key and payload
-        (let* ((mask-offset (- header-size 4))
-               (mask-key (subseq buf (+ start mask-offset)
-                                     (+ start mask-offset 4)))
+        ;; Unmask payload — read mask key directly from buffer, no allocation
+        (let* ((mask-start (+ start (- header-size 4)))
                (payload-start (+ start header-size))
                (payload (make-array payload-length
                                     :element-type '(unsigned-byte 8))))
-          ;; Copy and unmask
           (loop for i from 0 below payload-length
                 do (setf (aref payload i)
                          (logxor (aref buf (+ payload-start i))
-                                 (aref mask-key (mod i 4)))))
+                                 (aref buf (+ mask-start (logand i 3))))))
           (values (make-ws-frame :fin fin :opcode opcode :payload payload)
                   frame-size))))))
 
