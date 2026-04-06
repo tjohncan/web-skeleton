@@ -68,16 +68,14 @@
 (defun get-header (request name)
   "Look up a header value by NAME (case-insensitive).
    Returns the value string, or NIL if not present."
-  (cdr (assoc (string-downcase name)
-              (http-request-headers request)
-              :test #'string=)))
+  (cdr (assoc name (http-request-headers request)
+              :test #'string-equal)))
 
 (defun get-headers (request name)
   "Return a list of all values for headers matching NAME (case-insensitive).
    Handles the case where a client sends the same header multiple times."
-  (let ((key (string-downcase name)))
-    (loop for (n . v) in (http-request-headers request)
-          when (string= n key) collect v)))
+  (loop for (n . v) in (http-request-headers request)
+        when (string-equal n name) collect v))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CRLF utilities
