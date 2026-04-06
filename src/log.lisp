@@ -25,10 +25,10 @@
   (or (position level *log-levels*) 0))
 
 (defun timestamp ()
-  "Return current time as YYYY-MM-DDThh:mm:ss."
+  "Return current UTC time as YYYY-MM-DDThh:mm:ssZ."
   (multiple-value-bind (sec min hour day month year)
-      (decode-universal-time (get-universal-time))
-    (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d"
+      (decode-universal-time (get-universal-time) 0)
+    (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d"
             year month day hour min sec)))
 
 (defun log-msg (level format-string &rest args)
