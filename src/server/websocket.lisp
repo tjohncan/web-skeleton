@@ -221,9 +221,10 @@
   (build-ws-frame +ws-op-pong+ payload))
 
 (defun build-ws-ping ()
-  "Build a ping frame with empty payload."
-  (build-ws-frame +ws-op-ping+
-                  (make-array 0 :element-type '(unsigned-byte 8))))
+  "Return the pre-built ping frame (constant — safe because frames are only read)."
+  (load-time-value
+   (build-ws-frame +ws-op-ping+
+                   (make-array 0 :element-type '(unsigned-byte 8)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket event handler
