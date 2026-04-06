@@ -344,7 +344,8 @@
   response)
 
 (defun format-response (response)
-  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket."
+  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
+   Writes directly into a single pre-sized buffer — no intermediate strings."
   (let* ((status (http-response-status response))
          (reason (status-reason status))
          (body   (http-response-body response))
@@ -358,22 +359,49 @@
                                   (write-to-string (length body-bytes)))
                             headers)
                       headers))
-         ;; Build the header block
-         (header-str
-           (with-output-to-string (s)
-             (format s "HTTP/1.1 ~d ~a~a" status reason *crlf*)
-             (dolist (h headers)
-               (format s "~a: ~a~a" (car h) (cdr h) *crlf*))
-             (write-string *crlf* s))))
-    (let ((header-bytes (sb-ext:string-to-octets header-str
-                                                  :external-format :ascii)))
-      (if body-bytes
-          (let ((result (make-array (+ (length header-bytes) (length body-bytes))
-                                    :element-type '(unsigned-byte 8))))
-            (replace result header-bytes)
-            (replace result body-bytes :start1 (length header-bytes))
-            result)
-          header-bytes))))
+         ;; Pre-calculate exact buffer size
+         (header-size (+ 9                ; "HTTP/1.1 "
+                         3                ; status code (3 digits)
+                         1                ; space before reason
+                         (length reason)
+                         2                ; CRLF
+                         (loop for (name . value) in headers
+                               sum (+ (length name) 2 (length value) 2))
+                         2))              ; final CRLF
+         (body-len (if body-bytes (length body-bytes) 0))
+         (buf (make-array (+ header-size body-len)
+                          :element-type '(unsigned-byte 8)))
+         (pos 0))
+    (flet ((put-byte (b)
+             (setf (aref buf pos) b)
+             (incf pos))
+           (put-ascii (str)
+             (loop for i from 0 below (length str)
+                   do (setf (aref buf pos) (char-code (char str i)))
+                      (incf pos)))
+           (put-crlf ()
+             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
+             (incf pos 2)))
+      ;; Status line: "HTTP/1.1 NNN reason\r\n"
+      (put-ascii "HTTP/1.1 ")
+      (put-byte (+ 48 (floor status 100)))
+      (put-byte (+ 48 (mod (floor status 10) 10)))
+      (put-byte (+ 48 (mod status 10)))
+      (put-byte 32)
+      (put-ascii reason)
+      (put-crlf)
+      ;; Headers: "name: value\r\n"
+      (dolist (h headers)
+        (put-ascii (car h))
+        (put-byte 58) (put-byte 32)
+        (put-ascii (cdr h))
+        (put-crlf))
+      ;; Blank line terminates headers
+      (put-crlf)
+      ;; Body
+      (when body-bytes
+        (replace buf body-bytes :start1 pos)))
+    buf))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors
