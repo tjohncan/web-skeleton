@@ -24,11 +24,8 @@
   ;;   :websocket       — reading/writing WebSocket frames
   ;;   :closing         — sending close frame (disconnect when done)
   (state     :read-http :type keyword)
-  ;; Read buffer — accumulates incoming bytes
-  ;; Sized for the largest legal WebSocket frame: max payload + 14 bytes
-  ;; frame overhead (2 header + 8 extended length + 4 mask key).
-  (read-buf  (make-array (+ *max-ws-payload-size* 14)
-                         :element-type '(unsigned-byte 8))
+  ;; Read buffer — accumulates incoming bytes, grows as needed
+  (read-buf  (make-array 4096 :element-type '(unsigned-byte 8))
              :type (simple-array (unsigned-byte 8) (*)))
   (read-pos  0   :type fixnum)               ; bytes in read-buf so far
   ;; Write buffer — outgoing bytes to flush
@@ -76,14 +73,25 @@
 
 (defun connection-read-available (conn)
   "Drain all available bytes from fd into read buffer (edge-triggered).
+   Grows the buffer as needed, up to max frame size.
    Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
-  (let ((any-read nil))
+  (let ((any-read nil)
+        (max-size (+ *max-ws-payload-size* 14)))
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))
              (space (- (length buf) pos)))
         (when (<= space 0)
-          (return (if any-read :ok :full)))
+          ;; Buffer full — grow or give up
+          (if (>= (length buf) max-size)
+              (return (if any-read :ok :full))
+              (let* ((new-size (min (* (length buf) 2) max-size))
+                     (new-buf (make-array new-size
+                                          :element-type '(unsigned-byte 8))))
+                (replace new-buf buf :end2 pos)
+                (setf (connection-read-buf conn) new-buf
+                      buf new-buf
+                      space (- new-size pos)))))
         (let ((result (nb-read (connection-fd conn) buf pos space)))
           (cond
             ((eq result :eof)   (return :eof))
