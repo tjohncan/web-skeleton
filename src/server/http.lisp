@@ -41,14 +41,6 @@
          :message (apply #'format nil format-string args)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Recognized methods
-;;; ---------------------------------------------------------------------------
-
-(defparameter *http-methods*
-  '("GET" "HEAD" "POST" "PUT" "DELETE" "OPTIONS" "PATCH" "TRACE" "CONNECT")
-  "HTTP methods we recognize. Anything else is rejected.")
-
-;;; ---------------------------------------------------------------------------
 ;;; HTTP request structure
 ;;; ---------------------------------------------------------------------------
 
@@ -84,132 +76,199 @@
 (defvar *crlf* (coerce '(#\Return #\Newline) 'string))
 (defvar *crlf-crlf* (concatenate 'string *crlf* *crlf*))
 
-(defun crlf-split (text)
-  "Split TEXT on CRLF boundaries. Returns a list of strings."
-  (let ((lines '())
-        (start 0)
-        (crlf-len 2)
-        (len (length text)))
+;;; ---------------------------------------------------------------------------
+;;; Byte-level scanning helpers
+;;; ---------------------------------------------------------------------------
+
+(declaim (inline scan-crlf))
+
+(defun scan-crlf (buf start end)
+  "Find next CRLF (13 10) in BUF[START..END). Returns position of CR, or NIL."
+  (loop for i from start below (1- end)
+        when (and (= (aref buf i) 13) (= (aref buf (1+ i)) 10))
+        return i))
+
+(defun scan-crlf-crlf (buf start end)
+  "Find CRLFCRLF in BUF[START..END). Returns position of first CR, or NIL."
+  (loop for i from start to (- end 4)
+        when (and (= (aref buf i)       13)
+                  (= (aref buf (+ i 1)) 10)
+                  (= (aref buf (+ i 2)) 13)
+                  (= (aref buf (+ i 3)) 10))
+        return i))
+
+;;; ---------------------------------------------------------------------------
+;;; Byte-to-string conversion (allocation-minimal)
+;;; ---------------------------------------------------------------------------
+
+(defun bytes-to-string (buf start end)
+  "Convert BUF[START..END) to a UTF-8 string. Single allocation."
+  (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8))
+
+(defun bytes-to-lowercase-string (buf start end)
+  "Convert BUF[START..END) to a lowercase ASCII string. Single allocation."
+  (let ((str (make-string (- end start))))
+    (loop for i from start below end
+          for j from 0
+          do (let ((b (aref buf i)))
+               (setf (char str j)
+                     (if (<= 65 b 90)       ; A-Z → a-z
+                         (code-char (+ b 32))
+                         (code-char b)))))
+    str))
+
+(defun trim-ows-bounds (buf start end)
+  "Return (values trimmed-start trimmed-end) with leading/trailing OWS removed."
+  (let ((s start) (e end))
+    (loop while (and (< s e) (let ((b (aref buf s))) (or (= b 32) (= b 9))))
+          do (incf s))
+    (loop while (and (> e s) (let ((b (aref buf (1- e)))) (or (= b 32) (= b 9))))
+          do (decf e))
+    (values s e)))
+
+;;; ---------------------------------------------------------------------------
+;;; Byte-level HTTP method matching
+;;; ---------------------------------------------------------------------------
+
+(defun match-method-bytes (buf start end)
+  "Match BUF[START..END) against known HTTP methods. Returns keyword or NIL."
+  (flet ((match-p (str)
+           (let ((len (length str)))
+             (and (= (- end start) len)
+                  (loop for i from 0 below len
+                        always (= (aref buf (+ start i))
+                                  (char-code (char str i))))))))
+    (cond
+      ((match-p "GET")     :GET)
+      ((match-p "POST")    :POST)
+      ((match-p "PUT")     :PUT)
+      ((match-p "DELETE")  :DELETE)
+      ((match-p "HEAD")    :HEAD)
+      ((match-p "OPTIONS") :OPTIONS)
+      ((match-p "PATCH")   :PATCH)
+      ((match-p "TRACE")   :TRACE)
+      ((match-p "CONNECT") :CONNECT))))
+
+;;; ---------------------------------------------------------------------------
+;;; Byte-level header parser (single-pass)
+;;; ---------------------------------------------------------------------------
+
+(defun parse-headers-bytes (buf start end)
+  "Parse headers from BUF[START..END) into an alist of (lowercase-name . value).
+   Single-pass, handles obsolete line folding (RFC 7230 §3.2.4).
+   Stops at the first empty line (CRLFCRLF boundary)."
+  (let ((headers nil)
+        (count 0)
+        (pos start))
     (loop
-      (let ((pos (search *crlf* text :start2 start)))
-        (if pos
-            (progn
-              (push (subseq text start pos) lines)
-              (setf start (+ pos crlf-len)))
-            (progn
-              (when (< start len)
-                (push (subseq text start) lines))
-              (return)))))
-    (nreverse lines)))
-
-;;; ---------------------------------------------------------------------------
-;;; Request line parsing
-;;; ---------------------------------------------------------------------------
-
-(defun parse-request-line (line)
-  "Parse 'GET /path?query HTTP/1.1' into (values method path query version).
-   Signals HTTP-PARSE-ERROR on any malformation."
-  (when (zerop (length line))
-    (http-parse-error "empty request line"))
-  (when (> (length line) *max-request-line-length*)
-    (http-parse-error "request line too long (~d bytes, max ~d)"
-                      (length line) *max-request-line-length*))
-  ;; Split on spaces — exactly two spaces expected
-  (let* ((sp1 (position #\Space line))
-         (sp2 (when sp1 (position #\Space line :start (1+ sp1)))))
-    (unless (and sp1 sp2)
-      (http-parse-error "malformed request line (expected METHOD SP URI SP VERSION): ~s"
-                        (subseq line 0 (min (length line) 80))))
-    ;; Reject extra spaces
-    (when (position #\Space line :start (1+ sp2))
-      (http-parse-error "malformed request line (extra spaces): ~s"
-                        (subseq line 0 (min (length line) 80))))
-    (let ((method-str (subseq line 0 sp1))
-          (uri        (subseq line (1+ sp1) sp2))
-          (ver-str    (subseq line (1+ sp2))))
-      ;; Validate method
-      (unless (member method-str *http-methods* :test #'string=)
-        (http-parse-error "unrecognized method: ~s" method-str))
-      ;; Validate version
-      (unless (and (>= (length ver-str) 8)    ; "HTTP/X.Y"
-                   (string= "HTTP/" ver-str :end2 5))
-        (http-parse-error "malformed version: ~s" ver-str))
-      (let ((version (subseq ver-str 5)))
-        (unless (member version '("1.0" "1.1") :test #'string=)
-          (http-parse-error "unsupported HTTP version: ~s" version))
-        ;; Split URI into path and query
-        (let* ((qmark (position #\? uri))
-               (path  (if qmark (subseq uri 0 qmark) uri))
-               (query (when qmark (subseq uri (1+ qmark)))))
-          ;; Basic path validation
-          (when (zerop (length path))
-            (http-parse-error "empty request path"))
-          (unless (char= (char path 0) #\/)
-            (http-parse-error "request path must start with /: ~s" path))
-          (values (intern method-str :keyword)
-                  path
-                  query
-                  version))))))
-
-;;; ---------------------------------------------------------------------------
-;;; Header parsing
-;;; ---------------------------------------------------------------------------
-
-(defun parse-header-line (line)
-  "Parse 'Header-Name: value' into (name . value).
-   Name is lowercased, value is trimmed of leading/trailing whitespace."
-  (when (> (length line) *max-header-line-length*)
-    (http-parse-error "header line too long (~d bytes, max ~d)"
-                      (length line) *max-header-line-length*))
-  (let ((colon (position #\: line)))
-    (unless colon
-      (http-parse-error "malformed header (no colon): ~s"
-                        (subseq line 0 (min (length line) 80))))
-    (when (zerop colon)
-      (http-parse-error "empty header name"))
-    ;; Header name must not contain whitespace before colon (RFC 7230 §3.2.4)
-    (let ((name-part (subseq line 0 colon)))
-      (when (find-if (lambda (c) (or (char= c #\Space) (char= c #\Tab)))
-                     name-part)
-        (http-parse-error "whitespace in header name: ~s" name-part))
-      (cons (string-downcase name-part)
-            (string-trim '(#\Space #\Tab) (subseq line (1+ colon)))))))
-
-(defun fold-continuation-lines (lines)
-  "Handle obsolete header line folding (RFC 7230 §3.2.4).
-   Lines starting with SP or HT are folded into the previous header."
-  (let ((result '())
-        (current nil))
-    (dolist (line lines)
-      (if (and current
-               (> (length line) 0)
-               (let ((ch (char line 0)))
-                 (or (char= ch #\Space) (char= ch #\Tab))))
-          ;; Continuation — fold into current
-          (setf current (concatenate 'string current " "
-                                     (string-trim '(#\Space #\Tab) line)))
-          ;; New header
-          (progn
-            (when current (push current result))
-            (setf current line))))
-    (when current (push current result))
-    (nreverse result)))
-
-(defun parse-headers (header-text)
-  "Parse the header block (everything between request line and body)
-   into an alist of (lowercase-name . value) pairs."
-  (when (zerop (length header-text))
-    (return-from parse-headers nil))
-  (let* ((raw-lines (crlf-split header-text))
-         (folded    (fold-continuation-lines raw-lines))
-         (headers   (mapcar #'parse-header-line folded)))
-    (when (> (length headers) *max-header-count*)
+      (let ((crlf (scan-crlf buf pos end)))
+        (unless crlf (return))          ; no more complete lines
+        (when (= crlf pos) (return))    ; empty line = end of headers
+        (let ((line-len (- crlf pos)))
+          (when (> line-len *max-header-line-length*)
+            (http-parse-error "header line too long (~d bytes, max ~d)"
+                              line-len *max-header-line-length*))
+          (let ((first-byte (aref buf pos)))
+            (if (and headers (or (= first-byte 32) (= first-byte 9)))
+                ;; Continuation line — append to previous header value
+                (multiple-value-bind (ts te) (trim-ows-bounds buf pos crlf)
+                  (when (> te ts)
+                    (let* ((prev (car headers))
+                           (extra (bytes-to-string buf ts te)))
+                      (setf (cdr prev)
+                            (concatenate 'string (cdr prev) " " extra)))))
+                ;; New header — find colon
+                (let ((colon (position 58 buf :start pos :end crlf))) ; 58 = ':'
+                  (unless colon
+                    (http-parse-error "malformed header (no colon)"))
+                  (when (= colon pos)
+                    (http-parse-error "empty header name"))
+                  ;; Reject whitespace in header name
+                  (loop for i from pos below colon
+                        when (let ((b (aref buf i))) (or (= b 32) (= b 9)))
+                        do (http-parse-error "whitespace in header name"))
+                  (let ((name (bytes-to-lowercase-string buf pos colon)))
+                    (multiple-value-bind (vs ve)
+                        (trim-ows-bounds buf (1+ colon) crlf)
+                      (push (cons name (if (= vs ve) ""
+                                           (bytes-to-string buf vs ve)))
+                            headers)
+                      (incf count)))))))
+        (setf pos (+ crlf 2))))
+    (when (> count *max-header-count*)
       (http-parse-error "too many headers (~d, max ~d)"
-                        (length headers) *max-header-count*))
-    headers))
+                        count *max-header-count*))
+    (nreverse headers)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Full request parsing
+;;; Byte-level request parser
+;;; ---------------------------------------------------------------------------
+
+(defun parse-request-bytes (buf start end)
+  "Parse HTTP request directly from bytes BUF[START..END).
+   END should be past the CRLFCRLF terminator.
+   Returns an HTTP-REQUEST. Body is not extracted."
+  (let ((req-end (scan-crlf buf start end)))
+    (unless req-end
+      (http-parse-error "incomplete request (no CRLF in request line)"))
+    (let ((req-line-len (- req-end start)))
+      (when (zerop req-line-len)
+        (http-parse-error "empty request line"))
+      (when (> req-line-len *max-request-line-length*)
+        (http-parse-error "request line too long (~d bytes, max ~d)"
+                          req-line-len *max-request-line-length*)))
+    ;; Parse: METHOD SP URI SP VERSION
+    (let ((sp1 (position 32 buf :start start :end req-end)))  ; 32 = space
+      (unless sp1
+        (http-parse-error "malformed request line"))
+      (let ((sp2 (position 32 buf :start (1+ sp1) :end req-end)))
+        (unless sp2
+          (http-parse-error "malformed request line"))
+        (when (position 32 buf :start (1+ sp2) :end req-end)
+          (http-parse-error "malformed request line (extra spaces)"))
+        ;; Method
+        (let ((method (match-method-bytes buf start sp1)))
+          (unless method
+            (http-parse-error "unrecognized method: ~a"
+                              (bytes-to-string buf start sp1)))
+          ;; Version — match "HTTP/1.0" or "HTTP/1.1" byte-by-byte
+          (let* ((ver-start (1+ sp2))
+                 (ver-len (- req-end ver-start))
+                 (version
+                   (when (and (= ver-len 8)
+                              (= (aref buf ver-start)       72)  ; H
+                              (= (aref buf (+ ver-start 1)) 84)  ; T
+                              (= (aref buf (+ ver-start 2)) 84)  ; T
+                              (= (aref buf (+ ver-start 3)) 80)  ; P
+                              (= (aref buf (+ ver-start 4)) 47)  ; /
+                              (= (aref buf (+ ver-start 5)) 49)  ; 1
+                              (= (aref buf (+ ver-start 6)) 46)) ; .
+                     (case (aref buf (+ ver-start 7))
+                       (49 "1.1")    ; '1'
+                       (48 "1.0"))))) ; '0'
+            (unless version
+              (http-parse-error "unsupported HTTP version"))
+            ;; URI → path + query
+            (let* ((uri-start (1+ sp1))
+                   (qmark (position 63 buf :start uri-start :end sp2))  ; 63 = '?'
+                   (path-end (or qmark sp2)))
+              (when (= uri-start path-end)
+                (http-parse-error "empty request path"))
+              (unless (= (aref buf uri-start) 47)  ; 47 = '/'
+                (http-parse-error "request path must start with /"))
+              (let ((path (bytes-to-string buf uri-start path-end))
+                    (query (when qmark
+                             (bytes-to-string buf (1+ qmark) sp2))))
+                (let ((headers (parse-headers-bytes buf (+ req-end 2) end)))
+                  (make-http-request
+                   :method method
+                   :path path
+                   :query query
+                   :version version
+                   :headers headers))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; String-level convenience interface
 ;;; ---------------------------------------------------------------------------
 
 (defun find-header-end (data)
@@ -219,31 +278,12 @@
 
 (defun parse-request (raw-data)
   "Parse a raw HTTP request header string into an HTTP-REQUEST struct.
-   RAW-DATA must contain the complete headers (terminated by CRLFCRLF).
-   Body is not extracted here — callers provide it separately via the body slot."
-  (let ((header-end (find-header-end raw-data)))
-    (unless header-end
+   Convenience wrapper — converts to bytes and calls the byte-level parser."
+  (let* ((bytes (sb-ext:string-to-octets raw-data :external-format :utf-8))
+         (end (scan-crlf-crlf bytes 0 (length bytes))))
+    (unless end
       (http-parse-error "incomplete headers (no CRLFCRLF terminator)"))
-    (let* ((header-section (subseq raw-data 0 header-end))
-           ;; Split request line from header block
-           (first-crlf (search *crlf* header-section))
-           (request-line (if first-crlf
-                             (subseq header-section 0 first-crlf)
-                             header-section))
-           (header-text (if (and first-crlf
-                                 (< (+ first-crlf 2) (length header-section)))
-                            (subseq header-section (+ first-crlf 2))
-                            "")))
-      ;; Parse the components
-      (multiple-value-bind (method path query version)
-          (parse-request-line request-line)
-        (let ((headers (parse-headers header-text)))
-          (make-http-request
-           :method method
-           :path path
-           :query query
-           :version version
-           :headers headers))))))
+    (parse-request-bytes bytes 0 (+ end 4))))
 
 ;;; ===========================================================================
 ;;; HTTP Response Builder
