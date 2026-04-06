@@ -13,7 +13,6 @@
            #:get-header
            #:get-headers
            #:parse-request
-           #:find-header-end
            ;; HTTP response
            #:http-response
            #:http-response-status
@@ -37,42 +36,10 @@
            #:sha1
            #:sha1-hex
            #:base64-encode
-           ;; epoll FFI
-           #:epoll-create
-           #:epoll-add
-           #:epoll-modify
-           #:epoll-remove
-           #:epoll-wait
-           #:epoll-event-fd
-           #:epoll-event-flags
-           #:make-epoll-event-buf
-           #:+epollin+
-           #:+epollout+
-           #:+epollerr+
-           #:+epollhup+
-           #:+epollet+
-           #:set-nonblocking
-           #:set-socket-option-int
-           #:+sol-socket+
-           #:+so-reuseport+
-           #:socket-fd
-           #:nb-read
-           #:nb-write
-           ;; Connection
+           ;; Connection (minimal — for ws-handler identity)
            #:connection
-           #:make-client-connection
-           #:connection-close
            #:connection-fd
-           #:connection-socket
-           #:connection-state
-           #:connection-request
-           #:connection-on-read
-           #:connection-on-write
-           #:connection-queue-write
-           #:connection-parse-request
            ;; WebSocket
-           #:websocket-upgrade-p
-           #:websocket-on-read
            #:ws-frame
            #:ws-frame-fin
            #:ws-frame-opcode
@@ -94,6 +61,4 @@
            #:*idle-timeout*
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
-           #:*ws-max-missed-pongs*
-           #:connection-last-active
-           #:connection-missed-pongs))
+           #:*ws-max-missed-pongs*))
