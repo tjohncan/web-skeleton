@@ -9,13 +9,6 @@
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
-;;; Buffer size
-;;; ---------------------------------------------------------------------------
-
-(defconstant +read-buf-size+ 65536
-  "Size of the per-connection read buffer (64KB).")
-
-;;; ---------------------------------------------------------------------------
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
 
@@ -32,7 +25,9 @@
   ;;   :closing         — sending close frame (disconnect when done)
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes
-  (read-buf  (make-array +read-buf-size+
+  ;; Sized for the largest legal WebSocket frame: max payload + 14 bytes
+  ;; frame overhead (2 header + 8 extended length + 4 mask key).
+  (read-buf  (make-array (+ *max-ws-payload-size* 14)
                          :element-type '(unsigned-byte 8))
              :type (simple-array (unsigned-byte 8) (*)))
   (read-pos  0   :type fixnum)               ; bytes in read-buf so far

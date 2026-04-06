@@ -22,6 +22,9 @@
 (defparameter *max-body-size* (* 1 1024 1024)
   "Maximum request body size in bytes. Default 1MB.")
 
+(defparameter *max-ws-payload-size* 65536
+  "Maximum WebSocket frame payload size in bytes. Default 64KB.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
 ;;; ---------------------------------------------------------------------------

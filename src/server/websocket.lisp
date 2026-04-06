@@ -21,8 +21,7 @@
 (defconstant +ws-op-ping+  #x9)
 (defconstant +ws-op-pong+  #xA)
 
-(defparameter *max-ws-payload-size* 65536
-  "Maximum WebSocket frame payload size in bytes. Default 64KB.")
+;;; *max-ws-payload-size* is defined in http.lisp alongside the other limits.
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handshake
