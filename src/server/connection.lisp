@@ -40,8 +40,9 @@
   ;; Content-Length tracking (during :read-body state)
   (body-expected 0 :type fixnum)             ; Content-Length value
   (header-end    0 :type fixnum)             ; byte offset where body starts
-  ;; Timestamps
-  (created   0   :type integer))
+  ;; Activity tracking (for idle timeout and ping/pong)
+  (last-active   0 :type integer)             ; updated on real activity only
+  (missed-pongs  0 :type fixnum))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor
@@ -54,7 +55,7 @@
     (set-nonblocking fd)
     (make-connection :fd fd
                      :socket client-socket
-                     :created (get-internal-real-time))))
+                     :last-active (get-universal-time))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cleanup
@@ -143,6 +144,11 @@
       (:full  (log-warn "read buffer full on fd ~d" (connection-fd conn))
               (return-from connection-on-read :close))
       (:again (return-from connection-on-read :continue)))
+    ;; Update activity timestamp for HTTP states only.
+    ;; WebSocket updates selectively in websocket-on-read
+    ;; (application frames count, protocol pongs don't).
+    (unless (eq (connection-state conn) :websocket)
+      (setf (connection-last-active conn) (get-universal-time)))
     ;; We have new data — check state.
     ;; Only :read-http, :read-body, and :websocket watch EPOLLIN.
     ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.

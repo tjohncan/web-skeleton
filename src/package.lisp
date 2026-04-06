@@ -82,4 +82,11 @@
            #:*max-header-count*
            #:*max-header-line-length*
            #:*max-body-size*
-           #:*max-ws-payload-size*))
+           #:*max-ws-payload-size*
+           ;; Connection lifecycle
+           #:*idle-timeout*
+           #:*ws-idle-timeout*
+           #:*ws-ping-interval*
+           #:*ws-max-missed-pongs*
+           #:connection-last-active
+           #:connection-missed-pongs))

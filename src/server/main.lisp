@@ -122,6 +122,70 @@
   (gethash fd *connections*))
 
 ;;; ---------------------------------------------------------------------------
+;;; Connection lifecycle — idle timeout and WebSocket ping/pong
+;;;
+;;; Three mechanisms:
+;;;   1. HTTP idle timeout — close connections that never finish a request
+;;;   2. WebSocket ping/pong — detect dead connections (client vanished)
+;;;   3. WebSocket idle timeout — close inactive but alive connections
+;;; ---------------------------------------------------------------------------
+
+(defparameter *idle-timeout* 30
+  "Seconds before an idle HTTP connection is closed. 0 to disable.")
+
+(defparameter *ws-idle-timeout* 86400
+  "Seconds before an inactive WebSocket connection is closed. 0 to disable.
+   Inactivity = no text or binary frames from the client (pongs don't count).")
+
+(defparameter *ws-ping-interval* 30
+  "Seconds between server-initiated WebSocket pings.")
+
+(defparameter *ws-max-missed-pongs* 3
+  "Close a WebSocket connection after this many consecutive unanswered pings.")
+
+(defun sweep-idle-connections (epoll-fd now)
+  "Close connections that have been idle too long.
+   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*."
+  (let ((idle nil))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (let* ((ws-p (eq (connection-state conn) :websocket))
+                      (timeout (if ws-p *ws-idle-timeout* *idle-timeout*)))
+                 (when (and (> timeout 0)
+                            (> (- now (connection-last-active conn)) timeout))
+                   (push conn idle))))
+             *connections*)
+    (dolist (conn idle)
+      (log-debug "idle timeout fd ~d (~a)"
+                 (connection-fd conn) (connection-state conn))
+      (close-connection conn epoll-fd))))
+
+(defun ping-ws-connections (epoll-fd)
+  "Send pings to WebSocket connections and close dead ones.
+   Dead = exceeded *ws-max-missed-pongs* consecutive unanswered pings.
+   Skips connections with a write in progress (they're clearly not dead)."
+  (let ((dead nil)
+        (ping-frame (build-ws-ping)))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (when (eq (connection-state conn) :websocket)
+                 (cond
+                   ;; Dead — too many missed pongs
+                   ((>= (connection-missed-pongs conn) *ws-max-missed-pongs*)
+                    (push conn dead))
+                   ;; No write in progress — send ping
+                   ((>= (connection-write-pos conn) (connection-write-end conn))
+                    (incf (connection-missed-pongs conn))
+                    (connection-queue-write conn ping-frame)
+                    (epoll-modify epoll-fd (connection-fd conn)
+                                 (logior +epollout+ +epollet+))))))
+             *connections*)
+    (dolist (conn dead)
+      (log-info "ws dead (missed ~d pongs) fd ~d"
+                (connection-missed-pongs conn) (connection-fd conn))
+      (close-connection conn epoll-fd))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Shutdown flag
 ;;; ---------------------------------------------------------------------------
 
@@ -306,7 +370,8 @@
 
 (defun run-event-loop (listener-socket epoll-fd)
   "Main event loop. Runs until *shutdown* is set."
-  (let ((listener-fd (socket-fd listener-socket)))
+  (let ((listener-fd (socket-fd listener-socket))
+        (last-ping-time (get-universal-time)))
     (loop
       (when *shutdown* (return))
       (let ((events (epoll-wait epoll-fd *max-events* 1000)))
@@ -335,7 +400,13 @@
                      ;; Writable (check conn still alive after read handling)
                      (when (and (logtest flags +epollout+)
                                 (lookup-connection fd))
-                       (handle-client-write conn epoll-fd)))))))))))))
+                       (handle-client-write conn epoll-fd))))))))))
+      ;; Periodic maintenance
+      (let ((now (get-universal-time)))
+        (sweep-idle-connections epoll-fd now)
+        (when (>= (- now last-ping-time) *ws-ping-interval*)
+          (ping-ws-connections epoll-fd)
+          (setf last-ping-time now))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Worker

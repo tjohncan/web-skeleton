@@ -194,6 +194,11 @@
   "Build a pong frame echoing PAYLOAD."
   (build-ws-frame +ws-op-pong+ payload))
 
+(defun build-ws-ping ()
+  "Build a ping frame with empty payload."
+  (build-ws-frame +ws-op-ping+
+                  (make-array 0 :element-type '(unsigned-byte 8))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket event handler
 ;;;
@@ -229,10 +234,17 @@
                         (ws-frame-payload frame)
                         :external-format :utf-8)))
              (log-debug "ws recv: ~a" text)
+             ;; Real application frame — counts as activity
+             (setf (connection-last-active conn) (get-universal-time))
              (push (build-ws-text text) responses)))
           ((= (ws-frame-opcode frame) +ws-op-ping+)
-           (log-debug "ws ping")
+           (log-debug "ws ping from client fd ~d" (connection-fd conn))
            (push (build-ws-pong (ws-frame-payload frame)) responses))
+          ((= (ws-frame-opcode frame) +ws-op-pong+)
+           ;; Pong received — client is alive, reset dead detection counter.
+           ;; Does NOT count as user activity for idle timeout purposes.
+           (log-debug "ws pong fd ~d" (connection-fd conn))
+           (setf (connection-missed-pongs conn) 0))
           ((= (ws-frame-opcode frame) +ws-op-close+)
            (log-info "ws close requested on fd ~d" (connection-fd conn))
            ;; Shift buffer, then signal close
