@@ -34,7 +34,7 @@
 ;;; no locks, no shared state.
 ;;; ---------------------------------------------------------------------------
 
-(defvar *connections* (make-hash-table :test #'eql)
+(defvar *connections* nil
   "Maps file descriptor → connection object. Bound per-worker.")
 
 (defun register-connection (conn)
