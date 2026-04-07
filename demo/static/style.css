@@ -1,0 +1,83 @@
+/* web-skeleton demo — palette from favicon SVG */
+
+:root {
+  --bg-deep: #030108;
+  --bg-mid: #0c0818;
+  --bg-glow: #18102c;
+  --bone: #e8e4dc;
+  --bone-bright: #f2eee6;
+  --bone-dim: #b8b0a4;
+  --purple: #8050c8;
+  --purple-deep: #6838a0;
+  --electric: #6080e0;
+  --electric-bright: #d0dcf8;
+  --spark-blue: #80b0f0;
+  --err: #c06068;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: monospace;
+  background: var(--bg-deep);
+  background: radial-gradient(ellipse at 50% 30%, var(--bg-glow), var(--bg-deep) 70%);
+  color: var(--bone);
+  padding: 2em;
+  min-height: 100vh;
+}
+
+h1 {
+  margin-bottom: 1em;
+  color: var(--bone-bright);
+  text-shadow: 0 0 20px rgba(96, 128, 224, 0.3);
+}
+
+#log {
+  background: var(--bg-mid);
+  padding: 1em;
+  height: 400px;
+  overflow-y: auto;
+  border-radius: 4px;
+  margin-bottom: 1em;
+  white-space: pre-wrap;
+  box-shadow: 0 0 16px rgba(128, 80, 200, 0.12);
+}
+
+.status { color: var(--electric); }
+.sent { color: var(--bone-dim); }
+.recv { color: var(--spark-blue); }
+.err { color: var(--err); }
+
+form { display: flex; gap: 0.5em; }
+
+input {
+  flex: 1;
+  padding: 0.5em;
+  font-family: monospace;
+  font-size: 1em;
+  background: var(--bg-mid);
+  color: var(--bone);
+  border: 1px solid var(--purple-deep);
+  border-radius: 4px;
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--purple);
+  box-shadow: 0 0 8px rgba(128, 80, 200, 0.3);
+}
+
+button {
+  padding: 0.5em 1.5em;
+  font-family: monospace;
+  font-size: 1em;
+  background: var(--purple-deep);
+  color: var(--bone-bright);
+  border: 1px solid var(--purple);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--purple);
+}

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' ws: wss:; manifest-src 'self'; base-uri 'self';">
+    <title>web-skeleton</title>
+    <meta name="description" content="SBCL web server framework for Linux">
+    <meta property="og:title" content="web-skeleton">
+    <meta property="og:description" content="SBCL web server framework for Linux">
+    <meta property="og:image" content="/og-image.png"> <!-- use an absolute URL in production -->
+    <meta property="og:type" content="website">
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" type="image/svg+xml" href="/favicon/favicon.svg">
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/favicon/apple-touch-icon.png">
+    <link rel="manifest" href="/favicon/site.webmanifest">
+    <script src="/app.js" defer></script>
+</head>
+<body>
+    <h1>web-skeleton</h1>
+    <div id="log"></div>
+    <form id="form">
+        <input id="msg" type="text" placeholder="type a message..." autofocus>
+        <button type="submit">send</button>
+    </form>
+</body>
+</html>

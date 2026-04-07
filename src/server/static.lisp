@@ -184,12 +184,17 @@
   "Look up the request path in the static file cache.
    Returns a pre-built HTTP response byte vector ready to write,
    or NIL if the path is not cached.
-   Serves GET and HEAD requests. Rejects paths containing '..'."
+   Serves GET and HEAD requests. Rejects paths containing '..'.
+   Directories (paths ending in /) try index.html as a fallback."
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
       (let ((path (http-request-path request)))
         (unless (search ".." path)
-          (let ((entry (gethash path *static-cache*)))
+          (let ((entry (or (gethash path *static-cache*)
+                           ;; Try index.html for directory paths
+                           (when (char= (char path (1- (length path))) #\/)
+                             (gethash (concatenate 'string path "index.html")
+                                      *static-cache*)))))
             (when entry
               (if (eq method :GET)
                   (static-entry-get-response entry)

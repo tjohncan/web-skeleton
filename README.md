@@ -28,7 +28,7 @@ sbcl --non-interactive --load run-server.lisp
 ```
 
 Starts the demo server on port 8081. 
-The built-in test page (load `http://localhost:8081/` in a browser) 
+The demo page (load `http://localhost:8081/` in a browser) 
 opens a WebSocket connection and echoes messages back. Ctrl-C shuts down cleanly.
 
 ## Building
@@ -90,7 +90,8 @@ src/
     main.lisp                epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp               Demo package declaration
-  handler.lisp               Test page, echo WebSocket handler, demo entry point
+  handler.lisp               WebSocket echo handler, demo entry point
+  static/                    Demo static assets (HTML, CSS, JS, favicon, images)
 tests/
   package.lisp               Test package declaration
   run.lisp                   Test utilities and combined runner
@@ -127,7 +128,7 @@ tests/
   response. MIME detection, extensionless HTML aliases, directory traversal protection
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors and HTTP parser tests
-- **Demo application** — separate ASDF system with test page and echo server
+- **Demo application** — separate ASDF system with static demo page and echo server
 
 ## Configuration
 
