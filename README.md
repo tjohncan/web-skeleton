@@ -164,5 +164,4 @@ Without a handler, the server returns 501 for all requests.
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
 - **Session management** — map authenticated users to WebSocket connections
-- **Broadcast / room abstraction** — send to all connections in a group
 - **Graceful shutdown** — drain active connections on SIGTERM
