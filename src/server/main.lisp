@@ -111,11 +111,17 @@
       (close-connection conn epoll-fd))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Shutdown flag
+;;; Shutdown
 ;;; ---------------------------------------------------------------------------
 
 (defvar *shutdown* nil
   "Set to T to signal all workers to exit.")
+
+(defparameter *drain-timeout* 5
+  "Seconds to wait for connections to drain during graceful shutdown.")
+
+(defparameter *max-events* 64
+  "Maximum events to process per epoll_wait call.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request dispatch
@@ -189,6 +195,62 @@
       (unregister-connection conn)
       (connection-close conn)
       (log-debug "closed fd ~d" fd))))
+
+;;; ---------------------------------------------------------------------------
+;;; Graceful drain — flush in-progress writes, close cleanly
+;;; ---------------------------------------------------------------------------
+
+(defun drain-connections (listener-socket epoll-fd event-buf)
+  "Gracefully drain all active connections during shutdown.
+   Stops accepting, sends WebSocket close frames, lets writes flush,
+   force-closes anything remaining after *drain-timeout*."
+  ;; Stop accepting new connections
+  (ignore-errors (epoll-remove epoll-fd (socket-fd listener-socket)))
+  (let ((count (hash-table-count *connections*)))
+    (when (zerop count)
+      (return-from drain-connections))
+    (log-info "draining ~d connection~:p" count))
+  ;; Phase 1: initiate shutdown on each connection
+  (let ((to-close nil))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (case (connection-state conn)
+                 ;; HTTP connections still reading — nothing to drain
+                 ((:read-http :read-body)
+                  (push conn to-close))
+                 ;; WebSocket — send close frame (1001 = going away)
+                 (:websocket
+                  (connection-queue-write conn (build-ws-close 1001))
+                  (setf (connection-state conn) :closing)
+                  (epoll-modify epoll-fd (connection-fd conn)
+                               (logior +epollout+ +epollet+)))
+                 ;; :write-response, :ws-upgrade, :closing — let them finish
+                 (t nil)))
+             *connections*)
+    (dolist (conn to-close)
+      (close-connection conn epoll-fd)))
+  ;; Phase 2: flush remaining writes until drained or timeout
+  (let ((deadline (+ (get-universal-time) *drain-timeout*)))
+    (loop
+      (when (zerop (hash-table-count *connections*))
+        (log-info "all connections drained")
+        (return))
+      (when (> (get-universal-time) deadline)
+        (log-warn "drain timeout — force-closing ~d connection~:p"
+                  (hash-table-count *connections*))
+        (return))
+      (let ((n (epoll-wait epoll-fd event-buf *max-events* 200)))
+        (loop for i from 0 below n
+              do (let* ((fd (epoll-event-fd event-buf i))
+                        (flags (epoll-event-flags event-buf i))
+                        (conn (lookup-connection fd)))
+                   (when conn
+                     (cond
+                       ((or (logtest flags +epollerr+)
+                            (logtest flags +epollhup+))
+                        (close-connection conn epoll-fd))
+                       ((logtest flags +epollout+)
+                        (handle-client-write conn epoll-fd))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handle readable event on a client fd
@@ -306,16 +368,15 @@
 ;;; Event loop
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *max-events* 64
-  "Maximum events to process per epoll_wait call.")
-
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler)
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd (socket-fd listener-socket))
         (last-ping-time (get-universal-time))
         (event-buf (make-epoll-event-buf *max-events*)))
     (loop
-      (when *shutdown* (return))
+      (when *shutdown*
+        (drain-connections listener-socket epoll-fd event-buf)
+        (return))
       (let ((n (epoll-wait epoll-fd event-buf *max-events* 1000)))
         (loop for i from 0 below n
               do (block handle-event
@@ -401,6 +462,11 @@
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
   (setf *shutdown* nil)
+  ;; SIGTERM triggers graceful shutdown (same as Ctrl-C)
+  (sb-sys:enable-interrupt sb-unix:sigterm
+    (lambda (signal info context)
+      (declare (ignore signal info context))
+      (setf *shutdown* t)))
   (log-info "starting ~d worker~:p on port ~d" workers port)
   (let ((threads (loop for i from 0 below workers
                        collect (sb-thread:make-thread
@@ -409,13 +475,17 @@
                                 :name (format nil "web-skeleton-~d" i)))))
     (unwind-protect
         (handler-case
-            ;; Main thread waits for interrupt
-            (loop (sleep 1))
+            ;; Main thread waits for interrupt or SIGTERM
+            (loop (sleep 1)
+                  (when *shutdown*
+                    (log-info "shutting down")
+                    (return)))
           (sb-sys:interactive-interrupt ()
             (format t "~%")
             (log-info "interrupted — shutting down")))
-      ;; Signal workers to stop and wait for them
+      ;; Signal workers to drain and stop
       (setf *shutdown* t)
       (dolist (thread threads)
-        (ignore-errors (sb-thread:join-thread thread :timeout 5)))
+        (ignore-errors (sb-thread:join-thread thread
+                                              :timeout (+ *drain-timeout* 3))))
       (log-info "stopped"))))

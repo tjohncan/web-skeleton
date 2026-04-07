@@ -29,7 +29,8 @@ sbcl --non-interactive --load run-server.lisp
 
 Starts the demo server on port 8081. 
 The demo page (load `http://localhost:8081/` in a browser) 
-opens a WebSocket connection and echoes messages back. Ctrl-C shuts down cleanly.
+opens a WebSocket connection and echoes messages back.
+Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
 ## Building
 
@@ -128,6 +129,8 @@ tests/
   response. MIME detection, extensionless HTML aliases, directory traversal protection
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors and HTTP parser tests
+- **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
+  close frames, flushes in-progress writes, force-closes after drain timeout
 - **Demo application** — separate ASDF system with static demo page and echo server
 
 ## Configuration
@@ -147,6 +150,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-idle-timeout*` | `86400` | Seconds before an inactive WebSocket is closed |
 | `*ws-ping-interval*` | `30` | Seconds between server-initiated WebSocket pings |
 | `*ws-max-missed-pongs*` | `3` | Missed pongs before a WebSocket is declared dead |
+| `*drain-timeout*` | `5` | Seconds to wait for connections to drain on shutdown |
 
 The `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
 
@@ -164,4 +168,3 @@ Without a handler, the server returns 501 for all requests.
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
 - **Session management** — map authenticated users to WebSocket connections
-- **Graceful shutdown** — drain active connections on SIGTERM

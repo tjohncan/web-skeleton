@@ -64,4 +64,6 @@
            #:*idle-timeout*
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
-           #:*ws-max-missed-pongs*))
+           #:*ws-max-missed-pongs*
+           ;; Shutdown
+           #:*drain-timeout*))
