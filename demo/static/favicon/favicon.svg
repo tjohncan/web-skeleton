@@ -1,0 +1,300 @@
+<svg
+  width="512"
+  height="512"
+  viewBox="0 0 512 512"
+  xmlns="http://www.w3.org/2000/svg">
+
+<!-- ||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+
+  W E B - S K E L E T O N
+
+||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||| -->
+<!--
+
+
+commands for generating .png and .ico assets:
+
+# first, install popular image tools ... for example, by:
+# sudo apt-get install librsvg2-bin optipng icoutils
+
+# then:
+
+
+cd favicon
+
+rsvg-convert -w 16 -h 16 favicon.svg -o favicon-16x16.png
+rsvg-convert -w 32 -h 32 favicon.svg -o favicon-32x32.png
+rsvg-convert -w 48 -h 48 favicon.svg -o favicon-48x48.png
+rsvg-convert -w 64 -h 64 favicon.svg -o favicon-64x64.png
+rsvg-convert -w 180 -h 180 favicon.svg -o apple-touch-icon.png
+rsvg-convert -w 192 -h 192 favicon.svg -o icon-192x192.png
+rsvg-convert -w 512 -h 512 favicon.svg -o icon-512x512.png
+
+optipng -o7 *.png
+
+
+cd ..
+
+icotool -c -o favicon.ico favicon/favicon-16x16.png favicon/favicon-32x32.png favicon/favicon-48x48.png
+
+
+-->
+
+  <defs>
+    <!-- Background: deep purple X-ray ambience, centered on heart area -->
+    <radialGradient id="bg" cx="0.5" cy="0.46" r="0.58">
+      <stop offset="0%"   stop-color="#18102c"/>
+      <stop offset="55%"  stop-color="#0c0818"/>
+      <stop offset="100%" stop-color="#030108"/>
+    </radialGradient>
+
+    <!-- Bone surface: warm off-white, lit from above -->
+    <linearGradient id="bone" x1="256" y1="100" x2="256" y2="450"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#f2eee6"/>
+      <stop offset="50%"  stop-color="#e8e4dc"/>
+      <stop offset="100%" stop-color="#d8d2c8"/>
+    </linearGradient>
+
+    <!-- Vertebra surface: per-element top-lit shading -->
+    <linearGradient id="vert" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#f6f2ea"/>
+      <stop offset="35%"  stop-color="#e8e4dc"/>
+      <stop offset="100%" stop-color="#b8b0a4"/>
+    </linearGradient>
+
+    <!-- Purple aura for posterior skeleton -->
+    <filter id="aura" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="12" result="blur"/>
+      <feFlood flood-color="#8050c8" flood-opacity="0.6" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Electric aura for anterior cage -->
+    <filter id="electric" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="9" result="blur"/>
+      <feFlood flood-color="#6080e0" flood-opacity="0.7" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Electric spark: white-blue energy hotspot -->
+    <radialGradient id="spark">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="8%"   stop-color="#e0f0ff" stop-opacity="0.95"/>
+      <stop offset="25%"  stop-color="#80b0f0" stop-opacity="0.55"/>
+      <stop offset="50%"  stop-color="#5068d0" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#3040a0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" fill="url(#bg)"/>
+
+  <!-- All drawn elements scaled 1.13x around center -->
+  <g transform="translate(256,256) scale(1.13) translate(-256,-270)">
+
+    <!-- ===========================================================
+         POSTERIOR SKELETON
+         7 true ribs (T1-T7) from thoracic vertebrae.
+         3D shading: shadow below, bone surface, highlight above.
+         77% opaque with purple aura glow.
+         =========================================================== -->
+    <g opacity="0.77">
+      <g filter="url(#aura)">
+
+        <!-- Rib shadow -->
+        <g fill="none" stroke="#2a2420" stroke-width="26" stroke-linecap="round"
+           transform="translate(0, 5)" opacity="0.35">
+          <path d="M 256,130 C 320,118 374,124 364,142"/>
+          <path d="M 256,130 C 192,118 138,124 148,142"/>
+          <path d="M 256,172 C 340,156 416,166 402,190"/>
+          <path d="M 256,172 C 172,156 96,166 110,190"/>
+          <path d="M 256,214 C 354,194 442,208 424,238"/>
+          <path d="M 256,214 C 158,194 70,208 88,238"/>
+          <path d="M 256,256 C 362,232 456,252 434,286"/>
+          <path d="M 256,256 C 150,232 56,252 78,286"/>
+          <path d="M 256,298 C 360,276 452,302 428,338"/>
+          <path d="M 256,298 C 152,276 60,302 84,338"/>
+          <path d="M 256,340 C 354,318 440,346 416,390"/>
+          <path d="M 256,340 C 158,318 72,346 96,390"/>
+          <path d="M 256,382 C 340,362 414,392 392,438"/>
+          <path d="M 256,382 C 172,362 98,392 120,438"/>
+        </g>
+
+        <!-- Rib bones -->
+        <g fill="none" stroke="url(#bone)" stroke-width="20" stroke-linecap="round">
+          <path d="M 256,130 C 320,118 374,124 364,142"/>
+          <path d="M 256,130 C 192,118 138,124 148,142"/>
+          <path d="M 256,172 C 340,156 416,166 402,190"/>
+          <path d="M 256,172 C 172,156 96,166 110,190"/>
+          <path d="M 256,214 C 354,194 442,208 424,238"/>
+          <path d="M 256,214 C 158,194 70,208 88,238"/>
+          <path d="M 256,256 C 362,232 456,252 434,286"/>
+          <path d="M 256,256 C 150,232 56,252 78,286"/>
+          <path d="M 256,298 C 360,276 452,302 428,338"/>
+          <path d="M 256,298 C 152,276 60,302 84,338"/>
+          <path d="M 256,340 C 354,318 440,346 416,390"/>
+          <path d="M 256,340 C 158,318 72,346 96,390"/>
+          <path d="M 256,382 C 340,362 414,392 392,438"/>
+          <path d="M 256,382 C 172,362 98,392 120,438"/>
+        </g>
+
+        <!-- Rib highlight -->
+        <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round"
+           transform="translate(0, -4)" opacity="0.30">
+          <path d="M 256,130 C 320,118 374,124 364,142"/>
+          <path d="M 256,130 C 192,118 138,124 148,142"/>
+          <path d="M 256,172 C 340,156 416,166 402,190"/>
+          <path d="M 256,172 C 172,156 96,166 110,190"/>
+          <path d="M 256,214 C 354,194 442,208 424,238"/>
+          <path d="M 256,214 C 158,194 70,208 88,238"/>
+          <path d="M 256,256 C 362,232 456,252 434,286"/>
+          <path d="M 256,256 C 150,232 56,252 78,286"/>
+          <path d="M 256,298 C 360,276 452,302 428,338"/>
+          <path d="M 256,298 C 152,276 60,302 84,338"/>
+          <path d="M 256,340 C 354,318 440,346 416,390"/>
+          <path d="M 256,340 C 158,318 72,346 96,390"/>
+          <path d="M 256,382 C 340,362 414,392 392,438"/>
+          <path d="M 256,382 C 172,362 98,392 120,438"/>
+        </g>
+
+        <!-- 7 thoracic vertebrae, widening toward lumbar -->
+        <g fill="url(#vert)" stroke="#6838a0" stroke-width="2.5">
+          <rect x="240" y="113" width="32" height="34" rx="6"/>
+          <rect x="239" y="155" width="34" height="34" rx="6"/>
+          <rect x="238" y="197" width="36" height="34" rx="6"/>
+          <rect x="238" y="239" width="36" height="34" rx="6"/>
+          <rect x="237" y="281" width="38" height="34" rx="6"/>
+          <rect x="237" y="323" width="38" height="34" rx="6"/>
+          <rect x="236" y="365" width="40" height="34" rx="6"/>
+        </g>
+
+      </g>
+    </g>
+
+    <!-- ===========================================================
+         ANTERIOR CAGE
+         Costal cartilage (hollow outlines) connecting posterior rib
+         tips to the sternum. Ribs stop at the sternum edges.
+         T6+T7 bottom edges widen toward each other.
+         66% opaque with electric blue glow.
+         =========================================================== -->
+    <g opacity="0.66">
+      <g filter="url(#electric)">
+        <g fill="none" stroke="#d0dcf8" stroke-linejoin="round" stroke-width="3">
+
+          <!-- T1 right / left -->
+          <path d="M 364,133 C 332,137 288,143 267,142
+                   L 267,160
+                   C 288,161 332,155 364,151 Z"/>
+          <path d="M 148,133 C 180,137 224,143 245,142
+                   L 245,160
+                   C 224,161 180,155 148,151 Z"/>
+
+          <!-- T2 right / left -->
+          <path d="M 402,181 C 366,184 300,182 267,177
+                   L 267,193
+                   C 300,200 366,202 402,199 Z"/>
+          <path d="M 110,181 C 146,184 212,182 245,177
+                   L 245,193
+                   C 212,200 146,202 110,199 Z"/>
+
+          <!-- T3 right / left -->
+          <path d="M 424,229 C 390,227 316,209 267,200
+                   L 267,216
+                   C 316,226 390,245 424,247 Z"/>
+          <path d="M 88,229 C 122,227 196,209 245,200
+                   L 245,216
+                   C 196,226 122,245 88,247 Z"/>
+
+          <!-- T4 right / left -->
+          <path d="M 434,277 C 398,275 324,239 267,229
+                   L 267,245
+                   C 324,256 398,293 434,295 Z"/>
+          <path d="M 78,277 C 114,275 188,239 245,229
+                   L 245,245
+                   C 188,256 114,293 78,295 Z"/>
+
+          <!-- T5 right / left -->
+          <path d="M 428,329 C 396,325 328,273 267,261
+                   L 267,277
+                   C 328,290 396,343 428,347 Z"/>
+          <path d="M 84,329 C 116,325 184,273 245,261
+                   L 245,277
+                   C 184,290 116,343 84,347 Z"/>
+
+          <!-- T6 right / left — bottom widens toward T7 -->
+          <path d="M 416,381
+                   C 395,377 357,338 308,312
+                   C 292,303 278,297 267,292
+                   L 267,313
+                   C 278,316 292,326 308,335
+                   C 340,348 380,388 416,399 Z"/>
+          <path d="M 96,381
+                   C 117,377 155,338 204,312
+                   C 220,303 234,297 245,292
+                   L 245,313
+                   C 234,316 220,326 204,335
+                   C 172,348 132,388 96,399 Z"/>
+
+          <!-- T7 right / left — top widens toward T6 -->
+          <path d="M 392,429
+                   C 377,421 348,380 310,345
+                   C 294,334 280,324 267,317
+                   L 267,336
+                   C 280,344 294,358 310,368
+                   C 348,401 377,441 392,447 Z"/>
+          <path d="M 120,429
+                   C 135,421 164,380 202,345
+                   C 218,334 232,324 245,317
+                   L 245,336
+                   C 232,344 218,358 202,368
+                   C 164,401 135,441 120,447 Z"/>
+
+          <!-- Sternum: necktie manubrium, body, V-point xiphoid -->
+          <path d="
+            M 243,142
+            Q 243,140 245,140
+            L 267,140
+            Q 269,140 269,142
+            L 269,160 L 266,166 L 266,326
+            L 256,382
+            L 246,326 L 246,166 L 243,160
+            Z"/>
+
+          <!-- Sternal angle bar -->
+          <line x1="243" y1="163" x2="269" y2="163"/>
+
+        </g>
+      </g>
+    </g>
+
+    <!-- ===========================================================
+         ELECTRIC SPARKS
+         Three energy nodes in a triangle pattern.
+         Data pulses traveling the bone-wire network.
+         =========================================================== -->
+
+    <!-- Top of left T3 rib -->
+    <circle cx="132" cy="222" r="150" fill="url(#spark)"/>
+    <circle cx="132" cy="222" r="8" fill="#fff"/>
+
+    <!-- Right T5-T6 front rib -->
+    <circle cx="390" cy="330" r="150" fill="url(#spark)"/>
+    <circle cx="390" cy="330" r="8" fill="#fff"/>
+
+    <!-- Heart position — sternum edge at T3-T4 junction -->
+    <circle cx="274" cy="218" r="66" fill="url(#spark)"/>
+    <circle cx="274" cy="218" r="4" fill="#fff"/>
+
+  </g>
+
+</svg>
