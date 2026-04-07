@@ -86,6 +86,7 @@ src/
     connection.lisp          Connection state machine, read/write buffers
     http.lisp                HTTP request parser + response builder
     websocket.lisp           WebSocket handshake and incremental frame protocol
+    static.lisp              In-memory static file cache and serving
     main.lisp                epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp               Demo package declaration
@@ -121,6 +122,9 @@ tests/
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, and close frames
+- **Static file serving** — `load-static-files` reads a directory tree into memory
+  at startup; `serve-static` looks up the request path and returns a pre-built
+  response. MIME detection, extensionless HTML aliases, directory traversal protection
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors and HTTP parser tests
 - **Demo application** — separate ASDF system with test page and echo server
@@ -158,7 +162,6 @@ Without a handler, the server returns 501 for all requests.
 ## Roadmap
 - **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
 - **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
-- **Static file serving** — serve files from a directory
 - **Session management** — map authenticated users to WebSocket connections
 - **Broadcast / room abstraction** — send to all connections in a group
 - **Graceful shutdown** — drain active connections on SIGTERM

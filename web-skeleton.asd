@@ -19,9 +19,13 @@
                                                            "src/server/connection"
                                                            "src/algorithms/sha1"
                                                            "src/algorithms/base64"))
+               (:file "src/server/static" :depends-on ("src/package"
+                                                         "src/log"
+                                                         "src/server/http"))
                (:file "src/server/main"  :depends-on ("src/package"
                                                        "src/log"
                                                        "src/epoll"
                                                        "src/server/http"
                                                        "src/server/connection"
-                                                       "src/server/websocket"))))
+                                                       "src/server/websocket"
+                                                       "src/server/static"))))

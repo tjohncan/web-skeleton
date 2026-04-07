@@ -141,6 +141,12 @@
                        (http-request-method request)
                        (http-request-path request))
              (values (make-error-response 400) nil))))
+      ;; Pre-formatted response (e.g., static file — already bytes)
+      ((typep response '(simple-array (unsigned-byte 8) (*)))
+       (log-debug "~a ~a -> static"
+                  (http-request-method request)
+                  (http-request-path request))
+       (values response nil))
       ;; Normal HTTP response
       (t
        (log-debug "~a ~a -> ~d"
@@ -207,7 +213,10 @@
                 (multiple-value-bind (response upgrade-p)
                     (dispatch-request request handler)
                   ;; Queue the response for writing
-                  (let ((bytes (format-response response)))
+                  (let ((bytes (if (typep response
+                                         '(simple-array (unsigned-byte 8) (*)))
+                                   response
+                                   (format-response response))))
                     (connection-queue-write conn bytes)
                     (setf (connection-state conn)
                           (if upgrade-p :ws-upgrade :write-response))

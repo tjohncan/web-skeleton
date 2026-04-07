@@ -89,7 +89,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-request (request)
-  "Demo HTTP handler. Serves the test page and upgrades /ws."
+  "Demo HTTP handler. Serves the test page, static files, and upgrades /ws."
   (let ((method (http-request-method request))
         (path   (http-request-path request)))
     (cond
@@ -98,7 +98,8 @@
       ((and (eq method :GET) (string= path "/ws"))
        :upgrade)
       (t
-       (make-error-response 404)))))
+       (or (serve-static request)
+           (make-error-response 404))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler
@@ -118,6 +119,7 @@
 
 (defun start-demo (&key (port 8081))
   "Start the demo server."
+  (load-static-files "demo/static/")
   (start-server :port port
                 :handler #'handle-request
                 :ws-handler #'handle-ws-message))

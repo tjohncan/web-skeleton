@@ -49,6 +49,9 @@
            #:build-ws-text
            #:build-ws-frame
            #:build-ws-close
+           ;; Static files
+           #:load-static-files
+           #:serve-static
            ;; Conditions
            #:http-parse-error
            ;; Limits
