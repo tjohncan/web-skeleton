@@ -62,6 +62,18 @@
   (let ((req (parse-request (crlf "GET / HTTP/1.1" "Content-Type: text/html"))))
     (check "header case insensitive" (get-header req "CONTENT-TYPE") "text/html"))
 
+  ;; Cookie parsing
+  (let ((req (parse-request (crlf "GET / HTTP/1.1"
+                                  "Cookie: session=abc123; theme=dark; lang=en"))))
+    (check "cookie first"  (get-cookie req "session") "abc123")
+    (check "cookie middle" (get-cookie req "theme")   "dark")
+    (check "cookie last"   (get-cookie req "lang")    "en")
+    (check "cookie absent" (get-cookie req "missing") nil))
+
+  ;; Cookie with no Cookie header
+  (let ((req (parse-request (crlf "GET / HTTP/1.1" "Host: localhost"))))
+    (check "cookie no header" (get-cookie req "session") nil))
+
   ;; All methods
   (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH"))
     (let ((req (parse-request (crlf (format nil "~a / HTTP/1.1" method)

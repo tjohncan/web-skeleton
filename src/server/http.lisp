@@ -69,6 +69,32 @@
   (loop for (n . v) in (http-request-headers request)
         when (string-equal n name) collect v))
 
+(defun get-cookie (request name)
+  "Extract the value of cookie NAME from the request's Cookie header.
+   Returns the value string, or NIL if not found.
+   Scans in-place — one allocation for the return value only."
+  (let ((header (get-header request "cookie")))
+    (when header
+      (let ((name-len (length name))
+            (len (length header))
+            (pos 0))
+        (loop
+          ;; Skip whitespace after ;
+          (loop while (and (< pos len) (char= (char header pos) #\Space))
+                do (incf pos))
+          (when (>= pos len) (return nil))
+          ;; Check for name=
+          (when (and (<= (+ pos name-len 1) len)
+                     (string= header name :start1 pos :end1 (+ pos name-len))
+                     (char= (char header (+ pos name-len)) #\=))
+            (let* ((val-start (+ pos name-len 1))
+                   (val-end (or (position #\; header :start val-start) len)))
+              (return (subseq header val-start val-end))))
+          ;; Skip to next pair
+          (let ((semi (position #\; header :start pos)))
+            (unless semi (return nil))
+            (setf pos (1+ semi))))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; CRLF utilities
 ;;; ---------------------------------------------------------------------------

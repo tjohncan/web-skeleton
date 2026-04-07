@@ -12,6 +12,7 @@
            #:http-request-body
            #:get-header
            #:get-headers
+           #:get-cookie
            #:parse-request
            ;; HTTP response
            #:http-response
