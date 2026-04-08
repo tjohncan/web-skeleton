@@ -125,6 +125,9 @@ tests/
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, and close frames
+- **WebSocket server push** — `ws-send` sends a frame to a connection synchronously
+  from within the handler, enabling streaming responses (e.g. sending LLM tokens
+  as they arrive) without returning from the handler until the work is done
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built
   response. MIME detection, extensionless HTML aliases, directory traversal protection
@@ -168,6 +171,26 @@ The `port`, `workers`, `handler`, and `ws-handler` are passed as keyword argumen
 
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
+
+### Server push
+
+`ws-send` writes a WebSocket frame to a connection synchronously,
+blocking until all bytes are flushed. Call it from within `ws-handler`
+to send multiple frames during a single handler invocation — the event
+loop is paused while the handler runs, so there is no write contention.
+
+```lisp
+(defun handle-ws-message (conn frame)
+  (when (= (ws-frame-opcode frame) +ws-op-text+)
+    ;; Stream results back as they become available
+    (dolist (chunk (generate-chunks (ws-frame-payload frame)))
+      (ws-send conn (build-ws-text chunk)))
+    nil))  ; return nil — we already sent our responses
+```
+
+The worker thread is blocked for the duration of the handler call.
+With multiple workers this is fine for bounded work (e.g. streaming
+an LLM response for a few seconds), but avoid unbounded blocking.
 
 ## Roadmap
 - **Auth utilities** — helpers for token validation and session-based auth flows

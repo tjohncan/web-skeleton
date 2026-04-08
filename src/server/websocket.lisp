@@ -227,6 +227,29 @@
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Synchronous frame send
+;;;
+;;; Writes a complete WebSocket frame to a connection, blocking until
+;;; all bytes are flushed.  Intended for use inside ws-handler — the
+;;; event loop is paused while the handler runs, so there is no
+;;; contention with pings or other writes.
+;;; ---------------------------------------------------------------------------
+
+(defun ws-send (conn frame-bytes)
+  "Send FRAME-BYTES to CONN synchronously, blocking until fully written.
+   FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
+   Safe to call from within ws-handler — the event loop is paused while the
+   handler runs, so there is no write contention."
+  (let ((fd (connection-fd conn))
+        (pos 0)
+        (end (length frame-bytes)))
+    (loop while (< pos end)
+          do (let ((result (nb-write fd frame-bytes pos (- end pos))))
+               (if (eq result :again)
+                   (sleep 0.001)
+                   (incf pos result))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; WebSocket event handler
 ;;;
 ;;; Called by the event loop when a WebSocket connection is readable.

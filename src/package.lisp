@@ -50,6 +50,7 @@
            #:build-ws-text
            #:build-ws-frame
            #:build-ws-close
+           #:ws-send
            ;; Static files
            #:load-static-files
            #:serve-static
