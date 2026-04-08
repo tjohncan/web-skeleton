@@ -42,6 +42,9 @@
            #:sha1-hex
            #:base64-encode
            #:bytes-to-hex
+           ;; SHA-256
+           #:sha256
+           #:sha256-hex
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd

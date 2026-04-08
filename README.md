@@ -81,11 +81,13 @@ src/
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   algorithms/
+    hex.lisp                 Hex encoding utilities
     sha1.lisp                SHA-1 digest (FIPS 180-4)
+    sha256.lisp              SHA-256 digest (FIPS 180-4)
     base64.lisp              Base64 encoder (RFC 4648)
   server/
     connection.lisp          Connection state machine, read/write buffers
-    http.lisp                HTTP request parser + response builder
+    http.lisp                HTTP request parser, response builder, URL/query/routing
     websocket.lisp           WebSocket handshake and incremental frame protocol
     static.lisp              In-memory static file cache and serving
     fetch.lisp               Non-blocking outbound HTTP client
@@ -97,8 +99,8 @@ demo/
 tests/
   package.lisp               Test package declaration
   run.lisp                   Test utilities and combined runner
-  test-algorithms.lisp       SHA-1 and Base64 test vectors (FIPS, RFC)
-  test-server.lisp           HTTP parser and response builder tests
+  test-algorithms.lisp       SHA-1, SHA-256, Base64, and hex test vectors
+  test-server.lisp           HTTP parser, response builder, URL, query, routing tests
 ```
 
 ## What's implemented
@@ -120,7 +122,12 @@ tests/
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
 - **HTTP response builder** — status codes, headers, body serialization
+- **URL and query utilities** — percent-decoding (`url-decode`), query string
+  parsing (`parse-query-string`, `get-query-param`)
+- **Path matching** — `match-path` matches URL paths against patterns with
+  `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
 - **SHA-1** — complete implementation per FIPS 180-4
+- **SHA-256** — complete implementation per FIPS 180-4
 - **Base64** — encoder per RFC 4648
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
@@ -193,5 +200,12 @@ With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking.
 
 ## Roadmap
-- **Auth utilities** — helpers for token validation and session-based auth flows
+- **JWT validation** — ES256 (ECDSA P-256 + SHA-256) token verification,
+  JWKS parsing, claim extraction. Pure Lisp — no external dependencies
+- **Outbound TLS** — HTTPS support in `http-fetch` via libssl FFI.
+  Optional — only loaded when HTTPS is needed
+- **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
+  use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
+  remain the default when libssl is not present
 - **Session management** — map authenticated users to WebSocket connections
+- **HTTP keep-alive** — reuse connections across requests

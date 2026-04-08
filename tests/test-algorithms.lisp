@@ -74,6 +74,34 @@
          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
 
 ;;; ---------------------------------------------------------------------------
+;;; SHA-256 test vectors (FIPS 180-4)
+;;; ---------------------------------------------------------------------------
+
+(defun test-sha256 ()
+  (format t "~%SHA-256~%")
+
+  ;; FIPS 180-4 one-block message
+  (check "abc"
+         (sha256-hex (sb-ext:string-to-octets "abc"))
+         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+  ;; FIPS 180-4 two-block message
+  (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+         (sha256-hex (sb-ext:string-to-octets
+                      "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+
+  ;; Empty string
+  (check "empty string"
+         (sha256-hex (sb-ext:string-to-octets ""))
+         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+  ;; Single character
+  (check "single char 'a'"
+         (sha256-hex (sb-ext:string-to-octets "a"))
+         "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"))
+
+;;; ---------------------------------------------------------------------------
 ;;; Hex encoding tests
 ;;; ---------------------------------------------------------------------------
 
@@ -108,6 +136,7 @@
         *tests-failed* 0)
   (format t "~%=== Algorithm Tests ===~%")
   (test-sha1)
+  (test-sha256)
   (test-base64)
   (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
