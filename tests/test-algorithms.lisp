@@ -163,6 +163,51 @@
          "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"))
 
 ;;; ---------------------------------------------------------------------------
+;;; ECDSA P-256 verification tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-ecdsa ()
+  (format t "~%ECDSA P-256~%")
+
+  ;; Test vector: RFC 7515 Appendix A.3 (ES256 JWS)
+  ;; The signing input, key coordinates, and signature from the RFC example.
+  (let* ((signing-input "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")
+         (hash (sha256 (sb-ext:string-to-octets signing-input
+                                                 :external-format :ascii)))
+         ;; Public key from RFC 7515 A.3
+         (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
+         (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+         ;; Signature (r || s) from RFC 7515 A.3
+         (sig (concatenate '(simple-array (unsigned-byte 8) (*))
+                (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+                )))
+    ;; The RFC 7515 A.3 signature is 64 bytes (r=32, s=32)
+    (check "rfc7515 A.3 valid signature"
+           (ecdsa-verify-p256 hash sig x y)
+           t)
+
+    ;; Tampered hash should fail
+    (let ((bad-hash (copy-seq hash)))
+      (setf (aref bad-hash 0) (logxor (aref bad-hash 0) #xFF))
+      (check "tampered hash rejects"
+             (ecdsa-verify-p256 bad-hash sig x y)
+             nil))
+
+    ;; Tampered signature should fail
+    (let ((bad-sig (copy-seq sig)))
+      (setf (aref bad-sig 10) (logxor (aref bad-sig 10) #xFF))
+      (check "tampered signature rejects"
+             (ecdsa-verify-p256 hash bad-sig x y)
+             nil)))
+
+  ;; Generator point self-test: n*G should be the point at infinity
+  (check "n*G = infinity"
+         (web-skeleton::ec-mul web-skeleton::+p256-n+
+                               (cons web-skeleton::+p256-gx+
+                                     web-skeleton::+p256-gy+))
+         nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; HMAC-SHA256 test vectors (RFC 4231)
 ;;; ---------------------------------------------------------------------------
 
@@ -241,6 +286,7 @@
   (test-base64)
   (test-base64-decode)
   (test-base64url)
+  (test-ecdsa)
   (test-hmac-sha256)
   (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)

@@ -13,6 +13,7 @@
                                                             "src/algorithms/sha1"))
                (:file "src/algorithms/hmac"   :depends-on ("src/package"
                                                            "src/algorithms/sha256"))
+               (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
                (:file "src/server/http"  :depends-on ("src/package"
                                                        "src/algorithms/hex"))

@@ -50,6 +50,8 @@
            #:sha256-hex
            ;; HMAC
            #:hmac-sha256
+           ;; ECDSA
+           #:ecdsa-verify-p256
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd
