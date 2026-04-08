@@ -3,4 +3,5 @@
   (:export #:test
            #:test-algorithms
            #:test-json
-           #:test-server))
+           #:test-server
+           #:test-tls))

@@ -150,23 +150,40 @@
   (format t "~%HTTP Client~%")
 
   ;; URL parsing
-  (multiple-value-bind (host port path)
+  (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://localhost:8080/api/test")
+    (check "url scheme"    scheme :http)
     (check "url host"      host "localhost")
     (check "url port"      port 8080)
     (check "url path"      path "/api/test"))
 
-  (multiple-value-bind (host port path)
+  (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://example.com/rip/per")
+    (declare (ignore scheme))
     (check "url default port" port 80)
     (check "url host no port" host "example.com")
     (check "url path simple"  path "/rip/per"))
 
-  (multiple-value-bind (host port path)
+  (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://10.0.0.1:3000")
+    (declare (ignore scheme))
     (check "url ip host"      host "10.0.0.1")
     (check "url ip port"      port 3000)
     (check "url no path"      path "/"))
+
+  ;; HTTPS URLs
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "https://api.example.com/v1/data")
+    (check "https scheme"  scheme :https)
+    (check "https host"    host "api.example.com")
+    (check "https port"    port 443)
+    (check "https path"    path "/v1/data"))
+
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "https://10.0.0.1:8443/health")
+    (declare (ignore scheme host))
+    (check "https custom port" port 8443)
+    (check "https ip path"     path "/health"))
 
   ;; Request building
   (let* ((bytes (web-skeleton::build-outbound-request

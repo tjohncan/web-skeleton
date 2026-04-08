@@ -72,6 +72,7 @@ sbcl
 
 ```
 web-skeleton.asd             ASDF system definition (the framework)
+web-skeleton-tls.asd         ASDF system definition (optional TLS/HTTPS)
 web-skeleton-tests.asd       ASDF system definition (test suite)
 web-skeleton-demo.asd        ASDF system definition (demo app)
 build.lisp                   Build standalone demo binary via save-lisp-and-die
@@ -82,6 +83,7 @@ src/
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   json.lisp                  JSON parser and serializer (RFC 8259)
+  tls.lisp                   libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
     hex.lisp                 Hex encoding utilities
     sha1.lisp                SHA-1 digest (FIPS 180-4)
@@ -159,6 +161,10 @@ tests/
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
   makes the outbound call, and resumes with the callback result
+- **Outbound TLS** — HTTPS support in `http-fetch` via optional `web-skeleton-tls`
+  system. libssl FFI bindings, system CA verification, SNI. Same `http-fetch`
+  API — just use `https://` URLs. Blocking on the worker thread (fine for
+  API calls, JWKS fetch, webhooks)
 - **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
   close frames, flushes in-progress writes, force-closes after drain timeout
 - **Demo application** — separate ASDF system with static demo page and echo server
@@ -215,8 +221,6 @@ With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking.
 
 ## Roadmap
-- **Outbound TLS** — HTTPS support in `http-fetch` via libssl FFI.
-  Optional — only loaded when HTTPS is needed
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present

@@ -1,5 +1,7 @@
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton-tests")
+(handler-case (asdf:load-system "web-skeleton-tls")
+  (error () (format t "Note: TLS not available (libssl not found)~%")))
 (unless (web-skeleton-tests:test)
   (sb-ext:exit :code 1))

@@ -42,6 +42,8 @@
       (setf all-passed nil))
     (unless (test-server)
       (setf all-passed nil))
+    (unless (test-tls)
+      (setf all-passed nil))
     (if all-passed
         (format t "=== ALL TESTS PASSED ===~%~%")
         (format t "=== SOME TESTS FAILED ===~%~%"))

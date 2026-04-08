@@ -84,6 +84,7 @@
            #:serve-static
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
+           #:*https-fetch-fn*
            ;; Conditions
            #:http-parse-error
            ;; Limits

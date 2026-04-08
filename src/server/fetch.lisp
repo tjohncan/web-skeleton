@@ -41,20 +41,24 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun parse-url (url)
-  "Parse an HTTP URL into (values host port path).
-   Only http:// is supported (server sits behind reverse proxy for TLS)."
-  (unless (and (>= (length url) 7)
-               (string-equal url "http://" :end1 7))
-    (error "unsupported URL scheme (http:// only): ~a" url))
-  (let* ((authority-start 7)
-         (path-start (or (position #\/ url :start authority-start)
-                         (length url)))
-         (authority (subseq url authority-start path-start))
-         (path (if (= path-start (length url)) "/" (subseq url path-start)))
-         (colon (position #\: authority))
-         (host (if colon (subseq authority 0 colon) authority))
-         (port (if colon (parse-integer (subseq authority (1+ colon))) 80)))
-    (values host port path)))
+  "Parse a URL into (values scheme host port path).
+   Supports http:// and https:// schemes."
+  (let ((scheme nil) (authority-start nil) (default-port nil))
+    (cond
+      ((and (>= (length url) 8) (string-equal url "https://" :end1 8))
+       (setf scheme :https authority-start 8 default-port 443))
+      ((and (>= (length url) 7) (string-equal url "http://" :end1 7))
+       (setf scheme :http authority-start 7 default-port 80))
+      (t (error "unsupported URL scheme: ~a" url)))
+    (let* ((path-start (or (position #\/ url :start authority-start)
+                           (length url)))
+           (authority (subseq url authority-start path-start))
+           (path (if (= path-start (length url)) "/" (subseq url path-start)))
+           (colon (position #\: authority))
+           (host (if colon (subseq authority 0 colon) authority))
+           (port (if colon (parse-integer (subseq authority (1+ colon)))
+                     default-port)))
+      (values scheme host port path))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Build outbound HTTP request bytes
@@ -100,59 +104,72 @@
               (+ (* d1 100) (* d2 10) d3))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; HTTPS hook — set by web-skeleton-tls when loaded
+;;; ---------------------------------------------------------------------------
+
+(defvar *https-fetch-fn* nil
+  "When non-NIL, a function (conn epoll-fd fetch-req host port path) that
+   performs a blocking HTTPS fetch.  Set by web-skeleton-tls on load.")
+
+;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------
 
 (defun initiate-fetch (conn epoll-fd fetch-req)
-  "Start a non-blocking outbound HTTP request.
+  "Start an outbound HTTP(S) request.
    CONN is the inbound connection to park.
-   FETCH-REQ is the http-fetch-request descriptor."
+   FETCH-REQ is the http-fetch-request descriptor.
+   HTTP uses non-blocking epoll I/O. HTTPS dispatches to *https-fetch-fn*
+   (blocking on the worker thread) — requires web-skeleton-tls."
   (handler-case
-      (multiple-value-bind (host port path)
+      (multiple-value-bind (scheme host port path)
           (parse-url (http-fetch-request-url fetch-req))
-        ;; Create non-blocking TCP socket
-        (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                                     :type :stream :protocol :tcp)))
-          (set-nonblocking (socket-fd socket))
-          ;; Resolve host (blocking DNS — instant for IPs and localhost)
-          (let ((addr (sb-bsd-sockets:host-ent-address
-                       (sb-bsd-sockets:get-host-by-name host))))
-            ;; Non-blocking connect — EINPROGRESS is expected
-            (handler-case
-                (sb-bsd-sockets:socket-connect socket addr port)
-              (error () nil))
-            (let* ((out-fd (socket-fd socket))
-                   (request-bytes (build-outbound-request
-                                  (http-fetch-request-method fetch-req)
-                                  host path
-                                  :headers (http-fetch-request-headers fetch-req)
-                                  :body (http-fetch-request-body fetch-req)))
-                   (out-conn (make-connection
-                              :fd out-fd
-                              :socket socket
-                              :state :out-connecting
-                              :outbound-p t
-                              :inbound-fd (connection-fd conn)
-                              :fetch-callback (http-fetch-request-callback fetch-req)
-                              :last-active (get-universal-time))))
-              ;; Pre-queue the request bytes for when connect completes
-              (connection-queue-write out-conn request-bytes)
-              ;; Register outbound connection with epoll
-              (register-connection out-conn)
-              (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
-              ;; Park inbound connection
-              (setf (connection-state conn) :awaiting
-                    (connection-awaiting-fd conn) out-fd)
-              (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
-                         (connection-fd conn) host port path out-fd)))))
+        (if (eq scheme :https)
+            ;; HTTPS — blocking path via TLS hook
+            (if *https-fetch-fn*
+                (funcall *https-fetch-fn* conn epoll-fd fetch-req host port path)
+                (error "HTTPS not available — load web-skeleton-tls"))
+            ;; HTTP — non-blocking epoll path
+            (initiate-http-fetch conn epoll-fd fetch-req host port path)))
     (error (e)
-      ;; If anything fails during setup, deliver error to inbound immediately
       (log-error "fetch setup failed: ~a" e)
       (let ((error-response (format-response (make-error-response 502))))
         (connection-queue-write conn error-response)
         (setf (connection-state conn) :write-response)
         (epoll-modify epoll-fd (connection-fd conn)
                      (logior +epollout+ +epollet+))))))
+
+(defun initiate-http-fetch (conn epoll-fd fetch-req host port path)
+  "Start a non-blocking outbound HTTP request via epoll."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (set-nonblocking (socket-fd socket))
+    (let ((addr (sb-bsd-sockets:host-ent-address
+                 (sb-bsd-sockets:get-host-by-name host))))
+      (handler-case
+          (sb-bsd-sockets:socket-connect socket addr port)
+        (error () nil))
+      (let* ((out-fd (socket-fd socket))
+             (request-bytes (build-outbound-request
+                            (http-fetch-request-method fetch-req)
+                            host path
+                            :headers (http-fetch-request-headers fetch-req)
+                            :body (http-fetch-request-body fetch-req)))
+             (out-conn (make-connection
+                        :fd out-fd
+                        :socket socket
+                        :state :out-connecting
+                        :outbound-p t
+                        :inbound-fd (connection-fd conn)
+                        :fetch-callback (http-fetch-request-callback fetch-req)
+                        :last-active (get-universal-time))))
+        (connection-queue-write out-conn request-bytes)
+        (register-connection out-conn)
+        (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
+        (setf (connection-state conn) :awaiting
+              (connection-awaiting-fd conn) out-fd)
+        (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
+                   (connection-fd conn) host port path out-fd)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound event handlers
