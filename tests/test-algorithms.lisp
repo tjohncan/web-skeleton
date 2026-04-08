@@ -73,6 +73,67 @@
                                "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
 
+(defun test-base64-decode ()
+  (format t "~%Base64 Decode~%")
+
+  ;; RFC 4648 §10 round-trips
+  (check "empty"
+         (sb-ext:octets-to-string (base64-decode "") :external-format :utf-8)
+         "")
+
+  (check "f"
+         (sb-ext:octets-to-string (base64-decode "Zg==") :external-format :utf-8)
+         "f")
+
+  (check "fo"
+         (sb-ext:octets-to-string (base64-decode "Zm8=") :external-format :utf-8)
+         "fo")
+
+  (check "foo"
+         (sb-ext:octets-to-string (base64-decode "Zm9v") :external-format :utf-8)
+         "foo")
+
+  (check "foob"
+         (sb-ext:octets-to-string (base64-decode "Zm9vYg==") :external-format :utf-8)
+         "foob")
+
+  (check "fooba"
+         (sb-ext:octets-to-string (base64-decode "Zm9vYmE=") :external-format :utf-8)
+         "fooba")
+
+  (check "foobar"
+         (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8)
+         "foobar"))
+
+(defun test-base64url ()
+  (format t "~%Base64url~%")
+
+  ;; URL-safe encode: no padding, - instead of +, _ instead of /
+  (check "url encode no padding"
+         (base64url-encode (sb-ext:string-to-octets "f"))
+         "Zg")
+
+  (check "url encode replaces + with -"
+         (base64url-encode (sha1 (sb-ext:string-to-octets
+                                  "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
+         "s3pPLMBiTxaQ9kYGzzhZRbK-xOo")
+
+  ;; URL-safe decode: handles missing padding
+  (check "url decode no padding"
+         (sb-ext:octets-to-string (base64url-decode "Zg") :external-format :utf-8)
+         "f")
+
+  (check "url decode with - and _"
+         (bytes-to-hex (base64url-decode "s3pPLMBiTxaQ9kYGzzhZRbK-xOo"))
+         (sha1-hex (sb-ext:string-to-octets
+                    "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
+
+  ;; Round-trip: encode then decode
+  (let ((data (sb-ext:string-to-octets "the quick brown ankle leaps over the lazy heel")))
+    (check "url round-trip"
+           (bytes-to-hex (base64url-decode (base64url-encode data)))
+           (bytes-to-hex data))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; SHA-256 test vectors (FIPS 180-4)
 ;;; ---------------------------------------------------------------------------
@@ -138,6 +199,8 @@
   (test-sha1)
   (test-sha256)
   (test-base64)
+  (test-base64-decode)
+  (test-base64url)
   (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))

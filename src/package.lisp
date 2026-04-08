@@ -41,6 +41,9 @@
            #:sha1
            #:sha1-hex
            #:base64-encode
+           #:base64-decode
+           #:base64url-encode
+           #:base64url-decode
            #:bytes-to-hex
            ;; SHA-256
            #:sha256
