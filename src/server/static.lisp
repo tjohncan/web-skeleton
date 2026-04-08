@@ -72,39 +72,13 @@
   "Build pre-built GET and HEAD response byte vectors for a static file.
    CONTENT is a byte vector of the file data.
    Returns a STATIC-ENTRY with both responses ready to write."
-  (let* ((content-length-str (write-to-string (length content)))
-         (headers (list (cons "content-type" mime-type)
-                        (cons "content-length" content-length-str)
-                        (cons "cache-control" "public, max-age=3600")
-                        (cons "connection" "close")))
-         (header-size (+ 15  ; "HTTP/1.1 200 OK"
-                         2   ; CRLF
-                         (loop for (name . value) in headers
-                               sum (+ (length name) 2 (length value) 2))
-                         2)) ; final CRLF
-         (buf (make-array (+ header-size (length content))
-                          :element-type '(unsigned-byte 8)))
-         (pos 0))
-    (flet ((put-byte (b) (setf (aref buf pos) b) (incf pos))
-           (put-ascii (str)
-             (loop for i from 0 below (length str)
-                   do (setf (aref buf pos) (char-code (char str i)))
-                      (incf pos)))
-           (put-crlf ()
-             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
-             (incf pos 2)))
-      (put-ascii "HTTP/1.1 200 OK")
-      (put-crlf)
-      (dolist (h headers)
-        (put-ascii (car h))
-        (put-byte 58) (put-byte 32)
-        (put-ascii (cdr h))
-        (put-crlf))
-      (put-crlf)
-      (replace buf content :start1 pos))
-    ;; GET = full response; HEAD = headers only (same Content-Length, no body)
-    (make-static-entry :get-response buf
-                       :head-response (subseq buf 0 header-size))))
+  (let ((headers (list (cons "content-type" mime-type)
+                       (cons "content-length" (write-to-string (length content)))
+                       (cons "cache-control" "public, max-age=3600")
+                       (cons "connection" "close"))))
+    (make-static-entry
+     :get-response  (serialize-http-message "HTTP/1.1 200 OK" headers content)
+     :head-response (serialize-http-message "HTTP/1.1 200 OK" headers nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; File I/O (startup only)

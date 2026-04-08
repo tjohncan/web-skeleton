@@ -74,41 +74,10 @@
                               (when body-bytes
                                 (list (cons "content-length"
                                             (write-to-string
-                                             (length body-bytes)))))))
-         ;; Calculate size
-         (header-size (+ (length method-str) 1  ; "METHOD "
-                         (length path) 1          ; "path "
-                         8 2                      ; "HTTP/1.1\r\n"
-                         (loop for (n . v) in all-headers
-                               sum (+ (length n) 2 (length v) 2))
-                         2))  ; final CRLF
-         (body-len (if body-bytes (length body-bytes) 0))
-         (buf (make-array (+ header-size body-len)
-                          :element-type '(unsigned-byte 8)))
-         (pos 0))
-    (flet ((put-byte (b) (setf (aref buf pos) b) (incf pos))
-           (put-ascii (str)
-             (loop for i from 0 below (length str)
-                   do (setf (aref buf pos) (char-code (char str i)))
-                      (incf pos)))
-           (put-crlf ()
-             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
-             (incf pos 2)))
-      (put-ascii method-str)
-      (put-byte 32)
-      (put-ascii path)
-      (put-byte 32)
-      (put-ascii "HTTP/1.1")
-      (put-crlf)
-      (dolist (h all-headers)
-        (put-ascii (car h))
-        (put-byte 58) (put-byte 32)
-        (put-ascii (cdr h))
-        (put-crlf))
-      (put-crlf)
-      (when body-bytes
-        (replace buf body-bytes :start1 pos)))
-    buf))
+                                             (length body-bytes))))))))
+    (serialize-http-message
+     (format nil "~a ~a HTTP/1.1" method-str path)
+     all-headers body-bytes)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parse response status line

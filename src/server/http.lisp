@@ -357,6 +357,44 @@
   (body    nil   :type (or null string)))
 
 ;;; ---------------------------------------------------------------------------
+;;; HTTP message serialization (shared by response builder, static, and fetch)
+;;; ---------------------------------------------------------------------------
+
+(defun serialize-http-message (first-line headers body-bytes)
+  "Serialize an HTTP message into a byte vector ready to write to a socket.
+   FIRST-LINE: status line or request line string (without CRLF).
+   HEADERS: alist of (name . value) string pairs.
+   BODY-BYTES: byte vector or NIL.
+   Single pre-sized buffer — no intermediate allocations."
+  (let* ((header-size (+ (length first-line) 2   ; first line + CRLF
+                         (loop for (name . value) in headers
+                               sum (+ (length name) 2 (length value) 2))
+                         2))                      ; final CRLF
+         (body-len (if body-bytes (length body-bytes) 0))
+         (buf (make-array (+ header-size body-len)
+                          :element-type '(unsigned-byte 8)))
+         (pos 0))
+    (flet ((put-ascii (str)
+             (loop for i from 0 below (length str)
+                   do (setf (aref buf pos) (char-code (char str i)))
+                      (incf pos)))
+           (put-crlf ()
+             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
+             (incf pos 2)))
+      (put-ascii first-line)
+      (put-crlf)
+      (dolist (h headers)
+        (put-ascii (car h))
+        (setf (aref buf pos) 58 (aref buf (1+ pos)) 32)
+        (incf pos 2)
+        (put-ascii (cdr h))
+        (put-crlf))
+      (put-crlf)
+      (when body-bytes
+        (replace buf body-bytes :start1 pos)))
+    buf))
+
+;;; ---------------------------------------------------------------------------
 ;;; Response building helpers
 ;;; ---------------------------------------------------------------------------
 
@@ -370,64 +408,21 @@
   response)
 
 (defun format-response (response)
-  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
-   Writes directly into a single pre-sized buffer — no intermediate strings."
+  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket."
   (let* ((status (http-response-status response))
-         (reason (status-reason status))
          (body   (http-response-body response))
          (body-bytes (when body
                        (sb-ext:string-to-octets body :external-format :utf-8)))
-         ;; Auto-set Content-Length if there's a body and it's not already set
          (headers (http-response-headers response))
          (headers (if (and body-bytes
                            (not (assoc "content-length" headers :test #'string=)))
                       (cons (cons "content-length"
                                   (write-to-string (length body-bytes)))
                             headers)
-                      headers))
-         ;; Pre-calculate exact buffer size
-         (header-size (+ 9                ; "HTTP/1.1 "
-                         3                ; status code (3 digits)
-                         1                ; space before reason
-                         (length reason)
-                         2                ; CRLF
-                         (loop for (name . value) in headers
-                               sum (+ (length name) 2 (length value) 2))
-                         2))              ; final CRLF
-         (body-len (if body-bytes (length body-bytes) 0))
-         (buf (make-array (+ header-size body-len)
-                          :element-type '(unsigned-byte 8)))
-         (pos 0))
-    (flet ((put-byte (b)
-             (setf (aref buf pos) b)
-             (incf pos))
-           (put-ascii (str)
-             (loop for i from 0 below (length str)
-                   do (setf (aref buf pos) (char-code (char str i)))
-                      (incf pos)))
-           (put-crlf ()
-             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
-             (incf pos 2)))
-      ;; Status line: "HTTP/1.1 NNN reason\r\n"
-      (put-ascii "HTTP/1.1 ")
-      (put-byte (+ 48 (floor status 100)))
-      (put-byte (+ 48 (mod (floor status 10) 10)))
-      (put-byte (+ 48 (mod status 10)))
-      (put-byte 32)
-      (put-ascii reason)
-      (put-crlf)
-      ;; Headers: "name: value\r\n"
-      (dolist (h headers)
-        (put-ascii (car h))
-        (put-byte 58) (put-byte 32)
-        (put-ascii (cdr h))
-        (put-crlf))
-      ;; Blank line terminates headers
-      (put-crlf)
-      ;; Body
-      (when body-bytes
-        (replace buf body-bytes :start1 pos)))
-    buf))
+                      headers)))
+    (serialize-http-message
+     (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+     headers body-bytes)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors
