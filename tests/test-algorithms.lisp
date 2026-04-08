@@ -74,6 +74,32 @@
          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
 
 ;;; ---------------------------------------------------------------------------
+;;; Hex encoding tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-hex ()
+  (format t "~%Hex~%")
+
+  (check "empty"
+         (bytes-to-hex (make-array 0 :element-type '(unsigned-byte 8)))
+         "")
+
+  (check "single byte"
+         (bytes-to-hex (make-array 1 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(255)))
+         "ff")
+
+  (check "multiple bytes"
+         (bytes-to-hex (make-array 3 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(0 127 200)))
+         "007fc8")
+
+  ;; Confirm sha1-hex still works through bytes-to-hex
+  (check "sha1-hex via bytes-to-hex"
+         (sha1-hex (sb-ext:string-to-octets "abc"))
+         "a9993e364706816aba3e25717850c26c9cd0d89d"))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -83,5 +109,6 @@
   (format t "~%=== Algorithm Tests ===~%")
   (test-sha1)
   (test-base64)
+  (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))

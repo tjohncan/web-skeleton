@@ -96,6 +96,105 @@
             (setf pos (1+ semi))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; URL percent-decoding (RFC 3986)
+;;; ---------------------------------------------------------------------------
+
+(defun url-decode (string)
+  "Decode percent-encoded characters in STRING (RFC 3986).
+   %XX sequences are replaced with the corresponding byte, decoded as UTF-8.
+   '+' is passed through literally (this is path decoding, not form decoding)."
+  (let* ((bytes (sb-ext:string-to-octets string :external-format :ascii))
+         (len (length bytes))
+         (out (make-array len :element-type '(unsigned-byte 8) :fill-pointer 0)))
+    (loop with i = 0
+          while (< i len)
+          do (let ((b (aref bytes i)))
+               (if (and (= b 37)              ; '%'
+                        (< (+ i 2) len))
+                   (let ((hi (hex-digit-value (aref bytes (+ i 1))))
+                         (lo (hex-digit-value (aref bytes (+ i 2)))))
+                     (if (and hi lo)
+                         (progn
+                           (vector-push (logior (ash hi 4) lo) out)
+                           (incf i 3))
+                         (progn
+                           (vector-push b out)
+                           (incf i))))
+                   (progn
+                     (vector-push b out)
+                     (incf i)))))
+    (sb-ext:octets-to-string (subseq out 0 (fill-pointer out))
+                              :external-format :utf-8)))
+
+;;; ---------------------------------------------------------------------------
+;;; Query string parsing
+;;; ---------------------------------------------------------------------------
+
+(defun parse-query-string (query)
+  "Parse a query string like \"a=1&b=2\" into an alist.
+   Percent-decodes both names and values.
+   Keys with no = get empty string values."
+  (when (and query (> (length query) 0))
+    (let ((pairs nil)
+          (len (length query))
+          (start 0))
+      (loop
+        (let* ((amp (or (position #\& query :start start) len))
+               (segment-start start)
+               (eq-pos (position #\= query :start segment-start :end amp)))
+          (push (if eq-pos
+                    (cons (url-decode (subseq query segment-start eq-pos))
+                          (url-decode (subseq query (1+ eq-pos) amp)))
+                    (cons (url-decode (subseq query segment-start amp)) ""))
+                pairs)
+          (if (>= amp len)
+              (return (nreverse pairs))
+              (setf start (1+ amp))))))))
+
+(defun get-query-param (request name)
+  "Look up query parameter NAME from the request's query string.
+   Returns the decoded value string, or NIL if not present."
+  (cdr (assoc name (parse-query-string (http-request-query request))
+              :test #'string=)))
+
+;;; ---------------------------------------------------------------------------
+;;; Path matching
+;;; ---------------------------------------------------------------------------
+
+(defun split-path-segments (path)
+  "Split \"/users/42\" into (\"users\" \"42\"). Leading slash is consumed."
+  (let ((segments nil)
+        (start (if (and (> (length path) 0) (char= (char path 0) #\/)) 1 0))
+        (len (length path)))
+    (loop
+      (let ((slash (position #\/ path :start start)))
+        (push (subseq path start (or slash len)) segments)
+        (if slash
+            (setf start (1+ slash))
+            (return (nreverse segments)))))))
+
+(defun match-path (pattern path)
+  "Match PATH against PATTERN with :param segment captures.
+   Literal segments must match exactly; segments starting with : capture.
+   Returns NIL if no match, T if match with no captures,
+   or an alist of (name . decoded-value) pairs if match with captures.
+   Captured values are percent-decoded."
+  (let ((pat-segs  (split-path-segments pattern))
+        (path-segs (split-path-segments path))
+        (bindings nil))
+    (when (= (length pat-segs) (length path-segs))
+      (when (loop for pat in pat-segs
+                  for seg in path-segs
+                  always (if (and (> (length pat) 0)
+                                  (char= (char pat 0) #\:))
+                             (progn
+                               (push (cons (subseq pat 1) (url-decode seg))
+                                     bindings)
+                               t)
+                             (string= pat seg)))
+        (if bindings (nreverse bindings) t)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; CRLF utilities
 ;;; ---------------------------------------------------------------------------
 

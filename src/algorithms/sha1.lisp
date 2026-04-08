@@ -162,7 +162,4 @@
 
 (defun sha1-hex (data)
   "Compute SHA-1 of DATA and return as a lowercase hex string."
-  (let ((digest (sha1 data)))
-    (with-output-to-string (s)
-      (loop for byte across digest
-            do (format s "~(~2,'0x~)" byte)))))
+  (bytes-to-hex (sha1 data)))

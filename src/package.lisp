@@ -13,7 +13,11 @@
            #:get-header
            #:get-headers
            #:get-cookie
+           #:get-query-param
            #:parse-request
+           #:parse-query-string
+           #:url-decode
+           #:match-path
            ;; HTTP response
            #:http-response
            #:http-response-status
@@ -37,6 +41,7 @@
            #:sha1
            #:sha1-hex
            #:base64-encode
+           #:bytes-to-hex
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd

@@ -5,9 +5,12 @@
   :components ((:file "src/package")
                (:file "src/log" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
-               (:file "src/algorithms/sha1"  :depends-on ("src/package"))
+               (:file "src/algorithms/hex"   :depends-on ("src/package"))
+               (:file "src/algorithms/sha1"  :depends-on ("src/package"
+                                                           "src/algorithms/hex"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
-               (:file "src/server/http"  :depends-on ("src/package"))
+               (:file "src/server/http"  :depends-on ("src/package"
+                                                       "src/algorithms/hex"))
                (:file "src/server/connection" :depends-on ("src/package"
                                                             "src/log"
                                                             "src/epoll"

@@ -157,10 +157,10 @@
     (check "url path"      path "/api/test"))
 
   (multiple-value-bind (host port path)
-      (web-skeleton::parse-url "http://example.com/rip/ping")
+      (web-skeleton::parse-url "http://example.com/rip/per")
     (check "url default port" port 80)
     (check "url host no port" host "example.com")
-    (check "url path simple"  path "/rip/ping"))
+    (check "url path simple"  path "/rip/per"))
 
   (multiple-value-bind (host port path)
       (web-skeleton::parse-url "http://10.0.0.1:3000")
@@ -202,6 +202,133 @@
            (web-skeleton::parse-response-status buf 0 (length buf)) 302)))
 
 ;;; ---------------------------------------------------------------------------
+;;; URL decode tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-url-decode ()
+  (format t "~%URL Decode~%")
+
+  (check "no encoding"
+         (url-decode "/hello/world") "/hello/world")
+
+  (check "space %20"
+         (url-decode "/hello%20world") "/hello world")
+
+  (check "slash %2F"
+         (url-decode "a%2Fb") "a/b")
+
+  (check "mixed"
+         (url-decode "/path%20to/foot%3Fheel%3Dankle") "/path to/foot?heel=ankle")
+
+  (check "percent at end (incomplete)"
+         (url-decode "hello%2") "hello%2")
+
+  (check "uppercase hex"
+         (url-decode "%4A") "J")
+
+  (check "lowercase hex"
+         (url-decode "%4a") "J")
+
+  (check "empty string"
+         (url-decode "") "")
+
+  (check "plus literal (not space)"
+         (url-decode "a+b") "a+b"))
+
+;;; ---------------------------------------------------------------------------
+;;; Query string tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-query-string ()
+  (format t "~%Query String~%")
+
+  (check "simple pair"
+         (parse-query-string "a=1")
+         '(("a" . "1")))
+
+  (check "multiple pairs"
+         (parse-query-string "a=1&b=2&c=3")
+         '(("a" . "1") ("b" . "2") ("c" . "3")))
+
+  (check "encoded key and value"
+         (parse-query-string "hello%20world=foot%26heel")
+         '(("hello world" . "foot&heel")))
+
+  (check "key with no value"
+         (parse-query-string "flag")
+         '(("flag" . "")))
+
+  (check "empty value"
+         (parse-query-string "key=")
+         '(("key" . "")))
+
+  (check "nil query"
+         (parse-query-string nil)
+         nil)
+
+  (check "empty query"
+         (parse-query-string "")
+         nil)
+
+  ;; get-query-param via a parsed request
+  (let ((req (parse-request (crlf "GET /search?q=common%20lisp&page=3 HTTP/1.1"
+                                  "Host: localhost"))))
+    (check "get-query-param q"    (get-query-param req "q")    "common lisp")
+    (check "get-query-param page" (get-query-param req "page") "3")
+    (check "get-query-param miss" (get-query-param req "x")    nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; Path matching tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-match-path ()
+  (format t "~%Path Matching~%")
+
+  ;; Exact matches
+  (check "exact root"
+         (match-path "/" "/") t)
+
+  (check "exact path"
+         (match-path "/users" "/users") t)
+
+  (check "exact multi-segment"
+         (match-path "/api/v1/health" "/api/v1/health") t)
+
+  ;; No match
+  (check "different path"
+         (match-path "/users" "/posts") nil)
+
+  (check "different length"
+         (match-path "/users/list" "/users") nil)
+
+  (check "prefix only"
+         (match-path "/users" "/users/4444") nil)
+
+  ;; Single capture
+  (check "single param"
+         (match-path "/users/:id" "/users/4444")
+         '(("id" . "4444")))
+
+  ;; Multiple captures
+  (check "two params"
+         (match-path "/users/:id/posts/:post-id" "/users/4444/posts/7")
+         '(("id" . "4444") ("post-id" . "7")))
+
+  ;; Capture with percent-encoding
+  (check "param decoded"
+         (match-path "/files/:name" "/files/hello%20world")
+         '(("name" . "hello world")))
+
+  ;; Mixed literal and capture
+  (check "literal prefix + capture"
+         (match-path "/api/users/:id" "/api/users/99")
+         '(("id" . "99")))
+
+  (check "literal mismatch with capture"
+         (match-path "/api/users/:id" "/api/posts/99")
+         nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -213,5 +340,8 @@
   (test-http-parser-errors)
   (test-http-response)
   (test-fetch)
+  (test-url-decode)
+  (test-query-string)
+  (test-match-path)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
