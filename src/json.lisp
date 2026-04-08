@@ -1,0 +1,271 @@
+(in-package :web-skeleton)
+
+;;; ===========================================================================
+;;; JSON Parser and Serializer (RFC 8259)
+;;;
+;;; Parse: JSON string -> Lisp data
+;;;   Objects  -> alists  ((key . value) ...)
+;;;   Arrays   -> lists   (value ...)
+;;;   Strings  -> strings
+;;;   Numbers  -> integers or floats
+;;;   true     -> T
+;;;   false    -> :FALSE
+;;;   null     -> :NULL
+;;;
+;;; Serialize: Lisp data -> JSON string
+;;;   alists   -> objects (when car of first element is a string)
+;;;   lists    -> arrays
+;;;   strings  -> strings
+;;;   integers -> numbers
+;;;   floats   -> numbers
+;;;   T        -> true
+;;;   :FALSE   -> false
+;;;   :NULL    -> null
+;;;   NIL      -> [] (empty array) or {} (empty object, indistinguishable)
+;;;
+;;; false and null are keywords to avoid ambiguity with NIL (empty list).
+;;; ===========================================================================
+
+;;; ---------------------------------------------------------------------------
+;;; Parser internals
+;;; ---------------------------------------------------------------------------
+
+(defun json-skip-whitespace (str pos)
+  "Advance past JSON whitespace. Returns new position."
+  (loop while (and (< pos (length str))
+                   (member (char str pos) '(#\Space #\Tab #\Newline #\Return)))
+        do (incf pos))
+  pos)
+
+(defun json-parse-string (str pos)
+  "Parse a JSON string starting at the opening quote at POS.
+   Handles all escape sequences including \\uXXXX.
+   Returns (values string new-pos)."
+  (assert (char= (char str pos) #\"))
+  (incf pos)
+  (let ((out (make-array 64 :element-type 'character :fill-pointer 0 :adjustable t))
+        (len (length str)))
+    (loop
+      (when (>= pos len)
+        (error "json: unterminated string"))
+      (let ((ch (char str pos)))
+        (cond
+          ((char= ch #\")
+           (return (values (coerce out 'string) (1+ pos))))
+          ((char= ch #\\)
+           (incf pos)
+           (when (>= pos len)
+             (error "json: unterminated escape"))
+           (let ((esc (char str pos)))
+             (case esc
+               (#\n (vector-push-extend #\Newline out))
+               (#\t (vector-push-extend #\Tab out))
+               (#\r (vector-push-extend #\Return out))
+               (#\" (vector-push-extend #\" out))
+               (#\\ (vector-push-extend #\\ out))
+               (#\/ (vector-push-extend #\/ out))
+               (#\b (vector-push-extend (code-char 8) out))
+               (#\f (vector-push-extend (code-char 12) out))
+               (#\u
+                ;; \uXXXX — parse 4 hex digits
+                (let ((code (parse-integer str :start (1+ pos)
+                                               :end (min (+ pos 5) len)
+                                               :radix 16)))
+                  ;; Handle surrogate pairs for characters above U+FFFF
+                  (if (<= #xD800 code #xDBFF)
+                      ;; High surrogate — expect \uXXXX low surrogate
+                      (let ((low-start (+ pos 5)))
+                        (if (and (< (+ low-start 5) len)
+                                 (char= (char str low-start) #\\)
+                                 (char= (char str (1+ low-start)) #\u))
+                            (let ((low (parse-integer str :start (+ low-start 2)
+                                                          :end (+ low-start 6)
+                                                          :radix 16)))
+                              (let ((cp (+ #x10000
+                                           (ash (- code #xD800) 10)
+                                           (- low #xDC00))))
+                                (vector-push-extend (code-char cp) out))
+                              (incf pos 10))
+                            (progn
+                              (vector-push-extend (code-char code) out)
+                              (incf pos 4))))
+                      (progn
+                        (vector-push-extend (code-char code) out)
+                        (incf pos 4)))))
+               (t (vector-push-extend esc out))))
+           (incf pos))
+          (t
+           (vector-push-extend ch out)
+           (incf pos)))))))
+
+(defun json-parse-number (str pos)
+  "Parse a JSON number starting at POS. Returns (values number new-pos)."
+  (let ((start pos)
+        (len (length str)))
+    (when (and (< pos len) (char= (char str pos) #\-))
+      (incf pos))
+    (loop while (and (< pos len) (digit-char-p (char str pos)))
+          do (incf pos))
+    (when (and (< pos len) (char= (char str pos) #\.))
+      (incf pos)
+      (loop while (and (< pos len) (digit-char-p (char str pos)))
+            do (incf pos)))
+    (when (and (< pos len) (member (char str pos) '(#\e #\E)))
+      (incf pos)
+      (when (and (< pos len) (member (char str pos) '(#\+ #\-)))
+        (incf pos))
+      (loop while (and (< pos len) (digit-char-p (char str pos)))
+            do (incf pos)))
+    (let ((num-str (subseq str start pos)))
+      (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
+                  (read-from-string num-str)
+                  (parse-integer num-str))
+              pos))))
+
+(defun json-parse-value (str pos)
+  "Parse a JSON value at POS. Returns (values value new-pos)."
+  (setf pos (json-skip-whitespace str pos))
+  (when (>= pos (length str))
+    (error "json: unexpected end of input"))
+  (let ((ch (char str pos)))
+    (cond
+      ((char= ch #\") (json-parse-string str pos))
+      ((char= ch #\{) (json-parse-object str pos))
+      ((char= ch #\[) (json-parse-array str pos))
+      ((char= ch #\t)
+       (unless (and (<= (+ pos 4) (length str))
+                    (string= str "true" :start1 pos :end1 (+ pos 4)))
+         (error "json: invalid literal at ~d" pos))
+       (values t (+ pos 4)))
+      ((char= ch #\f)
+       (unless (and (<= (+ pos 5) (length str))
+                    (string= str "false" :start1 pos :end1 (+ pos 5)))
+         (error "json: invalid literal at ~d" pos))
+       (values :false (+ pos 5)))
+      ((char= ch #\n)
+       (unless (and (<= (+ pos 4) (length str))
+                    (string= str "null" :start1 pos :end1 (+ pos 4)))
+         (error "json: invalid literal at ~d" pos))
+       (values :null (+ pos 4)))
+      ((or (digit-char-p ch) (char= ch #\-))
+       (json-parse-number str pos))
+      (t (error "json: unexpected character '~a' at ~d" ch pos)))))
+
+(defun json-parse-object (str pos)
+  "Parse a JSON object at POS. Returns (values alist new-pos)."
+  (assert (char= (char str pos) #\{))
+  (incf pos)
+  (setf pos (json-skip-whitespace str pos))
+  (when (char= (char str pos) #\})
+    (return-from json-parse-object (values nil (1+ pos))))
+  (let ((pairs nil))
+    (loop
+      (setf pos (json-skip-whitespace str pos))
+      (multiple-value-bind (key new-pos) (json-parse-string str pos)
+        (setf pos (json-skip-whitespace str new-pos))
+        (unless (char= (char str pos) #\:)
+          (error "json: expected ':' at ~d" pos))
+        (incf pos)
+        (multiple-value-bind (val new-pos2) (json-parse-value str pos)
+          (push (cons key val) pairs)
+          (setf pos (json-skip-whitespace str new-pos2))
+          (cond
+            ((char= (char str pos) #\,) (incf pos))
+            ((char= (char str pos) #\})
+             (return (values (nreverse pairs) (1+ pos))))
+            (t (error "json: expected ',' or '}' at ~d" pos))))))))
+
+(defun json-parse-array (str pos)
+  "Parse a JSON array at POS. Returns (values list new-pos)."
+  (assert (char= (char str pos) #\[))
+  (incf pos)
+  (setf pos (json-skip-whitespace str pos))
+  (when (char= (char str pos) #\])
+    (return-from json-parse-array (values nil (1+ pos))))
+  (let ((items nil))
+    (loop
+      (multiple-value-bind (val new-pos) (json-parse-value str pos)
+        (push val items)
+        (setf pos (json-skip-whitespace str new-pos))
+        (cond
+          ((char= (char str pos) #\,) (incf pos))
+          ((char= (char str pos) #\])
+           (return (values (nreverse items) (1+ pos))))
+          (t (error "json: expected ',' or ']' at ~d" pos)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Public parser interface
+;;; ---------------------------------------------------------------------------
+
+(defun json-parse (str)
+  "Parse a JSON string into Lisp data.
+   Objects become alists, arrays become lists.
+   false -> :FALSE, null -> :NULL (to distinguish from NIL/empty list)."
+  (multiple-value-bind (val pos) (json-parse-value str 0)
+    (declare (ignore pos))
+    val))
+
+(defun json-get (obj key)
+  "Look up KEY (string) in a JSON object (alist). Returns value or NIL."
+  (cdr (assoc key obj :test #'string=)))
+
+;;; ---------------------------------------------------------------------------
+;;; Serializer
+;;; ---------------------------------------------------------------------------
+
+(defun json-serialize (value)
+  "Serialize a Lisp value to a JSON string."
+  (with-output-to-string (out)
+    (json-write-value value out)))
+
+(defun json-write-value (value stream)
+  "Write VALUE as JSON to STREAM."
+  (cond
+    ((eq value t)      (write-string "true" stream))
+    ((eq value :false) (write-string "false" stream))
+    ((eq value :null)  (write-string "null" stream))
+    ((null value)      (write-string "null" stream))
+    ((stringp value)   (json-write-string value stream))
+    ((integerp value)  (format stream "~d" value))
+    ((floatp value)    (format stream "~f" value))
+    ;; Alist (object) — detected by first element being a cons with string car
+    ((and (consp value) (consp (car value)) (stringp (caar value)))
+     (json-write-object value stream))
+    ;; List (array)
+    ((consp value)
+     (json-write-array value stream))
+    (t (error "json-serialize: unsupported type ~a" (type-of value)))))
+
+(defun json-write-string (str stream)
+  "Write a JSON-escaped string to STREAM."
+  (write-char #\" stream)
+  (loop for ch across str
+        do (case ch
+             (#\\ (write-string "\\\\" stream))
+             (#\" (write-string "\\\"" stream))
+             (#\Newline (write-string "\\n" stream))
+             (#\Return (write-string "\\r" stream))
+             (#\Tab (write-string "\\t" stream))
+             (t (let ((code (char-code ch)))
+                  (if (< code #x20)
+                      (format stream "\\u~4,'0x" code)
+                      (write-char ch stream))))))
+  (write-char #\" stream))
+
+(defun json-write-object (alist stream)
+  "Write an alist as a JSON object to STREAM."
+  (write-char #\{ stream)
+  (loop for (pair . rest) on alist
+        do (json-write-string (car pair) stream)
+           (write-char #\: stream)
+           (json-write-value (cdr pair) stream)
+        when rest do (write-char #\, stream))
+  (write-char #\} stream))
+
+(defun json-write-array (list stream)
+  "Write a list as a JSON array to STREAM."
+  (write-char #\[ stream)
+  (loop for (item . rest) on list
+        do (json-write-value item stream)
+        when rest do (write-char #\, stream))
+  (write-char #\] stream))

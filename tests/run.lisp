@@ -38,6 +38,8 @@
   (let ((all-passed t))
     (unless (test-algorithms)
       (setf all-passed nil))
+    (unless (test-json)
+      (setf all-passed nil))
     (unless (test-server)
       (setf all-passed nil))
     (if all-passed

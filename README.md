@@ -61,8 +61,9 @@ sbcl
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton-tests")
 (web-skeleton-tests:test)             ; run all tests
-(web-skeleton-tests:test-algorithms)  ; SHA-1 and Base64 only
-(web-skeleton-tests:test-server)      ; HTTP parser and response builder only
+(web-skeleton-tests:test-algorithms)  ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
+(web-skeleton-tests:test-json)        ; JSON parser and serializer
+(web-skeleton-tests:test-server)      ; HTTP, URL, query, routing, JWT
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
 ```
@@ -80,15 +81,19 @@ src/
   package.lisp               Package (namespace) declaration
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
+  json.lisp                  JSON parser and serializer (RFC 8259)
   algorithms/
     hex.lisp                 Hex encoding utilities
     sha1.lisp                SHA-1 digest (FIPS 180-4)
     sha256.lisp              SHA-256 digest (FIPS 180-4)
-    base64.lisp              Base64 encoder (RFC 4648)
+    hmac.lisp                HMAC-SHA256 (RFC 2104)
+    base64.lisp              Base64 encoder/decoder + URL-safe variant (RFC 4648)
+    ecdsa.lisp               ECDSA P-256 signature verification (FIPS 186-4)
   server/
     connection.lisp          Connection state machine, read/write buffers
     http.lisp                HTTP request parser, response builder, URL/query/routing
     websocket.lisp           WebSocket handshake and incremental frame protocol
+    jwt.lisp                 JWT validation (ES256) and JWKS parsing
     static.lisp              In-memory static file cache and serving
     fetch.lisp               Non-blocking outbound HTTP client
     main.lisp                epoll event loop, handler dispatch, server entry point
@@ -99,8 +104,9 @@ demo/
 tests/
   package.lisp               Test package declaration
   run.lisp                   Test utilities and combined runner
-  test-algorithms.lisp       SHA-1, SHA-256, Base64, and hex test vectors
-  test-server.lisp           HTTP parser, response builder, URL, query, routing tests
+  test-algorithms.lisp       SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
+  test-json.lisp             JSON parser and serializer tests
+  test-server.lisp           HTTP, URL, query, routing, JWT tests
 ```
 
 ## What's implemented
@@ -126,9 +132,17 @@ tests/
   parsing (`parse-query-string`, `get-query-param`)
 - **Path matching** — `match-path` matches URL paths against patterns with
   `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
+- **JSON** — full parser and serializer (RFC 8259). Objects become alists,
+  arrays become lists. Handles all escape sequences including `\uXXXX`
+  and surrogate pairs
 - **SHA-1** — complete implementation per FIPS 180-4
 - **SHA-256** — complete implementation per FIPS 180-4
-- **Base64** — encoder per RFC 4648
+- **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
+- **Base64** — encoder and decoder, standard and URL-safe alphabets (RFC 4648)
+- **ECDSA P-256** — signature verification per FIPS 186-4. Pure Lisp bignum
+  arithmetic, verification only (no signing, no key generation)
+- **JWT validation** — ES256 token verification, JWKS key set parsing, claim
+  extraction, expiration checking. Pure Lisp — no external dependencies
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, and close frames
@@ -139,7 +153,8 @@ tests/
   at startup; `serve-static` looks up the request path and returns a pre-built
   response. MIME detection, extensionless HTML aliases, directory traversal protection
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
-- **Test suite** — algorithm test vectors and HTTP parser tests
+- **Test suite** — FIPS/RFC test vectors for all crypto primitives, JSON
+  round-trip tests, HTTP parser tests, JWT validation tests
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
@@ -200,8 +215,6 @@ With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking.
 
 ## Roadmap
-- **JWT validation** — ES256 (ECDSA P-256 + SHA-256) token verification,
-  JWKS parsing, claim extraction. Pure Lisp — no external dependencies
 - **Outbound TLS** — HTTPS support in `http-fetch` via libssl FFI.
   Optional — only loaded when HTTPS is needed
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,

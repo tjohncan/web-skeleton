@@ -52,6 +52,19 @@
            #:hmac-sha256
            ;; ECDSA
            #:ecdsa-verify-p256
+           ;; JWT
+           #:jwt-key
+           #:make-jwt-key
+           #:jwt-key-kid
+           #:jwt-key-x
+           #:jwt-key-y
+           #:parse-jwks
+           #:jwt-verify
+           #:jwt-claim
+           ;; JSON
+           #:json-parse
+           #:json-serialize
+           #:json-get
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd

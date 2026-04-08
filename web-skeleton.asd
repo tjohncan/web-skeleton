@@ -31,6 +31,12 @@
                (:file "src/server/static" :depends-on ("src/package"
                                                          "src/log"
                                                          "src/server/http"))
+               (:file "src/json" :depends-on ("src/package"))
+               (:file "src/server/jwt"  :depends-on ("src/package"
+                                                       "src/json"
+                                                       "src/algorithms/sha256"
+                                                       "src/algorithms/base64"
+                                                       "src/algorithms/ecdsa"))
                (:file "src/server/fetch" :depends-on ("src/package"
                                                         "src/log"
                                                         "src/epoll"

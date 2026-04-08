@@ -329,6 +329,72 @@
          nil))
 
 ;;; ---------------------------------------------------------------------------
+;;; JWT tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-jwt ()
+  (format t "~%JWT~%")
+
+  ;; Use the RFC 7515 A.3 ES256 example to build a complete JWT test
+  (let* ((header-b64 "eyJhbGciOiJFUzI1NiJ9")
+         (payload-b64 "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")
+         (sig-b64 "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+         (token (format nil "~a.~a.~a" header-b64 payload-b64 sig-b64))
+         ;; Build a key set with the RFC 7515 A.3 public key
+         (keys (list (make-jwt-key
+                      :kid ""
+                      :x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU")
+                      :y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0")))))
+
+    ;; Valid token (exp is in the past, but this tests the crypto path)
+    ;; jwt-verify checks exp, so this will return NIL due to expiration.
+    ;; Test the pieces individually instead.
+    (check "jwt split"
+           (length (web-skeleton::jwt-split token)) 3)
+
+    ;; Verify signature is valid by calling ecdsa-verify-p256 directly
+    (let* ((signing-input (format nil "~a.~a" header-b64 payload-b64))
+           (hash (sha256 (sb-ext:string-to-octets signing-input
+                                                    :external-format :ascii)))
+           (sig (base64url-decode sig-b64)))
+      (check "jwt signature valid"
+             (ecdsa-verify-p256 hash sig
+                                (jwt-key-x (first keys))
+                                (jwt-key-y (first keys)))
+             t))
+
+    ;; jwt-verify rejects expired token
+    (check "jwt expired token"
+           (jwt-verify token keys)
+           nil)
+
+    ;; jwt-verify rejects tampered token
+    (let ((bad-token (format nil "~a.~a.~a"
+                             header-b64
+                             ;; tamper: change one base64 character
+                             (concatenate 'string "X" (subseq payload-b64 1))
+                             sig-b64)))
+      (check "jwt tampered token"
+             (jwt-verify bad-token keys)
+             nil))
+
+    ;; jwt-verify rejects wrong algorithm
+    (let ((bad-alg-token (format nil "~a.~a.~a"
+                                 (base64url-encode
+                                  (sb-ext:string-to-octets
+                                   "{\"alg\":\"RS256\"}" :external-format :utf-8))
+                                 payload-b64 sig-b64)))
+      (check "jwt wrong algorithm"
+             (jwt-verify bad-alg-token keys)
+             nil)))
+
+  ;; JWKS parsing
+  (let* ((jwks-json "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"test-key\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},{\"kty\":\"RSA\",\"kid\":\"rsa-key\",\"n\":\"abc\",\"e\":\"def\"}]}")
+         (keys (parse-jwks jwks-json)))
+    (check "jwks parses EC keys only" (length keys) 1)
+    (check "jwks kid" (jwt-key-kid (first keys)) "test-key")))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -343,5 +409,6 @@
   (test-url-decode)
   (test-query-string)
   (test-match-path)
+  (test-jwt)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
