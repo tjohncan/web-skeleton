@@ -97,6 +97,13 @@
   (optval (sb-alien:* t))
   (optlen sb-alien:unsigned-int))
 
+(sb-alien:define-alien-routine ("getsockopt" %getsockopt) sb-alien:int
+  (sockfd sb-alien:int)
+  (level sb-alien:int)
+  (optname sb-alien:int)
+  (optval (sb-alien:* t))
+  (optlen (sb-alien:* sb-alien:unsigned-int)))
+
 ;;; ===========================================================================
 ;;; Lisp wrappers — these are the public interface
 ;;; ===========================================================================
@@ -200,9 +207,10 @@
 ;;; Socket options
 ;;; ---------------------------------------------------------------------------
 
-;;; setsockopt constants
+;;; socket option constants
 (defconstant +sol-socket+    1)
 (defconstant +so-reuseport+ 15)
+(defconstant +so-error+      4)
 
 (defun set-socket-option-int (fd level optname value)
   "Set an integer-valued socket option."
@@ -212,6 +220,19 @@
       (let ((result (%setsockopt fd level optname (sb-sys:vector-sap buf) 4)))
         (when (< result 0)
           (error "setsockopt failed: errno ~d" (get-errno)))))))
+
+(defun get-socket-option-int (fd level optname)
+  "Get an integer-valued socket option."
+  (let ((val-buf (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))
+        (len-buf (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (pack-le-u32 len-buf 0 4)
+    (sb-sys:with-pinned-objects (val-buf len-buf)
+      (let ((result (%getsockopt fd level optname
+                                  (sb-sys:vector-sap val-buf)
+                                  (sb-sys:vector-sap len-buf))))
+        (when (< result 0)
+          (error "getsockopt failed: errno ~d" (get-errno)))))
+    (unpack-le-u32 val-buf 0)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-blocking socket setup

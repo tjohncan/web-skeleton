@@ -74,11 +74,12 @@
   (let ((idle nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
-               (let* ((ws-p (eq (connection-state conn) :websocket))
-                      (timeout (if ws-p *ws-idle-timeout* *idle-timeout*)))
-                 (when (and (> timeout 0)
-                            (> (- now (connection-last-active conn)) timeout))
-                   (push conn idle))))
+               (unless (connection-outbound-p conn)
+                 (let* ((ws-p (eq (connection-state conn) :websocket))
+                        (timeout (if ws-p *ws-idle-timeout* *idle-timeout*)))
+                   (when (and (> timeout 0)
+                              (> (- now (connection-last-active conn)) timeout))
+                     (push conn idle)))))
              *connections*)
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
@@ -147,6 +148,13 @@
                        (http-request-method request)
                        (http-request-path request))
              (values (make-error-response 400) nil))))
+      ;; Outbound fetch request — handler needs an external call
+      ((typep response 'http-fetch-request)
+       (log-debug "~a ~a -> fetch ~a"
+                  (http-request-method request)
+                  (http-request-path request)
+                  (http-fetch-request-url response))
+       (values response nil))
       ;; Pre-formatted response (e.g., static file — already bytes)
       ((typep response '(simple-array (unsigned-byte 8) (*)))
        (log-debug "~a ~a -> static"
@@ -214,12 +222,15 @@
   (let ((to-close nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
-               (case (connection-state conn)
+               (cond
+                 ;; Outbound connections — close immediately
+                 ((connection-outbound-p conn)
+                  (push conn to-close))
                  ;; HTTP connections still reading — nothing to drain
-                 ((:read-http :read-body)
+                 ((member (connection-state conn) '(:read-http :read-body :awaiting))
                   (push conn to-close))
                  ;; WebSocket — send close frame (1001 = going away)
-                 (:websocket
+                 ((eq (connection-state conn) :websocket)
                   (connection-queue-write conn (build-ws-close 1001))
                   (setf (connection-state conn) :closing)
                   (epoll-modify epoll-fd (connection-fd conn)
@@ -274,16 +285,21 @@
                            (http-request-version request))
                 (multiple-value-bind (response upgrade-p)
                     (dispatch-request request handler)
-                  ;; Queue the response for writing
-                  (let ((bytes (if (typep response
-                                         '(simple-array (unsigned-byte 8) (*)))
-                                   response
-                                   (format-response response))))
-                    (connection-queue-write conn bytes)
-                    (setf (connection-state conn)
-                          (if upgrade-p :ws-upgrade :write-response))
-                    (epoll-modify epoll-fd (connection-fd conn)
-                                 (logior +epollout+ +epollet+))))))
+                  (cond
+                    ;; Outbound fetch — park and initiate
+                    ((typep response 'http-fetch-request)
+                     (initiate-fetch conn epoll-fd response))
+                    ;; Normal response — queue for writing
+                    (t
+                     (let ((bytes (if (typep response
+                                            '(simple-array (unsigned-byte 8) (*)))
+                                      response
+                                      (format-response response))))
+                       (connection-queue-write conn bytes)
+                       (setf (connection-state conn)
+                             (if upgrade-p :ws-upgrade :write-response))
+                       (epoll-modify epoll-fd (connection-fd conn)
+                                    (logior +epollout+ +epollet+))))))))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — just wait for more data
@@ -388,22 +404,27 @@
                         ;; Edge-triggered: accept in a loop until none pending
                         (loop (unless (accept-connection listener-socket epoll-fd)
                                 (return))))
-                       ;; Event on a client connection
+                       ;; Event on a connection (inbound or outbound)
                        (t
                         (let ((conn (lookup-connection fd)))
                           (when conn
-                            ;; Error or hangup — close and skip to next event
-                            (when (or (logtest flags +epollerr+)
-                                      (logtest flags +epollhup+))
-                              (close-connection conn epoll-fd)
-                              (return-from handle-event))
-                            ;; Readable
-                            (when (logtest flags +epollin+)
-                              (handle-client-read conn epoll-fd handler ws-handler))
-                            ;; Writable (check conn still alive after read handling)
-                            (when (and (logtest flags +epollout+)
-                                       (lookup-connection fd))
-                              (handle-client-write conn epoll-fd))))))))))
+                            (if (connection-outbound-p conn)
+                                ;; Outbound fetch connection
+                                (handle-outbound-event conn epoll-fd flags)
+                                ;; Inbound client connection
+                                (progn
+                                  ;; Error or hangup — close and skip
+                                  (when (or (logtest flags +epollerr+)
+                                            (logtest flags +epollhup+))
+                                    (close-connection conn epoll-fd)
+                                    (return-from handle-event))
+                                  ;; Readable
+                                  (when (logtest flags +epollin+)
+                                    (handle-client-read conn epoll-fd handler ws-handler))
+                                  ;; Writable (check still alive after read)
+                                  (when (and (logtest flags +epollout+)
+                                             (lookup-connection fd))
+                                    (handle-client-write conn epoll-fd))))))))))))
       ;; Periodic maintenance
       (let ((now (get-universal-time)))
         (sweep-idle-connections epoll-fd now)

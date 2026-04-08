@@ -23,6 +23,10 @@
   ;;   :ws-upgrade      — sending WebSocket handshake (switch to :websocket when done)
   ;;   :websocket       — reading/writing WebSocket frames
   ;;   :closing         — sending close frame (disconnect when done)
+  ;;   :awaiting        — parked, waiting for outbound fetch to complete
+  ;;   :out-connecting   — outbound: TCP connect in progress
+  ;;   :out-write        — outbound: sending HTTP request
+  ;;   :out-read         — outbound: reading HTTP response
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes, grows as needed
   (read-buf  (make-array 4096 :element-type '(unsigned-byte 8))
@@ -39,7 +43,13 @@
   (header-end    0 :type fixnum)             ; byte offset where body starts
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
-  (missed-pongs  0 :type fixnum))
+  (missed-pongs  0 :type fixnum)
+  ;; Outbound fetch (when this connection IS an outbound call)
+  (outbound-p     nil :type boolean)          ; T for outbound connections
+  (inbound-fd     -1  :type fixnum)           ; fd of the parked inbound connection
+  (fetch-callback nil)                        ; (status headers body) -> response
+  ;; Awaiting (when this inbound connection is waiting for a fetch)
+  (awaiting-fd    -1  :type fixnum))          ; fd of the outbound connection
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor

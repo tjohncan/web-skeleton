@@ -53,6 +53,8 @@
            ;; Static files
            #:load-static-files
            #:serve-static
+           ;; HTTP client (non-blocking outbound fetch)
+           #:http-fetch
            ;; Conditions
            #:http-parse-error
            ;; Limits

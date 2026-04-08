@@ -88,6 +88,7 @@ src/
     http.lisp                HTTP request parser + response builder
     websocket.lisp           WebSocket handshake and incremental frame protocol
     static.lisp              In-memory static file cache and serving
+    fetch.lisp               Non-blocking outbound HTTP client
     main.lisp                epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp               Demo package declaration
@@ -129,6 +130,10 @@ tests/
   response. MIME detection, extensionless HTML aliases, directory traversal protection
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — algorithm test vectors and HTTP parser tests
+- **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
+  the event loop — outbound connections use the same epoll, zero blocking.
+  Handler returns a fetch descriptor; the framework parks the inbound connection,
+  makes the outbound call, and resumes with the callback result
 - **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
   close frames, flushes in-progress writes, force-closes after drain timeout
 - **Demo application** — separate ASDF system with static demo page and echo server
@@ -165,6 +170,5 @@ The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
 
 ## Roadmap
-- **HTTP client** — outbound requests (needed for auth token validation and Ollama integration)
-- **Auth middleware** — validate OAuth2 tokens against the C auth server on incoming requests
+- **Auth utilities** — helpers for token validation and session-based auth flows
 - **Session management** — map authenticated users to WebSocket connections

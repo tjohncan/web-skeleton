@@ -143,6 +143,65 @@
     (check "error body" (http-response-body resp) "404 Not Found")))
 
 ;;; ---------------------------------------------------------------------------
+;;; HTTP client (fetch) tests — pure functions only, no networking
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch ()
+  (format t "~%HTTP Client~%")
+
+  ;; URL parsing
+  (multiple-value-bind (host port path)
+      (web-skeleton::parse-url "http://localhost:8080/api/test")
+    (check "url host"      host "localhost")
+    (check "url port"      port 8080)
+    (check "url path"      path "/api/test"))
+
+  (multiple-value-bind (host port path)
+      (web-skeleton::parse-url "http://example.com/rip/ping")
+    (check "url default port" port 80)
+    (check "url host no port" host "example.com")
+    (check "url path simple"  path "/rip/ping"))
+
+  (multiple-value-bind (host port path)
+      (web-skeleton::parse-url "http://10.0.0.1:3000")
+    (check "url ip host"      host "10.0.0.1")
+    (check "url ip port"      port 3000)
+    (check "url no path"      path "/"))
+
+  ;; Request building
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "localhost" "/health"
+                 :headers '(("accept" . "application/json"))))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "req method"
+           (not (null (search "GET /health HTTP/1.1" text))) t)
+    (check "req host header"
+           (not (null (search "host: localhost" text))) t)
+    (check "req connection close"
+           (not (null (search "connection: close" text))) t)
+    (check "req custom header"
+           (not (null (search "accept: application/json" text))) t))
+
+  ;; Response status parsing
+  (let ((buf (sb-ext:string-to-octets
+              (concatenate 'string "HTTP/1.1 200 OK" *crlf*)
+              :external-format :ascii)))
+    (check "status 200"
+           (web-skeleton::parse-response-status buf 0 (length buf)) 200))
+
+  (let ((buf (sb-ext:string-to-octets
+              (concatenate 'string "HTTP/1.1 404 Not Found" *crlf*)
+              :external-format :ascii)))
+    (check "status 404"
+           (web-skeleton::parse-response-status buf 0 (length buf)) 404))
+
+  (let ((buf (sb-ext:string-to-octets
+              (concatenate 'string "HTTP/1.0 302 Found" *crlf*)
+              :external-format :ascii)))
+    (check "status 302 http/1.0"
+           (web-skeleton::parse-response-status buf 0 (length buf)) 302)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -153,5 +212,6 @@
   (test-http-parser)
   (test-http-parser-errors)
   (test-http-response)
+  (test-fetch)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
