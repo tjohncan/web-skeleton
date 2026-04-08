@@ -90,6 +90,11 @@
 (sb-alien:define-alien-routine ("close" %close) sb-alien:int
   (fd sb-alien:int))
 
+(sb-alien:define-alien-routine ("poll" %poll) sb-alien:int
+  (fds (sb-alien:* t))
+  (nfds sb-alien:unsigned-long)
+  (timeout sb-alien:int))
+
 (sb-alien:define-alien-routine ("setsockopt" %setsockopt) sb-alien:int
   (sockfd sb-alien:int)
   (level sb-alien:int)
@@ -250,6 +255,24 @@
 (defun socket-fd (socket)
   "Extract the raw file descriptor from an sb-bsd-sockets socket."
   (sb-bsd-sockets:socket-file-descriptor socket))
+
+;;; ---------------------------------------------------------------------------
+;;; poll(2) — block until an fd is ready
+;;; ---------------------------------------------------------------------------
+
+(defconstant +pollout+ #x004)
+
+(defun poll-writable (fd timeout-ms)
+  "Block until FD is writable or TIMEOUT-MS elapses.
+   Returns T if writable, NIL on timeout."
+  ;; struct pollfd: int fd (4) + short events (2) + short revents (2) = 8 bytes
+  (let ((buf (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (pack-le-u32 buf 0 fd)
+    (setf (aref buf 4) (logand +pollout+ #xFF)
+          (aref buf 5) (logand (ash +pollout+ -8) #xFF))
+    (sb-sys:with-pinned-objects (buf)
+      (let ((n (%poll (sb-sys:vector-sap buf) 1 timeout-ms)))
+        (> n 0)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-blocking read/write

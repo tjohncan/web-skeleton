@@ -246,7 +246,7 @@
     (loop while (< pos end)
           do (let ((result (nb-write fd frame-bytes pos (- end pos))))
                (if (eq result :again)
-                   (sleep 0.001)
+                   (poll-writable fd 1000)
                    (incf pos result))))))
 
 ;;; ---------------------------------------------------------------------------
