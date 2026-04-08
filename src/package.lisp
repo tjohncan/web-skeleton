@@ -48,6 +48,8 @@
            ;; SHA-256
            #:sha256
            #:sha256-hex
+           ;; HMAC
+           #:hmac-sha256
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd

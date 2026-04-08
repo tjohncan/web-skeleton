@@ -163,6 +163,46 @@
          "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"))
 
 ;;; ---------------------------------------------------------------------------
+;;; HMAC-SHA256 test vectors (RFC 4231)
+;;; ---------------------------------------------------------------------------
+
+(defun test-hmac-sha256 ()
+  (format t "~%HMAC-SHA256~%")
+
+  ;; RFC 4231 Test Case 1
+  (check "rfc4231 case 1"
+         (bytes-to-hex
+          (hmac-sha256
+           (make-array 20 :element-type '(unsigned-byte 8) :initial-element #x0b)
+           (sb-ext:string-to-octets "Hi There")))
+         "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+
+  ;; RFC 4231 Test Case 2 — key = "Jefe"
+  (check "rfc4231 case 2"
+         (bytes-to-hex
+          (hmac-sha256
+           (sb-ext:string-to-octets "Jefe")
+           (sb-ext:string-to-octets "what do ya want for nothing?")))
+         "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+
+  ;; RFC 4231 Test Case 3 — key = 20 bytes of 0xaa
+  (check "rfc4231 case 3"
+         (bytes-to-hex
+          (hmac-sha256
+           (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xaa)
+           (make-array 50 :element-type '(unsigned-byte 8) :initial-element #xdd)))
+         "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe")
+
+  ;; RFC 4231 Test Case 6 — key longer than block size (131 bytes of 0xaa)
+  (check "rfc4231 case 6 (long key)"
+         (bytes-to-hex
+          (hmac-sha256
+           (make-array 131 :element-type '(unsigned-byte 8) :initial-element #xaa)
+           (sb-ext:string-to-octets
+            "Test Using Larger Than Block-Size Key - Hash Key First")))
+         "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"))
+
+;;; ---------------------------------------------------------------------------
 ;;; Hex encoding tests
 ;;; ---------------------------------------------------------------------------
 
@@ -201,6 +241,7 @@
   (test-base64)
   (test-base64-decode)
   (test-base64url)
+  (test-hmac-sha256)
   (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
