@@ -346,6 +346,98 @@
          nil))
 
 ;;; ---------------------------------------------------------------------------
+;;; WebSocket tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-websocket ()
+  (format t "~%WebSocket~%")
+
+  ;; Handshake accept key — RFC 6455 §4.2.2 example
+  (check "accept key rfc6455"
+         (web-skeleton::websocket-accept-key "dGhlIHNhbXBsZSBub25jZQ==")
+         "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+  ;; connection-header-has-token-p
+  (check "token single"
+         (web-skeleton::connection-header-has-token-p "upgrade" "upgrade") t)
+  (check "token in list"
+         (web-skeleton::connection-header-has-token-p "keep-alive, Upgrade" "upgrade") t)
+  (check "token with whitespace"
+         (web-skeleton::connection-header-has-token-p "  Upgrade  ,  keep-alive  " "upgrade") t)
+  (check "token absent"
+         (web-skeleton::connection-header-has-token-p "keep-alive" "upgrade") nil)
+
+  ;; Frame building — text frame
+  (let ((frame (build-ws-text "hello")))
+    (check "text frame fin+opcode" (aref frame 0) #x81)  ; FIN=1, opcode=1
+    (check "text frame length"     (aref frame 1) 5)
+    (check "text frame payload"
+           (sb-ext:octets-to-string (subseq frame 2) :external-format :utf-8)
+           "hello"))
+
+  ;; Frame building — close frame
+  (let ((frame (build-ws-close 1000)))
+    (check "close frame fin+opcode" (aref frame 0) #x88)  ; FIN=1, opcode=8
+    (check "close frame length"     (aref frame 1) 2)
+    (check "close frame code"       (logior (ash (aref frame 2) 8) (aref frame 3))
+           1000))
+
+  ;; Frame parsing — build a masked client text frame and parse it
+  (let* ((frame (make-array 8 :element-type '(unsigned-byte 8)))
+         (result nil) (consumed 0))
+    (setf (aref frame 0) #x81          ; FIN + text
+          (aref frame 1) (logior #x80 2) ; MASK + len=2
+          (aref frame 2) #xAA (aref frame 3) #xBB
+          (aref frame 4) #xCC (aref frame 5) #xDD
+          ;; masked payload: 'h' XOR AA, 'i' XOR BB
+          (aref frame 6) (logxor (char-code #\h) #xAA)
+          (aref frame 7) (logxor (char-code #\i) #xBB))
+    (multiple-value-setq (result consumed)
+      (web-skeleton::try-parse-ws-frame frame 0 8))
+    (check "parse masked frame" (not (null result)) t)
+    (check "parse consumed bytes" consumed 8)
+    (check "parse opcode" (ws-frame-opcode result) 1)
+    (check "parse fin" (ws-frame-fin result) t)
+    (check "parse payload"
+           (sb-ext:octets-to-string (ws-frame-payload result)
+                                     :external-format :utf-8)
+           "hi")
+    ;; Incomplete frame — not enough bytes
+    (multiple-value-setq (result consumed)
+      (web-skeleton::try-parse-ws-frame frame 0 1))
+    (check "parse incomplete" result nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; Static file helper tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-static-helpers ()
+  (format t "~%Static Helpers~%")
+
+  (check "mime html"  (web-skeleton::mime-type-for-path "/index.html")
+         "text/html; charset=utf-8")
+  (check "mime css"   (web-skeleton::mime-type-for-path "/style.css")
+         "text/css; charset=utf-8")
+  (check "mime js"    (web-skeleton::mime-type-for-path "/app.js")
+         "application/javascript; charset=utf-8")
+  (check "mime png"   (web-skeleton::mime-type-for-path "/image.png")
+         "image/png")
+  (check "mime json"  (web-skeleton::mime-type-for-path "/data.json")
+         "application/json; charset=utf-8")
+  (check "mime svg"   (web-skeleton::mime-type-for-path "/icon.svg")
+         "image/svg+xml")
+  (check "mime woff2" (web-skeleton::mime-type-for-path "/font.woff2")
+         "font/woff2")
+  (check "mime unknown" (web-skeleton::mime-type-for-path "/data.xyz")
+         "application/octet-stream")
+  (check "mime no ext" (web-skeleton::mime-type-for-path "/LICENSE")
+         "application/octet-stream")
+
+  (check "ext html" (web-skeleton::file-extension "/index.html") "html")
+  (check "ext none" (web-skeleton::file-extension "/LICENSE") nil)
+  (check "ext dotfile" (web-skeleton::file-extension "/.hidden") "hidden"))
+
+;;; ---------------------------------------------------------------------------
 ;;; JWT tests
 ;;; ---------------------------------------------------------------------------
 
@@ -426,6 +518,8 @@
   (test-url-decode)
   (test-query-string)
   (test-match-path)
+  (test-websocket)
+  (test-static-helpers)
   (test-jwt)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))

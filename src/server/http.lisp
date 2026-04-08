@@ -195,13 +195,6 @@
         (if bindings (nreverse bindings) t)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; CRLF utilities
-;;; ---------------------------------------------------------------------------
-
-(defvar *crlf* (coerce '(#\Return #\Newline) 'string))
-(defvar *crlf-crlf* (concatenate 'string *crlf* *crlf*))
-
-;;; ---------------------------------------------------------------------------
 ;;; Byte-level scanning helpers
 ;;; ---------------------------------------------------------------------------
 
@@ -395,11 +388,6 @@
 ;;; ---------------------------------------------------------------------------
 ;;; String-level convenience interface
 ;;; ---------------------------------------------------------------------------
-
-(defun find-header-end (data)
-  "Find the position of the CRLFCRLF that terminates the header block.
-   Returns the index of the first CR, or NIL if not found."
-  (search *crlf-crlf* data))
 
 (defun parse-request (raw-data)
   "Parse a raw HTTP request header string into an HTTP-REQUEST struct.

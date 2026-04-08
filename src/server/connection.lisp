@@ -51,7 +51,10 @@
   ;; Awaiting (when this inbound connection is waiting for a fetch)
   (awaiting-fd    -1  :type fixnum)           ; fd of the outbound connection
   ;; Keep-alive
-  (close-after-p  nil :type boolean))         ; T = close after response sent
+  (close-after-p  nil :type boolean)          ; T = close after response sent
+  ;; WebSocket fragment reassembly
+  (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
+  (ws-frag-buf   nil))                        ; accumulated payload chunks, or NIL
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor
@@ -88,7 +91,7 @@
    Grows the buffer as needed, up to max frame size.
    Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
   (let ((any-read nil)
-        (max-size (+ *max-ws-payload-size* 14)))
+        (max-size (+ *max-ws-payload-size* 14)))  ; 14 = max masked frame header (10 + 4 mask bytes)
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))

@@ -64,6 +64,7 @@ sbcl
 (web-skeleton-tests:test-algorithms)  ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
 (web-skeleton-tests:test-json)        ; JSON parser and serializer
 (web-skeleton-tests:test-server)      ; HTTP, URL, query, routing, JWT
+(web-skeleton-tests:test-tls)         ; TLS roundtrip (skips if libssl absent)
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
 ```
@@ -109,6 +110,7 @@ tests/
   test-algorithms.lisp       SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
   test-json.lisp             JSON parser and serializer tests
   test-server.lisp           HTTP, URL, query, routing, JWT tests
+  test-tls.lisp              TLS roundtrip (skips gracefully without libssl)
 ```
 
 ## What's implemented
@@ -142,14 +144,15 @@ tests/
 - **SHA-1** — complete implementation per FIPS 180-4
 - **SHA-256** — complete implementation per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
-- **Base64** — encoder and decoder, standard and URL-safe alphabets (RFC 4648)
+- **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648)
 - **ECDSA P-256** — signature verification per FIPS 186-4. Pure Lisp bignum
   arithmetic, verification only (no signing, no key generation)
 - **JWT validation** — ES256 token verification, JWKS key set parsing, claim
   extraction, expiration checking. Pure Lisp — no external dependencies
 - **WebSocket handshake** — validates upgrade request, computes accept key
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
-  handles text, binary, ping/pong, and close frames
+  handles text, binary, ping/pong, close, and fragmented messages (automatic
+  reassembly with size limits)
 - **WebSocket server push** — `ws-send` sends a frame to a connection synchronously
   from within the handler, enabling streaming responses (e.g. sending LLM tokens
   as they arrive) without returning from the handler until the work is done
@@ -226,4 +229,3 @@ an LLM response for a few seconds), but avoid unbounded blocking.
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
-- **Session management** — map authenticated users to WebSocket connections

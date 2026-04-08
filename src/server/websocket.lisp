@@ -278,37 +278,92 @@
         ;; Advance past this frame
         (incf pos consumed)
         ;; Handle the frame
-        (cond
-          ((or (= (ws-frame-opcode frame) +ws-op-text+)
-               (= (ws-frame-opcode frame) +ws-op-binary+))
-           (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
-                      (ws-frame-opcode frame)
-                      (length (ws-frame-payload frame))
-                      (connection-fd conn))
-           ;; Application frame — counts as activity
-           (setf (connection-last-active conn) (get-universal-time))
-           (when ws-handler
-             (let ((response (funcall ws-handler conn frame)))
-               (when response (push response responses)))))
-          ((= (ws-frame-opcode frame) +ws-op-ping+)
-           (log-debug "ws ping from client fd ~d" (connection-fd conn))
-           (push (build-ws-pong (ws-frame-payload frame)) responses))
-          ((= (ws-frame-opcode frame) +ws-op-pong+)
-           ;; Pong received — client is alive, reset dead detection counter.
-           ;; Does NOT count as user activity for idle timeout purposes.
-           (log-debug "ws pong fd ~d" (connection-fd conn))
-           (setf (connection-missed-pongs conn) 0))
-          ((= (ws-frame-opcode frame) +ws-op-close+)
-           (log-info "ws close requested on fd ~d" (connection-fd conn))
-           ;; Shift buffer, then signal close
-           (let ((remaining (- end pos)))
-             (when (> remaining 0)
-               (replace buf buf :start1 0 :start2 pos :end2 end))
-             (setf (connection-read-pos conn) remaining))
-           (return-from websocket-on-read
-             (values :close (build-ws-close))))
-          (t
-           (log-warn "ws unhandled opcode: ~d" (ws-frame-opcode frame))))))
+        (let ((opcode (ws-frame-opcode frame)))
+          (cond
+            ;; Application frame (text or binary)
+            ((or (= opcode +ws-op-text+) (= opcode +ws-op-binary+))
+             (if (ws-frame-fin frame)
+                 ;; Complete single-frame message
+                 (progn
+                   (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
+                              opcode (length (ws-frame-payload frame))
+                              (connection-fd conn))
+                   (setf (connection-last-active conn) (get-universal-time))
+                   (when ws-handler
+                     (let ((response (funcall ws-handler conn frame)))
+                       (when response (push response responses)))))
+                 ;; First fragment — start accumulating
+                 (progn
+                   (setf (connection-ws-frag-opcode conn) opcode
+                         (connection-ws-frag-buf conn)
+                         (list (ws-frame-payload frame)))
+                   (log-debug "ws frag start opcode ~d fd ~d"
+                              opcode (connection-fd conn)))))
+            ;; Continuation frame
+            ((= opcode +ws-op-continuation+)
+             (unless (connection-ws-frag-buf conn)
+               (log-warn "ws continuation without start fd ~d"
+                         (connection-fd conn))
+               ;; Shift buffer, then signal close
+               (let ((remaining (- end pos)))
+                 (when (> remaining 0)
+                   (replace buf buf :start1 0 :start2 pos :end2 end))
+                 (setf (connection-read-pos conn) remaining))
+               (return-from websocket-on-read
+                 (values :close (build-ws-close 1002))))
+             ;; Accumulate fragment
+             (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
+             ;; Check total size
+             (let ((total (reduce #'+ (connection-ws-frag-buf conn) :key #'length)))
+               (when (> total *max-ws-payload-size*)
+                 (log-warn "ws fragmented message too large (~d bytes) fd ~d"
+                           total (connection-fd conn))
+                 (setf (connection-ws-frag-buf conn) nil)
+                 (let ((remaining (- end pos)))
+                   (when (> remaining 0)
+                     (replace buf buf :start1 0 :start2 pos :end2 end))
+                   (setf (connection-read-pos conn) remaining))
+                 (return-from websocket-on-read
+                   (values :close (build-ws-close 1009)))))
+             (when (ws-frame-fin frame)
+               ;; Final fragment — reassemble and deliver
+               (let* ((chunks (nreverse (connection-ws-frag-buf conn)))
+                      (total (reduce #'+ chunks :key #'length))
+                      (payload (make-array total :element-type '(unsigned-byte 8)))
+                      (offset 0))
+                 (dolist (chunk chunks)
+                   (replace payload chunk :start1 offset)
+                   (incf offset (length chunk)))
+                 (setf (connection-ws-frag-buf conn) nil)
+                 (log-debug "ws frag complete opcode ~d (~d bytes) fd ~d"
+                            (connection-ws-frag-opcode conn) total
+                            (connection-fd conn))
+                 (setf (connection-last-active conn) (get-universal-time))
+                 (let ((complete (make-ws-frame
+                                  :fin t
+                                  :opcode (connection-ws-frag-opcode conn)
+                                  :payload payload)))
+                   (when ws-handler
+                     (let ((response (funcall ws-handler conn complete)))
+                       (when response (push response responses))))))))
+            ;; Control frames (can arrive between fragments per RFC 6455 §5.4)
+            ((= opcode +ws-op-ping+)
+             (log-debug "ws ping from client fd ~d" (connection-fd conn))
+             (push (build-ws-pong (ws-frame-payload frame)) responses))
+            ((= opcode +ws-op-pong+)
+             (log-debug "ws pong fd ~d" (connection-fd conn))
+             (setf (connection-missed-pongs conn) 0))
+            ((= opcode +ws-op-close+)
+             (log-info "ws close requested on fd ~d" (connection-fd conn))
+             (setf (connection-ws-frag-buf conn) nil)
+             (let ((remaining (- end pos)))
+               (when (> remaining 0)
+                 (replace buf buf :start1 0 :start2 pos :end2 end))
+               (setf (connection-read-pos conn) remaining))
+             (return-from websocket-on-read
+               (values :close (build-ws-close))))
+            (t
+             (log-warn "ws unhandled opcode: ~d" opcode))))))
     ;; Concatenate response frames into a single write buffer
     (when responses
       (setf responses (nreverse responses))

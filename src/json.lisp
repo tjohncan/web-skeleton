@@ -118,7 +118,8 @@
             do (incf pos)))
     (let ((num-str (subseq str start pos)))
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
-                  (read-from-string num-str)
+                  (let ((*read-eval* nil))
+                    (coerce (read-from-string num-str) 'double-float))
                   (parse-integer num-str))
               pos))))
 
