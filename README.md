@@ -130,6 +130,8 @@ tests/
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
 - **HTTP response builder** — status codes, headers, body serialization
+- **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
+  are reused across requests; `Connection: close` and HTTP/1.0 are respected
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Path matching** — `match-path` matches URL paths against patterns with
@@ -225,4 +227,3 @@ an LLM response for a few seconds), but avoid unbounded blocking.
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
 - **Session management** — map authenticated users to WebSocket connections
-- **HTTP keep-alive** — reuse connections across requests

@@ -283,6 +283,16 @@
                            (http-request-path request)
                            (http-request-query request)
                            (http-request-version request))
+                ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
+                ;; HTTP/1.0 default is close. Connection header overrides.
+                (let ((conn-header (get-header request "connection")))
+                  (setf (connection-close-after-p conn)
+                        (cond
+                          ((and conn-header
+                                (connection-header-has-token-p conn-header "close"))
+                           t)
+                          ((string= (http-request-version request) "1.0") t)
+                          (t nil))))
                 (multiple-value-bind (response upgrade-p)
                     (dispatch-request request handler)
                   (cond
@@ -353,8 +363,22 @@
            ;; All bytes sent — next action depends on state
            (ecase (connection-state conn)
              (:write-response
-              ;; Normal HTTP — close (no keep-alive yet)
-              (close-connection conn epoll-fd))
+              (if (connection-close-after-p conn)
+                  (close-connection conn epoll-fd)
+                  ;; Keep-alive — reset for next request
+                  (progn
+                    (setf (connection-read-pos conn) 0
+                          (connection-write-buf conn) nil
+                          (connection-write-pos conn) 0
+                          (connection-write-end conn) 0
+                          (connection-request conn) nil
+                          (connection-body-expected conn) 0
+                          (connection-header-end conn) 0
+                          (connection-close-after-p conn) nil
+                          (connection-state conn) :read-http
+                          (connection-last-active conn) (get-universal-time))
+                    (epoll-modify epoll-fd (connection-fd conn)
+                                 (logior +epollin+ +epollet+)))))
              (:ws-upgrade
               ;; WebSocket handshake sent — preserve any data past the HTTP request
               (let* ((http-end (+ (connection-header-end conn) 4))

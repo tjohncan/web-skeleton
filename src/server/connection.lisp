@@ -19,7 +19,7 @@
   ;; Protocol state
   ;;   :read-http       — accumulating HTTP request bytes
   ;;   :read-body       — have headers, reading Content-Length body
-  ;;   :write-response  — sending HTTP response (close when done)
+  ;;   :write-response  — sending HTTP response (keep-alive or close when done)
   ;;   :ws-upgrade      — sending WebSocket handshake (switch to :websocket when done)
   ;;   :websocket       — reading/writing WebSocket frames
   ;;   :closing         — sending close frame (disconnect when done)
@@ -49,7 +49,9 @@
   (inbound-fd     -1  :type fixnum)           ; fd of the parked inbound connection
   (fetch-callback nil)                        ; (status headers body) -> response
   ;; Awaiting (when this inbound connection is waiting for a fetch)
-  (awaiting-fd    -1  :type fixnum))          ; fd of the outbound connection
+  (awaiting-fd    -1  :type fixnum)           ; fd of the outbound connection
+  ;; Keep-alive
+  (close-after-p  nil :type boolean))         ; T = close after response sent
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor

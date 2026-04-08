@@ -531,7 +531,6 @@
   "Build a response with a text body."
   (let ((resp (make-http-response :status status :body body)))
     (set-response-header resp "content-type" content-type)
-    (set-response-header resp "connection" "close")
     resp))
 
 (defun make-html-response (status body)

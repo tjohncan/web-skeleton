@@ -74,8 +74,7 @@
    Returns a STATIC-ENTRY with both responses ready to write."
   (let ((headers (list (cons "content-type" mime-type)
                        (cons "content-length" (write-to-string (length content)))
-                       (cons "cache-control" "public, max-age=3600")
-                       (cons "connection" "close"))))
+                       (cons "cache-control" "public, max-age=3600"))))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK" headers content)
      :head-response (serialize-http-message "HTTP/1.1 200 OK" headers nil))))
