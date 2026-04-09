@@ -135,9 +135,12 @@
     (let ((num-str (subseq str start pos)))
       ;; Floats: read-from-string with *read-eval* NIL is safe here —
       ;; input is pre-validated to [0-9.eE+-] by the loop above.
+      ;; Bind *read-default-float-format* to double-float so the CL reader
+      ;; produces full 64-bit precision (default is single-float).
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
-                  (let ((*read-eval* nil))
-                    (coerce (read-from-string num-str) 'double-float))
+                  (let ((*read-default-float-format* 'double-float)
+                        (*read-eval* nil))
+                    (read-from-string num-str))
                   (parse-integer num-str))
               pos))))
 
@@ -252,7 +255,20 @@
      (when (or (sb-ext:float-nan-p value)
                (sb-ext:float-infinity-p value))
        (error "json-serialize: cannot encode ~a" value))
-     (format stream "~f" value))
+     ;; Use write-to-string for shortest round-trippable representation.
+     ;; CL's ~f produces fixed-point which loses precision at extremes.
+     (let* ((*read-default-float-format* 'double-float)
+            (s (write-to-string (coerce value 'double-float))))
+       ;; CL may produce "1.0d0" — strip the d0 exponent marker
+       (let ((d-pos (position #\d s)))
+         (write-string (if d-pos
+                           (if (string= s "0" :start1 (1+ d-pos))
+                               (subseq s 0 d-pos)
+                               (concatenate 'string
+                                            (subseq s 0 d-pos) "e"
+                                            (subseq s (1+ d-pos))))
+                           s)
+                       stream))))
     ;; Alist (object) — detected by first element being a cons with string car
     ((and (consp value) (consp (car value)) (stringp (caar value)))
      (json-write-object value stream))
