@@ -233,3 +233,10 @@ an LLM response for a few seconds), but avoid unbounded blocking.
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
+- **Outbound fetch timeout** — socket-level `SO_RCVTIMEO`/`SO_SNDTIMEO`
+  for `http-fetch-stream` and TLS connections. Currently bounded only by
+  the OS TCP timeout (~2 minutes). Prevents a slow or unresponsive upstream
+  from blocking a worker indefinitely
+- **ETag for static files** — compute a content hash at load time and
+  include it in static responses. Enables `304 Not Modified` via
+  `If-None-Match`, reducing bandwidth for repeat visitors
