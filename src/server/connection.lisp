@@ -220,11 +220,12 @@
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
                                           0 (connection-read-pos conn))))
          (if header-end
-             ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
-             (when (scan-transfer-encoding (connection-read-buf conn) header-end)
-               (http-parse-error "Transfer-Encoding not supported"))
-             ;; Check if there's a body to read
-             (let* ((body-start (+ header-end 4))
+             (progn
+               ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
+               (when (scan-transfer-encoding (connection-read-buf conn) header-end)
+                 (http-parse-error "Transfer-Encoding not supported"))
+               ;; Check if there's a body to read
+               (let* ((body-start (+ header-end 4))
                     (content-length (scan-content-length
                                     (connection-read-buf conn) header-end)))
                (if (and content-length (> content-length 0))
@@ -253,7 +254,7 @@
                    ;; No body — request is complete
                    (progn
                      (setf (connection-header-end conn) header-end)
-                     :dispatch)))
+                     :dispatch))))
              ;; No CRLFCRLF yet — keep reading
              :continue)))
       (:read-body

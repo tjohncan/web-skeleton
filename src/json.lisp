@@ -97,7 +97,7 @@
                             code (- pos 4)))
                     (t
                      (vector-push-extend (code-char code) out)
-                     (incf pos 4))))))
+                     (incf pos 4)))))
                (t (vector-push-extend esc out))))
            (incf pos))
           (t
