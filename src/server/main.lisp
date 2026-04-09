@@ -55,6 +55,9 @@
 ;;;   3. WebSocket idle timeout — close inactive but alive connections
 ;;; ---------------------------------------------------------------------------
 
+(defparameter *max-connections* 10000
+  "Maximum connections per worker. New accepts are dropped when full.")
+
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
@@ -181,10 +184,18 @@
 
 (defun accept-connection (listener-socket epoll-fd)
   "Accept a pending connection and register it with epoll.
-   Returns T if a connection was accepted, NIL if none pending (EAGAIN)."
+   Returns T if a connection was accepted, NIL if none pending (EAGAIN).
+   Drops the connection if the per-worker limit is reached."
   (let ((client-socket (sb-bsd-sockets:socket-accept listener-socket)))
     (unless client-socket
       (return-from accept-connection nil))
+    ;; Enforce per-worker connection limit
+    (when (and (> *max-connections* 0)
+               (>= (hash-table-count *connections*) *max-connections*))
+      (log-warn "connection limit reached (~d), dropping new accept"
+                *max-connections*)
+      (ignore-errors (sb-bsd-sockets:socket-close client-socket))
+      (return-from accept-connection t))
     (handler-case
         (let ((conn (make-client-connection client-socket)))
           (register-connection conn)
