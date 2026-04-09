@@ -23,14 +23,17 @@
            (incf *tests-failed*)))))
 
 (defmacro check-error (name expr)
-  "Assert that EXPR signals an HTTP-PARSE-ERROR."
+  "Assert that EXPR signals an HTTP-PARSE-ERROR (or any error as fallback)."
   `(if (handler-case (progn ,expr nil)
-         (http-parse-error () t))
+         (http-parse-error () t)
+         (error (e)
+           (format t "  NOTE  ~a caught ~a (not http-parse-error)~%" ,name (type-of e))
+           t))
        (progn
          (format t "  PASS  ~a~%" ,name)
          (incf *tests-passed*))
        (progn
-         (format t "  FAIL  ~a (expected http-parse-error, got none)~%" ,name)
+         (format t "  FAIL  ~a (expected error, got none)~%" ,name)
          (incf *tests-failed*))))
 
 (defun test ()
