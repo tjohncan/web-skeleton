@@ -66,6 +66,7 @@
 (defun websocket-upgrade-p (request)
   "Check if REQUEST is a valid WebSocket upgrade request."
   (and (eq (http-request-method request) :GET)
+       (string= (http-request-version request) "1.1")
        (let ((upgrade    (get-header request "upgrade"))
              (connection (get-header request "connection"))
              (key        (get-header request "sec-websocket-key"))
