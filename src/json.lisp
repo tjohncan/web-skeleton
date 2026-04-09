@@ -26,6 +26,10 @@
 ;;; false and null are keywords to avoid ambiguity with NIL (empty list).
 ;;; ===========================================================================
 
+(defparameter *json-max-depth* 256
+  "Maximum nesting depth for JSON parsing. Prevents stack overflow on
+   deeply nested input.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parser internals
 ;;; ---------------------------------------------------------------------------
@@ -144,16 +148,18 @@
                   (parse-integer num-str))
               pos))))
 
-(defun json-parse-value (str pos)
+(defun json-parse-value (str pos &optional (depth 0))
   "Parse a JSON value at POS. Returns (values value new-pos)."
+  (when (> depth *json-max-depth*)
+    (error "json: nesting too deep (max ~d)" *json-max-depth*))
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str))
     (error "json: unexpected end of input"))
   (let ((ch (char str pos)))
     (cond
       ((char= ch #\") (json-parse-string str pos))
-      ((char= ch #\{) (json-parse-object str pos))
-      ((char= ch #\[) (json-parse-array str pos))
+      ((char= ch #\{) (json-parse-object str pos depth))
+      ((char= ch #\[) (json-parse-array str pos depth))
       ((char= ch #\t)
        (unless (and (<= (+ pos 4) (length str))
                     (string= str "true" :start1 pos :end1 (+ pos 4)))
@@ -173,7 +179,7 @@
        (json-parse-number str pos))
       (t (error "json: unexpected character '~a' at ~d" ch pos)))))
 
-(defun json-parse-object (str pos)
+(defun json-parse-object (str pos &optional (depth 0))
   "Parse a JSON object at POS. Returns (values alist new-pos)."
   (assert (char= (char str pos) #\{))
   (incf pos)
@@ -191,7 +197,7 @@
         (unless (char= (char str pos) #\:)
           (error "json: expected ':' at ~d" pos))
         (incf pos)
-        (multiple-value-bind (val new-pos2) (json-parse-value str pos)
+        (multiple-value-bind (val new-pos2) (json-parse-value str pos (1+ depth))
           (push (cons key val) pairs)
           (setf pos (json-skip-whitespace str new-pos2))
           (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
@@ -201,7 +207,7 @@
              (return (values (nreverse pairs) (1+ pos))))
             (t (error "json: expected ',' or '}' at ~d" pos))))))))
 
-(defun json-parse-array (str pos)
+(defun json-parse-array (str pos &optional (depth 0))
   "Parse a JSON array at POS. Returns (values list new-pos)."
   (assert (char= (char str pos) #\[))
   (incf pos)
@@ -211,7 +217,7 @@
     (return-from json-parse-array (values nil (1+ pos))))
   (let ((items nil))
     (loop
-      (multiple-value-bind (val new-pos) (json-parse-value str pos)
+      (multiple-value-bind (val new-pos) (json-parse-value str pos (1+ depth))
         (push val items)
         (setf pos (json-skip-whitespace str new-pos))
         (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
