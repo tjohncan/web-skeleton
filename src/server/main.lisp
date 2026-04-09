@@ -320,6 +320,9 @@
                           ((and conn-header
                                 (connection-header-has-token-p conn-header "close"))
                            t)
+                          ((and conn-header
+                                (connection-header-has-token-p conn-header "keep-alive"))
+                           nil)
                           ((string= (http-request-version request) "1.0") t)
                           (t nil))))
                 (multiple-value-bind (response upgrade-p)
