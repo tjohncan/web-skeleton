@@ -14,7 +14,8 @@ function appendLog(text, cls) {
 function connect(onOpen) {
   if (ws && ws.readyState <= 1) return;
   appendLog('[status] connecting...', 'status');
-  ws = new WebSocket('ws://' + location.host + '/ws');
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(proto + location.host + '/ws');
   ws.onopen = function() {
     appendLog('[status] connected', 'status');
     if (onOpen) onOpen();
