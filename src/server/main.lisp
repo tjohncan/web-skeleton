@@ -365,9 +365,17 @@
              (:write-response
               (if (connection-close-after-p conn)
                   (close-connection conn epoll-fd)
-                  ;; Keep-alive — reset for next request
-                  (progn
-                    (setf (connection-read-pos conn) 0
+                  ;; Keep-alive — reset for next request,
+                  ;; preserving any pipelined bytes already buffered
+                  (let* ((consumed (+ (connection-header-end conn) 4
+                                      (connection-body-expected conn)))
+                         (buffered (connection-read-pos conn))
+                         (extra (- buffered consumed)))
+                    (when (> extra 0)
+                      (replace (connection-read-buf conn)
+                               (connection-read-buf conn)
+                               :start1 0 :start2 consumed :end2 buffered))
+                    (setf (connection-read-pos conn) (max extra 0)
                           (connection-write-buf conn) nil
                           (connection-write-pos conn) 0
                           (connection-write-end conn) 0
