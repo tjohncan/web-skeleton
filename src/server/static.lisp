@@ -68,14 +68,17 @@
 ;;; Pre-build complete HTTP response bytes
 ;;; ---------------------------------------------------------------------------
 
-(defun build-static-response (mime-type content)
+(defun build-static-response (mime-type content file-mtime)
   "Build pre-built GET and HEAD response byte vectors for a static file.
    CONTENT is a byte vector of the file data.
+   FILE-MTIME is the file's modification time (universal-time).
    Returns a STATIC-ENTRY with both responses ready to write."
   (let ((headers (list (cons "content-type" mime-type)
                        (cons "content-length" (write-to-string (length content)))
                        (cons "cache-control" "public, max-age=3600")
-                       (cons "x-content-type-options" "nosniff"))))
+                       (cons "x-content-type-options" "nosniff")
+                       (cons "date" (http-date))
+                       (cons "last-modified" (http-date file-mtime)))))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK" headers content)
      :head-response (serialize-http-message "HTTP/1.1 200 OK" headers nil))))
@@ -123,7 +126,8 @@
                    (url-path (concatenate 'string "/" relative))
                    (content (read-file-bytes fs-path))
                    (mime (mime-type-for-path url-path))
-                   (response (build-static-response mime content)))
+                   (mtime (file-write-date file))
+                   (response (build-static-response mime content mtime)))
               (when (gethash url-path *static-cache*)
                 (log-debug "static: replacing ~a" url-path))
               (setf (gethash url-path *static-cache*) response)
