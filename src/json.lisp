@@ -21,7 +21,7 @@
 ;;;   T        -> true
 ;;;   :FALSE   -> false
 ;;;   :NULL    -> null
-;;;   NIL      -> [] (empty array) or {} (empty object, indistinguishable)
+;;;   NIL      -> null
 ;;;
 ;;; false and null are keywords to avoid ambiguity with NIL (empty list).
 ;;; ===========================================================================
@@ -72,26 +72,32 @@
                                                :end (min (+ pos 5) len)
                                                :radix 16)))
                   ;; Handle surrogate pairs for characters above U+FFFF
-                  (if (<= #xD800 code #xDBFF)
-                      ;; High surrogate — expect \uXXXX low surrogate
-                      (let ((low-start (+ pos 5)))
-                        (if (and (< (+ low-start 5) len)
-                                 (char= (char str low-start) #\\)
-                                 (char= (char str (1+ low-start)) #\u))
-                            (let ((low (parse-integer str :start (+ low-start 2)
-                                                          :end (+ low-start 6)
-                                                          :radix 16)))
-                              (let ((cp (+ #x10000
-                                           (ash (- code #xD800) 10)
-                                           (- low #xDC00))))
-                                (vector-push-extend (code-char cp) out))
-                              (incf pos 10))
-                            (progn
-                              (vector-push-extend (code-char code) out)
-                              (incf pos 4))))
-                      (progn
-                        (vector-push-extend (code-char code) out)
-                        (incf pos 4)))))
+                  (cond
+                    ((<= #xD800 code #xDBFF)
+                     ;; High surrogate — expect \uXXXX low surrogate
+                     (let ((low-start (+ pos 5)))
+                       (if (and (< (+ low-start 5) len)
+                                (char= (char str low-start) #\\)
+                                (char= (char str (1+ low-start)) #\u))
+                           (let ((low (parse-integer str :start (+ low-start 2)
+                                                         :end (+ low-start 6)
+                                                         :radix 16)))
+                             (unless (<= #xDC00 low #xDFFF)
+                               (error "json: expected low surrogate after \\u~4,'0X at ~d"
+                                      code (- pos 4)))
+                             (let ((cp (+ #x10000
+                                          (ash (- code #xD800) 10)
+                                          (- low #xDC00))))
+                               (vector-push-extend (code-char cp) out))
+                             (incf pos 10))
+                           (error "json: lone high surrogate \\u~4,'0X at ~d"
+                                  code (- pos 4)))))
+                    ((<= #xDC00 code #xDFFF)
+                     (error "json: lone low surrogate \\u~4,'0X at ~d"
+                            code (- pos 4)))
+                    (t
+                     (vector-push-extend (code-char code) out)
+                     (incf pos 4))))))
                (t (vector-push-extend esc out))))
            (incf pos))
           (t
@@ -104,6 +110,10 @@
         (len (length str)))
     (when (and (< pos len) (char= (char str pos) #\-))
       (incf pos))
+    ;; RFC 8259: leading zeros not allowed (except bare 0)
+    (when (and (< pos len) (char= (char str pos) #\0)
+               (< (1+ pos) len) (digit-char-p (char str (1+ pos))))
+      (error "json: leading zeros not allowed at ~d" start))
     (loop while (and (< pos len) (digit-char-p (char str pos)))
           do (incf pos))
     (when (and (< pos len) (char= (char str pos) #\.))
@@ -117,6 +127,8 @@
       (loop while (and (< pos len) (digit-char-p (char str pos)))
             do (incf pos)))
     (let ((num-str (subseq str start pos)))
+      ;; Floats: read-from-string with *read-eval* NIL is safe here —
+      ;; input is pre-validated to [0-9.eE+-] by the loop above.
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
                   (let ((*read-eval* nil))
                     (coerce (read-from-string num-str) 'double-float))
@@ -203,7 +215,9 @@
    Objects become alists, arrays become lists.
    false -> :FALSE, null -> :NULL (to distinguish from NIL/empty list)."
   (multiple-value-bind (val pos) (json-parse-value str 0)
-    (declare (ignore pos))
+    (let ((end (json-skip-whitespace str pos)))
+      (when (< end (length str))
+        (error "json: unexpected content at position ~d" end)))
     val))
 
 (defun json-get (obj key)
