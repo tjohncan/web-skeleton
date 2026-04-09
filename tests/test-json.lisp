@@ -18,6 +18,9 @@
          (concatenate 'string "caf" (string (code-char #xE9))))
   (check "string slash escape"
          (json-parse "\"a\\/b\"") "a/b")
+  (check "string surrogate pair"
+         (json-parse "\"\\uD83D\\uDE00\"")
+         (string (code-char #x1F600)))
 
   ;; Numbers
   (check "integer" (json-parse "4444") 4444)
@@ -82,7 +85,13 @@
     (check "lone low surrogate rejected"
            (signals-error-p (lambda () (json-parse "\"\\uDC00\""))) t)
     (check "high surrogate + non-surrogate rejected"
-           (signals-error-p (lambda () (json-parse "\"\\uD800\\u0041\""))) t)))
+           (signals-error-p (lambda () (json-parse "\"\\uD800\\u0041\""))) t)
+    (check "empty string rejected"
+           (signals-error-p (lambda () (json-parse ""))) t)
+    (check "truncated object rejected"
+           (signals-error-p (lambda () (json-parse "{"))) t)
+    (check "truncated array rejected"
+           (signals-error-p (lambda () (json-parse "[1,"))) t)))
 
 (defun test-json-serialize ()
   (format t "~%JSON Serializer~%")
