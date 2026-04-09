@@ -84,21 +84,21 @@
                                                          :radix 16)))
                              (unless (<= #xDC00 low #xDFFF)
                                (error "json: expected low surrogate after \\u~4,'0X at ~d"
-                                      code (- pos 4)))
+                                      code (1- pos)))
                              (let ((cp (+ #x10000
                                           (ash (- code #xD800) 10)
                                           (- low #xDC00))))
                                (vector-push-extend (code-char cp) out))
                              (incf pos 10))
                            (error "json: lone high surrogate \\u~4,'0X at ~d"
-                                  code (- pos 4)))))
+                                  code (1- pos)))))
                     ((<= #xDC00 code #xDFFF)
                      (error "json: lone low surrogate \\u~4,'0X at ~d"
-                            code (- pos 4)))
+                            code (1- pos)))
                     (t
                      (vector-push-extend (code-char code) out)
                      (incf pos 4)))))
-               (t (vector-push-extend esc out))))
+               (t (error "json: invalid escape \\~c at ~d" esc (1- pos)))))
            (incf pos))
           (t
            (vector-push-extend ch out)
@@ -118,14 +118,20 @@
           do (incf pos))
     (when (and (< pos len) (char= (char str pos) #\.))
       (incf pos)
-      (loop while (and (< pos len) (digit-char-p (char str pos)))
-            do (incf pos)))
+      (let ((frac-start pos))
+        (loop while (and (< pos len) (digit-char-p (char str pos)))
+              do (incf pos))
+        (when (= pos frac-start)
+          (error "json: no digits after decimal point at ~d" start))))
     (when (and (< pos len) (member (char str pos) '(#\e #\E)))
       (incf pos)
       (when (and (< pos len) (member (char str pos) '(#\+ #\-)))
         (incf pos))
-      (loop while (and (< pos len) (digit-char-p (char str pos)))
-            do (incf pos)))
+      (let ((exp-start pos))
+        (loop while (and (< pos len) (digit-char-p (char str pos)))
+              do (incf pos))
+        (when (= pos exp-start)
+          (error "json: no digits in exponent at ~d" start))))
     (let ((num-str (subseq str start pos)))
       ;; Floats: read-from-string with *read-eval* NIL is safe here —
       ;; input is pre-validated to [0-9.eE+-] by the loop above.
@@ -242,7 +248,11 @@
     ((null value)      (write-string "null" stream))
     ((stringp value)   (json-write-string value stream))
     ((integerp value)  (format stream "~d" value))
-    ((floatp value)    (format stream "~f" value))
+    ((floatp value)
+     (when (or (sb-ext:float-nan-p value)
+               (sb-ext:float-infinity-p value))
+       (error "json-serialize: cannot encode ~a" value))
+     (format stream "~f" value))
     ;; Alist (object) — detected by first element being a cons with string car
     ((and (consp value) (consp (car value)) (stringp (caar value)))
      (json-write-object value stream))
@@ -262,9 +272,11 @@
              (#\Return (write-string "\\r" stream))
              (#\Tab (write-string "\\t" stream))
              (t (let ((code (char-code ch)))
-                  (if (< code #x20)
-                      (format stream "\\u~4,'0x" code)
-                      (write-char ch stream))))))
+                  (cond
+                    ((= code 8)  (write-string "\\b" stream))
+                    ((= code 12) (write-string "\\f" stream))
+                    ((< code #x20) (format stream "\\u~4,'0x" code))
+                    (t (write-char ch stream)))))))
   (write-char #\" stream))
 
 (defun json-write-object (alist stream)
