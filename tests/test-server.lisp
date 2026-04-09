@@ -359,6 +359,9 @@
         (prog1 (aref bytes pos) (incf pos))
         :eof)))
 
+(defmethod stream-element-type ((s byte-array-stream))
+  '(unsigned-byte 8))
+
 (defun make-mock-stream (bytes)
   "Return an in-memory binary input stream over BYTES."
   (make-instance 'byte-array-stream :bytes bytes))
