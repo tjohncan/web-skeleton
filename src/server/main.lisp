@@ -55,7 +55,7 @@
 ;;;   3. WebSocket idle timeout — close inactive but alive connections
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *idle-timeout* 30
+(defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
 (defparameter *ws-idle-timeout* 86400
@@ -378,7 +378,10 @@
                           (connection-state conn) :read-http
                           (connection-last-active conn) (get-universal-time))
                     (epoll-modify epoll-fd (connection-fd conn)
-                                 (logior +epollin+ +epollet+)))))
+                                 (logior +epollin+ +epollet+))
+                    ;; Edge-triggered: data may already be waiting from a
+                    ;; pipelined request. Signal the event loop to try reading.
+                    (return-from handle-client-write :keep-alive))))
              (:ws-upgrade
               ;; WebSocket handshake sent — preserve any data past the HTTP request
               (let* ((http-end (+ (connection-header-end conn) 4))
@@ -448,7 +451,14 @@
                                   ;; Writable (check still alive after read)
                                   (when (and (logtest flags +epollout+)
                                              (lookup-connection fd))
-                                    (handle-client-write conn epoll-fd))))))))))))
+                                    (when (eq (handle-client-write conn epoll-fd)
+                                              :keep-alive)
+                                      ;; Keep-alive reset — read immediately in case
+                                      ;; the next request is already buffered
+                                      ;; (edge-triggered epoll won't re-notify)
+                                      (when (lookup-connection fd)
+                                        (handle-client-read conn epoll-fd
+                                                            handler ws-handler))))))))))))))
       ;; Periodic maintenance
       (let ((now (get-universal-time)))
         (sweep-idle-connections epoll-fd now)
