@@ -205,7 +205,19 @@
          (web-skeleton::ec-mul web-skeleton::+p256-n+
                                (cons web-skeleton::+p256-gx+
                                      web-skeleton::+p256-gy+))
-         nil))
+         nil)
+
+  ;; Invalid-curve point rejected (FIPS 186-4 §5.6.2.3.3)
+  ;; Use the valid RFC 7515 key but flip one byte in y — point no longer
+  ;; satisfies y² ≡ x³ + ax + b (mod p)
+  (let* ((hash (sha256 (sb-ext:string-to-octets "test")))
+         (sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1))
+         (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
+         (bad-y (copy-seq (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))))
+    (setf (aref bad-y 0) (logxor (aref bad-y 0) #xFF))
+    (check "invalid-curve point rejected"
+           (ecdsa-verify-p256 hash sig x bad-y)
+           nil)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HMAC-SHA256 test vectors (RFC 4231)
