@@ -500,10 +500,11 @@
                         :key #'car :test #'string=))))
   response)
 
-(defun http-date ()
-  "Return current UTC time in RFC 7231 IMF-fixdate format."
+(defun http-date (&optional (universal-time (get-universal-time)))
+  "Return UTC time in RFC 7231 IMF-fixdate format.
+   Defaults to current time if no argument given."
   (multiple-value-bind (sec min hour day month year dow)
-      (decode-universal-time (get-universal-time) 0)
+      (decode-universal-time universal-time 0)
     (format nil "~a, ~2,'0d ~a ~4,'0d ~2,'0d:~2,'0d:~2,'0d GMT"
             (nth dow '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
             day
