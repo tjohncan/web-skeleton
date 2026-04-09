@@ -4,7 +4,7 @@ const msg = document.getElementById('msg');
 let ws = null;
 
 function appendLog(text, cls) {
-  var line = document.createElement('div');
+  const line = document.createElement('div');
   line.className = cls;
   line.textContent = text;
   log.appendChild(line);
@@ -32,7 +32,7 @@ function connect(onOpen) {
 
 form.onsubmit = function(e) {
   e.preventDefault();
-  var text = msg.value;
+  const text = msg.value;
   if (!text) return;
   if (!ws || ws.readyState !== 1) {
     connect(function() {
