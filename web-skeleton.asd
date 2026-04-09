@@ -6,11 +6,13 @@
                (:file "src/log" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
+               (:file "src/algorithms/word32" :depends-on ("src/package"))
                (:file "src/algorithms/sha1"  :depends-on ("src/package"
-                                                           "src/algorithms/hex"))
+                                                           "src/algorithms/hex"
+                                                           "src/algorithms/word32"))
                (:file "src/algorithms/sha256" :depends-on ("src/package"
                                                             "src/algorithms/hex"
-                                                            "src/algorithms/sha1"))
+                                                            "src/algorithms/word32"))
                (:file "src/algorithms/hmac"   :depends-on ("src/package"
                                                            "src/algorithms/sha256"))
                (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))

@@ -7,26 +7,6 @@
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
-;;; 32-bit word operations
-;;;
-;;; SHA-1 works entirely in 32-bit unsigned integers. Common Lisp has
-;;; arbitrary-precision integers, so we mask to 32 bits after every
-;;; operation to stay in range.
-;;; ---------------------------------------------------------------------------
-
-(declaim (inline u32+ u32-rotate-left))
-
-(defun u32+ (&rest args)
-  "Add any number of values, masked to 32 bits."
-  (logand #xFFFFFFFF (apply #'+ args)))
-
-(defun u32-rotate-left (n count)
-  "Rotate 32-bit integer N left by COUNT bits."
-  (logand #xFFFFFFFF
-          (logior (ash n count)
-                  (ash n (- count 32)))))
-
-;;; ---------------------------------------------------------------------------
 ;;; SHA-1 round function and constants
 ;;;
 ;;; 80 rounds in 4 groups of 20. Each group uses a different logical
