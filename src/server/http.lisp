@@ -288,13 +288,8 @@
                               line-len *max-header-line-length*))
           (let ((first-byte (aref buf pos)))
             (if (and headers (or (= first-byte 32) (= first-byte 9)))
-                ;; Continuation line — append to previous header value
-                (multiple-value-bind (ts te) (trim-ows-bounds buf pos crlf)
-                  (when (> te ts)
-                    (let* ((prev (car headers))
-                           (extra (bytes-to-string buf ts te)))
-                      (setf (cdr prev)
-                            (concatenate 'string (cdr prev) " " extra)))))
+                ;; RFC 7230 §3.2.4: reject obsolete line folding
+                (http-parse-error "obsolete line folding not accepted")
                 ;; New header — find colon
                 (let ((colon (position 58 buf :start pos :end crlf))) ; 58 = ':'
                   (unless colon
