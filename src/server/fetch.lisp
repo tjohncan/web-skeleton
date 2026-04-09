@@ -160,13 +160,92 @@
               (close stream))))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
+;;; ---------------------------------------------------------------------------
+;;; Buffered stream reader
+;;;
+;;; Wraps a binary stream with a read-ahead buffer so callers can read
+;;; line-by-line without issuing one syscall per byte.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (stream-reader (:constructor make-stream-reader (stream)))
+  (stream nil)
+  (buf    (make-array 8192 :element-type '(unsigned-byte 8)))
+  (pos    0 :type fixnum)
+  (end    0 :type fixnum))
+
+(defun reader-fill (r)
+  "Refill the buffer. Returns bytes read (0 = EOF)."
+  (setf (stream-reader-pos r) 0)
+  (let ((n (read-sequence (stream-reader-buf r) (stream-reader-stream r))))
+    (setf (stream-reader-end r) n)
+    n))
+
+(defun reader-read-line (r)
+  "Read a line from the buffered reader. Returns a string, or NIL at EOF."
+  (let ((line-buf (make-array 256 :element-type '(unsigned-byte 8)
+                                  :fill-pointer 0 :adjustable t)))
+    (loop
+      (when (>= (stream-reader-pos r) (stream-reader-end r))
+        (when (zerop (reader-fill r))
+          (return (if (zerop (fill-pointer line-buf)) nil
+                      (sb-ext:octets-to-string line-buf
+                                               :external-format :utf-8)))))
+      (let* ((buf (stream-reader-buf r))
+             (pos (stream-reader-pos r))
+             (end (stream-reader-end r))
+             (lf  (position 10 buf :start pos :end end)))
+        (if lf
+            (progn
+              (loop for i from pos below lf
+                    for b = (aref buf i)
+                    unless (= b 13) do (vector-push-extend b line-buf))
+              (setf (stream-reader-pos r) (1+ lf))
+              (return (sb-ext:octets-to-string line-buf
+                                               :external-format :utf-8)))
+            (progn
+              (loop for i from pos below end
+                    for b = (aref buf i)
+                    unless (= b 13) do (vector-push-extend b line-buf))
+              (setf (stream-reader-pos r) end)))))))
+
+(defun reader-read-bytes (r count line-buf on-line)
+  "Read COUNT bytes through the buffered reader, splitting into lines.
+   Calls ON-LINE per complete line."
+  (let ((remaining count))
+    (loop while (> remaining 0) do
+      (when (>= (stream-reader-pos r) (stream-reader-end r))
+        (when (zerop (reader-fill r))
+          (return)))
+      (let* ((buf (stream-reader-buf r))
+             (pos (stream-reader-pos r))
+             (avail (- (stream-reader-end r) pos))
+             (take (min avail remaining)))
+        (loop for i from pos below (+ pos take)
+              for byte = (aref buf i)
+              do (cond
+                   ((= byte 10)
+                    (when on-line
+                      (funcall on-line (sb-ext:octets-to-string
+                                        (subseq line-buf 0 (fill-pointer line-buf))
+                                        :external-format :utf-8)))
+                    (setf (fill-pointer line-buf) 0))
+                   ((= byte 13) nil)
+                   (t (vector-push-extend byte line-buf))))
+        (incf (stream-reader-pos r) take)
+        (decf remaining take)))))
+
+;;; ---------------------------------------------------------------------------
+;;; HTTP response streaming
+;;; ---------------------------------------------------------------------------
+
 (defun stream-response-lines (stream on-line)
   "Read an HTTP response from a byte stream. Skip headers, call ON-LINE
    per body line. Handles chunked transfer encoding. Returns the status code."
-  (let ((status nil)
+  (let ((r (make-stream-reader stream))
+        (status nil)
         (chunked nil))
     ;; Read status line + headers
-    (loop for line = (read-stream-line stream)
+    (loop for line = (reader-read-line r)
           for first = t then nil
           while (and line (> (length line) 0))
           do (when first
@@ -182,63 +261,29 @@
                (setf chunked t)))
     ;; Stream body lines
     (if chunked
-        (stream-chunked-lines stream on-line)
-        (loop for line = (read-stream-line stream)
+        (stream-chunked-lines r on-line)
+        (loop for line = (reader-read-line r)
               while line
               do (when on-line (funcall on-line line))))
     (or status 0)))
 
-(defun stream-chunked-lines (stream on-line)
-  "Decode chunked transfer encoding, feed decoded bytes through a line
-   accumulator, call ON-LINE per complete line."
+(defun stream-chunked-lines (r on-line)
+  "Decode chunked transfer encoding via buffered reader R."
   (let ((line-buf (make-array 4096 :element-type '(unsigned-byte 8)
-                                   :fill-pointer 0 :adjustable t))
-        (one (make-array 1 :element-type '(unsigned-byte 8))))
+                                   :fill-pointer 0 :adjustable t)))
     (loop
-      ;; Read chunk size (hex)
-      (let* ((size-line (read-stream-line stream))
+      (let* ((size-line (reader-read-line r))
              (chunk-size (when (and size-line (> (length size-line) 0))
                            (parse-integer size-line :radix 16 :junk-allowed t))))
         (unless (and chunk-size (> chunk-size 0))
-          ;; Final chunk or error — emit any remaining bytes as a line
           (when (> (fill-pointer line-buf) 0)
             (when on-line
               (funcall on-line (sb-ext:octets-to-string
                                 line-buf :external-format :utf-8))))
           (return))
-        ;; Read chunk-size bytes, split into lines
-        (dotimes (i chunk-size)
-          (when (zerop (read-sequence one stream)) (return))
-          (let ((byte (aref one 0)))
-            (cond
-              ((= byte 10)
-               (when on-line
-                 (funcall on-line (sb-ext:octets-to-string
-                                   (subseq line-buf 0 (fill-pointer line-buf))
-                                   :external-format :utf-8)))
-               (setf (fill-pointer line-buf) 0))
-              ((= byte 13) nil)
-              (t (vector-push-extend byte line-buf)))))
-        ;; Consume trailing CRLF after chunk data
-        (read-sequence one stream)
-        (read-sequence one stream)))))
-
-(defun read-stream-line (stream)
-  "Read a line from a byte stream. Returns a string, or NIL at EOF."
-  (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
-                              :fill-pointer 0 :adjustable t))
-        (one (make-array 1 :element-type '(unsigned-byte 8))))
-    (loop
-      (let ((n (read-sequence one stream)))
-        (when (zerop n)
-          (return (if (zerop (fill-pointer buf)) nil
-                      (sb-ext:octets-to-string buf :external-format :utf-8))))
-        (let ((byte (aref one 0)))
-          (cond
-            ((= byte 10)
-             (return (sb-ext:octets-to-string buf :external-format :utf-8)))
-            ((= byte 13) nil)
-            (t (vector-push-extend byte buf))))))))
+        (reader-read-bytes r chunk-size line-buf on-line)
+        ;; Consume trailing CRLF
+        (reader-read-line r)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
