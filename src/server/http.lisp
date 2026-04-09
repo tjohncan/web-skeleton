@@ -50,8 +50,7 @@
   (query    nil :type (or null string))     ; "a=1&b=2" or nil
   (version  "1.1" :type string)             ; "1.0" or "1.1"
   (headers  nil :type list)                 ; alist — ((name . value) ...)
-  (body     nil :type (or null (simple-array (unsigned-byte 8) (*)))))
-                                              ; raw body bytes or nil
+  (body     nil :type (or null (simple-array (unsigned-byte 8) (*))))) ; raw body bytes or nil
 
 ;;; ---------------------------------------------------------------------------
 ;;; Header access
@@ -311,11 +310,11 @@
                       (push (cons name (if (= vs ve) ""
                                            (bytes-to-string buf vs ve)))
                             headers)
-                      (incf count)))))))
+                      (incf count)
+                      (when (> count *max-header-count*)
+                        (http-parse-error "too many headers (~d, max ~d)"
+                                          count *max-header-count*))))))))
         (setf pos (+ crlf 2))))
-    (when (> count *max-header-count*)
-      (http-parse-error "too many headers (~d, max ~d)"
-                        count *max-header-count*))
     (nreverse headers)))
 
 ;;; ---------------------------------------------------------------------------
