@@ -152,6 +152,14 @@
       (when (> payload-length *max-ws-payload-size*)
         (error "WebSocket: frame too large (~d bytes, max ~d)"
                payload-length *max-ws-payload-size*))
+      ;; Control frames (opcode >= 8): must have payload <= 125 and FIN=1
+      ;; (RFC 6455 §5.5)
+      (when (>= opcode 8)
+        (when (> payload-length 125)
+          (error "WebSocket: control frame payload too large (~d bytes, max 125)"
+                 payload-length))
+        (unless fin
+          (error "WebSocket: fragmented control frame")))
       ;; Account for mask key
       (when masked (incf header-size 4))
       ;; Check if we have the full frame
@@ -229,6 +237,9 @@
    (build-ws-frame +ws-op-ping+
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
+(defparameter *ws-send-timeout* 10
+  "Seconds before ws-send gives up writing a frame. 0 to disable.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Synchronous frame send
 ;;;
@@ -243,13 +254,14 @@
    FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
    Safe to call from within ws-handler — the event loop is paused while the
    handler runs, so there is no write contention.
-   Signals an error if the write takes longer than 10 seconds."
+   Signals an error if the write exceeds *ws-send-timeout*."
   (let ((fd (connection-fd conn))
         (pos 0)
         (end (length frame-bytes))
-        (deadline (+ (get-universal-time) 10)))
+        (deadline (when (> *ws-send-timeout* 0)
+                    (+ (get-universal-time) *ws-send-timeout*))))
     (loop while (< pos end)
-          do (when (> (get-universal-time) deadline)
+          do (when (and deadline (> (get-universal-time) deadline))
                (error "ws-send: write timeout"))
              (let ((result (nb-write fd frame-bytes pos (- end pos))))
                (if (eq result :again)
