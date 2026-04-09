@@ -388,12 +388,16 @@
             ((= opcode +ws-op-close+)
              (log-info "ws close requested on fd ~d" (connection-fd conn))
              (setf (connection-ws-frag-buf conn) nil)
-             (let ((remaining (- end pos)))
+             (let* ((payload (ws-frame-payload frame))
+                    (code (if (>= (length payload) 2)
+                              (logior (ash (aref payload 0) 8) (aref payload 1))
+                              1000))
+                    (remaining (- end pos)))
                (when (> remaining 0)
                  (replace buf buf :start1 0 :start2 pos :end2 end))
-               (setf (connection-read-pos conn) remaining))
-             (return-from websocket-on-read
-               (values :close (build-ws-close))))
+               (setf (connection-read-pos conn) remaining)
+               (return-from websocket-on-read
+                 (values :close (build-ws-close code)))))
             (t
              (log-warn "ws unhandled opcode: ~d" opcode))))))
     ;; Concatenate response frames into a single write buffer
