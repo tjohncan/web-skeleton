@@ -199,7 +199,7 @@
             ((char= (char str pos) #\,) (incf pos))
             ((char= (char str pos) #\})
              (return (values (nreverse pairs) (1+ pos))))
-            (t (error "json: expected ',' or '}' at ~d" pos)))))))))
+            (t (error "json: expected ',' or '}' at ~d" pos))))))))
 
 (defun json-parse-array (str pos)
   "Parse a JSON array at POS. Returns (values list new-pos)."
