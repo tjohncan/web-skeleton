@@ -81,6 +81,11 @@
                   (when (and exp (numberp exp)
                              (<= exp (jwt-current-time)))
                     (return-from jwt-verify nil)))
+                ;; Check not-before (RFC 7519 §4.1.5)
+                (let ((nbf (json-get claims "nbf")))
+                  (when (and nbf (numberp nbf)
+                             (> nbf (jwt-current-time)))
+                    (return-from jwt-verify nil)))
                 claims)))))
     (error () nil)))
 
