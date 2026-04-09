@@ -155,9 +155,11 @@
           (setf ssl (%ssl-new ctx))
           (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
             (error "SSL_new failed"))
-          ;; Set SNI hostname
-          (let ((hostname-bytes (sb-ext:string-to-octets hostname
-                                                         :external-format :ascii)))
+          ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses strlen)
+          (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
+                                             (sb-ext:string-to-octets hostname
+                                                                      :external-format :ascii)
+                                             #(0))))
             (sb-sys:with-pinned-objects (hostname-bytes)
               (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
                          (sb-sys:vector-sap hostname-bytes))))
