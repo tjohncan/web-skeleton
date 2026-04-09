@@ -61,6 +61,29 @@
     (check "jwks key kty"
            (json-get (first (json-get jwks "keys")) "kty") "EC")))
 
+(defun test-json-parse-errors ()
+  (format t "~%JSON Parser Errors~%")
+
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "leading zeros rejected"
+           (signals-error-p (lambda () (json-parse "01"))) t)
+    (check "negative leading zeros rejected"
+           (signals-error-p (lambda () (json-parse "-01"))) t)
+    (check "bare zero allowed"
+           (json-parse "0") 0)
+    (check "trailing content rejected"
+           (signals-error-p (lambda () (json-parse "4444 abc"))) t)
+    (check "trailing after array rejected"
+           (signals-error-p (lambda () (json-parse "[1,2] 3"))) t)
+    (check "lone high surrogate rejected"
+           (signals-error-p (lambda () (json-parse "\"\\uD800\""))) t)
+    (check "lone low surrogate rejected"
+           (signals-error-p (lambda () (json-parse "\"\\uDC00\""))) t)
+    (check "high surrogate + non-surrogate rejected"
+           (signals-error-p (lambda () (json-parse "\"\\uD800\\u0041\""))) t)))
+
 (defun test-json-serialize ()
   (format t "~%JSON Serializer~%")
 
@@ -109,6 +132,7 @@
         *tests-failed* 0)
   (format t "~%=== JSON Tests ===~%")
   (test-json-parse)
+  (test-json-parse-errors)
   (test-json-serialize)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
