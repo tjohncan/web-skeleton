@@ -238,7 +238,7 @@
                (let* ((body-start (+ header-end 4))
                       (content-length (scan-content-length
                                        (connection-read-buf conn) header-end)))
-               (if (and content-length (> content-length 0))
+               (if (> content-length 0)
                    ;; Need to read a body
                    (progn
                      ;; Reject oversized bodies before allocating
@@ -318,17 +318,16 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-on-write (conn)
-  "Handle writable event. Flushes the write buffer."
-  (let* ((buf (connection-write-buf conn))
-         (pos (connection-write-pos conn))
-         (remaining (- (connection-write-end conn) pos)))
-    (when (zerop remaining)
-      (return-from connection-on-write :done))
-    (let ((result (nb-write (connection-fd conn) buf pos remaining)))
-      (cond
-        ((eq result :again) :continue)
-        (t
-         (incf (connection-write-pos conn) result)
-         (if (>= (connection-write-pos conn) (connection-write-end conn))
-             :done
-             :continue))))))
+  "Handle writable event. Loops until EAGAIN or all bytes sent.
+   Edge-triggered epoll requires draining writability in one pass."
+  (let ((buf (connection-write-buf conn))
+        (end (connection-write-end conn)))
+    (loop
+      (let* ((pos (connection-write-pos conn))
+             (remaining (- end pos)))
+        (when (zerop remaining)
+          (return :done))
+        (let ((result (nb-write (connection-fd conn) buf pos remaining)))
+          (cond
+            ((eq result :again) (return :continue))
+            (t (incf (connection-write-pos conn) result))))))))
