@@ -96,6 +96,11 @@
   (larg sb-alien:long)
   (parg (* t)))
 
+;;; Hostname verification (OpenSSL 1.1.0+)
+(sb-alien:define-alien-routine ("SSL_set1_host" %ssl-set1-host) sb-alien:int
+  (ssl (* t))
+  (hostname sb-alien:c-string))
+
 ;;; Constants
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
@@ -107,23 +112,27 @@
 (defvar *ssl-ctx* nil
   "Shared SSL_CTX for outbound TLS connections. Created on first use.")
 
+(defvar *ssl-ctx-lock* (sb-thread:make-mutex :name "ssl-ctx-init"))
+
 (defun ensure-ssl-ctx ()
-  "Create the shared SSL_CTX if not already created."
-  (unless *ssl-ctx*
-    ;; Initialize OpenSSL
-    (%openssl-init-ssl 0 (sb-sys:int-sap 0))
-    ;; Create context with modern TLS client method
-    (let ((ctx (%ssl-ctx-new (%tls-client-method))))
-      (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
-        (error "SSL_CTX_new failed"))
-      ;; Load system CA certificates
-      (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
-        (log-warn "tls: could not load system CA certificates"))
-      ;; Enable peer certificate verification
-      (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
-      (setf *ssl-ctx* ctx)
-      (log-info "tls: SSL context initialized")))
-  *ssl-ctx*)
+  "Create the shared SSL_CTX if not already created. Thread-safe."
+  (or *ssl-ctx*
+      (sb-thread:with-mutex (*ssl-ctx-lock*)
+        (unless *ssl-ctx*
+          ;; Initialize OpenSSL
+          (%openssl-init-ssl 0 (sb-sys:int-sap 0))
+          ;; Create context with modern TLS client method
+          (let ((ctx (%ssl-ctx-new (%tls-client-method))))
+            (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
+              (error "SSL_CTX_new failed"))
+            ;; Load system CA certificates
+            (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
+              (log-warn "tls: could not load system CA certificates"))
+            ;; Enable peer certificate verification
+            (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
+            (setf *ssl-ctx* ctx)
+            (log-info "tls: SSL context initialized")))
+        *ssl-ctx*)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; TLS connection lifecycle
@@ -147,12 +156,14 @@
           (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
             (error "SSL_new failed"))
           ;; Set SNI hostname
-          (sb-sys:with-pinned-objects (hostname)
-            (let ((hostname-bytes (sb-ext:string-to-octets hostname
-                                                           :external-format :ascii)))
-              (sb-sys:with-pinned-objects (hostname-bytes)
-                (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
-                           (sb-sys:vector-sap hostname-bytes)))))
+          (let ((hostname-bytes (sb-ext:string-to-octets hostname
+                                                         :external-format :ascii)))
+            (sb-sys:with-pinned-objects (hostname-bytes)
+              (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
+                         (sb-sys:vector-sap hostname-bytes))))
+          ;; Enable hostname verification (OpenSSL 1.1.0+)
+          (when (zerop (%ssl-set1-host ssl hostname))
+            (error "SSL_set1_host failed"))
           ;; Attach to socket fd
           (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket))
           ;; TLS handshake
