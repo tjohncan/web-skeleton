@@ -361,7 +361,7 @@
                                    (when (and (>= (length line) 18)
                                               (string-equal line "transfer-encoding:"
                                                             :end1 18)
-                                              (search "chunked" line :start2 18))
+                                              (search "chunked" line :start2 18 :test #'char-equal))
                                      (setf chunked t))))))
                           ((= byte 13) nil)
                           (t (vector-push-extend byte line-buf))))
