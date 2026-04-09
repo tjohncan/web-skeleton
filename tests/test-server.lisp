@@ -488,6 +488,71 @@
     (check "parse incomplete" result nil)))
 
 ;;; ---------------------------------------------------------------------------
+;;; WebSocket fragmentation and control frame tests
+;;; ---------------------------------------------------------------------------
+
+(defun make-masked-frame (fin opcode payload)
+  "Build a masked client WebSocket frame for testing.
+   Supports payloads up to 65535 bytes (2-byte extended length)."
+  (let* ((len (length payload))
+         (mask #(#xAA #xBB #xCC #xDD))
+         (header-size (if (<= len 125) 6 8))
+         (frame (make-array (+ header-size len) :element-type '(unsigned-byte 8))))
+    (setf (aref frame 0) (logior (if fin #x80 0) opcode))
+    (if (<= len 125)
+        (setf (aref frame 1) (logior #x80 len))
+        (setf (aref frame 1) (logior #x80 126)
+              (aref frame 2) (logand #xFF (ash len -8))
+              (aref frame 3) (logand #xFF len)))
+    (replace frame mask :start1 (- header-size 4))
+    (loop for i from 0 below len
+          do (setf (aref frame (+ header-size i))
+                   (logxor (aref payload i) (aref mask (logand i 3)))))
+    frame))
+
+(defun test-websocket-fragmentation ()
+  (format t "~%WebSocket Fragmentation~%")
+
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+
+    ;; FIN=0 text frame (first fragment) — parses fine
+    (let ((frame (make-masked-frame nil 1 #(104 105))))  ; "hi"
+      (multiple-value-bind (result consumed)
+          (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (check "fragment first: parsed" (not (null result)) t)
+        (check "fragment first: fin" (ws-frame-fin result) nil)
+        (check "fragment first: opcode" (ws-frame-opcode result) 1)
+        (check "fragment first: consumed" consumed (length frame))))
+
+    ;; Continuation frame (FIN=1) — parses fine
+    (let ((frame (make-masked-frame t 0 #(33))))  ; "!"
+      (multiple-value-bind (result consumed)
+          (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (check "fragment continuation: parsed" (not (null result)) t)
+        (check "fragment continuation: fin" (ws-frame-fin result) t)
+        (check "fragment continuation: opcode" (ws-frame-opcode result) 0)))
+
+    ;; Control frame with payload > 125 — rejected
+    (let ((big-payload (make-array 126 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+      (check "control frame >125 rejected"
+             (signals-error-p
+              (lambda ()
+                (let ((frame (make-masked-frame t 9 big-payload)))
+                  (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
+             t))
+
+    ;; Fragmented control frame — rejected
+    (check "fragmented ping rejected"
+           (signals-error-p
+            (lambda ()
+              (let ((frame (make-masked-frame nil 9 #())))
+                (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
+           t)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Static file helper tests
 ;;; ---------------------------------------------------------------------------
 
@@ -600,6 +665,7 @@
   (test-match-path)
   (test-streaming-fetch)
   (test-websocket)
+  (test-websocket-fragmentation)
   (test-static-helpers)
   (test-jwt)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
