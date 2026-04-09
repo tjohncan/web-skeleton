@@ -111,6 +111,132 @@
   "When non-NIL, a function (conn epoll-fd fetch-req host port path) that
    performs a blocking HTTPS fetch.  Set by web-skeleton-tls on load.")
 
+(defvar *https-stream-fn* nil
+  "When non-NIL, a function (method host port path headers body on-line) that
+   performs a blocking streaming HTTPS fetch.  Set by web-skeleton-tls on load.")
+
+;;; ---------------------------------------------------------------------------
+;;; Blocking streaming fetch
+;;;
+;;; Reads the response body line by line, calling a callback per line.
+;;; Designed for NDJSON/SSE streaming APIs (e.g. LLM token streams).
+;;; Blocks the calling thread — call from ws-handler or HTTP handler.
+;;; ---------------------------------------------------------------------------
+
+(defun http-fetch-stream (method url &key headers body on-line)
+  "Blocking streaming HTTP(S) fetch.
+   Connects, sends request, calls (ON-LINE string) for each line of the
+   response body. Returns the HTTP status code.
+   Blocks the calling thread for the duration of the response."
+  (multiple-value-bind (scheme host port path) (parse-url url)
+    (if (eq scheme :https)
+        (if *https-stream-fn*
+            (funcall *https-stream-fn* method host port path headers body on-line)
+            (error "HTTPS streaming not available — load web-skeleton-tls"))
+        (fetch-stream-plain method host port path headers body on-line))))
+
+(defun fetch-stream-plain (method host port path headers body on-line)
+  "HTTP streaming fetch over plain TCP."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (unwind-protect
+        (progn
+          (sb-bsd-sockets:socket-connect
+           socket
+           (sb-bsd-sockets:host-ent-address
+            (sb-bsd-sockets:get-host-by-name host))
+           port)
+          (let ((stream (sb-bsd-sockets:socket-make-stream
+                         socket :input t :output t
+                         :element-type '(unsigned-byte 8)
+                         :buffering :full)))
+            (unwind-protect
+                (let ((request-bytes (build-outbound-request
+                                     method host path
+                                     :headers headers :body body)))
+                  (write-sequence request-bytes stream)
+                  (force-output stream)
+                  (stream-response-lines stream on-line))
+              (close stream))))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun stream-response-lines (stream on-line)
+  "Read an HTTP response from a byte stream. Skip headers, call ON-LINE
+   per body line. Handles chunked transfer encoding. Returns the status code."
+  (let ((status nil)
+        (chunked nil))
+    ;; Read status line + headers
+    (loop for line = (read-stream-line stream)
+          for first = t then nil
+          while (and line (> (length line) 0))
+          do (when first
+               (let ((sp (position #\Space line)))
+                 (when (and sp (< (+ sp 3) (length line)))
+                   (setf status (parse-integer line :start (1+ sp)
+                                                    :end (+ sp 4)
+                                                    :junk-allowed t)))))
+             (when (search "chunked" line)
+               (setf chunked t)))
+    ;; Stream body lines
+    (if chunked
+        (stream-chunked-lines stream on-line)
+        (loop for line = (read-stream-line stream)
+              while line
+              do (when on-line (funcall on-line line))))
+    (or status 0)))
+
+(defun stream-chunked-lines (stream on-line)
+  "Decode chunked transfer encoding, feed decoded bytes through a line
+   accumulator, call ON-LINE per complete line."
+  (let ((line-buf (make-array 4096 :element-type '(unsigned-byte 8)
+                                   :fill-pointer 0 :adjustable t))
+        (one (make-array 1 :element-type '(unsigned-byte 8))))
+    (loop
+      ;; Read chunk size (hex)
+      (let* ((size-line (read-stream-line stream))
+             (chunk-size (when (and size-line (> (length size-line) 0))
+                           (parse-integer size-line :radix 16 :junk-allowed t))))
+        (unless (and chunk-size (> chunk-size 0))
+          ;; Final chunk or error — emit any remaining bytes as a line
+          (when (> (fill-pointer line-buf) 0)
+            (when on-line
+              (funcall on-line (sb-ext:octets-to-string
+                                line-buf :external-format :utf-8))))
+          (return))
+        ;; Read chunk-size bytes, split into lines
+        (dotimes (i chunk-size)
+          (when (zerop (read-sequence one stream)) (return))
+          (let ((byte (aref one 0)))
+            (cond
+              ((= byte 10)
+               (when on-line
+                 (funcall on-line (sb-ext:octets-to-string
+                                   (subseq line-buf 0 (fill-pointer line-buf))
+                                   :external-format :utf-8)))
+               (setf (fill-pointer line-buf) 0))
+              ((= byte 13) nil)
+              (t (vector-push-extend byte line-buf)))))
+        ;; Consume trailing CRLF after chunk data
+        (read-sequence one stream)
+        (read-sequence one stream)))))
+
+(defun read-stream-line (stream)
+  "Read a line from a byte stream. Returns a string, or NIL at EOF."
+  (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
+                              :fill-pointer 0 :adjustable t))
+        (one (make-array 1 :element-type '(unsigned-byte 8))))
+    (loop
+      (let ((n (read-sequence one stream)))
+        (when (zerop n)
+          (return (if (zerop (fill-pointer buf)) nil
+                      (sb-ext:octets-to-string buf :external-format :utf-8))))
+        (let ((byte (aref one 0)))
+          (cond
+            ((= byte 10)
+             (return (sb-ext:octets-to-string buf :external-format :utf-8)))
+            ((= byte 13) nil)
+            (t (vector-push-extend byte buf))))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------

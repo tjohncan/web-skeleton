@@ -346,6 +346,75 @@
          nil))
 
 ;;; ---------------------------------------------------------------------------
+;;; Streaming fetch tests (no network — uses temp file as mock stream)
+;;; ---------------------------------------------------------------------------
+
+(defun make-mock-stream (bytes)
+  "Write BYTES to a temp file and return a binary input stream."
+  (let ((path (merge-pathnames "ws-test-stream.tmp"
+                               (uiop:temporary-directory))))
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+      (write-sequence bytes out))
+    (open path :element-type '(unsigned-byte 8))))
+
+(defun ascii-bytes (string)
+  "Convert STRING to a byte vector."
+  (sb-ext:string-to-octets string :external-format :ascii))
+
+(defun test-streaming-fetch ()
+  (format t "~%Streaming Fetch~%")
+
+  ;; Non-chunked response
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Content-Type: application/x-ndjson" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "{\"token\":\"hello\"}" (string #\Newline)
+                "{\"token\":\"world\"}" (string #\Newline))))
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (let ((status (web-skeleton::stream-response-lines
+                       stream (lambda (line) (push line lines)))))
+          (setf lines (nreverse lines))
+          (check "non-chunked status" status 200)
+          (check "non-chunked line count" (length lines) 2)
+          (check "non-chunked first line" (first lines) "{\"token\":\"hello\"}")
+          (check "non-chunked second line" (second lines) "{\"token\":\"world\"}"))
+      (close stream)))
+
+  ;; Chunked response
+  (let* ((chunk1 (concatenate 'string "{\"n\":1}" (string #\Newline)))
+         (chunk2 (concatenate 'string "{\"n\":2}" (string #\Newline)))
+         (raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                ;; chunk 1
+                (format nil "~x" (length chunk1)) (string #\Return) (string #\Newline)
+                chunk1
+                (string #\Return) (string #\Newline)
+                ;; chunk 2
+                (format nil "~x" (length chunk2)) (string #\Return) (string #\Newline)
+                chunk2
+                (string #\Return) (string #\Newline)
+                ;; final chunk
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (let ((status (web-skeleton::stream-response-lines
+                       stream (lambda (line) (push line lines)))))
+          (setf lines (nreverse lines))
+          (check "chunked status" status 200)
+          (check "chunked line count" (length lines) 2)
+          (check "chunked first line" (first lines) "{\"n\":1}")
+          (check "chunked second line" (second lines) "{\"n\":2}"))
+      (close stream))))
+
+;;; ---------------------------------------------------------------------------
 ;;; WebSocket tests
 ;;; ---------------------------------------------------------------------------
 
@@ -518,6 +587,7 @@
   (test-url-decode)
   (test-query-string)
   (test-match-path)
+  (test-streaming-fetch)
   (test-websocket)
   (test-static-helpers)
   (test-jwt)

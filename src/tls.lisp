@@ -280,9 +280,111 @@
                      (logior +epollout+ +epollet+))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Blocking streaming HTTPS fetch
+;;; ---------------------------------------------------------------------------
+
+(defun https-fetch-stream (method host port path headers body on-line)
+  "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line."
+  (multiple-value-bind (ssl socket)
+      (tls-connect host port)
+    (unwind-protect
+        (progn
+          (tls-write-all ssl (build-outbound-request method host path
+                                                     :headers headers :body body))
+          (tls-stream-response ssl on-line))
+      (tls-close ssl socket))))
+
+(defun tls-stream-response (ssl on-line)
+  "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
+   Handles chunked transfer encoding. Returns the status code."
+  (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)))
+        (line-buf (make-array 4096 :element-type '(unsigned-byte 8)
+                                   :fill-pointer 0 :adjustable t))
+        (status nil)
+        (chunked nil)
+        (in-headers t)
+        (first-line t)
+        ;; Chunked state
+        (in-chunk-size nil)
+        (chunk-remaining 0))
+    (flet ((emit-line ()
+             (let ((line (sb-ext:octets-to-string
+                          (subseq line-buf 0 (fill-pointer line-buf))
+                          :external-format :utf-8)))
+               (setf (fill-pointer line-buf) 0)
+               line))
+           (emit-body-line ()
+             (let ((line (sb-ext:octets-to-string
+                          (subseq line-buf 0 (fill-pointer line-buf))
+                          :external-format :utf-8)))
+               (setf (fill-pointer line-buf) 0)
+               (when on-line (funcall on-line line)))))
+      (loop
+        (sb-sys:with-pinned-objects (buf)
+          (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
+            (when (<= n 0) (return))
+            (loop for i from 0 below n
+                  for byte = (aref buf i)
+                  do (cond
+                       ;; Header phase
+                       (in-headers
+                        (cond
+                          ((= byte 10)
+                           (let ((line (emit-line)))
+                             (if (zerop (length line))
+                                 (progn
+                                   (setf in-headers nil)
+                                   (when chunked (setf in-chunk-size t)))
+                                 (progn
+                                   (when first-line
+                                     (let ((sp (position #\Space line)))
+                                       (when (and sp (< (+ sp 3) (length line)))
+                                         (setf status (parse-integer line :start (1+ sp)
+                                                                          :end (+ sp 4)
+                                                                          :junk-allowed t))))
+                                     (setf first-line nil))
+                                   (when (search "chunked" line)
+                                     (setf chunked t))))))
+                          ((= byte 13) nil)
+                          (t (vector-push-extend byte line-buf))))
+                       ;; Chunked body — reading chunk size
+                       ((and chunked in-chunk-size)
+                        (cond
+                          ((= byte 10)
+                           ;; Skip empty lines (chunk-terminator CRLFs)
+                           (when (> (fill-pointer line-buf) 0)
+                             (let* ((size-str (emit-line))
+                                    (size (parse-integer size-str :radix 16
+                                                                  :junk-allowed t)))
+                               (if (and size (> size 0))
+                                   (setf chunk-remaining size
+                                         in-chunk-size nil)
+                                   (return)))))  ; final chunk
+                          ((= byte 13) nil)
+                          (t (vector-push-extend byte line-buf))))
+                       ;; Chunked body — reading chunk data
+                       (chunked
+                        (when (> chunk-remaining 0)
+                          (decf chunk-remaining)
+                          (cond
+                            ((= byte 10) (emit-body-line))
+                            ((= byte 13) nil)
+                            (t (vector-push-extend byte line-buf))))
+                        (when (zerop chunk-remaining)
+                          (setf in-chunk-size t)))
+                       ;; Non-chunked body
+                       (t
+                        (cond
+                          ((= byte 10) (emit-body-line))
+                          ((= byte 13) nil)
+                          (t (vector-push-extend byte line-buf))))))))))
+    (or status 0)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Registration — hook into the core framework
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
   (setf *https-fetch-fn* #'https-fetch)
+  (setf *https-stream-fn* #'https-fetch-stream)
   (log-info "tls: HTTPS fetch enabled"))
