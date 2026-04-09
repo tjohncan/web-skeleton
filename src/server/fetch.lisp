@@ -175,7 +175,10 @@
                    (setf status (parse-integer line :start (1+ sp)
                                                     :end (+ sp 4)
                                                     :junk-allowed t)))))
-             (when (search "chunked" line)
+             (when (and (>= (length line) 18)
+                        (string-equal line "transfer-encoding:"
+                                      :end1 18)
+                        (search "chunked" line :start2 18))
                (setf chunked t)))
     ;; Stream body lines
     (if chunked
