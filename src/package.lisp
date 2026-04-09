@@ -86,6 +86,7 @@
            #:http-fetch
            #:http-fetch-stream
            #:*https-fetch-fn*
+           #:*https-stream-fn*
            ;; Conditions
            #:http-parse-error
            ;; Limits

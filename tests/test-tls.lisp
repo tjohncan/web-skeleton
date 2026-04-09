@@ -23,4 +23,4 @@
   (check "https-fetch-fn set"
          (not (null web-skeleton:*https-fetch-fn*)) t)
   (check "https-stream-fn set"
-         (not (null web-skeleton::*https-stream-fn*)) t))
+         (not (null web-skeleton:*https-stream-fn*)) t))
