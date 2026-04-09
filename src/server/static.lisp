@@ -57,12 +57,13 @@
 
 (defstruct static-entry
   "Cached static file with pre-built GET and HEAD responses."
-  (get-response  nil :type (simple-array (unsigned-byte 8) (*)))
-  (head-response nil :type (simple-array (unsigned-byte 8) (*))))
+  (get-response  nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (head-response nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
   "Maps URL path (string) to STATIC-ENTRY struct.
-   Populated at startup by load-static-files, read-only at request time.")
+   Populated at startup by load-static-files, read-only at request time.
+   Not thread-safe — call load-static-files before start-server only.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Pre-build complete HTTP response bytes
@@ -77,6 +78,9 @@
                        (cons "content-length" (write-to-string (length content)))
                        (cons "cache-control" "public, max-age=3600")
                        (cons "x-content-type-options" "nosniff")
+                       ;; Date is baked at load time (server startup), not per-request.
+                       ;; Tradeoff: technically stale per RFC 7231, but avoids
+                       ;; per-response work. Cache-Control max-age governs freshness.
                        (cons "date" (http-date))
                        (cons "last-modified" (http-date file-mtime)))))
     (make-static-entry
