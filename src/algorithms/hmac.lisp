@@ -4,7 +4,7 @@
 ;;; HMAC-SHA256 (RFC 2104)
 ;;;
 ;;; Standard HMAC construction using SHA-256.
-;;; Used by JWT validation, webhook signature verification, and HKDF.
+;;; Available for application use (e.g. webhook signature verification).
 ;;; ===========================================================================
 
 (defconstant +hmac-sha256-block-size+ 64
