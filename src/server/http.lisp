@@ -152,7 +152,8 @@
 
 (defun get-query-param (request name)
   "Look up query parameter NAME from the request's query string.
-   Returns the decoded value string, or NIL if not present."
+   Returns the decoded value string, or NIL if not present.
+   Reparses the query string on each call; cache the result if calling repeatedly."
   (cdr (assoc name (parse-query-string (http-request-query request))
               :test #'string=)))
 
@@ -186,7 +187,7 @@
                   for seg in path-segs
                   always (if (and (> (length pat) 0)
                                   (char= (char pat 0) #\:))
-                             (progn
+                             (when (> (length seg) 0)
                                (push (cons (subseq pat 1) (url-decode seg))
                                      bindings)
                                t)
@@ -411,22 +412,28 @@
     (200 . "OK")
     (201 . "Created")
     (204 . "No Content")
+    (206 . "Partial Content")
     (301 . "Moved Permanently")
     (302 . "Found")
     (304 . "Not Modified")
+    (307 . "Temporary Redirect")
+    (308 . "Permanent Redirect")
     (400 . "Bad Request")
     (401 . "Unauthorized")
     (403 . "Forbidden")
     (404 . "Not Found")
     (405 . "Method Not Allowed")
     (408 . "Request Timeout")
+    (409 . "Conflict")
     (413 . "Payload Too Large")
     (414 . "URI Too Long")
+    (429 . "Too Many Requests")
     (431 . "Request Header Fields Too Large")
     (500 . "Internal Server Error")
     (501 . "Not Implemented")
     (502 . "Bad Gateway")
-    (503 . "Service Unavailable"))
+    (503 . "Service Unavailable")
+    (504 . "Gateway Timeout"))
   "Map of HTTP status codes to reason phrases.")
 
 (defun status-reason (code)
@@ -493,6 +500,17 @@
                         :key #'car :test #'string=))))
   response)
 
+(defun http-date ()
+  "Return current UTC time in RFC 7231 IMF-fixdate format."
+  (multiple-value-bind (sec min hour day month year dow)
+      (decode-universal-time (get-universal-time) 0)
+    (format nil "~a, ~2,'0d ~a ~4,'0d ~2,'0d:~2,'0d:~2,'0d GMT"
+            (nth dow '("Mon" "Tue" "Wed" "Thu" "Fri" "Sat" "Sun"))
+            day
+            (nth (1- month) '("Jan" "Feb" "Mar" "Apr" "May" "Jun"
+                              "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
+            year hour min sec)))
+
 (defun format-response (response)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket."
   (let* ((status (http-response-status response))
@@ -505,7 +523,11 @@
                       (cons (cons "content-length"
                                   (write-to-string (length body-bytes)))
                             headers)
-                      headers)))
+                      headers))
+         ;; RFC 7231 §7.1.1.2: origin server MUST send Date
+         (headers (if (assoc "date" headers :test #'string=)
+                      headers
+                      (cons (cons "date" (http-date)) headers))))
     (serialize-http-message
      (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
      headers body-bytes)))
