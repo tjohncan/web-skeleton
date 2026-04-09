@@ -152,6 +152,13 @@
     (unless (and (<= 1 r (1- +p256-n+))
                  (<= 1 s (1- +p256-n+)))
       (return-from ecdsa-verify-p256 nil))
+    ;; Point-on-curve check (FIPS 186-4 §5.6.2.3.3):
+    ;; reject invalid-curve points to prevent small-subgroup attacks
+    (unless (= (mod-mul qy qy +p256-p+)
+               (mod-add (mod-add (mod-mul qx (mod-mul qx qx +p256-p+) +p256-p+)
+                                 (mod-mul +p256-a+ qx +p256-p+) +p256-p+)
+                         +p256-b+ +p256-p+))
+      (return-from ecdsa-verify-p256 nil))
     ;; w = s^-1 mod n
     (let* ((w (mod-inv s +p256-n+))
            ;; u1 = z*w mod n, u2 = r*w mod n
