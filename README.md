@@ -98,7 +98,7 @@ src/
     websocket.lisp           WebSocket handshake and incremental frame protocol
     jwt.lisp                 JWT validation (ES256) and JWKS parsing
     static.lisp              In-memory static file cache and serving
-    fetch.lisp               Non-blocking outbound HTTP client
+    fetch.lisp               Outbound HTTP client (non-blocking fetch, streaming fetch)
     main.lisp                epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp               Demo package declaration
@@ -166,10 +166,12 @@ tests/
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
   makes the outbound call, and resumes with the callback result
-- **Outbound TLS** — HTTPS support in `http-fetch` via optional `web-skeleton-tls`
-  system. libssl FFI bindings, system CA verification, SNI. Same `http-fetch`
-  API — just use `https://` URLs. Blocking on the worker thread (fine for
-  API calls, JWKS fetch, webhooks)
+- **Streaming fetch** — `http-fetch-stream` reads a response body line by line,
+  calling a callback per line. Designed for NDJSON/SSE streaming APIs (e.g.
+  LLM token streams). Blocking — call from within a handler
+- **Outbound TLS** — HTTPS support in `http-fetch` and `http-fetch-stream` via
+  optional `web-skeleton-tls` system. libssl FFI bindings, system CA
+  verification, SNI. Same API — just use `https://` URLs
 - **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
   close frames, flushes in-progress writes, force-closes after drain timeout
 - **Demo application** — separate ASDF system with static demo page and echo server
@@ -187,7 +189,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
 | `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB) |
-| `*idle-timeout*` | `30` | Seconds before an idle HTTP connection is closed |
+| `*idle-timeout*` | `10` | Seconds before an idle HTTP connection is closed |
 | `*ws-idle-timeout*` | `86400` | Seconds before an inactive WebSocket is closed |
 | `*ws-ping-interval*` | `30` | Seconds between server-initiated WebSocket pings |
 | `*ws-max-missed-pongs*` | `3` | Missed pongs before a WebSocket is declared dead |
