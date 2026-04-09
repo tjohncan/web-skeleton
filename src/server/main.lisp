@@ -374,7 +374,16 @@
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
-      (close-connection conn epoll-fd))
+      ;; Send 400 before closing so the client gets a proper HTTP response
+      (handler-case
+          (let ((err-bytes (format-response (make-error-response 400))))
+            (connection-queue-write conn err-bytes)
+            (setf (connection-state conn) :write-response
+                  (connection-close-after-p conn) t)
+            (epoll-modify epoll-fd (connection-fd conn)
+                         (logior +epollout+ +epollet+)))
+        (error ()
+          (close-connection conn epoll-fd))))
     (error (e)
       (log-error "error fd ~d: ~a" (connection-fd conn) e)
       (close-connection conn epoll-fd))))
