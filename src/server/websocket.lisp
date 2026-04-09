@@ -128,6 +128,9 @@
            (len7 (logand b1 #x7F))
            (header-size 2)
            payload-length)
+      ;; RSV1/2/3 must be zero unless an extension negotiated them (RFC 6455 §5.2)
+      (when (logtest b0 #x70)
+        (error "WebSocket: non-zero RSV bits"))
       ;; Determine payload length and header size
       (cond
         ((<= len7 125)
@@ -239,12 +242,16 @@
   "Send FRAME-BYTES to CONN synchronously, blocking until fully written.
    FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
    Safe to call from within ws-handler — the event loop is paused while the
-   handler runs, so there is no write contention."
+   handler runs, so there is no write contention.
+   Signals an error if the write takes longer than 10 seconds."
   (let ((fd (connection-fd conn))
         (pos 0)
-        (end (length frame-bytes)))
+        (end (length frame-bytes))
+        (deadline (+ (get-universal-time) 10)))
     (loop while (< pos end)
-          do (let ((result (nb-write fd frame-bytes pos (- end pos))))
+          do (when (> (get-universal-time) deadline)
+               (error "ws-send: write timeout"))
+             (let ((result (nb-write fd frame-bytes pos (- end pos))))
                (if (eq result :again)
                    (poll-writable fd 1000)
                    (incf pos result))))))
