@@ -58,6 +58,9 @@
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
+(defparameter *fetch-timeout* 30
+  "Seconds before a parked :awaiting connection is reaped. 0 to disable.")
+
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
    Inactivity = no text or binary frames from the client (pongs don't count).")
@@ -75,8 +78,11 @@
     (maphash (lambda (fd conn)
                (declare (ignore fd))
                (unless (connection-outbound-p conn)
-                 (let* ((ws-p (eq (connection-state conn) :websocket))
-                        (timeout (if ws-p *ws-idle-timeout* *idle-timeout*)))
+                 (let* ((state (connection-state conn))
+                        (timeout (cond
+                                   ((eq state :websocket) *ws-idle-timeout*)
+                                   ((eq state :awaiting)  *fetch-timeout*)
+                                   (t                     *idle-timeout*))))
                    (when (and (> timeout 0)
                               (> (- now (connection-last-active conn)) timeout))
                      (push conn idle)))))
@@ -196,9 +202,21 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun close-connection (conn epoll-fd)
-  "Remove from epoll, unregister, close fd."
+  "Remove from epoll, unregister, close fd.
+   If CONN is :awaiting, also closes its outbound connection to prevent
+   use-after-close on fd reuse."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
+      ;; If parked waiting for a fetch, close the orphaned outbound too
+      (when (eq (connection-state conn) :awaiting)
+        (let ((out-fd (connection-awaiting-fd conn)))
+          (when (>= out-fd 0)
+            (let ((out-conn (lookup-connection out-fd)))
+              (when out-conn
+                (ignore-errors (epoll-remove epoll-fd out-fd))
+                (unregister-connection out-conn)
+                (connection-close out-conn)
+                (log-debug "closed orphaned outbound fd ~d" out-fd))))))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (connection-close conn)

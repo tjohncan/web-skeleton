@@ -277,7 +277,7 @@
                  (sb-bsd-sockets:get-host-by-name host))))
       (handler-case
           (sb-bsd-sockets:socket-connect socket addr port)
-        (error () nil))
+        (sb-bsd-sockets:socket-error () nil))
       (let* ((out-fd (socket-fd socket))
              (request-bytes (build-outbound-request
                             (http-fetch-request-method fetch-req)
