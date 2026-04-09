@@ -142,9 +142,13 @@
       ;; Bind *read-default-float-format* to double-float so the CL reader
       ;; produces full 64-bit precision (default is single-float).
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
-                  (let ((*read-default-float-format* 'double-float)
-                        (*read-eval* nil))
-                    (read-from-string num-str))
+                  (let* ((*read-default-float-format* 'double-float)
+                         (*read-eval* nil)
+                         (val (read-from-string num-str)))
+                    (when (or (sb-ext:float-infinity-p val)
+                              (sb-ext:float-nan-p val))
+                      (error "json: number out of range at ~d" start))
+                    val)
                   (parse-integer num-str))
               pos))))
 
