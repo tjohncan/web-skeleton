@@ -178,30 +178,35 @@
   (assert (char= (char str pos) #\{))
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
+  (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
   (when (char= (char str pos) #\})
     (return-from json-parse-object (values nil (1+ pos))))
   (let ((pairs nil))
     (loop
       (setf pos (json-skip-whitespace str pos))
+      (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
       (multiple-value-bind (key new-pos) (json-parse-string str pos)
         (setf pos (json-skip-whitespace str new-pos))
+        (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
         (unless (char= (char str pos) #\:)
           (error "json: expected ':' at ~d" pos))
         (incf pos)
         (multiple-value-bind (val new-pos2) (json-parse-value str pos)
           (push (cons key val) pairs)
           (setf pos (json-skip-whitespace str new-pos2))
+          (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
           (cond
             ((char= (char str pos) #\,) (incf pos))
             ((char= (char str pos) #\})
              (return (values (nreverse pairs) (1+ pos))))
-            (t (error "json: expected ',' or '}' at ~d" pos))))))))
+            (t (error "json: expected ',' or '}' at ~d" pos)))))))))
 
 (defun json-parse-array (str pos)
   "Parse a JSON array at POS. Returns (values list new-pos)."
   (assert (char= (char str pos) #\[))
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
+  (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
   (when (char= (char str pos) #\])
     (return-from json-parse-array (values nil (1+ pos))))
   (let ((items nil))
@@ -209,6 +214,7 @@
       (multiple-value-bind (val new-pos) (json-parse-value str pos)
         (push val items)
         (setf pos (json-skip-whitespace str new-pos))
+        (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
         (cond
           ((char= (char str pos) #\,) (incf pos))
           ((char= (char str pos) #\])
@@ -248,6 +254,8 @@
     ((eq value t)      (write-string "true" stream))
     ((eq value :false) (write-string "false" stream))
     ((eq value :null)  (write-string "null" stream))
+    ;; NIL serializes as null. Empty {} and [] both parse to NIL,
+    ;; so they round-trip to null. Use :NULL for explicit null if needed.
     ((null value)      (write-string "null" stream))
     ((stringp value)   (json-write-string value stream))
     ((integerp value)  (format stream "~d" value))
