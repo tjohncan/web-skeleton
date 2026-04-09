@@ -54,7 +54,7 @@
   (close-after-p  nil :type boolean)          ; T = close after response sent
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
-  (ws-frag-buf   nil))                        ; accumulated payload chunks, or NIL
+  (ws-frag-buf   nil :type list))              ; accumulated payload chunks, or NIL
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor
@@ -131,11 +131,10 @@
                                          :external-format :ascii)))
         (result nil))
     (loop for i from 0 below end
-          do (when (and ;; Only match at start of a header line (BOF or after CRLF)
-                        (or (zerop i)
-                            (and (>= i 2)
-                                 (= (aref buf (- i 2)) 13)
-                                 (= (aref buf (- i 1)) 10)))
+          do (when (and ;; Only match at start of a header line (after CRLF)
+                        (and (>= i 2)
+                             (= (aref buf (- i 2)) 13)
+                             (= (aref buf (- i 1)) 10))
                         ;; Case-insensitive match of "content-length:"
                         (<= (+ i (length name)) end)
                         (loop for j below (length name)
@@ -182,10 +181,9 @@
                (sb-ext:string-to-octets "transfer-encoding:"
                                          :external-format :ascii))))
     (loop for i from 0 below end
-          thereis (and (or (zerop i)
-                           (and (>= i 2)
-                                (= (aref buf (- i 2)) 13)
-                                (= (aref buf (- i 1)) 10)))
+          thereis (and (and (>= i 2)
+                            (= (aref buf (- i 2)) 13)
+                            (= (aref buf (- i 1)) 10))
                        (<= (+ i (length name)) end)
                        (loop for j below (length name)
                              for b = (aref buf (+ i j))
@@ -238,8 +236,8 @@
                  (http-parse-error "Transfer-Encoding not supported"))
                ;; Check if there's a body to read
                (let* ((body-start (+ header-end 4))
-                    (content-length (scan-content-length
-                                    (connection-read-buf conn) header-end)))
+                      (content-length (scan-content-length
+                                       (connection-read-buf conn) header-end)))
                (if (and content-length (> content-length 0))
                    ;; Need to read a body
                    (progn
