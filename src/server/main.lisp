@@ -503,7 +503,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun cpu-count ()
-  "Return the number of online CPU cores."
+  "Return the number of online CPU cores.
+   Parses the 0-N format from /sys/devices/system/cpu/online.
+   Falls back to 1 for exotic topologies (comma-separated ranges, etc.)."
   (handler-case
       (with-open-file (s "/sys/devices/system/cpu/online")
         (let* ((line (read-line s))
