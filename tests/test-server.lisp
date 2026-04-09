@@ -346,7 +346,10 @@
          nil))
 
 ;;; ---------------------------------------------------------------------------
-;;; Streaming fetch tests (no network — uses temp file as mock stream)
+;;; Streaming fetch tests (no network — in-memory byte stream mock)
+;;;
+;;; Intentionally minimal: only stream-read-byte and stream-element-type.
+;;; read-sequence falls back to per-byte reads, which is fine for tests.
 ;;; ---------------------------------------------------------------------------
 
 (defclass byte-array-stream (sb-gray:fundamental-binary-input-stream)
