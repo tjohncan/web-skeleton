@@ -25,8 +25,8 @@ function connect(onOpen) {
   ws.onclose = function() {
     appendLog('[status] disconnected', 'status');
   };
-  ws.onerror = function() {
-    appendLog('[status] error', 'status');
+  ws.onerror = function(e) {
+    appendLog('[error] connection error', 'err');
   };
 }
 
