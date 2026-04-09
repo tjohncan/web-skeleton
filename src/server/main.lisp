@@ -12,8 +12,8 @@
 ;;; TCP listener
 ;;; ---------------------------------------------------------------------------
 
-(defun make-tcp-listener (port)
-  "Create a TCP socket, bind to 0.0.0.0:PORT, listen with a backlog of 128.
+(defun make-tcp-listener (host port)
+  "Create a TCP socket, bind to HOST:PORT, listen with a backlog of 128.
    Sets SO_REUSEADDR, SO_REUSEPORT, and non-blocking. Returns the socket."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                :type :stream
@@ -21,7 +21,7 @@
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
     (set-socket-option-int (socket-fd socket)
                            +sol-socket+ +so-reuseport+ 1)
-    (sb-bsd-sockets:socket-bind socket #(0 0 0 0) port)
+    (sb-bsd-sockets:socket-bind socket host port)
     (sb-bsd-sockets:socket-listen socket 128)
     (set-nonblocking (socket-fd socket))
     socket))
@@ -519,11 +519,11 @@
 ;;; Worker
 ;;; ---------------------------------------------------------------------------
 
-(defun run-worker (port worker-id handler ws-handler)
+(defun run-worker (host port worker-id handler ws-handler)
   "Run a single worker: own listener, own epoll fd, own connections."
   (let ((*connections* (make-hash-table :test #'eql))
         (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8))))
-    (let* ((listener (make-tcp-listener port))
+    (let* ((listener (make-tcp-listener host port))
            (epoll-fd (epoll-create)))
       (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
       (epoll-add epoll-fd (socket-fd listener)
@@ -560,9 +560,11 @@
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
-(defun start-server (&key (port 8081) (workers (cpu-count))
+(defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler)
-  "Start the server with WORKERS event loops on PORT.
+  "Start the server with WORKERS event loops on HOST:PORT.
+   HOST is a 4-byte vector (default #(127 0 0 1) = localhost only;
+   use #(0 0 0 0) to listen on all interfaces).
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
@@ -573,11 +575,11 @@
     (lambda (signal info context)
       (declare (ignore signal info context))
       (setf *shutdown* t)))
-  (log-info "starting ~d worker~:p on port ~d" workers port)
+  (log-info "starting ~d worker~:p on ~{~d~^.~}:~d" workers (coerce host 'list) port)
   (let ((threads (loop for i from 0 below workers
                        collect (sb-thread:make-thread
                                 (let ((id i))
-                                  (lambda () (run-worker port id handler ws-handler)))
+                                  (lambda () (run-worker host port id handler ws-handler)))
                                 :name (format nil "web-skeleton-~d" i)))))
     (unwind-protect
         (handler-case

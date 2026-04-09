@@ -198,15 +198,17 @@ All configurable via `setf` before calling `start-server`.
 | `*fetch-timeout*` | `30` | Seconds before a parked connection waiting for an outbound fetch is reaped |
 | `*drain-timeout*` | `5` | Seconds to wait for connections to drain on shutdown |
 
-The `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
 
 ```lisp
-(start-server :port 8081
+(start-server :host #(127 0 0 1)  ; localhost only (default)
+              :port 8081
               :workers 4
               :handler #'my-app:handle-request
               :ws-handler #'my-app:handle-ws-message)
 ```
 
+Use `:host #(0 0 0 0)` to listen on all interfaces.
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
 
