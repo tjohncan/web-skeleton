@@ -86,6 +86,7 @@ src/
   json.lisp                  JSON parser and serializer (RFC 8259)
   tls.lisp                   libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
+    word32.lisp              32-bit unsigned word ops (shared by SHA-1, SHA-256)
     hex.lisp                 Hex encoding utilities
     sha1.lisp                SHA-1 digest (FIPS 180-4)
     sha256.lisp              SHA-256 digest (FIPS 180-4)
