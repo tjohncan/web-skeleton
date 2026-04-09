@@ -78,10 +78,11 @@
                        (cons "content-length" (write-to-string (length content)))
                        (cons "cache-control" "public, max-age=3600")
                        (cons "x-content-type-options" "nosniff")
-                       ;; Date is baked at load time (server startup), not per-request.
-                       ;; Tradeoff: technically stale per RFC 7231, but avoids
-                       ;; per-response work. Cache-Control max-age governs freshness.
-                       (cons "date" (http-date))
+                       ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
+                       ;; Pre-built responses cannot carry a per-request timestamp,
+                       ;; and a stale Date would defeat max-age for caching proxies.
+                       ;; Omission is the least-harmful option: caches fall back to
+                       ;; received time (RFC 7234 §4.2.3), preserving correct freshness.
                        (cons "last-modified" (http-date file-mtime)))))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK" headers content)
