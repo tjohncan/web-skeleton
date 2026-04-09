@@ -88,10 +88,12 @@
 
 (defun connection-read-available (conn)
   "Drain all available bytes from fd into read buffer (edge-triggered).
-   Grows the buffer as needed, up to max frame size.
+   Grows the buffer as needed, up to the state-appropriate limit.
    Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
   (let ((any-read nil)
-        (max-size (+ *max-ws-payload-size* 14)))  ; 14 = max masked frame header (10 + 4 mask bytes)
+        (max-size (if (eq (connection-state conn) :websocket)
+                      (+ *max-ws-payload-size* 14)  ; max masked frame header
+                      *max-body-size*)))
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))
@@ -121,10 +123,13 @@
 (defun scan-content-length (buf end)
   "Scan BUF[0..END) for a Content-Length header value.
    Returns the integer value, or 0 if not found.
+   Signals http-parse-error on duplicate conflicting values
+   (RFC 7230 §3.3.2 — prevents request smuggling).
    Operates on bytes directly — no string allocation."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "content-length:"
-                                         :external-format :ascii))))
+                                         :external-format :ascii)))
+        (result nil))
     (loop for i from 0 below end
           do (when (and ;; Only match at start of a header line (BOF or after CRLF)
                         (or (zerop i)
@@ -152,9 +157,36 @@
                          do (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
                             (incf pos))
-                   (return-from scan-content-length
-                     (if found value 0))))))
-    0))
+                   (when found
+                     (if result
+                         (unless (= value result)
+                           (http-parse-error "duplicate Content-Length"))
+                         (setf result value)))))))
+    (or result 0)))
+
+;;; ---------------------------------------------------------------------------
+;;; Reject Transfer-Encoding (inbound chunked not implemented)
+;;; ---------------------------------------------------------------------------
+
+(defun scan-transfer-encoding (buf end)
+  "Return T if BUF[0..END) contains a Transfer-Encoding header.
+   We do not implement inbound chunked decoding — requests carrying
+   Transfer-Encoding are rejected to prevent CL-TE smuggling."
+  (let ((name (load-time-value
+               (sb-ext:string-to-octets "transfer-encoding:"
+                                         :external-format :ascii))))
+    (loop for i from 0 below end
+          thereis (and (or (zerop i)
+                           (and (>= i 2)
+                                (= (aref buf (- i 2)) 13)
+                                (= (aref buf (- i 1)) 10)))
+                       (<= (+ i (length name)) end)
+                       (loop for j below (length name)
+                             for b = (aref buf (+ i j))
+                             for n = (aref name j)
+                             always (or (= b n)
+                                        (and (<= 97 n 122)
+                                             (= b (- n 32)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-read
@@ -188,7 +220,10 @@
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
                                           0 (connection-read-pos conn))))
          (if header-end
-             ;; Found CRLFCRLF — check if there's a body to read
+             ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
+             (when (scan-transfer-encoding (connection-read-buf conn) header-end)
+               (http-parse-error "Transfer-Encoding not supported"))
+             ;; Check if there's a body to read
              (let* ((body-start (+ header-end 4))
                     (content-length (scan-content-length
                                     (connection-read-buf conn) header-end)))
