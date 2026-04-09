@@ -184,7 +184,7 @@ All configurable via `setf` before calling `start-server`.
 | Variable | Default | Description |
 |---|---|---|
 | `*log-level*` | `:info` | Minimum log level (`:debug`, `:info`, `:warn`, `:error`) |
-| `*log-stream*` | `*standard-output*` | Stream to write log output to |
+| `*log-stream*` | `nil` | Stream for log output (`nil` uses `*standard-output*`) |
 | `*max-request-line-length*` | `8192` | Max HTTP request line (bytes) |
 | `*max-header-count*` | `100` | Max number of headers per request |
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |

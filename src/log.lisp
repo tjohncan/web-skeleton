@@ -17,8 +17,8 @@
 (defparameter *log-level* :info
   "Minimum level to output. Set to :debug to see everything.")
 
-(defparameter *log-stream* *standard-output*
-  "Stream to write log output to.")
+(defparameter *log-stream* nil
+  "Stream to write log output to. NIL uses *standard-output*.")
 
 (defun log-level-value (level)
   "Return the numeric severity of LEVEL."
@@ -35,11 +35,12 @@
   "Log a message at LEVEL. Suppressed if below *log-level*."
   (when (>= (log-level-value level) (log-level-value *log-level*))
     (sb-thread:with-mutex (*log-lock*)
-      (format *log-stream* "~a [~a] ~?~%"
-              (timestamp)
-              (string-upcase (symbol-name level))
-              format-string args)
-      (force-output *log-stream*))))
+      (let ((stream (or *log-stream* *standard-output*)))
+        (format stream "~a [~a] ~?~%"
+                (timestamp)
+                (string-upcase (symbol-name level))
+                format-string args)
+        (force-output stream)))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))
