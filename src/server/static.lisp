@@ -162,7 +162,9 @@
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
       (let ((path (http-request-path request)))
-        (unless (search ".." path)
+        (unless (or (search "/../" path)
+                    (and (>= (length path) 3)
+                         (string= path "/.." :start1 (- (length path) 3))))
           (let ((entry (or (gethash path *static-cache*)
                            ;; Try index.html for directory paths
                            (when (char= (char path (1- (length path))) #\/)
