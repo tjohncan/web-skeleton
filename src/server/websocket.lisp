@@ -289,6 +289,18 @@
           (cond
             ;; Application frame (text or binary)
             ((or (= opcode +ws-op-text+) (= opcode +ws-op-binary+))
+             ;; RFC 6455 §5.4: new data frame while fragmentation in progress
+             ;; is a protocol error
+             (when (connection-ws-frag-buf conn)
+               (log-warn "ws new data frame mid-fragment fd ~d"
+                         (connection-fd conn))
+               (setf (connection-ws-frag-buf conn) nil)
+               (let ((remaining (- end pos)))
+                 (when (> remaining 0)
+                   (replace buf buf :start1 0 :start2 pos :end2 end))
+                 (setf (connection-read-pos conn) remaining))
+               (return-from websocket-on-read
+                 (values :close (build-ws-close 1002))))
              (if (ws-frame-fin frame)
                  ;; Complete single-frame message
                  (progn
