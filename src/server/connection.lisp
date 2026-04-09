@@ -158,6 +158,12 @@
                                   found t)
                             (incf pos))
                    (when found
+                     ;; Reject trailing non-whitespace (e.g. "100foo")
+                     (when (and (< pos end)
+                                (let ((b (aref buf pos)))
+                                  (not (or (= b 13) (= b 10)
+                                           (= b 32) (= b 9)))))
+                       (http-parse-error "invalid Content-Length"))
                      (if result
                          (unless (= value result)
                            (http-parse-error "duplicate Content-Length"))
@@ -204,8 +210,13 @@
   (let ((read-result (connection-read-available conn)))
     (case read-result
       (:eof   (return-from connection-on-read :close))
-      (:full  (log-warn "read buffer full on fd ~d" (connection-fd conn))
-              (return-from connection-on-read :close))
+      (:full
+       ;; For WebSocket, let frames be parsed and shifted before giving up
+       (if (eq (connection-state conn) :websocket)
+           (return-from connection-on-read :websocket)
+           (progn
+             (log-warn "read buffer full on fd ~d" (connection-fd conn))
+             (return-from connection-on-read :close))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
     ;; Update activity timestamp for HTTP states only.
@@ -283,6 +294,10 @@
       (setf (http-request-body request)
             (subseq (connection-read-buf conn) body-start
                     (+ body-start content-length))))
+    ;; RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header
+    (when (and (string= (http-request-version request) "1.1")
+               (not (get-header request "host")))
+      (http-parse-error "missing Host header in HTTP/1.1 request"))
     (setf (connection-request conn) request)
     request))
 
