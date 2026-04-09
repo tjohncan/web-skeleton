@@ -1,7 +1,7 @@
-var log = document.getElementById('log');
-var form = document.getElementById('form');
-var msg = document.getElementById('msg');
-var ws = null;
+const log = document.getElementById('log');
+const form = document.getElementById('form');
+const msg = document.getElementById('msg');
+let ws = null;
 
 function appendLog(text, cls) {
   var line = document.createElement('div');
@@ -25,7 +25,9 @@ function connect(onOpen) {
   ws.onclose = function() {
     appendLog('[status] disconnected', 'status');
   };
-  ws.onerror = function() {};
+  ws.onerror = function() {
+    appendLog('[status] error', 'status');
+  };
 }
 
 form.onsubmit = function(e) {
