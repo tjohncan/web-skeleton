@@ -349,14 +349,19 @@
 ;;; Streaming fetch tests (no network — uses temp file as mock stream)
 ;;; ---------------------------------------------------------------------------
 
+(defclass byte-array-stream (sb-gray:fundamental-binary-input-stream)
+  ((bytes :initarg :bytes)
+   (pos :initform 0)))
+
+(defmethod sb-gray:stream-read-byte ((s byte-array-stream))
+  (with-slots (bytes pos) s
+    (if (< pos (length bytes))
+        (prog1 (aref bytes pos) (incf pos))
+        :eof)))
+
 (defun make-mock-stream (bytes)
-  "Write BYTES to a temp file and return a binary input stream."
-  (let ((path (merge-pathnames "ws-test-stream.tmp"
-                               (uiop:temporary-directory))))
-    (with-open-file (out path :direction :output :if-exists :supersede
-                              :element-type '(unsigned-byte 8))
-      (write-sequence bytes out))
-    (open path :element-type '(unsigned-byte 8))))
+  "Return an in-memory binary input stream over BYTES."
+  (make-instance 'byte-array-stream :bytes bytes))
 
 (defun ascii-bytes (string)
   "Convert STRING to a byte vector."
