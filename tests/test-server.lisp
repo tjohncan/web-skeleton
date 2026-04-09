@@ -530,6 +530,7 @@
     (let ((frame (make-masked-frame t 0 #(33))))  ; "!"
       (multiple-value-bind (result consumed)
           (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (declare (ignore consumed))
         (check "fragment continuation: parsed" (not (null result)) t)
         (check "fragment continuation: fin" (ws-frame-fin result) t)
         (check "fragment continuation: opcode" (ws-frame-opcode result) 0)))
