@@ -95,6 +95,7 @@
            #:*max-header-line-length*
            #:*max-body-size*
            #:*max-ws-payload-size*
+           #:*max-connections*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*
