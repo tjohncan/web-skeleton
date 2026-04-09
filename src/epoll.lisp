@@ -137,9 +137,12 @@
 ;;; epoll
 ;;; ---------------------------------------------------------------------------
 
+(defconstant +epoll-cloexec+ #x80000)
+
 (defun epoll-create ()
-  "Create a new epoll instance. Returns the epoll file descriptor."
-  (let ((fd (%epoll-create1 0)))
+  "Create a new epoll instance. Returns the epoll file descriptor.
+   Sets CLOEXEC to prevent fd leak on fork+exec."
+  (let ((fd (%epoll-create1 +epoll-cloexec+)))
     (when (< fd 0)
       (error "epoll_create1 failed: errno ~d" (get-errno)))
     fd))
