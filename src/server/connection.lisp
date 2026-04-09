@@ -206,7 +206,8 @@
       (:eof   (return-from connection-on-read :close))
       (:full  (log-warn "read buffer full on fd ~d" (connection-fd conn))
               (return-from connection-on-read :close))
-      (:again (return-from connection-on-read :continue)))
+      (:again (when (zerop (connection-read-pos conn))
+                (return-from connection-on-read :continue))))
     ;; Update activity timestamp for HTTP states only.
     ;; WebSocket updates selectively in websocket-on-read
     ;; (application frames count, protocol pongs don't).
