@@ -228,9 +228,7 @@
        ;; For WebSocket, let frames be parsed and shifted before giving up
        (if (eq (connection-state conn) :websocket)
            (return-from connection-on-read :websocket)
-           (progn
-             (log-warn "read buffer full on fd ~d" (connection-fd conn))
-             (return-from connection-on-read :close))))
+           (http-parse-error "request too large (buffer full)")))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
     ;; Activity timestamp is NOT updated here on partial reads.
