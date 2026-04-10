@@ -104,6 +104,8 @@
 ;;; Constants
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
+(defconstant +ssl-ctrl-set-min-proto-version+ 123)
+(defconstant +tls1-2-version+ #x0303)
 
 ;;; ---------------------------------------------------------------------------
 ;;; SSL_CTX — shared context, created once
@@ -126,8 +128,8 @@
             (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
               (error "SSL_CTX_new failed"))
             ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1)
-            ;; SSL_CTRL_SET_MIN_PROTO_VERSION = 123, TLS1_2_VERSION = 0x0303
-            (%ssl-ctrl ctx 123 #x0303 (sb-sys:int-sap 0))
+            (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                       +tls1-2-version+ (sb-sys:int-sap 0))
             ;; Load system CA certificates
             (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
               (log-warn "tls: could not load system CA certificates"))
@@ -268,8 +270,13 @@
                                                          (+ first-crlf 2)
                                                          (+ header-end 4))))))
                      (body-start (when header-end (+ header-end 4)))
-                     (raw-body (when (and body-start (> buf-len body-start))
-                                 (subseq response-buf body-start buf-len)))
+                     (content-length (when header-end
+                                       (scan-content-length response-buf header-end)))
+                     (body-end (if (and body-start content-length)
+                                   (min buf-len (+ body-start content-length))
+                                   buf-len))
+                     (raw-body (when (and body-start (> body-end body-start))
+                                 (subseq response-buf body-start body-end)))
                      (body (if (and raw-body (response-chunked-p headers))
                                (decode-chunked-body raw-body 0 (length raw-body))
                                raw-body))
