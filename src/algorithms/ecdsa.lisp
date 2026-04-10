@@ -112,7 +112,9 @@
             (cons x3 y3))))))))
 
 (defun ec-mul (k point)
-  "Scalar multiplication K * POINT using double-and-add."
+  "Scalar multiplication K * POINT using double-and-add.
+   WARNING: not constant-time. Safe for verification only.
+   Do NOT use for signing or key generation."
   (let ((result nil)
         (addend point))
     (loop while (> k 0)
