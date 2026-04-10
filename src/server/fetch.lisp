@@ -412,7 +412,9 @@
        ;; Server closed connection — response is complete (Connection: close)
        (complete-fetch conn epoll-fd))
       (:full
-       ;; Buffer full — try to complete with what we have
+       ;; Buffer full — response truncated at *max-body-size*
+       (log-warn "fetch: response truncated at ~d bytes on fd ~d"
+                 (connection-read-pos conn) (connection-fd conn))
        (complete-fetch conn epoll-fd))
       (:again nil)  ; wait for more data
       (:ok
