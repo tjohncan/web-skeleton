@@ -61,10 +61,11 @@
           ;; Must be ES256
           (unless (string= alg "ES256")
             (return-from jwt-verify nil))
-          ;; Find matching key
-          (let ((key (if kid
-                         (find kid keys :key #'jwt-key-kid :test #'string=)
-                         (first keys))))
+          ;; Find matching key (reject kidless tokens when multiple keys exist)
+          (let ((key (cond
+                       (kid (find kid keys :key #'jwt-key-kid :test #'string=))
+                       ((= (length keys) 1) (first keys))
+                       (t nil))))
             (unless key
               (return-from jwt-verify nil))
             ;; Verify signature
