@@ -123,7 +123,10 @@
       (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
             do (incf pos))
       (when (= pos digit-start)
-        (error "json: expected digit at ~d" pos)))
+        (error "json: expected digit at ~d" pos))
+      ;; Cap integer digits to prevent O(n²) bignum construction DoS
+      (when (> (- pos digit-start) 300)
+        (error "json: integer too many digits at ~d" start)))
     (when (and (< pos len) (char= (char str pos) #\.))
       (incf pos)
       (let ((frac-start pos))
