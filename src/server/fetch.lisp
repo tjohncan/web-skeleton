@@ -434,8 +434,8 @@
            ;; Have complete headers — check if body is complete
            (let* ((body-start (+ header-end 4))
                   (content-length (scan-content-length buf header-end)))
-             (if (and content-length (> content-length 0))
-                 ;; Have Content-Length — wait for full body
+             (if content-length
+                 ;; Have Content-Length — complete when body received (including 0)
                  (when (>= (- pos body-start) content-length)
                    (complete-fetch conn epoll-fd))
                  ;; No Content-Length — wait for EOF (Connection: close)

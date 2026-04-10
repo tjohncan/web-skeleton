@@ -123,7 +123,7 @@
 
 (defun scan-content-length (buf end)
   "Scan BUF[0..END) for a Content-Length header value.
-   Returns the integer value, or 0 if not found.
+   Returns the integer value, or NIL if not found.
    Signals http-parse-error on duplicate conflicting values
    (RFC 7230 §3.3.2 — prevents request smuggling).
    Operates on bytes directly — no string allocation."
@@ -174,7 +174,7 @@
                          (unless (= value result)
                            (http-parse-error "duplicate Content-Length"))
                          (setf result value)))))))
-    (or result 0)))
+    result))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reject Transfer-Encoding (inbound chunked not implemented)
@@ -244,7 +244,7 @@
                (let* ((body-start (+ header-end 4))
                       (content-length (scan-content-length
                                        (connection-read-buf conn) header-end)))
-               (if (> content-length 0)
+               (if (and content-length (> content-length 0))
                    ;; Need to read a body
                    (progn
                      ;; Reject oversized bodies before allocating
