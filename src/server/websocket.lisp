@@ -317,6 +317,20 @@
              (if (ws-frame-fin frame)
                  ;; Complete single-frame message
                  (progn
+                   ;; RFC 6455 §5.6: text frames must contain valid UTF-8
+                   (when (= opcode +ws-op-text+)
+                     (handler-case
+                         (sb-ext:octets-to-string (ws-frame-payload frame)
+                                                   :external-format :utf-8)
+                       (error ()
+                         (log-warn "ws invalid UTF-8 in text frame fd ~d"
+                                   (connection-fd conn))
+                         (let ((remaining (- end pos)))
+                           (when (> remaining 0)
+                             (replace buf buf :start1 0 :start2 pos :end2 end))
+                           (setf (connection-read-pos conn) remaining))
+                         (return-from websocket-on-read
+                           (values :close (build-ws-close 1007))))))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
@@ -370,6 +384,19 @@
                  (log-debug "ws frag complete opcode ~d (~d bytes) fd ~d"
                             (connection-ws-frag-opcode conn) total
                             (connection-fd conn))
+                 ;; RFC 6455 §5.6: validate UTF-8 for reassembled text
+                 (when (= (connection-ws-frag-opcode conn) +ws-op-text+)
+                   (handler-case
+                       (sb-ext:octets-to-string payload :external-format :utf-8)
+                     (error ()
+                       (log-warn "ws invalid UTF-8 in reassembled text fd ~d"
+                                 (connection-fd conn))
+                       (let ((remaining (- end pos)))
+                         (when (> remaining 0)
+                           (replace buf buf :start1 0 :start2 pos :end2 end))
+                         (setf (connection-read-pos conn) remaining))
+                       (return-from websocket-on-read
+                         (values :close (build-ws-close 1007))))))
                  (setf (connection-last-active conn) (get-universal-time))
                  (let ((complete (make-ws-frame
                                   :fin t
