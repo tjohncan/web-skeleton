@@ -82,13 +82,13 @@
          (all-headers (flet ((has-header-p (name)
                               (assoc name headers :test #'string-equal)))
                        (append
-                       (unless (has-header-p "host")
-                         (list (cons "host" host-value)))
-                       (unless (has-header-p "connection")
-                         (list (cons "connection" "close")))
-                       (unless (has-header-p "user-agent")
-                         (list (cons "user-agent" "web-skeleton")))
-                       headers
+                        (unless (has-header-p "host")
+                          (list (cons "host" host-value)))
+                        (unless (has-header-p "connection")
+                          (list (cons "connection" "close")))
+                        (unless (has-header-p "user-agent")
+                          (list (cons "user-agent" "web-skeleton")))
+                        headers
                        (when (and body-bytes
                                   (not (has-header-p "content-length")))
                          (list (cons "content-length"
