@@ -205,6 +205,14 @@ a slow client holds the worker hostage.
 HTTP responses. Call it **before** `start-server`. It is not thread-safe
 and must not be called while the server is running.
 
+### JSON empty containers
+
+`json-parse` returns NIL for both `{}` and `[]`. `json-serialize` on NIL
+produces `"null"`. This means empty objects and arrays do not round-trip
+— they collapse to null. This is a deliberate design choice (CL's NIL
+is the natural empty representation). If the distinction matters for
+your use case, check the raw JSON string or use `:NULL` for explicit null.
+
 ### Query parameter parsing
 
 `get-query-param` reparses the query string on each call. If a handler
