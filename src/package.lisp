@@ -50,6 +50,7 @@
            #:sha256-hex
            ;; HMAC
            #:hmac-sha256
+           #:constant-time-equal
            ;; ECDSA
            #:ecdsa-verify-p256
            ;; JWT

@@ -41,3 +41,12 @@
         (replace outer-input opad)
         (replace outer-input inner-hash :start1 +hmac-sha256-block-size+)
         (sha256 outer-input)))))
+
+(defun constant-time-equal (a b)
+  "Compare byte vectors A and B in constant time.
+   Returns T if equal, NIL otherwise. Always examines every byte
+   to prevent timing side-channel leakage."
+  (if (/= (length a) (length b))
+      nil
+      (zerop (loop for i from 0 below (length a)
+                   sum (logxor (aref a i) (aref b i))))))
