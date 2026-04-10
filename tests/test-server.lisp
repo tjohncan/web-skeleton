@@ -778,7 +778,8 @@
   ;; Use the RFC 7515 A.3 ES256 example to build a complete JWT test
   (let* ((header-b64 "eyJhbGciOiJFUzI1NiJ9")
          (payload-b64 "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")
-         (sig-b64 "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+         ;; Low-S normalized signature (original RFC 7515 A.3 has high-S)
+         (sig-b64 "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmU69fgrc8OPGycO0lD3tat_FoFp57SETepkeks4eL_QfA")
          (token (format nil "~a.~a.~a" header-b64 payload-b64 sig-b64))
          ;; Build a key set with the RFC 7515 A.3 public key
          (keys (list (make-jwt-key
