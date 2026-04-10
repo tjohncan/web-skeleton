@@ -401,7 +401,7 @@
         (error ()
           (close-connection conn epoll-fd))))
     (error (e)
-      (log-error "error fd ~d: ~a" (connection-fd conn) e)
+      (log-warn "error fd ~d: ~a" (connection-fd conn) e)
       (close-connection conn epoll-fd))))
 
 ;;; ---------------------------------------------------------------------------
