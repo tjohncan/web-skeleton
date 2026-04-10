@@ -76,13 +76,17 @@
                                         :external-format :utf-8)))
                    (now (jwt-current-time)))
               (let ((exp (json-get claims "exp")))
-                (when (and exp (numberp exp)
-                           (<= exp (- now *jwt-clock-skew*)))
-                  (return-from jwt-verify nil)))
+                (when exp
+                  (unless (numberp exp)
+                    (return-from jwt-verify nil))
+                  (when (<= exp (- now *jwt-clock-skew*))
+                    (return-from jwt-verify nil))))
               (let ((nbf (json-get claims "nbf")))
-                (when (and nbf (numberp nbf)
-                           (> nbf (+ now *jwt-clock-skew*)))
-                  (return-from jwt-verify nil)))
+                (when nbf
+                  (unless (numberp nbf)
+                    (return-from jwt-verify nil))
+                  (when (> nbf (+ now *jwt-clock-skew*))
+                    (return-from jwt-verify nil))))
               ;; Claims are valid — now verify signature
               (let* ((signing-input (concatenate 'string header-b64 "." payload-b64))
                      (hash (sha256 (sb-ext:string-to-octets signing-input
