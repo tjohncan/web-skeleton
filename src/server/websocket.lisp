@@ -72,7 +72,7 @@
              (key        (get-header request "sec-websocket-key"))
              (version    (get-header request "sec-websocket-version")))
          (and upgrade
-              (string-equal upgrade "websocket")
+              (connection-header-has-token-p upgrade "websocket")
               connection
               (connection-header-has-token-p connection "upgrade")
               key
@@ -149,6 +149,9 @@
                (loop for i from 0 below 8
                      sum (ash (aref buf (+ start 2 i)) (* 8 (- 7 i))))
                header-size 10)))
+      ;; RFC 6455 §5.2: 64-bit length MSB must be 0
+      (when (logbitp 63 payload-length)
+        (error "WebSocket: invalid payload length (MSB set)"))
       ;; Reject oversized frames early
       (when (> payload-length *max-ws-payload-size*)
         (error "WebSocket: frame too large (~d bytes, max ~d)"
@@ -430,7 +433,11 @@
                (return-from websocket-on-read
                  (values :close (build-ws-close code)))))
             (t
-             (log-warn "ws unhandled opcode: ~d" opcode))))))
+             ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
+             (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
+             (ws-shift-buffer conn buf pos end)
+             (return-from websocket-on-read
+               (values :close (build-ws-close 1002))))))))
     ;; Concatenate response frames into a single write buffer
     (when responses
       (setf responses (nreverse responses))
