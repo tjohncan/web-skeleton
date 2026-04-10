@@ -260,6 +260,28 @@
          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"))
 
 ;;; ---------------------------------------------------------------------------
+;;; constant-time-equal tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-constant-time-equal ()
+  (format t "~%Constant-Time Equal~%")
+
+  (let ((a (make-array 4 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 2 3 4)))
+        (b (make-array 4 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 2 3 4)))
+        (c (make-array 4 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 2 3 5)))
+        (d (make-array 3 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 2 3)))
+        (e (make-array 0 :element-type '(unsigned-byte 8))))
+    (check "equal inputs" (constant-time-equal a b) t)
+    (check "unequal same length" (constant-time-equal a c) nil)
+    (check "length mismatch" (constant-time-equal a d) nil)
+    (check "empty equal" (constant-time-equal e e) t)
+    (check "empty vs non-empty" (constant-time-equal e a) nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Hex encoding tests
 ;;; ---------------------------------------------------------------------------
 
@@ -321,6 +343,7 @@
   (test-base64url)
   (test-ecdsa)
   (test-hmac-sha256)
+  (test-constant-time-equal)
   (test-hex)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
