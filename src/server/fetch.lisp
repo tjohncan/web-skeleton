@@ -65,10 +65,13 @@
 ;;; Build outbound HTTP request bytes
 ;;; ---------------------------------------------------------------------------
 
-(defun build-outbound-request (method host path &key (port 80) headers body)
+(defun build-outbound-request (method host path &key (scheme :http) (port 80)
+                                                      headers body)
   "Build an HTTP/1.1 request as a byte vector ready to write."
   (let* ((method-str (symbol-name method))
-         (host-value (if (or (= port 80) (= port 443))
+         (default-port-p (or (and (eq scheme :http) (= port 80))
+                             (and (eq scheme :https) (= port 443))))
+         (host-value (if default-port-p
                          host
                          (format nil "~a:~d" host port)))
          (body-bytes (etypecase body
