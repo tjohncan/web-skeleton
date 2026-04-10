@@ -223,11 +223,10 @@
              (return-from connection-on-read :close))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
-    ;; Update activity timestamp for HTTP states only.
-    ;; WebSocket updates selectively in websocket-on-read
-    ;; (application frames count, protocol pongs don't).
-    (unless (eq (connection-state conn) :websocket)
-      (setf (connection-last-active conn) (get-universal-time)))
+    ;; Activity timestamp is NOT updated here on partial reads.
+    ;; It resets only on complete request dispatch (in handle-client-read)
+    ;; to prevent slowloris attacks from resetting the idle timer with
+    ;; drip-fed bytes. WebSocket updates selectively in websocket-on-read.
     ;; We have new data — check state.
     ;; Only :read-http, :read-body, and :websocket watch EPOLLIN.
     ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.

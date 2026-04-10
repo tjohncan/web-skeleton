@@ -311,6 +311,7 @@
            (case result
              (:dispatch
               ;; Full request — parse and dispatch
+              (setf (connection-last-active conn) (get-universal-time))
               (let ((request (connection-parse-request conn)))
                 (log-debug "~a ~a~@[?~a~] HTTP/~a"
                            (http-request-method request)
