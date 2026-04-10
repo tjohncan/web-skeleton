@@ -157,11 +157,14 @@
                                   found t)
                             (incf pos))
                    (when found
-                     ;; Reject trailing non-whitespace (e.g. "100foo")
+                     ;; Skip optional trailing whitespace
+                     (loop while (and (< pos end)
+                                      (or (= (aref buf pos) 32)
+                                          (= (aref buf pos) 9)))
+                           do (incf pos))
+                     ;; Next byte must be CR or end of scanned region
                      (when (and (< pos end)
-                                (let ((b (aref buf pos)))
-                                  (not (or (= b 13) (= b 10)
-                                           (= b 32) (= b 9)))))
+                                (not (= (aref buf pos) 13)))
                        (http-parse-error "invalid Content-Length"))
                      (if result
                          (unless (= value result)
