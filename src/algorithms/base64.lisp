@@ -82,10 +82,11 @@
             while (< i data-len)
             do (let ((vals (loop for j from 0 below 4
                                  collect (if (< (+ i j) data-len)
-                                             (or (aref decode-table
-                                                       (char-code (char string (+ i j))))
-                                                 (error "base64: invalid character ~a at ~d"
-                                                        (char string (+ i j)) (+ i j)))
+                                             (let ((code (char-code (char string (+ i j)))))
+                                               (or (and (< code 128)
+                                                        (aref decode-table code))
+                                                   (error "base64: invalid character ~a at ~d"
+                                                          (char string (+ i j)) (+ i j))))
                                              0))))
                  (let ((triplet (logior (ash (first vals) 18)
                                         (ash (second vals) 12)
