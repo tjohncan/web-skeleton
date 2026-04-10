@@ -64,7 +64,7 @@ sbcl
 (web-skeleton-tests:test-algorithms)  ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
 (web-skeleton-tests:test-json)        ; JSON parser and serializer
 (web-skeleton-tests:test-server)      ; HTTP, URL, query, routing, JWT
-(web-skeleton-tests:test-tls)         ; TLS roundtrip (skips if libssl absent)
+(web-skeleton-tests:test-tls)         ; TLS registration (skips if libssl absent)
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
 ```
@@ -211,26 +211,6 @@ The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword
 Use `:host #(0 0 0 0)` to listen on all interfaces.
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
-
-### Server push
-
-`ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed. Call it from within `ws-handler`
-to send multiple frames during a single handler invocation — the event
-loop is paused while the handler runs, so there is no write contention.
-
-```lisp
-(defun handle-ws-message (conn frame)
-  (when (= (ws-frame-opcode frame) +ws-op-text+)
-    ;; Stream results back as they become available
-    (dolist (chunk (generate-chunks (ws-frame-payload frame)))
-      (ws-send conn (build-ws-text chunk)))
-    nil))  ; return nil — we already sent our responses
-```
-
-The worker thread is blocked for the duration of the handler call.
-With multiple workers this is fine for bounded work (e.g. streaming
-an LLM response for a few seconds), but avoid unbounded blocking.
 
 ## Deployment
 
