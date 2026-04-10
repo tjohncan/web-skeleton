@@ -133,7 +133,9 @@
         (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos frac-start)
-          (error "json: no digits after decimal point at ~d" start))))
+          (error "json: no digits after decimal point at ~d" start))
+        (when (> (- pos frac-start) 300)
+          (error "json: fractional part too many digits at ~d" start))))
     (when (and (< pos len) (member (char str pos) '(#\e #\E)))
       (incf pos)
       (when (and (< pos len) (member (char str pos) '(#\+ #\-)))
@@ -142,7 +144,9 @@
         (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos exp-start)
-          (error "json: no digits in exponent at ~d" start))))
+          (error "json: no digits in exponent at ~d" start))
+        (when (> (- pos exp-start) 20)
+          (error "json: exponent too many digits at ~d" start))))
     (let ((num-str (subseq str start pos)))
       ;; Floats: read-from-string with *read-eval* NIL is safe here —
       ;; input is pre-validated to [0-9.eE+-] by the loop above.
