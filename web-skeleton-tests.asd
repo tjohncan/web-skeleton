@@ -1,5 +1,7 @@
 (defsystem "web-skeleton-tests"
   :description "Tests for the web-skeleton framework"
+  :author "Tiger Johnson"
+  :license "MIT"
   :depends-on ("web-skeleton")
   :components ((:file "tests/package")
                (:file "tests/run" :depends-on ("tests/package"))

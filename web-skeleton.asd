@@ -1,6 +1,8 @@
 (defsystem "web-skeleton"
   :description "SBCL web server framework for Linux"
-  :version "0.0.1"
+  :version "0.0.7"
+  :author "Tiger Johnson"
+  :license "MIT"
   :depends-on ("sb-bsd-sockets")
   :components ((:file "src/package")
                (:file "src/log" :depends-on ("src/package"))
