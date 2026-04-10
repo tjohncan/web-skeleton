@@ -103,7 +103,14 @@
 
   (check "foobar"
          (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8)
-         "foobar"))
+         "foobar")
+
+  ;; Invalid: single character (6 bits, can't form a byte)
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "single char rejected"
+           (signals-error-p (lambda () (base64-decode "A"))) t)))
 
 (defun test-base64url ()
   (format t "~%Base64url~%")
@@ -132,7 +139,14 @@
   (let ((data (sb-ext:string-to-octets "the quick brown ankle leaps over the lazy heel")))
     (check "url round-trip"
            (bytes-to-hex (base64url-decode (base64url-encode data)))
-           (bytes-to-hex data))))
+           (bytes-to-hex data)))
+
+  ;; Invalid: single character rejected
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "url single char rejected"
+           (signals-error-p (lambda () (base64url-decode "A"))) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SHA-256 test vectors (FIPS 180-4)

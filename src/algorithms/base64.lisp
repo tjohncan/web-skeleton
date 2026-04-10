@@ -72,31 +72,33 @@
          ;; Strip padding for length calculation
          (data-len (loop for i downfrom (1- len) above 0
                          while (char= (char string i) #\=)
-                         finally (return (1+ i))))
-         (out (make-array (* 3 (ceiling data-len 4))
-                          :element-type '(unsigned-byte 8)
-                          :fill-pointer 0)))
-    (loop with i = 0
-          while (< i data-len)
-          do (let ((vals (loop for j from 0 below 4
-                               collect (if (< (+ i j) data-len)
-                                           (or (aref decode-table
-                                                     (char-code (char string (+ i j))))
-                                               (error "base64: invalid character ~a at ~d"
-                                                      (char string (+ i j)) (+ i j)))
-                                           0))))
-               (let ((triplet (logior (ash (first vals) 18)
-                                      (ash (second vals) 12)
-                                      (ash (third vals) 6)
-                                      (fourth vals)))
-                     (chars-present (min (- data-len i) 4)))
-                 (vector-push (logand #xFF (ash triplet -16)) out)
-                 (when (> chars-present 2)
-                   (vector-push (logand #xFF (ash triplet -8)) out))
-                 (when (> chars-present 3)
-                   (vector-push (logand #xFF triplet) out)))
-               (incf i 4)))
-    (subseq out 0 (fill-pointer out))))
+                         finally (return (1+ i)))))
+    (when (= (mod data-len 4) 1)
+      (error "base64: invalid input length ~d" len))
+    (let ((out (make-array (* 3 (ceiling data-len 4))
+                            :element-type '(unsigned-byte 8)
+                            :fill-pointer 0)))
+      (loop with i = 0
+            while (< i data-len)
+            do (let ((vals (loop for j from 0 below 4
+                                 collect (if (< (+ i j) data-len)
+                                             (or (aref decode-table
+                                                       (char-code (char string (+ i j))))
+                                                 (error "base64: invalid character ~a at ~d"
+                                                        (char string (+ i j)) (+ i j)))
+                                             0))))
+                 (let ((triplet (logior (ash (first vals) 18)
+                                        (ash (second vals) 12)
+                                        (ash (third vals) 6)
+                                        (fourth vals)))
+                       (chars-present (min (- data-len i) 4)))
+                   (vector-push (logand #xFF (ash triplet -16)) out)
+                   (when (> chars-present 2)
+                     (vector-push (logand #xFF (ash triplet -8)) out))
+                   (when (> chars-present 3)
+                     (vector-push (logand #xFF triplet) out)))
+                 (incf i 4)))
+      (subseq out 0 (fill-pointer out)))))
 
 (defun base64-decode (string)
   "Decode a base64 string (standard alphabet) into a byte vector."
