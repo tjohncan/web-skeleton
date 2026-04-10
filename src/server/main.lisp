@@ -186,7 +186,12 @@
   "Accept a pending connection and register it with epoll.
    Returns T if a connection was accepted, NIL if none pending (EAGAIN).
    Drops the connection if the per-worker limit is reached."
-  (let ((client-socket (sb-bsd-sockets:socket-accept listener-socket)))
+  (let ((client-socket (handler-case
+                          (sb-bsd-sockets:socket-accept listener-socket)
+                        (error (e)
+                          (log-error "socket-accept failed: ~a" e)
+                          (sleep 0.1) ; backoff to avoid log-spin on EMFILE
+                          (return-from accept-connection nil)))))
     (unless client-socket
       (return-from accept-connection nil))
     ;; Enforce per-worker connection limit
