@@ -388,8 +388,11 @@
                    (setf (connection-state conn) :websocket)
                    (epoll-modify epoll-fd (connection-fd conn)
                                 (logior +epollout+ +epollet+)))
-                  ;; No response needed (shouldn't normally happen)
-                  (t nil))))
+                  ;; No response — re-arm edge trigger in case kernel
+                  ;; still has data we couldn't buffer earlier
+                  (t
+                   (epoll-modify epoll-fd (connection-fd conn)
+                                (logior +epollin+ +epollet+))))))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — wait for more data
