@@ -224,3 +224,19 @@ needs multiple parameters, parse once and reuse:
         (page (cdr (assoc "page" params :test #'string=))))
     ...))
 ```
+
+### Form body decoding
+
+`url-decode` and `parse-query-string` use RFC 3986 path decoding where
+`+` is a literal character, not a space. For `application/x-www-form-urlencoded`
+POST bodies (HTML form submissions), `+` represents a space. The framework
+does not provide form-specific decoding — if your application handles HTML
+forms, replace `+` with space before parsing:
+
+```lisp
+(let* ((body (sb-ext:octets-to-string (http-request-body request)
+                                       :external-format :utf-8))
+       (decoded (substitute #\Space #\+ body))
+       (params (parse-query-string decoded)))
+  ...)
+```
