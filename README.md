@@ -1,11 +1,10 @@
 # Web Skeleton
 
 SBCL web server framework for Linux.
-Provides the network and protocol layer
- (TCP socket management,
- HTTP request parsing and response building,
- WebSocket handshake and framing)
-as a reusable foundation for web services and real-time applications.
+Provides the network and protocol layer (TCP socket management,
+HTTP request parsing and response building, WebSocket handshake
+and framing) as a reusable foundation for web services and
+real-time applications.
 
 Minimal external dependencies beyond SBCL's built-in libraries.
 
