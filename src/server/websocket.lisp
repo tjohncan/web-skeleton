@@ -417,9 +417,15 @@
              (setf (connection-ws-frag-buf conn) nil
                    (connection-ws-frag-total conn) 0)
              (let* ((payload (ws-frame-payload frame))
-                    (code (if (>= (length payload) 2)
-                              (logior (ash (aref payload 0) 8) (aref payload 1))
-                              1000)))
+                    (raw-code (if (>= (length payload) 2)
+                                  (logior (ash (aref payload 0) 8) (aref payload 1))
+                                  1000))
+                    ;; RFC 6455 §7.4.1: must not echo reserved codes
+                    (code (if (or (< raw-code 1000)
+                                  (member raw-code '(1005 1006 1015))
+                                  (and (>= raw-code 1016) (<= raw-code 2999)))
+                              1000
+                              raw-code)))
                (ws-shift-buffer conn buf pos end)
                (return-from websocket-on-read
                  (values :close (build-ws-close code)))))
