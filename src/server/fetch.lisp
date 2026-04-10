@@ -202,14 +202,20 @@
             (progn
               (loop for i from pos below lf
                     for b = (aref buf i)
-                    unless (= b 13) do (vector-push-extend b line-buf))
+                    unless (= b 13)
+                    do (when (> (fill-pointer line-buf) *max-body-size*)
+                         (error "streaming response line too large"))
+                       (vector-push-extend b line-buf))
               (setf (stream-reader-pos r) (1+ lf))
               (return (sb-ext:octets-to-string line-buf
                                                :external-format :utf-8)))
             (progn
               (loop for i from pos below end
                     for b = (aref buf i)
-                    unless (= b 13) do (vector-push-extend b line-buf))
+                    unless (= b 13)
+                    do (when (> (fill-pointer line-buf) *max-body-size*)
+                         (error "streaming response line too large"))
+                       (vector-push-extend b line-buf))
               (setf (stream-reader-pos r) end)))))))
 
 (defun reader-read-bytes (r count line-buf on-line)
@@ -234,7 +240,9 @@
                                         :external-format :utf-8)))
                     (setf (fill-pointer line-buf) 0))
                    ((= byte 13) nil)
-                   (t (vector-push-extend byte line-buf))))
+                   (t (when (> (fill-pointer line-buf) *max-body-size*)
+                        (error "streaming response line too large"))
+                      (vector-push-extend byte line-buf))))
         (incf (stream-reader-pos r) take)
         (decf remaining take)))))
 
