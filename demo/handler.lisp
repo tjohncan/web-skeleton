@@ -19,6 +19,8 @@
         (path   (http-request-path request)))
     (cond
       ((and (eq method :GET) (string= path "/ws"))
+       ;; Production apps must validate the Origin header before upgrading.
+       ;; See DEPLOYMENT.md "WebSocket origin validation".
        :upgrade)
       (t
        (or (serve-static request)
