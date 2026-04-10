@@ -16,6 +16,7 @@
   ;; Identity
   (fd        -1  :type fixnum)               ; raw file descriptor
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
+  (remote-addr nil)                           ; peer IP as string, or NIL for outbound
   ;; Protocol state
   ;;   :read-http       — accumulating HTTP request bytes
   ;;   :read-body       — have headers, reading Content-Length body
@@ -63,11 +64,16 @@
 
 (defun make-client-connection (client-socket)
   "Wrap a newly accepted socket into a connection object.
-   Sets the fd to non-blocking."
-  (let ((fd (socket-fd client-socket)))
+   Sets the fd to non-blocking. Captures the peer address."
+  (let ((fd (socket-fd client-socket))
+        (addr (ignore-errors
+                (multiple-value-bind (host port)
+                    (sb-bsd-sockets:socket-peername client-socket)
+                  (format nil "~{~d~^.~}:~d" (coerce host 'list) port)))))
     (set-nonblocking fd)
     (make-connection :fd fd
                      :socket client-socket
+                     :remote-addr addr
                      :last-active (get-universal-time))))
 
 ;;; ---------------------------------------------------------------------------

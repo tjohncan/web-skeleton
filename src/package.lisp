@@ -71,6 +71,7 @@
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd
+           #:connection-remote-addr
            ;; WebSocket
            #:ws-frame
            #:ws-frame-fin

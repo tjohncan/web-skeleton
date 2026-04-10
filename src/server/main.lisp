@@ -208,7 +208,8 @@
           (register-connection conn)
           (epoll-add epoll-fd (connection-fd conn)
                      (logior +epollin+ +epollet+))
-          (log-debug "accepted fd ~d" (connection-fd conn))
+          (log-debug "accepted fd ~d ~a" (connection-fd conn)
+                     (or (connection-remote-addr conn) ""))
           t)
       (error (e)
         (log-error "accept failed: ~a" e)
@@ -315,11 +316,12 @@
               ;; Full request — parse and dispatch
               (setf (connection-last-active conn) (get-universal-time))
               (let ((request (connection-parse-request conn)))
-                (log-debug "~a ~a~@[?~a~] HTTP/~a"
+                (log-debug "~a ~a~@[?~a~] HTTP/~a ~a"
                            (http-request-method request)
                            (http-request-path request)
                            (http-request-query request)
-                           (http-request-version request))
+                           (http-request-version request)
+                           (or (connection-remote-addr conn) ""))
                 ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
                 ;; HTTP/1.0 default is close. Connection header overrides.
                 (let ((conn-header (get-header request "connection")))
