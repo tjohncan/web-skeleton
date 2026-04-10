@@ -85,7 +85,8 @@
                        (unless (has-header-p "user-agent")
                          (list (cons "user-agent" "web-skeleton")))
                        headers
-                       (when body-bytes
+                       (when (and body-bytes
+                                  (not (has-header-p "content-length")))
                          (list (cons "content-length"
                                      (write-to-string
                                       (length body-bytes)))))))))
