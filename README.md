@@ -26,8 +26,8 @@ ASDF ships with SBCL.
 sbcl --non-interactive --load run-server.lisp
 ```
 
-Starts the demo server on port 8081. 
-The demo page (load `http://localhost:8081/` in a browser) 
+Starts the demo server on port 8081.
+The demo page (load `http://localhost:8081/` in a browser)
 opens a WebSocket connection and echoes messages back.
 Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
