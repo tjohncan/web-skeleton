@@ -38,15 +38,16 @@
 
 (defun test ()
   "Run all tests. Returns T if all passed."
-  (let ((all-passed t))
-    (unless (test-algorithms)
-      (setf all-passed nil))
-    (unless (test-json)
-      (setf all-passed nil))
-    (unless (test-server)
-      (setf all-passed nil))
-    (unless (test-tls)
-      (setf all-passed nil))
+  (let ((all-passed t)
+        (total-passed 0)
+        (total-failed 0))
+    (dolist (suite '(test-algorithms test-json test-server test-tls))
+      (unless (funcall suite)
+        (setf all-passed nil))
+      (incf total-passed *tests-passed*)
+      (incf total-failed *tests-failed*))
+    (format t "~d passed, ~d failed across all suites~%"
+            total-passed total-failed)
     (if all-passed
         (format t "=== ALL TESTS PASSED ===~%~%")
         (format t "=== SOME TESTS FAILED ===~%~%"))
