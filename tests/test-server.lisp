@@ -157,7 +157,7 @@
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
     (check "transfer-encoding detected"
-           (web-skeleton::scan-transfer-encoding bytes header-end)
+           (not (null (web-skeleton::scan-transfer-encoding bytes header-end)))
            t))
 
   ;; Duplicate conflicting Content-Length
@@ -518,6 +518,55 @@
       (close stream))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Buffered chunked body decoding tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-decode-chunked-body ()
+  (format t "~%Chunked Body Decode~%")
+
+  ;; Two chunks + terminator
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "7" (string #\Return) (string #\Newline)
+                "hello, " (string #\Return) (string #\Newline)
+                "6" (string #\Return) (string #\Newline)
+                "world!" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (decoded (web-skeleton::decode-chunked-body raw 0 (length raw))))
+    (check "chunked decode"
+           (sb-ext:octets-to-string decoded :external-format :utf-8)
+           "hello, world!"))
+
+  ;; Chunk with extension (RFC 7230 §4.1.1) — extension silently skipped
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "5;ext=val" (string #\Return) (string #\Newline)
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (decoded (web-skeleton::decode-chunked-body raw 0 (length raw))))
+    (check "chunked decode with extension"
+           (sb-ext:octets-to-string decoded :external-format :utf-8)
+           "hello"))
+
+  ;; Empty body (zero-size first chunk)
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (decoded (web-skeleton::decode-chunked-body raw 0 (length raw))))
+    (check "chunked decode empty" (length decoded) 0))
+
+  ;; response-chunked-p helper
+  (check "chunked-p yes"
+         (not (null (web-skeleton::response-chunked-p
+                     '(("transfer-encoding" . "chunked"))))) t)
+  (check "chunked-p no"
+         (web-skeleton::response-chunked-p
+          '(("content-type" . "text/plain"))) nil)
+  (check "chunked-p case-insensitive"
+         (not (null (web-skeleton::response-chunked-p
+                     '(("transfer-encoding" . "Chunked"))))) t))
+
+;;; ---------------------------------------------------------------------------
 ;;; WebSocket tests
 ;;; ---------------------------------------------------------------------------
 
@@ -802,6 +851,7 @@
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-decode-chunked-body)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
