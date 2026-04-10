@@ -480,6 +480,12 @@
                   (replace (connection-read-buf conn) (connection-read-buf conn)
                            :start1 0 :start2 http-end :end2 buffered))
                 (setf (connection-read-pos conn) (max extra 0)
+                      (connection-write-buf conn) nil
+                      (connection-write-pos conn) 0
+                      (connection-write-end conn) 0
+                      (connection-request conn) nil
+                      (connection-body-expected conn) 0
+                      (connection-header-end conn) 0
                       (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+)))
