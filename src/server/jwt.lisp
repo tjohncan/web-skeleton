@@ -8,6 +8,10 @@
 ;;; Uses the framework's JSON parser (src/json.lisp).
 ;;; ===========================================================================
 
+(defparameter *jwt-clock-skew* 60
+  "Seconds of clock skew tolerance for JWT exp/nbf checks.
+   Accounts for clock drift between the token issuer and this server.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; JWKS parsing
 ;;; ---------------------------------------------------------------------------
@@ -76,16 +80,17 @@
               (let ((claims (json-parse (sb-ext:octets-to-string
                                          (base64url-decode payload-b64)
                                          :external-format :utf-8))))
-                ;; Check expiration
-                (let ((exp (json-get claims "exp")))
+                ;; Check expiration (with clock skew tolerance)
+                (let ((exp (json-get claims "exp"))
+                      (now (jwt-current-time)))
                   (when (and exp (numberp exp)
-                             (<= exp (jwt-current-time)))
-                    (return-from jwt-verify nil)))
-                ;; Check not-before (RFC 7519 §4.1.5)
-                (let ((nbf (json-get claims "nbf")))
-                  (when (and nbf (numberp nbf)
-                             (> nbf (jwt-current-time)))
-                    (return-from jwt-verify nil)))
+                             (<= exp (- now *jwt-clock-skew*)))
+                    (return-from jwt-verify nil))
+                  ;; Check not-before (RFC 7519 §4.1.5)
+                  (let ((nbf (json-get claims "nbf")))
+                    (when (and nbf (numberp nbf)
+                               (> nbf (+ now *jwt-clock-skew*)))
+                      (return-from jwt-verify nil))))
                 claims)))))
     (error () nil)))
 

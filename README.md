@@ -195,6 +195,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*` | `30` | Seconds between server-initiated WebSocket pings |
 | `*ws-max-missed-pongs*` | `3` | Missed pongs before a WebSocket is declared dead |
 | `*fetch-timeout*` | `30` | Seconds before a parked connection waiting for an outbound fetch is reaped |
+| `*jwt-clock-skew*` | `60` | Seconds of clock skew tolerance for JWT exp/nbf checks |
 | `*drain-timeout*` | `5` | Seconds to wait for connections to drain on shutdown |
 
 The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:

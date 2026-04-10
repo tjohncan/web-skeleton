@@ -62,6 +62,7 @@
            #:jwt-key-y
            #:parse-jwks
            #:jwt-verify
+           #:*jwt-clock-skew*
            #:jwt-claim
            ;; JSON
            #:json-parse
