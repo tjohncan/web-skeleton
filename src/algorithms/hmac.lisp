@@ -45,10 +45,12 @@
 (defun constant-time-equal (a b)
   "Compare byte vectors A and B in constant time.
    Returns T if equal, NIL otherwise. Always examines every byte
-   to prevent timing side-channel leakage."
-  (if (/= (length a) (length b))
-      nil
-      (zerop (let ((acc 0))
-                (loop for i from 0 below (length a)
-                      do (setf acc (logior acc (logxor (aref a i) (aref b i)))))
-                acc))))
+   to prevent timing side-channel leakage.
+   Length mismatch is folded into the result without early return."
+  (let ((len-a (length a))
+        (len-b (length b))
+        (acc 0))
+    (setf acc (logxor len-a len-b))
+    (loop for i from 0 below (min len-a len-b)
+          do (setf acc (logior acc (logxor (aref a i) (aref b i)))))
+    (zerop acc)))
