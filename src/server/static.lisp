@@ -142,7 +142,10 @@
         ;; Second pass: register extensionless aliases for .html files
         ;; e.g., /login.html also serves at /login
         ;; Actual files take priority — don't overwrite existing entries
-        (let ((aliases 0))
+        (let ((aliases 0)
+              (pending nil))
+          ;; Collect aliases first — modifying a hash table during maphash
+          ;; is undefined per the CL spec
           (maphash (lambda (url-path response)
                      (let ((len (length url-path)))
                        (when (and (> len 5)
@@ -150,11 +153,12 @@
                                            :start1 (- len 5)))
                          (let ((alias (subseq url-path 0 (- len 5))))
                            (unless (gethash alias *static-cache*)
-                             (setf (gethash alias *static-cache*) response)
-                             (incf aliases)
-                             (log-debug "static: alias ~a -> ~a"
-                                        alias url-path))))))
+                             (push (cons alias response) pending))))))
                    *static-cache*)
+          (dolist (entry pending)
+            (setf (gethash (car entry) *static-cache*) (cdr entry))
+            (incf aliases)
+            (log-debug "static: alias ~a" (car entry)))
           (log-info "loaded ~d static file~:p (~:d bytes cached, ~d ~a)"
                     count total-bytes aliases
                     (if (= aliases 1) "alias" "aliases")))))))
