@@ -79,7 +79,9 @@
             (pos 0))
         (loop
           ;; Skip whitespace after ;
-          (loop while (and (< pos len) (char= (char header pos) #\Space))
+          (loop while (and (< pos len)
+                           (or (char= (char header pos) #\Space)
+                               (char= (char header pos) #\Tab)))
                 do (incf pos))
           (when (>= pos len) (return nil))
           ;; Check for name=
