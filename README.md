@@ -188,7 +188,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-count*` | `100` | Max number of headers per request |
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
-| `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB) |
+| `*max-ws-payload-size*` | `65536` | Max WebSocket frame payload (bytes, default 64KB). Also caps reassembled fragmented messages |
 | `*max-connections*` | `10000` | Max connections per worker (new accepts dropped when full) |
 | `*idle-timeout*` | `10` | Seconds before an idle HTTP connection is closed |
 | `*ws-idle-timeout*` | `86400` | Seconds before an inactive WebSocket is closed |
