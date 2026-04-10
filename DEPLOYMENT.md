@@ -156,11 +156,17 @@ side-channel on byte-by-byte comparison can leak the expected MAC:
 
 ```lisp
 (let ((expected (hmac-sha256 secret-key body))
-      (provided (hex-decode (get-header request "x-signature"))))
-  (when (constant-time-equal expected provided)
+      (provided (handler-case
+                    (hex-decode (get-header request "x-signature"))
+                  (error () nil))))
+  (when (and provided (constant-time-equal expected provided))
     ;; signature valid
     ...))
 ```
+
+`hex-decode` signals an error on invalid input (odd length, non-hex
+characters). Wrap it in `handler-case` to reject malformed signatures
+gracefully.
 
 ### Blocking fetch paths
 
