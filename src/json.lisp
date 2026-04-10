@@ -105,6 +105,10 @@
                (t (error "json: invalid escape \\~c at ~d" esc (1- pos)))))
            (incf pos))
           (t
+           ;; RFC 8259 §7: control characters U+0000-U+001F must be escaped
+           (when (< (char-code ch) #x20)
+             (error "json: unescaped control character U+~4,'0X at ~d"
+                    (char-code ch) pos))
            (vector-push-extend ch out)
            (incf pos)))))))
 
