@@ -268,8 +268,11 @@
                                                          (+ first-crlf 2)
                                                          (+ header-end 4))))))
                      (body-start (when header-end (+ header-end 4)))
-                     (body (when (and body-start (> buf-len body-start))
-                             (subseq response-buf body-start buf-len)))
+                     (raw-body (when (and body-start (> buf-len body-start))
+                                 (subseq response-buf body-start buf-len)))
+                     (body (if (and raw-body (response-chunked-p headers))
+                               (decode-chunked-body raw-body 0 (length raw-body))
+                               raw-body))
                      (callback (http-fetch-request-callback fetch-req)))
                 ;; Call the user's callback
                 (let ((response (funcall callback

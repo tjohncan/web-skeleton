@@ -442,6 +442,50 @@
                  nil))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Chunked body decoding (for buffered responses)
+;;; ---------------------------------------------------------------------------
+
+(defun response-chunked-p (headers)
+  "Return T if HEADERS indicate chunked transfer encoding."
+  (let ((te (cdr (assoc "transfer-encoding" headers :test #'string-equal))))
+    (and te (search "chunked" te :test #'char-equal))))
+
+(defun decode-chunked-body (buf start end)
+  "Decode chunked transfer encoding from BUF[START..END).
+   Returns a byte vector with the chunk framing stripped."
+  (let ((out (make-array (- end start) :element-type '(unsigned-byte 8)
+                                        :fill-pointer 0))
+        (pos start))
+    (loop
+      ;; Parse chunk size (hex digits)
+      (let ((size 0)
+            (found nil))
+        (loop while (< pos end)
+              for byte = (aref buf pos)
+              do (let ((digit (hex-digit-value byte)))
+                   (if digit
+                       (progn (setf size (+ (ash size 4) digit)
+                                    found t)
+                              (incf pos))
+                       (return))))
+        (unless found (return))
+        ;; Skip to end of chunk-size line (past CRLF)
+        (loop while (and (< pos end) (/= (aref buf pos) 10))
+              do (incf pos))
+        (when (< pos end) (incf pos))
+        ;; Zero-size chunk = end
+        (when (zerop size) (return))
+        ;; Copy chunk data
+        (let ((chunk-end (min (+ pos size) end)))
+          (loop for i from pos below chunk-end
+                do (vector-push-extend (aref buf i) out))
+          (setf pos chunk-end))
+        ;; Skip trailing CRLF after chunk data
+        (when (and (< pos end) (= (aref buf pos) 13)) (incf pos))
+        (when (and (< pos end) (= (aref buf pos) 10)) (incf pos))))
+    (subseq out 0 (fill-pointer out))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Deliver fetch result to the parked inbound connection
 ;;; ---------------------------------------------------------------------------
 
@@ -458,9 +502,12 @@
                       (when first-crlf
                         (parse-headers-bytes buf (+ first-crlf 2)
                                              (+ header-end 4))))))
-         ;; Extract body
-         (body (when (and body-start (> pos body-start))
-                 (subseq buf body-start pos)))
+         ;; Extract body (decode chunked framing if present)
+         (raw-body (when (and body-start (> pos body-start))
+                     (subseq buf body-start pos)))
+         (body (if (and raw-body (response-chunked-p headers))
+                   (decode-chunked-body raw-body 0 (length raw-body))
+                   raw-body))
          ;; Call the user's callback
          (callback (connection-fetch-callback out-conn))
          (inbound-fd (connection-inbound-fd out-conn)))
