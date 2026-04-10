@@ -68,30 +68,30 @@
                        (t nil))))
             (unless key
               (return-from jwt-verify nil))
-            ;; Verify signature
-            (let* ((signing-input (concatenate 'string header-b64 "." payload-b64))
-                   (hash (sha256 (sb-ext:string-to-octets signing-input
-                                                           :external-format :ascii)))
-                   (sig (base64url-decode sig-b64)))
-              (unless (and (= (length sig) 64)
-                           (ecdsa-verify-p256 hash sig
-                                              (jwt-key-x key) (jwt-key-y key)))
-                (return-from jwt-verify nil))
-              ;; Decode and return claims
-              (let ((claims (json-parse (sb-ext:octets-to-string
-                                         (base64url-decode payload-b64)
-                                         :external-format :utf-8))))
-                ;; Check expiration (with clock skew tolerance)
-                (let ((exp (json-get claims "exp"))
-                      (now (jwt-current-time)))
-                  (when (and exp (numberp exp)
-                             (<= exp (- now *jwt-clock-skew*)))
-                    (return-from jwt-verify nil))
-                  ;; Check not-before (RFC 7519 §4.1.5)
-                  (let ((nbf (json-get claims "nbf")))
-                    (when (and nbf (numberp nbf)
-                               (> nbf (+ now *jwt-clock-skew*)))
-                      (return-from jwt-verify nil))))
+            ;; Decode claims and check exp/nbf BEFORE expensive crypto.
+            ;; This prevents DoS via expired tokens forcing ECDSA verification.
+            ;; Safe: we already parse unauthenticated JSON for the header above.
+            (let* ((claims (json-parse (sb-ext:octets-to-string
+                                        (base64url-decode payload-b64)
+                                        :external-format :utf-8)))
+                   (now (jwt-current-time)))
+              (let ((exp (json-get claims "exp")))
+                (when (and exp (numberp exp)
+                           (<= exp (- now *jwt-clock-skew*)))
+                  (return-from jwt-verify nil)))
+              (let ((nbf (json-get claims "nbf")))
+                (when (and nbf (numberp nbf)
+                           (> nbf (+ now *jwt-clock-skew*)))
+                  (return-from jwt-verify nil)))
+              ;; Claims are valid — now verify signature
+              (let* ((signing-input (concatenate 'string header-b64 "." payload-b64))
+                     (hash (sha256 (sb-ext:string-to-octets signing-input
+                                                             :external-format :ascii)))
+                     (sig (base64url-decode sig-b64)))
+                (unless (and (= (length sig) 64)
+                             (ecdsa-verify-p256 hash sig
+                                                (jwt-key-x key) (jwt-key-y key)))
+                  (return-from jwt-verify nil))
                 claims)))))
     (error () nil)))
 
