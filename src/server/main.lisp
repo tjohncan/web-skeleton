@@ -338,6 +338,12 @@
                      (initiate-fetch conn epoll-fd response))
                     ;; Normal response — queue for writing
                     (t
+                     ;; HTTP/1.0 keep-alive: echo the header so the client
+                     ;; knows the connection will persist
+                     (when (and (not (connection-close-after-p conn))
+                                (string= (http-request-version request) "1.0")
+                                (typep response 'http-response))
+                       (set-response-header response "connection" "keep-alive"))
                      (let ((bytes (if (typep response
                                             '(simple-array (unsigned-byte 8) (*)))
                                       response
