@@ -54,7 +54,8 @@
   (close-after-p  nil :type boolean)          ; T = close after response sent
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
-  (ws-frag-buf   nil :type list))              ; accumulated payload chunks, or NIL
+  (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
+  (ws-frag-total  0  :type fixnum))           ; running total bytes in frag-buf
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor
