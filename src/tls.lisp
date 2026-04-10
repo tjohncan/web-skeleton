@@ -250,7 +250,7 @@
               (let ((request-bytes (build-outbound-request
                                    (http-fetch-request-method fetch-req)
                                    host path
-                                   :port port
+                                   :scheme :https :port port
                                    :headers (http-fetch-request-headers fetch-req)
                                    :body (http-fetch-request-body fetch-req))))
                 (tls-write-all ssl request-bytes))
@@ -313,7 +313,7 @@
     (unwind-protect
         (progn
           (tls-write-all ssl (build-outbound-request method host path
-                                                     :port port
+                                                     :scheme :https :port port
                                                      :headers headers :body body))
           (tls-stream-response ssl on-line))
       (tls-close ssl socket))))
