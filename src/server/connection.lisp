@@ -151,9 +151,12 @@
                                       (= (aref buf pos) 9)))
                        do (incf pos))
                  ;; Parse decimal digits
-                 (let ((value 0) (found nil))
+                 (let ((value 0) (found nil) (digits 0))
                    (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
-                         do (setf value (+ (* value 10) (- (aref buf pos) 48))
+                         do (incf digits)
+                            (when (> digits 15)
+                              (http-parse-error "Content-Length too large"))
+                            (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
                             (incf pos))
                    (when found
