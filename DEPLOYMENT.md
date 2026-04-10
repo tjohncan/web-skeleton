@@ -167,8 +167,9 @@ side-channel on byte-by-byte comparison can leak the expected MAC:
 `http-fetch-stream` and HTTPS fetch are **blocking** — they hold the
 worker thread for the duration of the upstream call. This is fine for
 bounded work inside a `ws-handler` (e.g. streaming an LLM response),
-but avoid calling them from HTTP handlers under load. The non-blocking
-`http-fetch` uses the epoll event loop and does not block.
+but avoid calling them from HTTP handlers under load. `http-fetch` is
+non-blocking for `http://` URLs (epoll event loop). For `https://` URLs
+it blocks the worker thread for the full request lifecycle.
 
 ### ws-send and worker blocking
 
