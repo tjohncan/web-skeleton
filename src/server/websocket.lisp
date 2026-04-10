@@ -269,6 +269,13 @@
                    (poll-writable fd 1000)
                    (incf pos result))))))
 
+(defun ws-shift-buffer (conn buf pos end)
+  "Shift unconsumed bytes to the start of the read buffer."
+  (let ((remaining (- end pos)))
+    (when (> remaining 0)
+      (replace buf buf :start1 0 :start2 pos :end2 end))
+    (setf (connection-read-pos conn) remaining)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket event handler
 ;;;
@@ -290,10 +297,7 @@
         (unless frame
           ;; No complete frame — shift unconsumed bytes to start of buffer
           (when (> pos 0)
-            (let ((remaining (- end pos)))
-              (when (> remaining 0)
-                (replace buf buf :start1 0 :start2 pos :end2 end))
-              (setf (connection-read-pos conn) remaining)))
+            (ws-shift-buffer conn buf pos end))
           (return))
         ;; Advance past this frame
         (incf pos consumed)
@@ -308,10 +312,7 @@
                (log-warn "ws new data frame mid-fragment fd ~d"
                          (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil)
-               (let ((remaining (- end pos)))
-                 (when (> remaining 0)
-                   (replace buf buf :start1 0 :start2 pos :end2 end))
-                 (setf (connection-read-pos conn) remaining))
+               (ws-shift-buffer conn buf pos end)
                (return-from websocket-on-read
                  (values :close (build-ws-close 1002))))
              (if (ws-frame-fin frame)
@@ -325,10 +326,7 @@
                        (error ()
                          (log-warn "ws invalid UTF-8 in text frame fd ~d"
                                    (connection-fd conn))
-                         (let ((remaining (- end pos)))
-                           (when (> remaining 0)
-                             (replace buf buf :start1 0 :start2 pos :end2 end))
-                           (setf (connection-read-pos conn) remaining))
+                         (ws-shift-buffer conn buf pos end)
                          (return-from websocket-on-read
                            (values :close (build-ws-close 1007))))))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
@@ -350,11 +348,7 @@
              (unless (connection-ws-frag-buf conn)
                (log-warn "ws continuation without start fd ~d"
                          (connection-fd conn))
-               ;; Shift buffer, then signal close
-               (let ((remaining (- end pos)))
-                 (when (> remaining 0)
-                   (replace buf buf :start1 0 :start2 pos :end2 end))
-                 (setf (connection-read-pos conn) remaining))
+               (ws-shift-buffer conn buf pos end)
                (return-from websocket-on-read
                  (values :close (build-ws-close 1002))))
              ;; Accumulate fragment
@@ -365,10 +359,7 @@
                  (log-warn "ws fragmented message too large (~d bytes) fd ~d"
                            total (connection-fd conn))
                  (setf (connection-ws-frag-buf conn) nil)
-                 (let ((remaining (- end pos)))
-                   (when (> remaining 0)
-                     (replace buf buf :start1 0 :start2 pos :end2 end))
-                   (setf (connection-read-pos conn) remaining))
+                 (ws-shift-buffer conn buf pos end)
                  (return-from websocket-on-read
                    (values :close (build-ws-close 1009)))))
              (when (ws-frame-fin frame)
@@ -391,10 +382,7 @@
                      (error ()
                        (log-warn "ws invalid UTF-8 in reassembled text fd ~d"
                                  (connection-fd conn))
-                       (let ((remaining (- end pos)))
-                         (when (> remaining 0)
-                           (replace buf buf :start1 0 :start2 pos :end2 end))
-                         (setf (connection-read-pos conn) remaining))
+                       (ws-shift-buffer conn buf pos end)
                        (return-from websocket-on-read
                          (values :close (build-ws-close 1007))))))
                  (setf (connection-last-active conn) (get-universal-time))
@@ -418,11 +406,8 @@
              (let* ((payload (ws-frame-payload frame))
                     (code (if (>= (length payload) 2)
                               (logior (ash (aref payload 0) 8) (aref payload 1))
-                              1000))
-                    (remaining (- end pos)))
-               (when (> remaining 0)
-                 (replace buf buf :start1 0 :start2 pos :end2 end))
-               (setf (connection-read-pos conn) remaining)
+                              1000)))
+               (ws-shift-buffer conn buf pos end)
                (return-from websocket-on-read
                  (values :close (build-ws-close code)))))
             (t
