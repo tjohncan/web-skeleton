@@ -176,6 +176,9 @@
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
       (let ((path (http-request-path request)))
+        ;; Defense-in-depth: this check operates on the raw (non-decoded)
+        ;; path, so %2e%2e bypasses it. The real traversal defense is the
+        ;; hash-table lookup below — only paths loaded at startup can match.
         (unless (or (search "/../" path)
                     (and (>= (length path) 3)
                          (string= path "/.." :start1 (- (length path) 3))))
