@@ -48,5 +48,7 @@
    to prevent timing side-channel leakage."
   (if (/= (length a) (length b))
       nil
-      (zerop (loop for i from 0 below (length a)
-                   sum (logxor (aref a i) (aref b i))))))
+      (zerop (let ((acc 0))
+                (loop for i from 0 below (length a)
+                      do (setf acc (logior acc (logxor (aref a i) (aref b i)))))
+                acc))))
