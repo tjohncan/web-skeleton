@@ -608,6 +608,9 @@
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
   (setf *shutdown* nil)
+  ;; Ignore SIGPIPE — writing to a broken connection must return EPIPE,
+  ;; not kill the process. SBCL typically ignores it, but not guaranteed.
+  (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
   ;; SIGTERM triggers graceful shutdown (same as Ctrl-C)
   (sb-sys:enable-interrupt sb-unix:sigterm
     (lambda (signal info context)
