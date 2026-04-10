@@ -75,20 +75,20 @@
                        (string (sb-ext:string-to-octets body
                                                          :external-format :utf-8))
                        ((simple-array (unsigned-byte 8) (*)) body)))
-         (has-header-p (lambda (name)
-                         (assoc name headers :test #'string-equal)))
-         (all-headers (append
-                       (unless (funcall has-header-p "host")
+         (all-headers (flet ((has-header-p (name)
+                              (assoc name headers :test #'string-equal)))
+                       (append
+                       (unless (has-header-p "host")
                          (list (cons "host" host-value)))
-                       (unless (funcall has-header-p "connection")
+                       (unless (has-header-p "connection")
                          (list (cons "connection" "close")))
-                       (unless (funcall has-header-p "user-agent")
+                       (unless (has-header-p "user-agent")
                          (list (cons "user-agent" "web-skeleton")))
                        headers
                        (when body-bytes
                          (list (cons "content-length"
                                      (write-to-string
-                                      (length body-bytes))))))))
+                                      (length body-bytes)))))))))
     (serialize-http-message
      (format nil "~a ~a HTTP/1.1" method-str path)
      all-headers body-bytes)))
