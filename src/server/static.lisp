@@ -126,6 +126,7 @@
         ;; First pass: load all files (skip directories)
         (dolist (file (directory wild))
           (when (and (pathname-name file)
+                     (> (length (pathname-name file)) 0)
                      (not (char= (char (pathname-name file) 0) #\.)))
             (let* ((fs-path (namestring file))
                    (relative (subseq fs-path (length base)))
