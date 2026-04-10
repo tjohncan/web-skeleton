@@ -172,10 +172,25 @@ but avoid calling them from HTTP handlers under load. The non-blocking
 
 ### ws-send and worker blocking
 
-`ws-send` writes synchronously, blocking the worker until the frame is
-flushed (up to `*ws-send-timeout*` seconds). Fine for streaming a
-bounded response (e.g. sending tokens as they arrive). Avoid unbounded
-loops — a slow client holds the worker hostage.
+`ws-send` writes a WebSocket frame to a connection synchronously,
+blocking until all bytes are flushed (up to 10 seconds). Call it from
+within `ws-handler` to send multiple frames during a single handler
+invocation — the event loop is paused while the handler runs, so there
+is no write contention.
+
+```lisp
+(defun handle-ws-message (conn frame)
+  (when (= (ws-frame-opcode frame) +ws-op-text+)
+    ;; Stream results back as they become available
+    (dolist (chunk (generate-chunks (ws-frame-payload frame)))
+      (ws-send conn (build-ws-text chunk)))
+    nil))  ; return nil — we already sent our responses
+```
+
+The worker thread is blocked for the duration of the handler call.
+With multiple workers this is fine for bounded work (e.g. streaming
+an LLM response for a few seconds), but avoid unbounded blocking —
+a slow client holds the worker hostage.
 
 ### Static files
 
