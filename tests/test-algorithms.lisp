@@ -283,7 +283,28 @@
   ;; Confirm sha1-hex still works through bytes-to-hex
   (check "sha1-hex via bytes-to-hex"
          (sha1-hex (sb-ext:string-to-octets "abc"))
-         "a9993e364706816aba3e25717850c26c9cd0d89d"))
+         "a9993e364706816aba3e25717850c26c9cd0d89d")
+
+  ;; hex-decode (compare via bytes-to-hex for array equality)
+  (check "decode empty"
+         (bytes-to-hex (hex-decode "")) "")
+
+  (check "decode round-trip"
+         (bytes-to-hex (hex-decode "007fc8")) "007fc8")
+
+  (check "decode uppercase"
+         (bytes-to-hex (hex-decode "FF00AB")) "ff00ab")
+
+  (check "decode lowercase"
+         (bytes-to-hex (hex-decode "ff00ab")) "ff00ab")
+
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "decode odd-length rejected"
+           (signals-error-p (lambda () (hex-decode "abc"))) t)
+    (check "decode invalid char rejected"
+           (signals-error-p (lambda () (hex-decode "zz"))) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
