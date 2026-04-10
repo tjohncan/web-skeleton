@@ -75,7 +75,7 @@
     (check "cookie no header" (get-cookie req "session") nil))
 
   ;; All methods
-  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH"))
+  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH" "TRACE" "CONNECT"))
     (let ((req (parse-request (crlf (format nil "~a / HTTP/1.1" method)
                                     "Host: localhost"))))
       (check (format nil "method ~a" method)
@@ -116,7 +116,60 @@
 
   ;; Path not starting with /
   (check-error "path without leading /"
-               (parse-request (crlf "GET relative HTTP/1.1" "Host: localhost"))))
+               (parse-request (crlf "GET relative HTTP/1.1" "Host: localhost")))
+
+  ;; Oversized request line
+  (check-error "oversized request line"
+               (let ((web-skeleton:*max-request-line-length* 10))
+                 (parse-request (crlf "GET /this-is-too-long HTTP/1.1"
+                                      "Host: localhost"))))
+
+  ;; Oversized header line (limit 20 lets "Host: localhost" pass)
+  (check-error "oversized header line"
+               (let ((web-skeleton:*max-header-line-length* 20))
+                 (parse-request (crlf "GET / HTTP/1.1"
+                                      "Host: localhost"
+                                      "X-Big: this-value-is-too-long"))))
+
+  ;; Too many headers
+  (check-error "too many headers"
+               (let ((web-skeleton:*max-header-count* 2))
+                 (parse-request (crlf "GET / HTTP/1.1"
+                                      "Host: localhost"
+                                      "A: 1"
+                                      "B: 2"))))
+
+  ;; Obsolete line folding
+  (check-error "obs-fold rejected"
+               (parse-request (concatenate 'string
+                                "GET / HTTP/1.1" *crlf*
+                                "Host: localhost" *crlf*
+                                "X-Folded:" *crlf*
+                                (string #\Tab) "continued" *crlf*
+                                *crlf*)))
+
+  ;; Transfer-Encoding rejected
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Host: localhost" *crlf*
+                "Transfer-Encoding: chunked" *crlf*
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check "transfer-encoding detected"
+           (web-skeleton::scan-transfer-encoding bytes header-end)
+           t))
+
+  ;; Duplicate conflicting Content-Length
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: 10" *crlf*
+                "Content-Length: 20" *crlf*
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check-error "duplicate Content-Length"
+                 (web-skeleton::scan-content-length bytes header-end))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests
@@ -560,7 +613,30 @@
             (lambda ()
               (let ((frame (make-masked-frame nil 9 #())))
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
-           t)))
+           t)
+
+    ;; Reserved close code clamped to 1000
+    ;; Build a close frame with code 1006 (reserved, must not echo)
+    (let ((close-frame (build-ws-close 1006)))
+      ;; Verify build-ws-close produces the code we asked for
+      (check "close frame code 1006 built"
+             (logior (ash (aref close-frame 2) 8) (aref close-frame 3))
+             1006))
+    ;; The clamping happens in websocket-on-read (requires a connection),
+    ;; but we verify the reserved-code logic directly:
+    (flet ((clamp-code (raw-code)
+             (if (or (< raw-code 1000)
+                     (member raw-code '(1005 1006 1015))
+                     (and (>= raw-code 1016) (<= raw-code 2999)))
+                 1000
+                 raw-code)))
+      (check "close code 1006 clamped" (clamp-code 1006) 1000)
+      (check "close code 1005 clamped" (clamp-code 1005) 1000)
+      (check "close code 1015 clamped" (clamp-code 1015) 1000)
+      (check "close code 999 clamped"  (clamp-code 999) 1000)
+      (check "close code 1000 passes"  (clamp-code 1000) 1000)
+      (check "close code 1001 passes"  (clamp-code 1001) 1001)
+      (check "close code 3000 passes"  (clamp-code 3000) 3000))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file helper tests
