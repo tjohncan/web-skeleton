@@ -160,6 +160,9 @@
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
                             (incf pos))
+                   ;; Header name matched but no digits — reject
+                   (unless found
+                     (http-parse-error "invalid Content-Length value"))
                    (when found
                      ;; Skip optional trailing whitespace
                      (loop while (and (< pos end)
