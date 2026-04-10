@@ -298,10 +298,13 @@
       (setf (http-request-body request)
             (subseq (connection-read-buf conn) body-start
                     (+ body-start content-length))))
-    ;; RFC 7230 §5.4: HTTP/1.1 requests MUST include a Host header
-    (when (and (string= (http-request-version request) "1.1")
-               (not (get-header request "host")))
-      (http-parse-error "missing Host header in HTTP/1.1 request"))
+    ;; RFC 7230 §5.4: HTTP/1.1 requests MUST have exactly one Host header
+    (when (string= (http-request-version request) "1.1")
+      (let ((host-count (length (get-headers request "host"))))
+        (when (zerop host-count)
+          (http-parse-error "missing Host header in HTTP/1.1 request"))
+        (when (> host-count 1)
+          (http-parse-error "duplicate Host header"))))
     (setf (connection-request conn) request)
     request))
 
