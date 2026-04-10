@@ -293,7 +293,15 @@
         (responses nil))
     (loop
       (multiple-value-bind (frame consumed)
-          (try-parse-ws-frame buf pos end)
+          (handler-case
+              (try-parse-ws-frame buf pos end)
+            (error (e)
+              ;; Protocol errors (RSV bits, oversized, unmasked, etc.)
+              ;; → close with 1002 per RFC 6455 §7.1.7
+              (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
+              (ws-shift-buffer conn buf pos end)
+              (return-from websocket-on-read
+                (values :close (build-ws-close 1002)))))
         (unless frame
           ;; No complete frame — shift unconsumed bytes to start of buffer
           (when (> pos 0)
