@@ -366,7 +366,13 @@
            (case result
              (:websocket
               (multiple-value-bind (response close-frame)
-                  (websocket-on-read conn ws-handler)
+                  (handler-case
+                      (websocket-on-read conn ws-handler)
+                    (error (e)
+                      ;; Handler or frame-processing error — send 1011 close
+                      (log-warn "ws handler error fd ~d: ~a"
+                                (connection-fd conn) e)
+                      (values :close (build-ws-close 1011))))
                 (cond
                   ;; Close requested — send close frame back, then shut down
                   ((eq response :close)
@@ -572,7 +578,9 @@
           (if dash
               (1+ (parse-integer (subseq line (1+ dash))))
               1)))
-    (error () 1)))
+    (error ()
+      (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")
+      1)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
