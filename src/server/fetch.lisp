@@ -1,11 +1,12 @@
 (in-package :web-skeleton)
 
 ;;; ===========================================================================
-;;; Non-blocking HTTP Client (outbound fetch)
+;;; HTTP Client (outbound fetch)
 ;;;
 ;;; Integrates with the event loop — outbound connections are registered
 ;;; with the same epoll fd and processed alongside inbound connections.
-;;; Zero blocking in the event loop.
+;;; Non-blocking I/O after connection. DNS resolution (get-host-by-name)
+;;; and HTTPS (via TLS hook) block the worker thread.
 ;;;
 ;;; Usage from a handler:
 ;;;   (http-fetch :get "http://host/path"
@@ -337,34 +338,40 @@
   "Start a non-blocking outbound HTTP request via epoll."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                :type :stream :protocol :tcp)))
-    (set-nonblocking (socket-fd socket))
-    (let ((addr (sb-bsd-sockets:host-ent-address
-                 (sb-bsd-sockets:get-host-by-name host))))
-      (handler-case
-          (sb-bsd-sockets:socket-connect socket addr port)
-        (sb-bsd-sockets:socket-error () nil))
-      (let* ((out-fd (socket-fd socket))
-             (request-bytes (build-outbound-request
-                            (http-fetch-request-method fetch-req)
-                            host path
-                            :port port
-                            :headers (http-fetch-request-headers fetch-req)
-                            :body (http-fetch-request-body fetch-req)))
-             (out-conn (make-connection
-                        :fd out-fd
-                        :socket socket
-                        :state :out-connecting
-                        :outbound-p t
-                        :inbound-fd (connection-fd conn)
-                        :fetch-callback (http-fetch-request-callback fetch-req)
-                        :last-active (get-universal-time))))
-        (connection-queue-write out-conn request-bytes)
-        (register-connection out-conn)
-        (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
-        (setf (connection-state conn) :awaiting
-              (connection-awaiting-fd conn) out-fd)
-        (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
-                   (connection-fd conn) host port path out-fd)))))
+    (handler-case
+        (progn
+          (set-nonblocking (socket-fd socket))
+          (let ((addr (sb-bsd-sockets:host-ent-address
+                       (sb-bsd-sockets:get-host-by-name host))))
+            (handler-case
+                (sb-bsd-sockets:socket-connect socket addr port)
+              (sb-bsd-sockets:socket-error () nil))
+            (let* ((out-fd (socket-fd socket))
+                   (request-bytes (build-outbound-request
+                                  (http-fetch-request-method fetch-req)
+                                  host path
+                                  :port port
+                                  :headers (http-fetch-request-headers fetch-req)
+                                  :body (http-fetch-request-body fetch-req)))
+                   (out-conn (make-connection
+                              :fd out-fd
+                              :socket socket
+                              :state :out-connecting
+                              :outbound-p t
+                              :inbound-fd (connection-fd conn)
+                              :fetch-callback (http-fetch-request-callback fetch-req)
+                              :last-active (get-universal-time))))
+              (connection-queue-write out-conn request-bytes)
+              (register-connection out-conn)
+              (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
+              (setf (connection-state conn) :awaiting
+                    (connection-awaiting-fd conn) out-fd)
+              (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
+                   (connection-fd conn) host port path out-fd))))
+      (error (e)
+        ;; Clean up the socket on any error (DNS failure, etc.)
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        (error e)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound event handlers
