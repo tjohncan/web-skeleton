@@ -449,8 +449,7 @@
                   (close-connection conn epoll-fd)
                   ;; Keep-alive — reset for next request,
                   ;; preserving any pipelined bytes already buffered
-                  (let* ((consumed (+ (connection-header-end conn) 4
-                                      (connection-body-expected conn)))
+                  (let* ((consumed (connection-request-end conn))
                          (buffered (connection-read-pos conn))
                          (extra (- buffered consumed)))
                     (when (> extra 0)
@@ -474,7 +473,7 @@
                     (return-from handle-client-write :keep-alive))))
              (:ws-upgrade
               ;; WebSocket handshake sent — preserve any data past the HTTP request
-              (let* ((http-end (+ (connection-header-end conn) 4))
+              (let* ((http-end (connection-request-end conn))
                      (buffered (connection-read-pos conn))
                      (extra (- buffered http-end)))
                 (when (> extra 0)

@@ -318,6 +318,15 @@
     request))
 
 ;;; ---------------------------------------------------------------------------
+;;; Request boundary
+;;; ---------------------------------------------------------------------------
+
+(defun connection-request-end (conn)
+  "Byte offset past the complete HTTP request (headers + body).
+   Used by keep-alive and ws-upgrade to find pipelined/extra data."
+  (+ (connection-header-end conn) 4 (connection-body-expected conn)))
+
+;;; ---------------------------------------------------------------------------
 ;;; State machine: queue write
 ;;; ---------------------------------------------------------------------------
 
