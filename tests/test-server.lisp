@@ -82,6 +82,15 @@
              (http-request-method req)
              (intern method :keyword)))))
 
+(defun test-http-date ()
+  (format t "~%HTTP Date~%")
+  ;; Use a known universal time: 2026-04-09 21:00:00 UTC = Thursday
+  ;; CL universal time for 2026-04-09 21:00:00 UTC:
+  ;; (encode-universal-time 0 0 21 9 4 2026 0) = 3985020000
+  (let ((date (web-skeleton::http-date (encode-universal-time 0 0 21 9 4 2026 0))))
+    (check "http-date format"
+           date "Thu, 09 Apr 2026 21:00:00 GMT")))
+
 (defun test-http-parser-errors ()
   (format t "~%HTTP Parser — rejection~%")
 
@@ -659,6 +668,7 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-http-date)
   (test-http-response)
   (test-fetch)
   (test-url-decode)
