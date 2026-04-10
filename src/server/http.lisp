@@ -181,6 +181,7 @@
 (defun match-path (pattern path)
   "Match PATH against PATTERN with :param segment captures.
    Literal segments must match exactly; segments starting with : capture.
+   Empty segments are not captured (e.g. /users/ does not match /users/:id).
    Returns NIL if no match, T if match with no captures,
    or an alist of (name . decoded-value) pairs if match with captures.
    Captured values are percent-decoded."
