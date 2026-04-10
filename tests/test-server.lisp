@@ -171,6 +171,16 @@
     (check-error "duplicate Content-Length"
                  (web-skeleton::scan-content-length bytes header-end)))
 
+  ;; Unparseable Content-Length value (e.g. +10) — smuggling vector
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: +10" *crlf*
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check-error "Content-Length: +10 rejected"
+                 (web-skeleton::scan-content-length bytes header-end)))
+
   ;; Host header validation (RFC 7230 §5.4)
   ;; connection-parse-request enforces this; parse-request does not.
   (let ((conn (web-skeleton::make-connection
