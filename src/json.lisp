@@ -118,16 +118,16 @@
     (let ((digit-start pos))
       ;; Leading zeros not allowed (except bare 0)
       (when (and (< pos len) (char= (char str pos) #\0)
-                 (< (1+ pos) len) (digit-char-p (char str (1+ pos))))
+                 (< (1+ pos) len) (char<= #\0 (char str (1+ pos)) #\9))
         (error "json: leading zeros not allowed at ~d" start))
-      (loop while (and (< pos len) (digit-char-p (char str pos)))
+      (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
             do (incf pos))
       (when (= pos digit-start)
         (error "json: expected digit at ~d" pos)))
     (when (and (< pos len) (char= (char str pos) #\.))
       (incf pos)
       (let ((frac-start pos))
-        (loop while (and (< pos len) (digit-char-p (char str pos)))
+        (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos frac-start)
           (error "json: no digits after decimal point at ~d" start))))
@@ -136,7 +136,7 @@
       (when (and (< pos len) (member (char str pos) '(#\+ #\-)))
         (incf pos))
       (let ((exp-start pos))
-        (loop while (and (< pos len) (digit-char-p (char str pos)))
+        (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos exp-start)
           (error "json: no digits in exponent at ~d" start))))
@@ -258,7 +258,8 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun json-serialize (value)
-  "Serialize a Lisp value to a JSON string."
+  "Serialize a Lisp value to a JSON string.
+   Alists with string keys serialize as objects; other lists as arrays."
   (with-output-to-string (out)
     (json-write-value value out)))
 
