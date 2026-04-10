@@ -169,7 +169,33 @@
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
     (check-error "duplicate Content-Length"
-                 (web-skeleton::scan-content-length bytes header-end))))
+                 (web-skeleton::scan-content-length bytes header-end)))
+
+  ;; Host header validation (RFC 7230 §5.4)
+  ;; connection-parse-request enforces this; parse-request does not.
+  (let ((conn (web-skeleton::make-connection
+               :fd -1
+               :last-active 0)))
+    ;; Missing Host
+    (let* ((raw (crlf "GET / HTTP/1.1" "Accept: */*"))
+           (bytes (sb-ext:string-to-octets raw :external-format :utf-8))
+           (end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+      (setf (web-skeleton::connection-read-buf conn) bytes
+            (web-skeleton::connection-read-pos conn) (length bytes)
+            (web-skeleton::connection-header-end conn) end
+            (web-skeleton::connection-body-expected conn) 0)
+      (check-error "missing Host rejected"
+                   (web-skeleton::connection-parse-request conn)))
+    ;; Duplicate Host
+    (let* ((raw (crlf "GET / HTTP/1.1" "Host: a.com" "Host: b.com"))
+           (bytes (sb-ext:string-to-octets raw :external-format :utf-8))
+           (end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+      (setf (web-skeleton::connection-read-buf conn) bytes
+            (web-skeleton::connection-read-pos conn) (length bytes)
+            (web-skeleton::connection-header-end conn) end
+            (web-skeleton::connection-body-expected conn) 0)
+      (check-error "duplicate Host rejected"
+                   (web-skeleton::connection-parse-request conn)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests
@@ -340,6 +366,10 @@
   (check "empty value"
          (parse-query-string "key=")
          '(("key" . "")))
+
+  (check "plus literal in query value"
+         (cdr (first (parse-query-string "a=b+c")))
+         "b+c")
 
   (check "nil query"
          (parse-query-string nil)
@@ -636,7 +666,27 @@
       (check "close code 999 clamped"  (clamp-code 999) 1000)
       (check "close code 1000 passes"  (clamp-code 1000) 1000)
       (check "close code 1001 passes"  (clamp-code 1001) 1001)
-      (check "close code 3000 passes"  (clamp-code 3000) 3000))))
+      (check "close code 3000 passes"  (clamp-code 3000) 3000))
+
+    ;; Binary frame (opcode 2)
+    (let ((frame (make-masked-frame t 2 #(#xDE #xAD))))
+      (multiple-value-bind (result consumed)
+          (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (declare (ignore consumed))
+        (check "binary frame opcode" (ws-frame-opcode result) 2)
+        (check "binary frame payload"
+               (bytes-to-hex (ws-frame-payload result)) "dead")))
+
+    ;; Extended length (126-65535 range, 2-byte extended header)
+    (let* ((payload (make-array 200 :element-type '(unsigned-byte 8)
+                                     :initial-element #x42))
+           (frame (make-masked-frame t 1 payload)))
+      (multiple-value-bind (result consumed)
+          (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (declare (ignore consumed))
+        (check "extended length parsed" (not (null result)) t)
+        (check "extended length size"
+               (length (ws-frame-payload result)) 200)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file helper tests
