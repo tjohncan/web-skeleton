@@ -96,8 +96,12 @@
   "Read an entire file into a byte vector."
   (with-open-file (stream path :element-type '(unsigned-byte 8))
     (let* ((size (file-length stream))
-           (buf (make-array size :element-type '(unsigned-byte 8))))
-      (read-sequence buf stream)
+           (buf (make-array size :element-type '(unsigned-byte 8)))
+           (pos 0))
+      (loop (let ((n (read-sequence buf stream :start pos)))
+              (when (= n pos) (return))  ; no progress — EOF
+              (setf pos n)
+              (when (>= pos size) (return))))
       buf)))
 
 ;;; ---------------------------------------------------------------------------
