@@ -89,10 +89,10 @@
                         (unless (has-header-p "user-agent")
                           (list (cons "user-agent" "web-skeleton")))
                         headers
-                       (when (and body-bytes
-                                  (not (has-header-p "content-length")))
-                         (list (cons "content-length"
-                                     (write-to-string
+                        (when (and body-bytes
+                                   (not (has-header-p "content-length")))
+                          (list (cons "content-length"
+                                      (write-to-string
                                       (length body-bytes)))))))))
     (serialize-http-message
      (format nil "~a ~a HTTP/1.1" method-str path)
