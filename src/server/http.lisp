@@ -122,8 +122,11 @@
                    (progn
                      (vector-push b out)
                      (incf i)))))
-    (sb-ext:octets-to-string (subseq out 0 (fill-pointer out))
-                              :external-format :utf-8)))
+    (handler-case
+        (sb-ext:octets-to-string (subseq out 0 (fill-pointer out))
+                                  :external-format :utf-8)
+      (sb-int:character-decoding-error ()
+        (http-parse-error "invalid UTF-8 in percent-decoded value")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Query string parsing
