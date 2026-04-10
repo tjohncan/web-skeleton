@@ -41,6 +41,29 @@
 (sb-alien:define-alien-routine ("__errno_location" errno-location)
     (sb-alien:* sb-alien:int))
 
+(defun errno-name (errno)
+  "Return a human-readable name for common errno values, or nil."
+  (case errno
+    (4   "EINTR")
+    (9   "EBADF")
+    (11  "EAGAIN")
+    (13  "EACCES")
+    (22  "EINVAL")
+    (23  "EMFILE")
+    (24  "ENFILE")
+    (32  "EPIPE")
+    (104 "ECONNRESET")
+    (107 "ENOTCONN")
+    (111 "ECONNREFUSED")
+    (t   nil)))
+
+(defun errno-string (errno)
+  "Format errno as 'NAME (N)' or just 'errno N' if unnamed."
+  (let ((name (errno-name errno)))
+    (if name
+        (format nil "~a (~d)" name errno)
+        (format nil "errno ~d" errno))))
+
 (defun get-errno ()
   "Return the current errno value."
   (sb-alien:deref (errno-location)))
@@ -144,7 +167,7 @@
    Sets CLOEXEC to prevent fd leak on fork+exec."
   (let ((fd (%epoll-create1 +epoll-cloexec+)))
     (when (< fd 0)
-      (error "epoll_create1 failed: errno ~d" (get-errno)))
+      (error "epoll_create1 failed: ~a" (errno-string (get-errno))))
     fd))
 
 (defvar *epoll-ctl-buf* nil
@@ -163,7 +186,7 @@
       (let ((result (%epoll-ctl epoll-fd op fd
                                 (sb-sys:vector-sap event))))
         (when (< result 0)
-          (error "epoll_ctl failed: errno ~d" (get-errno)))))))
+          (error "epoll_ctl failed: ~a" (errno-string (get-errno))))))))
 
 (defun epoll-add (epoll-fd fd events)
   "Register FD with EPOLL-FD, watching for EVENTS (bitmask)."
@@ -178,7 +201,7 @@
   (let ((result (%epoll-ctl epoll-fd +epoll-ctl-del+ fd
                             (sb-sys:int-sap 0))))
     (when (< result 0)
-      (error "epoll_ctl DEL failed: errno ~d" (get-errno)))))
+      (error "epoll_ctl DEL failed: ~a" (errno-string (get-errno))))))
 
 (defun epoll-wait (epoll-fd event-buf max-events timeout-ms)
   "Wait for events on EPOLL-FD into pre-allocated EVENT-BUF.
@@ -195,7 +218,7 @@
          (let ((err (get-errno)))
            (if (= err +eintr+)
                0
-               (error "epoll_wait failed: errno ~d" err))))))))
+               (error "epoll_wait failed: ~a" (errno-string err)))))))))
 
 (declaim (inline epoll-event-fd epoll-event-flags))
 
@@ -227,7 +250,7 @@
     (sb-sys:with-pinned-objects (buf)
       (let ((result (%setsockopt fd level optname (sb-sys:vector-sap buf) 4)))
         (when (< result 0)
-          (error "setsockopt failed: errno ~d" (get-errno)))))))
+          (error "setsockopt failed: ~a" (errno-string (get-errno))))))))
 
 (defun get-socket-option-int (fd level optname)
   "Get an integer-valued socket option."
@@ -239,7 +262,7 @@
                                   (sb-sys:vector-sap val-buf)
                                   (sb-sys:vector-sap len-buf))))
         (when (< result 0)
-          (error "getsockopt failed: errno ~d" (get-errno)))))
+          (error "getsockopt failed: ~a" (errno-string (get-errno))))))
     (unpack-le-u32 val-buf 0)))
 
 ;;; ---------------------------------------------------------------------------
@@ -250,10 +273,10 @@
   "Set the O_NONBLOCK flag on FD."
   (let ((flags (%fcntl fd +f-getfl+ 0)))
     (when (< flags 0)
-      (error "fcntl F_GETFL failed: errno ~d" (get-errno)))
+      (error "fcntl F_GETFL failed: ~a" (errno-string (get-errno))))
     (let ((result (%fcntl fd +f-setfl+ (logior flags +o-nonblock+))))
       (when (< result 0)
-        (error "fcntl F_SETFL failed: errno ~d" (get-errno))))))
+        (error "fcntl F_SETFL failed: ~a" (errno-string (get-errno)))))))
 
 (defun socket-fd (socket)
   "Extract the raw file descriptor from an sb-bsd-sockets socket."
@@ -294,7 +317,7 @@
         (t (let ((err (get-errno)))
              (if (or (= err +eagain+) (= err +ewouldblock+))
                  :again
-                 (error "read failed: errno ~d" err))))))))
+                 (error "read failed: ~a" (errno-string err)))))))))
 
 (defun nb-write (fd buffer start nbytes)
   "Non-blocking write from BUFFER starting at START, NBYTES bytes.
@@ -308,4 +331,4 @@
         (t (let ((err (get-errno)))
              (if (or (= err +eagain+) (= err +ewouldblock+))
                  :again
-                 (error "write failed: errno ~d" err))))))))
+                 (error "write failed: ~a" (errno-string err)))))))))
