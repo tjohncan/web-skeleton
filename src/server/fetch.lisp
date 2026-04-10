@@ -93,7 +93,7 @@
                                    (not (has-header-p "content-length")))
                           (list (cons "content-length"
                                       (write-to-string
-                                      (length body-bytes)))))))))
+                                       (length body-bytes)))))))))
     (serialize-http-message
      (format nil "~a ~a HTTP/1.1" method-str path)
      all-headers body-bytes)))
