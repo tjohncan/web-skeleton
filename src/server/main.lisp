@@ -385,7 +385,9 @@
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — wait for more data
-             ))))
+             )))
+        ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
+        (:awaiting nil))
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
