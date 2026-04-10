@@ -125,6 +125,9 @@
           (let ((ctx (%ssl-ctx-new (%tls-client-method))))
             (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
               (error "SSL_CTX_new failed"))
+            ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1)
+            ;; SSL_CTRL_SET_MIN_PROTO_VERSION = 123, TLS1_2_VERSION = 0x0303
+            (%ssl-ctrl ctx 123 #x0303 (sb-sys:int-sap 0))
             ;; Load system CA certificates
             (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
               (log-warn "tls: could not load system CA certificates"))
