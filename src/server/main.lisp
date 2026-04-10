@@ -124,8 +124,10 @@
 ;;; Shutdown
 ;;; ---------------------------------------------------------------------------
 
-(defvar *shutdown* nil
-  "Set to T to signal all workers to exit.")
+(sb-ext:defglobal *shutdown* nil
+  "Set to T to signal all workers to exit.
+   defglobal (not defvar) to avoid per-thread bindings and ensure
+   a single shared value cell across all worker threads.")
 
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
