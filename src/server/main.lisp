@@ -389,10 +389,22 @@
                    (epoll-modify epoll-fd (connection-fd conn)
                                 (logior +epollout+ +epollet+)))
                   ;; No response — re-arm edge trigger in case kernel
-                  ;; still has data we couldn't buffer earlier
+                  ;; still has data we couldn't buffer earlier.
+                  ;; But if buffer is at capacity (no frames were consumed),
+                  ;; a partial frame exceeds our limit — close with 1009
+                  ;; to prevent a spin loop.
                   (t
-                   (epoll-modify epoll-fd (connection-fd conn)
-                                (logior +epollin+ +epollet+))))))
+                   (if (>= (connection-read-pos conn)
+                           (length (connection-read-buf conn)))
+                       (progn
+                         (log-warn "ws buffer full, no parseable frames fd ~d"
+                                   (connection-fd conn))
+                         (connection-queue-write conn (build-ws-close 1009))
+                         (setf (connection-state conn) :closing)
+                         (epoll-modify epoll-fd (connection-fd conn)
+                                      (logior +epollout+ +epollet+)))
+                       (epoll-modify epoll-fd (connection-fd conn)
+                                    (logior +epollin+ +epollet+)))))))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — wait for more data
