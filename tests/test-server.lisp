@@ -656,12 +656,13 @@
     ;; but we verify the reserved-code logic directly:
     (flet ((clamp-code (raw-code)
              (if (or (< raw-code 1000)
-                     (member raw-code '(1005 1006 1015))
+                     (member raw-code '(1004 1005 1006 1015))
                      (and (>= raw-code 1016) (<= raw-code 2999)))
                  1000
                  raw-code)))
-      (check "close code 1006 clamped" (clamp-code 1006) 1000)
+      (check "close code 1004 clamped" (clamp-code 1004) 1000)
       (check "close code 1005 clamped" (clamp-code 1005) 1000)
+      (check "close code 1006 clamped" (clamp-code 1006) 1000)
       (check "close code 1015 clamped" (clamp-code 1015) 1000)
       (check "close code 999 clamped"  (clamp-code 999) 1000)
       (check "close code 1000 passes"  (clamp-code 1000) 1000)

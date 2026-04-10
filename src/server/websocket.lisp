@@ -422,7 +422,7 @@
                                   1000))
                     ;; RFC 6455 §7.4.1: must not echo reserved codes
                     (code (if (or (< raw-code 1000)
-                                  (member raw-code '(1005 1006 1015))
+                                  (member raw-code '(1004 1005 1006 1015))
                                   (and (>= raw-code 1016) (<= raw-code 2999)))
                               1000
                               raw-code)))
