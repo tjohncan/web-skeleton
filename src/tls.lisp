@@ -106,6 +106,8 @@
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
 (defconstant +ssl-ctrl-set-min-proto-version+ 123)
 (defconstant +tls1-2-version+ #x0303)
+(defconstant +ssl-error-syscall+ 5)
+(defconstant +ssl-error-zero-return+ 6)
 
 ;;; ---------------------------------------------------------------------------
 ;;; SSL_CTX — shared context, created once
@@ -219,7 +221,8 @@
              (let ((err (%ssl-get-error ssl n)))
                ;; 6 = SSL_ERROR_ZERO_RETURN (peer closed)
                ;; 5 = SSL_ERROR_SYSCALL (may be EOF)
-               (when (or (= err 6) (= err 5))
+               (when (or (= err +ssl-error-zero-return+)
+                         (= err +ssl-error-syscall+))
                  (return))
                (error "SSL_read failed: error ~d" err)))))))
     ;; Concatenate chunks
