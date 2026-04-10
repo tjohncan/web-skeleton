@@ -191,14 +191,20 @@
          ;; Public key from RFC 7515 A.3
          (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
          (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
-         ;; Signature (r || s) from RFC 7515 A.3
-         (sig (concatenate '(simple-array (unsigned-byte 8) (*))
-                (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
-                )))
-    ;; The RFC 7515 A.3 signature is 64 bytes (r=32, s=32)
-    (check "rfc7515 A.3 valid signature"
+         ;; Signature from RFC 7515 A.3, normalized to low-S
+         ;; (original has high-S which we reject to prevent malleability)
+         (sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmU69fgrc8OPGycO0lD3tat_FoFp57SETepkeks4eL_QfA"))
+         ;; Original high-S signature from the RFC
+         (high-s-sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")))
+    ;; Low-S signature verifies
+    (check "rfc7515 A.3 low-S signature"
            (ecdsa-verify-p256 hash sig x y)
            t)
+
+    ;; High-S (malleable twin) is rejected
+    (check "rfc7515 A.3 high-S rejected"
+           (ecdsa-verify-p256 hash high-s-sig x y)
+           nil)
 
     ;; Tampered hash should fail
     (let ((bad-hash (copy-seq hash)))

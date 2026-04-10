@@ -152,6 +152,11 @@
     (unless (and (<= 1 r (1- +p256-n+))
                  (<= 1 s (1- +p256-n+)))
       (return-from ecdsa-verify-p256 nil))
+    ;; Enforce low-S to prevent signature malleability.
+    ;; For any valid (r, s), (r, n-s) also verifies — reject high-S
+    ;; so each message maps to exactly one accepted signature.
+    (when (> s (ash +p256-n+ -1))
+      (return-from ecdsa-verify-p256 nil))
     ;; Point-on-curve check (FIPS 186-4 §5.6.2.3.3):
     ;; reject invalid-curve points to prevent small-subgroup attacks
     (unless (= (mod-mul qy qy +p256-p+)
