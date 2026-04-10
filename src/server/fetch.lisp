@@ -512,9 +512,14 @@
                       (when first-crlf
                         (parse-headers-bytes buf (+ first-crlf 2)
                                              (+ header-end 4))))))
-         ;; Extract body (decode chunked framing if present)
-         (raw-body (when (and body-start (> pos body-start))
-                     (subseq buf body-start pos)))
+         ;; Extract body, capped at Content-Length when present
+         (content-length (when header-end
+                           (scan-content-length buf header-end)))
+         (body-end (if (and body-start content-length)
+                       (min pos (+ body-start content-length))
+                       pos))
+         (raw-body (when (and body-start (> body-end body-start))
+                     (subseq buf body-start body-end)))
          (body (if (and raw-body (response-chunked-p headers))
                    (decode-chunked-body raw-body 0 (length raw-body))
                    raw-body))
