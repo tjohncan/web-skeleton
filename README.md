@@ -241,6 +241,9 @@ and practical notes on building with web-skeleton.
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
+- **Non-blocking DNS** — `get-host-by-name` blocks the event loop during
+  outbound fetch setup. Async resolution (thread pool or `getaddrinfo_a`)
+  would keep the non-blocking fetch path fully non-blocking
 - **Outbound fetch timeout** — socket-level `SO_RCVTIMEO`/`SO_SNDTIMEO`
   for `http-fetch-stream` and TLS connections. Currently bounded only by
   the OS TCP timeout (~2 minutes). Prevents a slow or unresponsive upstream
