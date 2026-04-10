@@ -103,6 +103,12 @@
   (check "ser false" (json-serialize :false) "false")
   (check "ser null" (json-serialize :null) "null")
   (check "ser nil" (json-serialize nil) "null")
+  (check "ser float" (json-serialize 3.14d0) "3.14")
+  (check "ser float large" (json-serialize 1.0d7) "1.0e7")
+  (check "ser float small" (json-serialize 1.0d-4) "1.0e-4")
+  (check "ser float zero" (json-serialize 0.0d0) "0.0")
+  (check "ser float round-trip"
+         (json-parse (json-serialize 3.14159d0)) 3.14159d0)
 
   ;; String escaping
   (check "ser escapes"
@@ -134,7 +140,16 @@
                              (("id" . 2) ("name" . "ankle")))))))
     (check "round-trip"
            (json-parse (json-serialize data))
-           data)))
+           data))
+
+  ;; Float error cases
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "ser Infinity rejected"
+           (signals-error-p
+            (lambda ()
+              (json-serialize sb-ext:double-float-positive-infinity))) t)))
 
 (defun test-json ()
   (setf *tests-passed* 0
