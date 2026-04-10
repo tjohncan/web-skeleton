@@ -232,6 +232,11 @@ The worker thread is blocked for the duration of the handler call.
 With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking.
 
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for project setup, configuration,
+and practical notes on building with web-skeleton.
+
 ## Roadmap
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
