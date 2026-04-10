@@ -207,8 +207,11 @@
         (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
           (cond
             ((> n 0)
-             (push (subseq buf 0 n) chunks)
-             (incf total n))
+             (incf total n)
+             (when (> total *max-body-size*)
+               (error "HTTPS response too large (~d bytes, max ~d)"
+                      total *max-body-size*))
+             (push (subseq buf 0 n) chunks))
             ((zerop n) (return))  ; clean shutdown
             (t
              (let ((err (%ssl-get-error ssl n)))
@@ -343,7 +346,9 @@
             (when (<= n 0) (return))
             (loop for i from 0 below n
                   for byte = (aref buf i)
-                  do (cond
+                  do (when (> (fill-pointer line-buf) *max-body-size*)
+                       (error "streaming response line too large"))
+                     (cond
                        ;; Header phase
                        (in-headers
                         (cond
