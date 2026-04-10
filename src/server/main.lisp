@@ -547,24 +547,33 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun run-worker (host port worker-id handler ws-handler)
-  "Run a single worker: own listener, own epoll fd, own connections."
-  (let ((*connections* (make-hash-table :test #'eql))
-        (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8))))
-    (let* ((listener (make-tcp-listener host port))
-           (epoll-fd (epoll-create)))
-      (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
-      (epoll-add epoll-fd (socket-fd listener)
-                 (logior +epollin+ +epollet+))
-      (unwind-protect
-          (run-event-loop listener epoll-fd handler ws-handler)
-        ;; Cleanup: close all connections, listener, epoll fd
-        (maphash (lambda (fd conn)
-                   (declare (ignore fd))
-                   (connection-close conn))
-                 *connections*)
-        (sb-bsd-sockets:socket-close listener)
-        (%close epoll-fd)
-        (log-info "worker ~d stopped" worker-id)))))
+  "Run a single worker: own listener, own epoll fd, own connections.
+   Automatically restarts on unhandled errors (with backoff)."
+  (loop
+    (handler-case
+        (let ((*connections* (make-hash-table :test #'eql))
+              (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8))))
+          (let* ((listener (make-tcp-listener host port))
+                 (epoll-fd (epoll-create)))
+            (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
+            (epoll-add epoll-fd (socket-fd listener)
+                       (logior +epollin+ +epollet+))
+            (unwind-protect
+                (run-event-loop listener epoll-fd handler ws-handler)
+              ;; Cleanup: close all connections, listener, epoll fd
+              (maphash (lambda (fd conn)
+                         (declare (ignore fd))
+                         (connection-close conn))
+                       *connections*)
+              (sb-bsd-sockets:socket-close listener)
+              (%close epoll-fd)))
+          ;; Normal exit (shutdown requested)
+          (log-info "worker ~d stopped" worker-id)
+          (return))
+      (error (e)
+        (log-error "worker ~d crashed: ~a — restarting in 1s" worker-id e)
+        (sleep 1)
+        (when *shutdown* (return))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CPU count
