@@ -44,9 +44,9 @@
 
 (defun constant-time-equal (a b)
   "Compare byte vectors A and B in constant time.
-   Returns T if equal, NIL otherwise. Iterates the longer input
-   to avoid leaking the shorter length through timing.
-   Length mismatch is folded into the result without early return."
+   Returns T if equal, NIL otherwise. Iterates max(len-a, len-b)
+   to prevent early return on length mismatch. Length difference
+   is folded into the accumulator, not leaked via control flow."
   (let ((len-a (length a))
         (len-b (length b))
         (acc 0))
