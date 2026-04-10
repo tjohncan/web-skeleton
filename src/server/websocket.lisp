@@ -420,9 +420,17 @@
              (setf (connection-ws-frag-buf conn) nil
                    (connection-ws-frag-total conn) 0)
              (let* ((payload (ws-frame-payload frame))
-                    (raw-code (if (>= (length payload) 2)
-                                  (logior (ash (aref payload 0) 8) (aref payload 1))
-                                  1000))
+                    ;; RFC 6455 §5.5.1: close body must be 0 or >= 2 bytes
+                    (raw-code (cond
+                                ((zerop (length payload)) 1000)
+                                ((= (length payload) 1)
+                                 (log-warn "ws close with 1-byte body fd ~d"
+                                           (connection-fd conn))
+                                 (ws-shift-buffer conn buf pos end)
+                                 (return-from websocket-on-read
+                                   (values :close (build-ws-close 1002))))
+                                (t (logior (ash (aref payload 0) 8)
+                                           (aref payload 1)))))
                     ;; RFC 6455 §7.4.1: must not echo reserved codes
                     (code (if (or (< raw-code 1000)
                                   (member raw-code '(1004 1005 1006 1015))
