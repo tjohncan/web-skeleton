@@ -428,6 +428,9 @@
                           ((= byte 10) (emit-body-line))
                           ((= byte 13) nil)
                           (t (vector-push-extend byte line-buf))))))))))
+    ;; Flush any remaining unterminated line
+    (when (> (fill-pointer line-buf) 0)
+      (emit-body-line))
     (or status 0)))
 
 ;;; ---------------------------------------------------------------------------
