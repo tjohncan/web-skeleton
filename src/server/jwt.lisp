@@ -32,10 +32,13 @@
     (loop for key-obj in keys-array
           when (and (string= (json-get key-obj "kty") "EC")
                     (string= (json-get key-obj "crv") "P-256"))
-          collect (make-jwt-key
-                   :kid (or (json-get key-obj "kid") "")
-                   :x (base64url-decode (json-get key-obj "x"))
-                   :y (base64url-decode (json-get key-obj "y"))))))
+          collect (let ((x (base64url-decode (json-get key-obj "x")))
+                        (y (base64url-decode (json-get key-obj "y"))))
+                    (unless (and (= (length x) 32) (= (length y) 32))
+                      (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
+                    (make-jwt-key
+                     :kid (or (json-get key-obj "kid") "")
+                     :x x :y y)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWT verification
