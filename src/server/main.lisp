@@ -430,7 +430,18 @@
           (close-connection conn epoll-fd))))
     (error (e)
       (log-warn "error fd ~d: ~a" (connection-fd conn) e)
-      (close-connection conn epoll-fd))))
+      ;; Send 500 before closing so the client gets a proper HTTP response
+      (handler-case
+          (let ((resp (make-error-response 500)))
+            (set-response-header resp "connection" "close")
+            (let ((err-bytes (format-response resp)))
+              (connection-queue-write conn err-bytes)
+              (setf (connection-state conn) :write-response
+                    (connection-close-after-p conn) t)
+              (epoll-modify epoll-fd (connection-fd conn)
+                           (logior +epollout+ +epollet+))))
+        (error ()
+          (close-connection conn epoll-fd))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handle writable event on a client fd
@@ -571,7 +582,8 @@
   (loop
     (handler-case
         (let ((*connections* (make-hash-table :test #'eql))
-              (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8))))
+              (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8)))
+              (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
           (let* ((listener (make-tcp-listener host port))
                  (epoll-fd (epoll-create)))
             (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)

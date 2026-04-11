@@ -288,11 +288,15 @@
 
 (defconstant +pollout+ #x004)
 
+(defvar *poll-buf* nil
+  "Pre-allocated 8-byte buffer for poll calls. Bound per-worker.")
+
 (defun poll-writable (fd timeout-ms)
   "Block until FD is writable or TIMEOUT-MS elapses.
    Returns T if writable, NIL on timeout."
   ;; struct pollfd: int fd (4) + short events (2) + short revents (2) = 8 bytes
-  (let ((buf (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+  (let ((buf (or *poll-buf*
+                 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))))
     (pack-le-u32 buf 0 fd)
     (setf (aref buf 4) (logand +pollout+ #xFF)
           (aref buf 5) (logand (ash +pollout+ -8) #xFF))
