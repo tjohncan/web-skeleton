@@ -227,16 +227,17 @@ needs multiple parameters, parse once and reuse:
 
 ### Form body decoding
 
-`url-decode` and `parse-query-string` use RFC 3986 path decoding where
-`+` is a literal character, not a space. For `application/x-www-form-urlencoded`
-POST bodies (HTML form submissions), `+` represents a space. The framework
-does not provide form-specific decoding — if your application handles HTML
-forms, replace `+` with space before parsing:
+`parse-query-string` and `get-query-param` decode `+` as space per
+`application/x-www-form-urlencoded` (the HTML form encoding standard).
+For POST bodies with this content type, parse directly:
 
 ```lisp
 (let* ((body (sb-ext:octets-to-string (http-request-body request)
                                        :external-format :utf-8))
-       (decoded (substitute #\Space #\+ body))
-       (params (parse-query-string decoded)))
+       (params (parse-query-string body)))
   ...)
 ```
+
+Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path
+decoding). The form-aware decoding is in `parse-query-string` and
+`form-decode`.

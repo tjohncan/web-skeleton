@@ -137,9 +137,14 @@
 ;;; Query string parsing
 ;;; ---------------------------------------------------------------------------
 
+(defun form-decode (string)
+  "Decode a form-encoded string (application/x-www-form-urlencoded).
+   Like url-decode but + means space, per HTML spec §4.10.22.6."
+  (url-decode (substitute #\Space #\+ string)))
+
 (defun parse-query-string (query)
   "Parse a query string like \"a=1&b=2\" into an alist.
-   Percent-decodes both names and values.
+   Decodes per application/x-www-form-urlencoded (+ as space, %XX).
    Keys with no = get empty string values."
   (when (and query (> (length query) 0))
     (let ((pairs nil)
@@ -150,9 +155,9 @@
                (segment-start start)
                (eq-pos (position #\= query :start segment-start :end amp)))
           (push (if eq-pos
-                    (cons (url-decode (subseq query segment-start eq-pos))
-                          (url-decode (subseq query (1+ eq-pos) amp)))
-                    (cons (url-decode (subseq query segment-start amp)) ""))
+                    (cons (form-decode (subseq query segment-start eq-pos))
+                          (form-decode (subseq query (1+ eq-pos) amp)))
+                    (cons (form-decode (subseq query segment-start amp)) ""))
                 pairs)
           (if (>= amp len)
               (return (nreverse pairs))

@@ -377,9 +377,9 @@
          (parse-query-string "key=")
          '(("key" . "")))
 
-  (check "plus literal in query value"
+  (check "plus as space in query value"
          (cdr (first (parse-query-string "a=b+c")))
-         "b+c")
+         "b c")
 
   (check "nil query"
          (parse-query-string nil)

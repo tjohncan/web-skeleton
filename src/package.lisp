@@ -17,6 +17,7 @@
            #:parse-request
            #:parse-query-string
            #:url-decode
+           #:form-decode
            #:match-path
            ;; HTTP response
            #:http-response
