@@ -76,6 +76,7 @@
               connection
               (connection-header-has-token-p connection "upgrade")
               key
+              (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
               version
               (string= version "13")))))
 
