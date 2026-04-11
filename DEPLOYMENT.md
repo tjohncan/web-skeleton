@@ -177,6 +177,16 @@ but avoid calling them from HTTP handlers under load. `http-fetch` is
 non-blocking for `http://` URLs (epoll event loop). For `https://` URLs
 it blocks the worker thread for the full request lifecycle.
 
+### Expect: 100-continue
+
+The server does not send `100 Continue` responses. Clients that use
+`Expect: 100-continue` (default for large POST bodies in curl, Go's
+net/http, Python requests, Java HttpClient) will pause 1-3 seconds
+after sending headers before giving up and sending the body. No error
+occurs — just invisible latency. Workaround: disable the Expect header
+on the client side (e.g., `curl --no-expect`, or set `Expect: ""`).
+This is on the roadmap.
+
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, validate the
