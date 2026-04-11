@@ -352,6 +352,19 @@
                                 (string= (http-request-version request) "1.0")
                                 (typep response 'http-response))
                        (set-response-header response "connection" "keep-alive"))
+                     ;; HEAD responses: set Content-Length but strip body
+                     (when (and (eq (http-request-method request) :HEAD)
+                                (typep response 'http-response)
+                                (http-response-body response))
+                       (let ((body (sb-ext:string-to-octets
+                                    (http-response-body response)
+                                    :external-format :utf-8)))
+                         (unless (assoc "content-length"
+                                        (http-response-headers response)
+                                        :test #'string=)
+                           (set-response-header response "content-length"
+                                                (write-to-string (length body)))))
+                       (setf (http-response-body response) nil))
                      (let ((bytes (if (typep response
                                             '(simple-array (unsigned-byte 8) (*)))
                                       response
