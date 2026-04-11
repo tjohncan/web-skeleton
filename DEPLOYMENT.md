@@ -177,6 +177,14 @@ but avoid calling them from HTTP handlers under load. `http-fetch` is
 non-blocking for `http://` URLs (epoll event loop). For `https://` URLs
 it blocks the worker thread for the full request lifecycle.
 
+### Fetch URL safety (SSRF)
+
+If your handler constructs fetch URLs from user input, validate the
+hostname against an allowlist. The framework does not filter resolved
+IP addresses — a user-supplied hostname resolving to `169.254.169.254`
+(cloud metadata), `127.0.0.1`, or any private RFC 1918 address will be
+connected to directly.
+
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
