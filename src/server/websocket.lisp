@@ -438,8 +438,19 @@
                               1000
                               raw-code)))
                (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close code)))))
+               ;; Flush any responses from earlier frames before the close
+               (let ((close-frame (build-ws-close code)))
+                 (if responses
+                     (let* ((all (nreverse (cons close-frame responses)))
+                            (total (reduce #'+ all :key #'length))
+                            (out (make-array total :element-type '(unsigned-byte 8)))
+                            (offset 0))
+                       (dolist (r all)
+                         (replace out r :start1 offset)
+                         (incf offset (length r)))
+                       (return-from websocket-on-read (values :close out)))
+                     (return-from websocket-on-read
+                       (values :close close-frame))))))
             (t
              ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
              (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
