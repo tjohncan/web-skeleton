@@ -444,14 +444,17 @@
               (pos (connection-read-pos conn))
               (header-end (scan-crlf-crlf buf 0 pos)))
          (when header-end
-           ;; Have complete headers — check if body is complete
+           ;; Have complete headers — check if body is complete.
+           ;; RFC 7230 §3.3.3: Transfer-Encoding takes precedence over CL.
            (let* ((body-start (+ header-end 4))
-                  (content-length (scan-content-length buf header-end)))
+                  (chunked (scan-transfer-encoding buf header-end))
+                  (content-length (unless chunked
+                                    (scan-content-length buf header-end))))
              (if content-length
-                 ;; Have Content-Length — complete when body received (including 0)
+                 ;; Have Content-Length (no TE) — complete when body received
                  (when (>= (- pos body-start) content-length)
                    (complete-fetch conn epoll-fd))
-                 ;; No Content-Length — wait for EOF (Connection: close)
+                 ;; Chunked or no CL — wait for EOF (Connection: close)
                  nil))))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -515,15 +518,17 @@
                       (when first-crlf
                         (parse-headers-bytes buf (+ first-crlf 2)
                                              (+ header-end 4))))))
-         ;; Extract body, capped at Content-Length when present
-         (content-length (when header-end
+         ;; Extract body, capped at Content-Length when present and not chunked
+         ;; (RFC 7230 §3.3.3: TE takes precedence over CL)
+         (chunked-p (response-chunked-p headers))
+         (content-length (when (and header-end (not chunked-p))
                            (scan-content-length buf header-end)))
          (body-end (if (and body-start content-length)
                        (min pos (+ body-start content-length))
                        pos))
          (raw-body (when (and body-start (> body-end body-start))
                      (subseq buf body-start body-end)))
-         (body (if (and raw-body (response-chunked-p headers))
+         (body (if (and raw-body chunked-p)
                    (decode-chunked-body raw-body 0 (length raw-body))
                    raw-body))
          ;; Call the user's callback
