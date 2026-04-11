@@ -224,10 +224,8 @@ and practical notes on building with web-skeleton.
 - **Non-blocking DNS** — `get-host-by-name` blocks the event loop during
   outbound fetch setup. Async resolution (thread pool or `getaddrinfo_a`)
   would keep the non-blocking fetch path fully non-blocking
-- **Outbound fetch timeout** — socket-level `SO_RCVTIMEO`/`SO_SNDTIMEO`
-  for `http-fetch-stream` and TLS connections. Currently bounded only by
-  the OS TCP timeout (~2 minutes). Prevents a slow or unresponsive upstream
-  from blocking a worker indefinitely
 - **ETag for static files** — compute a content hash at load time and
   include it in static responses. Enables `304 Not Modified` via
   `If-None-Match`, reducing bandwidth for repeat visitors
+- **Expect: 100-continue** — send `100 Continue` for requests with
+  the `Expect` header to eliminate 1-3s latency on large POST bodies
