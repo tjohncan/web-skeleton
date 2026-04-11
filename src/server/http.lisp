@@ -197,7 +197,7 @@
                                (push (cons (subseq pat 1) (url-decode seg))
                                      bindings)
                                t)
-                             (string= pat seg)))
+                             (string= pat (url-decode seg))))
         (if bindings (nreverse bindings) t)))))
 
 ;;; ---------------------------------------------------------------------------
