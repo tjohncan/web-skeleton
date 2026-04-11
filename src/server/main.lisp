@@ -376,10 +376,14 @@
                   (handler-case
                       (websocket-on-read conn ws-handler)
                     (error (e)
-                      ;; Handler or frame-processing error — send 1011 close
+                      ;; Handler error — close directly without a close frame.
+                      ;; ws-send may have left partial bytes on the wire,
+                      ;; corrupting the stream. A close frame would be
+                      ;; misinterpreted as continuation of the partial frame.
                       (log-warn "ws handler error fd ~d: ~a"
                                 (connection-fd conn) e)
-                      (values :close (build-ws-close 1011))))
+                      (close-connection conn epoll-fd)
+                      (return-from handle-client-read)))
                 (cond
                   ;; Close requested — send close frame back, then shut down
                   ((eq response :close)
