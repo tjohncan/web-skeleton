@@ -281,8 +281,7 @@
       ((match-p "HEAD")    :HEAD)
       ((match-p "OPTIONS") :OPTIONS)
       ((match-p "PATCH")   :PATCH)
-      ((match-p "TRACE")   :TRACE)
-      ((match-p "CONNECT") :CONNECT))))
+      ((match-p "TRACE")   :TRACE))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Byte-level header parser (single-pass)

@@ -75,7 +75,7 @@
     (check "cookie no header" (get-cookie req "session") nil))
 
   ;; All methods
-  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH" "TRACE" "CONNECT"))
+  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH" "TRACE"))
     (let ((req (parse-request (crlf (format nil "~a / HTTP/1.1" method)
                                     "Host: localhost"))))
       (check (format nil "method ~a" method)
