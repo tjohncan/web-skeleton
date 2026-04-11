@@ -174,6 +174,7 @@
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
                   (let* ((*read-default-float-format* 'double-float)
                          (*read-eval* nil)
+                         (*read-base* 10)
                          (val (read-from-string num-str)))
                     (when (or (sb-ext:float-infinity-p val)
                               (sb-ext:float-nan-p val))
