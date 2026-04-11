@@ -154,6 +154,9 @@
          (ssl nil))
     (handler-case
         (progn
+          ;; Set socket-level timeout to bound all blocking I/O
+          (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
+                              *fetch-timeout*)
           ;; Blocking TCP connect
           (let ((addr (sb-bsd-sockets:host-ent-address
                        (sb-bsd-sockets:get-host-by-name hostname))))
@@ -430,7 +433,10 @@
                           (t (vector-push-extend byte line-buf))))))))))
     ;; Flush any remaining unterminated line
     (when (> (fill-pointer line-buf) 0)
-      (emit-body-line))
+      (when on-line
+        (funcall on-line (sb-ext:octets-to-string
+                          (subseq line-buf 0 (fill-pointer line-buf))
+                          :external-format :utf-8))))
     (or status 0)))
 
 ;;; ---------------------------------------------------------------------------
