@@ -1,4 +1,4 @@
-# Web Skeleton
+# web-skeleton
 
 SBCL web server framework for Linux.
 Provides the network and protocol layer (TCP socket management,
@@ -194,7 +194,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-idle-timeout*` | `86400` | Seconds before an inactive WebSocket is closed |
 | `*ws-ping-interval*` | `30` | Seconds between server-initiated WebSocket pings |
 | `*ws-max-missed-pongs*` | `3` | Missed pongs before a WebSocket is declared dead |
-| `*fetch-timeout*` | `30` | Seconds before a parked connection waiting for an outbound fetch is reaped |
+| `*fetch-timeout*` | `30` | Blocking fetch I/O timeout and :awaiting connection reap deadline |
 | `*jwt-clock-skew*` | `60` | Seconds of clock skew tolerance for JWT exp/nbf checks |
 | `*drain-timeout*` | `5` | Seconds to wait for connections to drain on shutdown |
 
