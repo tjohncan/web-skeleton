@@ -61,8 +61,6 @@
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
-(defparameter *fetch-timeout* 30
-  "Seconds before a parked :awaiting connection is reaped. 0 to disable.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -508,7 +506,11 @@
                       (connection-header-end conn) 0
                       (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
-                           (logior +epollin+ +epollet+)))
+                           (logior +epollin+ +epollet+))
+              ;; Edge-triggered: buffered frame data from the upgrade
+              ;; request is in user-space, not the kernel. MOD won't
+              ;; re-fire. Signal the event loop to read immediately.
+              (return-from handle-client-write :keep-alive))
              (:websocket
               ;; WebSocket frame response sent — back to reading
               (epoll-modify epoll-fd (connection-fd conn)
