@@ -242,6 +242,8 @@
 (defconstant +sol-socket+    1)
 (defconstant +so-reuseport+ 15)
 (defconstant +so-error+      4)
+(defconstant +so-rcvtimeo+  20)
+(defconstant +so-sndtimeo+  21)
 
 (defun set-socket-option-int (fd level optname value)
   "Set an integer-valued socket option."
@@ -251,6 +253,22 @@
       (let ((result (%setsockopt fd level optname (sb-sys:vector-sap buf) 4)))
         (when (< result 0)
           (error "setsockopt failed: ~a" (errno-string (get-errno))))))))
+
+(defun set-socket-timeout (fd seconds)
+  "Set SO_RCVTIMEO and SO_SNDTIMEO on FD.
+   SECONDS is an integer. Uses struct timeval (16 bytes on x86-64)."
+  (let ((buf (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    ;; struct timeval: tv_sec (8 bytes LE) + tv_usec (8 bytes LE)
+    (pack-le-u32 buf 0 seconds)
+    (sb-sys:with-pinned-objects (buf)
+      (let ((result (%setsockopt fd +sol-socket+ +so-rcvtimeo+
+                                 (sb-sys:vector-sap buf) 16)))
+        (when (< result 0)
+          (error "setsockopt SO_RCVTIMEO failed: ~a" (errno-string (get-errno)))))
+      (let ((result (%setsockopt fd +sol-socket+ +so-sndtimeo+
+                                 (sb-sys:vector-sap buf) 16)))
+        (when (< result 0)
+          (error "setsockopt SO_SNDTIMEO failed: ~a" (errno-string (get-errno))))))))
 
 (defun get-socket-option-int (fd level optname)
   "Get an integer-valued socket option."
