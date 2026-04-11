@@ -80,6 +80,8 @@
   (let ((idle nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
+               ;; Outbound connections are cleaned up via their paired
+               ;; inbound's :awaiting timeout — see close-connection
                (unless (connection-outbound-p conn)
                  (let* ((state (connection-state conn))
                         (timeout (cond
@@ -158,7 +160,10 @@
              (log-warn "~a ~a -> 400 bad upgrade"
                        (http-request-method request)
                        (http-request-path request))
-             (values (make-error-response 400) nil))))
+             ;; RFC 6455 §4.4: MUST include supported version on rejection
+             (let ((resp (make-error-response 400)))
+               (set-response-header resp "sec-websocket-version" "13")
+               (values resp nil)))))
       ;; Outbound fetch request — handler needs an external call
       ((typep response 'http-fetch-request)
        (log-debug "~a ~a -> fetch ~a"
