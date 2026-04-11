@@ -35,7 +35,7 @@
             ((string= e "json") "application/json; charset=utf-8")
             ((string= e "txt")  "text/plain; charset=utf-8")
             ((string= e "xml")  "application/xml; charset=utf-8")
-            ((string= e "webmanifest") "application/manifest+json")
+            ((string= e "webmanifest") "application/manifest+json; charset=utf-8")
             ;; Images
             ((string= e "png")  "image/png")
             ((or (string= e "jpg") (string= e "jpeg")) "image/jpeg")
