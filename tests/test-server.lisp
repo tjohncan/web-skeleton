@@ -728,6 +728,48 @@
       (check "close code 1001 passes"  (clamp-code 1001) 1001)
       (check "close code 3000 passes"  (clamp-code 3000) 3000))
 
+    ;; Close frame with invalid UTF-8 reason — must fail with 1007
+    ;; (RFC 6455 §5.5.1: reason text after the 2-byte code must be valid UTF-8)
+    (let* ((close-payload (make-array 4 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(3 #xe8 #xFE #xFF)))
+           (close-frame (make-masked-frame t 8 close-payload))
+           (conn (web-skeleton::make-connection
+                  :fd -1 :state :websocket :last-active 0))
+           (buf (copy-seq close-frame)))
+      (setf (web-skeleton::connection-read-buf conn) buf
+            (web-skeleton::connection-read-pos conn) (length buf))
+      (multiple-value-bind (action response)
+          (web-skeleton::websocket-on-read conn nil)
+        (check "close invalid UTF-8 reason -> :close"
+               action :close)
+        (check "close invalid UTF-8 reason -> 1007"
+               (when (and response (>= (length response) 4))
+                 (logior (ash (aref response 2) 8) (aref response 3)))
+               1007)))
+
+    ;; Close frame with valid UTF-8 reason — should echo the code, not 1007
+    (let* ((reason (sb-ext:string-to-octets "going away" :external-format :utf-8))
+           (close-payload (make-array (+ 2 (length reason))
+                                       :element-type '(unsigned-byte 8)))
+           (close-frame (progn
+                          (setf (aref close-payload 0) (ash 1001 -8)
+                                (aref close-payload 1) (logand 1001 #xFF))
+                          (replace close-payload reason :start1 2)
+                          (make-masked-frame t 8 close-payload)))
+           (conn (web-skeleton::make-connection
+                  :fd -1 :state :websocket :last-active 0))
+           (buf (copy-seq close-frame)))
+      (setf (web-skeleton::connection-read-buf conn) buf
+            (web-skeleton::connection-read-pos conn) (length buf))
+      (multiple-value-bind (action response)
+          (web-skeleton::websocket-on-read conn nil)
+        (check "close valid UTF-8 reason -> :close"
+               action :close)
+        (check "close valid UTF-8 reason -> echoes 1001"
+               (when (and response (>= (length response) 4))
+                 (logior (ash (aref response 2) 8) (aref response 3)))
+               1001)))
+
     ;; Binary frame (opcode 2)
     (let ((frame (make-masked-frame t 2 #(#xDE #xAD))))
       (multiple-value-bind (result consumed)
