@@ -300,7 +300,8 @@
                                   (return-from https-fetch))
                                  (t (format-response response)))))
                     (connection-queue-write conn bytes)
-                    (setf (connection-state conn) :write-response)
+                    (setf (connection-state conn) :write-response
+                          (connection-last-active conn) (get-universal-time))
                     (epoll-modify epoll-fd (connection-fd conn)
                                  (logior +epollout+ +epollet+))
                     (log-debug "fetch: https ~a:~d~a -> fd ~d"
@@ -310,7 +311,8 @@
       (log-error "https fetch failed: ~a" e)
       (let ((err-bytes (format-response (make-error-response 502))))
         (connection-queue-write conn err-bytes)
-        (setf (connection-state conn) :write-response)
+        (setf (connection-state conn) :write-response
+              (connection-last-active conn) (get-universal-time))
         (epoll-modify epoll-fd (connection-fd conn)
                      (logior +epollout+ +epollet+))))))
 
