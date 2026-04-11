@@ -71,10 +71,18 @@
                (#\b (vector-push-extend (code-char 8) out))
                (#\f (vector-push-extend (code-char 12) out))
                (#\u
-                ;; \uXXXX — parse 4 hex digits
-                (let ((code (parse-integer str :start (1+ pos)
-                                               :end (min (+ pos 5) len)
-                                               :radix 16)))
+                ;; \uXXXX — exactly 4 hex digits required (RFC 8259 §7)
+                (when (> (+ pos 5) len)
+                  (error "json: truncated \\uXXXX escape at ~d" (1- pos)))
+                (let ((code (let ((hs (1+ pos)) (he (+ pos 5)))
+                              (loop for k from hs below he
+                                    for ch = (char str k)
+                                    unless (or (char<= #\0 ch #\9)
+                                               (char<= #\a ch #\f)
+                                               (char<= #\A ch #\F))
+                                    do (error "json: invalid hex digit '~c' in \\u escape at ~d"
+                                              ch (1- pos)))
+                              (parse-integer str :start hs :end he :radix 16))))
                   ;; Handle surrogate pairs for characters above U+FFFF
                   (cond
                     ((<= #xD800 code #xDBFF)
@@ -83,9 +91,16 @@
                        (if (and (< (+ low-start 5) len)
                                 (char= (char str low-start) #\\)
                                 (char= (char str (1+ low-start)) #\u))
-                           (let ((low (parse-integer str :start (+ low-start 2)
-                                                         :end (+ low-start 6)
-                                                         :radix 16)))
+                           (let ((low (let ((ls (+ low-start 2))
+                                          (le (+ low-start 6)))
+                                      (loop for k from ls below le
+                                            for ch = (char str k)
+                                            unless (or (char<= #\0 ch #\9)
+                                                       (char<= #\a ch #\f)
+                                                       (char<= #\A ch #\F))
+                                            do (error "json: invalid hex digit '~c' in \\u escape at ~d"
+                                                      ch low-start))
+                                      (parse-integer str :start ls :end le :radix 16))))
                              (unless (<= #xDC00 low #xDFFF)
                                (error "json: expected low surrogate after \\u~4,'0X at ~d"
                                       code (1- pos)))

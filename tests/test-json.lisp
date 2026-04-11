@@ -91,7 +91,14 @@
     (check "truncated object rejected"
            (signals-error-p (lambda () (json-parse "{"))) t)
     (check "truncated array rejected"
-           (signals-error-p (lambda () (json-parse "[1,"))) t)))
+           (signals-error-p (lambda () (json-parse "[1,"))) t)
+    ;; \uXXXX strict hex validation
+    (check "\\u with sign rejected"
+           (signals-error-p (lambda () (json-parse "\"\\u+041\""))) t)
+    (check "\\u with negative rejected"
+           (signals-error-p (lambda () (json-parse "\"\\u-001\""))) t)
+    (check "\\u truncated rejected"
+           (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)))
 
 (defun test-json-serialize ()
   (format t "~%JSON Serializer~%")
