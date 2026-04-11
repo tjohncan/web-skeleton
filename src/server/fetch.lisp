@@ -372,7 +372,10 @@
               (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
                    (connection-fd conn) host port path out-fd))))
       (error (e)
-        ;; Clean up the socket on any error (DNS failure, etc.)
+        ;; Clean up socket and any registered connection on error
+        (let* ((fd (sb-bsd-sockets:socket-file-descriptor socket))
+               (stale (when (>= fd 0) (lookup-connection fd))))
+          (when stale (unregister-connection stale)))
         (ignore-errors (sb-bsd-sockets:socket-close socket))
         (error e)))))
 
