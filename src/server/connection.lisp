@@ -118,7 +118,7 @@
                       space (- new-size pos)))))
         (let ((result (nb-read (connection-fd conn) buf pos space)))
           (cond
-            ((eq result :eof)   (return :eof))
+            ((eq result :eof)   (return (if any-read :ok :eof)))
             ((eq result :again) (return (if any-read :ok :again)))
             (t (incf (connection-read-pos conn) result)
                (setf any-read t))))))))
