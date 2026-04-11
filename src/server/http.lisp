@@ -101,8 +101,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun url-decode (string)
-  "Decode percent-encoded characters in STRING (RFC 3986).
+  "Decode percent-encoded characters in STRING (RFC 3986 §2.1).
    %XX sequences are replaced with the corresponding byte, decoded as UTF-8.
+   Incomplete percent sequences (e.g. %2 at end of string) are passed through literally.
    '+' is passed through literally (this is path decoding, not form decoding)."
   (let* ((bytes (handler-case
                     (sb-ext:string-to-octets string :external-format :ascii)
