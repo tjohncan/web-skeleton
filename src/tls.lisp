@@ -211,10 +211,10 @@
         (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
           (cond
             ((> n 0)
-             (incf total n)
-             (when (> total *max-body-size*)
+             (when (> (+ total n) *max-body-size*)
                (error "HTTPS response too large (~d bytes, max ~d)"
-                      total *max-body-size*))
+                      (+ total n) *max-body-size*))
+             (incf total n)
              (push (subseq buf 0 n) chunks))
             ((zerop n) (return))  ; clean shutdown
             (t
@@ -273,14 +273,16 @@
                                                          (+ first-crlf 2)
                                                          (+ header-end 4))))))
                      (body-start (when header-end (+ header-end 4)))
-                     (content-length (when header-end
+                     ;; RFC 7230 §3.3.3: TE takes precedence over CL
+                     (chunked-p (response-chunked-p headers))
+                     (content-length (when (and header-end (not chunked-p))
                                        (scan-content-length response-buf header-end)))
                      (body-end (if (and body-start content-length)
                                    (min buf-len (+ body-start content-length))
                                    buf-len))
                      (raw-body (when (and body-start (> body-end body-start))
                                  (subseq response-buf body-start body-end)))
-                     (body (if (and raw-body (response-chunked-p headers))
+                     (body (if (and raw-body chunked-p)
                                (decode-chunked-body raw-body 0 (length raw-body))
                                raw-body))
                      (callback (http-fetch-request-callback fetch-req)))
@@ -340,7 +342,9 @@
         (first-line t)
         ;; Chunked state
         (in-chunk-size nil)
-        (chunk-remaining 0))
+        (chunk-remaining 0)
+        (chunk-size-buf (make-array 20 :element-type '(unsigned-byte 8)
+                                       :fill-pointer 0 :adjustable t)))
     (flet ((emit-line ()
              (let ((line (sb-ext:octets-to-string
                           (subseq line-buf 0 (fill-pointer line-buf))
@@ -386,21 +390,26 @@
                                      (setf chunked t))))))
                           ((= byte 13) nil)
                           (t (vector-push-extend byte line-buf))))
-                       ;; Chunked body — reading chunk size
+                       ;; Chunked body — reading chunk size (separate buffer
+                       ;; to avoid corrupting body content in line-buf)
                        ((and chunked in-chunk-size)
                         (cond
                           ((= byte 10)
                            ;; Skip empty lines (chunk-terminator CRLFs)
-                           (when (> (fill-pointer line-buf) 0)
-                             (let* ((size-str (emit-line))
+                           (when (> (fill-pointer chunk-size-buf) 0)
+                             (let* ((size-str (sb-ext:octets-to-string
+                                              (subseq chunk-size-buf 0
+                                                      (fill-pointer chunk-size-buf))
+                                              :external-format :ascii))
                                     (size (parse-integer size-str :radix 16
                                                                   :junk-allowed t)))
+                               (setf (fill-pointer chunk-size-buf) 0)
                                (if (and size (> size 0))
                                    (setf chunk-remaining size
                                          in-chunk-size nil)
                                    (return)))))  ; final chunk
                           ((= byte 13) nil)
-                          (t (vector-push-extend byte line-buf))))
+                          (t (vector-push-extend byte chunk-size-buf))))
                        ;; Chunked body — reading chunk data
                        (chunked
                         (when (> chunk-remaining 0)
