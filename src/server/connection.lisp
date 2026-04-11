@@ -269,7 +269,8 @@
                            (setf (connection-read-buf conn) new-buf))
                          ;; Re-drain: buffer grew past connection-read-available's
                          ;; original cap, kernel may still have data (edge-triggered)
-                         (connection-read-available conn)))
+                         (when (eq (connection-read-available conn) :eof)
+                           (return-from connection-on-read :close))))
                      (let ((body-available (- (connection-read-pos conn) body-start)))
                        (setf (connection-state conn) :read-body
                              (connection-body-expected conn) content-length
