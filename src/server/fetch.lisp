@@ -26,6 +26,9 @@
   (body     nil)
   (callback nil    :type function))
 
+(defparameter *fetch-timeout* 30
+  "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
+
 (defun http-fetch (method url &key headers body then)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
@@ -156,6 +159,8 @@
                                :type :stream :protocol :tcp)))
     (unwind-protect
         (progn
+          ;; Set socket-level timeout to bound all blocking I/O
+          (set-socket-timeout (socket-fd socket) *fetch-timeout*)
           (sb-bsd-sockets:socket-connect
            socket
            (sb-bsd-sockets:host-ent-address
