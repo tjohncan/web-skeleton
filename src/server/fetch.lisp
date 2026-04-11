@@ -554,7 +554,8 @@
                              (t (format-response response)))))
                 (connection-queue-write inbound bytes)
                 (setf (connection-state inbound) :write-response
-                      (connection-awaiting-fd inbound) -1)
+                      (connection-awaiting-fd inbound) -1
+                      (connection-last-active inbound) (get-universal-time))
                 (epoll-modify epoll-fd (connection-fd inbound)
                              (logior +epollout+ +epollet+))
                 (log-debug "fetch: resumed fd ~d" inbound-fd)))
@@ -563,7 +564,8 @@
             (let ((err-bytes (format-response (make-error-response 500))))
               (connection-queue-write inbound err-bytes)
               (setf (connection-state inbound) :write-response
-                    (connection-awaiting-fd inbound) -1)
+                    (connection-awaiting-fd inbound) -1
+                    (connection-last-active inbound) (get-universal-time))
               (epoll-modify epoll-fd (connection-fd inbound)
                            (logior +epollout+ +epollet+)))))))))
 
@@ -577,7 +579,8 @@
         (let ((err-bytes (format-response (make-error-response 502))))
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response
-                (connection-awaiting-fd inbound) -1)
+                (connection-awaiting-fd inbound) -1
+                (connection-last-active inbound) (get-universal-time))
           (epoll-modify epoll-fd (connection-fd inbound)
                        (logior +epollout+ +epollet+)))))))
 
