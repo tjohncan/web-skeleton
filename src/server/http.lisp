@@ -104,7 +104,10 @@
   "Decode percent-encoded characters in STRING (RFC 3986).
    %XX sequences are replaced with the corresponding byte, decoded as UTF-8.
    '+' is passed through literally (this is path decoding, not form decoding)."
-  (let* ((bytes (sb-ext:string-to-octets string :external-format :ascii))
+  (let* ((bytes (handler-case
+                    (sb-ext:string-to-octets string :external-format :ascii)
+                  (sb-int:character-encoding-error ()
+                    (http-parse-error "non-ASCII character in URL"))))
          (len (length bytes))
          (out (make-array len :element-type '(unsigned-byte 8) :fill-pointer 0)))
     (loop with i = 0
@@ -227,7 +230,10 @@
 
 (defun bytes-to-string (buf start end)
   "Convert BUF[START..END) to a UTF-8 string. Single allocation."
-  (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8))
+  (handler-case
+      (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8)
+    (sb-int:character-decoding-error ()
+      (http-parse-error "invalid UTF-8 in request"))))
 
 (defun bytes-to-lowercase-string (buf start end)
   "Convert BUF[START..END) to a lowercase ASCII string. Single allocation."
