@@ -102,7 +102,7 @@
               (when (= n pos) (return))  ; no progress — EOF
               (setf pos n)
               (when (>= pos size) (return))))
-      buf)))
+      (if (= pos size) buf (subseq buf 0 pos)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Directory scanning and cache loading
