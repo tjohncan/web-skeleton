@@ -266,7 +266,10 @@
                                                     :initial-element 0)))
                            (replace new-buf (connection-read-buf conn)
                                     :end2 (connection-read-pos conn))
-                           (setf (connection-read-buf conn) new-buf))))
+                           (setf (connection-read-buf conn) new-buf))
+                         ;; Re-drain: buffer grew past connection-read-available's
+                         ;; original cap, kernel may still have data (edge-triggered)
+                         (connection-read-available conn)))
                      (let ((body-available (- (connection-read-pos conn) body-start)))
                        (setf (connection-state conn) :read-body
                              (connection-body-expected conn) content-length
