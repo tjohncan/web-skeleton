@@ -438,6 +438,17 @@
                                   (and (>= raw-code 1016) (<= raw-code 2999)))
                               1000
                               raw-code)))
+               ;; RFC 6455 §5.5.1: close reason text must be valid UTF-8
+               (when (> (length payload) 2)
+                 (handler-case
+                     (sb-ext:octets-to-string payload :start 2
+                                               :external-format :utf-8)
+                   (error ()
+                     (log-warn "ws invalid UTF-8 in close reason fd ~d"
+                               (connection-fd conn))
+                     (ws-shift-buffer conn buf pos end)
+                     (return-from websocket-on-read
+                       (values :close (build-ws-close 1007))))))
                (ws-shift-buffer conn buf pos end)
                ;; Flush any responses from earlier frames before the close
                (let ((close-frame (build-ws-close code)))
