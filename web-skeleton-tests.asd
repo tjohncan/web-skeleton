@@ -9,4 +9,5 @@
                (:file "tests/test-algorithms" :depends-on ("tests/run"))
                (:file "tests/test-json" :depends-on ("tests/run"))
                (:file "tests/test-server" :depends-on ("tests/run"))
+               (:file "tests/test-store" :depends-on ("tests/run"))
                (:file "tests/test-tls" :depends-on ("tests/run"))))

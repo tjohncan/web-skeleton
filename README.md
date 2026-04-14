@@ -181,6 +181,11 @@ tests/
   `register-cleanup` to run during graceful shutdown. Hooks fire in LIFO
   order inside the shutdown path after connection drain, each wrapped in
   `handler-case` so a raising hook cannot block the rest
+- **Concurrent keyed store** — `make-store` returns a thread-safe
+  hash-table-backed store for app state (sessions, caches, rate-limit
+  counters). Optional background reaper sweeps entries on an
+  app-supplied predicate and registers its stop via the cleanup hook
+  machinery — no app-side teardown needed
 - **Demo application** — separate ASDF system with static demo page and echo server
 
 ## Configuration

@@ -41,7 +41,7 @@
   (let ((all-passed t)
         (total-passed 0)
         (total-failed 0))
-    (dolist (suite '(test-algorithms test-json test-server test-tls))
+    (dolist (suite '(test-algorithms test-json test-server test-store test-tls))
       (unless (funcall suite)
         (setf all-passed nil))
       (incf total-passed *tests-passed*)

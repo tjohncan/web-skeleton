@@ -4,4 +4,5 @@
            #:test-algorithms
            #:test-json
            #:test-server
+           #:test-store
            #:test-tls))

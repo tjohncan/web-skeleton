@@ -237,6 +237,56 @@ in `handler-case` — a raising hook cannot block the rest or prevent
 `start-server` from returning to its caller. SIGTERM from Docker
 exercises the same path as Ctrl-C at the REPL.
 
+### Concurrent store
+
+`make-store` returns a thread-safe hash-table-backed store for
+app-level state (sessions, caches, rate-limit counters). All operations
+hold an internal mutex, so stores are safe to share across worker
+threads in the same process.
+
+For stores with a reaper, supply both `:expiry-fn` and `:reap-interval`:
+
+```lisp
+(defvar *sessions*
+  (make-store :expiry-fn     (lambda (id sess)
+                               (declare (ignore id))
+                               (session-expired-p sess))
+              :reap-interval 60))
+```
+
+The reaper thread is spawned during `make-store` and its stop function
+is registered in the shutdown hook machinery — no app-side teardown.
+Supplying `:expiry-fn` without `:reap-interval` (or vice versa) signals
+an error at `make-store` time rather than silently skipping the reaper.
+
+Two locking hazards to know about:
+
+- `store-map` holds the mutex for the entire iteration. Keep the
+  callback fast, or use it to collect keys and do slow work outside.
+- `expiry-fn` runs under the mutex during every sweep. Keep it a cheap
+  predicate — no I/O, no syscalls, nothing that can block.
+
+`store-get` returns two values — `(VALUE PRESENT-P)` — to distinguish
+an explicit NIL value from a missing key. Callers that never store NIL
+can ignore the second value; everyone else should branch on it.
+
+`store-update` takes a function rather than a plist:
+
+```lisp
+(store-update *counts* "visits" (lambda (old) (1+ (or old 0))))
+```
+
+The whole read-modify-write runs under the mutex, so concurrent updates
+to the same key serialize without lost writes. For the common
+"merge plist keys into the stored value" pattern, `store-update-plist`
+is a sugar wrapper:
+
+```lisp
+(store-update-plist *sessions* sid
+                    :access-token tok
+                    :expires-at   exp)
+```
+
 ### JSON empty containers
 
 `json-parse` returns NIL for both `{}` and `[]`. `json-serialize` on NIL

@@ -53,4 +53,7 @@
                                                        "src/server/connection"
                                                        "src/server/websocket"
                                                        "src/server/static"
-                                                       "src/server/fetch"))))
+                                                       "src/server/fetch"))
+               (:file "src/store" :depends-on ("src/package"
+                                                "src/log"
+                                                "src/server/main"))))

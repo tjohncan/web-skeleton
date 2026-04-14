@@ -109,4 +109,14 @@
            #:*fetch-timeout*
            ;; Shutdown
            #:*drain-timeout*
-           #:register-cleanup))
+           #:register-cleanup
+           ;; Concurrent store
+           #:storep
+           #:make-store
+           #:store-get
+           #:store-set
+           #:store-update
+           #:store-update-plist
+           #:store-delete
+           #:store-map
+           #:store-count))
