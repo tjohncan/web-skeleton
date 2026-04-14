@@ -13,6 +13,8 @@
            #:get-header
            #:get-headers
            #:get-cookie
+           #:build-cookie
+           #:delete-cookie
            #:get-query-param
            #:parse-request
            #:parse-query-string

@@ -287,6 +287,43 @@ is a sugar wrapper:
                     :expires-at   exp)
 ```
 
+### Cookies
+
+`get-cookie` reads a named cookie from the request's `Cookie` header.
+`build-cookie` / `delete-cookie` emit Set-Cookie header values with
+the usual attributes (`HttpOnly`, `Secure`, `SameSite`, `Max-Age`,
+`Path`, `Domain`).
+
+The builder's defaults are deliberately the secure ones: `:http-only t`,
+`:secure t`, `:same-site :lax`, `:path "/"`. Pass NIL to opt out of
+any of them — but know the consequences. Most session cookies should
+keep all four.
+
+`:same-site :none` requires `:secure t`; passing the first without the
+second signals an error at `build-cookie` time rather than a silent
+client-side failure (browsers reject `SameSite=None` without `Secure`).
+
+Name and value are validated against CR, LF, and semicolon — the
+three characters that would break the Set-Cookie header structure.
+Apps needing stricter RFC 6265 §4.1.1 token validation can layer it
+on top.
+
+Attach the result to a response via `set-response-header`:
+
+```lisp
+(set-response-header resp "set-cookie"
+                     (build-cookie "session" sid
+                                   :max-age (* 8 60 60)))
+```
+
+For removal — note that `:path` and `:domain` must match the
+originally-set cookie, since browsers match Set-Cookie to stored
+cookies on those two fields:
+
+```lisp
+(set-response-header resp "set-cookie" (delete-cookie "session"))
+```
+
 ### JSON empty containers
 
 `json-parse` returns NIL for both `{}` and `[]`. `json-serialize` on NIL

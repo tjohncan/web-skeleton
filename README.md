@@ -139,6 +139,11 @@ tests/
   latency with curl, Go, Python, and Java HTTP clients on large POSTs
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
+- **Cookies** — `get-cookie` reads a named cookie from the request
+  header; `build-cookie` / `delete-cookie` emit Set-Cookie values with
+  `HttpOnly`, `Secure`, `SameSite`, `Max-Age`, `Path`, `Domain`. Safe
+  defaults (HttpOnly, Secure, SameSite=Lax); structural-character
+  validation so a typo in an attribute name cannot be injected
 - **Path matching** — `match-path` matches URL paths against patterns with
   `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
 - **JSON** — full parser and serializer (RFC 8259). Objects become alists,

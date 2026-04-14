@@ -288,6 +288,91 @@
     (check "error body" (http-response-body resp) "404 Not Found")))
 
 ;;; ---------------------------------------------------------------------------
+;;; Cookie builder tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-cookie-builder ()
+  (format t "~%Cookie Builder~%")
+  (flet ((containsp (needle haystack)
+           (not (null (search needle haystack))))
+         (signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    ;; Default build — secure posture: HttpOnly + Secure + SameSite=Lax + Path=/
+    (let ((c (build-cookie "session" "abc123")))
+      (check "default: name=value present"
+             (containsp "session=abc123" c) t)
+      (check "default: Path=/"       (containsp "Path=/" c)       t)
+      (check "default: HttpOnly"     (containsp "HttpOnly" c)     t)
+      (check "default: Secure"       (containsp "Secure" c)       t)
+      (check "default: SameSite=Lax" (containsp "SameSite=Lax" c) t))
+    ;; Max-Age
+    (check "max-age rendered"
+           (containsp "Max-Age=3600"
+                      (build-cookie "k" "v" :max-age 3600))
+           t)
+    ;; Domain
+    (check "domain rendered"
+           (containsp "Domain=example.com"
+                      (build-cookie "k" "v" :domain "example.com"))
+           t)
+    ;; SameSite variants
+    (check "SameSite=Strict"
+           (containsp "SameSite=Strict"
+                      (build-cookie "k" "v" :same-site :strict))
+           t)
+    (check "SameSite=None with :secure t"
+           (containsp "SameSite=None"
+                      (build-cookie "k" "v" :same-site :none :secure t))
+           t)
+    (check ":same-site nil omits the attribute"
+           (containsp "SameSite" (build-cookie "k" "v" :same-site nil))
+           nil)
+    ;; Opt-outs
+    (check ":http-only nil omits HttpOnly"
+           (containsp "HttpOnly" (build-cookie "k" "v" :http-only nil))
+           nil)
+    (check ":secure nil omits Secure"
+           (containsp "Secure" (build-cookie "k" "v" :secure nil))
+           nil)
+    ;; Validation: SameSite=None requires Secure
+    (check "SameSite=None without :secure errors"
+           (signals-error-p
+            (lambda () (build-cookie "k" "v" :same-site :none :secure nil)))
+           t)
+    (check "invalid :same-site value errors"
+           (signals-error-p
+            (lambda () (build-cookie "k" "v" :same-site :bogus)))
+           t)
+    ;; Validation: structural characters
+    (check "semicolon in name errors"
+           (signals-error-p (lambda () (build-cookie "bad;name" "v")))
+           t)
+    (check "CR in value errors"
+           (signals-error-p
+            (lambda () (build-cookie "k" (format nil "v~cmore" #\Return))))
+           t)
+    (check "LF in value errors"
+           (signals-error-p
+            (lambda () (build-cookie "k" (format nil "v~cmore" #\Newline))))
+           t)
+    ;; delete-cookie: empty value with Max-Age=0
+    (let ((c (delete-cookie "session")))
+      (check "delete: empty value followed by attributes"
+             (containsp "session=; " c) t)
+      (check "delete: Max-Age=0"
+             (containsp "Max-Age=0" c) t)
+      (check "delete: default Path=/"
+             (containsp "Path=/" c) t))
+    (check "delete: domain rendered"
+           (containsp "Domain=example.com"
+                      (delete-cookie "session" :domain "example.com"))
+           t)
+    (check "delete: name validation"
+           (signals-error-p (lambda () (delete-cookie "bad;name")))
+           t)))
+
+;;; ---------------------------------------------------------------------------
 ;;; HTTP client (fetch) tests — pure functions only, no networking
 ;;; ---------------------------------------------------------------------------
 
@@ -981,6 +1066,7 @@
   (test-expect-100-continue)
   (test-http-date)
   (test-http-response)
+  (test-cookie-builder)
   (test-fetch)
   (test-url-decode)
   (test-query-string)

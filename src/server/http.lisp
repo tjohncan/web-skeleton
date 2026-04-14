@@ -97,6 +97,88 @@
             (setf pos (1+ semi))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Set-Cookie builder (RFC 6265)
+;;;
+;;; Symmetric with GET-COOKIE. Kills the per-app HttpOnly / Secure /
+;;; SameSite / Max-Age typo footgun — one misspelled attribute name in
+;;; hand-rolled Set-Cookie string construction is a silent security
+;;; regression nobody notices until audit time.
+;;;
+;;; Name and value are validated against CR, LF, and semicolon. Apps
+;;; that need strict RFC 6265 §4.1.1 token validation can layer it on
+;;; top; the framework only rejects characters that would break the
+;;; header structure itself.
+;;; ---------------------------------------------------------------------------
+
+(defun validate-cookie-field (kind field)
+  "Reject CR, LF, and semicolon in a cookie name or value — the three
+   characters that would break the Set-Cookie header grammar or enable
+   structural injection."
+  (when (or (find #\Return field)
+            (find #\Newline field)
+            (find #\; field))
+    (error "build-cookie: ~a contains a forbidden character (CR, LF, or ';')"
+           kind)))
+
+(defun build-cookie (name value &key (path "/") (http-only t) (secure t)
+                                     (same-site :lax) max-age domain)
+  "Build a Set-Cookie header value string.
+   :SAME-SITE accepts :LAX (default), :STRICT, :NONE, or NIL (omit).
+   :NONE requires :SECURE T — browsers reject the combination otherwise,
+   and catching it here is friendlier than a silent client-side failure.
+   :MAX-AGE is an integer (seconds) or NIL (session cookie, drops on
+   browser close).
+   :PATH defaults to '/'; :DOMAIN is omitted by default.
+   Use SET-RESPONSE-HEADER to attach the result to an HTTP-RESPONSE."
+  (validate-cookie-field "name" name)
+  (validate-cookie-field "value" value)
+  (unless (or (null same-site)
+              (member same-site '(:lax :strict :none)))
+    (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
+  (when (and (eq same-site :none) (not secure))
+    (error "build-cookie: :same-site :none requires :secure t"))
+  (with-output-to-string (out)
+    (write-string name out)
+    (write-char #\= out)
+    (write-string value out)
+    (when path
+      (write-string "; Path=" out)
+      (write-string path out))
+    (when domain
+      (write-string "; Domain=" out)
+      (write-string domain out))
+    (when max-age
+      (format out "; Max-Age=~d" max-age))
+    (when http-only
+      (write-string "; HttpOnly" out))
+    (when secure
+      (write-string "; Secure" out))
+    (when same-site
+      (write-string "; SameSite=" out)
+      (write-string (ecase same-site
+                      (:lax    "Lax")
+                      (:strict "Strict")
+                      (:none   "None"))
+                    out))))
+
+(defun delete-cookie (name &key (path "/") domain)
+  "Build a Set-Cookie header value that removes the cookie NAME.
+   Empty value + Max-Age=0 so the browser drops it on receipt.
+   :PATH and :DOMAIN must match how the cookie was originally set —
+   browsers match cookies to Set-Cookie by (name, domain, path);
+   HttpOnly / Secure / SameSite do not participate in matching."
+  (validate-cookie-field "name" name)
+  (with-output-to-string (out)
+    (write-string name out)
+    (write-char #\= out)
+    (write-string "; Path=" out)
+    (write-string path out)
+    (when domain
+      (write-string "; Domain=" out)
+      (write-string domain out))
+    (write-string "; Max-Age=0" out)))
+
+;;; ---------------------------------------------------------------------------
 ;;; URL percent-decoding (RFC 3986)
 ;;; ---------------------------------------------------------------------------
 
