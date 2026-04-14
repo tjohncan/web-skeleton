@@ -360,3 +360,52 @@ For POST bodies with this content type, parse directly:
 Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path
 decoding). The form-aware decoding is in `parse-query-string` and
 `form-decode`.
+
+### Testing your handlers
+
+`web-skeleton-test-harness` is an optional ASDF system for driving
+handlers from tests. Depend on it in your test build (typically via a
+`my-app-tests.asd` with `:depends-on ("my-app" "web-skeleton-test-harness")`)
+and use `with-test-server` to spin an ephemeral-port live server
+inside test bodies:
+
+```lisp
+(defpackage :my-app-tests
+  (:use :cl :web-skeleton :web-skeleton-test-harness))
+
+(in-package :my-app-tests)
+
+(defun test-index ()
+  (with-test-server (:handler #'my-app:handle-request)
+    (multiple-value-bind (status headers body)
+        (test-http-request :get "/")
+      (declare (ignore headers))
+      (assert (= status 200))
+      (assert (search "welcome" body)))))
+```
+
+`with-test-server` picks a free port, starts the server in a background
+thread, binds `*test-port*` for the body, and tears it down on scope
+exit (signal shutdown, bounded join, fallback to `terminate-thread`).
+Shutdown hooks registered inside the body are isolated to that
+server's teardown — they do not leak into the caller's state.
+
+For unit-style tests that bypass the network entirely,
+`make-test-request` constructs an `http-request` struct directly:
+
+```lisp
+(defun test-auth-rejection ()
+  (let* ((req (make-test-request :method :GET :path "/private"))
+         (resp (my-app:handle-request req)))
+    (assert (= (http-response-status resp) 401))))
+```
+
+`make-test-ws-frame` is the analogue for WebSocket handler unit tests
+— it builds a masked client frame that `ws-handler` code can parse
+and process.
+
+End-to-end tests are slower than unit-style tests (~1-2 seconds per
+`with-test-server` call, mostly shutdown latency). Use unit-style
+tests for handler logic, end-to-end for the request/response path
+itself and for anything that depends on the event loop or graceful
+shutdown machinery.

@@ -132,6 +132,15 @@
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
 
+(defparameter *shutdown-poll-interval* 1
+  "Seconds between shutdown-signal checks in the main thread's wait loop
+   and each worker's event-loop epoll timeout. Also governs the worker's
+   periodic-maintenance cadence (idle-connection sweep, WebSocket ping).
+   Default 1 second balances wake-up overhead against shutdown
+   responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
+   so teardown doesn't wait a full second per call. Float accepted —
+   the worker converts to ms for epoll_wait.")
+
 (defparameter *max-events* 64
   "Maximum events to process per epoll_wait call.")
 
@@ -611,7 +620,8 @@
       (when *shutdown*
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
-      (let ((n (epoll-wait epoll-fd event-buf *max-events* 1000)))
+      (let ((n (epoll-wait epoll-fd event-buf *max-events*
+                           (round (* *shutdown-poll-interval* 1000)))))
         (loop for i from 0 below n
               do (block handle-event
                    (let ((fd    (epoll-event-fd event-buf i))
@@ -741,7 +751,7 @@
     (unwind-protect
         (handler-case
             ;; Main thread waits for interrupt or SIGTERM
-            (loop (sleep 1)
+            (loop (sleep *shutdown-poll-interval*)
                   (when *shutdown*
                     (log-info "shutting down")
                     (return)))

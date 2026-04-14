@@ -114,6 +114,7 @@
            #:*fetch-timeout*
            ;; Shutdown
            #:*drain-timeout*
+           #:*shutdown-poll-interval*
            #:register-cleanup
            ;; Concurrent store
            #:storep

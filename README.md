@@ -173,6 +173,12 @@ tests/
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — FIPS/RFC test vectors for all crypto primitives, JSON
   round-trip tests, HTTP parser tests, JWT validation tests
+- **Test harness** — optional `web-skeleton-test-harness` ASDF system.
+  `with-test-server` spins an ephemeral-port live server,
+  `test-http-request` makes real HTTP round-trips inside test bodies,
+  `make-test-request` and `make-test-ws-frame` build structs for
+  unit-style handler tests. Downstream apps can depend on it in their
+  test build without pulling in the framework's own test suite
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
@@ -217,6 +223,7 @@ All configurable via `setf` before calling `start-server`.
 | `*fetch-timeout*` | `30` | Blocking fetch I/O timeout and :awaiting connection reap deadline |
 | `*jwt-clock-skew*` | `60` | Seconds of clock skew tolerance for JWT exp/nbf checks |
 | `*drain-timeout*` | `5` | Seconds to wait for connections to drain on shutdown |
+| `*shutdown-poll-interval*` | `1` | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout) |
 
 The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
 
