@@ -178,16 +178,6 @@ LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
 For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
-### Expect: 100-continue
-
-The server does not send `100 Continue` responses. Clients that use
-`Expect: 100-continue` (default for large POST bodies in curl, Go's
-net/http, Python requests, Java HttpClient) will pause 1-3 seconds
-after sending headers before giving up and sending the body. No error
-occurs — just invisible latency. Workaround: disable the Expect header
-on the client side (e.g., `curl --no-expect`, or set `Expect: ""`).
-This is on the roadmap.
-
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, validate the
@@ -223,6 +213,29 @@ a slow client holds the worker hostage.
 `load-static-files` reads files into memory at startup and pre-builds
 HTTP responses. Call it **before** `start-server`. It is not thread-safe
 and must not be called while the server is running.
+
+### Background work and shutdown cleanup
+
+Apps with their own background threads (session reapers, cache flushers,
+metrics exporters) should register a stop function via `register-cleanup`
+rather than wrapping `start-server` in an app-side `unwind-protect`.
+Cleanup hooks run inside `start-server`'s unwind path after connection
+drain and before the function returns:
+
+```lisp
+(defun start (&key (port 8080))
+  (load-static-files "static/")
+  (start-session-reaper)
+  (register-cleanup #'stop-session-reaper)
+  (start-server :port port
+                :handler #'handle-request
+                :ws-handler #'handle-ws-message))
+```
+
+Hooks fire in LIFO order (last registered, first called), each wrapped
+in `handler-case` — a raising hook cannot block the rest or prevent
+`start-server` from returning to its caller. SIGTERM from Docker
+exercises the same path as Ctrl-C at the REPL.
 
 ### JSON empty containers
 

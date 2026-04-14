@@ -209,14 +209,78 @@
                                              (= b (- n 32)))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Expect: 100-continue
+;;;
+;;; When a request carries "Expect: 100-continue" and we intend to read the
+;;; body, RFC 7231 §5.1.1 wants the server to answer with an interim
+;;; "HTTP/1.1 100 Continue" status before the body arrives. Without it,
+;;; curl / Go / Python / Java HTTP clients all pause 1-3s after sending
+;;; headers on large POSTs before giving up and sending the body.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *http-100-continue-bytes*
+  (sb-ext:string-to-octets
+   (format nil "HTTP/1.1 100 Continue~c~c~c~c"
+           #\Return #\Newline #\Return #\Newline)
+   :external-format :ascii)
+  "Pre-built bytes for the HTTP/1.1 100 Continue interim response.
+   Queued before reading the body when the client asks for it.")
+
+(defun scan-expect-100-continue (buf end)
+  "Return T if BUF[0..END) contains an Expect header whose value is
+   100-continue (case-insensitive). Start-of-line match only — suffixed
+   names like X-Expect do not match. The token terminator check blocks
+   near-miss matches like 100-continued."
+  (let ((name (load-time-value
+               (sb-ext:string-to-octets "expect:"
+                                         :external-format :ascii)))
+        (token (load-time-value
+                (sb-ext:string-to-octets "100-continue"
+                                          :external-format :ascii))))
+    (loop for i from 0 below end
+          do (when (and (>= i 2)
+                        (= (aref buf (- i 2)) 13)
+                        (= (aref buf (- i 1)) 10)
+                        (<= (+ i (length name)) end)
+                        (loop for j below (length name)
+                              for b = (aref buf (+ i j))
+                              for n = (aref name j)
+                              always (or (= b n)
+                                         (and (<= 97 n 122)
+                                              (= b (- n 32))))))
+               (let ((pos (+ i (length name))))
+                 ;; Skip OWS after the colon.
+                 (loop while (and (< pos end)
+                                  (or (= (aref buf pos) 32)
+                                      (= (aref buf pos) 9)))
+                       do (incf pos))
+                 ;; Case-insensitive match against "100-continue".
+                 (when (and (<= (+ pos (length token)) end)
+                            (loop for k below (length token)
+                                  for b = (aref buf (+ pos k))
+                                  for n = (aref token k)
+                                  always (or (= b n)
+                                             (and (<= 97 n 122)
+                                                  (= b (- n 32))))))
+                   ;; Require a token terminator so 100-continued (etc.)
+                   ;; does not match.
+                   (let ((after (+ pos (length token))))
+                     (when (or (>= after end)
+                               (let ((b (aref buf after)))
+                                 (or (= b 13) (= b 32) (= b 9))))
+                       (return t)))))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; State machine: on-read
 ;;;
 ;;; Called by the event loop when epoll reports EPOLLIN.
 ;;; Returns:
-;;;   :CONTINUE  — stay in current state, wait for more data
-;;;   :DISPATCH  — full HTTP request ready, route it
-;;;   :WEBSOCKET — WebSocket frame(s) available to process
-;;;   :CLOSE     — connection should be closed
+;;;   :CONTINUE      — stay in current state, wait for more data
+;;;   :DISPATCH      — full HTTP request ready, route it
+;;;   :SEND-CONTINUE — 100 Continue queued for an Expect: 100-continue
+;;;                    request; caller must flip the fd to EPOLLOUT
+;;;   :WEBSOCKET     — WebSocket frame(s) available to process
+;;;   :CLOSE         — connection should be closed
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-on-read (conn)
@@ -272,12 +336,28 @@
                          (when (eq (connection-read-available conn) :eof)
                            (return-from connection-on-read :close))))
                      (let ((body-available (- (connection-read-pos conn) body-start)))
-                       (setf (connection-state conn) :read-body
-                             (connection-body-expected conn) content-length
+                       (setf (connection-body-expected conn) content-length
                              (connection-header-end conn) header-end)
-                       (if (>= body-available content-length)
-                           :dispatch     ; already have the full body
-                           :continue)))  ; need more bytes
+                       (cond
+                         ;; Already have the full body — dispatch even if
+                         ;; Expect: 100-continue is set. The client chose
+                         ;; not to wait, and sending 100 now is pointless.
+                         ((>= body-available content-length)
+                          (setf (connection-state conn) :read-body)
+                          :dispatch)
+                         ;; Body still incoming and the client asked us to
+                         ;; confirm before sending it. Queue the interim
+                         ;; response; the worker flushes it and the body
+                         ;; arrives next.
+                         ((scan-expect-100-continue (connection-read-buf conn)
+                                                    header-end)
+                          (connection-queue-write conn *http-100-continue-bytes*)
+                          (setf (connection-state conn) :sending-100-continue)
+                          :send-continue)
+                         ;; Plain body wait.
+                         (t
+                          (setf (connection-state conn) :read-body)
+                          :continue))))
                    ;; No body — request is complete
                    (progn
                      (setf (connection-header-end conn) header-end)

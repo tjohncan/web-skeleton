@@ -208,6 +208,53 @@
                    (web-skeleton::connection-parse-request conn)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Expect: 100-continue tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-expect-100-continue ()
+  (format t "~%Expect: 100-continue~%")
+  (flet ((scan-p (&rest header-lines)
+           (let* ((raw   (apply #'crlf "POST /foo HTTP/1.1" header-lines))
+                  (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+                  (end   (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+             (not (null
+                   (web-skeleton::scan-expect-100-continue bytes end))))))
+    ;; Positive matches
+    (check "exact match"
+           (scan-p "Host: localhost" "Expect: 100-continue") t)
+    (check "case-insensitive header name"
+           (scan-p "Host: localhost" "EXPECT: 100-continue") t)
+    (check "case-insensitive value"
+           (scan-p "Host: localhost" "Expect: 100-Continue") t)
+    (check "extra spaces after colon"
+           (scan-p "Host: localhost" "Expect:   100-continue") t)
+    (check "tab after colon"
+           (scan-p "Host: localhost"
+                   (format nil "Expect:~c100-continue" #\Tab))
+           t)
+    ;; Negative matches
+    (check "no Expect header"
+           (scan-p "Host: localhost" "Content-Length: 10") nil)
+    (check "different expect value"
+           (scan-p "Host: localhost" "Expect: something-else") nil)
+    (check "suffixed header name does not match"
+           (scan-p "Host: localhost" "X-Expect: 100-continue") nil)
+    (check "token must have a valid terminator"
+           (scan-p "Host: localhost" "Expect: 100-continued") nil))
+  ;; Constant sanity — the pre-built bytes are exactly the status line.
+  (let ((bytes web-skeleton::*http-100-continue-bytes*))
+    (check "100 Continue ends with CRLFCRLF"
+           (list (aref bytes (- (length bytes) 4))
+                 (aref bytes (- (length bytes) 3))
+                 (aref bytes (- (length bytes) 2))
+                 (aref bytes (- (length bytes) 1)))
+           '(13 10 13 10))
+    (check "100 Continue status line"
+           (sb-ext:octets-to-string bytes :external-format :ascii)
+           (format nil "HTTP/1.1 100 Continue~c~c~c~c"
+                   #\Return #\Newline #\Return #\Newline))))
+
+;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests
 ;;; ---------------------------------------------------------------------------
 
@@ -931,6 +978,7 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-expect-100-continue)
   (test-http-date)
   (test-http-response)
   (test-fetch)

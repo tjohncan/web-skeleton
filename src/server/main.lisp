@@ -416,6 +416,12 @@
                              (if upgrade-p :ws-upgrade :write-response))
                        (epoll-modify epoll-fd (connection-fd conn)
                                     (logior +epollout+ +epollet+))))))))
+             (:send-continue
+              ;; connection-on-read queued the 100 Continue response and
+              ;; set state :sending-100-continue. Flip to EPOLLOUT so
+              ;; handle-client-write flushes it; the body arrives next.
+              (epoll-modify epoll-fd (connection-fd conn)
+                            (logior +epollout+ +epollet+)))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — just wait for more data
@@ -572,7 +578,20 @@
                            (logior +epollin+ +epollet+)))
              (:closing
               ;; Close frame sent — disconnect
-              (close-connection conn epoll-fd))))
+              (close-connection conn epoll-fd))
+             (:sending-100-continue
+              ;; 100 Continue flushed — switch to reading the body.
+              ;; Returning :keep-alive tells the main loop to re-enter
+              ;; handle-client-read immediately in case the body is
+              ;; already buffered (edge-triggered epoll won't re-fire
+              ;; on user-space bytes).
+              (setf (connection-write-buf conn) nil
+                    (connection-write-pos conn) 0
+                    (connection-write-end conn) 0
+                    (connection-state conn) :read-body)
+              (epoll-modify epoll-fd (connection-fd conn)
+                            (logior +epollin+ +epollet+))
+              (return-from handle-client-write :keep-alive))))
           ;; :continue — more bytes to write
           (:continue nil)))
     (error (e)

@@ -134,6 +134,9 @@ tests/
 - **HTTP response builder** — status codes, headers, body serialization
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
+- **Expect: 100-continue** — interim `100 Continue` sent before reading the
+  body when a request carries the `Expect` header. Prevents 1-3s invisible
+  latency with curl, Go, Python, and Java HTTP clients on large POSTs
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Path matching** — `match-path` matches URL paths against patterns with
@@ -174,6 +177,10 @@ tests/
   verification, SNI. Same API — just use `https://` URLs
 - **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
   close frames, flushes in-progress writes, force-closes after drain timeout
+- **Shutdown cleanup hooks** — apps register zero-argument functions via
+  `register-cleanup` to run during graceful shutdown. Hooks fire in LIFO
+  order inside the shutdown path after connection drain, each wrapped in
+  `handler-case` so a raising hook cannot block the rest
 - **Demo application** — separate ASDF system with static demo page and echo server
 
 ## Configuration
@@ -227,5 +234,3 @@ and practical notes on building with web-skeleton.
 - **ETag for static files** — compute a content hash at load time and
   include it in static responses. Enables `304 Not Modified` via
   `If-None-Match`, reducing bandwidth for repeat visitors
-- **Expect: 100-continue** — send `100 Continue` for requests with
-  the `Expect` header to eliminate 1-3s latency on large POST bodies
