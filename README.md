@@ -239,6 +239,43 @@ Use `:host #(0 0 0 0)` to listen on all interfaces.
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
 
+## Async HTTP fetch
+
+A handler that needs to call an upstream API **returns a continuation
+instead of blocking**. `defer-to-fetch` (or `http-fetch` directly)
+builds the continuation — a descriptor carrying the outbound method,
+URL, headers, body, and a `:then` callback. The framework recognizes
+the continuation as the handler's return value, parks the inbound
+connection, makes the outbound call on the same epoll loop
+(non-blocking for plain HTTP), then invokes the callback with
+`(status headers body-bytes)`. Whatever the callback returns becomes
+the final response to the original caller:
+
+```lisp
+(defun handle-proxy (request)
+  (declare (ignore request))
+  (defer-to-fetch :get "http://upstream/api/data"
+    :then (lambda (status headers body-bytes)
+            (declare (ignore headers))
+            (if (= status 200)
+                (make-text-response
+                 200
+                 (sb-ext:octets-to-string body-bytes
+                                          :external-format :utf-8))
+                (make-error-response 502)))))
+```
+
+The callback can itself return another continuation for chained
+fetches — the framework detects the nested continuation and runs the
+chain. A regular `http-response` object terminates the chain. See
+`demo/handler.lisp`'s `/demo-fetch` endpoint for a runnable example.
+
+`http-fetch-stream` is a separate, **blocking** variant that reads the
+response body line by line via a per-line callback. It holds the
+worker thread for the duration of the upstream call and is intended
+for NDJSON / SSE streaming APIs inside a `ws-handler`, where the event
+loop is already paused while the handler runs.
+
 ## Deployment
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for project setup, configuration,

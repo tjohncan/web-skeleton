@@ -94,6 +94,7 @@
            #:serve-static
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
+           #:defer-to-fetch
            #:http-fetch-stream
            #:*https-fetch-fn*
            #:*https-stream-fn*

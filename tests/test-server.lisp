@@ -446,7 +446,14 @@
               (concatenate 'string "HTTP/1.0 302 Found" *crlf*)
               :external-format :ascii)))
     (check "status 302 http/1.0"
-           (web-skeleton::parse-response-status buf 0 (length buf)) 302)))
+           (web-skeleton::parse-response-status buf 0 (length buf)) 302))
+
+  ;; defer-to-fetch is a thin readability wrapper over http-fetch; check
+  ;; that it returns the same continuation the framework recognizes as
+  ;; an async signal.
+  (let ((c (defer-to-fetch :get "http://example.com/" :then #'identity)))
+    (check "defer-to-fetch returns a continuation"
+           (typep c 'web-skeleton::http-fetch-continuation) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL decode tests

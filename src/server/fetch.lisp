@@ -18,7 +18,7 @@
 ;;; Fetch request descriptor (returned by handler)
 ;;; ---------------------------------------------------------------------------
 
-(defstruct http-fetch-request
+(defstruct http-fetch-continuation
   "Descriptor for an outbound HTTP request. Returned by http-fetch."
   (method   :GET   :type keyword)
   (url      ""     :type string)
@@ -33,12 +33,22 @@
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
    THEN is called with (status headers body) when the response arrives;
-   it must return an HTTP response, byte vector, or another http-fetch-request."
+   it must return an HTTP response, byte vector, or another http-fetch-continuation."
   (unless then
     (error "http-fetch requires :then callback"))
-  (make-http-fetch-request :method method :url url
-                            :headers headers :body body
-                            :callback then))
+  (make-http-fetch-continuation :method method :url url
+                                :headers headers :body body
+                                :callback then))
+
+(defun defer-to-fetch (method url &key headers body then)
+  "Readability alias for HTTP-FETCH at the handler call site. Returns an
+   HTTP-FETCH-CONTINUATION which the framework recognizes as a signal to
+   park the inbound connection and run the outbound call.
+   Handlers that write (defer-to-fetch :post url :then ...) read as
+   'this handler defers to an outbound fetch', which is exactly what is
+   happening — the handler's return value encodes the next async step
+   instead of producing a synchronous response."
+  (http-fetch method url :headers headers :body body :then then))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL parsing
@@ -321,12 +331,12 @@
 (defun initiate-fetch (conn epoll-fd fetch-req)
   "Start an outbound HTTP(S) request.
    CONN is the inbound connection to park.
-   FETCH-REQ is the http-fetch-request descriptor.
+   FETCH-REQ is the http-fetch-continuation descriptor.
    HTTP uses non-blocking epoll I/O. HTTPS dispatches to *https-fetch-fn*
    (blocking on the worker thread) — requires web-skeleton-tls."
   (handler-case
       (multiple-value-bind (scheme host port path)
-          (parse-url (http-fetch-request-url fetch-req))
+          (parse-url (http-fetch-continuation-url fetch-req))
         (if (eq scheme :https)
             ;; HTTPS — blocking path via TLS hook
             (if *https-fetch-fn*
@@ -356,18 +366,18 @@
               (sb-bsd-sockets:socket-error () nil))
             (let* ((out-fd (socket-fd socket))
                    (request-bytes (build-outbound-request
-                                  (http-fetch-request-method fetch-req)
+                                  (http-fetch-continuation-method fetch-req)
                                   host path
                                   :port port
-                                  :headers (http-fetch-request-headers fetch-req)
-                                  :body (http-fetch-request-body fetch-req)))
+                                  :headers (http-fetch-continuation-headers fetch-req)
+                                  :body (http-fetch-continuation-body fetch-req)))
                    (out-conn (make-connection
                               :fd out-fd
                               :socket socket
                               :state :out-connecting
                               :outbound-p t
                               :inbound-fd (connection-fd conn)
-                              :fetch-callback (http-fetch-request-callback fetch-req)
+                              :fetch-callback (http-fetch-continuation-callback fetch-req)
                               :last-active (get-universal-time))))
               (connection-queue-write out-conn request-bytes)
               (register-connection out-conn)
@@ -552,7 +562,7 @@
               (let ((bytes (cond
                              ((typep response '(simple-array (unsigned-byte 8) (*)))
                               response)
-                             ((typep response 'http-fetch-request)
+                             ((typep response 'http-fetch-continuation)
                               ;; Chained fetch — initiate another outbound call
                               (initiate-fetch inbound epoll-fd response)
                               (return-from complete-fetch))

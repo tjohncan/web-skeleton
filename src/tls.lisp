@@ -256,11 +256,11 @@
             (progn
               ;; Build and send the HTTP request
               (let ((request-bytes (build-outbound-request
-                                   (http-fetch-request-method fetch-req)
+                                   (http-fetch-continuation-method fetch-req)
                                    host path
                                    :scheme :https :port port
-                                   :headers (http-fetch-request-headers fetch-req)
-                                   :body (http-fetch-request-body fetch-req))))
+                                   :headers (http-fetch-continuation-headers fetch-req)
+                                   :body (http-fetch-continuation-body fetch-req))))
                 (tls-write-all ssl request-bytes))
               ;; Read the complete response
               (let* ((response-buf (tls-read-all ssl))
@@ -288,7 +288,7 @@
                      (body (if (and raw-body chunked-p)
                                (decode-chunked-body raw-body 0 (length raw-body))
                                raw-body))
-                     (callback (http-fetch-request-callback fetch-req)))
+                     (callback (http-fetch-continuation-callback fetch-req)))
                 ;; Call the user's callback
                 (let ((response (funcall callback
                                          (or status 0) (or headers nil)
@@ -297,7 +297,7 @@
                   (let ((bytes (cond
                                  ((typep response '(simple-array (unsigned-byte 8) (*)))
                                   response)
-                                 ((typep response 'http-fetch-request)
+                                 ((typep response 'http-fetch-continuation)
                                   ;; Chained fetch
                                   (initiate-fetch conn epoll-fd response)
                                   (return-from https-fetch))

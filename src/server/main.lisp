@@ -214,11 +214,11 @@
                (set-response-header resp "sec-websocket-version" "13")
                (values resp nil)))))
       ;; Outbound fetch request — handler needs an external call
-      ((typep response 'http-fetch-request)
+      ((typep response 'http-fetch-continuation)
        (log-debug "~a ~a -> fetch ~a"
                   (http-request-method request)
                   (http-request-path request)
-                  (http-fetch-request-url response))
+                  (http-fetch-continuation-url response))
        (values response nil))
       ;; Pre-formatted response (e.g., static file — already bytes)
       ((typep response '(simple-array (unsigned-byte 8) (*)))
@@ -393,7 +393,7 @@
                     (dispatch-request request handler)
                   (cond
                     ;; Outbound fetch — park and initiate
-                    ((typep response 'http-fetch-request)
+                    ((typep response 'http-fetch-continuation)
                      (initiate-fetch conn epoll-fd response))
                     ;; Normal response — queue for writing
                     (t
