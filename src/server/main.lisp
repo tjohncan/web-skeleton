@@ -136,6 +136,48 @@
   "Maximum events to process per epoll_wait call.")
 
 ;;; ---------------------------------------------------------------------------
+;;; User-extensible cleanup hooks
+;;;
+;;; Apps with background work (session reapers, cache flushers, metrics
+;;; exporters) register zero-argument cleanup functions via REGISTER-CLEANUP.
+;;; Hooks run inside start-server's unwind-protect after worker drain, each
+;;; wrapped in HANDLER-CASE so one raising hook cannot prevent the rest from
+;;; firing. This is the integration seam for primitives that own a live
+;;; thread — e.g. a store with an expiry reaper.
+;;; ---------------------------------------------------------------------------
+
+(defvar *shutdown-hooks* nil
+  "List of zero-argument cleanup functions, head = most recently registered.
+   DEFVAR rather than DEFGLOBAL so tests can rebind it locally.
+   Workers spawned via SB-THREAD:MAKE-THREAD see the top-level binding —
+   dynamic bindings are not carried across thread creation.")
+
+(defvar *shutdown-hooks-lock* (sb-thread:make-mutex :name "shutdown-hooks")
+  "Serializes REGISTER-CLEANUP across concurrent threads.")
+
+(defun register-cleanup (fn)
+  "Register FN (a zero-argument function) to run during graceful shutdown.
+   Hooks run after workers have drained, before START-SERVER returns.
+   Thread-safe — callable from any thread, before or during server run.
+   Each invocation is wrapped in HANDLER-CASE, so raising from a hook does
+   not abort the rest. Returns FN."
+  (sb-thread:with-mutex (*shutdown-hooks-lock*)
+    (push fn *shutdown-hooks*))
+  fn)
+
+(defun run-shutdown-hooks ()
+  "Invoke each registered cleanup hook in LIFO order, catching errors.
+   Called from START-SERVER's unwind-protect — do not call directly.
+   Copies the hook list under the mutex before iterating so a hook that
+   registers another hook does not mutate the list we're walking."
+  (let ((hooks (sb-thread:with-mutex (*shutdown-hooks-lock*)
+                 (copy-list *shutdown-hooks*))))
+    (dolist (fn hooks)
+      (handler-case (funcall fn)
+        (error (e)
+          (log-error "shutdown hook error: ~a" e))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Request dispatch
 ;;; ---------------------------------------------------------------------------
 
@@ -692,4 +734,9 @@
       (dolist (thread threads)
         (ignore-errors (sb-thread:join-thread thread
                                               :timeout (+ *drain-timeout* 3))))
+      ;; Workers have drained; run any app-registered cleanup before
+      ;; returning. Hooks own their own error handling — one raising
+      ;; hook cannot block the rest, cannot block the "stopped" log,
+      ;; and cannot prevent START-SERVER from returning to its caller.
+      (run-shutdown-hooks)
       (log-info "stopped"))))

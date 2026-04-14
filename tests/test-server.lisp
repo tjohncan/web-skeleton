@@ -888,6 +888,40 @@
     (check "jwks kid" (jwt-key-kid (first keys)) "test-key")))
 
 ;;; ---------------------------------------------------------------------------
+;;; Shutdown hook tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-shutdown-hooks ()
+  (format t "~%Shutdown Hooks~%")
+  ;; Rebind the hook list so this test does not pollute framework state.
+  ;; The lock stays shared — it is about thread safety of the cell access,
+  ;; not about isolating the list value itself.
+  (let ((web-skeleton::*shutdown-hooks* nil)
+        (log (make-array 4 :fill-pointer 0 :adjustable t)))
+    (web-skeleton:register-cleanup
+     (lambda () (vector-push-extend :first log)))
+    (web-skeleton:register-cleanup
+     (lambda () (vector-push-extend :second log)))
+    (web-skeleton:register-cleanup
+     (lambda () (error "intentional test failure — must not abort the rest")))
+    (web-skeleton:register-cleanup
+     (lambda () (vector-push-extend :third log)))
+    ;; Suppress the log-error line from the raising hook so the test output
+    ;; stays clean.
+    (let ((web-skeleton:*log-level* :error)
+          (web-skeleton:*log-stream* (make-broadcast-stream)))
+      (web-skeleton::run-shutdown-hooks))
+    ;; LIFO: :third (last in) runs first, then the raiser (caught), then
+    ;; :second, then :first. The raiser contributes nothing to the log.
+    (check "hooks run LIFO and survive a raising hook"
+           (coerce log 'list)
+           '(:third :second :first))
+    ;; Registration is idempotent on the return value — it returns FN.
+    (let ((fn (lambda () nil)))
+      (check "register-cleanup returns the function"
+             (eq (web-skeleton:register-cleanup fn) fn) t))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -909,5 +943,6 @@
   (test-websocket-fragmentation)
   (test-static-helpers)
   (test-jwt)
+  (test-shutdown-hooks)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))

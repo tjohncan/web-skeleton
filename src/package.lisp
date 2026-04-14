@@ -108,4 +108,5 @@
            #:*ws-max-missed-pongs*
            #:*fetch-timeout*
            ;; Shutdown
-           #:*drain-timeout*))
+           #:*drain-timeout*
+           #:register-cleanup))
