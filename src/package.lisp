@@ -55,6 +55,9 @@
            ;; HMAC
            #:hmac-sha256
            #:constant-time-equal
+           ;; Random
+           #:random-bytes
+           #:random-token
            ;; ECDSA
            #:ecdsa-verify-p256
            ;; JWT

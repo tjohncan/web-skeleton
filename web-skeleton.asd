@@ -19,6 +19,8 @@
                                                            "src/algorithms/sha256"))
                (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
+               (:file "src/random" :depends-on ("src/package"
+                                                 "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/package"
                                                        "src/algorithms/hex"))
                (:file "src/server/connection" :depends-on ("src/package"

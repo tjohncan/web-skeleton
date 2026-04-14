@@ -349,6 +349,51 @@
            (signals-error-p (lambda () (hex-decode "zz"))) t)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Crypto random tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-random ()
+  (format t "~%Random~%")
+  ;; Length
+  (check "random-bytes: 32" (length (random-bytes 32)) 32)
+  (check "random-bytes: 16" (length (random-bytes 16)) 16)
+  (check "random-bytes: 1"  (length (random-bytes 1))  1)
+  ;; Element type
+  (check "random-bytes: element-type"
+         (array-element-type (random-bytes 16))
+         '(unsigned-byte 8))
+  ;; Distinctness — successive 32-byte calls must not match. A collision
+  ;; is 2^-256, effectively impossible; a match here means /dev/urandom
+  ;; is broken or we're reading the wrong thing.
+  (let ((a (random-bytes 32))
+        (b (random-bytes 32)))
+    (check "random-bytes: successive calls differ"
+           (equalp a b) nil))
+  ;; random-token: expected base64url length (unpadded)
+  ;; 32 bytes -> ceil(32*4/3) = 43 chars
+  ;; 16 bytes -> ceil(16*4/3) = 22 chars
+  (check "random-token: default length 43"
+         (length (random-token)) 43)
+  (check "random-token: :bytes 16 length 22"
+         (length (random-token :bytes 16)) 22)
+  ;; random-token output is pure base64url charset
+  (let ((token (random-token :bytes 64)))
+    (check "random-token: base64url charset"
+           (every (lambda (c)
+                    (or (char<= #\A c #\Z)
+                        (char<= #\a c #\z)
+                        (char<= #\0 c #\9)
+                        (char= c #\-)
+                        (char= c #\_)))
+                  token)
+           t))
+  ;; Distinctness
+  (let ((a (random-token))
+        (b (random-token)))
+    (check "random-token: successive calls differ"
+           (string= a b) nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -365,5 +410,6 @@
   (test-hmac-sha256)
   (test-constant-time-equal)
   (test-hex)
+  (test-random)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))

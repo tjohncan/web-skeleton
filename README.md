@@ -153,6 +153,9 @@ tests/
 - **SHA-256** — complete implementation per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
 - **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648)
+- **Crypto random** — `random-bytes` reads N bytes from `/dev/urandom`;
+  `random-token` returns a base64url-encoded token (default 32 bytes /
+  ~256 bits). For session IDs, CSRF tokens, nonces, PKCE verifiers
 - **ECDSA P-256** — signature verification per FIPS 186-4. Pure Lisp bignum
   arithmetic, verification only (no signing, no key generation)
 - **JWT validation** — ES256 token verification, JWKS key set parsing, claim
