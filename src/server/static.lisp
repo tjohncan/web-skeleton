@@ -115,16 +115,18 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun read-file-bytes (path)
-  "Read an entire file into a byte vector."
+  "Read an entire regular file into a byte vector.
+   READ-SEQUENCE on an SBCL binary file stream fills the buffer in
+   one call for regular files, and LOAD-STATIC-FILES only ever reads
+   regular files — special streams (pipes, devices) with partial
+   availability are out of scope for this helper. The SUBSEQ branch
+   handles the edge case where the file shrinks between FILE-LENGTH
+   and READ-SEQUENCE."
   (with-open-file (stream path :element-type '(unsigned-byte 8))
     (let* ((size (file-length stream))
-           (buf (make-array size :element-type '(unsigned-byte 8)))
-           (pos 0))
-      (loop (let ((n (read-sequence buf stream :start pos)))
-              (when (= n pos) (return))  ; no progress — EOF
-              (setf pos n)
-              (when (>= pos size) (return))))
-      (if (= pos size) buf (subseq buf 0 pos)))))
+           (buf  (make-array size :element-type '(unsigned-byte 8)))
+           (n    (read-sequence buf stream)))
+      (if (= n size) buf (subseq buf 0 n)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Directory scanning and cache loading
