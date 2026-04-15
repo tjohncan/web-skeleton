@@ -1184,21 +1184,24 @@
              (logior (ash (aref close-frame 2) 8) (aref close-frame 3))
              1006))
     ;; The clamping happens in websocket-on-read (requires a connection),
-    ;; but we verify the reserved-code logic directly:
-    (flet ((clamp-code (raw-code)
-             (if (or (< raw-code 1000)
-                     (member raw-code '(1004 1005 1006 1015))
-                     (and (>= raw-code 1016) (<= raw-code 2999)))
-                 1000
-                 raw-code)))
-      (check "close code 1004 clamped" (clamp-code 1004) 1000)
-      (check "close code 1005 clamped" (clamp-code 1005) 1000)
-      (check "close code 1006 clamped" (clamp-code 1006) 1000)
-      (check "close code 1015 clamped" (clamp-code 1015) 1000)
-      (check "close code 999 clamped"  (clamp-code 999) 1000)
-      (check "close code 1000 passes"  (clamp-code 1000) 1000)
-      (check "close code 1001 passes"  (clamp-code 1001) 1001)
-      (check "close code 3000 passes"  (clamp-code 3000) 3000))
+    ;; but we verify the reserved-code logic directly against the
+    ;; extracted helper — same function the server calls, no duplicate.
+    (check "close code 1004 clamped"
+           (web-skeleton::clamp-close-code 1004) 1000)
+    (check "close code 1005 clamped"
+           (web-skeleton::clamp-close-code 1005) 1000)
+    (check "close code 1006 clamped"
+           (web-skeleton::clamp-close-code 1006) 1000)
+    (check "close code 1015 clamped"
+           (web-skeleton::clamp-close-code 1015) 1000)
+    (check "close code 999 clamped"
+           (web-skeleton::clamp-close-code 999) 1000)
+    (check "close code 1000 passes"
+           (web-skeleton::clamp-close-code 1000) 1000)
+    (check "close code 1001 passes"
+           (web-skeleton::clamp-close-code 1001) 1001)
+    (check "close code 3000 passes"
+           (web-skeleton::clamp-close-code 3000) 3000)
 
     ;; Close frame with invalid UTF-8 reason — must fail with 1007
     ;; (RFC 6455 §5.5.1: reason text after the 2-byte code must be valid UTF-8)
@@ -1374,11 +1377,14 @@
 (defun test-jwt ()
   (format t "~%JWT~%")
 
-  ;; Use the RFC 7515 A.3 ES256 example to build a complete JWT test
+  ;; Use the RFC 7515 A.3 ES256 example to build a complete JWT test.
+  ;; Signature is the one the RFC actually publishes (high-S) — RFC
+  ;; 7515 / 7518 do not mandate low-S normalization and the ECDSA
+  ;; primitive now accepts both forms. Same vector as
+  ;; test-algorithms.lisp's test-ecdsa.
   (let* ((header-b64 "eyJhbGciOiJFUzI1NiJ9")
          (payload-b64 "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")
-         ;; Low-S normalized signature (original RFC 7515 A.3 has high-S)
-         (sig-b64 "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmU69fgrc8OPGycO0lD3tat_FoFp57SETepkeks4eL_QfA")
+         (sig-b64 "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
          (token (format nil "~a.~a.~a" header-b64 payload-b64 sig-b64))
          ;; Build a key set with the RFC 7515 A.3 public key
          (keys (list (make-jwt-key

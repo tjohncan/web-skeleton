@@ -34,6 +34,20 @@
          (digest (sha1 (sb-ext:string-to-octets combined :external-format :ascii))))
     (base64-encode digest)))
 
+(defun clamp-close-code (raw-code)
+  "Map a client-supplied WebSocket close code to the code we echo
+   back (RFC 6455 §7.4.1). Reserved codes 1004/1005/1006/1015 and
+   the private range 1016-2999 must not be echoed; anything below
+   1000 is invalid. Clamp those to 1000; pass everything else
+   through unchanged. Lifted out of WEBSOCKET-ON-READ so the
+   reserved-code logic has a single definition instead of one in
+   the server and a duplicate in the test suite."
+  (if (or (< raw-code 1000)
+          (member raw-code '(1004 1005 1006 1015))
+          (and (>= raw-code 1016) (<= raw-code 2999)))
+      1000
+      raw-code))
+
 (defun websocket-upgrade-p (request)
   "Check if REQUEST is a valid WebSocket upgrade request."
   (and (eq (http-request-method request) :GET)
@@ -403,12 +417,7 @@
                                    (values :close (build-ws-close 1002))))
                                 (t (logior (ash (aref payload 0) 8)
                                            (aref payload 1)))))
-                    ;; RFC 6455 §7.4.1: must not echo reserved codes
-                    (code (if (or (< raw-code 1000)
-                                  (member raw-code '(1004 1005 1006 1015))
-                                  (and (>= raw-code 1016) (<= raw-code 2999)))
-                              1000
-                              raw-code)))
+                    (code (clamp-close-code raw-code)))
                ;; RFC 6455 §5.5.1: close reason text must be valid UTF-8
                (when (> (length payload) 2)
                  (handler-case
