@@ -61,7 +61,6 @@
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
-
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
    Inactivity = no text or binary frames from the client (pongs don't count).")
@@ -141,8 +140,12 @@
    so teardown doesn't wait a full second per call. Float accepted —
    the worker converts to ms for epoll_wait.")
 
-(defparameter *max-events* 64
-  "Maximum events to process per epoll_wait call.")
+(defconstant +max-events+ 64
+  "Maximum events to process per epoll_wait call. Internal — not a
+   tunable. A larger batch increases worst-case latency for the
+   tail of the batch without meaningfully improving throughput; a
+   smaller batch adds syscall overhead. 64 is the historical sweet
+   spot that epoll-oriented servers have converged on.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; User-extensible cleanup hooks
@@ -344,7 +347,7 @@
         (log-warn "drain timeout — force-closing ~d connection~:p"
                   (hash-table-count *connections*))
         (return))
-      (let ((n (epoll-wait epoll-fd event-buf *max-events* 200)))
+      (let ((n (epoll-wait epoll-fd event-buf +max-events+ 200)))
         (loop for i from 0 below n
               do (let* ((fd (epoll-event-fd event-buf i))
                         (flags (epoll-event-flags event-buf i))
@@ -618,12 +621,12 @@
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd (socket-fd listener-socket))
         (last-ping-time (get-universal-time))
-        (event-buf (make-epoll-event-buf *max-events*)))
+        (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when *shutdown*
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
-      (let ((n (epoll-wait epoll-fd event-buf *max-events*
+      (let ((n (epoll-wait epoll-fd event-buf +max-events+
                            (round (* *shutdown-poll-interval* 1000)))))
         (loop for i from 0 below n
               do (block handle-event
@@ -703,8 +706,15 @@
           (log-info "worker ~d stopped" worker-id)
           (return))
       (error (e)
-        (log-error "worker ~d crashed: ~a — restarting in 1s" worker-id e)
-        (sleep 1)
+        (log-error "worker ~d crashed: ~a — restarting" worker-id e)
+        ;; 1-second backoff, sliced into *shutdown-poll-interval*
+        ;; chunks so a SIGTERM arriving during the backoff is noticed
+        ;; within one slice rather than after the full second.
+        (let ((until (+ (get-internal-real-time)
+                        internal-time-units-per-second)))
+          (loop until (or *shutdown*
+                          (>= (get-internal-real-time) until))
+                do (sleep *shutdown-poll-interval*)))
         (when *shutdown* (return))))))
 
 ;;; ---------------------------------------------------------------------------
