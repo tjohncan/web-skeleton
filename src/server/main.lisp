@@ -324,18 +324,25 @@
     (when (zerop count)
       (return-from drain-connections))
     (log-info "draining ~d connection~:p" count))
-  ;; Phase 1: initiate shutdown on each connection
-  (let ((to-close nil))
+  ;; Phase 1: initiate shutdown on each connection. Outbound
+  ;; connections and inbound connections that haven't completed a
+  ;; request are closed immediately. WebSocket connections get a
+  ;; 1001 close frame and are flipped to :closing so the event
+  ;; loop finishes flushing the close before tearing them down.
+  ;; Outbounds and inbounds are split into two lists so outbounds
+  ;; can be routed through close-outbound (which fires the fetch
+  ;; callback); close-connection on a direct outbound wouldn't
+  ;; because its :awaiting branch only handles paired-outbound
+  ;; teardown, not the outbound itself.
+  (let ((outbounds-to-close nil)
+        (inbounds-to-close nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
                (cond
-                 ;; Outbound connections — close immediately
                  ((connection-outbound-p conn)
-                  (push conn to-close))
-                 ;; HTTP connections still reading — nothing to drain
+                  (push conn outbounds-to-close))
                  ((member (connection-state conn) '(:read-http :read-body :awaiting))
-                  (push conn to-close))
-                 ;; WebSocket — send close frame (1001 = going away)
+                  (push conn inbounds-to-close))
                  ((eq (connection-state conn) :websocket)
                   (connection-queue-write conn (build-ws-close 1001))
                   (setf (connection-state conn) :closing)
@@ -344,7 +351,12 @@
                  ;; :write-response, :ws-upgrade, :closing — let them finish
                  (t nil)))
              *connections*)
-    (dolist (conn to-close)
+    ;; Close outbounds first so their fetch callbacks fire. Inbounds
+    ;; afterward — any that were in :awaiting find their paired
+    ;; outbound already gone and short-circuit cleanly.
+    (dolist (conn outbounds-to-close)
+      (close-outbound conn epoll-fd))
+    (dolist (conn inbounds-to-close)
       (close-connection conn epoll-fd)))
   ;; Phase 2: flush remaining writes until drained or timeout
   (let ((deadline (+ (get-universal-time) *drain-timeout*)))
@@ -709,14 +721,29 @@
                        (logior +epollin+ +epollet+))
             (unwind-protect
                 (run-event-loop listener epoll-fd handler ws-handler)
-              ;; Cleanup: reap any in-flight DNS subprocesses first so
-              ;; a worker crash doesn't leak zombie getent children,
-              ;; then close all connections, listener, epoll fd.
-              (maphash (lambda (fd conn)
-                         (declare (ignore fd))
-                         (maybe-reap-dns-process conn)
-                         (connection-close conn))
-                       *connections*)
+              ;; Cleanup on worker crash or normal exit. Split the
+              ;; table into outbounds and everything else — outbounds
+              ;; go through CLOSE-OUTBOUND so their fetch callbacks
+              ;; fire even when the worker dies with requests in
+              ;; flight, matching the contract that every fetch's
+              ;; :then closure runs exactly once. Non-outbounds get
+              ;; the raw CONNECTION-CLOSE; we can't deliver anything
+              ;; to their clients at this point and the epoll fd is
+              ;; about to be torn down anyway. The collect step
+              ;; avoids mutating the hash table during MAPHASH — we
+              ;; only call UNREGISTER-CONNECTION (via close-outbound)
+              ;; in the dolist after the walk.
+              (let ((outbounds nil))
+                (maphash (lambda (fd conn)
+                           (declare (ignore fd))
+                           (if (connection-outbound-p conn)
+                               (push conn outbounds)
+                               (progn
+                                 (maybe-reap-dns-process conn)
+                                 (connection-close conn))))
+                         *connections*)
+                (dolist (conn outbounds)
+                  (close-outbound conn epoll-fd)))
               (sb-bsd-sockets:socket-close listener)
               (%close epoll-fd)))
           ;; Normal exit (shutdown requested)
@@ -805,7 +832,12 @@
         ;; and cannot prevent START-SERVER from returning to its caller.
         (run-shutdown-hooks)
         (log-info "stopped")
-        ;; Hand the signals back to whoever had them before we started.
+        ;; Hand the signals back to whoever had them before we
+        ;; started. Each restore gets its own IGNORE-ERRORS — a
+        ;; single wrapper would short-circuit SIGPIPE if SIGTERM
+        ;; restore raised, leaking the framework's SIGPIPE handler
+        ;; into the host image.
         (ignore-errors
-         (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm)
+         (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))
+        (ignore-errors
          (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))))))
