@@ -64,6 +64,15 @@
           ;; Must be ES256
           (unless (string= alg "ES256")
             (return-from jwt-verify nil))
+          ;; Reject any token carrying a crit header parameter
+          ;; (RFC 7515 §4.1.11). crit lists extensions the recipient
+          ;; must understand and process; we implement none, so any
+          ;; non-empty crit is an instant reject. (A malformed empty
+          ;; crit array parses to NIL and slips past this check — it
+          ;; is spec-invalid but carries no extension claim, so the
+          ;; simpler test is enough for the security-critical case.)
+          (when (json-get header "crit")
+            (return-from jwt-verify nil))
           ;; Find matching key (reject kidless tokens when multiple keys exist)
           (let ((key (cond
                        (kid (find kid keys :key #'jwt-key-kid :test #'string=))
