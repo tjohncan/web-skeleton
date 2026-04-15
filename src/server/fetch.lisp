@@ -629,30 +629,76 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-outbound-event (conn epoll-fd flags)
-  "Handle an epoll event on an outbound connection."
+  "Handle an epoll event on an outbound connection.
+
+   Flag-dispatch order is deliberate: EPOLLIN is processed before
+   EPOLLERR / EPOLLHUP. Linux delivers (EPOLLIN | EPOLLHUP) together
+   when an upstream sends its final bytes and FINs in the same TCP
+   segment — a common shape for close-delimited and chunked
+   responses. The previous cond-first-match structure matched the
+   HUP arm first and returned 502 even though a complete response
+   was sitting in the kernel buffer. Now the read path runs first
+   (draining to :eof and calling complete-fetch), and the HUP arm
+   only fires as fatal if the connection is still alive after the
+   drain — meaning the response really was incomplete.
+
+   State-dispatch for the individual flag branches is permissive:
+   stale EPOLLIN for a connection whose state advanced to :out-write
+   earlier in the same batch, or stale EPOLLOUT for a connection
+   that moved to :out-read, silently no-op instead of raising into
+   the outer handler-case's 502 path."
   (handler-case
       (cond
         ;; DNS lookup: EPOLLIN or EPOLLHUP both mean drain-and-parse.
         ;; getent writes its output and then exits, which may surface
         ;; either as readable data (EPOLLIN) or as a pipe close hint
-        ;; (EPOLLHUP). The read path handles EOF cleanly either way —
-        ;; treating HUP as an error here would lose the final output.
+        ;; (EPOLLHUP). The read path handles EOF cleanly either way.
         ;; Dispatched via *HANDLE-DNS-READY-FN* so fetch.lisp has no
         ;; forward reference to dns.lisp.
         ((eq (connection-state conn) :out-dns)
          (funcall *handle-dns-ready-fn* conn epoll-fd))
-        ((or (logtest flags +epollerr+) (logtest flags +epollhup+))
-         (deliver-fetch-error conn epoll-fd "connection error"))
-        ((logtest flags +epollout+)
-         (ecase (connection-state conn)
-           (:out-connecting (handle-outbound-connect conn epoll-fd))
-           (:out-write      (handle-outbound-write conn epoll-fd))))
-        ((logtest flags +epollin+)
-         (ecase (connection-state conn)
-           (:out-read (handle-outbound-read conn epoll-fd)))))
+        (t
+         ;; 1. Drain readable bytes first so a batched IN+HUP sees
+         ;;    the bytes before the HUP is treated as fatal.
+         (when (logtest flags +epollin+)
+           (case (connection-state conn)
+             (:out-read (handle-outbound-read conn epoll-fd))
+             ;; Stale EPOLLIN in another state — ignore silently.
+             (otherwise nil)))
+         ;; 2. Handle writable. Gated on (lookup-connection ...) so
+         ;;    we skip if step 1 already completed and tore down
+         ;;    the out-conn.
+         (when (and (logtest flags +epollout+)
+                    (lookup-connection (connection-fd conn)))
+           (case (connection-state conn)
+             (:out-connecting (handle-outbound-connect conn epoll-fd))
+             (:out-write      (handle-outbound-write conn epoll-fd))
+             (otherwise nil)))
+         ;; 3. HUP/ERR after draining. If we still have a live
+         ;;    :out-read connection, give it one more shot at
+         ;;    completion — handle-outbound-read's nb-read will
+         ;;    see :eof on a HUP'd fd and route to complete-fetch.
+         ;;    If that still leaves the connection alive, the
+         ;;    response really is incomplete and we deliver 502.
+         (when (and (or (logtest flags +epollerr+)
+                        (logtest flags +epollhup+))
+                    (lookup-connection (connection-fd conn)))
+           (cond
+             ((eq (connection-state conn) :out-read)
+              (handle-outbound-read conn epoll-fd)
+              (when (lookup-connection (connection-fd conn))
+                (deliver-fetch-error conn epoll-fd
+                                     "connection error after partial read")))
+             (t
+              (deliver-fetch-error conn epoll-fd "connection error"))))))
     (error (e)
       (log-error "outbound error fd ~d: ~a" (connection-fd conn) e)
-      (deliver-fetch-error conn epoll-fd "outbound request failed"))))
+      ;; Skip the error-delivery if the connection was already torn
+      ;; down (e.g. complete-fetch ran earlier in this call and
+      ;; close-outbound unregistered the fd). Avoids double-delivery
+      ;; of a 502 on top of an already-queued real response.
+      (when (lookup-connection (connection-fd conn))
+        (deliver-fetch-error conn epoll-fd "outbound request failed")))))
 
 (defun handle-outbound-connect (conn epoll-fd)
   "Check if non-blocking connect succeeded, then start writing the request."
@@ -724,10 +770,24 @@
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).
-   Returns a byte vector with the chunk framing stripped."
+   Returns a byte vector with the chunk framing stripped.
+
+   Raises on truncation: the zero-size chunk header (0 CRLF) is the
+   only permitted exit. A response that runs out of bytes before
+   the terminator (MITM RST, short read, upstream crash mid-body)
+   is reported as an error so the caller's outer handler-case can
+   convert it into a 502 or fire the fetch cleanup callback — the
+   same discipline as the Content-Length truncation guard in
+   COMPLETE-FETCH and HTTPS-FETCH, applied to the chunked path
+   which has no Content-Length to compare against.
+
+   Also requires strict CRLF after both chunk-size and chunk-data
+   per RFC 7230 §4.1. Lax trailing CRLF is a smuggling primitive
+   against a strict downstream that re-parses the body bytes."
   (let ((out (make-array (- end start) :element-type '(unsigned-byte 8)
                                         :fill-pointer 0))
-        (pos start))
+        (pos start)
+        (terminated nil))
     (loop
       ;; Parse chunk size (hex digits)
       (let ((size 0)
@@ -740,7 +800,12 @@
                                     found t)
                               (incf pos))
                        (return))))
-        (unless found (return))
+        (unless found
+          ;; Ran out of bytes before seeing a chunk-size header.
+          ;; Either the upstream closed mid-stream (truncation) or
+          ;; the response never included the 0-chunk terminator.
+          ;; Both are incomplete.
+          (return))
         ;; Require strict CRLF after the chunk-size (RFC 7230 §4.1).
         ;; Any chunk extensions between the hex digits and CRLF are
         ;; passed through untouched — we scan for the LF and verify
@@ -754,16 +819,31 @@
                        (= (aref buf (1- eol)) 13))
             (error "chunked: expected CRLF after chunk-size"))
           (setf pos (1+ eol)))
-        ;; Zero-size chunk = end
-        (when (zerop size) (return))
-        ;; Copy chunk data
-        (let ((chunk-end (min (+ pos size) end)))
-          (loop for i from pos below chunk-end
-                do (vector-push-extend (aref buf i) out))
-          (setf pos chunk-end))
-        ;; Skip trailing CRLF after chunk data
-        (when (and (< pos end) (= (aref buf pos) 13)) (incf pos))
-        (when (and (< pos end) (= (aref buf pos) 10)) (incf pos))))
+        ;; Zero-size chunk = end (the only clean exit from this loop).
+        (when (zerop size)
+          (setf terminated t)
+          (return))
+        ;; Copy chunk data. Short-read here is truncation: we declared
+        ;; SIZE bytes and need exactly that many.
+        (when (> (+ pos size) end)
+          (error "chunked: short chunk-data (~d of ~d bytes)"
+                 (- end pos) size))
+        (loop for i from pos below (+ pos size)
+              do (vector-push-extend (aref buf i) out))
+        (incf pos size)
+        ;; Require strict CRLF after chunk-data (RFC 7230 §4.1).
+        ;; The lax \r-or-\n-or-nothing accept-anything behaviour was
+        ;; a smuggling primitive: a response shaped 5\r\nhellonext...
+        ;; (no CRLF between the data and the next chunk-size) would
+        ;; be decoded differently by web-skeleton and a strict
+        ;; downstream that re-parsed the body bytes.
+        (unless (and (<= (+ pos 2) end)
+                     (= (aref buf pos) 13)
+                     (= (aref buf (1+ pos)) 10))
+          (error "chunked: expected CRLF after chunk-data"))
+        (incf pos 2)))
+    (unless terminated
+      (error "chunked: incomplete response (no zero-size terminator)"))
     (subseq out 0 (fill-pointer out))))
 
 ;;; ---------------------------------------------------------------------------

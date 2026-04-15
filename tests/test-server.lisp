@@ -1172,6 +1172,45 @@
          (decoded (web-skeleton::decode-chunked-body raw 0 (length raw))))
     (check "chunked decode empty" (length decoded) 0))
 
+  ;; Truncation — no zero-size terminator (MITM RST mid-stream).
+  ;; The old decoder silently returned the partial body; now raise.
+  (let ((raw (ascii-bytes (concatenate 'string
+                "5" (string #\Return) (string #\Newline)
+                "hello" (string #\Return) (string #\Newline)))))
+    (check-error "chunked truncation: no terminator"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
+  ;; Truncation — chunk-size header read but data short.
+  (let ((raw (ascii-bytes (concatenate 'string
+                "a" (string #\Return) (string #\Newline)
+                "hel"))))
+    (check-error "chunked truncation: short chunk-data"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
+  ;; Truncation — ran out mid-chunk-size line.
+  (let ((raw (ascii-bytes "5")))
+    (check-error "chunked truncation: partial chunk-size"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
+  ;; Lax trailing CRLF after chunk-data — bare LF (missing CR) was
+  ;; previously accepted; now rejected to close a smuggling primitive.
+  (let ((raw (ascii-bytes (concatenate 'string
+                "5" (string #\Return) (string #\Newline)
+                "hello" (string #\Newline)                 ; bare LF
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)))))
+    (check-error "chunked trailing: bare LF rejected"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
+  ;; Lax trailing CRLF — bare CR (missing LF) previously accepted.
+  (let ((raw (ascii-bytes (concatenate 'string
+                "5" (string #\Return) (string #\Newline)
+                "hello" (string #\Return)                  ; bare CR
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)))))
+    (check-error "chunked trailing: bare CR rejected"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
   ;; response-chunked-p helper
   (check "chunked-p yes"
          (not (null (web-skeleton::response-chunked-p
