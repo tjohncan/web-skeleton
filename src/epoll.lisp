@@ -256,9 +256,14 @@
 
 (defun set-socket-timeout (fd seconds)
   "Set SO_RCVTIMEO and SO_SNDTIMEO on FD.
-   SECONDS is an integer. Uses struct timeval (16 bytes on x86-64)."
+   SECONDS is an integer. Uses struct timeval (16 bytes on x86-64:
+   8-byte tv_sec followed by 8-byte tv_usec, both LE). We write the
+   low 32 bits of tv_sec and leave the upper 32 bits and tv_usec at
+   zero from :initial-element 0 — correct for any sane timeout since
+   SECONDS < 2^32 means 136 years. BE careful not to read the comment
+   above the pack-le-u32 call as 'writes 8 bytes' — it is stating the
+   struct layout, not the call's width."
   (let ((buf (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
-    ;; struct timeval: tv_sec (8 bytes LE) + tv_usec (8 bytes LE)
     (pack-le-u32 buf 0 seconds)
     (sb-sys:with-pinned-objects (buf)
       (let ((result (%setsockopt fd +sol-socket+ +so-rcvtimeo+
@@ -311,7 +316,9 @@
 
 (defun poll-writable (fd timeout-ms)
   "Block until FD is writable or TIMEOUT-MS elapses.
-   Returns T if writable, NIL on timeout."
+   Returns T if writable, NIL on timeout or EINTR. Other poll(2)
+   errors (EBADF/EINVAL/EFAULT/ENOMEM) raise — silently masking them
+   as timeouts would turn programming mistakes into mysterious hangs."
   ;; struct pollfd: int fd (4) + short events (2) + short revents (2) = 8 bytes
   (let ((buf (or *poll-buf*
                  (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))))
@@ -320,7 +327,13 @@
           (aref buf 5) (logand (ash +pollout+ -8) #xFF))
     (sb-sys:with-pinned-objects (buf)
       (let ((n (%poll (sb-sys:vector-sap buf) 1 timeout-ms)))
-        (> n 0)))))
+        (cond
+          ((> n 0) t)
+          ((zerop n) nil)                         ; timeout
+          (t (let ((err (get-errno)))
+               (if (= err +eintr+)
+                   nil                            ; spurious wake-up
+                   (error "poll failed: ~a" (errno-string err))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-blocking read/write
