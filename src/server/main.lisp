@@ -288,22 +288,22 @@
 
 (defun close-connection (conn epoll-fd)
   "Remove from epoll, unregister, close fd.
-   If CONN is :awaiting, also closes its outbound connection to prevent
-   use-after-close on fd reuse. MAYBE-REAP-DNS-PROCESS runs on every
-   cleaned-up connection so a half-finished DNS lookup never leaks."
+   If CONN is :awaiting, also closes its outbound connection via
+   CLOSE-OUTBOUND — which fires the app's fetch cleanup callback if
+   the outbound was still carrying one, so DB handles / metrics /
+   rate-limit counters get a defined moment to run their teardown
+   even on inbound-driven aborts (drain, idle timeout, I/O error).
+   MAYBE-REAP-DNS-PROCESS runs on every cleaned-up connection so a
+   half-finished DNS lookup never leaks."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
-      ;; If parked waiting for a fetch, close the orphaned outbound too
+      ;; If parked waiting for a fetch, close the orphaned outbound too.
       (when (eq (connection-state conn) :awaiting)
         (let ((out-fd (connection-awaiting-fd conn)))
           (when (>= out-fd 0)
             (let ((out-conn (lookup-connection out-fd)))
               (when out-conn
-                (ignore-errors (epoll-remove epoll-fd out-fd))
-                (unregister-connection out-conn)
-                (maybe-reap-dns-process out-conn)
-                (connection-close out-conn)
-                (log-debug "closed orphaned outbound fd ~d" out-fd))))))
+                (close-outbound out-conn epoll-fd))))))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)

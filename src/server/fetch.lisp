@@ -766,52 +766,69 @@
          ;; (RFC 7230 §3.3.3: TE takes precedence over CL)
          (chunked-p (response-chunked-p headers))
          (content-length (when (and header-end (not chunked-p))
-                           (scan-content-length buf header-end)))
-         (body-end (if (and body-start content-length)
-                       (min pos (+ body-start content-length))
-                       pos))
-         (raw-body (when (and body-start (> body-end body-start))
-                     (subseq buf body-start body-end)))
-         (body (if (and raw-body chunked-p)
-                   (decode-chunked-body raw-body 0 (length raw-body))
-                   raw-body))
-         ;; Call the user's callback
-         (callback (connection-fetch-callback out-conn))
-         (inbound-fd (connection-inbound-fd out-conn)))
-    ;; Clean up outbound connection
-    (close-outbound out-conn epoll-fd)
-    ;; Find and resume inbound connection
-    (let ((inbound (lookup-connection inbound-fd)))
-      (when inbound
-        (handler-case
-            (let ((response (funcall callback
-                                     (or status 0) (or headers nil)
-                                     (or body nil))))
-              ;; Queue the response on the inbound connection
-              (let ((bytes (cond
-                             ((typep response '(simple-array (unsigned-byte 8) (*)))
-                              response)
-                             ((typep response 'http-fetch-continuation)
-                              ;; Chained fetch — initiate another outbound call
-                              (initiate-fetch inbound epoll-fd response)
-                              (return-from complete-fetch))
-                             (t (format-response response)))))
-                (connection-queue-write inbound bytes)
+                           (scan-content-length buf header-end))))
+    ;; Truncation guard: if the upstream declared a Content-Length
+    ;; and we hit EOF before receiving that many body bytes, the
+    ;; response is incomplete. Passing the partial body to the
+    ;; callback would silently deliver truncated data to the app —
+    ;; an especially ugly failure for MITM'd HTTPS fetches where
+    ;; the attacker can RST at any point. Abort through
+    ;; deliver-fetch-error so the callback fires its cleanup path
+    ;; and the inbound gets a 502 instead of a short body.
+    (when (and content-length body-start
+               (< (- pos body-start) content-length))
+      (deliver-fetch-error out-conn epoll-fd
+                           (format nil "short body: ~d of ~d bytes"
+                                   (- pos body-start) content-length))
+      (return-from complete-fetch))
+    (let* ((body-end (if (and body-start content-length)
+                         (min pos (+ body-start content-length))
+                         pos))
+           (raw-body (when (and body-start (> body-end body-start))
+                       (subseq buf body-start body-end)))
+           (body (if (and raw-body chunked-p)
+                     (decode-chunked-body raw-body 0 (length raw-body))
+                     raw-body))
+           ;; Call the user's callback.
+           (callback (connection-fetch-callback out-conn))
+           (inbound-fd (connection-inbound-fd out-conn)))
+      ;; Clear the slot so close-outbound's cleanup-firing path does
+      ;; not re-invoke the callback on the happy path. We already
+      ;; captured the actual callback into the CALLBACK local above.
+      (setf (connection-fetch-callback out-conn) nil)
+      (close-outbound out-conn epoll-fd)
+      ;; Find and resume inbound connection
+      (let ((inbound (lookup-connection inbound-fd)))
+        (when inbound
+          (handler-case
+              (let ((response (funcall callback
+                                       (or status 0) (or headers nil)
+                                       (or body nil))))
+                ;; Queue the response on the inbound connection
+                (let ((bytes (cond
+                               ((typep response '(simple-array (unsigned-byte 8) (*)))
+                                response)
+                               ((typep response 'http-fetch-continuation)
+                                ;; Chained fetch — initiate another outbound call
+                                (initiate-fetch inbound epoll-fd response)
+                                (return-from complete-fetch))
+                               (t (format-response response)))))
+                  (connection-queue-write inbound bytes)
+                  (setf (connection-state inbound) :write-response
+                        (connection-awaiting-fd inbound) -1
+                        (connection-last-active inbound) (get-universal-time))
+                  (epoll-modify epoll-fd (connection-fd inbound)
+                                (logior +epollout+ +epollet+))
+                  (log-debug "fetch: resumed fd ~d" inbound-fd)))
+            (error (e)
+              (log-error "fetch callback error: ~a" e)
+              (let ((err-bytes (format-response (make-error-response 500))))
+                (connection-queue-write inbound err-bytes)
                 (setf (connection-state inbound) :write-response
                       (connection-awaiting-fd inbound) -1
                       (connection-last-active inbound) (get-universal-time))
                 (epoll-modify epoll-fd (connection-fd inbound)
-                             (logior +epollout+ +epollet+))
-                (log-debug "fetch: resumed fd ~d" inbound-fd)))
-          (error (e)
-            (log-error "fetch callback error: ~a" e)
-            (let ((err-bytes (format-response (make-error-response 500))))
-              (connection-queue-write inbound err-bytes)
-              (setf (connection-state inbound) :write-response
-                    (connection-awaiting-fd inbound) -1
-                    (connection-last-active inbound) (get-universal-time))
-              (epoll-modify epoll-fd (connection-fd inbound)
-                           (logior +epollout+ +epollet+)))))))))
+                              (logior +epollout+ +epollet+))))))))))
 
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."
@@ -831,9 +848,24 @@
 (defun close-outbound (conn epoll-fd)
   "Close and unregister an outbound connection. Reaps any attached
    getent DNS subprocess via MAYBE-REAP-DNS-PROCESS — a no-op for
-   TCP outbound connections that never had a DNS phase."
+   TCP outbound connections that never had a DNS phase.
+
+   If CONN still carries a :FETCH-CALLBACK, fire it once with
+   (NIL NIL NIL) before teardown so application-level cleanup
+   (releasing DB handles, closing metric spans, decrementing
+   circuit breakers, returning rate-limit budget) runs exactly
+   once per fetch. COMPLETE-FETCH clears the slot before calling
+   close-outbound so the happy path does not double-fire. The
+   callback is wrapped in HANDLER-CASE: a raising cleanup hook
+   is logged at warn level and must not block teardown."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
+      (let ((callback (connection-fetch-callback conn)))
+        (when callback
+          (setf (connection-fetch-callback conn) nil)
+          (handler-case (funcall callback nil nil nil)
+            (error (e)
+              (log-warn "fetch cleanup callback raised: ~a" e)))))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
