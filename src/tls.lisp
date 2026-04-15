@@ -151,14 +151,12 @@
         (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
           (error "SSL_CTX_new failed"))
         ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
-        ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION
-        ;; — the return used to be discarded, so a silent failure on
-        ;; OpenSSL 1.1.1 (still shipped by long-tail LTS distros) would
-        ;; leave the default floor, which on 1.1.1 is TLS 1.0. We'd
-        ;; then happily negotiate 1.0 against a misconfigured peer.
-        ;; OpenSSL 3.0's default security level already forbids 1.0/1.1
-        ;; so this only matters on long-tail targets, but the extra
-        ;; loudness is free.
+        ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION.
+        ;; A silent failure on OpenSSL 1.1.1 (still shipped by long-tail
+        ;; LTS distros, where the default floor is TLS 1.0) would leave
+        ;; the client willing to negotiate 1.0 against a misconfigured
+        ;; peer; OpenSSL 3.0's default security level already forbids
+        ;; 1.0/1.1 so this check is redundant there but free to keep.
         (unless (= 1 (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
                                 +tls1-2-version+ (sb-sys:int-sap 0)))
           (error "SSL_CTX set min proto version failed"))
@@ -254,7 +252,7 @@
    callback's cleanup sentinel.
 
    SSL_ERROR_SYSCALL conflates at least four distinct conditions
-   and the pre-pack-16 shape treated all of them as clean EOF:
+   and must NOT be treated uniformly as clean EOF:
      errno = 0                 — unexpected EOF with no close_notify.
                                  Benign for HTTP/1.0-style legacy
                                  servers that drop the TCP connection
@@ -358,51 +356,63 @@
                                      :headers (http-fetch-continuation-headers fetch-req)
                                      :body (http-fetch-continuation-body fetch-req))))
                   (tls-write-all ssl request-bytes))
-                ;; Read the complete response
+                ;; Read the complete response. The parsing discipline
+                ;; here mirrors COMPLETE-FETCH on the plain path:
+                ;; header-end and status must both be present before
+                ;; the callback fires the happy-path branch, otherwise
+                ;; we raise and let the outer handler-case convert to
+                ;; 502 + cleanup sentinel. A 'status = 0' happy-path
+                ;; callback is a DEPLOYMENT.md contract violation —
+                ;; apps pattern-matching on (if status ...) treat the
+                ;; integer 0 as truthy and blow up interpreting it as
+                ;; an HTTP status.
                 (let* ((response-buf (tls-read-all ssl))
                        (buf-len (length response-buf))
-                       (header-end (scan-crlf-crlf response-buf 0 buf-len))
-                       (status (when header-end
-                                 (parse-response-status response-buf 0 buf-len)))
-                       (headers (when header-end
-                                  (let ((first-crlf (scan-crlf response-buf 0
-                                                               header-end)))
-                                    (when first-crlf
-                                      (parse-headers-bytes response-buf
-                                                           (+ first-crlf 2)
-                                                           (+ header-end 4))))))
-                       (body-start (when header-end (+ header-end 4)))
-                       ;; RFC 7230 §3.3.3: TE takes precedence over CL
-                       (chunked-p (response-chunked-p headers))
-                       (content-length (when (and header-end (not chunked-p))
-                                         (scan-content-length response-buf header-end))))
-                  ;; Truncation guard: an upstream that declares a
-                  ;; Content-Length and then closes short must not be
-                  ;; allowed to hand us a silently-truncated body. The
-                  ;; MITM case is the nasty one — attacker RSTs
-                  ;; mid-stream and the app receives short data with no
-                  ;; indication. Signal an error so the outer
-                  ;; handler-case converts it into a 502 and fires
-                  ;; the cleanup sentinel.
-                  (when (and content-length body-start
-                             (< (- buf-len body-start) content-length))
-                    (error "https: short body (~d of ~d bytes)"
-                           (- buf-len body-start) content-length))
-                  (let* ((body-end (if (and body-start content-length)
-                                       (min buf-len (+ body-start content-length))
-                                       buf-len))
-                         (raw-body (when (and body-start (> body-end body-start))
-                                     (subseq response-buf body-start body-end)))
-                         (body (if (and raw-body chunked-p)
-                                   (decode-chunked-body raw-body 0 (length raw-body))
-                                   raw-body)))
+                       (header-end (scan-crlf-crlf response-buf 0 buf-len)))
+                  (unless header-end
+                    (error "https: upstream response has no parseable headers"))
+                  (let* ((status (parse-response-status response-buf 0 buf-len))
+                         (headers
+                          (let ((first-crlf (scan-crlf response-buf 0 header-end)))
+                            (when first-crlf
+                              (parse-headers-bytes response-buf
+                                                   (+ first-crlf 2)
+                                                   (+ header-end 4)))))
+                         (body-start (+ header-end 4))
+                         ;; RFC 7230 §3.3.3: TE takes precedence over CL
+                         (chunked-p (response-chunked-p headers))
+                         (content-length (unless chunked-p
+                                           (scan-content-length response-buf
+                                                                header-end))))
+                    (unless status
+                      (error "https: upstream status line unparseable"))
+                    ;; Truncation guard: an upstream that declares a
+                    ;; Content-Length and then closes short must not be
+                    ;; allowed to hand us a silently-truncated body. The
+                    ;; MITM case is the nasty one — attacker RSTs
+                    ;; mid-stream and the app receives short data with no
+                    ;; indication. Signal an error so the outer
+                    ;; handler-case converts it into a 502 and fires
+                    ;; the cleanup sentinel.
+                    (when (and content-length
+                               (< (- buf-len body-start) content-length))
+                      (error "https: short body (~d of ~d bytes)"
+                             (- buf-len body-start) content-length))
+                    (let* ((body-end (if content-length
+                                         (min buf-len (+ body-start content-length))
+                                         buf-len))
+                           (raw-body (when (> body-end body-start)
+                                       (subseq response-buf body-start body-end)))
+                           (body (if (and raw-body chunked-p)
+                                     (decode-chunked-body raw-body 0 (length raw-body))
+                                     raw-body)))
                     ;; Mark the callback as fired before the funcall so
                     ;; that a raising user callback doesn't get invoked
                     ;; a second time with nil sentinels in the outer
                     ;; handler-case's cleanup branch.
                     (setf callback-fired t)
                     (let ((response (funcall callback
-                                             (or status 0) (or headers nil)
+                                             status (or headers nil)
                                              (or body nil))))
                       ;; Deliver to inbound connection
                       (let ((bytes (cond
@@ -419,7 +429,7 @@
                         (epoll-modify epoll-fd (connection-fd conn)
                                       (logior +epollout+ +epollet+))
                         (log-debug "fetch: https ~a:~d~a -> fd ~d"
-                                   host port path (connection-fd conn)))))))
+                                   host port path (connection-fd conn))))))))
             (tls-close ssl socket)))
       (error (e)
         (log-error "https fetch failed: ~a" e)
@@ -456,12 +466,31 @@
 
 (defun tls-stream-response (ssl on-line)
   "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
-   Handles chunked transfer encoding. Returns the status code."
+   Handles chunked transfer encoding. Returns the status code.
+
+   Truncation discipline on the TLS streaming path (twin of the
+   plain-path STREAM-RESPONSE-LINES):
+     - chunked: TERMINATED is set when the zero-size chunk header
+       arrives. The post-loop check raises if the outer loop exited
+       without seeing it (mid-body close, MITM RST, zero-byte SSL
+       read classified as benign :eof by ssl-read-eof-or-raise).
+     - content-length (no TE): BODY-CONSUMED counts body bytes as
+       they are processed, and the post-loop check raises if the
+       count is short of the declared length. The SSL-layer
+       classifier treats an errno=0 close as benign :eof, so the
+       CL comparison is the only thing standing between a MITM
+       mid-body close on a CL-framed HTTPS stream and the app
+       receiving a silently truncated response.
+     - close-delimited (no TE, no CL): the connection close IS
+       the framing signal; clean EOF is treated as complete."
   (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)))
         (line-buf (make-array 4096 :element-type '(unsigned-byte 8)
                                    :fill-pointer 0 :adjustable t))
         (status nil)
         (chunked nil)
+        (content-length nil)
+        (body-consumed 0)
+        (terminated nil)
         (in-headers t)
         (first-line t)
         ;; Chunked state
@@ -482,6 +511,9 @@
                (setf (fill-pointer line-buf) 0)
                (when on-line (funcall on-line line)))))
       (loop
+        (when terminated (return))
+        (when (and content-length (>= body-consumed content-length))
+          (return))
         (sb-sys:with-pinned-objects (buf)
           (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
             (cond
@@ -528,7 +560,26 @@
                                         (let ((value (string-trim '(#\Space #\Tab)
                                                                    (subseq line 18))))
                                           (when (connection-header-has-token-p value "chunked")
-                                            (setf chunked t))))))))
+                                            (setf chunked t))))
+                                      ;; Capture Content-Length for
+                                      ;; the non-chunked truncation
+                                      ;; check. Strict digits-only
+                                      ;; parse — same discipline as
+                                      ;; SCAN-CONTENT-LENGTH on the
+                                      ;; inbound side so a malformed
+                                      ;; value does not silently
+                                      ;; disable the check.
+                                      (when (and (>= (length line) 15)
+                                                 (string-equal line "content-length:"
+                                                               :end1 15))
+                                        (let ((value (string-trim '(#\Space #\Tab)
+                                                                   (subseq line 15))))
+                                          (when (and (> (length value) 0)
+                                                     (every (lambda (c)
+                                                              (char<= #\0 c #\9))
+                                                            value))
+                                            (setf content-length
+                                                  (parse-integer value)))))))))
                              ((= byte 13) nil)
                              (t (vector-push-extend byte line-buf))))
                           ;; Chunked body — reading chunk size (separate
@@ -551,7 +602,16 @@
                                              (fill-pointer chunk-size-buf))))
                                   (setf (fill-pointer chunk-size-buf) 0)
                                   (cond
-                                    ((zerop size) (return))  ; final chunk
+                                    ((zerop size)
+                                     ;; Final chunk — mark terminated
+                                     ;; so the outer loop's guard
+                                     ;; exits cleanly. The post-loop
+                                     ;; check then passes, and a
+                                     ;; stream that closed mid-body
+                                     ;; without reaching this point
+                                     ;; will raise.
+                                     (setf terminated t)
+                                     (return))
                                     (t (setf chunk-remaining size
                                              in-chunk-size nil))))))
                              ((= byte 13) nil)
@@ -566,12 +626,36 @@
                                (t (vector-push-extend byte line-buf))))
                            (when (zerop chunk-remaining)
                              (setf in-chunk-size t)))
-                          ;; Non-chunked body
+                          ;; Non-chunked body. BODY-CONSUMED tracks
+                          ;; every byte that flows through the body
+                          ;; cond, so the post-loop CL check can
+                          ;; compare against declared length. For
+                          ;; close-delimited responses (no CL set),
+                          ;; the count is still maintained but never
+                          ;; compared.
                           (t
+                           (incf body-consumed)
                            (cond
                              ((= byte 10) (emit-body-line))
                              ((= byte 13) nil)
-                             (t (vector-push-extend byte line-buf))))))))))))
+                             (t (vector-push-extend byte line-buf)))
+                           (when (and content-length
+                                      (>= body-consumed content-length))
+                             ;; Hit declared length — stop processing
+                             ;; and let the outer loop exit via its
+                             ;; pre-read guard so any trailing bytes
+                             ;; in the current buffer are discarded.
+                             (return)))))))))))
+    ;; Post-loop truncation checks. Raise loud on either framing
+    ;; shape that came up short — the outer UNWIND-PROTECT in
+    ;; HTTPS-FETCH-STREAM closes the TLS session and the error
+    ;; propagates to the app so a silently-truncated NDJSON / SSE
+    ;; stream is no longer presented as 'success with short body'.
+    (when (and chunked (not terminated))
+      (error "https streaming: chunked response missing zero-size terminator"))
+    (when (and content-length (< body-consumed content-length))
+      (error "https streaming: short body (~d of ~d bytes)"
+             body-consumed content-length))
     ;; Flush any remaining unterminated line
     (when (> (fill-pointer line-buf) 0)
       (when on-line
@@ -773,11 +857,11 @@
    internally, so those checks are not duplicated here. Both (r, s)
    and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S."
   ;; Length-gate like the pure-Lisp path. DER-ENCODE-ECDSA-SIGNATURE
-  ;; reads bytes 0..63 from sig-bytes unconditionally, so an 80-byte
-  ;; sig would have been silently truncated to the first 64 rather
-  ;; than rejected. Match the behavior of the Lisp implementation
-  ;; exactly: anything other than 64 bytes fails verification before
-  ;; we touch the DER builder or libssl.
+  ;; reads bytes 0..63 from sig-bytes unconditionally, so anything
+  ;; other than a 64-byte input must be rejected here before the
+  ;; DER builder sees it — otherwise an 80-byte signature would be
+  ;; silently truncated to the first 64 bytes and verified against
+  ;; whatever that prefix happened to decode to.
   (unless (= (length sig-bytes) 64)
     (return-from ecdsa-verify-p256-libssl nil))
   (let ((spki (build-p256-spki pubkey-x pubkey-y))
