@@ -157,6 +157,15 @@
    through the function cell, and an inlined caller would bypass the
    cell and keep calling whichever implementation was visible at
    compile time."
+  ;; Length-gate the signature before indexing into it. The earlier
+  ;; shape silently used (subseq sig-bytes 0 32) / (subseq sig-bytes 32 64)
+  ;; and would have accepted a 65-byte signature with one garbage
+  ;; byte appended — the trailing byte would vanish without a peep.
+  ;; ES256 signatures are fixed-width r||s = 64 bytes; anything else
+  ;; is malformed, not merely 'contains the bytes we wanted plus
+  ;; some'.
+  (unless (= (length sig-bytes) 64)
+    (return-from ecdsa-verify-p256-lisp nil))
   (let ((r (bytes-to-integer (subseq sig-bytes 0 32)))
         (s (bytes-to-integer (subseq sig-bytes 32 64)))
         (qx (bytes-to-integer pubkey-x))

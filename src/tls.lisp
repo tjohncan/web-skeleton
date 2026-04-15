@@ -700,6 +700,14 @@
    OpenSSL handles r/s range and invalid-curve point rejection
    internally, so those checks are not duplicated here. Both (r, s)
    and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S."
+  ;; Length-gate like the pure-Lisp path. DER-ENCODE-ECDSA-SIGNATURE
+  ;; reads bytes 0..63 from sig-bytes unconditionally, so an 80-byte
+  ;; sig would have been silently truncated to the first 64 rather
+  ;; than rejected. Match the behavior of the Lisp implementation
+  ;; exactly: anything other than 64 bytes fails verification before
+  ;; we touch the DER builder or libssl.
+  (unless (= (length sig-bytes) 64)
+    (return-from ecdsa-verify-p256-libssl nil))
   (let ((spki (build-p256-spki pubkey-x pubkey-y))
         (sig-der (der-encode-ecdsa-signature sig-bytes))
         (pkey nil)

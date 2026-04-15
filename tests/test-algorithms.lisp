@@ -211,6 +211,26 @@
       (setf (aref bad-sig 10) (logxor (aref bad-sig 10) #xFF))
       (check "tampered signature rejects"
              (ecdsa-verify-p256 hash bad-sig x y)
+             nil))
+
+    ;; Wrong-length signature rejects. ES256 is fixed-width r||s
+    ;; (64 bytes). Both paths used to take (subseq sig 0 32) and
+    ;; (subseq sig 32 64) unconditionally, so a 65-byte signature
+    ;; passed through with the trailing garbage silently dropped
+    ;; and a 63-byte signature crashed with a subseq error instead
+    ;; of returning NIL. Both shapes must now be explicit rejects.
+    (let ((too-long (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  sig #(0))))
+      (check "oversized signature rejects"
+             (ecdsa-verify-p256 hash too-long x y)
+             nil))
+    (let ((too-short (subseq sig 0 63)))
+      (check "undersized signature rejects"
+             (ecdsa-verify-p256 hash too-short x y)
+             nil))
+    (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+      (check "empty signature rejects"
+             (ecdsa-verify-p256 hash empty x y)
              nil)))
 
   ;; Generator point self-test: n*G should be the point at infinity
