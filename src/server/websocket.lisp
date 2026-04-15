@@ -334,15 +334,28 @@
                    (when ws-handler
                      (let ((response (funcall ws-handler conn frame)))
                        (when response (push response responses)))))
-                 ;; First fragment — start accumulating
-                 (progn
-                   (setf (connection-ws-frag-opcode conn) opcode
-                         (connection-ws-frag-buf conn)
-                         (list (ws-frame-payload frame))
-                         (connection-ws-frag-total conn)
-                         (length (ws-frame-payload frame)))
-                   (log-debug "ws frag start opcode ~d fd ~d"
-                              opcode (connection-fd conn)))))
+                 ;; First fragment — start accumulating. Enforce the
+                 ;; message-size cap on the starting size too, not
+                 ;; only on continuation accumulation, so apps that
+                 ;; configure *max-ws-payload-size* higher than
+                 ;; *max-ws-message-size* cannot slip a giant first
+                 ;; fragment past the running-total check.
+                 (let ((len (length (ws-frame-payload frame))))
+                   (if (> len *max-ws-message-size*)
+                       (progn
+                         (log-warn "ws fragmented message too large ~
+                                    on first fragment (~d bytes) fd ~d"
+                                   len (connection-fd conn))
+                         (ws-shift-buffer conn buf pos end)
+                         (return-from websocket-on-read
+                           (values :close (build-ws-close 1009))))
+                       (progn
+                         (setf (connection-ws-frag-opcode conn) opcode
+                               (connection-ws-frag-buf conn)
+                               (list (ws-frame-payload frame))
+                               (connection-ws-frag-total conn) len)
+                         (log-debug "ws frag start opcode ~d fd ~d"
+                                    opcode (connection-fd conn)))))))
             ;; Continuation frame
             ((= opcode +ws-op-continuation+)
              (unless (connection-ws-frag-buf conn)
