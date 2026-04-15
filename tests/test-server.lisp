@@ -74,13 +74,18 @@
   (let ((req (parse-request (crlf "GET / HTTP/1.1" "Host: localhost"))))
     (check "cookie no header" (get-cookie req "session") nil))
 
-  ;; All methods
-  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH" "TRACE"))
+  ;; All methods (TRACE is deliberately rejected — see parser test below)
+  (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH"))
     (let ((req (parse-request (crlf (format nil "~a / HTTP/1.1" method)
                                     "Host: localhost"))))
       (check (format nil "method ~a" method)
              (http-request-method req)
-             (intern method :keyword)))))
+             (intern method :keyword))))
+
+  ;; TRACE is rejected at the parser layer (XST defense). Framework
+  ;; handlers never see it.
+  (check-error "TRACE rejected"
+               (parse-request (crlf "TRACE / HTTP/1.1" "Host: localhost"))))
 
 (defun test-http-date ()
   (format t "~%HTTP Date~%")

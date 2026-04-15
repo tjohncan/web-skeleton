@@ -349,7 +349,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun match-method-bytes (buf start end)
-  "Match BUF[START..END) against known HTTP methods. Returns keyword or NIL."
+  "Match BUF[START..END) against known HTTP methods. Returns keyword or NIL.
+   TRACE is intentionally unsupported: it echoes the request back in
+   the response body (RFC 7231 §4.3.8), which is the classic
+   cross-site-tracing (XST) sink for leaking cookies and auth headers
+   through a compromised client-side script. Rejecting it at the
+   parser layer means downstream handlers can never see it."
   (flet ((match-p (str)
            (let ((len (length str)))
              (and (= (- end start) len)
@@ -363,8 +368,7 @@
       ((match-p "DELETE")  :DELETE)
       ((match-p "HEAD")    :HEAD)
       ((match-p "OPTIONS") :OPTIONS)
-      ((match-p "PATCH")   :PATCH)
-      ((match-p "TRACE")   :TRACE))))
+      ((match-p "PATCH")   :PATCH))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Byte-level header parser (single-pass)
