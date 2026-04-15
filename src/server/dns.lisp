@@ -115,6 +115,16 @@
                     :outbound-p t
                     :inbound-fd (connection-fd conn)
                     :dns-process process
+                    ;; Carry the fetch callback on the dns-conn so
+                    ;; close-outbound fires it on any DNS teardown
+                    ;; path that doesn't chain to a successful
+                    ;; initiate-http-fetch-to-address. The success
+                    ;; path in handle-dns-ready explicitly clears
+                    ;; this slot before calling close-outbound so
+                    ;; the callback isn't fired twice when dns-then
+                    ;; creates a fresh outbound with the same
+                    ;; callback attached.
+                    :fetch-callback (http-fetch-continuation-callback fetch-req)
                     :dns-then (lambda (ip family)
                                 (initiate-http-fetch-to-address
                                  conn epoll-fd fetch-req
@@ -145,24 +155,13 @@
 ;;; Completion paths
 ;;; ---------------------------------------------------------------------------
 
-(defun close-dns-conn (dns-conn epoll-fd)
-  "Tear down a :out-dns outbound connection: unregister from epoll,
-   remove from the connection table, reap the getent process, close
-   the pipe fd. Leaves the parked inbound alone — the caller decides
-   whether to resume it (TCP phase) or fail it (502)."
-  (let ((fd (connection-fd dns-conn)))
-    (when (>= fd 0)
-      (ignore-errors (epoll-remove epoll-fd fd)))
-    (unregister-connection dns-conn)
-    (maybe-reap-dns-process dns-conn)
-    (connection-close dns-conn)))
-
 (defun deliver-dns-error (dns-conn epoll-fd)
   "DNS lookup failed — no usable address, getent gave up, or a parse
-   error. Reply to the parked inbound with a 502 and clean up the
-   DNS connection."
+   error. Reply to the parked inbound with a 502 and tear down the
+   dns-conn through CLOSE-OUTBOUND, which fires the fetch callback
+   with (NIL NIL NIL) so app-level cleanup runs."
   (let ((inbound-fd (connection-inbound-fd dns-conn)))
-    (close-dns-conn dns-conn epoll-fd)
+    (close-outbound dns-conn epoll-fd)
     (let ((inbound (lookup-connection inbound-fd)))
       (when inbound
         (let ((err-bytes (format-response (make-error-response 502))))
@@ -187,7 +186,15 @@
          (cond
            (parsed
             (let ((dns-then (connection-dns-then dns-conn)))
-              (close-dns-conn dns-conn epoll-fd)
+              ;; DNS succeeded — dns-then will chain to
+              ;; initiate-http-fetch-to-address which creates a
+              ;; fresh outbound carrying the same fetch callback.
+              ;; Clear the slot on the dns-conn so close-outbound
+              ;; doesn't fire the callback here (that would be a
+              ;; double-fire against the fresh outbound's own
+              ;; teardown path).
+              (setf (connection-fetch-callback dns-conn) nil)
+              (close-outbound dns-conn epoll-fd)
               (destructuring-bind (ip . family) parsed
                 (funcall dns-then ip family))))
            ((eq result :eof)
