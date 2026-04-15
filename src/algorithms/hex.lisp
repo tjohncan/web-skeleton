@@ -27,15 +27,15 @@
 
 (defun hex-decode (hex-string)
   "Convert a hex string to a byte vector."
-  (let* ((len (length hex-string))
-         (bytes (make-array (ash len -1) :element-type '(unsigned-byte 8))))
+  (let ((len (length hex-string)))
     (when (oddp len)
       (error "hex-decode: odd-length input"))
-    (loop for i from 0 below len by 2
-          for j from 0
-          for hi = (hex-digit-value (char-code (char hex-string i)))
-          for lo = (hex-digit-value (char-code (char hex-string (1+ i))))
-          do (unless (and hi lo)
-               (error "hex-decode: invalid hex character at ~d" i))
-             (setf (aref bytes j) (logior (ash hi 4) lo)))
-    bytes))
+    (let ((bytes (make-array (ash len -1) :element-type '(unsigned-byte 8))))
+      (loop for i from 0 below len by 2
+            for j from 0
+            for hi = (hex-digit-value (char-code (char hex-string i)))
+            for lo = (hex-digit-value (char-code (char hex-string (1+ i))))
+            do (unless (and hi lo)
+                 (error "hex-decode: invalid hex character at ~d" i))
+               (setf (aref bytes j) (logior (ash hi 4) lo)))
+      bytes)))
