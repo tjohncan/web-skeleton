@@ -48,7 +48,8 @@
                                                         "src/log"
                                                         "src/epoll"
                                                         "src/server/http"
-                                                        "src/server/connection"))
+                                                        "src/server/connection"
+                                                        "src/server/websocket"))
                (:file "src/server/dns" :depends-on ("src/package"
                                                       "src/log"
                                                       "src/epoll"

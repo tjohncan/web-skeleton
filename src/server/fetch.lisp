@@ -443,9 +443,10 @@
                                                     :junk-allowed t)))))
              (when (and (>= (length line) 18)
                         (string-equal line "transfer-encoding:"
-                                      :end1 18)
-                        (search "chunked" line :start2 18 :test #'char-equal))
-               (setf chunked t)))
+                                      :end1 18))
+               (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
+                 (when (connection-header-has-token-p value "chunked")
+                   (setf chunked t)))))
     ;; Stream body lines
     (if chunked
         (stream-chunked-lines r on-line)
@@ -668,9 +669,11 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun response-chunked-p (headers)
-  "Return T if HEADERS indicate chunked transfer encoding."
+  "Return T if HEADERS indicate chunked transfer encoding.
+   Uses token-aware matching (RFC 7230 §3.2.6) so 'identity' or
+   'unchunked-foo' don't false-match on substring 'chunked'."
   (let ((te (cdr (assoc "transfer-encoding" headers :test #'string-equal))))
-    (and te (search "chunked" te :test #'char-equal))))
+    (and te (connection-header-has-token-p te "chunked"))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).
