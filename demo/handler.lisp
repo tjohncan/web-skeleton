@@ -46,8 +46,11 @@
    need to reach an upstream API return a DEFER-TO-FETCH continuation
    instead of blocking. The framework parks the inbound connection,
    runs the outbound call on the same epoll loop, then calls the
-   :THEN callback with (status headers body-bytes). Whatever the
-   callback returns becomes the final response to the original caller.
+   :THEN callback with (status headers body-bytes) on success, or
+   with (NIL NIL NIL) as a cleanup sentinel if the fetch aborts
+   before delivering a response. Whatever the happy-path callback
+   returns becomes the final response to the original caller;
+   cleanup-path return values are discarded.
 
    This endpoint demonstrates the pattern by self-fetching the demo's
    own /robots.txt over HTTP. A real app would target an upstream API."
@@ -56,14 +59,21 @@
    :get (format nil "http://~a:~d/robots.txt" *demo-host* *demo-port*)
    :then (lambda (status headers body-bytes)
            (declare (ignore headers))
-           (make-text-response
-            200
-            (format nil "fetched /robots.txt~%  status: ~d~%  body: ~a"
-                    status
-                    (if body-bytes
-                        (sb-ext:octets-to-string
-                         body-bytes :external-format :utf-8)
-                        "(empty)"))))))
+           (if status
+               ;; Happy path — upstream responded, shape a demo body.
+               (make-text-response
+                200
+                (format nil "fetched /robots.txt~%  status: ~d~%  body: ~a"
+                        status
+                        (if body-bytes
+                            (sb-ext:octets-to-string
+                             body-bytes :external-format :utf-8)
+                            "(empty)")))
+               ;; Cleanup path — fetch never completed (inbound
+               ;; vanished, drain, worker crash). Nothing to release
+               ;; in this demo; return NIL and let the framework
+               ;; discard the value.
+               nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler

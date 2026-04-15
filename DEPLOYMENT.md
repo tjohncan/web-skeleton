@@ -191,6 +191,61 @@ LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
 For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
+**Truncation under Connection: close framing.** An HTTPS upstream
+that frames its response purely by `Connection: close` (no
+`Content-Length`, no `Transfer-Encoding: chunked`) and then closes
+the TCP connection mid-body surfaces as `SSL_ERROR_SYSCALL` inside
+`tls-read-all`, which the framework treats as clean EOF. The
+framework's `Content-Length` truncation guard catches the more
+common declared-length case; the pure Connection-close case is a
+known OpenSSL-level limitation (see `SSL_OP_IGNORE_UNEXPECTED_EOF`
+for a deeper fix). If your app speaks to a hand-rolled JSON API
+that frames responses this way and exact body integrity matters,
+prefer declaring `Content-Length` on the upstream.
+
+### Fetch callback contract
+
+The `:then` closure supplied to `http-fetch` / `defer-to-fetch`
+fires **exactly once per fetch** with one of two argument shapes:
+
+- **`(status headers body)`** on the happy path — `status` is an
+  integer HTTP status, `headers` is an alist of lowercase-name
+  string pairs, `body` is a byte vector (or `NIL` for empty bodies).
+  The closure's return value becomes the response delivered to the
+  original inbound client.
+- **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal
+  teardown path: upstream TCP / TLS / DNS failure, short-body
+  truncation, inbound connection closed mid-fetch, drain, worker
+  crash. The closure's return value is discarded in this branch
+  because there is no inbound to deliver anything to.
+
+The cleanup sentinel exists so apps can release state deterministically
+without ambient try/finally bookkeeping: DB transactions, metrics
+spans, circuit-breaker counters, rate-limit budgets. Handlers that
+interpolate `status` or `body` into log lines or response strings
+must check for `NIL` explicitly:
+
+```lisp
+:then (lambda (status headers body)
+        (declare (ignore headers))
+        (if status
+            ;; Happy path — shape a real response from the fetch.
+            (make-text-response
+             status
+             (if body
+                 (sb-ext:octets-to-string body :external-format :utf-8)
+                 ""))
+            ;; Cleanup path — fetch never completed. Release any
+            ;; resources the closure captured and return NIL; the
+            ;; framework discards the value.
+            (progn (release-resources) nil)))
+```
+
+A raising cleanup closure is logged at WARN and swallowed by
+`close-outbound`'s handler-case, so it never blocks the framework's
+own teardown. Don't rely on cleanup-path exceptions propagating
+back to the caller — they don't.
+
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, validate the
