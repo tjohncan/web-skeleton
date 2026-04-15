@@ -1039,6 +1039,77 @@
 ;;; Static file helper tests
 ;;; ---------------------------------------------------------------------------
 
+(defun test-static-etag ()
+  (format t "~%Static ETag~%")
+
+  ;; ---- build-static-response populates ETag metadata ----
+  (let* ((content (sb-ext:string-to-octets "hello world"
+                                            :external-format :utf-8))
+         (entry (web-skeleton::build-static-response
+                 "text/plain" content 0)))
+    (check "static-entry: etag slot populated"
+           (not (null (web-skeleton::static-entry-etag entry))) t)
+    (check "static-entry: etag is a quoted string"
+           (let ((e (web-skeleton::static-entry-etag entry)))
+             (and (char= (char e 0) #\")
+                  (char= (char e (1- (length e))) #\")))
+           t)
+    (check "static-entry: etag is sha256 of content"
+           (web-skeleton::static-entry-etag entry)
+           (format nil "\"~a\"" (sha256-hex content)))
+    (check "static-entry: not-modified response pre-built"
+           (not (null (web-skeleton::static-entry-not-modified-response entry)))
+           t))
+
+  ;; Same content → same etag (deterministic)
+  (let* ((a (web-skeleton::build-static-response
+             "text/plain" (sb-ext:string-to-octets "payload") 0))
+         (b (web-skeleton::build-static-response
+             "text/plain" (sb-ext:string-to-octets "payload") 0)))
+    (check "same content yields same etag"
+           (string= (web-skeleton::static-entry-etag a)
+                    (web-skeleton::static-entry-etag b))
+           t))
+  ;; Different content → different etag
+  (let* ((a (web-skeleton::build-static-response
+             "text/plain" (sb-ext:string-to-octets "aaa") 0))
+         (b (web-skeleton::build-static-response
+             "text/plain" (sb-ext:string-to-octets "bbb") 0)))
+    (check "different content yields different etag"
+           (string= (web-skeleton::static-entry-etag a)
+                    (web-skeleton::static-entry-etag b))
+           nil))
+
+  ;; ---- if-none-match-hit-p parser (RFC 7232 §3.2) ----
+  (labels ((hit (client our)
+             (not (null (web-skeleton::if-none-match-hit-p client our)))))
+    (check "exact strong match"
+           (hit "\"abc\"" "\"abc\"") t)
+    (check "exact mismatch"
+           (hit "\"abc\"" "\"xyz\"") nil)
+    (check "weak prefix match"
+           (hit "W/\"abc\"" "\"abc\"") t)
+    (check "weak prefix mismatch"
+           (hit "W/\"abc\"" "\"xyz\"") nil)
+    (check "wildcard matches"
+           (hit "*" "\"abc\"") t)
+    (check "wildcard with leading whitespace"
+           (hit "   *" "\"abc\"") t)
+    (check "comma list: first matches"
+           (hit "\"abc\", \"def\"" "\"abc\"") t)
+    (check "comma list: second matches"
+           (hit "\"abc\", \"def\"" "\"def\"") t)
+    (check "comma list: neither matches"
+           (hit "\"abc\", \"def\"" "\"xyz\"") nil)
+    (check "comma list with weak prefixes"
+           (hit "W/\"abc\", W/\"def\"" "\"def\"") t)
+    (check "empty header"
+           (hit "" "\"abc\"") nil))
+  (check "nil client header returns nil"
+         (web-skeleton::if-none-match-hit-p nil "\"abc\"") nil)
+  (check "nil our etag returns nil"
+         (web-skeleton::if-none-match-hit-p "\"abc\"" nil) nil))
+
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
 
@@ -1190,6 +1261,7 @@
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
+  (test-static-etag)
   (test-jwt)
   (test-shutdown-hooks)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)

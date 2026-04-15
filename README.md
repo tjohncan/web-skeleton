@@ -172,7 +172,9 @@ tests/
   as they arrive) without returning from the handler until the work is done
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built
-  response. MIME detection, extensionless HTML aliases, directory traversal protection
+  response. MIME detection, extensionless HTML aliases, directory traversal
+  protection, ETag-based revalidation (`If-None-Match` → `304 Not Modified`
+  using a SHA-256 strong entity tag computed at load time)
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — FIPS/RFC test vectors for all crypto primitives, JSON
   round-trip tests, HTTP parser tests, JWT validation tests
@@ -294,6 +296,3 @@ and practical notes on building with web-skeleton.
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
-- **ETag for static files** — compute a content hash at load time and
-  include it in static responses. Enables `304 Not Modified` via
-  `If-None-Match`, reducing bandwidth for repeat visitors

@@ -56,9 +56,15 @@
 ;;; ---------------------------------------------------------------------------
 
 (defstruct static-entry
-  "Cached static file with pre-built GET and HEAD responses."
-  (get-response  nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (head-response nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  "Cached static file with pre-built responses. Three byte vectors:
+   the 200 GET (headers + body), the 200 HEAD (same headers, body
+   suppressed), and the 304 Not Modified (etag + cache-control only,
+   no body). ETAG is the content's SHA-256 hex wrapped in a quoted
+   string — a strong entity tag per RFC 7232 §2.3."
+  (get-response          nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (head-response         nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (not-modified-response nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (etag                  nil :type (or null string)))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
   "Maps URL path (string) to STATIC-ENTRY struct.
@@ -70,23 +76,39 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun build-static-response (mime-type content file-mtime)
-  "Build pre-built GET and HEAD response byte vectors for a static file.
-   CONTENT is a byte vector of the file data.
-   FILE-MTIME is the file's modification time (universal-time).
-   Returns a STATIC-ENTRY with both responses ready to write."
-  (let ((headers (list (cons "content-type" mime-type)
-                       (cons "content-length" (write-to-string (length content)))
-                       (cons "cache-control" "public, max-age=3600")
-                       (cons "x-content-type-options" "nosniff")
-                       ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
-                       ;; Pre-built responses cannot carry a per-request timestamp,
-                       ;; and a stale Date would defeat max-age for caching proxies.
-                       ;; Omission is the least-harmful option: caches fall back to
-                       ;; received time (RFC 7234 §4.2.3), preserving correct freshness.
-                       (cons "last-modified" (http-date file-mtime)))))
+  "Build pre-built 200 GET, 200 HEAD, and 304 Not Modified response
+   byte vectors for a static file. CONTENT is the file's bytes;
+   FILE-MTIME is its modification time (universal-time). The ETag
+   is a strong entity tag derived from the content's SHA-256 — so
+   revalidation via If-None-Match happens automatically the moment
+   LOAD-STATIC-FILES runs. Returns a STATIC-ENTRY."
+  (let* ((etag (format nil "\"~a\"" (sha256-hex content)))
+         (full-headers
+          (list (cons "content-type" mime-type)
+                (cons "content-length" (write-to-string (length content)))
+                (cons "etag" etag)
+                (cons "cache-control" "public, max-age=3600")
+                (cons "x-content-type-options" "nosniff")
+                ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
+                ;; Pre-built responses cannot carry a per-request timestamp,
+                ;; and a stale Date would defeat max-age for caching proxies.
+                ;; Omission is the least-harmful option: caches fall back to
+                ;; received time (RFC 7234 §4.2.3), preserving correct freshness.
+                (cons "last-modified" (http-date file-mtime))))
+         ;; 304 responses carry validator headers (ETag, Cache-Control)
+         ;; and nothing else. No Content-Type / Content-Length / body.
+         (not-modified-headers
+          (list (cons "etag" etag)
+                (cons "cache-control" "public, max-age=3600"))))
     (make-static-entry
-     :get-response  (serialize-http-message "HTTP/1.1 200 OK" headers content)
-     :head-response (serialize-http-message "HTTP/1.1 200 OK" headers nil))))
+     :get-response  (serialize-http-message "HTTP/1.1 200 OK"
+                                            full-headers content)
+     :head-response (serialize-http-message "HTTP/1.1 200 OK"
+                                            full-headers nil)
+     :not-modified-response (serialize-http-message
+                             "HTTP/1.1 304 Not Modified"
+                             not-modified-headers nil)
+     :etag etag)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; File I/O (startup only)
@@ -176,12 +198,73 @@
 ;;; Request serving
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; If-None-Match parsing (RFC 7232 §3.2)
+;;;
+;;; The client's header value may be:
+;;;   - Wildcard '*' (matches whenever the resource exists)
+;;;   - One or more comma-separated entity tags
+;;;   - Each tag may carry an optional 'W/' weak-validator prefix
+;;; Weak comparison is used for If-None-Match: a weak and a strong tag
+;;; with the same opaque body match each other. We normalize by
+;;; stripping W/ before comparing, which is equivalent for our case
+;;; (we only ever generate strong tags, so the opaque bodies are the
+;;; only thing that can differ).
+;;; ---------------------------------------------------------------------------
+
+(defun if-none-match-hit-p (header-value our-etag)
+  "Return T when HEADER-VALUE (an If-None-Match header value) indicates
+   the client already has OUR-ETAG. Handles wildcards, comma-separated
+   lists, and the W/ weak prefix per RFC 7232 §3.2. Returns NIL on
+   missing inputs or any parse miss."
+  (unless (and header-value our-etag (> (length header-value) 0))
+    (return-from if-none-match-hit-p nil))
+  (let ((len (length header-value))
+        (pos 0))
+    (loop
+      ;; Skip leading whitespace
+      (loop while (and (< pos len)
+                       (or (char= (char header-value pos) #\Space)
+                           (char= (char header-value pos) #\Tab)))
+            do (incf pos))
+      (when (>= pos len) (return nil))
+      ;; Wildcard — matches immediately.
+      (when (char= (char header-value pos) #\*)
+        (return t))
+      ;; Next comma marks the end of this entry.
+      (let ((end (or (position #\, header-value :start pos) len))
+            (start pos))
+        ;; Trim trailing OWS.
+        (loop while (and (> end start)
+                         (or (char= (char header-value (1- end)) #\Space)
+                             (char= (char header-value (1- end)) #\Tab)))
+              do (decf end))
+        ;; Strip optional W/ weak prefix — our own ETags are strong,
+        ;; so weak comparison reduces to 'same opaque body'.
+        (when (and (>= (- end start) 2)
+                   (char= (char header-value start) #\W)
+                   (char= (char header-value (1+ start)) #\/))
+          (incf start 2))
+        (when (and (> end start)
+                   (= (- end start) (length our-etag))
+                   (string= header-value our-etag
+                            :start1 start :end1 end))
+          (return t))
+        (when (>= end len) (return nil))
+        (setf pos (1+ end))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Request serving
+;;; ---------------------------------------------------------------------------
+
 (defun serve-static (request)
   "Look up the request path in the static file cache.
-   Returns a pre-built HTTP response byte vector ready to write,
-   or NIL if the path is not cached.
-   Serves GET and HEAD requests. Rejects paths containing '..'.
-   Directories (paths ending in /) try index.html as a fallback."
+   Returns a pre-built HTTP response byte vector ready to write, or
+   NIL if the path is not cached. Serves GET and HEAD requests.
+   Honors If-None-Match (RFC 7232) — a cached ETag match returns the
+   pre-built 304 Not Modified response instead of the full body.
+   Rejects paths containing '..'. Directories (paths ending in /)
+   try index.html as a fallback."
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
       (let ((path (http-request-path request)))
@@ -197,6 +280,11 @@
                              (gethash (concatenate 'string path "index.html")
                                       *static-cache*)))))
             (when entry
-              (if (eq method :GET)
-                  (static-entry-get-response entry)
-                  (static-entry-head-response entry)))))))))
+              (cond
+                ((if-none-match-hit-p (get-header request "if-none-match")
+                                      (static-entry-etag entry))
+                 (static-entry-not-modified-response entry))
+                ((eq method :GET)
+                 (static-entry-get-response entry))
+                (t
+                 (static-entry-head-response entry))))))))))
