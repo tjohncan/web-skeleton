@@ -315,7 +315,54 @@
   ;; Error response
   (let ((resp (make-error-response 404)))
     (check "error status" (http-response-status resp) 404)
-    (check "error body" (http-response-body resp) "404 Not Found")))
+    (check "error body" (http-response-body resp) "404 Not Found"))
+
+  ;; HTTP header field names are case-insensitive (RFC 7230 §3.2).
+  ;; Framework helpers route through set-response-header with lowercase
+  ;; literals, but apps that build responses with mixed-case :headers
+  ;; directly must still get clean replacement instead of duplication —
+  ;; duplicate Content-Length is a response-smuggling primitive when a
+  ;; caching proxy is in front.
+  (flet ((count-occurrences (needle haystack)
+           (loop with pos = 0
+                 with count = 0
+                 for next = (search needle haystack :start2 pos)
+                 while next
+                 do (incf count)
+                    (setf pos (+ next (length needle)))
+                 finally (return count))))
+    ;; set-response-header replaces a mixed-case pre-existing entry
+    (let ((resp (web-skeleton::make-http-response
+                 :status 200
+                 :headers '(("Content-Type" . "text/html")))))
+      (set-response-header resp "content-type" "application/json")
+      (check "mixed-case replace: header count"
+             (length (http-response-headers resp))
+             1)
+      (check "mixed-case replace: value wins"
+             (cdr (first (http-response-headers resp)))
+             "application/json"))
+    ;; format-response auto-Content-Length skips when mixed-case present
+    (let* ((resp (web-skeleton::make-http-response
+                  :status 200
+                  :body "hello"
+                  :headers '(("Content-Length" . "5")
+                             ("Content-Type" . "text/plain"))))
+           (bytes (format-response resp))
+           (text  (sb-ext:octets-to-string bytes :external-format :utf-8)))
+      (check "mixed-case CL: not duplicated"
+             (count-occurrences "ontent-length:" text)
+             1))
+    ;; format-response auto-Date skips when mixed-case Date present
+    (let* ((resp (web-skeleton::make-http-response
+                  :status 200
+                  :body "hi"
+                  :headers '(("Date" . "Mon, 01 Jan 2024 00:00:00 GMT"))))
+           (bytes (format-response resp))
+           (text  (sb-ext:octets-to-string bytes :external-format :utf-8)))
+      (check "mixed-case Date: not duplicated"
+             (count-occurrences "date:" text)
+             1))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cookie builder tests

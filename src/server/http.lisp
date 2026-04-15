@@ -611,12 +611,17 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun set-response-header (response name value)
-  "Set a header on RESPONSE. Replaces any existing header with the same name."
+  "Set a header on RESPONSE. Replaces any existing header with the
+   same name, compared case-insensitively per RFC 7230 §3.2. Apps
+   that build responses with mixed-case header literals
+   ('Content-Type') still get clean replacement instead of
+   duplication — duplicate Content-Length or Content-Type is a
+   response-smuggling primitive when a caching proxy is in front."
   (let ((key (string-downcase name)))
     (setf (http-response-headers response)
           (cons (cons key value)
                 (remove key (http-response-headers response)
-                        :key #'car :test #'string=))))
+                        :key #'car :test #'string-equal))))
   response)
 
 (defun http-date (&optional (universal-time (get-universal-time)))
@@ -639,13 +644,14 @@
                        (sb-ext:string-to-octets body :external-format :utf-8)))
          (headers (http-response-headers response))
          (headers (if (and body-bytes
-                           (not (assoc "content-length" headers :test #'string=)))
+                           (not (assoc "content-length" headers
+                                       :test #'string-equal)))
                       (cons (cons "content-length"
                                   (write-to-string (length body-bytes)))
                             headers)
                       headers))
          ;; RFC 7231 §7.1.1.2: origin server MUST send Date
-         (headers (if (assoc "date" headers :test #'string=)
+         (headers (if (assoc "date" headers :test #'string-equal)
                       headers
                       (cons (cons "date" (http-date)) headers))))
     (serialize-http-message

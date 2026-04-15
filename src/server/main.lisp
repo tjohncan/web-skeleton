@@ -427,7 +427,7 @@
                                     :external-format :utf-8)))
                          (unless (assoc "content-length"
                                         (http-response-headers response)
-                                        :test #'string=)
+                                        :test #'string-equal)
                            (set-response-header response "content-length"
                                                 (write-to-string (length body)))))
                        (setf (http-response-body response) nil))
