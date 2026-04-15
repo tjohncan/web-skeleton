@@ -14,10 +14,19 @@
 
 (defun make-tcp-listener (host port)
   "Create a TCP socket, bind to HOST:PORT, listen with a backlog of 128.
-   Sets SO_REUSEADDR, SO_REUSEPORT, and non-blocking. Returns the socket."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream
-                               :protocol :tcp)))
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the family
+   is dispatched accordingly. Sets SO_REUSEADDR, SO_REUSEPORT, and
+   non-blocking. Returns the socket."
+  (let* ((family (case (length host)
+                   (4  :inet)
+                   (16 :inet6)
+                   (t (error "make-tcp-listener: :host must be a 4-byte v4 ~
+                              or 16-byte v6 vector, got ~a" host))))
+         (socket (make-instance (if (eq family :inet)
+                                    'sb-bsd-sockets:inet-socket
+                                    'sb-bsd-sockets:inet6-socket)
+                                :type :stream
+                                :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
     (set-socket-option-int (socket-fd socket)
                            +sol-socket+ +so-reuseport+ 1)
@@ -761,7 +770,7 @@
                         (lambda (signal info context)
                           (declare (ignore signal info context))
                           (setf *shutdown* t)))))
-    (log-info "starting ~d worker~:p on ~{~d~^.~}:~d" workers (coerce host 'list) port)
+    (log-info "starting ~d worker~:p on ~a" workers (format-peer-addr host port))
     (let ((threads (loop for i from 0 below workers
                          collect (sb-thread:make-thread
                                   (let ((id i))

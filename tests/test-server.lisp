@@ -645,6 +645,31 @@
   (check "unknown family"    (is-public-address-p #(1 1 1 1) :inet7)        nil))
 
 ;;; ---------------------------------------------------------------------------
+;;; Peer address formatter — both families
+;;; ---------------------------------------------------------------------------
+
+(defun test-format-peer-addr ()
+  (format t "~%format-peer-addr~%")
+  (check "v4 localhost"
+         (web-skeleton::format-peer-addr #(127 0 0 1) 8080)
+         "127.0.0.1:8080")
+  (check "v4 bound-all"
+         (web-skeleton::format-peer-addr #(0 0 0 0) 443)
+         "0.0.0.0:443")
+  (check "v6 loopback"
+         (web-skeleton::format-peer-addr
+          #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) 8080)
+         "[0:0:0:0:0:0:0:1]:8080")
+  (check "v6 unspecified"
+         (web-skeleton::format-peer-addr
+          #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) 443)
+         "[0:0:0:0:0:0:0:0]:443")
+  (check "v6 documentation"
+         (web-skeleton::format-peer-addr
+          #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
+         "[2001:db8:0:0:0:0:0:1]:80"))
+
+;;; ---------------------------------------------------------------------------
 ;;; URL decode tests
 ;;; ---------------------------------------------------------------------------
 
@@ -1337,6 +1362,7 @@
   (test-fetch)
   (test-dns)
   (test-is-public-address)
+  (test-format-peer-addr)
   (test-url-decode)
   (test-query-string)
   (test-match-path)

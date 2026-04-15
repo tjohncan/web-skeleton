@@ -67,6 +67,20 @@
 ;;; Constructor
 ;;; ---------------------------------------------------------------------------
 
+(defun format-peer-addr (host port)
+  "Format a (HOST PORT) pair as a peer-address string for log output.
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the v6 form
+   uses the bracketed 8-group hex representation (no :: compression —
+   a log line doesn't need canonical form, just unambiguous identity)."
+  (case (length host)
+    (4  (format nil "~{~d~^.~}:~d" (coerce host 'list) port))
+    (16 (format nil "[~{~x~^:~}]:~d"
+                (loop for i from 0 below 16 by 2
+                      collect (logior (ash (aref host i) 8)
+                                      (aref host (1+ i))))
+                port))
+    (t  (format nil "<addr>:~d" port))))
+
 (defun make-client-connection (client-socket)
   "Wrap a newly accepted socket into a connection object.
    Sets the fd to non-blocking. Captures the peer address."
@@ -74,7 +88,7 @@
         (addr (ignore-errors
                 (multiple-value-bind (host port)
                     (sb-bsd-sockets:socket-peername client-socket)
-                  (format nil "~{~d~^.~}:~d" (coerce host 'list) port)))))
+                  (format-peer-addr host port)))))
     (set-nonblocking fd)
     (make-connection :fd fd
                      :socket client-socket

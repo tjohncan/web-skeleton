@@ -140,7 +140,7 @@ tests/
 - **Connection lifecycle** — idle timeout for HTTP (slowloris protection),
   server-initiated ping/pong for dead WebSocket detection, configurable
   idle timeout for inactive WebSocket connections
-- **TCP listener** — binds a socket, accepts connections, clean shutdown on Ctrl-C
+- **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown on Ctrl-C
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
 - **HTTP response builder** — status codes, headers, body serialization
@@ -258,7 +258,11 @@ The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword
               :ws-handler #'my-app:handle-ws-message)
 ```
 
-Use `:host #(0 0 0 0)` to listen on all interfaces.
+`:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector and
+dispatches the listener family accordingly. Use `:host #(0 0 0 0)`
+to listen on all IPv4 interfaces, or
+`:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)` to listen on all IPv6
+interfaces. IPv6 loopback is `:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)`.
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
 
