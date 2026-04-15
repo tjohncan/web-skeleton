@@ -343,9 +343,13 @@
   ;; duplicate Content-Length is a response-smuggling primitive when a
   ;; caching proxy is in front.
   (flet ((count-occurrences (needle haystack)
+           ;; Case-insensitive — the response will serialize whatever
+           ;; capitalization the app passed in (Content-Length vs
+           ;; content-length), and the test doesn't care which.
            (loop with pos = 0
                  with count = 0
-                 for next = (search needle haystack :start2 pos)
+                 for next = (search needle haystack
+                                    :start2 pos :test #'char-equal)
                  while next
                  do (incf count)
                     (setf pos (+ next (length needle)))
@@ -1357,7 +1361,11 @@
 
   (check "ext html" (web-skeleton::file-extension "/index.html") "html")
   (check "ext none" (web-skeleton::file-extension "/LICENSE") nil)
-  (check "ext dotfile" (web-skeleton::file-extension "/.hidden") "hidden"))
+  (check "ext dotfile" (web-skeleton::file-extension "/.hidden") nil)
+  (check "ext dotfile in subdir"
+         (web-skeleton::file-extension "/foo/.hidden") nil)
+  (check "ext regular in subdir"
+         (web-skeleton::file-extension "/foo/bar.txt") "txt"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWT tests

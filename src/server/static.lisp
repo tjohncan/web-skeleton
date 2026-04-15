@@ -14,10 +14,14 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun file-extension (path)
-  "Extract the file extension from PATH (without the dot), or NIL."
+  "Extract the file extension from PATH (without the dot), or NIL.
+   A dotfile like '/.hidden' has no extension — its leading '.' is
+   part of the name, not a separator. Loading dotfiles is refused
+   elsewhere, but this keeps the helper's contract clean for any
+   future caller."
   (let ((dot (position #\. path :from-end t))
         (slash (position #\/ path :from-end t)))
-    (when (and dot (or (null slash) (> dot slash)))
+    (when (and dot (or (null slash) (> dot (1+ slash))))
       (subseq path (1+ dot)))))
 
 (defun mime-type-for-path (path)
