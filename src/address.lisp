@@ -65,13 +65,29 @@
   "Return T if the 16-byte vector BYTES is a publicly routable IPv6."
   (let ((b0 (aref bytes 0)))
     (cond
-      ;; ::/120 — ::, ::1, and the deprecated IPv4-compatible prefix.
-      ((loop for i from 0 below 15 always (zerop (aref bytes i))) nil)
-      ;; ::ffff:0:0/96 — IPv4-mapped IPv6. Classify via the embedded v4
-      ;; so an attacker cannot rewrite 127.0.0.1 as ::ffff:127.0.0.1.
+      ;; ::ffff:0:0/96 — IPv4-mapped IPv6 (RFC 4291 §2.5.5.2).
+      ;; Classify via the embedded v4 so an attacker cannot rewrite
+      ;; 127.0.0.1 as ::ffff:127.0.0.1. Must come before the
+      ;; IPv4-compatible branch below because that one's all-zero
+      ;; prefix is a superset of this one's 0x...ffff prefix.
       ((and (loop for i from 0 below 10 always (zerop (aref bytes i)))
             (= (aref bytes 10) #xff)
             (= (aref bytes 11) #xff))
+       (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
+         (replace v4 bytes :start2 12 :end2 16)
+         (ipv4-public-p v4)))
+      ;; ::a.b.c.d — deprecated IPv4-compatible IPv6 (RFC 4291
+      ;; §2.5.5.1). The prefix is retired and modern Linux doesn't
+      ;; special-case it (unlike the mapped prefix above), so
+      ;; routing to ::127.0.0.1 on current kernels goes through
+      ;; normal IPv6 routing and fails — but the address is
+      ;; semantically IPv4, and the framework's policy is to
+      ;; reject every dangerous-looking address. Unwrap and
+      ;; classify via the embedded v4 for consistency with the
+      ;; mapped branch. Also subsumes the old ::/120 check: ::
+      ;; unwraps to 0.0.0.0 (rejected), ::1 unwraps to 0.0.0.1
+      ;; (rejected — zero first octet).
+      ((loop for i from 0 below 12 always (zerop (aref bytes i)))
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 12 :end2 16)
          (ipv4-public-p v4)))
