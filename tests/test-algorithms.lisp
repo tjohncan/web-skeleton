@@ -413,3 +413,51 @@
   (test-random)
   (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
   (zerop *tests-failed*))
+
+;;; ---------------------------------------------------------------------------
+;;; Pure-Lisp crypto re-verification (framework-dev entry point)
+;;;
+;;; NOT wired into the default (test) runner. Intended for humans editing
+;;; src/algorithms/sha1.lisp, sha256.lisp, or ecdsa.lisp who want to verify
+;;; their changes to the pure-Lisp implementations on a machine that has
+;;; web-skeleton-tls loaded (and therefore sees the libssl-backed versions
+;;; as the active sha1/sha256/ecdsa-verify-p256 by default).
+;;;
+;;; Mechanism: temporarily swap SYMBOL-FUNCTION for the three public
+;;; crypto names back to their *-LISP originals, run the existing
+;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-ECDSA functions
+;;; unchanged (so the FIPS / RFC vectors live in exactly one place),
+;;; then restore via UNWIND-PROTECT. Safe only in a serial test runner.
+;;; If libssl isn't loaded, the swap still works — it just replaces
+;;; the thin SHA1/SHA256/ECDSA-VERIFY-P256 wrappers with their direct
+;;; *-LISP targets, which is effectively a no-op.
+;;; ---------------------------------------------------------------------------
+
+(defun test-pure-lisp-crypto ()
+  "Framework-dev entry point: re-run the existing crypto tests against
+   the pure-Lisp implementations by temporarily swapping SYMBOL-FUNCTION
+   for SHA1 / SHA256 / ECDSA-VERIFY-P256. HMAC-SHA256 is exercised for
+   free because it calls SHA256 through the function cell. Not part of
+   the default TEST runner — invoke manually when editing pure-Lisp
+   algorithm sources."
+  (setf *tests-passed* 0
+        *tests-failed* 0)
+  (format t "~%=== Pure-Lisp crypto re-verification ===~%")
+  (let ((saved-sha1   (symbol-function 'sha1))
+        (saved-sha256 (symbol-function 'sha256))
+        (saved-ecdsa  (symbol-function 'ecdsa-verify-p256)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'sha1)              #'web-skeleton::sha1-lisp
+                 (symbol-function 'sha256)            #'web-skeleton::sha256-lisp
+                 (symbol-function 'ecdsa-verify-p256) #'web-skeleton::ecdsa-verify-p256-lisp)
+           (test-sha1)
+           (test-sha256)
+           (test-hmac-sha256)
+           (test-ecdsa))
+      (setf (symbol-function 'sha1)              saved-sha1
+            (symbol-function 'sha256)            saved-sha256
+            (symbol-function 'ecdsa-verify-p256) saved-ecdsa)))
+  (format t "~%~d passed, ~d failed (pure-Lisp)~%~%"
+          *tests-passed* *tests-failed*)
+  (zerop *tests-failed*))

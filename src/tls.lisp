@@ -439,6 +439,239 @@
                           :external-format :utf-8))))
     (or status 0)))
 
+;;; ===========================================================================
+;;; Crypto primitives — EVP digest + ECDSA verify
+;;;
+;;; At load time, this file swaps web-skeleton's public SHA-1, SHA-256,
+;;; and ECDSA-VERIFY-P256 symbols for libssl-backed implementations via
+;;; SETF SYMBOL-FUNCTION. The pure-Lisp originals stay reachable as
+;;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP for framework-dev
+;;; verification via TEST-PURE-LISP-CRYPTO.
+;;;
+;;; SHA uses the EVP_MD_CTX interface — the modern, non-deprecated path.
+;;; We deliberately avoid the one-shot SHA1() / SHA256() symbols, which
+;;; are marked OSSL_DEPRECATEDIN_3_0 in OpenSSL 3's headers.
+;;;
+;;; ECDSA uses d2i_PUBKEY (not deprecated in 3.0) to parse a hand-built
+;;; SubjectPublicKeyInfo, then EVP_PKEY_verify against a DER-encoded
+;;; SEQUENCE { r, s } signature. HMAC-SHA256 is not accelerated
+;;; directly — it's pure Lisp, but its internal SHA-256 calls route
+;;; through the function cell and pick up the libssl swap for free.
+;;; ===========================================================================
+
+;;; ---------------------------------------------------------------------------
+;;; FFI bindings (digest)
+;;; ---------------------------------------------------------------------------
+
+(sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
+
+(sb-alien:define-alien-routine ("EVP_MD_CTX_free" %evp-md-ctx-free) sb-alien:void
+  (ctx (* t)))
+
+(sb-alien:define-alien-routine ("EVP_sha1"   %evp-sha1)   (* t))
+(sb-alien:define-alien-routine ("EVP_sha256" %evp-sha256) (* t))
+
+(sb-alien:define-alien-routine ("EVP_DigestInit_ex" %evp-digest-init-ex)
+    sb-alien:int
+  (ctx  (* t))
+  (md   (* t))
+  (impl (* t)))
+
+(sb-alien:define-alien-routine ("EVP_DigestUpdate" %evp-digest-update)
+    sb-alien:int
+  (ctx  (* t))
+  (data (* t))
+  (len  sb-alien:unsigned-long))
+
+(sb-alien:define-alien-routine ("EVP_DigestFinal_ex" %evp-digest-final-ex)
+    sb-alien:int
+  (ctx    (* t))
+  (md     (* t))
+  (outlen (* t)))
+
+;;; ---------------------------------------------------------------------------
+;;; FFI bindings (ECDSA verify via EVP_PKEY)
+;;; ---------------------------------------------------------------------------
+
+(sb-alien:define-alien-routine ("d2i_PUBKEY" %d2i-pubkey) (* t)
+  (a      (* t))
+  (pp     (* t))
+  (length sb-alien:long))
+
+(sb-alien:define-alien-routine ("EVP_PKEY_free" %evp-pkey-free) sb-alien:void
+  (pkey (* t)))
+
+(sb-alien:define-alien-routine ("EVP_PKEY_CTX_new" %evp-pkey-ctx-new) (* t)
+  (pkey   (* t))
+  (engine (* t)))
+
+(sb-alien:define-alien-routine ("EVP_PKEY_CTX_free" %evp-pkey-ctx-free)
+    sb-alien:void
+  (ctx (* t)))
+
+(sb-alien:define-alien-routine ("EVP_PKEY_verify_init" %evp-pkey-verify-init)
+    sb-alien:int
+  (ctx (* t)))
+
+(sb-alien:define-alien-routine ("EVP_PKEY_verify" %evp-pkey-verify) sb-alien:int
+  (ctx    (* t))
+  (sig    (* t))
+  (siglen sb-alien:unsigned-long)
+  (tbs    (* t))
+  (tbslen sb-alien:unsigned-long))
+
+;;; ---------------------------------------------------------------------------
+;;; SHA via EVP_MD_CTX
+;;; ---------------------------------------------------------------------------
+
+(defun %libssl-digest (evp-md data out-len)
+  "Compute a digest via OpenSSL's EVP interface. EVP-MD is the alien
+   pointer returned by %EVP-SHA1 or %EVP-SHA256. DATA is the input byte
+   vector. OUT-LEN is the expected digest size in bytes (20 for SHA-1,
+   32 for SHA-256). Returns a fresh OUT-LEN byte vector."
+  (let ((ctx (%evp-md-ctx-new)))
+    (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
+      (error "EVP_MD_CTX_new failed"))
+    (unwind-protect
+         (progn
+           (unless (= 1 (%evp-digest-init-ex ctx evp-md (sb-sys:int-sap 0)))
+             (error "EVP_DigestInit_ex failed"))
+           (sb-sys:with-pinned-objects (data)
+             (unless (= 1 (%evp-digest-update ctx
+                                              (sb-sys:vector-sap data)
+                                              (length data)))
+               (error "EVP_DigestUpdate failed")))
+           (let ((out (make-array out-len :element-type '(unsigned-byte 8))))
+             (sb-sys:with-pinned-objects (out)
+               ;; NULL out-len argument = skip writing the length back;
+               ;; we already know the size for a fixed-digest algorithm.
+               (unless (= 1 (%evp-digest-final-ex
+                             ctx
+                             (sb-sys:vector-sap out)
+                             (sb-sys:int-sap 0)))
+                 (error "EVP_DigestFinal_ex failed")))
+             out))
+      (%evp-md-ctx-free ctx))))
+
+(defun sha1-libssl (data)
+  "libssl-accelerated SHA-1. Matches SHA1-LISP's contract — byte-vector
+   in, 20-byte digest out."
+  (%libssl-digest (%evp-sha1) data 20))
+
+(defun sha256-libssl (data)
+  "libssl-accelerated SHA-256. Matches SHA256-LISP's contract — byte
+   vector in, 32-byte digest out."
+  (%libssl-digest (%evp-sha256) data 32))
+
+;;; ---------------------------------------------------------------------------
+;;; ECDSA P-256 verify via d2i_PUBKEY + EVP_PKEY_verify
+;;; ---------------------------------------------------------------------------
+
+(defparameter *p256-spki-prefix*
+  (make-array 27 :element-type '(unsigned-byte 8)
+              :initial-contents '(#x30 #x59 #x30 #x13
+                                   #x06 #x07 #x2A #x86 #x48 #xCE #x3D #x02 #x01
+                                   #x06 #x08 #x2A #x86 #x48 #xCE #x3D #x03 #x01 #x07
+                                   #x03 #x42 #x00 #x04))
+  "Fixed 27-byte DER prefix for a NIST P-256 SubjectPublicKeyInfo with
+   an uncompressed public-key point. Callers append X (32 bytes) and
+   Y (32 bytes) for a total 91-byte SPKI that d2i_PUBKEY parses as an
+   EVP_PKEY. Byte map:
+     30 59                               ; SEQUENCE, 89 bytes content
+       30 13                             ; SEQUENCE, 19 bytes content
+         06 07 2A 86 48 CE 3D 02 01      ; OID 1.2.840.10045.2.1 ecPublicKey
+         06 08 2A 86 48 CE 3D 03 01 07   ; OID 1.2.840.10045.3.1.7 prime256v1
+       03 42                             ; BIT STRING, 66 bytes content
+         00                              ; 0 unused bits
+         04                              ; uncompressed point marker
+         (caller appends 32-byte X, 32-byte Y)")
+
+(defun build-p256-spki (x y)
+  "Assemble a 91-byte DER SubjectPublicKeyInfo for a P-256 public key
+   from raw 32-byte X and Y coordinates. Fresh byte vector each call."
+  (let ((out (make-array 91 :element-type '(unsigned-byte 8))))
+    (replace out *p256-spki-prefix*)
+    (replace out x :start1 27 :end1 59)
+    (replace out y :start1 59 :end1 91)
+    out))
+
+(defun der-encode-ecdsa-signature (sig-bytes)
+  "DER-encode a raw 64-byte ECDSA signature (r || s, each 32 bytes
+   big-endian) as an ASN.1 SEQUENCE { INTEGER r, INTEGER s }. Returns
+   a fresh 70- to 72-byte vector depending on whether r or s has its
+   high bit set — each such case needs a 0x00 prefix to keep the
+   ASN.1 INTEGER positive."
+  (let* ((r-pad (logbitp 7 (aref sig-bytes 0)))
+         (s-pad (logbitp 7 (aref sig-bytes 32)))
+         (r-len (if r-pad 33 32))
+         (s-len (if s-pad 33 32))
+         (content-len (+ 2 r-len 2 s-len))
+         (out (make-array (+ 2 content-len) :element-type '(unsigned-byte 8)))
+         (pos 0))
+    (setf (aref out pos) #x30) (incf pos)         ; SEQUENCE tag
+    (setf (aref out pos) content-len) (incf pos)  ; SEQUENCE length
+    (setf (aref out pos) #x02) (incf pos)         ; INTEGER tag (r)
+    (setf (aref out pos) r-len) (incf pos)        ; r length
+    (when r-pad (setf (aref out pos) #x00) (incf pos))
+    (replace out sig-bytes :start1 pos :start2 0 :end2 32)
+    (incf pos 32)
+    (setf (aref out pos) #x02) (incf pos)         ; INTEGER tag (s)
+    (setf (aref out pos) s-len) (incf pos)        ; s length
+    (when s-pad (setf (aref out pos) #x00) (incf pos))
+    (replace out sig-bytes :start1 pos :start2 32 :end2 64)
+    out))
+
+(defun ecdsa-verify-p256-libssl (hash sig-bytes pubkey-x pubkey-y)
+  "libssl-accelerated ECDSA P-256 signature verification. Matches
+   ECDSA-VERIFY-P256-LISP's contract — all inputs are byte vectors,
+   returns T on valid, NIL on any failure. Builds a DER SubjectPublicKeyInfo
+   from the raw (X, Y) coordinates, parses it to an EVP_PKEY via
+   d2i_PUBKEY, DER-encodes the raw r||s signature, then calls
+   EVP_PKEY_verify. Cleanup via unwind-protect regardless of path.
+
+   Enforces low-S explicitly before handing off to OpenSSL:
+   EVP_PKEY_verify accepts both (r, s) and (r, n-s) as mathematically
+   valid ECDSA signatures, so without this check the libssl path would
+   silently diverge from the pure-Lisp path on the malleability test.
+   OpenSSL does reject r/s out of range and invalid-curve points
+   internally, so those checks are not duplicated here."
+  ;; Low-S enforcement — match ECDSA-VERIFY-P256-LISP's policy of
+  ;; mapping each message to exactly one accepted signature.
+  (when (> (bytes-to-integer (subseq sig-bytes 32 64))
+           (ash +p256-n+ -1))
+    (return-from ecdsa-verify-p256-libssl nil))
+  (let ((spki (build-p256-spki pubkey-x pubkey-y))
+        (sig-der (der-encode-ecdsa-signature sig-bytes))
+        (pkey nil)
+        (ctx nil))
+    (unwind-protect
+         (block verify
+           (sb-sys:with-pinned-objects (spki sig-der hash)
+             ;; d2i_PUBKEY wants `const unsigned char **` — a pointer to
+             ;; a pointer. We allocate PP on the alien stack, seed it
+             ;; with the SAP of the SPKI buffer, and pass its address.
+             (sb-alien:with-alien ((pp (* t)))
+               (setf pp (sb-alien:sap-alien (sb-sys:vector-sap spki) (* t)))
+               (setf pkey (%d2i-pubkey (sb-sys:int-sap 0)
+                                        (sb-alien:addr pp)
+                                        (length spki))))
+             (when (sb-sys:sap= (sb-alien:alien-sap pkey) (sb-sys:int-sap 0))
+               (setf pkey nil)
+               (return-from verify nil))
+             (setf ctx (%evp-pkey-ctx-new pkey (sb-sys:int-sap 0)))
+             (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
+               (setf ctx nil)
+               (return-from verify nil))
+             (unless (= 1 (%evp-pkey-verify-init ctx))
+               (return-from verify nil))
+             (= 1 (%evp-pkey-verify ctx
+                                    (sb-sys:vector-sap sig-der)
+                                    (length sig-der)
+                                    (sb-sys:vector-sap hash)
+                                    (length hash)))))
+      (when ctx  (%evp-pkey-ctx-free ctx))
+      (when pkey (%evp-pkey-free pkey)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Registration — hook into the core framework
 ;;; ---------------------------------------------------------------------------
@@ -446,4 +679,14 @@
 (eval-when (:load-toplevel :execute)
   (setf *https-fetch-fn* #'https-fetch)
   (setf *https-stream-fn* #'https-fetch-stream)
-  (log-info "tls: HTTPS fetch enabled"))
+  ;; Swap the pure-Lisp crypto primitives for libssl-backed versions.
+  ;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP remain reachable
+  ;; internally; TEST-PURE-LISP-CRYPTO uses them to re-verify the
+  ;; pure-Lisp paths on a libssl-enabled machine. HMAC-SHA256 is not
+  ;; swapped directly — it's pure-Lisp, but its internal SHA-256 calls
+  ;; route through the function cell and pick up this swap for free.
+  (setf (symbol-function 'sha1)              #'sha1-libssl
+        (symbol-function 'sha256)            #'sha256-libssl
+        (symbol-function 'ecdsa-verify-p256) #'ecdsa-verify-p256-libssl)
+  (log-info "tls: HTTPS fetch enabled")
+  (log-info "tls: crypto swapped to libssl (sha1, sha256, ecdsa-p256)"))

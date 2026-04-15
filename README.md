@@ -66,6 +66,8 @@ sbcl
 (web-skeleton-tests:test-algorithms)  ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
 (web-skeleton-tests:test-json)        ; JSON parser and serializer
 (web-skeleton-tests:test-server)      ; HTTP, URL, query, routing, JWT
+(web-skeleton-tests:test-store)       ; concurrent store and reaper
+(web-skeleton-tests:test-harness)     ; live-server test harness round-trips
 (web-skeleton-tests:test-tls)         ; TLS registration (skips if libssl absent)
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
@@ -76,7 +78,8 @@ sbcl
 ```
 web-skeleton.asd             ASDF system definition (the framework)
 web-skeleton-tls.asd         ASDF system definition (optional TLS/HTTPS)
-web-skeleton-tests.asd       ASDF system definition (test suite)
+web-skeleton-test-harness.asd  ASDF system definition (optional test harness)
+web-skeleton-tests.asd       ASDF system definition (framework test suite)
 web-skeleton-demo.asd        ASDF system definition (demo app)
 build.lisp                   Build standalone demo binary via save-lisp-and-die
 run-server.lisp              Entry point — load demo system and start server
@@ -86,6 +89,8 @@ src/
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   json.lisp                  JSON parser and serializer (RFC 8259)
+  random.lisp                Crypto random bytes and tokens (/dev/urandom)
+  store.lisp                 Concurrent keyed store with optional reaper
   tls.lisp                   libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
     word32.lisp              32-bit unsigned word ops (shared by SHA-1, SHA-256)
@@ -102,6 +107,7 @@ src/
     jwt.lisp                 JWT validation (ES256) and JWKS parsing
     static.lisp              In-memory static file cache and serving
     fetch.lisp               Outbound HTTP client (non-blocking fetch, streaming fetch)
+    dns.lisp                 Async DNS via getent ahosts subprocess
     main.lisp                epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp               Demo package declaration
@@ -110,9 +116,12 @@ demo/
 tests/
   package.lisp               Test package declaration
   run.lisp                   Test utilities and combined runner
+  harness.lisp               Ephemeral-port live server and request/frame builders
   test-algorithms.lisp       SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
   test-json.lisp             JSON parser and serializer tests
   test-server.lisp           HTTP, URL, query, routing, JWT tests
+  test-store.lisp            Concurrent store and reaper tests
+  test-harness.lisp          Test harness self-tests (live-server round-trips)
   test-tls.lisp              TLS roundtrip (skips gracefully without libssl)
 ```
 
@@ -175,15 +184,11 @@ tests/
   response. MIME detection, extensionless HTML aliases, directory traversal
   protection, ETag-based revalidation (`If-None-Match` → `304 Not Modified`
   using a SHA-256 strong entity tag computed at load time)
-- **Standalone binary** — `save-lisp-and-die` produces a single executable
-- **Test suite** — FIPS/RFC test vectors for all crypto primitives, JSON
-  round-trip tests, HTTP parser tests, JWT validation tests
-- **Test harness** — optional `web-skeleton-test-harness` ASDF system.
-  `with-test-server` spins an ephemeral-port live server,
-  `test-http-request` makes real HTTP round-trips inside test bodies,
-  `make-test-request` and `make-test-ws-frame` build structs for
-  unit-style handler tests. Downstream apps can depend on it in their
-  test build without pulling in the framework's own test suite
+- **Concurrent keyed store** — `make-store` returns a thread-safe
+  hash-table-backed store for app state (sessions, caches, rate-limit
+  counters). Optional background reaper sweeps entries on an
+  app-supplied predicate and registers its stop via the cleanup hook
+  machinery — no app-side teardown needed
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
@@ -198,18 +203,26 @@ tests/
   LLM token streams). Blocking — call from within a handler
 - **Outbound TLS** — HTTPS support in `http-fetch` and `http-fetch-stream` via
   optional `web-skeleton-tls` system. libssl FFI bindings, system CA
-  verification, SNI. Same API — just use `https://` URLs
+  verification, SNI. Same API — just use `https://` URLs. Loading this
+  system also swaps `sha1`, `sha256`, and `ecdsa-verify-p256` for
+  libssl-backed implementations via `setf symbol-function`; the pure-Lisp
+  versions remain reachable internally and `hmac-sha256` benefits
+  transparently because it calls `sha256` through the function cell
 - **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting, sends WebSocket
   close frames, flushes in-progress writes, force-closes after drain timeout
 - **Shutdown cleanup hooks** — apps register zero-argument functions via
   `register-cleanup` to run during graceful shutdown. Hooks fire in LIFO
   order inside the shutdown path after connection drain, each wrapped in
   `handler-case` so a raising hook cannot block the rest
-- **Concurrent keyed store** — `make-store` returns a thread-safe
-  hash-table-backed store for app state (sessions, caches, rate-limit
-  counters). Optional background reaper sweeps entries on an
-  app-supplied predicate and registers its stop via the cleanup hook
-  machinery — no app-side teardown needed
+- **Standalone binary** — `save-lisp-and-die` produces a single executable
+- **Test suite** — FIPS/RFC test vectors for all crypto primitives, JSON
+  round-trip tests, HTTP parser tests, JWT validation tests
+- **Test harness** — optional `web-skeleton-test-harness` ASDF system.
+  `with-test-server` spins an ephemeral-port live server,
+  `test-http-request` makes real HTTP round-trips inside test bodies,
+  `make-test-request` and `make-test-ws-frame` build structs for
+  unit-style handler tests. Downstream apps can depend on it in their
+  test build without pulling in the framework's own test suite
 - **Demo application** — separate ASDF system with static demo page and echo server
 
 ## Configuration
@@ -291,8 +304,3 @@ loop is already paused while the handler runs.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for project setup, configuration,
 and practical notes on building with web-skeleton.
-
-## Roadmap
-- **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
-  use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
-  remain the default when libssl is not present

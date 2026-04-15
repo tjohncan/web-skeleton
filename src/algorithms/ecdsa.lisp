@@ -139,12 +139,24 @@
 ;;; Public interface
 ;;; ---------------------------------------------------------------------------
 
-(defun ecdsa-verify-p256 (hash sig-bytes pubkey-x pubkey-y)
-  "Verify an ECDSA P-256 signature.
+(defun ecdsa-verify-p256-lisp (hash sig-bytes pubkey-x pubkey-y)
+  "Pure-Lisp ECDSA P-256 signature verification (FIPS 186-4).
    HASH: 32-byte SHA-256 digest of the signed message.
    SIG-BYTES: 64-byte signature (r || s, each 32 bytes big-endian).
    PUBKEY-X, PUBKEY-Y: 32-byte x and y coordinates of the public key.
-   Returns T if valid, NIL otherwise."
+   Returns T if valid, NIL otherwise.
+
+   Always reachable under this name regardless of whether
+   web-skeleton-tls has been loaded — the TLS system swaps the public
+   ECDSA-VERIFY-P256 symbol to a libssl-backed version at load time via
+   SETF SYMBOL-FUNCTION, but this function stays accessible directly
+   so the framework-dev entry point TEST-PURE-LISP-CRYPTO can re-verify
+   the pure-Lisp path on a libssl-enabled machine.
+
+   DO NOT declaim ECDSA-VERIFY-P256 inline: the libssl swap works
+   through the function cell, and an inlined caller would bypass the
+   cell and keep calling whichever implementation was visible at
+   compile time."
   (let ((r (bytes-to-integer (subseq sig-bytes 0 32)))
         (s (bytes-to-integer (subseq sig-bytes 32 64)))
         (qx (bytes-to-integer pubkey-x))
@@ -153,19 +165,19 @@
     ;; Check r, s in [1, n-1]
     (unless (and (<= 1 r (1- +p256-n+))
                  (<= 1 s (1- +p256-n+)))
-      (return-from ecdsa-verify-p256 nil))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; Enforce low-S to prevent signature malleability.
     ;; For any valid (r, s), (r, n-s) also verifies — reject high-S
     ;; so each message maps to exactly one accepted signature.
     (when (> s (ash +p256-n+ -1))
-      (return-from ecdsa-verify-p256 nil))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; Point-on-curve check (FIPS 186-4 §5.6.2.3.3):
     ;; reject invalid-curve points to prevent small-subgroup attacks
     (unless (= (mod-mul qy qy +p256-p+)
                (mod-add (mod-add (mod-mul qx (mod-mul qx qx +p256-p+) +p256-p+)
                                  (mod-mul +p256-a+ qx +p256-p+) +p256-p+)
                          +p256-b+ +p256-p+))
-      (return-from ecdsa-verify-p256 nil))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; w = s^-1 mod n
     (let* ((w (mod-inv s +p256-n+))
            ;; u1 = z*w mod n, u2 = r*w mod n
@@ -176,6 +188,13 @@
            (q (cons qx qy))
            (r-point (ec-add (ec-mul u1 g) (ec-mul u2 q))))
       (unless r-point
-        (return-from ecdsa-verify-p256 nil))
+        (return-from ecdsa-verify-p256-lisp nil))
       ;; Valid if R.x mod n == r
       (= (mod (car r-point) +p256-n+) r))))
+
+(defun ecdsa-verify-p256 (hash sig-bytes pubkey-x pubkey-y)
+  "Verify an ECDSA P-256 signature. Delegates to ECDSA-VERIFY-P256-LISP
+   by default; web-skeleton-tls replaces this function with a libssl-
+   backed version at load time. JWT-VERIFY and any other caller picks
+   up the swap transparently by routing through the function cell."
+  (ecdsa-verify-p256-lisp hash sig-bytes pubkey-x pubkey-y))
