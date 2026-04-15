@@ -689,9 +689,12 @@
                        (logior +epollin+ +epollet+))
             (unwind-protect
                 (run-event-loop listener epoll-fd handler ws-handler)
-              ;; Cleanup: close all connections, listener, epoll fd
+              ;; Cleanup: reap any in-flight DNS subprocesses first so
+              ;; a worker crash doesn't leak zombie getent children,
+              ;; then close all connections, listener, epoll fd.
               (maphash (lambda (fd conn)
                          (declare (ignore fd))
+                         (maybe-reap-dns-process conn)
                          (connection-close conn))
                        *connections*)
               (sb-bsd-sockets:socket-close listener)
