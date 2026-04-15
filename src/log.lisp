@@ -32,15 +32,28 @@
             year month day hour min sec)))
 
 (defun log-msg (level format-string &rest args)
-  "Log a message at LEVEL. Suppressed if below *log-level*."
+  "Log a message at LEVEL. Suppressed if below *log-level*.
+   A broken-pipe or closed *log-stream* falls back to *error-output*
+   rather than raising into the worker's hot path — a missed log line
+   is less harmful than a logger that crashes the request pipeline."
   (when (>= (log-level-value level) (log-level-value *log-level*))
     (sb-thread:with-mutex (*log-lock*)
       (let ((stream (or *log-stream* *standard-output*)))
-        (format stream "~a [~a] ~?~%"
-                (timestamp)
-                (string-upcase (symbol-name level))
-                format-string args)
-        (force-output stream)))))
+        (handler-case
+            (progn
+              (format stream "~a [~a] ~?~%"
+                      (timestamp)
+                      (string-upcase (symbol-name level))
+                      format-string args)
+              (force-output stream))
+          (error ()
+            (ignore-errors
+             (format *error-output*
+                     "~a [~a] (log stream failed) ~?~%"
+                     (timestamp)
+                     (string-upcase (symbol-name level))
+                     format-string args)
+             (force-output *error-output*))))))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))
