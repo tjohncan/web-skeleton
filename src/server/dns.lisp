@@ -93,8 +93,12 @@
    closure. When the pipe becomes readable, HANDLE-DNS-READY parses the
    output and fires DNS-THEN, which opens the TCP socket and transitions
    to :out-connecting — the existing outbound flow takes over from there."
+  ;; -- terminates getent's option parsing so a hostname that begins
+  ;; with '-' cannot be misread as a flag. Numeric IP literals never
+  ;; reach this path (parse-ipv4-literal / parse-ipv6-literal catch
+  ;; them earlier) so this is strictly a habit-of-care hardening.
   (let ((process (sb-ext:run-program "getent"
-                                      (list "ahosts" host)
+                                      (list "ahosts" "--" host)
                                       :output :stream
                                       :wait nil
                                       :search t)))
