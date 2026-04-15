@@ -36,6 +36,19 @@
    bodies — applying that 1 MiB inbound limit to outbound responses
    would reject legitimate 1 MiB HTTPS responses on principle.")
 
+(defparameter *max-streaming-line-size* (* 1 1024 1024)
+  "Maximum size of a single line in a streamed response (NDJSON,
+   SSE, chunked text). Default 1 MiB. Applied by the streaming
+   readers in FETCH-STREAM-PLAIN (via READER-READ-LINE /
+   READER-READ-BYTES) and TLS-STREAM-RESPONSE. Distinct from
+   *MAX-BODY-SIZE* (inbound request body cap) — the streaming
+   readers used to reach for *MAX-BODY-SIZE* out of convenience,
+   so tightening the inbound cap for request hardening would
+   silently break the app's NDJSON client. Distinct from
+   *MAX-OUTBOUND-RESPONSE-SIZE* too: this cap is per-line, not
+   per-response, because the streaming readers operate on one
+   line at a time and never buffer the whole response.")
+
 (defun http-fetch (method url &key headers body then)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
@@ -160,11 +173,28 @@
 ;;; URL parsing
 ;;; ---------------------------------------------------------------------------
 
+(defun %parse-port (authority start)
+  "Parse a decimal port number from AUTHORITY starting at START.
+   Raises a clean error on non-numeric input instead of letting
+   parse-integer's SIMPLE-TYPE-ERROR leak out of parse-url."
+  (handler-case (parse-integer authority :start start)
+    (error ()
+      (error "malformed URL authority: non-numeric port in ~a" authority))))
+
 (defun parse-authority (authority default-port)
   "Split an HTTP authority string into (values HOST PORT). Handles
    bracketed IPv6 literals per RFC 3986 §3.2.2: '[::1]:8080' → host '::1',
    port 8080. For unbracketed authorities, splits on the first (only)
-   colon between host and port."
+   colon between host and port.
+
+   Userinfo (user:pass@host) is rejected explicitly. RFC 7230 §2.7.1
+   deprecates the http(s) userinfo form and advises discarding it on
+   sight. We do not forward credentials, and silently accepting
+   user:pass@host would make the resulting Host header and any
+   origin checks work against the wrong string."
+  (when (find #\@ authority)
+    (error "malformed URL authority: userinfo not supported in ~a"
+           authority))
   (cond
     ;; Bracketed IPv6 literal
     ((and (> (length authority) 0) (char= (char authority 0) #\[))
@@ -174,14 +204,14 @@
        (let ((host (subseq authority 1 close))
              (rest (subseq authority (1+ close))))
          (if (and (> (length rest) 0) (char= (char rest 0) #\:))
-             (values host (parse-integer rest :start 1))
+             (values host (%parse-port rest 1))
              (values host default-port)))))
     ;; Plain host or IPv4 literal
     (t
      (let ((colon (position #\: authority)))
        (if colon
            (values (subseq authority 0 colon)
-                   (parse-integer authority :start (1+ colon)))
+                   (%parse-port authority (1+ colon)))
            (values authority default-port))))))
 
 (defun parse-url (url)
@@ -263,13 +293,32 @@
 
 (defun build-outbound-request (method host path &key (scheme :http) (port 80)
                                                       headers body)
-  "Build an HTTP/1.1 request as a byte vector ready to write."
+  "Build an HTTP/1.1 request as a byte vector ready to write.
+
+   IPv6 literal hosts are re-bracketed for the wire Host: value.
+   parse-authority strips the brackets from the internal HOST
+   string (correct — they're URL syntax, not part of the address),
+   but RFC 7230 §5.4 requires the Host header to be identical to
+   the authority component, and RFC 3986 §3.2.2 defines the IPv6
+   authority grammar as '[' IPv6address ']' with the brackets
+   mandatory. The old path emitted 'Host: ::1:8080' which is
+   unparseable — the boundary between address and port is
+   ambiguous — and strict upstreams 400 it. Adding the square
+   brackets back on the wire closes the parse-url → wire-form
+   asymmetry."
   (let* ((method-str (symbol-name method))
          (default-port-p (or (and (eq scheme :http) (= port 80))
                              (and (eq scheme :https) (= port 443))))
+         ;; Re-bracket IPv6 literals. An IPv6 address always contains
+         ;; at least one ':'; no DNS name, IPv4 literal, or port-qualified
+         ;; DNS name ever contains a ':' internally at this call point
+         ;; (parse-authority has already split port off). Detecting
+         ;; via colon is the minimal, allocation-free test.
+         (ipv6-p (find #\: host))
+         (wire-host (if ipv6-p (format nil "[~a]" host) host))
          (host-value (if default-port-p
-                         host
-                         (format nil "~a:~d" host port)))
+                         wire-host
+                         (format nil "~a:~d" wire-host port)))
          (body-bytes (etypecase body
                        (null nil)
                        (string (sb-ext:string-to-octets body
@@ -415,7 +464,10 @@
     n))
 
 (defun reader-read-line (r)
-  "Read a line from the buffered reader. Returns a string, or NIL at EOF."
+  "Read a line from the buffered reader. Returns a string, or NIL at
+   EOF with no pending line bytes. An EOF mid-line (no trailing LF)
+   flushes the accumulated partial line as the return value and
+   the next call returns NIL."
   (let ((line-buf (make-array 256 :element-type '(unsigned-byte 8)
                                   :fill-pointer 0 :adjustable t)))
     (loop
@@ -433,8 +485,10 @@
               (loop for i from pos below lf
                     for b = (aref buf i)
                     unless (= b 13)
-                    do (when (> (fill-pointer line-buf) *max-body-size*)
-                         (error "streaming response line too large"))
+                    do (when (> (fill-pointer line-buf)
+                                *max-streaming-line-size*)
+                         (error "streaming response line too large (max ~d)"
+                                *max-streaming-line-size*))
                        (vector-push-extend b line-buf))
               (setf (stream-reader-pos r) (1+ lf))
               (return (sb-ext:octets-to-string line-buf
@@ -443,14 +497,20 @@
               (loop for i from pos below end
                     for b = (aref buf i)
                     unless (= b 13)
-                    do (when (> (fill-pointer line-buf) *max-body-size*)
-                         (error "streaming response line too large"))
+                    do (when (> (fill-pointer line-buf)
+                                *max-streaming-line-size*)
+                         (error "streaming response line too large (max ~d)"
+                                *max-streaming-line-size*))
                        (vector-push-extend b line-buf))
               (setf (stream-reader-pos r) end)))))))
 
 (defun reader-read-bytes (r count line-buf on-line)
   "Read COUNT bytes through the buffered reader, splitting into lines.
-   Calls ON-LINE per complete line."
+   Calls ON-LINE per complete line. Returns the number of bytes
+   actually consumed — the caller compares against COUNT to detect
+   truncation (EOF before the requested body was delivered, which
+   is indistinguishable on the SBCL stream layer from SO_RCVTIMEO
+   firing mid-stream)."
   (let ((remaining count))
     (loop while (> remaining 0) do
       (when (>= (stream-reader-pos r) (stream-reader-end r))
@@ -470,22 +530,43 @@
                                         :external-format :utf-8)))
                     (setf (fill-pointer line-buf) 0))
                    ((= byte 13) nil)
-                   (t (when (> (fill-pointer line-buf) *max-body-size*)
-                        (error "streaming response line too large"))
+                   (t (when (> (fill-pointer line-buf)
+                               *max-streaming-line-size*)
+                        (error "streaming response line too large (max ~d)"
+                               *max-streaming-line-size*))
                       (vector-push-extend byte line-buf))))
         (incf (stream-reader-pos r) take)
-        (decf remaining take)))))
+        (decf remaining take)))
+    (- count remaining)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response streaming
 ;;; ---------------------------------------------------------------------------
 
 (defun stream-response-lines (stream on-line)
-  "Read an HTTP response from a byte stream. Skip headers, call ON-LINE
-   per body line. Handles chunked transfer encoding. Returns the status code."
+  "Read an HTTP response from a byte stream. Skip headers, call
+   ON-LINE per body line. Handles chunked transfer encoding.
+   Returns the status code.
+
+   Truncation discipline on the streaming path:
+     - chunked: stream-chunked-lines raises if the zero-size
+       terminator never arrives. Same contract as decode-chunked-body
+       for the buffered path.
+     - content-length (no TE): reader-read-bytes is called with the
+       declared length; a short return means EOF (or SO_RCVTIMEO on
+       the underlying blocking socket) before the full body was
+       delivered — raise so the caller sees a loud error instead of
+       a silently short stream. This is the plain-HTTP twin of the
+       SSL_ERROR_SYSCALL discipline in tls.lisp's ssl-read-eof-or-raise.
+     - close-delimited (no TE, no CL): by definition the connection
+       close IS the end; we cannot distinguish a legitimate end from
+       a premature RST without out-of-band framing, so treat clean
+       EOF as complete. Apps that care about this case should use a
+       framed path upstream."
   (let ((r (make-stream-reader stream))
         (status nil)
-        (chunked nil))
+        (chunked nil)
+        (content-length nil))
     ;; Read status line + headers
     (loop for line = (reader-read-line r)
           for first = t then nil
@@ -501,32 +582,107 @@
                                       :end1 18))
                (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
                  (when (connection-header-has-token-p value "chunked")
-                   (setf chunked t)))))
+                   (setf chunked t))))
+             (when (and (>= (length line) 15)
+                        (string-equal line "content-length:"
+                                      :end1 15))
+               (let ((value (string-trim '(#\Space #\Tab) (subseq line 15))))
+                 (setf content-length
+                       (handler-case (parse-integer value)
+                         (error () nil))))))
     ;; Stream body lines
-    (if chunked
-        (stream-chunked-lines r on-line)
-        (loop for line = (reader-read-line r)
-              while line
-              do (when on-line (funcall on-line line))))
+    (cond
+      (chunked
+       (stream-chunked-lines r on-line))
+      ((and content-length (not chunked))
+       ;; Framed non-chunked. Track bytes against CL so SO_RCVTIMEO
+       ;; or peer RST mid-body raises loud instead of quietly ending
+       ;; the stream. RFC 7230 §3.3.3 order: TE wins over CL, so we
+       ;; only reach this branch when the response has CL and no TE.
+       (let* ((line-buf (make-array 4096 :element-type '(unsigned-byte 8)
+                                         :fill-pointer 0 :adjustable t))
+              (consumed (reader-read-bytes r content-length line-buf on-line)))
+         (when (< consumed content-length)
+           (error "streaming response short body: ~d of ~d bytes"
+                  consumed content-length))
+         ;; Flush any final unterminated line so the app sees the
+         ;; last fragment even when the upstream omitted a trailing
+         ;; newline — matches reader-read-line's EOF-with-partial
+         ;; behavior.
+         (when (> (fill-pointer line-buf) 0)
+           (when on-line
+             (funcall on-line (sb-ext:octets-to-string
+                               line-buf :external-format :utf-8))))))
+      (t
+       ;; Close-delimited — trust EOF as the framing signal.
+       (loop for line = (reader-read-line r)
+             while line
+             do (when on-line (funcall on-line line)))))
     (or status 0)))
 
+(defun parse-chunked-size-line (size-line)
+  "Parse a chunked-transfer size token from SIZE-LINE. Strips
+   chunk-extensions (RFC 7230 §4.1.1 — everything from ';' onwards),
+   requires at least one hex digit, and raises on parse failure.
+   Returns the integer size (0 for the final chunk).
+
+   Shared between stream-chunked-lines (plain streaming) and
+   tls-stream-response (tls streaming) so both paths reject the
+   same garbage inputs. The pre-pack-16 shape used
+   parse-integer :junk-allowed t which silently accepted 'xyz'
+   as NIL (treated as final chunk — loop exits clean) and '-5'
+   as -5 (loop exits clean) — a parser-disagreement smuggling
+   primitive against any stricter downstream."
+  (let* ((semi (position #\; size-line))
+         (hex-end (or semi (length size-line)))
+         (hex (string-trim '(#\Space #\Tab) (subseq size-line 0 hex-end))))
+    (when (zerop (length hex))
+      (error "chunked: empty chunk-size line"))
+    (loop for ch across hex
+          unless (or (char<= #\0 ch #\9)
+                     (char<= #\A (char-upcase ch) #\F))
+          do (error "chunked: non-hex byte in chunk-size ~s" hex))
+    (parse-integer hex :radix 16)))
+
+(defun parse-chunked-size-bytes (bytes start end)
+  "Byte-buffer entry point for PARSE-CHUNKED-SIZE-LINE. Used by
+   tls-stream-response which accumulates the chunk-size line in a
+   (unsigned-byte 8) fill-pointered buffer — this wrapper converts
+   and calls the string-level parser so the strict acceptance set
+   is identical on both sides of the tls/plaintext split."
+  (parse-chunked-size-line
+   (sb-ext:octets-to-string bytes :start start :end end
+                                   :external-format :ascii)))
+
 (defun stream-chunked-lines (r on-line)
-  "Decode chunked transfer encoding via buffered reader R."
+  "Decode chunked transfer encoding via buffered reader R. Requires
+   the zero-size chunk terminator (RFC 7230 §4.1) — a reader that
+   runs out before seeing it raises, matching decode-chunked-body's
+   truncation discipline so the async and streaming paths cannot
+   diverge on incomplete input."
   (let ((line-buf (make-array 4096 :element-type '(unsigned-byte 8)
-                                   :fill-pointer 0 :adjustable t)))
+                                   :fill-pointer 0 :adjustable t))
+        (terminated nil))
     (loop
-      (let* ((size-line (reader-read-line r))
-             (chunk-size (when (and size-line (> (length size-line) 0))
-                           (parse-integer size-line :radix 16 :junk-allowed t))))
-        (unless (and chunk-size (> chunk-size 0))
-          (when (> (fill-pointer line-buf) 0)
-            (when on-line
-              (funcall on-line (sb-ext:octets-to-string
-                                line-buf :external-format :utf-8))))
-          (return))
-        (reader-read-bytes r chunk-size line-buf on-line)
-        ;; Consume trailing CRLF
-        (reader-read-line r)))))
+      (let ((size-line (reader-read-line r)))
+        (unless size-line
+          (return))  ; stream EOF — handled by terminated check below
+        ;; PARSE-CHUNKED-SIZE-LINE raises on empty input, non-hex,
+        ;; and trailing garbage, so a lax or truncated chunk-size
+        ;; line fails loudly here.
+        (let ((chunk-size (parse-chunked-size-line size-line)))
+          (when (zerop chunk-size)
+            (setf terminated t)
+            (return))
+          (reader-read-bytes r chunk-size line-buf on-line)
+          ;; Consume trailing CRLF after chunk-data
+          (reader-read-line r))))
+    (unless terminated
+      (error "chunked: incomplete stream (no zero-size terminator)"))
+    (when (> (fill-pointer line-buf) 0)
+      (when on-line
+        (funcall on-line (sb-ext:octets-to-string
+                          line-buf :external-format :utf-8))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
@@ -579,39 +735,56 @@
   (let ((socket (make-instance (if (eq family :inet)
                                    'sb-bsd-sockets:inet-socket
                                    'sb-bsd-sockets:inet6-socket)
-                               :type :stream :protocol :tcp)))
+                               :type :stream :protocol :tcp))
+        (out-conn nil)
+        (registered nil)
+        (epoll-added nil)
+        (done nil))
     (handler-case
-        (progn
-          (set-nonblocking (socket-fd socket))
-          (handler-case
-              (sb-bsd-sockets:socket-connect socket ip port)
-            (sb-bsd-sockets:socket-error () nil))
-          (let* ((out-fd (socket-fd socket))
-                 (request-bytes (build-outbound-request
-                                (http-fetch-continuation-method fetch-req)
-                                host path
-                                :port port
-                                :headers (http-fetch-continuation-headers fetch-req)
-                                :body (http-fetch-continuation-body fetch-req)))
-                 (out-conn (make-connection
-                            :fd out-fd
-                            :socket socket
-                            :state :out-connecting
-                            :outbound-p t
-                            :inbound-fd (connection-fd conn)
-                            :fetch-callback (http-fetch-continuation-callback fetch-req)
-                            :last-active (get-universal-time))))
-            (connection-queue-write out-conn request-bytes)
-            (register-connection out-conn)
-            (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
-            (setf (connection-state conn) :awaiting
-                  (connection-awaiting-fd conn) out-fd)
-            (log-debug "fetch: fd ~d -> ~a :~d~a (outbound fd ~d, ~a)"
-                       (connection-fd conn) host port path out-fd family)))
+        (unwind-protect
+             (progn
+               (set-nonblocking (socket-fd socket))
+               (handler-case
+                   (sb-bsd-sockets:socket-connect socket ip port)
+                 (sb-bsd-sockets:socket-error () nil))
+               (let* ((out-fd (socket-fd socket))
+                      (request-bytes (build-outbound-request
+                                      (http-fetch-continuation-method fetch-req)
+                                      host path
+                                      :port port
+                                      :headers (http-fetch-continuation-headers fetch-req)
+                                      :body (http-fetch-continuation-body fetch-req))))
+                 (setf out-conn (make-connection
+                                 :fd out-fd
+                                 :socket socket
+                                 :state :out-connecting
+                                 :outbound-p t
+                                 :inbound-fd (connection-fd conn)
+                                 :fetch-callback (http-fetch-continuation-callback fetch-req)
+                                 :last-active (get-universal-time)))
+                 (connection-queue-write out-conn request-bytes)
+                 (register-connection out-conn)
+                 (setf registered t)
+                 (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
+                 (setf epoll-added t)
+                 (setf (connection-state conn) :awaiting
+                       (connection-awaiting-fd conn) out-fd)
+                 (log-debug "fetch: fd ~d -> ~a :~d~a (outbound fd ~d, ~a)"
+                            (connection-fd conn) host port path out-fd family)
+                 (setf done t)))
+          ;; Error path: if the error landed after REGISTER-CONNECTION but
+          ;; before we finished wiring, tear down partial state. Symmetric
+          ;; with ACCEPT-CONNECTION's flagged-unwind shape — the pre-
+          ;; pack-16 handler-case unregistered but never called
+          ;; EPOLL-REMOVE, leaving a latent stale-entry window if a
+          ;; refactor ever moved setf/log-debug into the raising region.
+          (unless done
+            (when (and registered epoll-added out-conn)
+              (ignore-errors
+               (epoll-remove epoll-fd (connection-fd out-conn))))
+            (when (and registered out-conn)
+              (unregister-connection out-conn))))
       (error (e)
-        (let* ((fd (sb-bsd-sockets:socket-file-descriptor socket))
-               (stale (when (>= fd 0) (lookup-connection fd))))
-          (when stale (unregister-connection stale)))
         (ignore-errors (sb-bsd-sockets:socket-close socket))
         (error e)))))
 
@@ -741,10 +914,20 @@
        ;; Server closed connection — response is complete (Connection: close)
        (complete-fetch conn epoll-fd))
       (:full
-       ;; Buffer full — response truncated at *max-body-size*
-       (log-warn "fetch: response truncated at ~d bytes on fd ~d"
-                 (connection-read-pos conn) (connection-fd conn))
-       (complete-fetch conn epoll-fd))
+       ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. The old path here
+       ;; logged a warn and called COMPLETE-FETCH, which routed through
+       ;; the happy-path callback with a silently-truncated body: fine
+       ;; for a content-length-framed response (the truncation guard
+       ;; in COMPLETE-FETCH catches it) and fine for chunked
+       ;; (DECODE-CHUNKED-BODY raises on missing terminator), but a
+       ;; CONNECTION: close-framed response has neither guard and the
+       ;; app would receive an 8-MiB-truncated body as 'success'.
+       ;; Route through DELIVER-FETCH-ERROR so the inbound gets a 502
+       ;; and the fetch callback's cleanup sentinel fires.
+       (deliver-fetch-error
+        conn epoll-fd
+        (format nil "response exceeds ~d bytes (cap)"
+                *max-outbound-response-size*)))
       (:again nil)  ; wait for more data
       (:ok
        ;; Got data — check if we have a complete response
@@ -862,20 +1045,30 @@
   "Parse the outbound response and deliver it to the parked inbound connection."
   (let* ((buf (connection-read-buf out-conn))
          (pos (connection-read-pos out-conn))
-         (header-end (scan-crlf-crlf buf 0 pos))
-         (status (when header-end (parse-response-status buf 0 pos)))
-         (body-start (when header-end (+ header-end 4)))
-         ;; Parse response headers
-         (headers (when header-end
-                    (let ((first-crlf (scan-crlf buf 0 header-end)))
+         (header-end (scan-crlf-crlf buf 0 pos)))
+    ;; Gate on complete headers. The pre-pack-16 shape let every
+    ;; downstream (when header-end ...) short-circuit to NIL and then
+    ;; fired the callback with (0 NIL NIL), which violated the
+    ;; DEPLOYMENT.md contract (happy path = integer status, cleanup
+    ;; path = all-NIL sentinel — never a zero status). Apps pattern-
+    ;; matching on (if status ...) saw 0 as truthy, routed to the
+    ;; happy branch, and blew up interpreting the integer 0 as an
+    ;; HTTP status. Route through DELIVER-FETCH-ERROR when headers
+    ;; are incomplete so the inbound gets a 502 and the callback
+    ;; fires its cleanup sentinel.
+    (unless header-end
+      (deliver-fetch-error out-conn epoll-fd
+                           "upstream response has no parseable headers")
+      (return-from complete-fetch))
+    (let* ((status (parse-response-status buf 0 pos))
+           (body-start (+ header-end 4))
+           (headers (let ((first-crlf (scan-crlf buf 0 header-end)))
                       (when first-crlf
                         (parse-headers-bytes buf (+ first-crlf 2)
-                                             (+ header-end 4))))))
-         ;; Extract body, capped at Content-Length when present and not chunked
-         ;; (RFC 7230 §3.3.3: TE takes precedence over CL)
-         (chunked-p (response-chunked-p headers))
-         (content-length (when (and header-end (not chunked-p))
-                           (scan-content-length buf header-end))))
+                                             (+ header-end 4)))))
+           (chunked-p (response-chunked-p headers))
+           (content-length (unless chunked-p
+                             (scan-content-length buf header-end))))
     ;; Truncation guard: if the upstream declared a Content-Length
     ;; and we hit EOF before receiving that many body bytes, the
     ;; response is incomplete. Passing the partial body to the
@@ -884,7 +1077,7 @@
     ;; the attacker can RST at any point. Abort through
     ;; deliver-fetch-error so the callback fires its cleanup path
     ;; and the inbound gets a 502 instead of a short body.
-    (when (and content-length body-start
+    (when (and content-length
                (< (- pos body-start) content-length))
       (deliver-fetch-error out-conn epoll-fd
                            (format nil "short body: ~d of ~d bytes"
@@ -950,7 +1143,7 @@
             ;; "callback fires once per fetch lifetime".
             (handler-case (funcall callback nil nil nil)
               (error (e)
-                (log-warn "fetch cleanup callback raised: ~a" e))))))))
+                (log-warn "fetch cleanup callback raised: ~a" e)))))))))
 
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."

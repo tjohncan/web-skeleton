@@ -516,6 +516,24 @@
                   (let ((name (bytes-to-lowercase-string buf pos colon)))
                     (multiple-value-bind (vs ve)
                         (trim-ows-bounds buf (1+ colon) crlf)
+                      ;; RFC 7230 §3.2: field-value excludes CTLs
+                      ;; except HTAB. scan-crlf only terminates on
+                      ;; the CRLF pair, so a bare CR, bare LF, NUL,
+                      ;; or other CTL embedded in a value survives
+                      ;; into the alist — and from there into any
+                      ;; ~a-interpolated log line. Same log-injection
+                      ;; shape the request-target and method checks
+                      ;; already close in parse-request-bytes, and
+                      ;; symmetric with serialize-http-message's
+                      ;; value reject on egress. The asymmetry was
+                      ;; the bug — inbound accepted bytes the
+                      ;; outbound side would refuse to emit.
+                      (loop for i from vs below ve
+                            for b = (aref buf i)
+                            when (or (and (< b #x20) (/= b 9))
+                                     (= b #x7F))
+                            do (http-parse-error
+                                "invalid byte 0x~2,'0x in header value" b))
                       (push (cons name (if (= vs ve) ""
                                            (bytes-to-string buf vs ve)))
                             headers)
