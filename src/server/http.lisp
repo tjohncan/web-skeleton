@@ -399,10 +399,15 @@
                     (http-parse-error "malformed header (no colon)"))
                   (when (= colon pos)
                     (http-parse-error "empty header name"))
-                  ;; Reject whitespace in header name
+                  ;; Reject whitespace, CTL, and DEL in header name
+                  ;; (RFC 7230 §3.2: token excludes all controls and 0x7F).
+                  ;; Same discipline as the request-target check in
+                  ;; parse-request-bytes — a NUL or CR hidden in a header
+                  ;; name is a smuggling primitive if it reaches assoc.
                   (loop for i from pos below colon
-                        when (let ((b (aref buf i))) (or (= b 32) (= b 9)))
-                        do (http-parse-error "whitespace in header name"))
+                        for b = (aref buf i)
+                        when (or (<= b #x20) (= b #x7F))
+                        do (http-parse-error "invalid byte in header name"))
                   (let ((name (bytes-to-lowercase-string buf pos colon)))
                     (multiple-value-bind (vs ve)
                         (trim-ows-bounds buf (1+ colon) crlf)

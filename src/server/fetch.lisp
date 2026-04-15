@@ -202,10 +202,29 @@
       ((and (>= (length url) 7) (string-equal url "http://" :end1 7))
        (setf scheme :http authority-start 7 default-port 80))
       (t (error "unsupported URL scheme: ~a" url)))
-    (let* ((path-start (or (position #\/ url :start authority-start)
-                           (length url)))
+    ;; Authority ends at the first '/', '?', or '#' (RFC 3986 §3.2 /
+    ;; §3.4). A URL like 'http://host?q=1' has no path segment at all,
+    ;; so if we only looked for '/' we would parse "host?q=1" as the
+    ;; hostname and dial it.
+    (let* ((end       (length url))
+           (path-start
+            (or (loop for i from authority-start below end
+                      for ch = (char url i)
+                      when (or (char= ch #\/)
+                               (char= ch #\?)
+                               (char= ch #\#))
+                      return i)
+                end))
            (authority (subseq url authority-start path-start))
-           (path (if (= path-start (length url)) "/" (subseq url path-start))))
+           (path
+            (cond
+              ((= path-start end) "/")
+              ((char= (char url path-start) #\/)
+               (subseq url path-start))
+              ;; No path segment — synthesize '/' so the origin-form
+              ;; request-target is well-formed (HTTP/1.1 §5.3).
+              (t
+               (concatenate 'string "/" (subseq url path-start))))))
       (multiple-value-bind (host port) (parse-authority authority default-port)
         (values scheme host port path)))))
 

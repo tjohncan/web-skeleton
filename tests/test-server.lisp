@@ -148,6 +148,25 @@
                 (crlf (format nil "GET /foo~cbar HTTP/1.1" #\Tab)
                       "Host: localhost")))
 
+  ;; CTL / DEL bytes in header NAMES rejected (RFC 7230 §3.2).
+  ;; Previously only space and tab were rejected; NUL or DEL slipped
+  ;; through into the header alist.
+  (check-error "NUL in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "X-~aBad: v" (code-char 0))
+                      "Host: localhost")))
+  (check-error "DEL in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "X-~aBad: v" (code-char #x7f))
+                      "Host: localhost")))
+  (check-error "CR in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "X-~aBad: v" #\Return)
+                      "Host: localhost")))
+
   ;; Oversized request line
   (check-error "oversized request line"
                (let ((web-skeleton:*max-request-line-length* 10))
@@ -491,6 +510,30 @@
     (declare (ignore scheme host))
     (check "https custom port" port 8443)
     (check "https ip path"     path "/health"))
+
+  ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4).
+  ;; Before the fix, 'http://host?q=1' parsed the whole 'host?q=1'
+  ;; as the authority and dialed a hostname containing '?'.
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://example.com?q=1")
+    (declare (ignore scheme))
+    (check "query-only: host" host "example.com")
+    (check "query-only: port" port 80)
+    (check "query-only: path" path "/?q=1"))
+
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://example.com#frag")
+    (declare (ignore scheme))
+    (check "fragment-only: host" host "example.com")
+    (check "fragment-only: port" port 80)
+    (check "fragment-only: path" path "/#frag"))
+
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://example.com:8080?x=1&y=2")
+    (declare (ignore scheme))
+    (check "query+port: host" host "example.com")
+    (check "query+port: port" port 8080)
+    (check "query+port: path" path "/?x=1&y=2"))
 
   ;; Request building
   (let* ((bytes (web-skeleton::build-outbound-request
