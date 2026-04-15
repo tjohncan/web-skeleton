@@ -692,7 +692,8 @@
   (loop
     (handler-case
         (let ((*connections* (make-hash-table :test #'eql))
-              (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8)))
+              (*epoll-ctl-buf* (make-array +epoll-event-size+
+                                           :element-type '(unsigned-byte 8)))
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
           (let* ((listener (make-tcp-listener host port))
                  (epoll-fd (epoll-create)))

@@ -24,6 +24,34 @@
 (defconstant +epollhup+ #x010)    ; hang up
 (defconstant +epollet+  (ash 1 31))  ; edge-triggered
 
+;;; struct epoll_event layout
+;;;
+;;; Linux UAPI declares struct epoll_event with __attribute__((packed))
+;;; on x86_64 only (see include/uapi/linux/eventpoll.h). Every other
+;;; arch follows natural alignment, so the u64 data union forces 4
+;;; bytes of padding after the u32 events field:
+;;;
+;;;   x86_64:   events@0 (4) + data@4 (8)                = 12 bytes
+;;;   arm64:    events@0 (4) + pad@4 (4) + data@8 (8)    = 16 bytes
+;;;
+;;; Hardcoding 12 everywhere would silently break the framework on
+;;; aarch64: epoll_wait would overflow the caller-supplied buffer
+;;; (heap corruption) and the per-event field offsets would be
+;;; off-by-(4*index) (garbage fd reads). Fail loudly at load time on
+;;; any target we haven't verified instead of assuming a layout.
+(defconstant +epoll-event-size+
+  #+x86-64 12
+  #+arm64  16
+  #-(or x86-64 arm64)
+  (error "epoll struct layout not verified for this SBCL target. ~
+          Patch src/epoll.lisp after consulting include/uapi/linux/eventpoll.h."))
+
+(defconstant +epoll-event-data-offset+
+  #+x86-64 4
+  #+arm64  8
+  #-(or x86-64 arm64)
+  (error "epoll struct layout not verified for this SBCL target."))
+
 ;;; fcntl commands and flags
 (defconstant +f-getfl+ 3)
 (defconstant +f-setfl+ 4)
@@ -171,17 +199,25 @@
     fd))
 
 (defvar *epoll-ctl-buf* nil
-  "Pre-allocated 12-byte buffer for epoll_ctl calls. Bound per-worker.")
+  "Pre-allocated struct epoll_event buffer for epoll_ctl calls.
+   Bound per-worker. Length is +EPOLL-EVENT-SIZE+ bytes — the
+   packed x86_64 layout is 12, arm64's naturally aligned layout
+   is 16.")
 
 (defun %epoll-ctl-call (epoll-fd op fd events)
   "Internal: populate the ctl buffer and call epoll_ctl."
   (let ((event (or *epoll-ctl-buf*
-                   (make-array 12 :element-type '(unsigned-byte 8)))))
-    ;; struct epoll_event: uint32_t events + epoll_data_t data
-    ;; We store the fd in the data union (offset 4, as int32)
+                   (make-array +epoll-event-size+
+                               :element-type '(unsigned-byte 8)))))
+    ;; struct epoll_event: u32 events + epoll_data_t data.
+    ;; Stash the fd in the low 32 bits of the data u64.
     (pack-le-u32 event 0 events)
-    (pack-le-u32 event 4 fd)
-    (pack-le-u32 event 8 0)
+    ;; Zero the 4 bytes of alignment padding between events and data
+    ;; on naturally aligned arches. x86_64 packs the struct, so this
+    ;; line is elided by the reader and there is nothing to zero.
+    #+arm64 (pack-le-u32 event 4 0)
+    (pack-le-u32 event +epoll-event-data-offset+       fd)
+    (pack-le-u32 event (+ +epoll-event-data-offset+ 4) 0)
     (sb-sys:with-pinned-objects (event)
       (let ((result (%epoll-ctl epoll-fd op fd
                                 (sb-sys:vector-sap event))))
@@ -205,7 +241,7 @@
 
 (defun epoll-wait (epoll-fd event-buf max-events timeout-ms)
   "Wait for events on EPOLL-FD into pre-allocated EVENT-BUF.
-   EVENT-BUF must be at least (* MAX-EVENTS 12) bytes.
+   EVENT-BUF must be at least (* MAX-EVENTS +EPOLL-EVENT-SIZE+) bytes.
    Returns the number of events ready (0 on timeout or interrupt).
    Caller reads events via EPOLL-EVENT-FD and EPOLL-EVENT-FLAGS."
   (sb-sys:with-pinned-objects (event-buf)
@@ -223,16 +259,23 @@
 (declaim (inline epoll-event-fd epoll-event-flags))
 
 (defun epoll-event-fd (event-buf index)
-  "Read the fd from event at INDEX in EVENT-BUF."
-  (unpack-le-u32 event-buf (+ (* index 12) 4)))
+  "Read the fd from event at INDEX in EVENT-BUF. The fd lives in the
+   low 32 bits of the epoll_data_t union, which sits at
+   +EPOLL-EVENT-DATA-OFFSET+ within each struct epoll_event."
+  (unpack-le-u32 event-buf
+                 (+ (* index +epoll-event-size+)
+                    +epoll-event-data-offset+)))
 
 (defun epoll-event-flags (event-buf index)
   "Read the event flags from event at INDEX in EVENT-BUF."
-  (unpack-le-u32 event-buf (* index 12)))
+  (unpack-le-u32 event-buf (* index +epoll-event-size+)))
 
 (defun make-epoll-event-buf (max-events)
-  "Allocate a reusable event buffer for MAX-EVENTS."
-  (make-array (* max-events 12) :element-type '(unsigned-byte 8)))
+  "Allocate a reusable event buffer for MAX-EVENTS.
+   Sized at MAX-EVENTS * sizeof(struct epoll_event) for the running
+   arch (12 bytes per event on x86_64, 16 on arm64)."
+  (make-array (* max-events +epoll-event-size+)
+              :element-type '(unsigned-byte 8)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Socket options
