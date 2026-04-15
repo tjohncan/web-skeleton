@@ -44,8 +44,8 @@
 (defun json-parse-string (str pos)
   "Parse a JSON string starting at the opening quote at POS.
    Handles all escape sequences including \\uXXXX.
-   Returns (values string new-pos)."
-  (assert (char= (char str pos) #\"))
+   Returns (values string new-pos).
+   Caller is responsible for checking the opening quote."
   (incf pos)
   (let ((out (make-array 64 :element-type 'character :fill-pointer 0 :adjustable t))
         (len (length str)))
@@ -215,8 +215,8 @@
       (t (error "json: unexpected character '~a' at ~d" ch pos)))))
 
 (defun json-parse-object (str pos &optional (depth 0))
-  "Parse a JSON object at POS. Returns (values alist new-pos)."
-  (assert (char= (char str pos) #\{))
+  "Parse a JSON object at POS. Returns (values alist new-pos).
+   Caller (json-parse-value) has already dispatched on the opening '{'."
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
@@ -226,6 +226,11 @@
     (loop
       (setf pos (json-skip-whitespace str pos))
       (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
+      ;; Object keys must be quoted strings (RFC 8259 §4). This is the
+      ;; one json-parse-string call site without an upstream dispatch,
+      ;; so the check belongs here rather than inside json-parse-string.
+      (unless (char= (char str pos) #\")
+        (error "json: expected string key at ~d" pos))
       (multiple-value-bind (key new-pos) (json-parse-string str pos)
         (setf pos (json-skip-whitespace str new-pos))
         (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
@@ -243,8 +248,8 @@
             (t (error "json: expected ',' or '}' at ~d" pos))))))))
 
 (defun json-parse-array (str pos &optional (depth 0))
-  "Parse a JSON array at POS. Returns (values list new-pos)."
-  (assert (char= (char str pos) #\[))
+  "Parse a JSON array at POS. Returns (values list new-pos).
+   Caller (json-parse-value) has already dispatched on the opening '['."
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
@@ -312,8 +317,13 @@
      (let* ((*read-default-float-format* 'double-float)
             (s (write-to-string (coerce value 'double-float))))
        (write-string s stream)))
-    ;; Alist (object) — detected by first element being a cons with string car
-    ((and (consp value) (consp (car value)) (stringp (caar value)))
+    ;; Alist (object) — every element must be a cons with a string car.
+    ;; Checking only the first element was a footgun: a mixed list like
+    ;; '(("foo" . 1) "bar") would route to json-write-object and crash
+    ;; mid-serialize. Checking every element falls back to the array
+    ;; branch on mixed input, producing well-formed (if surprising) JSON.
+    ((and (consp value)
+          (every (lambda (el) (and (consp el) (stringp (car el)))) value))
      (json-write-object value stream))
     ;; List (array)
     ((consp value)
