@@ -18,16 +18,18 @@
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
   (remote-addr nil)                           ; peer IP as string, or NIL for outbound
   ;; Protocol state
-  ;;   :read-http       — accumulating HTTP request bytes
-  ;;   :read-body       — have headers, reading Content-Length body
-  ;;   :write-response  — sending HTTP response (keep-alive or close when done)
-  ;;   :ws-upgrade      — sending WebSocket handshake (switch to :websocket when done)
-  ;;   :websocket       — reading/writing WebSocket frames
-  ;;   :closing         — sending close frame (disconnect when done)
-  ;;   :awaiting        — parked, waiting for outbound fetch to complete
-  ;;   :out-connecting   — outbound: TCP connect in progress
-  ;;   :out-write        — outbound: sending HTTP request
-  ;;   :out-read         — outbound: reading HTTP response
+  ;;   :read-http             — accumulating HTTP request bytes
+  ;;   :read-body             — have headers, reading Content-Length body
+  ;;   :sending-100-continue  — flushing interim status before body read
+  ;;   :write-response        — sending HTTP response (keep-alive or close when done)
+  ;;   :ws-upgrade            — sending WebSocket handshake
+  ;;   :websocket             — reading/writing WebSocket frames
+  ;;   :closing               — sending close frame (disconnect when done)
+  ;;   :awaiting              — parked, waiting for outbound fetch to complete
+  ;;   :out-dns               — outbound: getent subprocess resolving hostname
+  ;;   :out-connecting        — outbound: TCP connect in progress
+  ;;   :out-write             — outbound: sending HTTP request
+  ;;   :out-read              — outbound: reading HTTP response
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes, grows as needed
   (read-buf  (make-array 4096 :element-type '(unsigned-byte 8))
@@ -56,7 +58,10 @@
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
   (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
-  (ws-frag-total  0  :type fixnum))           ; running total bytes in frag-buf
+  (ws-frag-total  0  :type fixnum)            ; running total bytes in frag-buf
+  ;; DNS lookup (set during :out-dns phase on an outbound connection)
+  (dns-process nil)                           ; sb-ext:process running getent
+  (dns-then    nil :type (or null function))) ; (IP FAMILY) -> kick off TCP phase
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor
@@ -88,6 +93,23 @@
       (setf (connection-fd conn) -1
             (connection-socket conn) nil
             (connection-state conn) :closing))))
+
+(defun maybe-reap-dns-process (conn)
+  "If CONN has an attached getent process (a :out-dns outbound during
+   the DNS phase), kill it (if still running) and reap the zombie.
+   Safe to call on any connection — no-op when there is no process.
+   Idempotent: nulls the process slot so repeat calls are harmless.
+   Called from every teardown path (CLOSE-OUTBOUND in fetch.lisp,
+   CLOSE-CONNECTION in main.lisp) so a half-finished DNS lookup never
+   leaks a zombie process. Lives here alongside CONNECTION-CLOSE for
+   load-order symmetry with both callers."
+  (let ((process (connection-dns-process conn)))
+    (when process
+      (ignore-errors
+       (when (sb-ext:process-alive-p process)
+         (sb-ext:process-kill process 9)))
+      (ignore-errors (sb-ext:process-close process))
+      (setf (connection-dns-process conn) nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Read buffer helpers

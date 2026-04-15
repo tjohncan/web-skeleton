@@ -456,6 +456,112 @@
            (typep c 'web-skeleton::http-fetch-continuation) t)))
 
 ;;; ---------------------------------------------------------------------------
+;;; DNS helper tests — IP literal parsers, getent output parser,
+;;; bracket-aware URL parsing. Pure functions, no network.
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns ()
+  (format t "~%DNS helpers~%")
+  (flet ((v4 (s) (web-skeleton::parse-ipv4-literal s))
+         (v6 (s) (web-skeleton::parse-ipv6-literal s))
+         (bytes (s) (sb-ext:string-to-octets s :external-format :ascii)))
+
+    ;; ---- parse-ipv4-literal ----
+    (check "ipv4: 127.0.0.1"
+           (coerce (v4 "127.0.0.1") 'list) '(127 0 0 1))
+    (check "ipv4: 0.0.0.0"
+           (coerce (v4 "0.0.0.0") 'list) '(0 0 0 0))
+    (check "ipv4: 255.255.255.255"
+           (coerce (v4 "255.255.255.255") 'list) '(255 255 255 255))
+    (check "ipv4: bare zero octet"
+           (coerce (v4 "1.2.3.0") 'list) '(1 2 3 0))
+    (check "ipv4: leading zero rejected"  (v4 "1.2.3.01") nil)
+    (check "ipv4: out of range rejected"  (v4 "1.2.3.256") nil)
+    (check "ipv4: too few octets"         (v4 "1.2.3") nil)
+    (check "ipv4: too many octets"        (v4 "1.2.3.4.5") nil)
+    (check "ipv4: non-numeric"            (v4 "a.b.c.d") nil)
+    (check "ipv4: empty"                  (v4 "") nil)
+    (check "ipv4: hostname"               (v4 "example.com") nil)
+
+    ;; ---- parse-ipv6-literal ----
+    (let ((r (v6 "::1")))
+      (check "ipv6: ::1 length 16"  (length r) 16)
+      (check "ipv6: ::1 last byte"  (aref r 15) 1)
+      (check "ipv6: ::1 prefix zero"
+             (every (lambda (b) (= b 0)) (subseq r 0 15)) t))
+    (let ((r (v6 "::")))
+      (check "ipv6: :: all zero"
+             (every (lambda (b) (= b 0)) r) t))
+    (let ((r (v6 "2001:db8::1")))
+      (check "ipv6: 2001:db8::1 byte 0" (aref r 0) #x20)
+      (check "ipv6: 2001:db8::1 byte 1" (aref r 1) #x01)
+      (check "ipv6: 2001:db8::1 byte 3" (aref r 3) #xb8)
+      (check "ipv6: 2001:db8::1 last"   (aref r 15) 1))
+    (let ((r (v6 "fe80::1")))
+      (check "ipv6: fe80::1 byte 0" (aref r 0) #xfe)
+      (check "ipv6: fe80::1 byte 1" (aref r 1) #x80)
+      (check "ipv6: fe80::1 last"   (aref r 15) 1))
+    (check "ipv6: invalid hex rejected"    (v6 "::zz") nil)
+    (check "ipv6: too few groups no ::"    (v6 "1:2:3") nil)
+    (check "ipv6: empty"                   (v6 "") nil)
+    (check "ipv6: hostname"                (v6 "example.com") nil)
+    (check "ipv6: ipv4 rejected"           (v6 "127.0.0.1") nil)
+
+    ;; ---- parse-getent-output ----
+    (let* ((text (format nil "127.0.0.1       STREAM localhost~%~
+                              127.0.0.1       DGRAM ~%~
+                              127.0.0.1       RAW ~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: ipv4 family"  (cdr result) :inet)
+      (check "getent: ipv4 address" (coerce (car result) 'list) '(127 0 0 1)))
+    (let* ((text (format nil "::1             STREAM localhost~%~
+                              ::1             DGRAM ~%~
+                              ::1             RAW ~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: ipv6 family"     (cdr result) :inet6)
+      (check "getent: ipv6 last byte"  (aref (car result) 15) 1))
+    (let* ((text (format nil "::1             STREAM localhost~%~
+                              127.0.0.1       STREAM localhost~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: first STREAM wins (ipv6 first)"
+             (cdr result) :inet6))
+    (let* ((text (format nil "127.0.0.1       DGRAM ~%~
+                              127.0.0.1       RAW ~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: no STREAM rows -> nil" result nil))
+    (let* ((text "")
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: empty buffer -> nil" result nil))
+    (let* ((text "127.0.0.1       STREAM")  ; no trailing LF
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: partial line (no LF) -> nil" result nil))
+
+    ;; ---- parse-url with IPv6 brackets ----
+    (multiple-value-bind (scheme host port path)
+        (web-skeleton::parse-url "http://[::1]:8080/path")
+      (check "url: ipv6 scheme" scheme :http)
+      (check "url: ipv6 host"   host   "::1")
+      (check "url: ipv6 port"   port   8080)
+      (check "url: ipv6 path"   path   "/path"))
+    (multiple-value-bind (scheme host port path)
+        (web-skeleton::parse-url "http://[2001:db8::1]/")
+      (declare (ignore scheme))
+      (check "url: ipv6 default port" port 80)
+      (check "url: ipv6 full host"    host "2001:db8::1")
+      (check "url: ipv6 root path"    path "/"))
+    (multiple-value-bind (scheme host port path)
+        (web-skeleton::parse-url "https://[::1]:8443/v1")
+      (declare (ignore scheme path))
+      (check "url: https ipv6 host" host "::1")
+      (check "url: https ipv6 port" port 8443))))
+
+;;; ---------------------------------------------------------------------------
 ;;; URL decode tests
 ;;; ---------------------------------------------------------------------------
 
@@ -1075,6 +1181,7 @@
   (test-http-response)
   (test-cookie-builder)
   (test-fetch)
+  (test-dns)
   (test-url-decode)
   (test-query-string)
   (test-match-path)

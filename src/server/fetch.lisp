@@ -51,12 +51,136 @@
   (http-fetch method url :headers headers :body body :then then))
 
 ;;; ---------------------------------------------------------------------------
+;;; IP literal parsers
+;;;
+;;; Used both by PARSE-URL (to recognize bracketed IPv6 literals) and by
+;;; INITIATE-HTTP-FETCH (to skip DNS entirely when the host is already an
+;;; address). Returning NIL on any failure — callers fall through to the
+;;; next case, never error.
+;;; ---------------------------------------------------------------------------
+
+(defun parse-ipv4-literal (str)
+  "Parse STR as a strict dotted-quad IPv4 address. Returns a 4-byte
+   vector on success, NIL on any failure. Rejects leading zeros (except
+   the bare '0'), out-of-range octets, wrong segment count, non-digits."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv4-literal nil))
+  (let ((parts '())
+        (start 0)
+        (len (length str)))
+    (dotimes (i (1+ len))
+      (when (or (= i len) (char= (char str i) #\.))
+        (let ((piece (subseq str start i)))
+          (when (zerop (length piece))
+            (return-from parse-ipv4-literal nil))
+          (when (and (> (length piece) 1) (char= (char piece 0) #\0))
+            (return-from parse-ipv4-literal nil))
+          (unless (every (lambda (c) (char<= #\0 c #\9)) piece)
+            (return-from parse-ipv4-literal nil))
+          (let ((val (parse-integer piece)))
+            (unless (<= 0 val 255)
+              (return-from parse-ipv4-literal nil))
+            (push val parts)))
+        (setf start (1+ i))))
+    (when (= (length parts) 4)
+      (make-array 4 :element-type '(unsigned-byte 8)
+                    :initial-contents (nreverse parts)))))
+
+(defun %ipv6-groups-to-bytes (groups)
+  "Convert a list of eight 16-bit integers to a 16-byte vector (network
+   byte order — big-endian)."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8))))
+    (loop for g in groups
+          for i from 0 by 2
+          do (setf (aref out i)       (logand #xFF (ash g -8))
+                   (aref out (1+ i))  (logand #xFF g)))
+    out))
+
+(defun %parse-ipv6-group (s)
+  "Parse 1-4 hex digits as an integer 0-65535, or return NIL."
+  (and (<= 1 (length s) 4)
+       (every (lambda (c)
+                (or (char<= #\0 c #\9)
+                    (char<= #\a c #\f)
+                    (char<= #\A c #\F)))
+              s)
+       (parse-integer s :radix 16)))
+
+(defun %split-ipv6-groups (s)
+  "Split S on colons into a list of substrings. Empty S returns NIL."
+  (when (zerop (length s))
+    (return-from %split-ipv6-groups nil))
+  (let ((groups '())
+        (start 0))
+    (dotimes (i (1+ (length s)) (nreverse groups))
+      (when (or (= i (length s)) (char= (char s i) #\:))
+        (push (subseq s start i) groups)
+        (setf start (1+ i))))))
+
+(defun parse-ipv6-literal (str)
+  "Parse STR as an IPv6 literal. Returns a 16-byte vector on success,
+   NIL on failure. Handles :: compression. Does not handle IPv4-mapped
+   addresses (::ffff:1.2.3.4) or zone identifiers (fe80::1%eth0) — both
+   are rare in URL contexts and v1 rejects them cleanly."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv6-literal nil))
+  (let ((dcolon (search "::" str)))
+    (cond
+      ;; "::" compression present
+      (dcolon
+       (let* ((prefix (subseq str 0 dcolon))
+              (suffix (subseq str (+ dcolon 2)))
+              (pre (if (zerop (length prefix)) '() (%split-ipv6-groups prefix)))
+              (suf (if (zerop (length suffix)) '() (%split-ipv6-groups suffix)))
+              (pre-vals (mapcar #'%parse-ipv6-group pre))
+              (suf-vals (mapcar #'%parse-ipv6-group suf))
+              (filled (+ (length pre-vals) (length suf-vals))))
+         (when (and (every #'identity pre-vals)
+                    (every #'identity suf-vals)
+                    (<= filled 7))
+           (%ipv6-groups-to-bytes
+            (append pre-vals
+                    (make-list (- 8 filled) :initial-element 0)
+                    suf-vals)))))
+      ;; No "::" — must be exactly 8 groups
+      (t
+       (let* ((groups (%split-ipv6-groups str))
+              (vals (mapcar #'%parse-ipv6-group groups)))
+         (when (and (= (length vals) 8) (every #'identity vals))
+           (%ipv6-groups-to-bytes vals)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; URL parsing
 ;;; ---------------------------------------------------------------------------
 
+(defun parse-authority (authority default-port)
+  "Split an HTTP authority string into (values HOST PORT). Handles
+   bracketed IPv6 literals per RFC 3986 §3.2.2: '[::1]:8080' → host '::1',
+   port 8080. For unbracketed authorities, splits on the first (only)
+   colon between host and port."
+  (cond
+    ;; Bracketed IPv6 literal
+    ((and (> (length authority) 0) (char= (char authority 0) #\[))
+     (let ((close (position #\] authority)))
+       (unless close
+         (error "malformed URL authority: unclosed '[' in ~a" authority))
+       (let ((host (subseq authority 1 close))
+             (rest (subseq authority (1+ close))))
+         (if (and (> (length rest) 0) (char= (char rest 0) #\:))
+             (values host (parse-integer rest :start 1))
+             (values host default-port)))))
+    ;; Plain host or IPv4 literal
+    (t
+     (let ((colon (position #\: authority)))
+       (if colon
+           (values (subseq authority 0 colon)
+                   (parse-integer authority :start (1+ colon)))
+           (values authority default-port))))))
+
 (defun parse-url (url)
   "Parse a URL into (values scheme host port path).
-   Supports http:// and https:// schemes."
+   Supports http:// and https:// schemes. Host may be a plain name,
+   an IPv4 literal, or a bracketed IPv6 literal ('[2001:db8::1]')."
   (let ((scheme nil) (authority-start nil) (default-port nil))
     (cond
       ((and (>= (length url) 8) (string-equal url "https://" :end1 8))
@@ -67,12 +191,9 @@
     (let* ((path-start (or (position #\/ url :start authority-start)
                            (length url)))
            (authority (subseq url authority-start path-start))
-           (path (if (= path-start (length url)) "/" (subseq url path-start)))
-           (colon (position #\: authority))
-           (host (if colon (subseq authority 0 colon) authority))
-           (port (if colon (parse-integer (subseq authority (1+ colon)))
-                     default-port)))
-      (values scheme host port path))))
+           (path (if (= path-start (length url)) "/" (subseq url path-start))))
+      (multiple-value-bind (host port) (parse-authority authority default-port)
+        (values scheme host port path)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Build outbound HTTP request bytes
@@ -352,47 +473,81 @@
         (epoll-modify epoll-fd (connection-fd conn)
                      (logior +epollout+ +epollet+))))))
 
-(defun initiate-http-fetch (conn epoll-fd fetch-req host port path)
-  "Start a non-blocking outbound HTTP request via epoll."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+(defvar *dns-lookup-fn* nil
+  "Async DNS dispatcher — set by src/server/dns.lisp at load time.
+   Called with (CONN EPOLL-FD FETCH-REQ HOST PORT PATH) when HOST is
+   not a numeric IP literal. The dispatcher parks CONN behind a getent
+   subprocess and resumes via INITIATE-HTTP-FETCH-TO-ADDRESS on
+   completion. The hook pattern keeps fetch.lisp free of forward
+   references to dns.lisp.")
+
+(defvar *handle-dns-ready-fn* nil
+  "Async DNS read-ready handler — set by src/server/dns.lisp at load
+   time. Called with (DNS-CONN EPOLL-FD) from HANDLE-OUTBOUND-EVENT
+   when epoll reports EPOLLIN or EPOLLHUP on a :OUT-DNS connection.
+   Second half of the DNS hook pair, mirroring *DNS-LOOKUP-FN*.")
+
+(defun initiate-http-fetch-to-address (conn epoll-fd fetch-req host port path ip family)
+  "Open a non-blocking TCP socket (FAMILY :INET or :INET6) to IP:PORT and
+   send the outbound HTTP request. CONN is the parked inbound connection.
+   HOST is the original hostname — used for the Host: header, not for
+   routing. Called from INITIATE-HTTP-FETCH's numeric-IP fast path and
+   from the DNS-ready callback in src/server/dns.lisp."
+  (let ((socket (make-instance (if (eq family :inet)
+                                   'sb-bsd-sockets:inet-socket
+                                   'sb-bsd-sockets:inet6-socket)
                                :type :stream :protocol :tcp)))
     (handler-case
         (progn
           (set-nonblocking (socket-fd socket))
-          (let ((addr (sb-bsd-sockets:host-ent-address
-                       (sb-bsd-sockets:get-host-by-name host))))
-            (handler-case
-                (sb-bsd-sockets:socket-connect socket addr port)
-              (sb-bsd-sockets:socket-error () nil))
-            (let* ((out-fd (socket-fd socket))
-                   (request-bytes (build-outbound-request
-                                  (http-fetch-continuation-method fetch-req)
-                                  host path
-                                  :port port
-                                  :headers (http-fetch-continuation-headers fetch-req)
-                                  :body (http-fetch-continuation-body fetch-req)))
-                   (out-conn (make-connection
-                              :fd out-fd
-                              :socket socket
-                              :state :out-connecting
-                              :outbound-p t
-                              :inbound-fd (connection-fd conn)
-                              :fetch-callback (http-fetch-continuation-callback fetch-req)
-                              :last-active (get-universal-time))))
-              (connection-queue-write out-conn request-bytes)
-              (register-connection out-conn)
-              (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
-              (setf (connection-state conn) :awaiting
-                    (connection-awaiting-fd conn) out-fd)
-              (log-debug "fetch: fd ~d -> ~a:~d~a (outbound fd ~d)"
-                   (connection-fd conn) host port path out-fd))))
+          (handler-case
+              (sb-bsd-sockets:socket-connect socket ip port)
+            (sb-bsd-sockets:socket-error () nil))
+          (let* ((out-fd (socket-fd socket))
+                 (request-bytes (build-outbound-request
+                                (http-fetch-continuation-method fetch-req)
+                                host path
+                                :port port
+                                :headers (http-fetch-continuation-headers fetch-req)
+                                :body (http-fetch-continuation-body fetch-req)))
+                 (out-conn (make-connection
+                            :fd out-fd
+                            :socket socket
+                            :state :out-connecting
+                            :outbound-p t
+                            :inbound-fd (connection-fd conn)
+                            :fetch-callback (http-fetch-continuation-callback fetch-req)
+                            :last-active (get-universal-time))))
+            (connection-queue-write out-conn request-bytes)
+            (register-connection out-conn)
+            (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
+            (setf (connection-state conn) :awaiting
+                  (connection-awaiting-fd conn) out-fd)
+            (log-debug "fetch: fd ~d -> ~a :~d~a (outbound fd ~d, ~a)"
+                       (connection-fd conn) host port path out-fd family)))
       (error (e)
-        ;; Clean up socket and any registered connection on error
         (let* ((fd (sb-bsd-sockets:socket-file-descriptor socket))
                (stale (when (>= fd 0) (lookup-connection fd))))
           (when stale (unregister-connection stale)))
         (ignore-errors (sb-bsd-sockets:socket-close socket))
         (error e)))))
+
+(defun initiate-http-fetch (conn epoll-fd fetch-req host port path)
+  "Start a non-blocking outbound HTTP request. Fast path: HOST is a
+   numeric IPv4 or IPv6 literal, skip DNS entirely and connect direct.
+   Slow path: dispatch to *DNS-LOOKUP-FN* (provided by dns.lisp) which
+   runs getent in a subprocess and resumes via
+   INITIATE-HTTP-FETCH-TO-ADDRESS when the address is in hand."
+  (let* ((v4 (parse-ipv4-literal host))
+         (v6 (unless v4 (parse-ipv6-literal host))))
+    (cond
+      (v4 (initiate-http-fetch-to-address
+           conn epoll-fd fetch-req host port path v4 :inet))
+      (v6 (initiate-http-fetch-to-address
+           conn epoll-fd fetch-req host port path v6 :inet6))
+      (*dns-lookup-fn*
+       (funcall *dns-lookup-fn* conn epoll-fd fetch-req host port path))
+      (t (error "no DNS resolver loaded")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound event handlers
@@ -402,6 +557,15 @@
   "Handle an epoll event on an outbound connection."
   (handler-case
       (cond
+        ;; DNS lookup: EPOLLIN or EPOLLHUP both mean drain-and-parse.
+        ;; getent writes its output and then exits, which may surface
+        ;; either as readable data (EPOLLIN) or as a pipe close hint
+        ;; (EPOLLHUP). The read path handles EOF cleanly either way —
+        ;; treating HUP as an error here would lose the final output.
+        ;; Dispatched via *HANDLE-DNS-READY-FN* so fetch.lisp has no
+        ;; forward reference to dns.lisp.
+        ((eq (connection-state conn) :out-dns)
+         (funcall *handle-dns-ready-fn* conn epoll-fd))
         ((or (logtest flags +epollerr+) (logtest flags +epollhup+))
          (deliver-fetch-error conn epoll-fd "connection error"))
         ((logtest flags +epollout+)
@@ -600,10 +764,13 @@
                        (logior +epollout+ +epollet+)))))))
 
 (defun close-outbound (conn epoll-fd)
-  "Close and unregister an outbound connection."
+  "Close and unregister an outbound connection. Reaps any attached
+   getent DNS subprocess via MAYBE-REAP-DNS-PROCESS — a no-op for
+   TCP outbound connections that never had a DNS phase."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
+      (maybe-reap-dns-process conn)
       (connection-close conn)
       (log-debug "fetch: closed outbound fd ~d" fd))))

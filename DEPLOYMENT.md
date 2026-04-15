@@ -186,6 +186,57 @@ IP addresses — a user-supplied hostname resolving to `169.254.169.254`
 (cloud metadata), `127.0.0.1`, or any private RFC 1918 address will be
 connected to directly.
 
+### DNS resolution and caching
+
+Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs are
+resolved asynchronously: the framework spawns `getent ahosts <host>`
+via `sb-ext:run-program`, registers the subprocess's stdout pipe with
+the worker's epoll, and parks the inbound connection in an `:out-dns`
+state until the address lands. The first TCP-compatible line
+(`<address> STREAM`) wins. IPv4 and IPv6 are both supported, with
+`AI_ADDRCONFIG` filtering so addresses for unreachable families never
+appear. Numeric literals (including bracketed IPv6 forms like
+`http://[::1]:8080/`) skip the subprocess entirely via the numeric
+fast path.
+
+Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
+`/etc/hosts`, `/etc/nsswitch.conf`, Docker's embedded DNS, LDAP, mDNS
+— every NSS-configured source is queried via the usual `getaddrinfo(3)`
+code path underneath. Apps that depend on exotic name sources continue
+to work without change.
+
+**Caching is opt-in at the app layer.** `getent` is reinvoked on
+every outbound fetch, which is fine for apps making a handful of
+calls per inbound request. Apps that pound a small set of upstream
+hosts many times can cache DNS themselves using the `store`
+primitive in about fifteen lines, then bypass the framework's DNS
+path by passing the resolved IP literal at the call site:
+
+```lisp
+(defvar *dns-cache*
+  (make-store :expiry-fn (lambda (host entry)
+                           (declare (ignore host))
+                           (> (get-universal-time) (cdr entry)))
+              :reap-interval 60))
+
+(defun cached-ip-for (host)
+  (car (store-get *dns-cache* host)))
+
+(defun remember-ip (host ip &key (ttl 60))
+  (store-set *dns-cache* host (cons ip (+ (get-universal-time) ttl))))
+```
+
+At the call site, check `cached-ip-for` first and build the URL with
+the IP literal when there's a hit — the framework's numeric fast
+path skips `getent` entirely. On a miss, fall through to a hostname
+URL (paying the `getent` cost once) and populate the cache when the
+response arrives.
+
+The framework deliberately does not ship a DNS cache of its own.
+`getent` output does not surface TTL information, so any built-in
+cache would have to invent its own expiry policy — a choice that
+belongs to the app, not the framework.
+
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,

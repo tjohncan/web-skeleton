@@ -12,10 +12,13 @@ Minimal external dependencies beyond SBCL's built-in libraries.
 
 - SBCL (Steel Bank Common Lisp)
 - Linux
+- `getent` on PATH — ships with glibc and musl, present on every
+  mainstream distro. Used via `sb-ext:run-program` for non-blocking
+  hostname resolution.
 
 SBCL built-ins used:
  `sb-bsd-sockets` (TCP),
- `sb-ext` (byte conversion),
+ `sb-ext` (byte conversion, subprocess),
  `sb-alien` (epoll/fcntl/read/write FFI),
  `sb-thread` (log mutex; worker pool).
 ASDF ships with SBCL.
@@ -183,6 +186,11 @@ tests/
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
   makes the outbound call, and resumes with the callback result
+- **Async DNS resolution** — non-numeric hostnames are resolved via a
+  `getent ahosts` subprocess whose stdout pipe is registered with the
+  worker's epoll; the parked inbound resumes when the address lands.
+  Numeric IPv4 and IPv6 literals (including `http://[::1]:8080/`) skip
+  DNS entirely via a fast path. Both families supported
 - **Streaming fetch** — `http-fetch-stream` reads a response body line by line,
   calling a callback per line. Designed for NDJSON/SSE streaming APIs (e.g.
   LLM token streams). Blocking — call from within a handler
@@ -246,7 +254,8 @@ instead of blocking**. `defer-to-fetch` (or `http-fetch` directly)
 builds the continuation — a descriptor carrying the outbound method,
 URL, headers, body, and a `:then` callback. The framework recognizes
 the continuation as the handler's return value, parks the inbound
-connection, makes the outbound call on the same epoll loop
+connection, resolves the hostname asynchronously via a `getent`
+subprocess if needed, makes the outbound call on the same epoll loop
 (non-blocking for plain HTTP), then invokes the callback with
 `(status headers body-bytes)`. Whatever the callback returns becomes
 the final response to the original caller:
@@ -285,9 +294,6 @@ and practical notes on building with web-skeleton.
 - **OpenSSL-accelerated crypto** — when libssl is loaded for outbound TLS,
   use it for SHA-1, SHA-256, and HMAC as well. Pure Lisp implementations
   remain the default when libssl is not present
-- **Non-blocking DNS** — `get-host-by-name` blocks the event loop during
-  outbound fetch setup. Async resolution (thread pool or `getaddrinfo_a`)
-  would keep the non-blocking fetch path fully non-blocking
 - **ETag for static files** — compute a content hash at load time and
   include it in static responses. Enables `304 Not Modified` via
   `If-None-Match`, reducing bandwidth for repeat visitors
