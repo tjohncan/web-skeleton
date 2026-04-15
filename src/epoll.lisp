@@ -442,18 +442,20 @@
 (defun nb-write (fd buffer start nbytes)
   "Non-blocking write from BUFFER starting at START, NBYTES bytes.
    Returns bytes written or :AGAIN if EAGAIN/EWOULDBLOCK.
+
    Linux write(2) on a non-zero count returns > 0 on success or -1
-   on error; it never returns 0. If a future kernel or an exotic
-   fd type (never in web-skeleton's inet-socket case) did return 0,
-   the caller's (incf write-pos 0) would loop forever. Treated as
-   a theoretical non-issue here; worth a one-line mention so a
-   future reader doesn't hunt for a bug that isn't."
+   on error; it never returns 0 for stream sockets. A zero return
+   on some exotic fd type — or a kernel oddity we have yet to meet —
+   would loop the caller's (incf write-pos 0) forever, so we map
+   zero to :AGAIN defensively. The cost is a single extra epoll
+   wake-up in the theoretical case and nothing in the real one."
   (sb-sys:with-pinned-objects (buffer)
     (let ((n (%write fd
                      (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
                      nbytes)))
       (cond
-        ((>= n 0) n)
+        ((> n 0)    n)
+        ((zerop n)  :again)
         (t (let ((err (get-errno)))
              (if (or (= err +eagain+) (= err +ewouldblock+))
                  :again
