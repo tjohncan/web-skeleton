@@ -123,6 +123,31 @@
   (check-error "path without leading /"
                (parse-request (crlf "GET relative HTTP/1.1" "Host: localhost")))
 
+  ;; CTL bytes in request-target rejected (RFC 7230 §3.2.6).
+  ;; scan-crlf only matches the CRLF pair, so a bare LF or CR
+  ;; embedded in the URL would survive and land in the parsed
+  ;; path string — a log-injection primitive via ~a interpolation.
+  (check-error "bare LF in URL"
+               (parse-request
+                (crlf (format nil "GET /foo~cbar HTTP/1.1" #\Newline)
+                      "Host: localhost")))
+  (check-error "bare CR in URL"
+               (parse-request
+                (crlf (format nil "GET /foo~cbar HTTP/1.1" #\Return)
+                      "Host: localhost")))
+  (check-error "NUL in URL"
+               (parse-request
+                (crlf (format nil "GET /foo~cbar HTTP/1.1" (code-char 0))
+                      "Host: localhost")))
+  (check-error "DEL in URL"
+               (parse-request
+                (crlf (format nil "GET /foo~cbar HTTP/1.1" (code-char #x7f))
+                      "Host: localhost")))
+  (check-error "tab in URL"
+               (parse-request
+                (crlf (format nil "GET /foo~cbar HTTP/1.1" #\Tab)
+                      "Host: localhost")))
+
   ;; Oversized request line
   (check-error "oversized request line"
                (let ((web-skeleton:*max-request-line-length* 10))

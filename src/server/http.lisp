@@ -472,6 +472,17 @@
                 (http-parse-error "empty request path"))
               (unless (= (aref buf uri-start) 47)  ; 47 = '/'
                 (http-parse-error "request path must start with /"))
+              ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the request-target
+              ;; region (RFC 7230 §3.2.6: request-target uses pchar, which
+              ;; excludes controls). Without this check a bare CR or LF
+              ;; smuggled into the URL survives scan-crlf (which only
+              ;; matches the CRLF pair) and ends up in the parsed PATH
+              ;; string, giving an attacker a log-injection primitive via
+              ;; any ~a-interpolated log call that names the path.
+              (loop for i from uri-start below sp2
+                    for b = (aref buf i)
+                    when (or (< b #x20) (= b #x7F))
+                    do (http-parse-error "control character in request-target"))
               (let ((path (bytes-to-string buf uri-start path-end))
                     (query (when qmark
                              (bytes-to-string buf (1+ qmark) sp2))))
