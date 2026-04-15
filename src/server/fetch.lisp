@@ -279,6 +279,12 @@
   "When non-NIL, a function (method host port path headers body on-line) that
    performs a blocking streaming HTTPS fetch.  Set by web-skeleton-tls on load.")
 
+(defvar *dns-resolve-blocking-fn* nil
+  "Synchronous DNS resolver — set by src/server/dns.lisp at load time.
+   Called with (HOST) and returns (values IP FAMILY) or NIL. Used by
+   FETCH-STREAM-PLAIN and TLS-CONNECT to share the same getent-based
+   resolver as the async path without forward-referencing dns.lisp.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Blocking streaming fetch
 ;;;
@@ -300,32 +306,38 @@
         (fetch-stream-plain method host port path headers body on-line))))
 
 (defun fetch-stream-plain (method host port path headers body on-line)
-  "HTTP streaming fetch over plain TCP."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream :protocol :tcp)))
-    (unwind-protect
-        (progn
-          ;; Set socket-level timeout to bound all blocking I/O
-          (set-socket-timeout (socket-fd socket) *fetch-timeout*)
-          (sb-bsd-sockets:socket-connect
-           socket
-           (sb-bsd-sockets:host-ent-address
-            (sb-bsd-sockets:get-host-by-name host))
-           port)
-          (let ((stream (sb-bsd-sockets:socket-make-stream
-                         socket :input t :output t
-                         :element-type '(unsigned-byte 8)
-                         :buffering :full)))
-            (unwind-protect
-                (let ((request-bytes (build-outbound-request
-                                     method host path
-                                     :port port
-                                     :headers headers :body body)))
-                  (write-sequence request-bytes stream)
-                  (force-output stream)
-                  (stream-response-lines stream on-line))
-              (close stream))))
-      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+  "HTTP streaming fetch over plain TCP. Blocks the calling thread for
+   the full request/response lifecycle, bounded by *FETCH-TIMEOUT* for
+   each of DNS resolution, TCP connect, and socket-level read/write.
+   DNS uses the shared getent resolver (same as the async path); the
+   TCP connect uses a non-blocking connect + poll(2) so a black-holed
+   peer cannot pin the worker for ~120s under tcp_syn_retries."
+  (multiple-value-bind (ip family)
+      (funcall *dns-resolve-blocking-fn* host)
+    (unless ip
+      (error "fetch-stream: failed to resolve ~a" host))
+    (let ((socket (make-instance (if (eq family :inet)
+                                     'sb-bsd-sockets:inet-socket
+                                     'sb-bsd-sockets:inet6-socket)
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+          (progn
+            (set-socket-timeout (socket-fd socket) *fetch-timeout*)
+            (blocking-connect socket ip port *fetch-timeout*)
+            (let ((stream (sb-bsd-sockets:socket-make-stream
+                           socket :input t :output t
+                           :element-type '(unsigned-byte 8)
+                           :buffering :full)))
+              (unwind-protect
+                  (let ((request-bytes (build-outbound-request
+                                       method host path
+                                       :port port
+                                       :headers headers :body body)))
+                    (write-sequence request-bytes stream)
+                    (force-output stream)
+                    (stream-response-lines stream on-line))
+                (close stream))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Buffered stream reader

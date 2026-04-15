@@ -301,6 +301,15 @@
       (when (< result 0)
         (error "fcntl F_SETFL failed: ~a" (errno-string (get-errno)))))))
 
+(defun set-blocking (fd)
+  "Clear the O_NONBLOCK flag on FD."
+  (let ((flags (%fcntl fd +f-getfl+ 0)))
+    (when (< flags 0)
+      (error "fcntl F_GETFL failed: ~a" (errno-string (get-errno))))
+    (let ((result (%fcntl fd +f-setfl+ (logand flags (lognot +o-nonblock+)))))
+      (when (< result 0)
+        (error "fcntl F_SETFL failed: ~a" (errno-string (get-errno)))))))
+
 (defun socket-fd (socket)
   "Extract the raw file descriptor from an sb-bsd-sockets socket."
   (sb-bsd-sockets:socket-file-descriptor socket))
@@ -334,6 +343,41 @@
                (if (= err +eintr+)
                    nil                            ; spurious wake-up
                    (error "poll failed: ~a" (errno-string err))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Bounded blocking connect
+;;;
+;;; SO_RCVTIMEO and SO_SNDTIMEO do not apply to connect(2) — Linux
+;;; falls back to tcp_syn_retries (~120s) on a black-holed peer. To
+;;; bound a blocking fetch setup under *FETCH-TIMEOUT*, we switch the
+;;; socket to non-blocking, let connect(2) return immediately with
+;;; EINPROGRESS, poll-wait up to the timeout, check SO_ERROR, then
+;;; put the socket back in blocking mode so subsequent read/write use
+;;; the familiar blocking semantics (still bounded by SO_RCVTIMEO /
+;;; SO_SNDTIMEO which the caller sets beforehand).
+;;; ---------------------------------------------------------------------------
+
+(defun blocking-connect (socket ip port timeout-seconds)
+  "Connect SOCKET to IP:PORT bounded by TIMEOUT-SECONDS. Uses a
+   non-blocking connect + poll(2) because connect(2) itself is not
+   bounded by SO_RCVTIMEO/SO_SNDTIMEO. Leaves SOCKET in blocking mode
+   on success so subsequent read/write block normally. Raises on
+   timeout or any connect failure. Returns SOCKET."
+  (let ((fd (socket-fd socket)))
+    (set-nonblocking fd)
+    ;; Mirror the async path: a non-blocking connect either succeeds
+    ;; immediately (localhost) or raises with EINPROGRESS. Either way,
+    ;; the SO_ERROR check below after POLL-WRITABLE is authoritative.
+    (handler-case
+        (sb-bsd-sockets:socket-connect socket ip port)
+      (sb-bsd-sockets:socket-error () nil))
+    (unless (poll-writable fd (* timeout-seconds 1000))
+      (error "connect: timed out after ~a seconds" timeout-seconds))
+    (let ((err (get-socket-option-int fd +sol-socket+ +so-error+)))
+      (unless (zerop err)
+        (error "connect: ~a" (errno-string err))))
+    (set-blocking fd)
+    socket))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-blocking read/write

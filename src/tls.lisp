@@ -162,48 +162,55 @@
 
 (defun tls-connect (hostname port)
   "Open a blocking TLS connection to HOSTNAME:PORT.
-   Returns (values ssl-ptr socket) on success."
-  (let* ((ctx (ensure-ssl-ctx))
-         (socket (make-instance 'sb-bsd-sockets:inet-socket
-                                :type :stream :protocol :tcp))
-         (ssl nil))
-    (handler-case
-        (progn
-          ;; Set socket-level timeout to bound all blocking I/O
-          (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
-                              *fetch-timeout*)
-          ;; Blocking TCP connect
-          (let ((addr (sb-bsd-sockets:host-ent-address
-                       (sb-bsd-sockets:get-host-by-name hostname))))
-            (sb-bsd-sockets:socket-connect socket addr port))
-          ;; Create SSL object
-          (setf ssl (%ssl-new ctx))
-          (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
-            (error "SSL_new failed"))
-          ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses strlen)
-          (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
-                                             (sb-ext:string-to-octets hostname
-                                                                      :external-format :ascii)
-                                             #(0))))
-            (sb-sys:with-pinned-objects (hostname-bytes)
-              (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
-                         (sb-sys:vector-sap hostname-bytes))))
-          ;; Enable hostname verification (OpenSSL 1.1.0+)
-          (when (zerop (%ssl-set1-host ssl hostname))
-            (error "SSL_set1_host failed"))
-          ;; Attach to socket fd
-          (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket))
-          ;; TLS handshake
-          (let ((result (%ssl-connect ssl)))
-            (unless (= result 1)
-              (error "SSL_connect failed: error ~d"
-                     (%ssl-get-error ssl result))))
-          (values ssl socket))
-      (error (e)
-        (when ssl
-          (ignore-errors (%ssl-free ssl)))
-        (ignore-errors (sb-bsd-sockets:socket-close socket))
-        (error "tls-connect ~a:~d failed: ~a" hostname port e)))))
+   Returns (values ssl-ptr socket) on success. DNS resolution and the
+   TCP connect are both bounded by *FETCH-TIMEOUT*; DNS goes through
+   the shared *DNS-RESOLVE-BLOCKING-FN* getent resolver (same one the
+   async HTTP path uses) so both v4 and v6 addresses are handled and
+   there is exactly one DNS primitive in the framework."
+  (let ((ctx (ensure-ssl-ctx))
+        (ssl nil)
+        (socket nil))
+    (multiple-value-bind (ip family)
+        (funcall *dns-resolve-blocking-fn* hostname)
+      (unless ip
+        (error "tls-connect: failed to resolve ~a" hostname))
+      (setf socket (make-instance (if (eq family :inet)
+                                      'sb-bsd-sockets:inet-socket
+                                      'sb-bsd-sockets:inet6-socket)
+                                  :type :stream :protocol :tcp))
+      (handler-case
+          (progn
+            (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
+                                *fetch-timeout*)
+            (blocking-connect socket ip port *fetch-timeout*)
+            ;; Create SSL object
+            (setf ssl (%ssl-new ctx))
+            (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
+              (error "SSL_new failed"))
+            ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses strlen)
+            (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
+                                                (sb-ext:string-to-octets hostname
+                                                                         :external-format :ascii)
+                                                #(0))))
+              (sb-sys:with-pinned-objects (hostname-bytes)
+                (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
+                           (sb-sys:vector-sap hostname-bytes))))
+            ;; Enable hostname verification (OpenSSL 1.1.0+)
+            (when (zerop (%ssl-set1-host ssl hostname))
+              (error "SSL_set1_host failed"))
+            ;; Attach to socket fd
+            (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket))
+            ;; TLS handshake
+            (let ((result (%ssl-connect ssl)))
+              (unless (= result 1)
+                (error "SSL_connect failed: error ~d"
+                       (%ssl-get-error ssl result))))
+            (values ssl socket))
+        (error (e)
+          (when ssl
+            (ignore-errors (%ssl-free ssl)))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))
+          (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
 
 (defun tls-write-all (ssl bytes)
   "Write all BYTES through the SSL connection. Blocks until complete."

@@ -172,7 +172,20 @@ gracefully.
 
 `http-fetch-stream` and HTTPS fetch are **blocking** — they hold the
 worker thread for the duration of the upstream call, bounded by
-`*fetch-timeout*` (default 30s) via socket-level `SO_RCVTIMEO`/`SO_SNDTIMEO`.
+`*fetch-timeout*` (default 30s) across each of three setup phases:
+
+1. **DNS resolution** — shared `getent ahosts` subprocess, run
+   synchronously via `sb-ext:run-program :wait t`. Same resolver as
+   the async path, so `/etc/hosts`, NSS, Docker DNS, and mDNS all
+   work identically in both modes. IPv4 and IPv6 both supported.
+2. **TCP connect** — non-blocking `connect(2)` plus `poll(2)` with
+   the same timeout. `SO_RCVTIMEO` / `SO_SNDTIMEO` do **not** apply
+   to `connect(2)` — without this bound a black-holed peer would
+   pin the worker for ~120s (Linux `tcp_syn_retries`). The socket
+   is returned to blocking mode after the connect completes so the
+   subsequent read/write use the familiar blocking semantics.
+3. **Request I/O** — bounded by `SO_RCVTIMEO` / `SO_SNDTIMEO` on
+   the connected socket.
 This is fine for bounded work inside a `ws-handler` (e.g. streaming an
 LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
@@ -220,6 +233,13 @@ state until the address lands. The first TCP-compatible line
 appear. Numeric literals (including bracketed IPv6 forms like
 `http://[::1]:8080/`) skip the subprocess entirely via the numeric
 fast path.
+
+`http-fetch-stream` and the HTTPS paths use the same `getent`
+subprocess synchronously via `resolve-host-blocking` — same parser,
+same parity with `/etc/hosts` and NSS, same family selection logic.
+The only difference from the async path is that the subprocess runs
+with `:wait t` and the caller blocks on `sb-ext:process-wait` instead
+of parking in epoll. There is one DNS primitive across the framework.
 
 Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 `/etc/hosts`, `/etc/nsswitch.conf`, Docker's embedded DNS, LDAP, mDNS

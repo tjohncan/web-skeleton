@@ -201,14 +201,60 @@
        (deliver-dns-error dns-conn epoll-fd)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Synchronous resolver for blocking fetch paths
+;;;
+;;; FETCH-STREAM-PLAIN and TLS-CONNECT are blocking by construction —
+;;; the whole request/response lifecycle holds the worker thread. They
+;;; cannot park in epoll the way the async HTTP path does. But they
+;;; should still share the same resolver so semantics match: /etc/hosts,
+;;; NSS, Docker's embedded DNS, mDNS — whatever the system knows, both
+;;; blocking and async fetches inherit automatically. RESOLVE-HOST-BLOCKING
+;;; spawns the same `getent ahosts` subprocess and drains its output
+;;; synchronously via SB-EXT:PROCESS-WAIT. Numeric literals short-circuit
+;;; the subprocess via the same parser as the async path.
+;;; ---------------------------------------------------------------------------
+
+(defun resolve-host-blocking (host)
+  "Synchronously resolve HOST via `getent ahosts`.
+   Returns (values IP FAMILY) on success or NIL on failure. FAMILY is
+   :INET or :INET6. Numeric IPv4 and IPv6 literals skip the subprocess
+   via the same fast path as the async resolver. Used by the blocking
+   fetch setup paths so there is a single DNS primitive across the
+   framework."
+  (let ((v4 (parse-ipv4-literal host)))
+    (when v4 (return-from resolve-host-blocking (values v4 :inet))))
+  (let ((v6 (parse-ipv6-literal host)))
+    (when v6 (return-from resolve-host-blocking (values v6 :inet6))))
+  (handler-case
+      (let ((process (sb-ext:run-program "getent"
+                                          (list "ahosts" "--" host)
+                                          :output :stream
+                                          :wait t
+                                          :search t)))
+        (unwind-protect
+             (when (and process (zerop (sb-ext:process-exit-code process)))
+               (let* ((stream (sb-ext:process-output process))
+                      (buf (make-array 1024 :element-type '(unsigned-byte 8)
+                                             :fill-pointer 0 :adjustable t)))
+                 (loop for byte = (read-byte stream nil nil)
+                       while byte
+                       do (vector-push-extend byte buf))
+                 (let ((parsed (parse-getent-output buf (length buf))))
+                   (when parsed
+                     (values (car parsed) (cdr parsed))))))
+          (ignore-errors (sb-ext:process-close process))))
+    (error () nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Registration
 ;;;
-;;; Install our dispatcher into fetch.lisp's *DNS-LOOKUP-FN* hook so
-;;; initiate-http-fetch can reach us without a compile-time forward
-;;; reference. The hook pattern mirrors src/tls.lisp's registration of
-;;; *HTTPS-FETCH-FN*.
+;;; Install our dispatchers into fetch.lisp's hook slots so initiate-
+;;; http-fetch, fetch-stream-plain, and tls-connect can reach us without
+;;; compile-time forward references. The hook pattern mirrors src/tls.lisp's
+;;; registration of *HTTPS-FETCH-FN*.
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
-  (setf *dns-lookup-fn*      #'initiate-dns-lookup
-        *handle-dns-ready-fn* #'handle-dns-ready))
+  (setf *dns-lookup-fn*           #'initiate-dns-lookup
+        *handle-dns-ready-fn*     #'handle-dns-ready
+        *dns-resolve-blocking-fn* #'resolve-host-blocking))
