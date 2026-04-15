@@ -270,12 +270,24 @@
       (ignore-errors (sb-bsd-sockets:socket-close client-socket))
       (return-from accept-connection t))
     (handler-case
-        (let ((conn (make-client-connection client-socket)))
-          (register-connection conn)
-          (epoll-add epoll-fd (connection-fd conn)
-                     (logior +epollin+ +epollet+))
-          (log-debug "accepted fd ~d ~a" (connection-fd conn)
-                     (or (connection-remote-addr conn) ""))
+        (let ((conn (make-client-connection client-socket))
+              (registered nil)
+              (done nil))
+          (unwind-protect
+               (progn
+                 (register-connection conn)
+                 (setf registered t)
+                 (epoll-add epoll-fd (connection-fd conn)
+                            (logior +epollin+ +epollet+))
+                 (log-debug "accepted fd ~d ~a" (connection-fd conn)
+                            (or (connection-remote-addr conn) ""))
+                 (setf done t))
+            ;; If EPOLL-ADD raised after REGISTER-CONNECTION succeeded,
+            ;; the connection is in *CONNECTIONS* but the kernel never
+            ;; saw the fd — a stale entry that the idle sweeper would
+            ;; later trip over. Drop it so the table stays honest.
+            (when (and registered (not done))
+              (unregister-connection conn)))
           t)
       (error (e)
         (log-error "accept failed: ~a" e)
@@ -800,15 +812,33 @@
 
 (defun cpu-count ()
   "Return the number of online CPU cores.
-   Parses the 0-N format from /sys/devices/system/cpu/online.
-   Falls back to 1 for exotic topologies (comma-separated ranges, etc.)."
+   Parses /sys/devices/system/cpu/online. Handles both the simple
+   '0-N' shape and the multi-range 'A-B,C,D-E' shape produced by
+   hotplugged or heterogeneous topologies (Intel E-cores offline,
+   VMs with non-contiguous CPU masks, etc.). The old one-shot
+   `dash + parse-integer` parser fell back to 1 on any comma,
+   silently wasting cores on exactly the machines where we cared
+   about parallelism most."
   (handler-case
       (with-open-file (s "/sys/devices/system/cpu/online")
-        (let* ((line (read-line s))
-               (dash (position #\- line)))
-          (if dash
-              (1+ (parse-integer (subseq line (1+ dash))))
-              1)))
+        (let ((line (read-line s)))
+          (loop with total = 0
+                with start = 0
+                with len = (length line)
+                while (< start len)
+                for comma = (or (position #\, line :start start) len)
+                for dash  = (position #\- line :start start :end comma)
+                do (if dash
+                       (let ((lo (parse-integer line :start start :end dash))
+                             (hi (parse-integer line :start (1+ dash)
+                                                     :end comma)))
+                         (incf total (1+ (- hi lo))))
+                       (progn
+                         ;; Single-CPU token — still parse to validate.
+                         (parse-integer line :start start :end comma)
+                         (incf total)))
+                   (setf start (1+ comma))
+                finally (return (max 1 total)))))
     (error ()
       (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")
       1)))
@@ -829,48 +859,70 @@
   (setf *shutdown* nil)
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an
-  ;; orchestrator) without permanently stealing the signals. Both are
-  ;; restored in the unwind-protect cleanup.
+  ;; orchestrator) without permanently stealing the signals.
   ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
   ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
+  ;;
+  ;; The restore lives in an OUTER unwind-protect wrapping the entire
+  ;; thread lifecycle. An earlier shape nested the signal restore
+  ;; inside the same unwind-protect that drained the threads, which
+  ;; meant a MAKE-THREAD raise partway through the spawn loop — thread
+  ;; exhaustion, setrlimit, etc. — blew past both the drain and the
+  ;; restore, leaving the host image with the framework's SIGPIPE /
+  ;; SIGTERM handlers installed forever.
   (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore))
         (prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
                         (lambda (signal info context)
                           (declare (ignore signal info context))
                           (setf *shutdown* t)))))
-    (log-info "starting ~d worker~:p on ~a" workers (format-peer-addr host port))
-    (let ((threads (loop for i from 0 below workers
-                         collect (sb-thread:make-thread
-                                  (let ((id i))
-                                    (lambda () (run-worker host port id handler ws-handler)))
-                                  :name (format nil "web-skeleton-~d" i)))))
-      (unwind-protect
-          (handler-case
-              ;; Main thread waits for interrupt or SIGTERM
-              (loop (sleep *shutdown-poll-interval*)
-                    (when *shutdown*
-                      (log-info "shutting down")
-                      (return)))
-            (sb-sys:interactive-interrupt ()
-              (format t "~%")
-              (log-info "interrupted — shutting down")))
-        ;; Signal workers to drain and stop
-        (setf *shutdown* t)
-        (dolist (thread threads)
-          (ignore-errors (sb-thread:join-thread thread
-                                                :timeout (+ *drain-timeout* 3))))
-        ;; Workers have drained; run any app-registered cleanup before
-        ;; returning. Hooks own their own error handling — one raising
-        ;; hook cannot block the rest, cannot block the "stopped" log,
-        ;; and cannot prevent START-SERVER from returning to its caller.
-        (run-shutdown-hooks)
-        (log-info "stopped")
-        ;; Hand the signals back to whoever had them before we
-        ;; started. Each restore gets its own IGNORE-ERRORS — a
-        ;; single wrapper would short-circuit SIGPIPE if SIGTERM
-        ;; restore raised, leaking the framework's SIGPIPE handler
-        ;; into the host image.
-        (ignore-errors
-         (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))
-        (ignore-errors
-         (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))))))
+    (unwind-protect
+         (progn
+           (log-info "starting ~d worker~:p on ~a"
+                     workers (format-peer-addr host port))
+           ;; Accumulate threads incrementally rather than via LOOP
+           ;; COLLECT: if MAKE-THREAD raises on iteration N, the
+           ;; partial list in THREADS still covers workers 0..N-1 so
+           ;; the drain cleanup can signal and join them.
+           (let ((threads nil))
+             (unwind-protect
+                  (progn
+                    (dotimes (i workers)
+                      (let ((id i))
+                        (push (sb-thread:make-thread
+                               (lambda ()
+                                 (run-worker host port id
+                                             handler ws-handler))
+                               :name (format nil "web-skeleton-~d" i))
+                              threads)))
+                    (handler-case
+                        ;; Main thread waits for interrupt or SIGTERM
+                        (loop (sleep *shutdown-poll-interval*)
+                              (when *shutdown*
+                                (log-info "shutting down")
+                                (return)))
+                      (sb-sys:interactive-interrupt ()
+                        (format t "~%")
+                        (log-info "interrupted — shutting down"))))
+               ;; Signal workers to drain and stop. Runs on normal
+               ;; exit, interactive-interrupt, AND a MAKE-THREAD
+               ;; raise partway through the spawn loop.
+               (setf *shutdown* t)
+               (dolist (thread threads)
+                 (ignore-errors
+                  (sb-thread:join-thread thread
+                                         :timeout (+ *drain-timeout* 3))))
+               ;; Workers have drained; run any app-registered cleanup
+               ;; before returning. Hooks own their own error handling —
+               ;; one raising hook cannot block the rest, cannot block
+               ;; the "stopped" log, and cannot prevent START-SERVER
+               ;; from returning to its caller.
+               (run-shutdown-hooks)
+               (log-info "stopped"))))
+      ;; Hand the signals back to whoever had them before we started.
+      ;; Each restore gets its own IGNORE-ERRORS — a single wrapper
+      ;; would short-circuit SIGPIPE if SIGTERM restore raised,
+      ;; leaking the framework's SIGPIPE handler into the host image.
+      (ignore-errors
+       (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))
+      (ignore-errors
+       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe)))))
