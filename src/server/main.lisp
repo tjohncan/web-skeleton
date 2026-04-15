@@ -386,9 +386,18 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-client-read (conn epoll-fd handler ws-handler)
-  "Handle EPOLLIN on a client connection."
+  "Handle EPOLLIN on a client connection.
+   State dispatch is permissive: a stale EPOLLIN for a connection
+   whose state moved to :write-response / :ws-upgrade / :closing /
+   :sending-100-continue earlier in the same epoll batch silently
+   no-ops instead of raising into the outer handler-case and
+   queueing a 500 over the legitimate response that's already in
+   the write buffer. The race is reachable when one event in a
+   batch completes a fetch (setting an inbound's state to
+   :write-response) and a later event in the same batch is a
+   stale EPOLLIN for that inbound."
   (handler-case
-      (ecase (connection-state conn)
+      (case (connection-state conn)
         ;; HTTP request accumulation
         ((:read-http :read-body)
          (let ((result (connection-on-read conn)))
@@ -516,7 +525,13 @@
              ;; :continue — wait for more data
              )))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
-        (:awaiting nil))
+        (:awaiting nil)
+        ;; Stale EPOLLIN for a state that isn't currently reading.
+        ;; Silently ignored so a late notification can't escalate
+        ;; into a 500 via the handler-case fallback below.
+        (otherwise
+         (log-debug "stale EPOLLIN fd ~d in state ~a — ignoring"
+                    (connection-fd conn) (connection-state conn))))
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
@@ -552,13 +567,17 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-client-write (conn epoll-fd)
-  "Handle EPOLLOUT on a client connection."
+  "Handle EPOLLOUT on a client connection.
+   Inner state dispatch is permissive for the same reason as
+   HANDLE-CLIENT-READ: a stale EPOLLOUT can arrive for a state
+   that isn't currently writing, and raising into the handler-case
+   below would overwrite a legitimate in-flight response with a 500."
   (handler-case
       (let ((result (connection-on-write conn)))
         (case result
           (:done
            ;; All bytes sent — next action depends on state
-           (ecase (connection-state conn)
+           (case (connection-state conn)
              (:write-response
               (if (connection-close-after-p conn)
                   (close-connection conn epoll-fd)
@@ -627,7 +646,14 @@
                     (connection-state conn) :read-body)
               (epoll-modify epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+))
-              (return-from handle-client-write :keep-alive))))
+              (return-from handle-client-write :keep-alive))
+             ;; Stale EPOLLOUT for a state that isn't currently
+             ;; writing (e.g. a race where read-side completed
+             ;; earlier in the same batch and flipped the state
+             ;; before this event was dispatched). Silently ignore.
+             (otherwise
+              (log-debug "stale EPOLLOUT :done fd ~d in state ~a — ignoring"
+                         (connection-fd conn) (connection-state conn)))))
           ;; :continue — more bytes to write
           (:continue nil)))
     (error (e)
@@ -667,13 +693,13 @@
                             (if (connection-outbound-p conn)
                                 ;; Outbound fetch connection
                                 (handle-outbound-event conn epoll-fd flags)
-                                ;; Inbound client connection
+                                ;; Inbound client connection. Process
+                                ;; EPOLLIN before EPOLLHUP so a
+                                ;; fire-and-close HTTP/1.0 client
+                                ;; (sends request, immediately FINs)
+                                ;; gets the request processed instead
+                                ;; of losing it to the HUP arm.
                                 (progn
-                                  ;; Error or hangup — close and skip
-                                  (when (or (logtest flags +epollerr+)
-                                            (logtest flags +epollhup+))
-                                    (close-connection conn epoll-fd)
-                                    (return-from handle-event))
                                   ;; Readable
                                   (when (logtest flags +epollin+)
                                     (handle-client-read conn epoll-fd handler ws-handler))
@@ -687,7 +713,14 @@
                                       ;; (edge-triggered epoll won't re-notify)
                                       (when (lookup-connection fd)
                                         (handle-client-read conn epoll-fd
-                                                            handler ws-handler))))))))))))))
+                                                            handler ws-handler))))
+                                  ;; Error/hangup — close only if the
+                                  ;; read/write path didn't already
+                                  ;; tear the connection down.
+                                  (when (and (or (logtest flags +epollerr+)
+                                                 (logtest flags +epollhup+))
+                                             (lookup-connection fd))
+                                    (close-connection conn epoll-fd))))))))))))
       ;; Periodic maintenance — both scans gated on elapsed wall
       ;; clock so a busy epoll loop doesn't walk the connection
       ;; table multiple times per second. 1 s is fine: idle
