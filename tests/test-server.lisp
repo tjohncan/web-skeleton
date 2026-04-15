@@ -184,6 +184,37 @@
                (parse-request
                 (crlf "GET / HTTP/1.1" "X-B{ad: v" "Host: localhost")))
 
+  ;; RFC 7230 §3.2: field-value excludes CTLs except HTAB (0x09).
+  ;; scan-crlf only matches the CRLF pair, so a bare CR or LF
+  ;; embedded in a header value survives into the parsed alist
+  ;; string — a log-injection primitive against any ~a-interpolated
+  ;; log call. serialize-http-message already rejects these on
+  ;; the outbound side; parse-headers-bytes was the remaining gap.
+  (check-error "bare LF in header value"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "Host: exam~cFAKE: x" #\Newline))))
+  (check-error "bare CR in header value"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "Host: exam~cple.com" #\Return))))
+  (check-error "NUL in header value"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "Host: exam~cple.com" (code-char 0)))))
+  (check-error "DEL in header value"
+               (parse-request
+                (crlf "GET / HTTP/1.1"
+                      (format nil "Host: exam~cple.com" (code-char #x7f)))))
+  ;; HTAB is explicitly permitted by RFC 7230 §3.2 inside field-value.
+  (let* ((raw (crlf "GET / HTTP/1.1"
+                    (format nil "Host: a~cb.example" #\Tab)))
+         (req (parse-request raw)))
+    (check "TAB in header value accepted"
+           (not (null (search "a	b.example"
+                              (web-skeleton::get-header req "host"))))
+           t))
+
   ;; CTL / DEL bytes in the METHOD region rejected. Same shape as
   ;; the URL check above: scan-crlf only matches the CRLF pair so
   ;; a bare LF smuggled into the method survives parsing and
@@ -270,10 +301,32 @@
     (check-error "Content-Length: +10 rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
 
-  ;; Content-Length parser agreement (audit 2.1-C3). scan-content-length
-  ;; is the fast byte scanner used for pre-allocation; parse-headers-bytes
-  ;; populates the header alist. They are hand-rolled and the risk is
-  ;; that a future edit lets one accept a value the other rejects, which
+  ;; Content-Length digit cap tightened from 15 to 10 in pack 16.
+  ;; 10 decimal digits ≈ 9.3 GB, still orders of magnitude past any
+  ;; real *MAX-BODY-SIZE*, so the hard cap cannot be reached via a
+  ;; legitimate value but the per-digit scan now bails early on
+  ;; attacker-supplied padding.
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: 12345678901" *crlf*  ; 11 digits
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check-error "Content-Length 11 digits rejected"
+                 (web-skeleton::scan-content-length bytes header-end)))
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: 9999999999" *crlf*  ; 10 digits — allowed
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check "Content-Length 10 digits accepted"
+           (web-skeleton::scan-content-length bytes header-end) 9999999999))
+
+  ;; Content-Length parser agreement. scan-content-length is the fast
+  ;; byte scanner used for pre-allocation; parse-headers-bytes populates
+  ;; the header alist. They are hand-rolled and the risk is that a
+  ;; future edit lets one accept a value the other rejects, which
   ;; would open a smuggling gap. This locks in agreement for every CL
   ;; shape we already care about — valid and invalid.
   (flet ((alist-cl (bytes header-end)
@@ -723,6 +776,19 @@
     (check "http v6 bracketed port" port 8080)
     (check "http v6 bracketed path" path "/"))
 
+  ;; Userinfo in the authority is rejected. The pre-pack-16 shape
+  ;; raised a bare parse-integer type-error from the port split —
+  ;; the new path is a dedicated "userinfo not supported" error
+  ;; so the caller sees what's wrong.
+  (check-error "url: userinfo rejected"
+               (web-skeleton::parse-url "http://user:pass@example.com/"))
+  (check-error "url: userinfo (just user) rejected"
+               (web-skeleton::parse-url "http://user@example.com/"))
+  ;; Non-numeric port comes back as a friendly "non-numeric port"
+  ;; error instead of a raw SIMPLE-TYPE-ERROR from parse-integer.
+  (check-error "url: non-numeric port rejected"
+               (web-skeleton::parse-url "http://example.com:abc/"))
+
   ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4).
   ;; Before the fix, 'http://host?q=1' parsed the whole 'host?q=1'
   ;; as the authority and dialed a hostname containing '?'.
@@ -772,6 +838,38 @@
            (not (null (search "connection: close" text))) t)
     (check "req custom header"
            (not (null (search "accept: application/json" text))) t))
+
+  ;; IPv6 literal host: the wire Host header must re-bracket the
+  ;; address. parse-authority strips the brackets from the internal
+  ;; host string (correct — URL syntax, not address), and the
+  ;; pre-pack-16 build-outbound-request reused that unbracketed
+  ;; string on the wire, emitting 'Host: ::1:8080' which is
+  ;; unparseable — no way for a reader to tell where the address
+  ;; ends and the port begins. RFC 7230 §5.4 / RFC 3986 §3.2.2
+  ;; require '[' IPv6address ']' for IP-literal authorities.
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "::1" "/" :port 8080))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "ipv6 host rebracketed with port"
+           (not (null (search "host: [::1]:8080" text))) t))
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "2001:db8::1" "/api" :port 80))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "ipv6 host rebracketed default port"
+           (not (null (search "host: [2001:db8::1]" text))) t))
+  ;; End-to-end: parse-url → build-outbound-request pipeline for an
+  ;; IPv6 literal URL. The two tests above cover the builder directly;
+  ;; this one locks in that the whole chain behaves correctly, so a
+  ;; future refactor that re-introduces the asymmetry can't hide
+  ;; behind the separate parse-url tests.
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://[::1]:8080/api")
+    (declare (ignore scheme))
+    (let* ((bytes (web-skeleton::build-outbound-request
+                   :GET host path :port port))
+           (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+      (check "ipv6 end-to-end host bracketed"
+             (not (null (search "host: [::1]:8080" text))) t)))
 
   ;; Response status parsing
   (let ((buf (sb-ext:string-to-octets
@@ -899,10 +997,10 @@
       (check "url: ipv6 default port" port 80)
       (check "url: ipv6 full host"    host "2001:db8::1")
       (check "url: ipv6 root path"    path "/"))
-    ;; https:// + IP literal is rejected (audit 2.1-C1). The covering
-    ;; rejection tests live in test-fetch; this is here only to pin
-    ;; down that the DNS helper group's earlier https-with-bracketed-v6
-    ;; case no longer parses successfully.
+    ;; https:// + IP literal is rejected. The covering rejection
+    ;; tests live in test-fetch; this is here only to pin down that
+    ;; the DNS helper group's earlier https-with-bracketed-v6 case
+    ;; no longer parses successfully.
     (check-error "url: https ipv6 rejected"
                  (web-skeleton::parse-url "https://[::1]:8443/v1"))))
 
@@ -991,6 +1089,23 @@
   (check "v6 ::8.8.8.8 compat public"
          (is-public-address-p
           #(0 0 0 0 0 0 0 0 0 0 0 0 8 8 8 8) :inet6) t)
+
+  ;; 6to4 (2002::/16, RFC 3056 / RFC 7526). Deprecated but shape-
+  ;; consistent with the other v4-in-v6 laundering defenses: v4
+  ;; payload lives in bytes 2..5, everything past that is an
+  ;; arbitrary host id. Classify via embedded v4.
+  (check "v6 2002:0a00:0001:: carries 10.0.0.1"
+         (is-public-address-p
+          #(#x20 #x02 10 0 0 1 0 0 0 0 0 0 0 0 0 0) :inet6) nil)
+  (check "v6 2002:7f00:0001:: carries 127.0.0.1"
+         (is-public-address-p
+          #(#x20 #x02 127 0 0 1 0 0 0 0 0 0 0 0 0 0) :inet6) nil)
+  (check "v6 2002:a9fe:a9fe:: carries link-local"
+         (is-public-address-p
+          #(#x20 #x02 169 254 169 254 0 0 0 0 0 0 0 0 0 0) :inet6) nil)
+  (check "v6 2002:0808:0808:: carries 8.8.8.8 (public)"
+         (is-public-address-p
+          #(#x20 #x02 8 8 8 8 0 0 0 0 0 0 0 0 0 0) :inet6) t)
 
   ;; Wrong length / unknown family returns NIL (conservative)
   (check "v4 wrong length"   (is-public-address-p #(1 2 3) :inet)           nil)
@@ -1319,7 +1434,35 @@
           '(("content-type" . "text/plain"))) nil)
   (check "chunked-p case-insensitive"
          (not (null (web-skeleton::response-chunked-p
-                     '(("transfer-encoding" . "Chunked"))))) t))
+                     '(("transfer-encoding" . "Chunked"))))) t)
+
+  ;; parse-chunked-size-line — shared by the streaming chunk parsers
+  ;; in stream-chunked-lines and tls-stream-response. Strict hex,
+  ;; strips chunk-extensions from ';' onwards, raises on garbage.
+  ;; The pre-pack-16 parse-integer :junk-allowed t shape silently
+  ;; accepted 'xyz' (→ NIL, loop-exit-as-final-chunk) and '-5'
+  ;; (→ -5, loop-exit-as-final-chunk) — a parser-disagreement
+  ;; smuggling primitive against any stricter downstream.
+  (check "chunked size: plain hex"
+         (web-skeleton::parse-chunked-size-line "a0") 160)
+  (check "chunked size: uppercase hex"
+         (web-skeleton::parse-chunked-size-line "FF") 255)
+  (check "chunked size: zero"
+         (web-skeleton::parse-chunked-size-line "0") 0)
+  (check "chunked size: extension stripped"
+         (web-skeleton::parse-chunked-size-line "5;name=value") 5)
+  (check "chunked size: extension with whitespace"
+         (web-skeleton::parse-chunked-size-line "10 ; foo=bar") 16)
+  (check-error "chunked size: rejects xyz"
+               (web-skeleton::parse-chunked-size-line "xyz"))
+  (check-error "chunked size: rejects -5"
+               (web-skeleton::parse-chunked-size-line "-5"))
+  (check-error "chunked size: rejects empty"
+               (web-skeleton::parse-chunked-size-line ""))
+  (check-error "chunked size: rejects extension-only"
+               (web-skeleton::parse-chunked-size-line ";foo=bar"))
+  (check-error "chunked size: rejects trailing garbage"
+               (web-skeleton::parse-chunked-size-line "5g")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket tests
@@ -1564,7 +1707,46 @@
       (check "fragment reassembly: opcode is text"
              received-opcode 1)
       (check "fragment reassembly: concatenated payload"
-             received-text "hello world"))))
+             received-text "hello world"))
+
+    ;; Error-close preserves earlier batch responses. First text
+    ;; frame produces a handler response; second frame has an
+    ;; unknown opcode (5) which triggers close-with 1002. The
+    ;; pre-pack-16 shape dropped the earlier response on the
+    ;; floor — every error-close branch used
+    ;; (values :close (build-ws-close NNNN)) without concatenating
+    ;; responses. The close-with helper now goes through the same
+    ;; code path as the normal-close branch.
+    (let* ((good (make-masked-frame t 1 #(104 105)))  ; text "hi"
+           (bad  (make-masked-frame t 5 #()))         ; unknown opcode 5
+           (buf  (concatenate '(simple-array (unsigned-byte 8) (*))
+                              good bad))
+           (reply (sb-ext:string-to-octets "REPLY" :external-format :ascii))
+           (conn  (web-skeleton::make-connection
+                   :fd -1 :state :websocket :last-active 0)))
+      (setf (web-skeleton::connection-read-buf conn) buf
+            (web-skeleton::connection-read-pos conn) (length buf))
+      (let ((handler (lambda (c frame)
+                       (declare (ignore c frame))
+                       ;; Return raw bytes — websocket-on-read pushes
+                       ;; into RESPONSES.
+                       reply)))
+        (multiple-value-bind (action response)
+            (web-skeleton::websocket-on-read conn handler)
+          (check "error-close action :close" action :close)
+          ;; Response should contain BOTH the reply bytes and a
+          ;; close frame. Search for the literal "REPLY" prefix
+          ;; as the first response, and the 1002 status code in
+          ;; the close frame payload further down.
+          (check "error-close carries earlier response"
+                 (and response (search reply response)) 0)
+          (check "error-close carries close code 1002"
+                 (let ((close-start (+ (length reply) 2)))
+                   (and response
+                        (>= (length response) (+ close-start 2))
+                        (logior (ash (aref response close-start) 8)
+                                (aref response (1+ close-start)))))
+                 1002))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file helper tests
