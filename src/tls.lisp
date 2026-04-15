@@ -150,9 +150,18 @@
       (let ((ctx (%ssl-ctx-new (%tls-client-method))))
         (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
           (error "SSL_CTX_new failed"))
-        ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1)
-        (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
-                   +tls1-2-version+ (sb-sys:int-sap 0))
+        ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
+        ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION
+        ;; — the return used to be discarded, so a silent failure on
+        ;; OpenSSL 1.1.1 (still shipped by long-tail LTS distros) would
+        ;; leave the default floor, which on 1.1.1 is TLS 1.0. We'd
+        ;; then happily negotiate 1.0 against a misconfigured peer.
+        ;; OpenSSL 3.0's default security level already forbids 1.0/1.1
+        ;; so this only matters on long-tail targets, but the extra
+        ;; loudness is free.
+        (unless (= 1 (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                                +tls1-2-version+ (sb-sys:int-sap 0)))
+          (error "SSL_CTX set min proto version failed"))
         ;; Load system CA certificates
         (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
           (log-warn "tls: could not load system CA certificates"))
@@ -193,14 +202,21 @@
             (setf ssl (%ssl-new ctx))
             (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
               (error "SSL_new failed"))
-            ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses strlen)
+            ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses
+            ;; strlen). SSL_set_tlsext_host_name returns 1 on success,
+            ;; 0 on failure. A silent failure here meant the handshake
+            ;; proceeded without SNI and the upstream typically rejected
+            ;; with an opaque 'unknown certificate' further down the
+            ;; stack — raising loud at the call site is much easier to
+            ;; diagnose than debugging the eventual cert mismatch.
             (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
                                                 (sb-ext:string-to-octets hostname
                                                                          :external-format :ascii)
                                                 #(0))))
               (sb-sys:with-pinned-objects (hostname-bytes)
-                (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
-                           (sb-sys:vector-sap hostname-bytes))))
+                (unless (= 1 (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
+                                        (sb-sys:vector-sap hostname-bytes)))
+                  (error "SSL_set_tlsext_host_name failed for ~a" hostname))))
             ;; Enable hostname verification (OpenSSL 1.1.0+)
             (when (zerop (%ssl-set1-host ssl hostname))
               (error "SSL_set1_host failed"))
@@ -231,6 +247,47 @@
                    (error "SSL_write failed: error ~d" (%ssl-get-error ssl n)))
                  (incf pos n))))))
 
+(defun ssl-read-eof-or-raise (ssl n)
+  "Classify a non-positive SSL_read return. Returns :EOF if the peer
+   cleanly closed the stream, raises otherwise so the outer
+   handler-case converts the error into a 502 and fires the fetch
+   callback's cleanup sentinel.
+
+   SSL_ERROR_SYSCALL conflates at least four distinct conditions
+   and the pre-pack-16 shape treated all of them as clean EOF:
+     errno = 0                 — unexpected EOF with no close_notify.
+                                 Benign for HTTP/1.0-style legacy
+                                 servers that drop the TCP connection
+                                 as their framing signal. Treat as
+                                 clean EOF.
+     errno = EAGAIN/EWOULDBLOCK — SO_RCVTIMEO fired (the
+                                 *fetch-timeout* we install on the
+                                 socket in tls-connect). This is the
+                                 behavior DEPLOYMENT.md promises the
+                                 framework enforces; silent-EOF here
+                                 made that promise a lie for
+                                 close-delimited HTTPS responses and
+                                 for http-fetch-stream over HTTPS.
+     errno = ECONNRESET / EPIPE / ETIMEDOUT / other
+                              — real transport failure, including
+                                 the nasty MITM-RST-mid-stream case
+                                 where an attacker truncates a
+                                 response and the app sees 'success'.
+                              Loud raise.
+   Other SSL errors (WANT_READ / WANT_WRITE / SSL / etc) also raise."
+  (let ((err (%ssl-get-error ssl n)))
+    (cond
+      ((= err +ssl-error-zero-return+) :eof)
+      ((= err +ssl-error-syscall+)
+       (let ((errno (get-errno)))
+         (cond
+           ((zerop errno) :eof)
+           ((or (= errno +eagain+) (= errno +ewouldblock+))
+            (error "SSL_read: timed out (~a)" (errno-string errno)))
+           (t
+            (error "SSL_read: transport error ~a" (errno-string errno))))))
+      (t (error "SSL_read failed: error ~d" err)))))
+
 (defun tls-read-all (ssl)
   "Read the complete HTTP response through the SSL connection.
    Returns the raw response as a byte vector. Bounded by
@@ -253,13 +310,8 @@
              (push (subseq buf 0 n) chunks))
             ((zerop n) (return))  ; clean shutdown
             (t
-             (let ((err (%ssl-get-error ssl n)))
-               ;; 6 = SSL_ERROR_ZERO_RETURN (peer closed)
-               ;; 5 = SSL_ERROR_SYSCALL (may be EOF)
-               (when (or (= err +ssl-error-zero-return+)
-                         (= err +ssl-error-syscall+))
-                 (return))
-               (error "SSL_read failed: error ~d" err)))))))
+             (ssl-read-eof-or-raise ssl n)
+             (return))))))
     ;; Concatenate chunks
     (let ((result (make-array total :element-type '(unsigned-byte 8)))
           (offset 0))
@@ -432,74 +484,94 @@
       (loop
         (sb-sys:with-pinned-objects (buf)
           (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
-            (when (<= n 0) (return))
-            (loop for i from 0 below n
-                  for byte = (aref buf i)
-                  do (when (> (fill-pointer line-buf) *max-body-size*)
-                       (error "streaming response line too large"))
-                     (cond
-                       ;; Header phase
-                       (in-headers
+            (cond
+              ((zerop n) (return))
+              ((< n 0)
+               ;; Non-positive return must NOT be treated as clean EOF
+               ;; unconditionally — SSL_ERROR_SYSCALL conflates timeout,
+               ;; transport error, and benign HTTP/1.0 connection-close.
+               ;; Same discipline as tls-read-all: the helper either
+               ;; returns :EOF (benign) or raises so the outer
+               ;; unwind-protect tears down and the caller sees the
+               ;; error instead of a silently-truncated NDJSON/SSE
+               ;; stream.
+               (ssl-read-eof-or-raise ssl n)
+               (return))
+              (t
+               (loop for i from 0 below n
+                     for byte = (aref buf i)
+                     do (when (> (fill-pointer line-buf) *max-streaming-line-size*)
+                          (error "streaming response line too large (~d bytes, max ~d)"
+                                 (fill-pointer line-buf)
+                                 *max-streaming-line-size*))
                         (cond
-                          ((= byte 10)
-                           (let ((line (emit-line)))
-                             (if (zerop (length line))
-                                 (progn
-                                   (setf in-headers nil)
-                                   (when chunked (setf in-chunk-size t)))
-                                 (progn
-                                   (when first-line
-                                     (let ((sp (position #\Space line)))
-                                       (when (and sp (< (+ sp 3) (length line)))
-                                         (setf status (parse-integer line :start (1+ sp)
-                                                                          :end (+ sp 4)
-                                                                          :junk-allowed t))))
-                                     (setf first-line nil))
-                                   (when (and (>= (length line) 18)
-                                              (string-equal line "transfer-encoding:"
-                                                            :end1 18))
-                                     (let ((value (string-trim '(#\Space #\Tab)
-                                                                (subseq line 18))))
-                                       (when (connection-header-has-token-p value "chunked")
-                                         (setf chunked t))))))))
-                          ((= byte 13) nil)
-                          (t (vector-push-extend byte line-buf))))
-                       ;; Chunked body — reading chunk size (separate buffer
-                       ;; to avoid corrupting body content in line-buf)
-                       ((and chunked in-chunk-size)
-                        (cond
-                          ((= byte 10)
-                           ;; Skip empty lines (chunk-terminator CRLFs)
-                           (when (> (fill-pointer chunk-size-buf) 0)
-                             (let* ((size-str (sb-ext:octets-to-string
-                                              (subseq chunk-size-buf 0
-                                                      (fill-pointer chunk-size-buf))
-                                              :external-format :ascii))
-                                    (size (parse-integer size-str :radix 16
-                                                                  :junk-allowed t)))
-                               (setf (fill-pointer chunk-size-buf) 0)
-                               (if (and size (> size 0))
-                                   (setf chunk-remaining size
-                                         in-chunk-size nil)
-                                   (return)))))  ; final chunk
-                          ((= byte 13) nil)
-                          (t (vector-push-extend byte chunk-size-buf))))
-                       ;; Chunked body — reading chunk data
-                       (chunked
-                        (when (> chunk-remaining 0)
-                          (decf chunk-remaining)
-                          (cond
-                            ((= byte 10) (emit-body-line))
-                            ((= byte 13) nil)
-                            (t (vector-push-extend byte line-buf))))
-                        (when (zerop chunk-remaining)
-                          (setf in-chunk-size t)))
-                       ;; Non-chunked body
-                       (t
-                        (cond
-                          ((= byte 10) (emit-body-line))
-                          ((= byte 13) nil)
-                          (t (vector-push-extend byte line-buf))))))))))
+                          ;; Header phase
+                          (in-headers
+                           (cond
+                             ((= byte 10)
+                              (let ((line (emit-line)))
+                                (if (zerop (length line))
+                                    (progn
+                                      (setf in-headers nil)
+                                      (when chunked (setf in-chunk-size t)))
+                                    (progn
+                                      (when first-line
+                                        (let ((sp (position #\Space line)))
+                                          (when (and sp (< (+ sp 3) (length line)))
+                                            (setf status (parse-integer line :start (1+ sp)
+                                                                             :end (+ sp 4)
+                                                                             :junk-allowed t))))
+                                        (setf first-line nil))
+                                      (when (and (>= (length line) 18)
+                                                 (string-equal line "transfer-encoding:"
+                                                               :end1 18))
+                                        (let ((value (string-trim '(#\Space #\Tab)
+                                                                   (subseq line 18))))
+                                          (when (connection-header-has-token-p value "chunked")
+                                            (setf chunked t))))))))
+                             ((= byte 13) nil)
+                             (t (vector-push-extend byte line-buf))))
+                          ;; Chunked body — reading chunk size (separate
+                          ;; buffer so body content in line-buf is not
+                          ;; corrupted across chunk boundaries). Strict
+                          ;; parse: parse-chunked-size-bytes strips
+                          ;; chunk-extensions (RFC 7230 §4.1.1 — anything
+                          ;; from ';' onwards), requires at least one
+                          ;; hex digit, and raises on parse failure.
+                          ;; The prior :junk-allowed t + NIL → final-
+                          ;; chunk behavior was a parser-disagreement
+                          ;; smuggling primitive between us and any
+                          ;; stricter downstream.
+                          ((and chunked in-chunk-size)
+                           (cond
+                             ((= byte 10)
+                              (when (> (fill-pointer chunk-size-buf) 0)
+                                (let ((size (parse-chunked-size-bytes
+                                             chunk-size-buf 0
+                                             (fill-pointer chunk-size-buf))))
+                                  (setf (fill-pointer chunk-size-buf) 0)
+                                  (cond
+                                    ((zerop size) (return))  ; final chunk
+                                    (t (setf chunk-remaining size
+                                             in-chunk-size nil))))))
+                             ((= byte 13) nil)
+                             (t (vector-push-extend byte chunk-size-buf))))
+                          ;; Chunked body — reading chunk data
+                          (chunked
+                           (when (> chunk-remaining 0)
+                             (decf chunk-remaining)
+                             (cond
+                               ((= byte 10) (emit-body-line))
+                               ((= byte 13) nil)
+                               (t (vector-push-extend byte line-buf))))
+                           (when (zerop chunk-remaining)
+                             (setf in-chunk-size t)))
+                          ;; Non-chunked body
+                          (t
+                           (cond
+                             ((= byte 10) (emit-body-line))
+                             ((= byte 13) nil)
+                             (t (vector-push-extend byte line-buf))))))))))))
     ;; Flush any remaining unterminated line
     (when (> (fill-pointer line-buf) 0)
       (when on-line
