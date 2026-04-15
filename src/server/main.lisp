@@ -238,13 +238,24 @@
                   (http-request-method request)
                   (http-request-path request))
        (values response nil))
-      ;; Normal HTTP response
-      (t
+      ;; Normal HTTP response — must be an HTTP-RESPONSE struct. The
+      ;; previous catch-all let a handler that forgot MAKE-TEXT-RESPONSE
+      ;; (returning a raw string or alist) fall through to FORMAT-RESPONSE
+      ;; where it tripped a deep SIMPLE-TYPE-ERROR from the struct
+      ;; accessor, which the outer handler-case converted to a 500.
+      ;; Correct outcome, terrible message — apps debugging their own
+      ;; handler bugs had to trace into HTTP-RESPONSE-STATUS to realize
+      ;; the issue was upstream. Check here and raise a pointed error.
+      ((typep response 'http-response)
        (log-debug "~a ~a -> ~d"
                   (http-request-method request)
                   (http-request-path request)
                   (http-response-status response))
-       (values response nil)))))
+       (values response nil))
+      (t
+       (error "handler returned ~a; expected an HTTP-RESPONSE, ~
+               HTTP-FETCH-CONTINUATION, byte vector, or :UPGRADE"
+              (type-of response))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Accept a new connection
@@ -356,10 +367,31 @@
                  ((member (connection-state conn) '(:read-http :read-body :awaiting))
                   (push conn inbounds-to-close))
                  ((eq (connection-state conn) :websocket)
-                  (connection-queue-write conn (build-ws-close 1001))
-                  (setf (connection-state conn) :closing)
-                  (epoll-modify epoll-fd (connection-fd conn)
-                               (logior +epollout+ +epollet+)))
+                  ;; Must not clobber an in-flight write. The race:
+                  ;; ping-ws-connections queued a 2-byte ping whose
+                  ;; first byte was flushed, write-pos=1 write-end=2
+                  ;; (EAGAIN on byte 2). SIGTERM arrives, drain runs,
+                  ;; connection-queue-write overwrites write-buf with
+                  ;; the close frame bytes and resets write-pos to 0.
+                  ;; What hits the wire: partial ping + close frame
+                  ;; bytes as one contiguous buffer, and the client
+                  ;; interprets the close frame's FIN+opcode byte as
+                  ;; the ping's length, then waits forever. Same
+                  ;; discipline ping-ws-connections itself uses
+                  ;; (queue only when nothing is in flight). If a
+                  ;; write IS in flight, transition to :closing and
+                  ;; let handle-client-write tear the connection
+                  ;; down after the partial write finishes — the
+                  ;; peer sees a truncated frame rather than a
+                  ;; corrupt one.
+                  (cond
+                    ((< (connection-write-pos conn) (connection-write-end conn))
+                     (setf (connection-state conn) :closing))
+                    (t
+                     (connection-queue-write conn (build-ws-close 1001))
+                     (setf (connection-state conn) :closing)
+                     (epoll-modify epoll-fd (connection-fd conn)
+                                   (logior +epollout+ +epollet+)))))
                  ;; :write-response, :ws-upgrade, :closing — let them finish
                  (t nil)))
              *connections*)
@@ -583,7 +615,17 @@
    Inner state dispatch is permissive for the same reason as
    HANDLE-CLIENT-READ: a stale EPOLLOUT can arrive for a state
    that isn't currently writing, and raising into the handler-case
-   below would overwrite a legitimate in-flight response with a 500."
+   below would overwrite a legitimate in-flight response with a 500.
+
+   Bumps LAST-ACTIVE on entry so a legitimate slow client (mobile
+   3G pulling a 5 MiB response at 200 KB/s) is not reaped by the
+   idle sweeper 10 s into the download. The pre-pack-16 shape only
+   bumped on dispatch-time and on keep-alive reset, so a response
+   that took longer than *IDLE-TIMEOUT* to flush was killed mid-
+   write. Bumping here treats EPOLLOUT itself as progress — if the
+   kernel says we can write, the connection is alive — which is
+   the correct semantics for a slow-pipe client."
+  (setf (connection-last-active conn) (get-universal-time))
   (handler-case
       (let ((result (connection-on-write conn)))
         (case result

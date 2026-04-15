@@ -280,6 +280,30 @@
         (pos 0)
         (end (connection-read-pos conn))
         (responses nil))
+    (labels ((close-with (code)
+               ;; Tear-down helper for every error-close site. The
+               ;; pre-pack-16 shape had every error branch emit
+               ;; (values :close (build-ws-close NNNN)) which
+               ;; silently dropped the RESPONSES list populated by
+               ;; earlier frames in the same batch — a reply from
+               ;; frame N-1 would be lost if frame N had an RSV bit
+               ;; set. The normal-close branch already had the
+               ;; concat-then-close logic inline; lifting it out so
+               ;; every error site goes through the same code path
+               ;; means the responses list is always preserved.
+               (ws-shift-buffer conn buf pos end)
+               (let ((close-frame (build-ws-close code)))
+                 (if responses
+                     (let* ((all (nreverse (cons close-frame responses)))
+                            (total (reduce #'+ all :key #'length))
+                            (out (make-array total
+                                              :element-type '(unsigned-byte 8)))
+                            (offset 0))
+                       (dolist (r all)
+                         (replace out r :start1 offset)
+                         (incf offset (length r)))
+                       (values :close out))
+                     (values :close close-frame)))))
     (loop
       (multiple-value-bind (frame consumed)
           (handler-case
@@ -288,9 +312,7 @@
               ;; Protocol errors (RSV bits, oversized, unmasked, etc.)
               ;; → close with 1002 per RFC 6455 §7.1.7
               (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
-              (ws-shift-buffer conn buf pos end)
-              (return-from websocket-on-read
-                (values :close (build-ws-close 1002)))))
+              (return-from websocket-on-read (close-with 1002))))
         (unless frame
           ;; No complete frame — shift unconsumed bytes to start of buffer
           (when (> pos 0)
@@ -310,9 +332,7 @@
                          (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1002))))
+               (return-from websocket-on-read (close-with 1002)))
              (if (ws-frame-fin frame)
                  ;; Complete single-frame message
                  (progn
@@ -324,9 +344,7 @@
                        (error ()
                          (log-warn "ws invalid UTF-8 in text frame fd ~d"
                                    (connection-fd conn))
-                         (ws-shift-buffer conn buf pos end)
-                         (return-from websocket-on-read
-                           (values :close (build-ws-close 1007))))))
+                         (return-from websocket-on-read (close-with 1007)))))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
@@ -346,9 +364,7 @@
                          (log-warn "ws fragmented message too large ~
                                     on first fragment (~d bytes) fd ~d"
                                    len (connection-fd conn))
-                         (ws-shift-buffer conn buf pos end)
-                         (return-from websocket-on-read
-                           (values :close (build-ws-close 1009))))
+                         (return-from websocket-on-read (close-with 1009)))
                        (progn
                          (setf (connection-ws-frag-opcode conn) opcode
                                (connection-ws-frag-buf conn)
@@ -361,9 +377,7 @@
              (unless (connection-ws-frag-buf conn)
                (log-warn "ws continuation without start fd ~d"
                          (connection-fd conn))
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1002))))
+               (return-from websocket-on-read (close-with 1002)))
              ;; Accumulate fragment — O(1) running total instead of re-scanning
              (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
              (incf (connection-ws-frag-total conn) (length (ws-frame-payload frame)))
@@ -372,9 +386,7 @@
                          (connection-ws-frag-total conn) (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1009))))
+               (return-from websocket-on-read (close-with 1009)))
              (when (ws-frame-fin frame)
                ;; Final fragment — reassemble and deliver
                (let* ((chunks (nreverse (connection-ws-frag-buf conn)))
@@ -396,9 +408,7 @@
                      (error ()
                        (log-warn "ws invalid UTF-8 in reassembled text fd ~d"
                                  (connection-fd conn))
-                       (ws-shift-buffer conn buf pos end)
-                       (return-from websocket-on-read
-                         (values :close (build-ws-close 1007))))))
+                       (return-from websocket-on-read (close-with 1007)))))
                  (setf (connection-last-active conn) (get-universal-time))
                  (let ((complete (make-ws-frame
                                   :fin t
@@ -425,9 +435,8 @@
                                 ((= (length payload) 1)
                                  (log-warn "ws close with 1-byte body fd ~d"
                                            (connection-fd conn))
-                                 (ws-shift-buffer conn buf pos end)
                                  (return-from websocket-on-read
-                                   (values :close (build-ws-close 1002))))
+                                   (close-with 1002)))
                                 (t (logior (ash (aref payload 0) 8)
                                            (aref payload 1)))))
                     (code (clamp-close-code raw-code)))
@@ -439,38 +448,24 @@
                    (error ()
                      (log-warn "ws invalid UTF-8 in close reason fd ~d"
                                (connection-fd conn))
-                     (ws-shift-buffer conn buf pos end)
-                     (return-from websocket-on-read
-                       (values :close (build-ws-close 1007))))))
-               (ws-shift-buffer conn buf pos end)
-               ;; Flush any responses from earlier frames before the close
-               (let ((close-frame (build-ws-close code)))
-                 (if responses
-                     (let* ((all (nreverse (cons close-frame responses)))
-                            (total (reduce #'+ all :key #'length))
-                            (out (make-array total :element-type '(unsigned-byte 8)))
-                            (offset 0))
-                       (dolist (r all)
-                         (replace out r :start1 offset)
-                         (incf offset (length r)))
-                       (return-from websocket-on-read (values :close out)))
-                     (return-from websocket-on-read
-                       (values :close close-frame))))))
+                     (return-from websocket-on-read (close-with 1007)))))
+               ;; Normal client-initiated close: CLOSE-WITH concatenates
+               ;; any pending responses from earlier frames in this batch
+               ;; with the close frame and shifts the buffer.
+               (return-from websocket-on-read (close-with code))))
             (t
              ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
              (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
-             (ws-shift-buffer conn buf pos end)
-             (return-from websocket-on-read
-               (values :close (build-ws-close 1002))))))))
-    ;; Concatenate response frames into a single write buffer
-    (when responses
-      (setf responses (nreverse responses))
-      (if (= (length responses) 1)
-          (first responses)
-          (let* ((total (reduce #'+ responses :key #'length))
-                 (out (make-array total :element-type '(unsigned-byte 8)))
-                 (offset 0))
-            (dolist (r responses)
-              (replace out r :start1 offset)
-              (incf offset (length r)))
-            out)))))
+             (return-from websocket-on-read (close-with 1002)))))))
+      ;; Concatenate response frames into a single write buffer
+      (when responses
+        (setf responses (nreverse responses))
+        (if (= (length responses) 1)
+            (first responses)
+            (let* ((total (reduce #'+ responses :key #'length))
+                   (out (make-array total :element-type '(unsigned-byte 8)))
+                   (offset 0))
+              (dolist (r responses)
+                (replace out r :start1 offset)
+                (incf offset (length r)))
+              out))))))
