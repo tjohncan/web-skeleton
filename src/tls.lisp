@@ -628,18 +628,9 @@
    from the raw (X, Y) coordinates, parses it to an EVP_PKEY via
    d2i_PUBKEY, DER-encodes the raw r||s signature, then calls
    EVP_PKEY_verify. Cleanup via unwind-protect regardless of path.
-
-   Enforces low-S explicitly before handing off to OpenSSL:
-   EVP_PKEY_verify accepts both (r, s) and (r, n-s) as mathematically
-   valid ECDSA signatures, so without this check the libssl path would
-   silently diverge from the pure-Lisp path on the malleability test.
-   OpenSSL does reject r/s out of range and invalid-curve points
-   internally, so those checks are not duplicated here."
-  ;; Low-S enforcement — match ECDSA-VERIFY-P256-LISP's policy of
-  ;; mapping each message to exactly one accepted signature.
-  (when (> (bytes-to-integer (subseq sig-bytes 32 64))
-           (ash +p256-n+ -1))
-    (return-from ecdsa-verify-p256-libssl nil))
+   OpenSSL handles r/s range and invalid-curve point rejection
+   internally, so those checks are not duplicated here. Both (r, s)
+   and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S."
   (let ((spki (build-p256-spki pubkey-x pubkey-y))
         (sig-der (der-encode-ecdsa-signature sig-bytes))
         (pkey nil)

@@ -163,13 +163,13 @@
         (qy (bytes-to-integer pubkey-y))
         (z (bytes-to-integer hash)))
     ;; Check r, s in [1, n-1]
+    ;; Both (r, s) and (r, n-s) are valid ES256 signatures per
+    ;; RFC 7515 / 7518 — JOSE does not mandate low-S normalization
+    ;; and mainstream issuers emit high-S roughly half the time.
+    ;; A Bitcoin-style malleability wrapper can layer on top at a
+    ;; call site that needs it; JWT verification does not.
     (unless (and (<= 1 r (1- +p256-n+))
                  (<= 1 s (1- +p256-n+)))
-      (return-from ecdsa-verify-p256-lisp nil))
-    ;; Enforce low-S to prevent signature malleability.
-    ;; For any valid (r, s), (r, n-s) also verifies — reject high-S
-    ;; so each message maps to exactly one accepted signature.
-    (when (> s (ash +p256-n+ -1))
       (return-from ecdsa-verify-p256-lisp nil))
     ;; Point-on-curve check (FIPS 186-4 §5.6.2.3.3):
     ;; reject invalid-curve points to prevent small-subgroup attacks
