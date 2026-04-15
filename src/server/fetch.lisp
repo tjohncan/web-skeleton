@@ -41,13 +41,13 @@
    SSE, chunked text). Default 1 MiB. Applied by the streaming
    readers in FETCH-STREAM-PLAIN (via READER-READ-LINE /
    READER-READ-BYTES) and TLS-STREAM-RESPONSE. Distinct from
-   *MAX-BODY-SIZE* (inbound request body cap) — the streaming
-   readers used to reach for *MAX-BODY-SIZE* out of convenience,
-   so tightening the inbound cap for request hardening would
-   silently break the app's NDJSON client. Distinct from
-   *MAX-OUTBOUND-RESPONSE-SIZE* too: this cap is per-line, not
-   per-response, because the streaming readers operate on one
-   line at a time and never buffer the whole response.")
+   *MAX-BODY-SIZE* (the inbound request-body cap) so tightening
+   one does not move the other — an app tuning its request
+   hardening should not incidentally break its NDJSON client.
+   Distinct from *MAX-OUTBOUND-RESPONSE-SIZE* too: this cap is
+   per-line, not per-response, because the streaming readers
+   operate on one line at a time and never buffer the whole
+   response.")
 
 (defun http-fetch (method url &key headers body then)
   "Create an outbound HTTP request descriptor.
@@ -244,13 +244,13 @@
     ;; RFC 3986 §3.5: fragment is identified by '#' and is never
     ;; sent to the origin server. Cap the effective end of the URL
     ;; at the fragment delimiter once so both the authority scan
-    ;; and the path slice respect the same boundary — the old code
-    ;; left the fragment glued to the path and we'd send something
-    ;; like "GET /?q=1#frag HTTP/1.1", which RFC 7230 §5.3 forbids.
+    ;; and the path slice respect the same boundary — leaving the
+    ;; fragment glued to the path would emit a request-target
+    ;; containing '#frag', which RFC 7230 §5.3 forbids.
     ;;
     ;; Authority ends at the first '/' or '?' within that cap
     ;; (RFC 3986 §3.2). A URL like 'http://host?q=1' has no path
-    ;; segment at all, so if we only looked for '/' we would parse
+    ;; segment at all, so scanning only for '/' would parse
     ;; "host?q=1" as the hostname and dial it.
     (let* ((end          (length url))
            (frag-start   (position #\# url))
@@ -301,11 +301,10 @@
    but RFC 7230 §5.4 requires the Host header to be identical to
    the authority component, and RFC 3986 §3.2.2 defines the IPv6
    authority grammar as '[' IPv6address ']' with the brackets
-   mandatory. The old path emitted 'Host: ::1:8080' which is
-   unparseable — the boundary between address and port is
-   ambiguous — and strict upstreams 400 it. Adding the square
-   brackets back on the wire closes the parse-url → wire-form
-   asymmetry."
+   mandatory. A bare 'Host: ::1:8080' is unparseable — no reader
+   can tell where the address ends and the port begins — and
+   strict upstreams 400 it. The re-bracket here keeps the
+   parse-url → wire-form pipeline symmetric."
   (let* ((method-str (symbol-name method))
          (default-port-p (or (and (eq scheme :http) (= port 80))
                              (and (eq scheme :https) (= port 443))))
@@ -504,6 +503,27 @@
                        (vector-push-extend b line-buf))
               (setf (stream-reader-pos r) end)))))))
 
+(defun reader-expect-crlf (r)
+  "Consume exactly two bytes from R and raise if they are not
+   CR (0x0D) followed by LF (0x0A). Used by stream-chunked-lines
+   to enforce the strict RFC 7230 §4.1 chunk-data terminator.
+
+   READER-READ-LINE walks to the next LF and silently strips CR
+   bytes from the accumulated content, so calling it on the
+   trailing CRLF would tolerate a bare LF, a bare CR followed by
+   anything, or even multi-byte garbage before the LF — all
+   acceptance modes the buffered DECODE-CHUNKED-BODY rejects."
+  (flet ((next-byte ()
+           (when (>= (stream-reader-pos r) (stream-reader-end r))
+             (when (zerop (reader-fill r))
+               (error "chunked stream: truncated before chunk-data CRLF")))
+           (prog1 (aref (stream-reader-buf r) (stream-reader-pos r))
+             (incf (stream-reader-pos r)))))
+    (unless (= (next-byte) 13)
+      (error "chunked stream: expected CR after chunk-data"))
+    (unless (= (next-byte) 10)
+      (error "chunked stream: expected LF after chunk-data"))))
+
 (defun reader-read-bytes (r count line-buf on-line)
   "Read COUNT bytes through the buffered reader, splitting into lines.
    Calls ON-LINE per complete line. Returns the number of bytes
@@ -586,15 +606,35 @@
              (when (and (>= (length line) 15)
                         (string-equal line "content-length:"
                                       :end1 15))
+               ;; Strict digits-only parse, symmetric with the
+               ;; inbound SCAN-CONTENT-LENGTH byte scanner so a
+               ;; future edit can't let one path accept a value
+               ;; the other rejects. Rejects '+10', '-5', and
+               ;; anything with non-digit bytes, and raises on
+               ;; duplicate CL headers with differing values —
+               ;; the same CL-TE smuggling discipline applied to
+               ;; streaming responses. A negative CL matters in
+               ;; particular: READER-READ-BYTES short-circuits on
+               ;; (while (> remaining 0)) at count=-5, returns 0,
+               ;; and the (< 0 -5) truncation guard would be false,
+               ;; so a permissive parse would let the stream deliver
+               ;; an empty body as success.
                (let ((value (string-trim '(#\Space #\Tab) (subseq line 15))))
-                 (setf content-length
-                       (handler-case (parse-integer value)
-                         (error () nil))))))
+                 (unless (and (> (length value) 0)
+                              (every (lambda (c) (char<= #\0 c #\9)) value))
+                   (error "streaming response: malformed Content-Length ~s"
+                          value))
+                 (let ((n (parse-integer value)))
+                   (when (and content-length (/= n content-length))
+                     (error "streaming response: conflicting Content-Length ~
+                             ~d vs ~d"
+                            content-length n))
+                   (setf content-length n)))))
     ;; Stream body lines
     (cond
       (chunked
        (stream-chunked-lines r on-line))
-      ((and content-length (not chunked))
+      (content-length
        ;; Framed non-chunked. Track bytes against CL so SO_RCVTIMEO
        ;; or peer RST mid-body raises loud instead of quietly ending
        ;; the stream. RFC 7230 §3.3.3 order: TE wins over CL, so we
@@ -628,11 +668,11 @@
 
    Shared between stream-chunked-lines (plain streaming) and
    tls-stream-response (tls streaming) so both paths reject the
-   same garbage inputs. The pre-pack-16 shape used
-   parse-integer :junk-allowed t which silently accepted 'xyz'
-   as NIL (treated as final chunk — loop exits clean) and '-5'
-   as -5 (loop exits clean) — a parser-disagreement smuggling
-   primitive against any stricter downstream."
+   same garbage inputs. Strict rejection matters here because a
+   permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
+   the decoder loop as if the stream were complete — a parser-
+   disagreement smuggling primitive against any stricter
+   downstream that re-parses the body."
   (let* ((semi (position #\; size-line))
          (hex-end (or semi (length size-line)))
          (hex (string-trim '(#\Space #\Tab) (subseq size-line 0 hex-end))))
@@ -675,8 +715,12 @@
             (setf terminated t)
             (return))
           (reader-read-bytes r chunk-size line-buf on-line)
-          ;; Consume trailing CRLF after chunk-data
-          (reader-read-line r))))
+          ;; Strict trailing CRLF after chunk-data (RFC 7230 §4.1).
+          ;; READER-READ-LINE would silently tolerate a bare LF or
+          ;; garbage followed by LF — READER-EXPECT-CRLF requires
+          ;; both bytes exactly, matching decode-chunked-body's
+          ;; discipline on the buffered path.
+          (reader-expect-crlf r))))
     (unless terminated
       (error "chunked: incomplete stream (no zero-size terminator)"))
     (when (> (fill-pointer line-buf) 0)
@@ -774,10 +818,10 @@
                  (setf done t)))
           ;; Error path: if the error landed after REGISTER-CONNECTION but
           ;; before we finished wiring, tear down partial state. Symmetric
-          ;; with ACCEPT-CONNECTION's flagged-unwind shape — the pre-
-          ;; pack-16 handler-case unregistered but never called
-          ;; EPOLL-REMOVE, leaving a latent stale-entry window if a
-          ;; refactor ever moved setf/log-debug into the raising region.
+          ;; with ACCEPT-CONNECTION's flagged-unwind shape — an error
+          ;; between register and epoll-add would otherwise leave a stale
+          ;; entry in *CONNECTIONS* pointing at a bare fd that the epoll
+          ;; fd has no record of, and the next sweep would trip over it.
           (unless done
             (when (and registered epoll-added out-conn)
               (ignore-errors
@@ -914,16 +958,15 @@
        ;; Server closed connection — response is complete (Connection: close)
        (complete-fetch conn epoll-fd))
       (:full
-       ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. The old path here
-       ;; logged a warn and called COMPLETE-FETCH, which routed through
-       ;; the happy-path callback with a silently-truncated body: fine
-       ;; for a content-length-framed response (the truncation guard
-       ;; in COMPLETE-FETCH catches it) and fine for chunked
-       ;; (DECODE-CHUNKED-BODY raises on missing terminator), but a
-       ;; CONNECTION: close-framed response has neither guard and the
-       ;; app would receive an 8-MiB-truncated body as 'success'.
-       ;; Route through DELIVER-FETCH-ERROR so the inbound gets a 502
-       ;; and the fetch callback's cleanup sentinel fires.
+       ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. Route through
+       ;; DELIVER-FETCH-ERROR so the inbound gets a 502 and the
+       ;; fetch callback's cleanup sentinel fires. A
+       ;; Content-Length-framed response would otherwise hit
+       ;; COMPLETE-FETCH's truncation guard and a chunked one would
+       ;; hit DECODE-CHUNKED-BODY's missing-terminator raise, but
+       ;; a Connection: close-framed response has neither guard —
+       ;; routing all three shapes through deliver-fetch-error on
+       ;; :full keeps the cap a hard boundary in every framing.
        (deliver-fetch-error
         conn epoll-fd
         (format nil "response exceeds ~d bytes (cap)"
@@ -997,6 +1040,21 @@
           ;; the response never included the 0-chunk terminator.
           ;; Both are incomplete.
           (return))
+        ;; RFC 7230 §4.1.1 lists only ';' (chunk-ext start), SP /
+        ;; HTAB (BWS tolerance), and CR (start of CRLF) as legal
+        ;; bytes after the hex digits of a chunk-size. Anything
+        ;; else is rejected symmetrically with PARSE-CHUNKED-SIZE-LINE
+        ;; on the streaming path — without this check '5g\r\n'
+        ;; would silently parse as chunk-size 5 with 'g' as an
+        ;; implicit extension and become a smuggling primitive
+        ;; against a stricter downstream.
+        (when (< pos end)
+          (let ((b (aref buf pos)))
+            (unless (or (= b 59)  ; ';'
+                        (= b 32)  ; SP
+                        (= b 9)   ; HTAB
+                        (= b 13)) ; CR
+              (error "chunked: invalid byte 0x~2,'0x after chunk-size" b))))
         ;; Require strict CRLF after the chunk-size (RFC 7230 §4.1).
         ;; Any chunk extensions between the hex digits and CRLF are
         ;; passed through untouched — we scan for the LF and verify
@@ -1046,16 +1104,14 @@
   (let* ((buf (connection-read-buf out-conn))
          (pos (connection-read-pos out-conn))
          (header-end (scan-crlf-crlf buf 0 pos)))
-    ;; Gate on complete headers. The pre-pack-16 shape let every
-    ;; downstream (when header-end ...) short-circuit to NIL and then
-    ;; fired the callback with (0 NIL NIL), which violated the
-    ;; DEPLOYMENT.md contract (happy path = integer status, cleanup
-    ;; path = all-NIL sentinel — never a zero status). Apps pattern-
-    ;; matching on (if status ...) saw 0 as truthy, routed to the
-    ;; happy branch, and blew up interpreting the integer 0 as an
-    ;; HTTP status. Route through DELIVER-FETCH-ERROR when headers
-    ;; are incomplete so the inbound gets a 502 and the callback
-    ;; fires its cleanup sentinel.
+    ;; Gate on complete headers. DEPLOYMENT.md's fetch callback
+    ;; contract promises the happy path fires with an integer
+    ;; status and the cleanup sentinel is (NIL NIL NIL) — never
+    ;; a zero status. Apps pattern-matching on (if status ...)
+    ;; treat 0 as truthy, route to the happy branch, and blow up
+    ;; interpreting the integer 0 as an HTTP status. Incomplete
+    ;; headers go through DELIVER-FETCH-ERROR so the inbound
+    ;; gets a 502 and the callback fires its cleanup sentinel.
     (unless header-end
       (deliver-fetch-error out-conn epoll-fd
                            "upstream response has no parseable headers")
@@ -1069,6 +1125,14 @@
            (chunked-p (response-chunked-p headers))
            (content-length (unless chunked-p
                              (scan-content-length buf header-end))))
+    ;; Status line must parse too. PARSE-RESPONSE-STATUS returns
+    ;; NIL on a malformed status line ('HTTP/1.1 ABC OK', status
+    ;; digits out of range, missing version, etc.) — same 'never
+    ;; a zero status' contract as the header-end gate above.
+    (unless status
+      (deliver-fetch-error out-conn epoll-fd
+                           "upstream status line unparseable")
+      (return-from complete-fetch))
     ;; Truncation guard: if the upstream declared a Content-Length
     ;; and we hit EOF before receiving that many body bytes, the
     ;; response is incomplete. Passing the partial body to the
@@ -1083,10 +1147,14 @@
                            (format nil "short body: ~d of ~d bytes"
                                    (- pos body-start) content-length))
       (return-from complete-fetch))
-    (let* ((body-end (if (and body-start content-length)
+    ;; BODY-START is unconditionally (+ header-end 4) past the
+    ;; header-end gate above — it is always a positive fixnum at
+    ;; this point, so no further nil-guards on BODY-START are
+    ;; needed.
+    (let* ((body-end (if content-length
                          (min pos (+ body-start content-length))
                          pos))
-           (raw-body (when (and body-start (> body-end body-start))
+           (raw-body (when (> body-end body-start)
                        (subseq buf body-start body-end)))
            (body (if (and raw-body chunked-p)
                      (decode-chunked-body raw-body 0 (length raw-body))
@@ -1109,7 +1177,7 @@
         (if inbound
             (handler-case
               (let ((response (funcall callback
-                                       (or status 0) (or headers nil)
+                                       status (or headers nil)
                                        (or body nil))))
                 ;; Queue the response on the inbound connection
                 (let ((bytes (cond
