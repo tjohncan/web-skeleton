@@ -149,8 +149,8 @@
                       "Host: localhost")))
 
   ;; CTL / DEL bytes in header NAMES rejected (RFC 7230 §3.2).
-  ;; Previously only space and tab were rejected; NUL or DEL slipped
-  ;; through into the header alist.
+  ;; NUL and DEL must not reach the header alist — any CTL in a
+  ;; header name is a log-injection or smuggling primitive.
   (check-error "NUL in header name"
                (parse-request
                 (crlf "GET / HTTP/1.1"
@@ -301,11 +301,10 @@
     (check-error "Content-Length: +10 rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
 
-  ;; Content-Length digit cap tightened from 15 to 10 in pack 16.
-  ;; 10 decimal digits ≈ 9.3 GB, still orders of magnitude past any
-  ;; real *MAX-BODY-SIZE*, so the hard cap cannot be reached via a
-  ;; legitimate value but the per-digit scan now bails early on
-  ;; attacker-supplied padding.
+  ;; Content-Length digit cap is 10 decimal digits ≈ 9.3 GB, still
+  ;; orders of magnitude past any real *MAX-BODY-SIZE*. The cap
+  ;; cannot be reached via a legitimate value but bails early on
+  ;; attacker-supplied padding like 'Content-Length: 999999999999999'.
   (let* ((raw (concatenate 'string
                 "GET / HTTP/1.1" *crlf*
                 "Content-Length: 12345678901" *crlf*  ; 11 digits
@@ -544,10 +543,10 @@
   ;; serialize-http-message strictness. An app that builds a
   ;; response alist with a CR, NUL, '(' in the header name, or
   ;; char code > 127 must not silently produce a broken wire
-  ;; message — the old path did char-code → (unsigned-byte 8)
-  ;; which both truncated (for codes > 255) and injected (for
-  ;; CR/LF in values). The new path UTF-8 encodes up front and
-  ;; validates the resulting bytes.
+  ;; message. The serializer UTF-8 encodes up front and validates
+  ;; the resulting bytes, so non-ASCII gets a clean content error
+  ;; and CR/LF in values can't slip through as a header-injection
+  ;; primitive.
   (flet ((serialize (first-line headers &optional body)
            (web-skeleton::serialize-http-message first-line headers body)))
     ;; First-line CTL rejection (beyond just CR/LF).
@@ -776,22 +775,22 @@
     (check "http v6 bracketed port" port 8080)
     (check "http v6 bracketed path" path "/"))
 
-  ;; Userinfo in the authority is rejected. The pre-pack-16 shape
-  ;; raised a bare parse-integer type-error from the port split —
-  ;; the new path is a dedicated "userinfo not supported" error
-  ;; so the caller sees what's wrong.
+  ;; Userinfo in the authority is rejected with a dedicated
+  ;; "userinfo not supported" error so the caller sees what's
+  ;; wrong instead of a bare parse-integer type-error leaking up
+  ;; from the port split.
   (check-error "url: userinfo rejected"
                (web-skeleton::parse-url "http://user:pass@example.com/"))
   (check-error "url: userinfo (just user) rejected"
                (web-skeleton::parse-url "http://user@example.com/"))
-  ;; Non-numeric port comes back as a friendly "non-numeric port"
+  ;; Non-numeric port surfaces as a friendly "non-numeric port"
   ;; error instead of a raw SIMPLE-TYPE-ERROR from parse-integer.
   (check-error "url: non-numeric port rejected"
                (web-skeleton::parse-url "http://example.com:abc/"))
 
-  ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4).
-  ;; Before the fix, 'http://host?q=1' parsed the whole 'host?q=1'
-  ;; as the authority and dialed a hostname containing '?'.
+  ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4) —
+  ;; without this, 'http://host?q=1' would parse the whole
+  ;; 'host?q=1' as the authority and dial a hostname containing '?'.
   (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://example.com?q=1")
     (declare (ignore scheme))
@@ -841,12 +840,11 @@
 
   ;; IPv6 literal host: the wire Host header must re-bracket the
   ;; address. parse-authority strips the brackets from the internal
-  ;; host string (correct — URL syntax, not address), and the
-  ;; pre-pack-16 build-outbound-request reused that unbracketed
-  ;; string on the wire, emitting 'Host: ::1:8080' which is
-  ;; unparseable — no way for a reader to tell where the address
-  ;; ends and the port begins. RFC 7230 §5.4 / RFC 3986 §3.2.2
-  ;; require '[' IPv6address ']' for IP-literal authorities.
+  ;; host string (correct — URL syntax, not address), but RFC 7230
+  ;; §5.4 / RFC 3986 §3.2.2 require '[' IPv6address ']' for
+  ;; IP-literal authorities on the wire. A bare 'Host: ::1:8080'
+  ;; is unparseable — no reader can tell where the address ends
+  ;; and the port begins.
   (let* ((bytes (web-skeleton::build-outbound-request
                  :GET "::1" "/" :port 8080))
          (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
@@ -870,6 +868,22 @@
            (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
       (check "ipv6 end-to-end host bracketed"
              (not (null (search "host: [::1]:8080" text))) t)))
+
+  ;; Config knobs that DEPLOYMENT.md tells users to setf from their
+  ;; own packages must be exported from :WEB-SKELETON. An unqualified
+  ;; reference inside another package's setf form would otherwise
+  ;; resolve to a fresh symbol in the caller's package and silently
+  ;; leave the framework's cap untouched — the kind of bug that
+  ;; only surfaces when someone discovers the framework-side value
+  ;; is still at its default despite the app's tune block.
+  (dolist (name '("*MAX-BODY-SIZE*"
+                  "*MAX-OUTBOUND-RESPONSE-SIZE*"
+                  "*MAX-STREAMING-LINE-SIZE*"
+                  "*MAX-WS-PAYLOAD-SIZE*"
+                  "*MAX-WS-MESSAGE-SIZE*"))
+    (check (format nil "~a exported from :web-skeleton" name)
+           (nth-value 1 (find-symbol name :web-skeleton))
+           :external))
 
   ;; Response status parsing
   (let ((buf (sb-ext:string-to-octets
@@ -1346,6 +1360,73 @@
           (check "chunked line count" (length lines) 2)
           (check "chunked first line" (first lines) "{\"n\":1}")
           (check "chunked second line" (second lines) "{\"n\":2}"))
+      (close stream)))
+
+  ;; Streaming Content-Length parser: strict digits-only +
+  ;; duplicate-conflict rejection, symmetric with the inbound
+  ;; SCAN-CONTENT-LENGTH byte scanner.
+  (flet ((run-headers (header-line)
+           (let* ((raw (ascii-bytes (concatenate 'string
+                        "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                        header-line (string #\Return) (string #\Newline)
+                        (string #\Return) (string #\Newline)
+                        "x")))
+                  (stream (make-mock-stream raw)))
+             (unwind-protect
+                 (handler-case
+                     (progn (web-skeleton::stream-response-lines
+                             stream (lambda (line) (declare (ignore line))))
+                            nil)
+                   (error () t))
+               (close stream)))))
+    (check "streaming CL: negative rejected"
+           (run-headers "Content-Length: -5") t)
+    (check "streaming CL: +10 rejected"
+           (run-headers "Content-Length: +10") t)
+    (check "streaming CL: non-digit rejected"
+           (run-headers "Content-Length: 10x") t)
+    (check "streaming CL: empty rejected"
+           (run-headers "Content-Length: ") t))
+
+  ;; Duplicate Content-Length with conflicting values must raise —
+  ;; smuggling vector if a downstream re-parses the stream frame.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Content-Length: 5" (string #\Return) (string #\Newline)
+                "Content-Length: 10" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "hello")))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming CL: duplicate conflict rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
+  ;; Stream-chunked-lines trailing CRLF is now strict via
+  ;; reader-expect-crlf: bare LF after chunk-data is rejected,
+  ;; matching decode-chunked-body's buffered discipline.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "5" (string #\Return) (string #\Newline)
+                "hello" (string #\Newline)                 ; bare LF
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming chunked: bare LF after chunk-data rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
       (close stream))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1406,8 +1487,10 @@
     (check-error "chunked truncation: partial chunk-size"
                  (web-skeleton::decode-chunked-body raw 0 (length raw))))
 
-  ;; Lax trailing CRLF after chunk-data — bare LF (missing CR) was
-  ;; previously accepted; now rejected to close a smuggling primitive.
+  ;; Strict trailing CRLF after chunk-data — bare LF (missing CR)
+  ;; must be rejected. A lax trailing terminator is a smuggling
+  ;; primitive against a stricter downstream that re-parses the
+  ;; body bytes.
   (let ((raw (ascii-bytes (concatenate 'string
                 "5" (string #\Return) (string #\Newline)
                 "hello" (string #\Newline)                 ; bare LF
@@ -1416,7 +1499,7 @@
     (check-error "chunked trailing: bare LF rejected"
                  (web-skeleton::decode-chunked-body raw 0 (length raw))))
 
-  ;; Lax trailing CRLF — bare CR (missing LF) previously accepted.
+  ;; Strict trailing CRLF — bare CR (missing LF) rejected same.
   (let ((raw (ascii-bytes (concatenate 'string
                 "5" (string #\Return) (string #\Newline)
                 "hello" (string #\Return)                  ; bare CR
@@ -1424,6 +1507,32 @@
                 (string #\Return) (string #\Newline)))))
     (check-error "chunked trailing: bare CR rejected"
                  (web-skeleton::decode-chunked-body raw 0 (length raw))))
+
+  ;; Non-hex trailing byte after chunk-size digits. RFC 7230 §4.1.1
+  ;; lists only ';' (chunk-ext start), SP / HTAB (BWS tolerance),
+  ;; and CR (start of CRLF) as legal bytes after the hex digits.
+  ;; '5g\r\n' must be rejected — silently accepting it as 'size 5
+  ;; with an implicit g-extension' is a smuggling primitive.
+  (let ((raw (ascii-bytes (concatenate 'string
+                "5g" (string #\Return) (string #\Newline)
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)))))
+    (check-error "chunked chunk-size: 5g rejected (no ;)"
+                 (web-skeleton::decode-chunked-body raw 0 (length raw))))
+  ;; Positive: '5;ext=val\r\n' is still accepted — ';' is the
+  ;; documented chunk-extension delimiter. Covered by the existing
+  ;; "chunked decode with extension" test above.
+  ;; Positive: '5 \r\n' — SP is BWS tolerance, legal per RFC 7230.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "5 " (string #\Return) (string #\Newline)
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (decoded (web-skeleton::decode-chunked-body raw 0 (length raw))))
+    (check "chunked chunk-size: BWS SP after size accepted"
+           (sb-ext:octets-to-string decoded :external-format :utf-8)
+           "hello"))
 
   ;; response-chunked-p helper
   (check "chunked-p yes"
@@ -1439,10 +1548,10 @@
   ;; parse-chunked-size-line — shared by the streaming chunk parsers
   ;; in stream-chunked-lines and tls-stream-response. Strict hex,
   ;; strips chunk-extensions from ';' onwards, raises on garbage.
-  ;; The pre-pack-16 parse-integer :junk-allowed t shape silently
-  ;; accepted 'xyz' (→ NIL, loop-exit-as-final-chunk) and '-5'
-  ;; (→ -5, loop-exit-as-final-chunk) — a parser-disagreement
-  ;; smuggling primitive against any stricter downstream.
+  ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
+  ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
+  ;; parser-disagreement smuggling primitive against any stricter
+  ;; downstream.
   (check "chunked size: plain hex"
          (web-skeleton::parse-chunked-size-line "a0") 160)
   (check "chunked size: uppercase hex"
@@ -1711,12 +1820,11 @@
 
     ;; Error-close preserves earlier batch responses. First text
     ;; frame produces a handler response; second frame has an
-    ;; unknown opcode (5) which triggers close-with 1002. The
-    ;; pre-pack-16 shape dropped the earlier response on the
-    ;; floor — every error-close branch used
-    ;; (values :close (build-ws-close NNNN)) without concatenating
-    ;; responses. The close-with helper now goes through the same
-    ;; code path as the normal-close branch.
+    ;; unknown opcode (5) which triggers close-with 1002. A naive
+    ;; (values :close (build-ws-close NNNN)) at each error site
+    ;; would drop the earlier response on the floor — the
+    ;; close-with helper funnels every error-close through the
+    ;; same concat-then-return path as the normal close branch.
     (let* ((good (make-masked-frame t 1 #(104 105)))  ; text "hi"
            (bad  (make-masked-frame t 5 #()))         ; unknown opcode 5
            (buf  (concatenate '(simple-array (unsigned-byte 8) (*))
