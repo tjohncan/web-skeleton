@@ -354,7 +354,7 @@
              ;; Accumulate fragment — O(1) running total instead of re-scanning
              (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
              (incf (connection-ws-frag-total conn) (length (ws-frame-payload frame)))
-             (when (> (connection-ws-frag-total conn) *max-ws-payload-size*)
+             (when (> (connection-ws-frag-total conn) *max-ws-message-size*)
                (log-warn "ws fragmented message too large (~d bytes) fd ~d"
                          (connection-ws-frag-total conn) (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil

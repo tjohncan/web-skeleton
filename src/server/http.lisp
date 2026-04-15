@@ -23,7 +23,22 @@
   "Maximum request body size in bytes. Default 1MB.")
 
 (defparameter *max-ws-payload-size* 65536
-  "Maximum WebSocket frame payload size in bytes. Default 64KB.")
+  "Maximum WebSocket frame payload size in bytes. Default 64KB.
+   Applies to each individual frame on the read path — per-frame
+   memory bound.")
+
+(defparameter *max-ws-message-size* (* 1 1024 1024)
+  "Maximum reassembled WebSocket message size in bytes. Default 1MB.
+   Applies to the running total of a fragmented message (opcode
+   TEXT/BINARY followed by one or more CONTINUATION frames, final
+   fragment FIN=1). Separate from *MAX-WS-PAYLOAD-SIZE* so that
+   fragmentation is actually useful at the application level —
+   if the two caps were the same, a fragmented message could
+   never carry more bytes than a single frame, which makes the
+   whole fragmentation path pointless. Set higher for apps that
+   stream large messages in fragments; the worst-case memory
+   pressure is (MAX-CONNECTIONS * this-cap) bytes of in-flight
+   reassembly buffers.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -105,7 +120,16 @@
 (defun get-cookie (request name)
   "Extract the value of cookie NAME from the request's Cookie header.
    Returns the value string, or NIL if not found.
-   Scans in-place — one allocation for the return value only."
+   Scans in-place — one allocation for the return value only.
+
+   Parses the unquoted form only (cookie-pair = cookie-name \"=\"
+   cookie-value per RFC 6265 §4.1.1). The spec's cookie-octet set
+   excludes ';', '\"', and comma, so the quoted form (name=\"...\")
+   is redundant — a spec-compliant quoted value can't contain any
+   character that the unquoted parser would mishandle. Non-compliant
+   servers (historically Tomcat and Jetty) that emit 'name=\"v;x\"'
+   with literal semicolons inside quotes are unsupported by design —
+   the framework does not condone non-compliant input."
   (let ((header (get-header request "cookie")))
     (when header
       (let ((name-len (length name))
@@ -307,9 +331,21 @@
   "Match PATH against PATTERN with :param segment captures.
    Literal segments must match exactly; segments starting with : capture.
    Empty segments are not captured (e.g. /users/ does not match /users/:id).
-   Returns NIL if no match, T if match with no captures,
-   or an alist of (name . decoded-value) pairs if match with captures.
-   Captured values are percent-decoded."
+   Captured values are percent-decoded.
+
+   Return contract is a deliberate tri-state:
+     NIL      — PATH does not match PATTERN
+     T        — PATH matches and PATTERN has no captures
+     alist    — PATH matches and PATTERN has one or more captures
+
+   Callers that write (cdr (assoc \"id\" (match-path ...))) must only
+   do so for patterns they know carry a matching capture — the T
+   branch is not an alist and will raise. The alternative (return
+   () for capture-less match) would collapse 'matched without
+   captures' into 'did not match' because () is NIL in Common Lisp,
+   which is worse. Prefer a match-then-assoc idiom:
+     (let ((b (match-path p path)))
+       (when (and b (listp b)) (cdr (assoc \"id\" b))))"
   (let ((pat-segs  (split-path-segments pattern))
         (path-segs (split-path-segments path))
         (bindings nil))

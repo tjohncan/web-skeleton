@@ -112,6 +112,7 @@
            #:*max-body-size*
            #:*max-outbound-response-size*
            #:*max-ws-payload-size*
+           #:*max-ws-message-size*
            #:*max-connections*
            ;; Connection lifecycle
            #:*idle-timeout*
