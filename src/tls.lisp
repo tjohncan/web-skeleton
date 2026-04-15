@@ -18,14 +18,29 @@
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
-  (handler-case
-      (progn
-        (sb-alien:load-shared-object "libcrypto.so" :dont-save t)
-        (sb-alien:load-shared-object "libssl.so" :dont-save t))
-    (error (e)
-      (error "web-skeleton-tls: failed to load libssl — ~a~%~
-              Install libssl-dev (Debian/Ubuntu), openssl-devel (RHEL), ~
-              or openssl-dev (Alpine)." e))))
+  ;; Try versioned SONAMEs first, fall through to the unversioned link.
+  ;; Production containers (debian:slim, alpine, distroless/cc) ship
+  ;; only libssl.so.3 or libssl.so.1.1 — the bare libssl.so symlink
+  ;; comes with the -dev package, which slim images don't install.
+  ;; Loading the unversioned name first would have worked on a dev
+  ;; workstation and silently failed in the container.
+  (labels ((try-load (candidates)
+             "Walk CANDIDATES and return the first SONAME that loads,
+              or NIL if none did."
+             (dolist (name candidates)
+               (when (ignore-errors
+                      (sb-alien:load-shared-object name :dont-save t)
+                      t)
+                 (return name)))))
+    (let ((crypto (try-load '("libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so")))
+          (ssl    (try-load '("libssl.so.3"    "libssl.so.1.1"    "libssl.so"))))
+      (unless (and crypto ssl)
+        (error "web-skeleton-tls: failed to load libssl (tried .so.3, .so.1.1, .so).~%~
+                Production containers ship libssl.so.3 or libssl.so.1.1; ~
+                dev hosts also ship the unversioned libssl.so symlink via ~
+                libssl-dev (Debian/Ubuntu), openssl-devel (RHEL), or ~
+                openssl-dev (Alpine). Install whichever matches your distro."))
+      (log-info "tls: loaded ~a and ~a" crypto ssl))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; FFI bindings
