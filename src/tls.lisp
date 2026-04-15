@@ -280,87 +280,111 @@
 
 (defun https-fetch (conn epoll-fd fetch-req host port path)
   "Perform a blocking HTTPS fetch and deliver the result to CONN.
-   Called by initiate-fetch when the URL scheme is :https."
-  (handler-case
-      (multiple-value-bind (ssl socket)
-          (tls-connect host port)
-        (unwind-protect
-            (progn
-              ;; Build and send the HTTP request
-              (let ((request-bytes (build-outbound-request
-                                   (http-fetch-continuation-method fetch-req)
-                                   host path
-                                   :scheme :https :port port
-                                   :headers (http-fetch-continuation-headers fetch-req)
-                                   :body (http-fetch-continuation-body fetch-req))))
-                (tls-write-all ssl request-bytes))
-              ;; Read the complete response
-              (let* ((response-buf (tls-read-all ssl))
-                     (buf-len (length response-buf))
-                     (header-end (scan-crlf-crlf response-buf 0 buf-len))
-                     (status (when header-end
-                               (parse-response-status response-buf 0 buf-len)))
-                     (headers (when header-end
-                                (let ((first-crlf (scan-crlf response-buf 0
-                                                             header-end)))
-                                  (when first-crlf
-                                    (parse-headers-bytes response-buf
-                                                         (+ first-crlf 2)
-                                                         (+ header-end 4))))))
-                     (body-start (when header-end (+ header-end 4)))
-                     ;; RFC 7230 §3.3.3: TE takes precedence over CL
-                     (chunked-p (response-chunked-p headers))
-                     (content-length (when (and header-end (not chunked-p))
-                                       (scan-content-length response-buf header-end))))
-                ;; Truncation guard: an upstream that declares a
-                ;; Content-Length and then closes short must not be
-                ;; allowed to hand us a silently-truncated body. The
-                ;; MITM case is the nasty one — attacker RSTs
-                ;; mid-stream and the app receives short data with no
-                ;; indication. Signal an error so the outer
-                ;; handler-case converts it into a 502.
-                (when (and content-length body-start
-                           (< (- buf-len body-start) content-length))
-                  (error "https: short body (~d of ~d bytes)"
-                         (- buf-len body-start) content-length))
-                (let* ((body-end (if (and body-start content-length)
-                                     (min buf-len (+ body-start content-length))
-                                     buf-len))
-                       (raw-body (when (and body-start (> body-end body-start))
-                                   (subseq response-buf body-start body-end)))
-                       (body (if (and raw-body chunked-p)
-                                 (decode-chunked-body raw-body 0 (length raw-body))
-                                 raw-body))
-                       (callback (http-fetch-continuation-callback fetch-req)))
-                  ;; Call the user's callback
-                  (let ((response (funcall callback
-                                           (or status 0) (or headers nil)
-                                           (or body nil))))
-                    ;; Deliver to inbound connection
-                    (let ((bytes (cond
-                                   ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                    response)
-                                   ((typep response 'http-fetch-continuation)
-                                    ;; Chained fetch
-                                    (initiate-fetch conn epoll-fd response)
-                                    (return-from https-fetch))
-                                   (t (format-response response)))))
-                      (connection-queue-write conn bytes)
-                      (setf (connection-state conn) :write-response
-                            (connection-last-active conn) (get-universal-time))
-                      (epoll-modify epoll-fd (connection-fd conn)
-                                    (logior +epollout+ +epollet+))
-                      (log-debug "fetch: https ~a:~d~a -> fd ~d"
-                                 host port path (connection-fd conn)))))))
-          (tls-close ssl socket)))
-    (error (e)
-      (log-error "https fetch failed: ~a" e)
-      (let ((err-bytes (format-response (make-error-response 502))))
-        (connection-queue-write conn err-bytes)
-        (setf (connection-state conn) :write-response
-              (connection-last-active conn) (get-universal-time))
-        (epoll-modify epoll-fd (connection-fd conn)
-                     (logior +epollout+ +epollet+))))))
+   Called by initiate-fetch when the URL scheme is :https.
+
+   The fetch callback fires exactly once per call — either with real
+   (status headers body) arguments on the happy path, or with
+   (nil nil nil) as a cleanup sentinel in every error path
+   (tls-connect failure, handshake error, parse error, truncation).
+   Apps get a single defined moment to release DB handles, close
+   metric spans, or decrement rate-limit counters regardless of how
+   the fetch ends. CALLBACK-FIRED is flipped just before the happy-
+   path funcall so that if the user callback itself raises, the
+   outer handler-case does not re-invoke it."
+  (let ((callback (http-fetch-continuation-callback fetch-req))
+        (callback-fired nil))
+    (handler-case
+        (multiple-value-bind (ssl socket)
+            (tls-connect host port)
+          (unwind-protect
+              (progn
+                ;; Build and send the HTTP request
+                (let ((request-bytes (build-outbound-request
+                                     (http-fetch-continuation-method fetch-req)
+                                     host path
+                                     :scheme :https :port port
+                                     :headers (http-fetch-continuation-headers fetch-req)
+                                     :body (http-fetch-continuation-body fetch-req))))
+                  (tls-write-all ssl request-bytes))
+                ;; Read the complete response
+                (let* ((response-buf (tls-read-all ssl))
+                       (buf-len (length response-buf))
+                       (header-end (scan-crlf-crlf response-buf 0 buf-len))
+                       (status (when header-end
+                                 (parse-response-status response-buf 0 buf-len)))
+                       (headers (when header-end
+                                  (let ((first-crlf (scan-crlf response-buf 0
+                                                               header-end)))
+                                    (when first-crlf
+                                      (parse-headers-bytes response-buf
+                                                           (+ first-crlf 2)
+                                                           (+ header-end 4))))))
+                       (body-start (when header-end (+ header-end 4)))
+                       ;; RFC 7230 §3.3.3: TE takes precedence over CL
+                       (chunked-p (response-chunked-p headers))
+                       (content-length (when (and header-end (not chunked-p))
+                                         (scan-content-length response-buf header-end))))
+                  ;; Truncation guard: an upstream that declares a
+                  ;; Content-Length and then closes short must not be
+                  ;; allowed to hand us a silently-truncated body. The
+                  ;; MITM case is the nasty one — attacker RSTs
+                  ;; mid-stream and the app receives short data with no
+                  ;; indication. Signal an error so the outer
+                  ;; handler-case converts it into a 502 and fires
+                  ;; the cleanup sentinel.
+                  (when (and content-length body-start
+                             (< (- buf-len body-start) content-length))
+                    (error "https: short body (~d of ~d bytes)"
+                           (- buf-len body-start) content-length))
+                  (let* ((body-end (if (and body-start content-length)
+                                       (min buf-len (+ body-start content-length))
+                                       buf-len))
+                         (raw-body (when (and body-start (> body-end body-start))
+                                     (subseq response-buf body-start body-end)))
+                         (body (if (and raw-body chunked-p)
+                                   (decode-chunked-body raw-body 0 (length raw-body))
+                                   raw-body)))
+                    ;; Mark the callback as fired before the funcall so
+                    ;; that a raising user callback doesn't get invoked
+                    ;; a second time with nil sentinels in the outer
+                    ;; handler-case's cleanup branch.
+                    (setf callback-fired t)
+                    (let ((response (funcall callback
+                                             (or status 0) (or headers nil)
+                                             (or body nil))))
+                      ;; Deliver to inbound connection
+                      (let ((bytes (cond
+                                     ((typep response '(simple-array (unsigned-byte 8) (*)))
+                                      response)
+                                     ((typep response 'http-fetch-continuation)
+                                      ;; Chained fetch
+                                      (initiate-fetch conn epoll-fd response)
+                                      (return-from https-fetch))
+                                     (t (format-response response)))))
+                        (connection-queue-write conn bytes)
+                        (setf (connection-state conn) :write-response
+                              (connection-last-active conn) (get-universal-time))
+                        (epoll-modify epoll-fd (connection-fd conn)
+                                      (logior +epollout+ +epollet+))
+                        (log-debug "fetch: https ~a:~d~a -> fd ~d"
+                                   host port path (connection-fd conn)))))))
+            (tls-close ssl socket)))
+      (error (e)
+        (log-error "https fetch failed: ~a" e)
+        ;; Fire the cleanup sentinel in every pre-delivery error
+        ;; path so the app's :then closure runs exactly once.
+        ;; Wrapped in its own handler-case — a raising cleanup hook
+        ;; must not block the 502 from reaching the inbound.
+        (unless callback-fired
+          (handler-case (funcall callback nil nil nil)
+            (error (e2)
+              (log-warn "fetch cleanup callback raised: ~a" e2))))
+        (let ((err-bytes (format-response (make-error-response 502))))
+          (connection-queue-write conn err-bytes)
+          (setf (connection-state conn) :write-response
+                (connection-last-active conn) (get-universal-time))
+          (epoll-modify epoll-fd (connection-fd conn)
+                        (logior +epollout+ +epollet+)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Blocking streaming HTTPS fetch
