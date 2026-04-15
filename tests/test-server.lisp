@@ -880,6 +880,19 @@
          (is-public-address-p
           #(0 0 0 0 0 0 0 0 0 0 #xff #xff 8 8 8 8) :inet6) t)
 
+  ;; IPv4-compatible IPv6 (deprecated, RFC 4291 §2.5.5.1). Same
+  ;; laundering defense — ::127.0.0.1 and ::1.2.3.4 classify via
+  ;; their embedded v4.
+  (check "v6 ::127.0.0.1 compat loopback"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 0 0 127 0 0 1) :inet6) nil)
+  (check "v6 ::10.0.0.1 compat private"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 0 0 10 0 0 1) :inet6) nil)
+  (check "v6 ::8.8.8.8 compat public"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 0 0 8 8 8 8) :inet6) t)
+
   ;; Wrong length / unknown family returns NIL (conservative)
   (check "v4 wrong length"   (is-public-address-p #(1 2 3) :inet)           nil)
   (check "v6 wrong length"   (is-public-address-p #(1 2 3 4) :inet6)        nil)
@@ -1385,7 +1398,35 @@
         (declare (ignore consumed))
         (check "extended length parsed" (not (null result)) t)
         (check "extended length size"
-               (length (ws-frame-payload result)) 200)))))
+               (length (ws-frame-payload result)) 200)))
+
+    ;; Multi-fragment reassembly end-to-end through websocket-on-read.
+    ;; First text frame with FIN=0, then a continuation frame with
+    ;; FIN=1. The handler should see one synthetic frame whose
+    ;; payload is the concatenation of both fragments' payloads.
+    (let* ((first  (make-masked-frame nil 1 #(104 101 108 108 111 32)))  ; "hello "
+           (cont   (make-masked-frame t 0 #(119 111 114 108 100)))       ; "world"
+           (buf    (concatenate '(simple-array (unsigned-byte 8) (*))
+                                first cont))
+           (conn   (web-skeleton::make-connection
+                    :fd -1 :state :websocket :last-active 0))
+           (received-opcode nil)
+           (received-text nil))
+      (setf (web-skeleton::connection-read-buf conn) buf
+            (web-skeleton::connection-read-pos conn) (length buf))
+      (let ((handler (lambda (c frame)
+                       (declare (ignore c))
+                       (setf received-opcode (ws-frame-opcode frame)
+                             received-text
+                             (sb-ext:octets-to-string
+                              (ws-frame-payload frame)
+                              :external-format :utf-8))
+                       nil)))
+        (web-skeleton::websocket-on-read conn handler))
+      (check "fragment reassembly: opcode is text"
+             received-opcode 1)
+      (check "fragment reassembly: concatenated payload"
+             received-text "hello world"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file helper tests
