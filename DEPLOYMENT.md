@@ -174,10 +174,14 @@ gracefully.
 worker thread for the duration of the upstream call, bounded by
 `*fetch-timeout*` (default 30s) across each of three setup phases:
 
-1. **DNS resolution** — shared `getent ahosts` subprocess, run
-   synchronously via `sb-ext:run-program :wait t`. Same resolver as
-   the async path, so `/etc/hosts`, NSS, Docker DNS, and mDNS all
-   work identically in both modes. IPv4 and IPv6 both supported.
+1. **DNS resolution** — shared `getent ahosts` subprocess, spawned
+   with `:wait nil` and deadline-polled until exit or
+   `*fetch-timeout*` expires. On expiry, the child is killed with
+   SIGKILL so a hung libc resolver (unresponsive nameserver, slow
+   NSS module, hung mDNS responder) cannot pin the worker thread.
+   Same resolver as the async path, so `/etc/hosts`, NSS, Docker
+   DNS, and mDNS all work identically in both modes. IPv4 and IPv6
+   both supported.
 2. **TCP connect** — non-blocking `connect(2)` plus `poll(2)` with
    the same timeout. `SO_RCVTIMEO` / `SO_SNDTIMEO` do **not** apply
    to `connect(2)` — without this bound a black-holed peer would

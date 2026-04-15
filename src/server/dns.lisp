@@ -1,5 +1,11 @@
 (in-package :web-skeleton)
 
+;;; RESOLVE-HOST-BLOCKING uses *FETCH-TIMEOUT* (defined in fetch.lisp,
+;;; which loads before this file) as the subprocess deadline. Forward-
+;;; declared special so the compiler doesn't warn on first-compile
+;;; orderings where fetch.lisp isn't yet in the image.
+(declaim (special *fetch-timeout*))
+
 ;;; ===========================================================================
 ;;; Async DNS resolution via a getent subprocess
 ;;;
@@ -227,7 +233,15 @@
    :INET or :INET6. Numeric IPv4 and IPv6 literals skip the subprocess
    via the same fast path as the async resolver. Used by the blocking
    fetch setup paths so there is a single DNS primitive across the
-   framework."
+   framework.
+
+   Bounded by *FETCH-TIMEOUT* via a deadline poll: the subprocess is
+   spawned with :WAIT NIL, the caller sleeps in short slices until
+   process exit or deadline, and we SIGKILL the child on expiry. A
+   libc resolver hang (unresponsive nameserver, slow NSS module, hung
+   mDNS responder) no longer pins the worker thread indefinitely —
+   the promise that *FETCH-TIMEOUT* covers each of DNS, connect, and
+   I/O on the blocking path is now actually kept."
   (let ((v4 (parse-ipv4-literal host)))
     (when v4 (return-from resolve-host-blocking (values v4 :inet))))
   (let ((v6 (parse-ipv6-literal host)))
@@ -236,19 +250,39 @@
       (let ((process (sb-ext:run-program "getent"
                                           (list "ahosts" "--" host)
                                           :output :stream
-                                          :wait t
+                                          :wait nil
                                           :search t)))
+        (unless process
+          (return-from resolve-host-blocking nil))
         (unwind-protect
-             (when (and process (zerop (sb-ext:process-exit-code process)))
-               (let* ((stream (sb-ext:process-output process))
-                      (buf (make-array 1024 :element-type '(unsigned-byte 8)
-                                             :fill-pointer 0 :adjustable t)))
-                 (loop for byte = (read-byte stream nil nil)
-                       while byte
-                       do (vector-push-extend byte buf))
-                 (let ((parsed (parse-getent-output buf (length buf))))
-                   (when parsed
-                     (values (car parsed) (cdr parsed))))))
+             (let ((deadline (+ (get-internal-real-time)
+                                (* *fetch-timeout*
+                                   internal-time-units-per-second))))
+               ;; Wait for exit, sliced so shutdown stays responsive.
+               (loop until (or (not (sb-ext:process-alive-p process))
+                               (>= (get-internal-real-time) deadline))
+                     do (sleep 0.05))
+               (cond
+                 ;; Timed out — kill the child and report no result.
+                 ((sb-ext:process-alive-p process)
+                  (ignore-errors (sb-ext:process-kill process 9))
+                  (ignore-errors (sb-ext:process-wait process))
+                  nil)
+                 ;; Exited non-zero — unresolved.
+                 ((not (zerop (sb-ext:process-exit-code process)))
+                  nil)
+                 ;; Exited clean — drain stdout and parse.
+                 (t
+                  (let* ((stream (sb-ext:process-output process))
+                         (buf (make-array 1024
+                                          :element-type '(unsigned-byte 8)
+                                          :fill-pointer 0 :adjustable t)))
+                    (loop for byte = (read-byte stream nil nil)
+                          while byte
+                          do (vector-push-extend byte buf))
+                    (let ((parsed (parse-getent-output buf (length buf))))
+                      (when parsed
+                        (values (car parsed) (cdr parsed))))))))
           (ignore-errors (sb-ext:process-close process))))
     (error () nil)))
 
