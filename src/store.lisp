@@ -30,7 +30,10 @@
   (table          nil :type hash-table)
   (lock           nil)
   (expiry-fn      nil :type (or null function))
-  (reap-interval  nil :type (or null (integer 1)))
+  ;; REAP-INTERVAL accepts any positive real — integer in production
+  ;; (seconds between sweeps), float permitted so the test suite can
+  ;; use sub-second intervals without a real 2-second sleep.
+  (reap-interval  nil :type (or null (real (0))))
   (reaper-thread  nil)
   (stop-requested nil))
 

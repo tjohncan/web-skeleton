@@ -123,17 +123,17 @@
               :expiry-fn (lambda (k v)
                            (declare (ignore k))
                            (eq v :doomed))
-              :reap-interval 1)))
+              :reap-interval 0.2)))
       (store-set s "keep-a"   :alive)
       (store-set s "keep-b"   :alive)
       (store-set s "doomed-a" :doomed)
       (store-set s "doomed-b" :doomed)
       (check "before reap: count is 4"
              (store-count s) 4)
-      ;; Wait for the reaper to sweep at least once. Interval is 1s;
-      ;; sleeping 2s gives a comfortable margin against thread-start
-      ;; latency and scheduler jitter.
-      (sleep 2)
+      ;; Wait for the reaper to sweep at least once. Interval is
+      ;; 0.2s; sleeping 0.5s gives ~2.5x margin against thread-start
+      ;; latency, scheduler jitter, and the reaper's 0.1s slice.
+      (sleep 0.5)
       (check "after reap: count is 2 (doomed entries gone)"
              (store-count s) 2)
       (check "after reap: keep-a still alive"
