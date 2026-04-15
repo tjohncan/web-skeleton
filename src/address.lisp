@@ -98,6 +98,20 @@
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 12 :end2 16)
          (ipv4-public-p v4)))
+      ;; 2002::/16 — 6to4 encapsulation (RFC 3056). The IPv4 payload
+      ;; lives in bytes 2..5; the rest of the address is an arbitrary
+      ;; host identifier. 6to4 is deprecated (RFC 7526) and current
+      ;; Linux kernels do not route 2002::/16 by default, so this is
+      ;; primarily shape-consistency with the ::ffff: and 64:ff9b::
+      ;; branches above — the framework's policy is to reject every
+      ;; private-shaped address whether its v4 carrier is live on
+      ;; the host or not. An attacker who rewrites 10.0.0.1 as
+      ;; 2002:0a00:0001:: cannot then use it to reach an internal
+      ;; host.
+      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x02))
+       (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
+         (replace v4 bytes :start2 2 :end2 6)
+         (ipv4-public-p v4)))
       ;; 2001:db8::/32 — documentation
       ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
             (= (aref bytes 2) #x0d) (= (aref bytes 3) #xb8))
