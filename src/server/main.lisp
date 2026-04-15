@@ -740,38 +740,45 @@
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
   (setf *shutdown* nil)
-  ;; Ignore SIGPIPE — writing to a broken connection must return EPIPE,
-  ;; not kill the process. SBCL typically ignores it, but not guaranteed.
-  (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
-  ;; SIGTERM triggers graceful shutdown (same as Ctrl-C)
-  (sb-sys:enable-interrupt sb-unix:sigterm
-    (lambda (signal info context)
-      (declare (ignore signal info context))
-      (setf *shutdown* t)))
-  (log-info "starting ~d worker~:p on ~{~d~^.~}:~d" workers (coerce host 'list) port)
-  (let ((threads (loop for i from 0 below workers
-                       collect (sb-thread:make-thread
-                                (let ((id i))
-                                  (lambda () (run-worker host port id handler ws-handler)))
-                                :name (format nil "web-skeleton-~d" i)))))
-    (unwind-protect
-        (handler-case
-            ;; Main thread waits for interrupt or SIGTERM
-            (loop (sleep *shutdown-poll-interval*)
-                  (when *shutdown*
-                    (log-info "shutting down")
-                    (return)))
-          (sb-sys:interactive-interrupt ()
-            (format t "~%")
-            (log-info "interrupted — shutting down")))
-      ;; Signal workers to drain and stop
-      (setf *shutdown* t)
-      (dolist (thread threads)
-        (ignore-errors (sb-thread:join-thread thread
-                                              :timeout (+ *drain-timeout* 3))))
-      ;; Workers have drained; run any app-registered cleanup before
-      ;; returning. Hooks own their own error handling — one raising
-      ;; hook cannot block the rest, cannot block the "stopped" log,
-      ;; and cannot prevent START-SERVER from returning to its caller.
-      (run-shutdown-hooks)
-      (log-info "stopped"))))
+  ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
+  ;; be called from inside a host SBCL image (a REPL, a test runner, an
+  ;; orchestrator) without permanently stealing the signals. Both are
+  ;; restored in the unwind-protect cleanup.
+  ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
+  ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
+  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore))
+        (prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
+                        (lambda (signal info context)
+                          (declare (ignore signal info context))
+                          (setf *shutdown* t)))))
+    (log-info "starting ~d worker~:p on ~{~d~^.~}:~d" workers (coerce host 'list) port)
+    (let ((threads (loop for i from 0 below workers
+                         collect (sb-thread:make-thread
+                                  (let ((id i))
+                                    (lambda () (run-worker host port id handler ws-handler)))
+                                  :name (format nil "web-skeleton-~d" i)))))
+      (unwind-protect
+          (handler-case
+              ;; Main thread waits for interrupt or SIGTERM
+              (loop (sleep *shutdown-poll-interval*)
+                    (when *shutdown*
+                      (log-info "shutting down")
+                      (return)))
+            (sb-sys:interactive-interrupt ()
+              (format t "~%")
+              (log-info "interrupted — shutting down")))
+        ;; Signal workers to drain and stop
+        (setf *shutdown* t)
+        (dolist (thread threads)
+          (ignore-errors (sb-thread:join-thread thread
+                                                :timeout (+ *drain-timeout* 3))))
+        ;; Workers have drained; run any app-registered cleanup before
+        ;; returning. Hooks own their own error handling — one raising
+        ;; hook cannot block the rest, cannot block the "stopped" log,
+        ;; and cannot prevent START-SERVER from returning to its caller.
+        (run-shutdown-hooks)
+        (log-info "stopped")
+        ;; Hand the signals back to whoever had them before we started.
+        (ignore-errors
+         (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm)
+         (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))))))
