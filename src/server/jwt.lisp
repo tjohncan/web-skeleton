@@ -41,13 +41,26 @@
                 when (and kty crv
                           (string= kty "EC")
                           (string= crv "P-256"))
-                collect (let ((x (base64url-decode (json-get key-obj "x")))
-                              (y (base64url-decode (json-get key-obj "y"))))
-                          (unless (and (= (length x) 32) (= (length y) 32))
-                            (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
-                          (make-jwt-key
-                           :kid (or (json-get key-obj "kid") "")
-                           :x x :y y)))))
+                collect (let ((x-b64 (json-get key-obj "x"))
+                              (y-b64 (json-get key-obj "y")))
+                          ;; Guard before base64url-decode. An EC key
+                          ;; with a missing coordinate used to crash
+                          ;; as a type-error from BASE64URL-DECODE
+                          ;; receiving NIL, which was technically
+                          ;; correct behavior (reject) but came out
+                          ;; of a call stack the caller could not
+                          ;; match against — rotating on a
+                          ;; coordinate-missing key looked like a
+                          ;; framework bug instead of an issuer bug.
+                          (unless (and x-b64 y-b64)
+                            (error "JWKS: EC P-256 key missing x or y"))
+                          (let ((x (base64url-decode x-b64))
+                                (y (base64url-decode y-b64)))
+                            (unless (and (= (length x) 32) (= (length y) 32))
+                              (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
+                            (make-jwt-key
+                             :kid (or (json-get key-obj "kid") "")
+                             :x x :y y))))))
     (let ((seen (make-hash-table :test 'equal)))
       (dolist (k keys)
         (let ((kid (jwt-key-kid k)))
