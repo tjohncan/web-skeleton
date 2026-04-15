@@ -95,13 +95,23 @@ Tune parameters before calling `start-server`:
   ;; Tune limits for your workload
   (setf *idle-timeout* 15
         *max-connections* 5000
-        *max-body-size* (* 2 1024 1024))  ; 2MB
+        *max-body-size* (* 2 1024 1024)          ; 2 MiB inbound request body
+        *max-outbound-response-size* (* 16 1024 1024) ; 16 MiB buffered fetch
+        *max-streaming-line-size* (* 2 1024 1024))    ; 2 MiB per stream line
   (load-static-files "static/")
   (start-server :port port
                 :host #(0 0 0 0)          ; listen on all interfaces
                 :handler #'handle-request
                 :ws-handler #'handle-ws-message))
 ```
+
+`*max-body-size*` caps the inbound request body. `*max-outbound-response-size*`
+caps the total bytes (headers + body) that `tls-read-all` will buffer for an
+HTTPS fetch — tune this when your app's `:then` callback expects responses
+larger than the 8 MiB default. `*max-streaming-line-size*` caps one line inside
+a streamed response (NDJSON, SSE, chunked text) on the `http-fetch-stream`
+paths — the default 1 MiB is generous for JSON, tighten it for known-small
+line protocols or raise it for unusual schemas.
 
 ## Deployment notes
 
@@ -195,17 +205,18 @@ LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
 For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
-**Truncation under Connection: close framing.** An HTTPS upstream
-that frames its response purely by `Connection: close` (no
-`Content-Length`, no `Transfer-Encoding: chunked`) and then closes
-the TCP connection mid-body surfaces as `SSL_ERROR_SYSCALL` inside
-`tls-read-all`, which the framework treats as clean EOF. The
-framework's `Content-Length` truncation guard catches the more
-common declared-length case; the pure Connection-close case is a
-known OpenSSL-level limitation (see `SSL_OP_IGNORE_UNEXPECTED_EOF`
-for a deeper fix). If your app speaks to a hand-rolled JSON API
-that frames responses this way and exact body integrity matters,
-prefer declaring `Content-Length` on the upstream.
+**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns
+`SSL_ERROR_SYSCALL` for four distinct conditions — unexpected peer
+close without `close_notify` (benign for legacy HTTP/1.0-style
+servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`), real transport
+errors (`errno = ECONNRESET` / `EPIPE` / other), and read(2)
+failures. `tls-read-all` and `tls-stream-response` now inspect
+`errno` after each `SSL_ERROR_SYSCALL` and raise loud on the
+non-benign cases so `*fetch-timeout*` actually bounds the HTTPS
+read path — the pre-pack-16 shape treated every `SSL_ERROR_SYSCALL`
+as clean EOF, which made the promise above a lie for close-delimited
+HTTPS responses and `http-fetch-stream` over HTTPS. Legitimate
+unexpected-EOF-without-`close_notify` is still accepted silently.
 
 ### Fetch callback contract
 
@@ -389,6 +400,27 @@ a slow client holds the worker hostage.
 `load-static-files` reads files into memory at startup and pre-builds
 HTTP responses. Call it **before** `start-server`. It is not thread-safe
 and must not be called while the server is running.
+
+Static responses **omit the `Date` header** — the pre-built bytes are
+frozen at startup time and the framework will not patch each served
+response with a per-request date. This violates the RFC 7231 §7.1.1.2
+`MUST`, but a stale `Date` from 14 hours ago would be strictly worse
+than none (CDN caches would use it as the freshness anchor). Downstream
+caches fall back to the time they received the response, which is
+correct. If you place web-skeleton behind a CDN or reverse proxy, the
+proxy will stamp its own `Date` on the way out — operators should not
+be surprised to see `Date` missing on `/static/*` when watching the
+upstream directly with `curl -v`.
+
+### IDN hostnames
+
+`tls-connect` calls `SSL_set1_host` with the hostname as ASCII bytes,
+which means **internationalized domain names must be ACE-encoded**
+(punycode) by the caller before being handed to `http-fetch`. Passing
+`https://café.example/` directly will send raw UTF-8 to the server
+and fail verification. Convert to `https://xn--caf-dma.example/` in
+the app if you deal with IDN — the framework does not ship a
+UTS-46 / Nameprep implementation.
 
 ### Background work and shutdown cleanup
 
