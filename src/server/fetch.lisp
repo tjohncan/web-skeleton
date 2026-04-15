@@ -818,10 +818,15 @@
       ;; captured the actual callback into the CALLBACK local above.
       (setf (connection-fetch-callback out-conn) nil)
       (close-outbound out-conn epoll-fd)
-      ;; Find and resume inbound connection
+      ;; Find and resume inbound connection. If the inbound vanished
+      ;; between :awaiting parking and now (drain race, idle reap,
+      ;; I/O error on the inbound fd), we can't deliver a response
+      ;; anywhere — but the contract is still "callback fires exactly
+      ;; once per fetch lifetime", so fire the cleanup sentinel here
+      ;; before returning so app state gets released.
       (let ((inbound (lookup-connection inbound-fd)))
-        (when inbound
-          (handler-case
+        (if inbound
+            (handler-case
               (let ((response (funcall callback
                                        (or status 0) (or headers nil)
                                        (or body nil))))
@@ -849,7 +854,15 @@
                       (connection-awaiting-fd inbound) -1
                       (connection-last-active inbound) (get-universal-time))
                 (epoll-modify epoll-fd (connection-fd inbound)
-                              (logior +epollout+ +epollet+))))))))))
+                              (logior +epollout+ +epollet+)))))
+            ;; Inbound vanished between :awaiting parking and now
+            ;; (drain race, idle reap, I/O error). Fire the cleanup
+            ;; sentinel so app state gets released — we can't deliver
+            ;; a response anywhere but the contract is still
+            ;; "callback fires once per fetch lifetime".
+            (handler-case (funcall callback nil nil nil)
+              (error (e)
+                (log-warn "fetch cleanup callback raised: ~a" e))))))))
 
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."
