@@ -267,24 +267,28 @@
    try index.html as a fallback."
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
-      (let ((path (http-request-path request)))
-        ;; Defense-in-depth: this check operates on the raw (non-decoded)
-        ;; path, so %2e%2e bypasses it. The real traversal defense is the
-        ;; hash-table lookup below — only paths loaded at startup can match.
-        (unless (or (search "/../" path)
-                    (and (>= (length path) 3)
-                         (string= path "/.." :start1 (- (length path) 3))))
-          (let ((entry (or (gethash path *static-cache*)
-                           ;; Try index.html for directory paths
-                           (when (char= (char path (1- (length path))) #\/)
-                             (gethash (concatenate 'string path "index.html")
-                                      *static-cache*)))))
-            (when entry
-              (cond
-                ((if-none-match-hit-p (get-header request "if-none-match")
-                                      (static-entry-etag entry))
-                 (static-entry-not-modified-response entry))
-                ((eq method :GET)
-                 (static-entry-get-response entry))
-                (t
-                 (static-entry-head-response entry))))))))))
+      ;; Decode percent-encoding so /foo%20bar hits a cached /foo bar
+      ;; and %2e%2e cannot slip past the traversal check below. The
+      ;; cache is keyed on decoded filesystem paths, so this is the
+      ;; form that can actually match. Malformed encoding → NIL, which
+      ;; falls through to the app handler for a clean 404.
+      (let ((path (handler-case (url-decode (http-request-path request))
+                    (error () nil))))
+        (when (and path (> (length path) 0))
+          (unless (or (search "/../" path)
+                      (and (>= (length path) 3)
+                           (string= path "/.." :start1 (- (length path) 3))))
+            (let ((entry (or (gethash path *static-cache*)
+                             ;; Try index.html for directory paths
+                             (when (char= (char path (1- (length path))) #\/)
+                               (gethash (concatenate 'string path "index.html")
+                                        *static-cache*)))))
+              (when entry
+                (cond
+                  ((if-none-match-hit-p (get-header request "if-none-match")
+                                        (static-entry-etag entry))
+                   (static-entry-not-modified-response entry))
+                  ((eq method :GET)
+                   (static-entry-get-response entry))
+                  (t
+                   (static-entry-head-response entry)))))))))))
