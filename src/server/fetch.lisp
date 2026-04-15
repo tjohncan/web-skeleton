@@ -29,6 +29,13 @@
 (defparameter *fetch-timeout* 30
   "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
 
+(defparameter *max-outbound-response-size* (* 8 1024 1024)
+  "Maximum total bytes (headers + body together) for a buffered
+   outbound HTTPS response read by TLS-READ-ALL. Default 8 MiB.
+   Distinct from *MAX-BODY-SIZE*, which caps inbound request
+   bodies — applying that 1 MiB inbound limit to outbound responses
+   would reject legitimate 1 MiB HTTPS responses on principle.")
+
 (defun http-fetch (method url &key headers body then)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.

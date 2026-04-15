@@ -134,27 +134,33 @@
 (defvar *ssl-ctx-lock* (sb-thread:make-mutex :name "ssl-ctx-init"))
 
 (defun ensure-ssl-ctx ()
-  "Create the shared SSL_CTX if not already created. Thread-safe."
-  (or *ssl-ctx*
-      (sb-thread:with-mutex (*ssl-ctx-lock*)
-        (unless *ssl-ctx*
-          ;; Initialize OpenSSL
-          (%openssl-init-ssl 0 (sb-sys:int-sap 0))
-          ;; Create context with modern TLS client method
-          (let ((ctx (%ssl-ctx-new (%tls-client-method))))
-            (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
-              (error "SSL_CTX_new failed"))
-            ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1)
-            (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
-                       +tls1-2-version+ (sb-sys:int-sap 0))
-            ;; Load system CA certificates
-            (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
-              (log-warn "tls: could not load system CA certificates"))
-            ;; Enable peer certificate verification
-            (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
-            (setf *ssl-ctx* ctx)
-            (log-info "tls: SSL context initialized")))
-        *ssl-ctx*)))
+  "Create the shared SSL_CTX if not already created. Thread-safe.
+   Always takes the mutex rather than double-checked locking: on
+   weakly-ordered architectures (aarch64 Graviton, Ampere, Apple
+   Silicon), a thread could observe the *SSL-CTX* pointer set before
+   the SSL_CTX_new + set_default_verify_paths + set_verify init
+   sequence is fully visible. Init happens once per process, so the
+   mutex cost is irrelevant — correctness on every supported target
+   beats a micro-optimisation on x86 alone."
+  (sb-thread:with-mutex (*ssl-ctx-lock*)
+    (unless *ssl-ctx*
+      ;; Initialize OpenSSL
+      (%openssl-init-ssl 0 (sb-sys:int-sap 0))
+      ;; Create context with modern TLS client method
+      (let ((ctx (%ssl-ctx-new (%tls-client-method))))
+        (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
+          (error "SSL_CTX_new failed"))
+        ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1)
+        (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                   +tls1-2-version+ (sb-sys:int-sap 0))
+        ;; Load system CA certificates
+        (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
+          (log-warn "tls: could not load system CA certificates"))
+        ;; Enable peer certificate verification
+        (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
+        (setf *ssl-ctx* ctx)
+        (log-info "tls: SSL context initialized")))
+    *ssl-ctx*))
 
 ;;; ---------------------------------------------------------------------------
 ;;; TLS connection lifecycle
@@ -227,7 +233,11 @@
 
 (defun tls-read-all (ssl)
   "Read the complete HTTP response through the SSL connection.
-   Returns the raw response as a byte vector."
+   Returns the raw response as a byte vector. Bounded by
+   *MAX-OUTBOUND-RESPONSE-SIZE* (headers + body together) — the
+   inbound *MAX-BODY-SIZE* cap was the wrong knob here, since a
+   legitimate 1 MB HTTPS response with a few hundred bytes of
+   headers exceeds the inbound-request budget on principle."
   (let ((chunks nil)
         (total 0)
         (buf (make-array 8192 :element-type '(unsigned-byte 8))))
@@ -236,9 +246,9 @@
         (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
           (cond
             ((> n 0)
-             (when (> (+ total n) *max-body-size*)
+             (when (> (+ total n) *max-outbound-response-size*)
                (error "HTTPS response too large (~d bytes, max ~d)"
-                      (+ total n) *max-body-size*))
+                      (+ total n) *max-outbound-response-size*))
              (incf total n)
              (push (subseq buf 0 n) chunks))
             ((zerop n) (return))  ; clean shutdown
@@ -479,7 +489,7 @@
 ;;; ECDSA uses d2i_PUBKEY (not deprecated in 3.0) to parse a hand-built
 ;;; SubjectPublicKeyInfo, then EVP_PKEY_verify against a DER-encoded
 ;;; SEQUENCE { r, s } signature. HMAC-SHA256 is not accelerated
-;;; directly — it's pure Lisp, but its internal SHA-256 calls route
+;;; directly — it's pure-Lisp, but its internal SHA-256 calls route
 ;;; through the function cell and pick up the libssl swap for free.
 ;;; ===========================================================================
 

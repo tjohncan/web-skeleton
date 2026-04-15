@@ -107,6 +107,7 @@
            #:*max-header-count*
            #:*max-header-line-length*
            #:*max-body-size*
+           #:*max-outbound-response-size*
            #:*max-ws-payload-size*
            #:*max-connections*
            ;; Connection lifecycle
