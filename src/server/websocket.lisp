@@ -34,35 +34,6 @@
          (digest (sha1 (sb-ext:string-to-octets combined :external-format :ascii))))
     (base64-encode digest)))
 
-(defun connection-header-has-token-p (header-value token)
-  "Check if TOKEN appears in a comma-separated header value (RFC 7230 §3.2.6).
-   Comparison is case-insensitive, tokens are trimmed of whitespace.
-   Zero intermediate string allocation."
-  (let ((len (length header-value))
-        (token-len (length token)))
-    (loop with pos = 0
-          while (< pos len)
-          do ;; Skip leading whitespace
-             (loop while (and (< pos len)
-                              (let ((ch (char header-value pos)))
-                                (or (char= ch #\Space) (char= ch #\Tab))))
-                   do (incf pos))
-             ;; Find end of token (comma or end of string)
-             (let ((end (or (position #\, header-value :start pos) len)))
-               ;; Trim trailing whitespace
-               (let ((trimmed-end end))
-                 (loop while (and (> trimmed-end pos)
-                                  (let ((ch (char header-value (1- trimmed-end))))
-                                    (or (char= ch #\Space) (char= ch #\Tab))))
-                       do (decf trimmed-end))
-                 ;; Compare bounded region case-insensitively
-                 (when (and (= (- trimmed-end pos) token-len)
-                            (string-equal header-value token
-                                         :start1 pos :end1 trimmed-end))
-                   (return t))
-                 ;; Move past comma
-                 (setf pos (1+ end)))))))
-
 (defun websocket-upgrade-p (request)
   "Check if REQUEST is a valid WebSocket upgrade request."
   (and (eq (http-request-method request) :GET)
