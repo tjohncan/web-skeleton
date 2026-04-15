@@ -27,11 +27,12 @@
 (defstruct (store (:constructor %make-store)
                   (:copier nil)
                   (:predicate storep))
-  (table         nil :type hash-table)
-  (lock          nil)
-  (expiry-fn     nil :type (or null function))
-  (reap-interval nil :type (or null (integer 1)))
-  (reaper-thread nil))
+  (table          nil :type hash-table)
+  (lock           nil)
+  (expiry-fn      nil :type (or null function))
+  (reap-interval  nil :type (or null (integer 1)))
+  (reaper-thread  nil)
+  (stop-requested nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API
@@ -152,27 +153,39 @@
     (setf (store-reaper-thread store)
           (sb-thread:make-thread
            (lambda ()
-             (loop
-               (sleep interval)
-               (handler-case
-                   (let ((n (reap-store store)))
-                     (when (> n 0)
-                       (log-info "store reaped ~d entr~:@p" n)))
-                 (error (e)
-                   (log-error "store reaper error: ~a" e)))))
+             (loop until (store-stop-requested store) do
+               ;; Sleep the configured interval in 100 ms slices so a
+               ;; shutdown request is noticed within one slice regardless
+               ;; of how long REAP-INTERVAL is. Polling beats
+               ;; TERMINATE-THREAD — interrupting MAPHASH mid-sweep is
+               ;; async-unsafe, and the 100 ms idle cost is nothing next
+               ;; to a reap-interval typically measured in minutes.
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* interval
+                                     internal-time-units-per-second))))
+                 (loop until (or (store-stop-requested store)
+                                 (>= (get-internal-real-time) deadline))
+                       do (sleep 0.1)))
+               (unless (store-stop-requested store)
+                 (handler-case
+                     (let ((n (reap-store store)))
+                       (when (> n 0)
+                         (log-info "store reaped ~d entr~:@p" n)))
+                   (error (e)
+                     (log-error "store reaper error: ~a" e))))))
            :name "web-skeleton-store-reaper"))
     (register-cleanup (lambda () (stop-store-reaper store)))))
 
 (defun stop-store-reaper (store)
   "Stop STORE's reaper thread. Safe to call on a store with no reaper,
-   and safe to call multiple times. TERMINATE-THREAD interrupts the
-   thread's current SLEEP or reap; WITH-MUTEX unwinds cleanly through
-   the interrupt via its internal UNWIND-PROTECT, so the store's lock
-   is always released even if the reaper was mid-sweep."
+   and safe to call multiple times. Sets STOP-REQUESTED and waits for
+   the reaper to notice on its next slice — within ~100 ms in the
+   common case, capped at 5 s if the reaper is stuck inside a sweep
+   that the expiry predicate made slow."
   (let ((thread (store-reaper-thread store)))
-    (setf (store-reaper-thread store) nil)
+    (setf (store-stop-requested store) t
+          (store-reaper-thread store)  nil)
     (when (and thread (sb-thread:thread-alive-p thread))
       (handler-case
-          (progn (sb-thread:terminate-thread thread)
-                 (sb-thread:join-thread thread))
+          (sb-thread:join-thread thread :default nil :timeout 5)
         (error () nil)))))
