@@ -78,11 +78,12 @@
 (defun format-peer-addr (host port)
   "Format a (HOST PORT) pair as a peer-address string for log output.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the v6 form
-   uses the bracketed 8-group hex representation (no :: compression —
-   a log line doesn't need canonical form, just unambiguous identity)."
+   uses the bracketed 8-group lowercase hex representation (RFC 5952).
+   No :: compression — a log line doesn't need canonical form, just
+   unambiguous identity."
   (case (length host)
     (4  (format nil "~{~d~^.~}:~d" (coerce host 'list) port))
-    (16 (format nil "[~{~x~^:~}]:~d"
+    (16 (format nil "[~(~{~x~^:~}~)]:~d"
                 (loop for i from 0 below 16 by 2
                       collect (logior (ash (aref host i) 8)
                                       (aref host (1+ i))))
@@ -318,11 +319,14 @@
                                              (and (<= 97 n 122)
                                                   (= b (- n 32))))))
                    ;; Require a token terminator so 100-continued (etc.)
-                   ;; does not match.
+                   ;; does not match. Accepted terminators: CR (end of
+                   ;; header line), SP/TAB (continuation), and ';'
+                   ;; (header parameter start — 'Expect: 100-continue;q=1.0'
+                   ;; is rare but permitted by RFC 7231).
                    (let ((after (+ pos (length token))))
                      (when (or (>= after end)
                                (let ((b (aref buf after)))
-                                 (or (= b 13) (= b 32) (= b 9))))
+                                 (or (= b 13) (= b 32) (= b 9) (= b 59))))
                        (return t)))))))))
 
 ;;; ---------------------------------------------------------------------------
