@@ -122,7 +122,7 @@ tests/
   test-server.lisp           HTTP, URL, query, routing, JWT tests
   test-store.lisp            Concurrent store and reaper tests
   test-harness.lisp          Test harness self-tests (live-server round-trips)
-  test-tls.lisp              TLS roundtrip (skips gracefully without libssl)
+  test-tls.lisp              TLS registration (skips if libssl absent)
 ```
 
 ## What's implemented
