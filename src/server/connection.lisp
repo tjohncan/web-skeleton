@@ -188,7 +188,9 @@
   "Scan BUF[0..END) for a Content-Length header value.
    Returns the integer value, or NIL if not found.
    Signals http-parse-error on duplicate conflicting values
-   (RFC 7230 §3.3.2 — prevents request smuggling).
+   (RFC 7230 §3.3.3 — 'if a message is received without
+   Transfer-Encoding and with multiple Content-Length header
+   fields having differing field-values', the smuggling vector).
    Operates on bytes directly — no string allocation."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "content-length:"
@@ -217,8 +219,18 @@
                  ;; Parse decimal digits
                  (let ((value 0) (found nil) (digits 0))
                    (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
+                         ;; 10 decimal digits caps at 9_999_999_999 ≈ 9.3 GB
+                         ;; which is still four orders of magnitude past
+                         ;; any sensible *MAX-BODY-SIZE* default. The prior
+                         ;; 15-digit cap permitted values up to 10^15 ~ 900 TB,
+                         ;; which the real *MAX-BODY-SIZE* check always
+                         ;; rejected anyway — so the per-digit loop was
+                         ;; cosmetic, and an attacker sending
+                         ;; 'Content-Length: 999999999999999' forced a
+                         ;; bignum accumulator for free. Tightening to 10
+                         ;; makes the per-digit cap do real work.
                          do (incf digits)
-                            (when (> digits 15)
+                            (when (> digits 10)
                               (http-parse-error "Content-Length too large"))
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
@@ -247,8 +259,22 @@
 
 (defun scan-transfer-encoding (buf end)
   "Return T if BUF[0..END) contains a Transfer-Encoding header.
-   We do not implement inbound chunked decoding — requests carrying
-   Transfer-Encoding are rejected to prevent CL-TE smuggling."
+
+   Used on two paths with different consequences:
+     Inbound: any Transfer-Encoding is rejected as an unimplemented
+       framing mode. We do not decode chunked request bodies —
+       accepting one would expose the CL-TE smuggling gap that
+       motivates the rejection.
+     Outbound response: a present Transfer-Encoding means 'ignore
+       any Content-Length' per RFC 7230 §3.3.3 (TE wins over CL).
+       HANDLE-OUTBOUND-READ and COMPLETE-FETCH use this to select
+       between the chunked decoder and the CL-bounded body slice.
+
+   The function just answers 'is TE present?' — the policy
+   decision about what to do with the answer lives at the call
+   site. The older docstring only described the inbound path and
+   misled a reader grepping scan-transfer-encoding to wonder why
+   outbound chunked decoding worked at all."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "transfer-encoding:"
                                          :external-format :ascii))))
