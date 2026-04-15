@@ -299,13 +299,11 @@
 
 (defun set-socket-timeout (fd seconds)
   "Set SO_RCVTIMEO and SO_SNDTIMEO on FD.
-   SECONDS is an integer. Uses struct timeval (16 bytes on x86-64:
-   8-byte tv_sec followed by 8-byte tv_usec, both LE). We write the
-   low 32 bits of tv_sec and leave the upper 32 bits and tv_usec at
-   zero from :initial-element 0 — correct for any sane timeout since
-   SECONDS < 2^32 means 136 years. BE careful not to read the comment
-   above the pack-le-u32 call as 'writes 8 bytes' — it is stating the
-   struct layout, not the call's width."
+   SECONDS is an integer. struct timeval on 64-bit Linux is 16
+   bytes: tv_sec (8) + tv_usec (8), both little-endian. We write
+   only the low 32 bits of tv_sec via PACK-LE-U32; the upper 32
+   bits and tv_usec stay zero from :INITIAL-ELEMENT 0, which is
+   correct for every SECONDS under 2^32 (≈136 years)."
   (let ((buf (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
     (pack-le-u32 buf 0 seconds)
     (sb-sys:with-pinned-objects (buf)
