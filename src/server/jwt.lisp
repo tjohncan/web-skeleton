@@ -43,15 +43,14 @@
                           (string= crv "P-256"))
                 collect (let ((x-b64 (json-get key-obj "x"))
                               (y-b64 (json-get key-obj "y")))
-                          ;; Guard before base64url-decode. An EC key
-                          ;; with a missing coordinate used to crash
-                          ;; as a type-error from BASE64URL-DECODE
-                          ;; receiving NIL, which was technically
-                          ;; correct behavior (reject) but came out
-                          ;; of a call stack the caller could not
-                          ;; match against — rotating on a
-                          ;; coordinate-missing key looked like a
-                          ;; framework bug instead of an issuer bug.
+                          ;; Guard before base64url-decode so a JWKS
+                          ;; with a missing coordinate raises a clean
+                          ;; "missing x or y" error instead of a
+                          ;; type-error from inside BASE64URL-DECODE —
+                          ;; rotating on a coordinate-missing issuer
+                          ;; key should look like an issuer bug, not
+                          ;; a framework bug, to the operator reading
+                          ;; the log.
                           (unless (and x-b64 y-b64)
                             (error "JWKS: EC P-256 key missing x or y"))
                           (let ((x (base64url-decode x-b64))

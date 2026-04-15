@@ -430,11 +430,10 @@
                          ;; original cap, kernel may still have data (edge-triggered).
                          ;; Both :EOF (peer hung up before the body completed) and
                          ;; :FULL (pipelined bytes would overflow the body cap)
-                         ;; are terminal; :OK and :AGAIN continue normally. The
-                         ;; prior code only handled :EOF, so a :FULL from the
-                         ;; re-drain silently fell through into the body-wait
-                         ;; branch and the connection sat on bytes the cap had
-                         ;; already rejected.
+                         ;; are terminal; :OK and :AGAIN continue normally.
+                         ;; Handling :FULL is what keeps the cap a hard
+                         ;; boundary — without it the connection would
+                         ;; sit on bytes the cap had already rejected.
                          (case (connection-read-available conn)
                            ((:eof :full)
                             (return-from connection-on-read :close)))))

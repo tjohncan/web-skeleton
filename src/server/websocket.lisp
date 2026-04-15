@@ -281,16 +281,13 @@
         (end (connection-read-pos conn))
         (responses nil))
     (labels ((close-with (code)
-               ;; Tear-down helper for every error-close site. The
-               ;; pre-pack-16 shape had every error branch emit
-               ;; (values :close (build-ws-close NNNN)) which
-               ;; silently dropped the RESPONSES list populated by
-               ;; earlier frames in the same batch — a reply from
-               ;; frame N-1 would be lost if frame N had an RSV bit
-               ;; set. The normal-close branch already had the
-               ;; concat-then-close logic inline; lifting it out so
-               ;; every error site goes through the same code path
-               ;; means the responses list is always preserved.
+               ;; Tear-down helper for every error-close site. A
+               ;; bare (values :close (build-ws-close NNNN)) would
+               ;; drop the RESPONSES list populated by earlier frames
+               ;; in the same batch — a reply from frame N-1 would be
+               ;; lost if frame N had an RSV bit set. Funneling every
+               ;; site through one helper keeps the concat-then-close
+               ;; shape consistent with the normal close branch.
                (ws-shift-buffer conn buf pos end)
                (let ((close-frame (build-ws-close code)))
                  (if responses

@@ -709,13 +709,14 @@
    BODY-BYTES: byte vector or NIL.
 
    All strings are UTF-8 encoded to bytes before validation and
-   write. The old path did (char-code (char str i)) → (unsigned-byte 8)
-   which silently truncated char codes > 255 and crashed on codes
-   > 127 whose utf-8 form set high bits; apps that stuffed a UTF-8
-   status reason or accidental non-ASCII header value into a response
-   would see a type-error from SETF AREF rather than a clean error
-   about the content. Encoding up front means the per-byte checks
-   below operate on the wire form, not the source string form.
+   write. A naive (char-code (char str i)) → (unsigned-byte 8)
+   write would truncate char codes > 255 and crash on codes > 127
+   whose UTF-8 form sets a high byte — an app that stuffs a UTF-8
+   status reason or accidental non-ASCII header value into a
+   response deserves a pointed content error, not a type-error
+   from SETF AREF deep inside the serializer. Encoding up front
+   means the per-byte checks below operate on the wire form, not
+   the source string form.
 
    Header names are validated against the RFC 7230 §3.2.6 tchar
    table — the same table parse-headers-bytes uses on ingress.

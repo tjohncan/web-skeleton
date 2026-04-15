@@ -214,11 +214,10 @@
              nil))
 
     ;; Wrong-length signature rejects. ES256 is fixed-width r||s
-    ;; (64 bytes). Both paths used to take (subseq sig 0 32) and
-    ;; (subseq sig 32 64) unconditionally, so a 65-byte signature
-    ;; passed through with the trailing garbage silently dropped
-    ;; and a 63-byte signature crashed with a subseq error instead
-    ;; of returning NIL. Both shapes must now be explicit rejects.
+    ;; (64 bytes) — a 65-byte or 63-byte input is malformed, not
+    ;; 'contains the right bytes plus/minus some', and both shapes
+    ;; must return NIL rather than truncating or crashing deep in
+    ;; a subseq call.
     (let ((too-long (concatenate '(simple-array (unsigned-byte 8) (*))
                                   sig #(0))))
       (check "oversized signature rejects"

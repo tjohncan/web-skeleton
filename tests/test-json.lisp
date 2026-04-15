@@ -100,9 +100,9 @@
     (check "\\u truncated rejected"
            (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)
     ;; Exponent overflow — 1e9999 is syntactically valid per the 20
-    ;; exponent-digit cap but overflows IEEE 754. The old path let
-    ;; SBCL's reader raise a raw FLOATING-POINT-OVERFLOW out to the
-    ;; caller; now it comes back as a friendly parser error.
+    ;; exponent-digit cap but overflows IEEE 754. A raw
+    ;; FLOATING-POINT-OVERFLOW from SBCL's reader would be useless
+    ;; to the app; parser error is what the caller should see.
     (check "exponent overflow rejected"
            (signals-error-p (lambda () (json-parse "1e9999"))) t)
     (check "negative exponent overflow rejected"

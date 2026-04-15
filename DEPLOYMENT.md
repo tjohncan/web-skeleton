@@ -210,13 +210,13 @@ For `https://` URLs it blocks the worker thread for the full request lifecycle.
 close without `close_notify` (benign for legacy HTTP/1.0-style
 servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`), real transport
 errors (`errno = ECONNRESET` / `EPIPE` / other), and read(2)
-failures. `tls-read-all` and `tls-stream-response` now inspect
-`errno` after each `SSL_ERROR_SYSCALL` and raise loud on the
-non-benign cases so `*fetch-timeout*` actually bounds the HTTPS
-read path — the pre-pack-16 shape treated every `SSL_ERROR_SYSCALL`
-as clean EOF, which made the promise above a lie for close-delimited
-HTTPS responses and `http-fetch-stream` over HTTPS. Legitimate
-unexpected-EOF-without-`close_notify` is still accepted silently.
+failures. `tls-read-all` and `tls-stream-response` inspect `errno`
+after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign
+cases so `*fetch-timeout*` actually bounds the HTTPS read path
+for close-delimited responses and `http-fetch-stream` over HTTPS.
+Legitimate unexpected-EOF-without-`close_notify` is still accepted
+silently — that's the framing signal for HTTP/1.0-style servers
+that never send `close_notify` at all.
 
 ### Fetch callback contract
 

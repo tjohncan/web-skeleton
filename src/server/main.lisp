@@ -619,12 +619,11 @@
 
    Bumps LAST-ACTIVE on entry so a legitimate slow client (mobile
    3G pulling a 5 MiB response at 200 KB/s) is not reaped by the
-   idle sweeper 10 s into the download. The pre-pack-16 shape only
-   bumped on dispatch-time and on keep-alive reset, so a response
-   that took longer than *IDLE-TIMEOUT* to flush was killed mid-
-   write. Bumping here treats EPOLLOUT itself as progress — if the
-   kernel says we can write, the connection is alive — which is
-   the correct semantics for a slow-pipe client."
+   idle sweeper midway through the download. EPOLLOUT firing means
+   the kernel has room in the socket buffer; treating that as
+   activity is the correct semantics for a slow-pipe client, and
+   dispatch-time + keep-alive-reset bumps alone would not survive
+   a response that takes longer than *IDLE-TIMEOUT* to flush."
   (setf (connection-last-active conn) (get-universal-time))
   (handler-case
       (let ((result (connection-on-write conn)))
@@ -906,12 +905,12 @@
   ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
   ;;
   ;; The restore lives in an OUTER unwind-protect wrapping the entire
-  ;; thread lifecycle. An earlier shape nested the signal restore
-  ;; inside the same unwind-protect that drained the threads, which
-  ;; meant a MAKE-THREAD raise partway through the spawn loop — thread
-  ;; exhaustion, setrlimit, etc. — blew past both the drain and the
-  ;; restore, leaving the host image with the framework's SIGPIPE /
-  ;; SIGTERM handlers installed forever.
+  ;; thread lifecycle — it MUST NOT be nested inside the same unwind-
+  ;; protect that drains the worker threads, because a MAKE-THREAD
+  ;; raise partway through the spawn loop (thread exhaustion,
+  ;; setrlimit, etc.) would blow past both the drain and the restore
+  ;; and leave the host image with the framework's SIGPIPE / SIGTERM
+  ;; handlers installed forever.
   (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore))
         (prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
                         (lambda (signal info context)
