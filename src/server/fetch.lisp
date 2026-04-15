@@ -245,19 +245,27 @@
 
 (defun parse-response-status (buf start end)
   "Extract the integer status code from a response line in BUF[START..END).
-   Expects 'HTTP/1.x NNN reason'. Returns the status code or NIL."
+   Expects 'HTTP/1.x NNN' or 'HTTP/1.x NNN reason' (RFC 7230 §3.1.2).
+   Returns the status only if it is a 3-digit number in the 100-599
+   range (RFC 7231 §6) followed by SP or CR. Rejects 4-digit codes,
+   junk-terminated digits, and anything outside the defined ranges."
   (let ((crlf (scan-crlf buf start end)))
     (unless crlf (return-from parse-response-status nil))
-    ;; Find space after "HTTP/1.x"
     (let ((sp (position 32 buf :start start :end crlf)))
       (unless sp (return-from parse-response-status nil))
       (let ((s (1+ sp)))
-        (when (< (+ s 2) (length buf))
+        ;; Need three digits plus a terminator byte (SP before reason,
+        ;; or CR at end-of-line if the reason-phrase is omitted).
+        (when (<= (+ s 3) crlf)
           (let ((d1 (- (aref buf s) 48))
                 (d2 (- (aref buf (+ s 1)) 48))
-                (d3 (- (aref buf (+ s 2)) 48)))
-            (when (and (<= 0 d1 9) (<= 0 d2 9) (<= 0 d3 9))
-              (+ (* d1 100) (* d2 10) d3))))))))
+                (d3 (- (aref buf (+ s 2)) 48))
+                (after (aref buf (+ s 3))))
+            (when (and (<= 0 d1 9) (<= 0 d2 9) (<= 0 d3 9)
+                       (or (= after 32) (= after 13)))
+              (let ((status (+ (* d1 100) (* d2 10) d3)))
+                (when (<= 100 status 599)
+                  status)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
@@ -671,10 +679,19 @@
                               (incf pos))
                        (return))))
         (unless found (return))
-        ;; Skip to end of chunk-size line (past CRLF)
-        (loop while (and (< pos end) (/= (aref buf pos) 10))
-              do (incf pos))
-        (when (< pos end) (incf pos))
+        ;; Require strict CRLF after the chunk-size (RFC 7230 §4.1).
+        ;; Any chunk extensions between the hex digits and CRLF are
+        ;; passed through untouched — we scan for the LF and verify
+        ;; the preceding byte is CR so a bare-LF or truncated line
+        ;; cannot slip through as "5junk<LF>data".
+        (let ((eol pos))
+          (loop while (and (< eol end) (/= (aref buf eol) 10))
+                do (incf eol))
+          (unless (and (< eol end)
+                       (> eol pos)
+                       (= (aref buf (1- eol)) 13))
+            (error "chunked: expected CRLF after chunk-size"))
+          (setf pos (1+ eol)))
         ;; Zero-size chunk = end
         (when (zerop size) (return))
         ;; Copy chunk data
