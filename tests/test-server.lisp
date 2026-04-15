@@ -567,6 +567,84 @@
       (check "url: https ipv6 port" port 8443))))
 
 ;;; ---------------------------------------------------------------------------
+;;; IP address classification (SSRF helper)
+;;; ---------------------------------------------------------------------------
+
+(defun test-is-public-address ()
+  (format t "~%is-public-address-p~%")
+
+  ;; IPv4 — public
+  (check "v4 1.1.1.1"          (is-public-address-p #(1 1 1 1) :inet)       t)
+  (check "v4 8.8.8.8"          (is-public-address-p #(8 8 8 8) :inet)       t)
+  (check "v4 172.32 is public" (is-public-address-p #(172 32 0 1) :inet)    t)
+  (check "v4 100.63 is public" (is-public-address-p #(100 63 0 1) :inet)    t)
+
+  ;; IPv4 — not public
+  (check "v4 0.0.0.0"     (is-public-address-p #(0 0 0 0) :inet)            nil)
+  (check "v4 10/8"        (is-public-address-p #(10 0 0 1) :inet)           nil)
+  (check "v4 cgnat low"   (is-public-address-p #(100 64 0 1) :inet)         nil)
+  (check "v4 cgnat high"  (is-public-address-p #(100 127 255 255) :inet)    nil)
+  (check "v4 loopback"    (is-public-address-p #(127 0 0 1) :inet)          nil)
+  (check "v4 loopback top" (is-public-address-p #(127 255 255 255) :inet)   nil)
+  (check "v4 link-local"  (is-public-address-p #(169 254 1 1) :inet)        nil)
+  (check "v4 aws metadata" (is-public-address-p #(169 254 169 254) :inet)   nil)
+  (check "v4 172.16/12 low"  (is-public-address-p #(172 16 0 1) :inet)      nil)
+  (check "v4 172.16/12 high" (is-public-address-p #(172 31 255 255) :inet)  nil)
+  (check "v4 192.168/16"  (is-public-address-p #(192 168 1 1) :inet)        nil)
+  (check "v4 test-net-1"  (is-public-address-p #(192 0 2 1) :inet)          nil)
+  (check "v4 test-net-2"  (is-public-address-p #(198 51 100 1) :inet)       nil)
+  (check "v4 test-net-3"  (is-public-address-p #(203 0 113 1) :inet)        nil)
+  (check "v4 benchmarking" (is-public-address-p #(198 18 0 1) :inet)        nil)
+  (check "v4 multicast"   (is-public-address-p #(224 0 0 1) :inet)          nil)
+  (check "v4 reserved"    (is-public-address-p #(240 0 0 1) :inet)          nil)
+  (check "v4 broadcast"   (is-public-address-p #(255 255 255 255) :inet)    nil)
+
+  ;; IPv6 — public
+  (check "v6 public"
+         (is-public-address-p
+          #(#x20 #x01 #x48 #x60 #x48 #x60 0 0 0 0 0 0 0 0 #x88 #x88) :inet6)
+         t)
+
+  ;; IPv6 — not public
+  (check "v6 ::"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) :inet6) nil)
+  (check "v6 ::1"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 fe80::1 link-local"
+         (is-public-address-p
+          #(#xfe #x80 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 fc00::1 ULA"
+         (is-public-address-p
+          #(#xfc 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 fd00:ec2::254 AWS"
+         (is-public-address-p
+          #(#xfd 0 #xec #x02 0 0 0 0 0 0 0 0 0 0 #x02 #x54) :inet6) nil)
+  (check "v6 ff02::1 multicast"
+         (is-public-address-p
+          #(#xff #x02 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:db8:: documentation"
+         (is-public-address-p
+          #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
+  ;; IPv4-mapped IPv6 — attacker cannot launder 127.0.0.1
+  (check "v6 ::ffff:127.0.0.1 mapped loopback"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 #xff #xff 127 0 0 1) :inet6) nil)
+  (check "v6 ::ffff:10.0.0.1 mapped private"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 #xff #xff 10 0 0 1) :inet6) nil)
+  (check "v6 ::ffff:8.8.8.8 mapped public"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 0 0 #xff #xff 8 8 8 8) :inet6) t)
+
+  ;; Wrong length / unknown family returns NIL (conservative)
+  (check "v4 wrong length"   (is-public-address-p #(1 2 3) :inet)           nil)
+  (check "v6 wrong length"   (is-public-address-p #(1 2 3 4) :inet6)        nil)
+  (check "unknown family"    (is-public-address-p #(1 1 1 1) :inet7)        nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; URL decode tests
 ;;; ---------------------------------------------------------------------------
 
@@ -1258,6 +1336,7 @@
   (test-cookie-builder)
   (test-fetch)
   (test-dns)
+  (test-is-public-address)
   (test-url-decode)
   (test-query-string)
   (test-match-path)

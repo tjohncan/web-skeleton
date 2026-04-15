@@ -7,6 +7,7 @@
   :components ((:file "src/package")
                (:file "src/log" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
+               (:file "src/address" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
                (:file "src/algorithms/word32" :depends-on ("src/package"))
                (:file "src/algorithms/sha1"  :depends-on ("src/package"

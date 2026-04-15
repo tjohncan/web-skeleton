@@ -181,10 +181,32 @@ For `https://` URLs it blocks the worker thread for the full request lifecycle.
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, validate the
-hostname against an allowlist. The framework does not filter resolved
+destination before dialing. The framework does not filter resolved
 IP addresses — a user-supplied hostname resolving to `169.254.169.254`
-(cloud metadata), `127.0.0.1`, or any private RFC 1918 address will be
-connected to directly.
+(cloud metadata), `127.0.0.1`, or any private RFC 1918 address will
+be connected to directly unless the app refuses.
+
+`is-public-address-p` is the primitive for doing this refusal
+correctly. It takes a byte vector and a family keyword and returns
+T only for publicly routable addresses, rejecting loopback, link-local,
+RFC 1918 private, RFC 6598 CGNAT, RFC 4193 unique local, multicast,
+documentation prefixes, reserved ranges, and cloud metadata IPs. It
+unwraps IPv4-mapped IPv6 and NAT64 so an attacker cannot launder
+`127.0.0.1` as `::ffff:127.0.0.1`.
+
+```lisp
+(defun handle-proxy (req)
+  (let* ((url  (get-query-param (http-request-query req) "url"))
+         (host (and url (host-from-url url)))   ; app-level URL parser
+         (ip   (and host (parse-ipv4-literal host))))
+    (unless (and ip (is-public-address-p ip :inet))
+      (return-from handle-proxy (make-error-response 403)))
+    (defer-to-fetch :get url :then ...)))
+```
+
+The helper deliberately does not resolve hostnames — apps that accept
+hostnames must resolve first and then call `is-public-address-p` on
+each resolved address before dialing.
 
 ### DNS resolution and caching
 

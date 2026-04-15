@@ -60,6 +60,8 @@
            #:random-token
            ;; ECDSA
            #:ecdsa-verify-p256
+           ;; Address classification
+           #:is-public-address-p
            ;; JWT
            #:jwt-key
            #:make-jwt-key
