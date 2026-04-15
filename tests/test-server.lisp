@@ -230,6 +230,61 @@
     (check-error "Content-Length: +10 rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
 
+  ;; Content-Length parser agreement (audit 2.1-C3). scan-content-length
+  ;; is the fast byte scanner used for pre-allocation; parse-headers-bytes
+  ;; populates the header alist. They are hand-rolled and the risk is
+  ;; that a future edit lets one accept a value the other rejects, which
+  ;; would open a smuggling gap. This locks in agreement for every CL
+  ;; shape we already care about — valid and invalid.
+  (flet ((alist-cl (bytes header-end)
+           ;; Skip the request line — parse-headers-bytes expects START
+           ;; to point at the first header byte, not the request line.
+           (let* ((req-end (web-skeleton::scan-crlf bytes 0 header-end))
+                  (headers (web-skeleton::parse-headers-bytes
+                            bytes (+ req-end 2) (+ header-end 4)))
+                  (v (cdr (assoc "content-length" headers :test #'string=))))
+             (when v
+               ;; Trim OWS around the value; scan-content-length does
+               ;; the same before running its digit loop.
+               (let ((trimmed (string-trim '(#\Space #\Tab) v)))
+                 (when (every (lambda (c) (char<= #\0 c #\9)) trimmed)
+                   (parse-integer trimmed))))))
+         (block-bytes (header)
+           (let ((raw (concatenate 'string
+                                   "POST / HTTP/1.1" *crlf*
+                                   "Host: localhost" *crlf*
+                                   header *crlf* *crlf*)))
+             (sb-ext:string-to-octets raw :external-format :ascii))))
+    ;; Valid shapes — both parsers must agree on the same integer.
+    (dolist (v '(("Content-Length: 0"     0)
+                 ("Content-Length: 10"    10)
+                 ("Content-Length: 42"    42)
+                 ("content-length: 99"    99)
+                 ("Content-Length:   7"    7)  ; extra SP OWS
+                 (#.(format nil "Content-Length:~c13" #\Tab)  13)))  ; TAB OWS
+      (destructuring-bind (header expected) v
+        (let* ((bytes (block-bytes header))
+               (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+          (check (format nil "CL agreement scanner ~s" header)
+                 (web-skeleton::scan-content-length bytes header-end) expected)
+          (check (format nil "CL agreement alist ~s" header)
+                 (alist-cl bytes header-end) expected))))
+    ;; Invalid shapes — scanner must reject. The alist path is lax by
+    ;; design (it's a string value, not a validated integer), so we
+    ;; only assert the authoritative side: scan-content-length must
+    ;; raise on every one of these and never return a number.
+    (dolist (header '("Content-Length: 10 20"
+                      "Content-Length: 10x"
+                      "Content-Length: +10"
+                      "Content-Length: -5"))
+      (let* ((bytes (block-bytes header))
+             (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+        (check (format nil "CL scanner rejects ~s" header)
+               (handler-case
+                   (progn (web-skeleton::scan-content-length bytes header-end) nil)
+                 (error () t))
+               t))))
+
   ;; Host header validation (RFC 7230 §5.4)
   ;; connection-parse-request enforces this; parse-request does not.
   (let ((conn (web-skeleton::make-connection
@@ -509,11 +564,32 @@
     (check "https port"    port 443)
     (check "https path"    path "/v1/data"))
 
+  ;; HTTPS with an IP-literal host is rejected — SSL_set1_host wants a
+  ;; DNS name and the framework does not wire up IP SAN verification
+  ;; via X509_VERIFY_PARAM_set1_ip_asc. Failing loudly at parse-url
+  ;; closes the asymmetry with plain-HTTP IP-literal support.
+  (check-error "https + v4 literal rejected"
+               (web-skeleton::parse-url "https://10.0.0.1:8443/health"))
+  (check-error "https + v4 bare rejected"
+               (web-skeleton::parse-url "https://1.2.3.4/"))
+  (check-error "https + v6 bracketed rejected"
+               (web-skeleton::parse-url "https://[::1]:8443/"))
+  (check-error "https + v6 bracketed doc rejected"
+               (web-skeleton::parse-url "https://[2001:db8::1]/api"))
+  ;; Plain-HTTP IP literals still supported — the framework's fetch
+  ;; path dials these directly with no TLS.
   (multiple-value-bind (scheme host port path)
-      (web-skeleton::parse-url "https://10.0.0.1:8443/health")
-    (declare (ignore scheme host))
-    (check "https custom port" port 8443)
-    (check "https ip path"     path "/health"))
+      (web-skeleton::parse-url "http://10.0.0.1:8443/health")
+    (declare (ignore scheme))
+    (check "http v4 literal host" host "10.0.0.1")
+    (check "http v4 literal port" port 8443)
+    (check "http v4 literal path" path "/health"))
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://[::1]:8080/")
+    (declare (ignore scheme))
+    (check "http v6 bracketed host" host "::1")
+    (check "http v6 bracketed port" port 8080)
+    (check "http v6 bracketed path" path "/"))
 
   ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4).
   ;; Before the fix, 'http://host?q=1' parsed the whole 'host?q=1'
@@ -679,11 +755,12 @@
       (check "url: ipv6 default port" port 80)
       (check "url: ipv6 full host"    host "2001:db8::1")
       (check "url: ipv6 root path"    path "/"))
-    (multiple-value-bind (scheme host port path)
-        (web-skeleton::parse-url "https://[::1]:8443/v1")
-      (declare (ignore scheme path))
-      (check "url: https ipv6 host" host "::1")
-      (check "url: https ipv6 port" port 8443))))
+    ;; https:// + IP literal is rejected (audit 2.1-C1). The covering
+    ;; rejection tests live in test-fetch; this is here only to pin
+    ;; down that the DNS helper group's earlier https-with-bracketed-v6
+    ;; case no longer parses successfully.
+    (check-error "url: https ipv6 rejected"
+                 (web-skeleton::parse-url "https://[::1]:8443/v1"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IP address classification (SSRF helper)

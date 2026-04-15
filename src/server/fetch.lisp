@@ -226,6 +226,18 @@
               (t
                (concatenate 'string "/" (subseq url path-start))))))
       (multiple-value-bind (host port) (parse-authority authority default-port)
+        ;; Reject https:// with an IP-literal host. SSL_set1_host sets
+        ;; a DNS name for peer verification; matching an IP SAN requires
+        ;; X509_VERIFY_PARAM_set1_ip_asc, which we do not wire up. A
+        ;; certificate with only a DNS SAN — which is the common case —
+        ;; would fail the handshake anyway; failing loudly here closes
+        ;; the asymmetry with plain-HTTP IP-literal support honestly
+        ;; instead of producing an opaque SSL_connect error in the app.
+        (when (and (eq scheme :https)
+                   (or (parse-ipv4-literal host)
+                       (parse-ipv6-literal host)))
+          (error "https:// with IP-literal host not supported — ~
+                  use a DNS name (IP SAN verification is not wired up)"))
         (values scheme host port path)))))
 
 ;;; ---------------------------------------------------------------------------
