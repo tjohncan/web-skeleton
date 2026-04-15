@@ -8,6 +8,14 @@
 ;;; reports the fd is readable, and CONNECTION-ON-WRITE when writable.
 ;;; ===========================================================================
 
+;;; CONNECTION-READ-AVAILABLE needs to see *MAX-OUTBOUND-RESPONSE-SIZE*
+;;; (defined in src/server/fetch.lisp) to cap outbound reads separately
+;;; from inbound request bodies. fetch.lisp loads after connection.lisp,
+;;; so we proclaim the symbol special up front to silence the compile-
+;;; time "undefined variable" warning — the actual defparameter lands
+;;; before any call to CONNECTION-READ-AVAILABLE happens.
+(declaim (special *max-outbound-response-size*))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
@@ -132,11 +140,23 @@
 (defun connection-read-available (conn)
   "Drain all available bytes from fd into read buffer (edge-triggered).
    Grows the buffer as needed, up to the state-appropriate limit.
-   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
+   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN.
+
+   The size cap is state- and direction-dependent:
+     :websocket         → *max-ws-payload-size* + 14 (masked header)
+     outbound response  → *max-outbound-response-size* (8 MiB default)
+     inbound request    → *max-body-size*             (1 MiB default)
+   Keeping the inbound and outbound caps separate means a 1 MiB+ HTTPS
+   response (which a real upstream will routinely send) doesn't get
+   truncated by the inbound request-body budget."
   (let ((any-read nil)
-        (max-size (if (eq (connection-state conn) :websocket)
-                      (+ *max-ws-payload-size* 14)  ; max masked frame header
-                      *max-body-size*)))
+        (max-size (cond
+                    ((eq (connection-state conn) :websocket)
+                     (+ *max-ws-payload-size* 14))
+                    ((connection-outbound-p conn)
+                     *max-outbound-response-size*)
+                    (t
+                     *max-body-size*))))
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))
