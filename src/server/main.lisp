@@ -628,8 +628,9 @@
 
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler)
   "Main event loop. Runs until *shutdown* is set."
-  (let ((listener-fd (socket-fd listener-socket))
-        (last-ping-time (get-universal-time))
+  (let ((listener-fd    (socket-fd listener-socket))
+        (last-ping-time  (get-universal-time))
+        (last-sweep-time (get-universal-time))
         (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when *shutdown*
@@ -675,9 +676,15 @@
                                       (when (lookup-connection fd)
                                         (handle-client-read conn epoll-fd
                                                             handler ws-handler))))))))))))))
-      ;; Periodic maintenance
+      ;; Periodic maintenance — both scans gated on elapsed wall
+      ;; clock so a busy epoll loop doesn't walk the connection
+      ;; table multiple times per second. 1 s is fine: idle
+      ;; timeouts are measured in 10 s+ units, so sub-second sweep
+      ;; granularity is pure waste.
       (let ((now (get-universal-time)))
-        (sweep-idle-connections epoll-fd now)
+        (when (>= (- now last-sweep-time) 1)
+          (sweep-idle-connections epoll-fd now)
+          (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
           (setf last-ping-time now))))))
