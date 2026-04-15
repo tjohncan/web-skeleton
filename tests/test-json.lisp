@@ -98,7 +98,28 @@
     (check "\\u with negative rejected"
            (signals-error-p (lambda () (json-parse "\"\\u-001\""))) t)
     (check "\\u truncated rejected"
-           (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)))
+           (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)
+    ;; Exponent overflow — 1e9999 is syntactically valid per the 20
+    ;; exponent-digit cap but overflows IEEE 754. The old path let
+    ;; SBCL's reader raise a raw FLOATING-POINT-OVERFLOW out to the
+    ;; caller; now it comes back as a friendly parser error.
+    (check "exponent overflow rejected"
+           (signals-error-p (lambda () (json-parse "1e9999"))) t)
+    (check "negative exponent overflow rejected"
+           (signals-error-p (lambda () (json-parse "-1e9999"))) t)
+    ;; Duplicate keys — RFC 8259 §4 says SHOULD be unique; we say MUST.
+    (check "duplicate key rejected"
+           (signals-error-p
+            (lambda () (json-parse "{\"a\":1,\"a\":2}")))
+           t)
+    (check "duplicate key rejected nested"
+           (signals-error-p
+            (lambda () (json-parse "{\"o\":{\"k\":1,\"k\":2}}")))
+           t)
+    (check "duplicate key across three rejected"
+           (signals-error-p
+            (lambda () (json-parse "{\"a\":1,\"b\":2,\"a\":3}")))
+           t)))
 
 (defun test-json-serialize ()
   (format t "~%JSON Serializer~%")

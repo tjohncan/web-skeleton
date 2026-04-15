@@ -171,11 +171,25 @@
       ;; input is pre-validated to [0-9.eE+-] by the loop above.
       ;; Bind *read-default-float-format* to double-float so the CL reader
       ;; produces full 64-bit precision (default is single-float).
+      ;;
+      ;; The syntactic caps above (300 integer digits, 300 fraction
+      ;; digits, 20 exponent digits) admit values like '1e9999' which
+      ;; overflow IEEE 754 double. SBCL's reader signals a
+      ;; floating-point-overflow from inside READ-FROM-STRING before
+      ;; control returns — earlier than the post-read infinity check
+      ;; could see it — so the friendly 'number out of range' error
+      ;; never fired and apps got a raw SB-KERNEL:FLOATING-POINT-
+      ;; EXCEPTION with 'an error of type FLOATING-POINT-OVERFLOW'.
+      ;; Catch the arithmetic condition family and remap to the same
+      ;; clean overflow error the infinity branch produces.
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
                   (let* ((*read-default-float-format* 'double-float)
                          (*read-eval* nil)
                          (*read-base* 10)
-                         (val (read-from-string num-str)))
+                         (val (handler-case (read-from-string num-str)
+                                (arithmetic-error ()
+                                  (error "json: number out of range at ~d"
+                                         start)))))
                     (when (or (sb-ext:float-infinity-p val)
                               (sb-ext:float-nan-p val))
                       (error "json: number out of range at ~d" start))
@@ -216,13 +230,23 @@
 
 (defun json-parse-object (str pos &optional (depth 0))
   "Parse a JSON object at POS. Returns (values alist new-pos).
-   Caller (json-parse-value) has already dispatched on the opening '{'."
+   Caller (json-parse-value) has already dispatched on the opening '{'.
+
+   Duplicate keys raise. RFC 8259 §4 says names within an object
+   SHOULD be unique and permits 'undefined' or 'implementation-
+   dependent' behavior on duplicates, and several popular parsers
+   silently pick last-wins. Our alist keeps every pair, so a naive
+   (cdr (assoc ...)) consumer would see the FIRST value and a
+   rewrite to (cdr (car ...)) would see the LAST, and the behavior
+   of the application would swing on an invisible ordering detail.
+   Rejecting is the honest option."
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
   (when (char= (char str pos) #\})
     (return-from json-parse-object (values nil (1+ pos))))
-  (let ((pairs nil))
+  (let ((pairs nil)
+        (seen (make-hash-table :test #'equal)))
     (loop
       (setf pos (json-skip-whitespace str pos))
       (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
@@ -231,21 +255,28 @@
       ;; so the check belongs here rather than inside json-parse-string.
       (unless (char= (char str pos) #\")
         (error "json: expected string key at ~d" pos))
-      (multiple-value-bind (key new-pos) (json-parse-string str pos)
-        (setf pos (json-skip-whitespace str new-pos))
-        (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
-        (unless (char= (char str pos) #\:)
-          (error "json: expected ':' at ~d" pos))
-        (incf pos)
-        (multiple-value-bind (val new-pos2) (json-parse-value str pos (1+ depth))
-          (push (cons key val) pairs)
-          (setf pos (json-skip-whitespace str new-pos2))
-          (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
-          (cond
-            ((char= (char str pos) #\,) (incf pos))
-            ((char= (char str pos) #\})
-             (return (values (nreverse pairs) (1+ pos))))
-            (t (error "json: expected ',' or '}' at ~d" pos))))))))
+      (let ((key-pos pos))
+        (multiple-value-bind (key new-pos) (json-parse-string str pos)
+          (when (gethash key seen)
+            (error "json: duplicate key ~s at ~d" key key-pos))
+          (setf (gethash key seen) t)
+          (setf pos (json-skip-whitespace str new-pos))
+          (when (>= pos (length str))
+            (error "json: unterminated object at ~d" pos))
+          (unless (char= (char str pos) #\:)
+            (error "json: expected ':' at ~d" pos))
+          (incf pos)
+          (multiple-value-bind (val new-pos2)
+              (json-parse-value str pos (1+ depth))
+            (push (cons key val) pairs)
+            (setf pos (json-skip-whitespace str new-pos2))
+            (when (>= pos (length str))
+              (error "json: unterminated object at ~d" pos))
+            (cond
+              ((char= (char str pos) #\,) (incf pos))
+              ((char= (char str pos) #\})
+               (return (values (nreverse pairs) (1+ pos))))
+              (t (error "json: expected ',' or '}' at ~d" pos)))))))))
 
 (defun json-parse-array (str pos &optional (depth 0))
   "Parse a JSON array at POS. Returns (values list new-pos).
