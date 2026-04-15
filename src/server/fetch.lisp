@@ -180,7 +180,14 @@
 (defun parse-url (url)
   "Parse a URL into (values scheme host port path).
    Supports http:// and https:// schemes. Host may be a plain name,
-   an IPv4 literal, or a bracketed IPv6 literal ('[2001:db8::1]')."
+   an IPv4 literal, or a bracketed IPv6 literal ('[2001:db8::1]').
+   Rejects URLs longer than *MAX-REQUEST-LINE-LENGTH* — a handler that
+   proxies a user-controlled URL must not be able to hand us a 100 MB
+   string that allocates through several intermediate buffers before
+   anything else can push back."
+  (when (> (length url) *max-request-line-length*)
+    (error "URL too long (~d bytes, max ~d)"
+           (length url) *max-request-line-length*))
   (let ((scheme nil) (authority-start nil) (default-port nil))
     (cond
       ((and (>= (length url) 8) (string-equal url "https://" :end1 8))
