@@ -98,6 +98,9 @@
            #:http-fetch
            #:defer-to-fetch
            #:http-fetch-stream
+           #:parse-url
+           #:parse-ipv4-literal
+           #:parse-ipv6-literal
            #:*https-fetch-fn*
            #:*https-stream-fn*
            ;; Conditions

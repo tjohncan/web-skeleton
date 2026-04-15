@@ -88,7 +88,10 @@
        nil)
       ;; fc00::/7 — unique local (RFC 4193), covers AWS fd00:ec2::254
       ((= (logand b0 #xfe) #xfc) nil)
-      ;; fe00::/8 — link-local, deprecated site-local, reserved
+      ;; fe00::/8 — a conservative superset of link-local (fe80::/10),
+      ;; deprecated site-local (fec0::/10), and everything else in the
+      ;; IETF-reserved fe00::/8 range. None of it is publicly routable,
+      ;; so the /8 gate is both simpler and safer than narrow matches.
       ((= b0 #xfe) nil)
       ;; ff00::/8 — multicast
       ((= b0 #xff) nil)

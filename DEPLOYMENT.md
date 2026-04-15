@@ -207,14 +207,38 @@ documentation prefixes, reserved ranges, and cloud metadata IPs. It
 unwraps IPv4-mapped IPv6 and NAT64 so an attacker cannot launder
 `127.0.0.1` as `::ffff:127.0.0.1`.
 
+The framework exports `parse-url`, `parse-ipv4-literal`, and
+`parse-ipv6-literal` specifically so a handler writing this check
+doesn't have to reinvent them. They are the same parsers the
+outbound fetch path uses internally, so a policy decision on the
+inbound side and the actual dial on the outbound side agree on
+what "host" means:
+
 ```lisp
 (defun handle-proxy (req)
-  (let* ((url  (get-query-param (http-request-query req) "url"))
-         (host (and url (host-from-url url)))   ; app-level URL parser
-         (ip   (and host (parse-ipv4-literal host))))
-    (unless (and ip (is-public-address-p ip :inet))
-      (return-from handle-proxy (make-error-response 403)))
-    (defer-to-fetch :get url :then ...)))
+  (let ((url (get-query-param (http-request-query req) "url")))
+    (unless url
+      (return-from handle-proxy (make-error-response 400)))
+    (multiple-value-bind (scheme host port path)
+        (handler-case (parse-url url) (error () (values nil nil nil nil)))
+      (declare (ignore port path))
+      (unless scheme
+        (return-from handle-proxy (make-error-response 400)))
+      ;; parse-url + parse-ipv*-literal + is-public-address-p together.
+      ;; Only IP-literal hosts are accepted, and only if the address
+      ;; classifies as publicly routable. Hostnames are rejected —
+      ;; a permissive app would allowlist specific ones up front,
+      ;; or resolve via its own DNS path before calling
+      ;; is-public-address-p on each resolved address.
+      (let* ((v4 (parse-ipv4-literal host))
+             (v6 (and (not v4) (parse-ipv6-literal host))))
+        (cond
+          ((and v4 (is-public-address-p v4 :inet))
+           (defer-to-fetch :get url :then my-callback))
+          ((and v6 (is-public-address-p v6 :inet6))
+           (defer-to-fetch :get url :then my-callback))
+          (t
+           (make-error-response 403)))))))
 ```
 
 The helper deliberately does not resolve hostnames — apps that accept
