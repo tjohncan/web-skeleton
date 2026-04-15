@@ -47,6 +47,20 @@
         (setf all-passed nil))
       (incf total-passed *tests-passed*)
       (incf total-failed *tests-failed*))
+    ;; When libssl is loaded, the earlier TEST-ALGORITHMS run
+    ;; exercised the libssl-backed sha1 / sha256 / ecdsa-verify-p256
+    ;; via the swapped symbol cells — the pure-Lisp originals went
+    ;; completely untested. Re-run the crypto suite with the
+    ;; function cells temporarily swapped back, so edits to
+    ;; src/algorithms/*.lisp are caught on libssl-enabled machines
+    ;; too. No-op when libssl is absent: the default function
+    ;; cells already are the pure-Lisp versions, so there is
+    ;; nothing to re-verify.
+    (when web-skeleton:*https-fetch-fn*
+      (unless (test-pure-lisp-crypto)
+        (setf all-passed nil))
+      (incf total-passed *tests-passed*)
+      (incf total-failed *tests-failed*))
     (format t "~d passed, ~d failed across all suites~%"
             total-passed total-failed)
     (if all-passed

@@ -50,7 +50,22 @@ required at runtime.
 sbcl --non-interactive --load run-tests.lisp
 ```
 
-Exits with code 0 on success, 1 on failure.
+Exits with code 0 on success, 1 on failure. On a machine with libssl
+loaded, the default runner also re-exercises the pure-Lisp crypto paths
+so edits to `src/algorithms/*.lisp` are caught even when libssl has
+swapped them out of the default function cells.
+
+For framework-dev work focused on the pure-Lisp crypto alone:
+
+```bash
+sbcl --non-interactive --load run-pure-lisp-tests.lisp
+```
+
+This loads the tests and (if present) `web-skeleton-tls`, then runs
+only `test-pure-lisp-crypto` — the SHA-1 / SHA-256 / HMAC / ECDSA
+suites with the function cells temporarily swapped back to their
+`*-lisp` originals. Useful when iterating on one of those files
+on a libssl-enabled box.
 
 ## Development (REPL)
 
@@ -62,13 +77,14 @@ sbcl
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton-tests")
-(web-skeleton-tests:test)             ; run all tests
-(web-skeleton-tests:test-algorithms)  ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
-(web-skeleton-tests:test-json)        ; JSON parser and serializer
-(web-skeleton-tests:test-server)      ; HTTP, URL, query, routing, JWT
-(web-skeleton-tests:test-store)       ; concurrent store and reaper
-(web-skeleton-tests:test-harness)     ; live-server test harness round-trips
-(web-skeleton-tests:test-tls)         ; TLS registration (skips if libssl absent)
+(web-skeleton-tests:test)                 ; run all tests
+(web-skeleton-tests:test-algorithms)      ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
+(web-skeleton-tests:test-json)            ; JSON parser and serializer
+(web-skeleton-tests:test-server)          ; HTTP, URL, query, routing, JWT
+(web-skeleton-tests:test-store)           ; concurrent store and reaper
+(web-skeleton-tests:test-harness)         ; live-server test harness round-trips
+(web-skeleton-tests:test-tls)             ; TLS registration (skips if libssl absent)
+(web-skeleton-tests:test-pure-lisp-crypto) ; re-run crypto suites against the pure-Lisp originals
 (asdf:load-system "web-skeleton-demo")
 (web-skeleton-demo:start-demo)  ; run the demo server
 ```
