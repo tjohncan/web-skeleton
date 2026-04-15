@@ -167,6 +167,29 @@
                       (format nil "X-~aBad: v" #\Return)
                       "Host: localhost")))
 
+  ;; CTL / DEL bytes in the METHOD region rejected. Same shape as
+  ;; the URL check above: scan-crlf only matches the CRLF pair so
+  ;; a bare LF smuggled into the method survives parsing and
+  ;; would otherwise flow into the 'unrecognized method: ~a' error
+  ;; text, splitting the log line into two and handing the second
+  ;; one to an attacker.
+  (check-error "bare LF in method"
+               (parse-request
+                (crlf (format nil "GE~cT / HTTP/1.1" #\Newline)
+                      "Host: localhost")))
+  (check-error "bare CR in method"
+               (parse-request
+                (crlf (format nil "GE~cT / HTTP/1.1" #\Return)
+                      "Host: localhost")))
+  (check-error "NUL in method"
+               (parse-request
+                (crlf (format nil "GE~cT / HTTP/1.1" (code-char 0))
+                      "Host: localhost")))
+  (check-error "DEL in method"
+               (parse-request
+                (crlf (format nil "GE~cT / HTTP/1.1" (code-char #x7f))
+                      "Host: localhost")))
+
   ;; Oversized request line
   (check-error "oversized request line"
                (let ((web-skeleton:*max-request-line-length* 10))
@@ -563,6 +586,28 @@
     (check "https host"    host "api.example.com")
     (check "https port"    port 443)
     (check "https path"    path "/v1/data"))
+
+  ;; CTL bytes in the URL rejected. Without this check an
+  ;; attacker-supplied URL (passed by an app to defer-to-fetch)
+  ;; with a bare CR / LF could reach the fetch-path log-debug
+  ;; lines in fetch.lisp / dns.lisp / tls.lisp via ~a interpolation
+  ;; of HOST and PATH — same log-injection shape as the inbound
+  ;; request-target check.
+  (check-error "parse-url: bare LF rejected"
+               (web-skeleton::parse-url
+                (format nil "http://example.com/foo~cbar" #\Newline)))
+  (check-error "parse-url: bare CR rejected"
+               (web-skeleton::parse-url
+                (format nil "http://example.com/foo~cbar" #\Return)))
+  (check-error "parse-url: NUL rejected"
+               (web-skeleton::parse-url
+                (format nil "http://example.com/foo~cbar" (code-char 0))))
+  (check-error "parse-url: DEL rejected"
+               (web-skeleton::parse-url
+                (format nil "http://example.com/foo~cbar" (code-char #x7f))))
+  (check-error "parse-url: LF in host rejected"
+               (web-skeleton::parse-url
+                (format nil "http://examp~cle.com/" #\Newline)))
 
   ;; HTTPS with an IP-literal host is rejected — SSL_set1_host wants a
   ;; DNS name and the framework does not wire up IP SAN verification

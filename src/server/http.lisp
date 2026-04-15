@@ -517,6 +517,18 @@
           (http-parse-error "malformed request line"))
         (when (position 32 buf :start (1+ sp2) :end req-end)
           (http-parse-error "malformed request line (extra spaces)"))
+        ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the method region.
+        ;; Same discipline as the request-target check below: scan-crlf
+        ;; only matches the CRLF pair, so a bare CR or LF smuggled
+        ;; between start and the first space survives into
+        ;; bytes-to-string and lands in the 'unrecognized method: ~a'
+        ;; error text, which log-warn then splits across two lines —
+        ;; a log-injection primitive identical in shape to the
+        ;; request-target vector.
+        (loop for i from start below sp1
+              for b = (aref buf i)
+              when (or (< b #x20) (= b #x7F))
+              do (http-parse-error "control character in request method"))
         ;; Method
         (let ((method (match-method-bytes buf start sp1)))
           (unless method

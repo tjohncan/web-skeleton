@@ -191,10 +191,19 @@
    Rejects URLs longer than *MAX-REQUEST-LINE-LENGTH* — a handler that
    proxies a user-controlled URL must not be able to hand us a 100 MB
    string that allocates through several intermediate buffers before
-   anything else can push back."
+   anything else can push back. Also rejects CTL bytes in the URL:
+   the fetch path log-debug lines in fetch.lisp / dns.lisp / tls.lisp
+   interpolate HOST and PATH with ~a, so an attacker-supplied URL
+   with bare CR / LF would otherwise give a log-injection primitive
+   identical in shape to the inbound request-target check in
+   parse-request-bytes."
   (when (> (length url) *max-request-line-length*)
     (error "URL too long (~d bytes, max ~d)"
            (length url) *max-request-line-length*))
+  (loop for i from 0 below (length url)
+        for code = (char-code (char url i))
+        when (or (< code #x20) (= code #x7F))
+        do (error "URL contains control character"))
   (let ((scheme nil) (authority-start nil) (default-port nil))
     (cond
       ((and (>= (length url) 8) (string-equal url "https://" :end1 8))
