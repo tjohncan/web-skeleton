@@ -26,19 +26,35 @@
 
 (defun parse-jwks (json-string)
   "Parse a JWKS JSON string into a list of JWT-KEY structs.
-   Extracts ES256 keys only (kty=EC, crv=P-256)."
+   Extracts ES256 keys only (kty=EC, crv=P-256). Rejects JWKS sets
+   containing two EC keys with the same kid — an accidental duplicate
+   during a rotation window would make (FIND kid ...) silently pick
+   whichever one sorted first, and that's rarely what the issuer
+   meant. Missing kty or crv are skipped cleanly (not type-erroring
+   on STRING= against NIL)."
   (let* ((jwks (json-parse json-string))
-         (keys-array (json-get jwks "keys")))
-    (loop for key-obj in keys-array
-          when (and (string= (json-get key-obj "kty") "EC")
-                    (string= (json-get key-obj "crv") "P-256"))
-          collect (let ((x (base64url-decode (json-get key-obj "x")))
-                        (y (base64url-decode (json-get key-obj "y"))))
-                    (unless (and (= (length x) 32) (= (length y) 32))
-                      (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
-                    (make-jwt-key
-                     :kid (or (json-get key-obj "kid") "")
-                     :x x :y y)))))
+         (keys-array (json-get jwks "keys"))
+         (keys
+          (loop for key-obj in keys-array
+                for kty = (json-get key-obj "kty")
+                for crv = (json-get key-obj "crv")
+                when (and kty crv
+                          (string= kty "EC")
+                          (string= crv "P-256"))
+                collect (let ((x (base64url-decode (json-get key-obj "x")))
+                              (y (base64url-decode (json-get key-obj "y"))))
+                          (unless (and (= (length x) 32) (= (length y) 32))
+                            (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
+                          (make-jwt-key
+                           :kid (or (json-get key-obj "kid") "")
+                           :x x :y y)))))
+    (let ((seen (make-hash-table :test 'equal)))
+      (dolist (k keys)
+        (let ((kid (jwt-key-kid k)))
+          (when (and (> (length kid) 0) (gethash kid seen))
+            (error "JWKS: duplicate kid ~s" kid))
+          (setf (gethash kid seen) t))))
+    keys))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWT verification
