@@ -319,14 +319,24 @@
                                              (and (<= 97 n 122)
                                                   (= b (- n 32))))))
                    ;; Require a token terminator so 100-continued (etc.)
-                   ;; does not match. Accepted terminators: CR (end of
-                   ;; header line), SP/TAB (continuation), and ';'
-                   ;; (header parameter start — 'Expect: 100-continue;q=1.0'
-                   ;; is rare but permitted by RFC 7231).
+                   ;; does not match. Accepted terminators:
+                   ;;   CR (13)  — end of header line
+                   ;;   SP (32)  — whitespace continuation
+                   ;;   TAB (9)  — whitespace continuation
+                   ;;   ';' (59) — header parameter start
+                   ;;              (Expect: 100-continue;q=1.0 — rare
+                   ;;               but permitted by RFC 7231)
+                   ;;   ',' (44) — list separator. RFC 7231 §5.1.1
+                   ;;              defines Expect as 1#expectation
+                   ;;              (the RFC 7230 §7 list rule), so
+                   ;;              Expect: 100-continue, foo is a
+                   ;;              well-formed shape and the comma
+                   ;;              terminates the 100-continue token.
                    (let ((after (+ pos (length token))))
                      (when (or (>= after end)
                                (let ((b (aref buf after)))
-                                 (or (= b 13) (= b 32) (= b 9) (= b 59))))
+                                 (or (= b 13) (= b 32) (= b 9)
+                                     (= b 59) (= b 44))))
                        (return t)))))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -391,9 +401,17 @@
                                     :end2 (connection-read-pos conn))
                            (setf (connection-read-buf conn) new-buf))
                          ;; Re-drain: buffer grew past connection-read-available's
-                         ;; original cap, kernel may still have data (edge-triggered)
-                         (when (eq (connection-read-available conn) :eof)
-                           (return-from connection-on-read :close))))
+                         ;; original cap, kernel may still have data (edge-triggered).
+                         ;; Both :EOF (peer hung up before the body completed) and
+                         ;; :FULL (pipelined bytes would overflow the body cap)
+                         ;; are terminal; :OK and :AGAIN continue normally. The
+                         ;; prior code only handled :EOF, so a :FULL from the
+                         ;; re-drain silently fell through into the body-wait
+                         ;; branch and the connection sat on bytes the cap had
+                         ;; already rejected.
+                         (case (connection-read-available conn)
+                           ((:eof :full)
+                            (return-from connection-on-read :close)))))
                      (let ((body-available (- (connection-read-pos conn) body-start)))
                        (setf (connection-body-expected conn) content-length
                              (connection-header-end conn) header-end)

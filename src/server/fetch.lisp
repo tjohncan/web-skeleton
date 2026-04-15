@@ -211,29 +211,37 @@
       ((and (>= (length url) 7) (string-equal url "http://" :end1 7))
        (setf scheme :http authority-start 7 default-port 80))
       (t (error "unsupported URL scheme: ~a" url)))
-    ;; Authority ends at the first '/', '?', or '#' (RFC 3986 §3.2 /
-    ;; §3.4). A URL like 'http://host?q=1' has no path segment at all,
-    ;; so if we only looked for '/' we would parse "host?q=1" as the
-    ;; hostname and dial it.
-    (let* ((end       (length url))
+    ;; RFC 3986 §3.5: fragment is identified by '#' and is never
+    ;; sent to the origin server. Cap the effective end of the URL
+    ;; at the fragment delimiter once so both the authority scan
+    ;; and the path slice respect the same boundary — the old code
+    ;; left the fragment glued to the path and we'd send something
+    ;; like "GET /?q=1#frag HTTP/1.1", which RFC 7230 §5.3 forbids.
+    ;;
+    ;; Authority ends at the first '/' or '?' within that cap
+    ;; (RFC 3986 §3.2). A URL like 'http://host?q=1' has no path
+    ;; segment at all, so if we only looked for '/' we would parse
+    ;; "host?q=1" as the hostname and dial it.
+    (let* ((end          (length url))
+           (frag-start   (position #\# url))
+           (request-end  (or frag-start end))
            (path-start
-            (or (loop for i from authority-start below end
+            (or (loop for i from authority-start below request-end
                       for ch = (char url i)
-                      when (or (char= ch #\/)
-                               (char= ch #\?)
-                               (char= ch #\#))
+                      when (or (char= ch #\/) (char= ch #\?))
                       return i)
-                end))
+                request-end))
            (authority (subseq url authority-start path-start))
            (path
             (cond
-              ((= path-start end) "/")
+              ((= path-start request-end) "/")
               ((char= (char url path-start) #\/)
-               (subseq url path-start))
+               (subseq url path-start request-end))
               ;; No path segment — synthesize '/' so the origin-form
               ;; request-target is well-formed (HTTP/1.1 §5.3).
               (t
-               (concatenate 'string "/" (subseq url path-start))))))
+               (concatenate 'string "/"
+                            (subseq url path-start request-end))))))
       (multiple-value-bind (host port) (parse-authority authority default-port)
         ;; Reject https:// with an IP-literal host. SSL_set1_host sets
         ;; a DNS name for peer verification; matching an IP SAN requires

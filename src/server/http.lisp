@@ -441,6 +441,40 @@
       ((match-p "PATCH")   :PATCH))))
 
 ;;; ---------------------------------------------------------------------------
+;;; RFC 7230 §3.2.6 tchar table
+;;;
+;;; One shared lookup used by both the inbound parser (header name
+;;; validation) and the outbound serializer (header name validation
+;;; before we copy bytes to the wire). Keeping the acceptance set
+;;; symmetric on both edges means an app can never build a response
+;;; header the framework would reject if it came back in as a request.
+;;;
+;;; tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "."
+;;;       / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+;;; ---------------------------------------------------------------------------
+
+(declaim (type (simple-array bit (256)) *tchar-table*))
+(defvar *tchar-table*
+  (let ((tbl (make-array 256 :element-type 'bit :initial-element 0)))
+    (loop for c from (char-code #\0) to (char-code #\9)
+          do (setf (aref tbl c) 1))
+    (loop for c from (char-code #\A) to (char-code #\Z)
+          do (setf (aref tbl c) 1))
+    (loop for c from (char-code #\a) to (char-code #\z)
+          do (setf (aref tbl c) 1))
+    (loop for ch across "!#$%&'*+-.^_`|~"
+          do (setf (aref tbl (char-code ch)) 1))
+    tbl)
+  "256-entry bit table: 1 iff the byte index is a valid RFC 7230
+   §3.2.6 token character. Used by parse-headers-bytes on ingress
+   and serialize-http-message on egress.")
+
+(declaim (inline tchar-byte-p))
+(defun tchar-byte-p (byte)
+  "T if BYTE is an RFC 7230 §3.2.6 tchar. BYTE must be in 0..255."
+  (= 1 (aref *tchar-table* byte)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Byte-level header parser (single-pass)
 ;;; ---------------------------------------------------------------------------
 
@@ -469,14 +503,15 @@
                     (http-parse-error "malformed header (no colon)"))
                   (when (= colon pos)
                     (http-parse-error "empty header name"))
-                  ;; Reject whitespace, CTL, and DEL in header name
-                  ;; (RFC 7230 §3.2: token excludes all controls and 0x7F).
-                  ;; Same discipline as the request-target check in
-                  ;; parse-request-bytes — a NUL or CR hidden in a header
-                  ;; name is a smuggling primitive if it reaches assoc.
+                  ;; RFC 7230 §3.2.6: header name must be a token,
+                  ;; i.e. each byte must be a tchar. The earlier
+                  ;; loose check (<=0x20 or =0x7F) rejected CTLs and
+                  ;; SP but let through separators like ':', '(',
+                  ;; ',', '/', etc. — any of which hidden in a name
+                  ;; is a smuggling primitive if it reaches assoc.
                   (loop for i from pos below colon
                         for b = (aref buf i)
-                        when (or (<= b #x20) (= b #x7F))
+                        unless (tchar-byte-p b)
                         do (http-parse-error "invalid byte in header name"))
                   (let ((name (bytes-to-lowercase-string buf pos colon)))
                     (multiple-value-bind (vs ve)
@@ -654,39 +689,79 @@
    FIRST-LINE: status line or request line string (without CRLF).
    HEADERS: alist of (name . value) string pairs.
    BODY-BYTES: byte vector or NIL.
-   Single pre-sized buffer — no intermediate allocations."
-  (let* ((header-size (+ (length first-line) 2   ; first line + CRLF
-                         (loop for (name . value) in headers
-                               sum (+ (length name) 2 (length value) 2))
-                         2))                      ; final CRLF
+
+   All strings are UTF-8 encoded to bytes before validation and
+   write. The old path did (char-code (char str i)) → (unsigned-byte 8)
+   which silently truncated char codes > 255 and crashed on codes
+   > 127 whose utf-8 form set high bits; apps that stuffed a UTF-8
+   status reason or accidental non-ASCII header value into a response
+   would see a type-error from SETF AREF rather than a clean error
+   about the content. Encoding up front means the per-byte checks
+   below operate on the wire form, not the source string form.
+
+   Header names are validated against the RFC 7230 §3.2.6 tchar
+   table — the same table parse-headers-bytes uses on ingress.
+   First-line and header-value bytes reject CTLs (0x00-0x1F, 0x7F)
+   except HTAB (0x09, permitted in field values per RFC 7230 §3.2.6).
+   Single pre-sized buffer — no intermediate allocations during write."
+  (let* ((first-line-bytes (sb-ext:string-to-octets
+                            first-line :external-format :utf-8))
+         ;; Encode each header once; reuse byte vectors for sizing
+         ;; and for the final copy. Consing one cons cell per header
+         ;; is cheaper than encoding twice.
+         (header-byte-specs
+          (loop for (name . value) in headers
+                collect (cons (sb-ext:string-to-octets
+                               name :external-format :utf-8)
+                              (sb-ext:string-to-octets
+                               value :external-format :utf-8))))
+         (header-size (+ (length first-line-bytes) 2   ; first line + CRLF
+                         (loop for (nb . vb) in header-byte-specs
+                               sum (+ (length nb) 2 (length vb) 2))
+                         2))                            ; final CRLF
          (body-len (if body-bytes (length body-bytes) 0))
          (buf (make-array (+ header-size body-len)
                           :element-type '(unsigned-byte 8)))
          (pos 0))
-    (flet ((put-ascii (str)
-             (loop for i from 0 below (length str)
-                   do (setf (aref buf pos) (char-code (char str i)))
-                      (incf pos)))
-           (put-crlf ()
-             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
-             (incf pos 2)))
-      ;; Reject CRLF in request/status line (prevents request line injection)
-      (when (or (find #\Return first-line) (find #\Newline first-line))
-        (error "HTTP message line contains CRLF"))
-      (put-ascii first-line)
+    (labels ((reject-ctl-bytes (bytes where)
+               ;; Reject CTLs (<0x20, =0x7F) except HTAB. HTAB is
+               ;; legal inside field values (RFC 7230 §3.2.6); it
+               ;; is not meaningful in a first line but is also
+               ;; not a smuggling vector, and allowing it here
+               ;; keeps the same primitive usable for both callers.
+               (loop for i from 0 below (length bytes)
+                     for b = (aref bytes i)
+                     when (or (and (< b #x20) (/= b 9)) (= b #x7F))
+                     do (error "HTTP ~a contains control byte 0x~2,'0x"
+                               where b)))
+             (put-bytes (src)
+               (replace buf src :start1 pos)
+               (incf pos (length src)))
+             (put-crlf ()
+               (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
+               (incf pos 2)))
+      (reject-ctl-bytes first-line-bytes "first line")
+      (put-bytes first-line-bytes)
       (put-crlf)
-      (dolist (h headers)
-        (let ((name (car h))
-              (value (cdr h)))
-          ;; Reject CRLF in header names and values (prevents injection)
-          (when (or (find #\Return name) (find #\Newline name))
-            (error "HTTP header name contains CRLF: ~a" name))
-          (when (or (find #\Return value) (find #\Newline value))
-            (error "HTTP header value contains CRLF: ~a" name))
-          (put-ascii name)
-          (setf (aref buf pos) 58 (aref buf (1+ pos)) 32)
+      (dolist (spec header-byte-specs)
+        (let ((name-bytes (car spec))
+              (value-bytes (cdr spec)))
+          (when (zerop (length name-bytes))
+            (error "HTTP header has empty name"))
+          ;; tchar on every byte of the name. UTF-8 encoding a
+          ;; non-ASCII character produces bytes >= 0x80, all of
+          ;; which fail tchar-byte-p — so a header name like
+          ;; "X-Résumé" is rejected here cleanly instead of
+          ;; emitting broken bytes on the wire.
+          (loop for i from 0 below (length name-bytes)
+                for b = (aref name-bytes i)
+                unless (tchar-byte-p b)
+                do (error "HTTP header name has invalid byte 0x~2,'0x" b))
+          (reject-ctl-bytes value-bytes "header value")
+          (put-bytes name-bytes)
+          (setf (aref buf pos) 58 (aref buf (1+ pos)) 32)  ; ": "
           (incf pos 2)
-          (put-ascii value)
+          (put-bytes value-bytes)
           (put-crlf)))
       (put-crlf)
       (when body-bytes

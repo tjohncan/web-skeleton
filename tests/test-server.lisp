@@ -167,6 +167,23 @@
                       (format nil "X-~aBad: v" #\Return)
                       "Host: localhost")))
 
+  ;; RFC 7230 §3.2.6: header name is a token, which excludes all
+  ;; separators. The earlier check only rejected SP, CTLs, and DEL,
+  ;; so a '(', ',', '/', or ':' could land in a header name and
+  ;; slip past the parser into the alist. tchar-byte-p closes that.
+  (check-error "'(' in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1" "X-B(ad: v" "Host: localhost")))
+  (check-error "',' in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1" "X-B,ad: v" "Host: localhost")))
+  (check-error "'/' in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1" "X-B/ad: v" "Host: localhost")))
+  (check-error "'{' in header name"
+               (parse-request
+                (crlf "GET / HTTP/1.1" "X-B{ad: v" "Host: localhost")))
+
   ;; CTL / DEL bytes in the METHOD region rejected. Same shape as
   ;; the URL check above: scan-crlf only matches the CRLF pair so
   ;; a bare LF smuggled into the method survives parsing and
@@ -359,6 +376,12 @@
            (scan-p "Host: localhost"
                    (format nil "Expect:~c100-continue" #\Tab))
            t)
+    ;; RFC 7231 §5.1.1: Expect is 1#expectation — a list. Comma
+    ;; terminates the 100-continue token just like ';' or CR.
+    (check "comma separator accepted"
+           (scan-p "Host: localhost" "Expect: 100-continue, x-foo=y") t)
+    (check "comma immediately after token"
+           (scan-p "Host: localhost" "Expect: 100-continue,x-foo=y") t)
     ;; Negative matches
     (check "no Expect header"
            (scan-p "Host: localhost" "Content-Length: 10") nil)
@@ -463,7 +486,71 @@
            (text  (sb-ext:octets-to-string bytes :external-format :utf-8)))
       (check "mixed-case Date: not duplicated"
              (count-occurrences "date:" text)
-             1))))
+             1)))
+
+  ;; serialize-http-message strictness. An app that builds a
+  ;; response alist with a CR, NUL, '(' in the header name, or
+  ;; char code > 127 must not silently produce a broken wire
+  ;; message — the old path did char-code → (unsigned-byte 8)
+  ;; which both truncated (for codes > 255) and injected (for
+  ;; CR/LF in values). The new path UTF-8 encodes up front and
+  ;; validates the resulting bytes.
+  (flet ((serialize (first-line headers &optional body)
+           (web-skeleton::serialize-http-message first-line headers body)))
+    ;; First-line CTL rejection (beyond just CR/LF).
+    (check-error "first-line NUL rejected"
+                 (serialize (format nil "HTTP/1.1 200 ~cOK" (code-char 0))
+                            '(("x" . "y")) nil))
+    (check-error "first-line DEL rejected"
+                 (serialize (format nil "HTTP/1.1 200 ~cOK" (code-char #x7f))
+                            '(("x" . "y")) nil))
+    (check-error "first-line CR rejected"
+                 (serialize (format nil "HTTP/1.1 200 ~cOK" #\Return)
+                            '(("x" . "y")) nil))
+    ;; Header name tchar — colon, comma, paren, space all rejected.
+    (check-error "header name with ':' rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("x:y" . "v")) nil))
+    (check-error "header name with ',' rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("x,y" . "v")) nil))
+    (check-error "header name with ' ' rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("x y" . "v")) nil))
+    (check-error "header name with '(' rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("x(y" . "v")) nil))
+    (check-error "header name with '>' rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("x>y" . "v")) nil))
+    (check-error "empty header name rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("" . "v")) nil))
+    ;; Non-ASCII in a header name — UTF-8 encoding produces >= 0x80
+    ;; bytes, which fail tchar-byte-p cleanly.
+    (check-error "non-ASCII header name rejected"
+                 (serialize "HTTP/1.1 200 OK" '(("X-Résumé" . "v")) nil))
+    ;; Header value CTL rejection — CR, LF, NUL, DEL. TAB is legal.
+    (check-error "header value CR rejected"
+                 (serialize "HTTP/1.1 200 OK"
+                            `(("x" . ,(format nil "a~cb" #\Return))) nil))
+    (check-error "header value LF rejected"
+                 (serialize "HTTP/1.1 200 OK"
+                            `(("x" . ,(format nil "a~cb" #\Newline))) nil))
+    (check-error "header value NUL rejected"
+                 (serialize "HTTP/1.1 200 OK"
+                            `(("x" . ,(format nil "a~cb" (code-char 0)))) nil))
+    (check-error "header value DEL rejected"
+                 (serialize "HTTP/1.1 200 OK"
+                            `(("x" . ,(format nil "a~cb" (code-char #x7f)))) nil))
+    (let ((bytes (serialize "HTTP/1.1 200 OK"
+                            `(("x" . ,(format nil "a~cb" #\Tab))) nil)))
+      (check "header value TAB allowed"
+             (not (null (search "a	b"
+                                (sb-ext:octets-to-string
+                                 bytes :external-format :utf-8))))
+             t))
+    ;; Non-ASCII value — UTF-8 encoded, copied as bytes. Old path
+    ;; crashed on (aref buf pos) := (char-code #\é) = 233 which is
+    ;; fine, but (char-code #\✓) = 10003 exceeded (unsigned-byte 8).
+    (let* ((bytes (serialize "HTTP/1.1 200 OK" '(("x" . "café ✓")) nil))
+           (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+      (check "non-ASCII value UTF-8 encoded"
+             (not (null (search "café ✓" text))) t))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cookie builder tests
@@ -646,12 +733,24 @@
     (check "query-only: port" port 80)
     (check "query-only: path" path "/?q=1"))
 
+  ;; RFC 3986 §3.5 / RFC 7230 §5.3: fragment never goes on the wire.
+  ;; Parsing must strip it from the path in every shape.
   (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://example.com#frag")
     (declare (ignore scheme))
     (check "fragment-only: host" host "example.com")
     (check "fragment-only: port" port 80)
-    (check "fragment-only: path" path "/#frag"))
+    (check "fragment-only: path" path "/"))
+
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://example.com/foo#frag")
+    (declare (ignore scheme host port))
+    (check "fragment+path: path" path "/foo"))
+
+  (multiple-value-bind (scheme host port path)
+      (web-skeleton::parse-url "http://example.com/foo?q=1#frag")
+    (declare (ignore scheme host port))
+    (check "fragment+query: path" path "/foo?q=1"))
 
   (multiple-value-bind (scheme host port path)
       (web-skeleton::parse-url "http://example.com:8080?x=1&y=2")
