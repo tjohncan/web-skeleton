@@ -728,7 +728,7 @@
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
       (let ((n (epoll-wait epoll-fd event-buf +max-events+
-                           (round (* *shutdown-poll-interval* 1000)))))
+                           (max 10 (round (* *shutdown-poll-interval* 1000))))))
         (loop for i from 0 below n
               do (block handle-event
                    (let ((fd    (epoll-event-fd event-buf i))
