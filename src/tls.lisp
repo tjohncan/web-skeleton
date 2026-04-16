@@ -307,7 +307,9 @@
                       (+ total n) *max-outbound-response-size*))
              (incf total n)
              (push (subseq buf 0 n) chunks))
-            ((zerop n) (return))  ; clean shutdown
+            ((zerop n)
+             (ssl-read-eof-or-raise ssl n)
+             (return))
             (t
              (ssl-read-eof-or-raise ssl n)
              (return))))))
@@ -502,6 +504,8 @@
         ;; Chunked state
         (in-chunk-size nil)
         (chunk-remaining 0)
+        (expect-cr nil)    ; awaiting CR after chunk-data
+        (expect-lf nil)    ; awaiting LF after chunk-data
         (chunk-size-buf (make-array 20 :element-type '(unsigned-byte 8)
                                        :fill-pointer 0 :adjustable t)))
     (flet ((emit-line ()
@@ -524,7 +528,9 @@
         (sb-sys:with-pinned-objects (buf)
           (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
             (cond
-              ((zerop n) (return))
+              ((zerop n)
+               (ssl-read-eof-or-raise ssl n)
+               (return))
               ((< n 0)
                ;; Non-positive return must NOT be treated as clean EOF
                ;; unconditionally — SSL_ERROR_SYSCALL conflates timeout,
@@ -582,12 +588,17 @@
                                                                :end1 15))
                                         (let ((value (string-trim '(#\Space #\Tab)
                                                                    (subseq line 15))))
-                                          (when (and (> (length value) 0)
-                                                     (every (lambda (c)
-                                                              (char<= #\0 c #\9))
-                                                            value))
-                                            (setf content-length
-                                                  (parse-integer value)))))))))
+                                          (unless (and (> (length value) 0)
+                                                       (every (lambda (c)
+                                                                (char<= #\0 c #\9))
+                                                              value))
+                                            (error "https streaming: malformed Content-Length ~s"
+                                                   value))
+                                          (let ((n (parse-integer value)))
+                                            (when (and content-length (/= n content-length))
+                                              (error "https streaming: conflicting Content-Length ~d vs ~d"
+                                                     content-length n))
+                                            (setf content-length n))))))))
                              ((= byte 13) nil)
                              (t (vector-push-extend byte line-buf))))
                           ;; Chunked body — reading chunk size (separate
@@ -624,6 +635,19 @@
                                              in-chunk-size nil))))))
                              ((= byte 13) nil)
                              (t (vector-push-extend byte chunk-size-buf))))
+                          ;; Strict CRLF after chunk-data (RFC 7230 4.1).
+                          ;; Symmetric with decode-chunked-body and
+                          ;; reader-expect-crlf on the plain paths.
+                          (expect-cr
+                           (unless (= byte 13)
+                             (error "chunked stream: expected CR after chunk-data"))
+                           (setf expect-cr nil
+                                 expect-lf t))
+                          (expect-lf
+                           (unless (= byte 10)
+                             (error "chunked stream: expected LF after chunk-data"))
+                           (setf expect-lf nil
+                                 in-chunk-size t))
                           ;; Chunked body — reading chunk data
                           (chunked
                            (when (> chunk-remaining 0)
@@ -633,7 +657,7 @@
                                ((= byte 13) nil)
                                (t (vector-push-extend byte line-buf))))
                            (when (zerop chunk-remaining)
-                             (setf in-chunk-size t)))
+                             (setf expect-cr t)))
                           ;; Non-chunked body. BODY-CONSUMED tracks
                           ;; every byte that flows through the body
                           ;; cond, so the post-loop CL check can
@@ -829,31 +853,45 @@
     (replace out y :start1 59 :end1 91)
     out))
 
+(defun %der-integer-bounds (sig-bytes offset)
+  "Return (values START LEN PAD-P) for the minimal DER INTEGER
+   encoding of the 32-byte big-endian value at SIG-BYTES[OFFSET..OFFSET+32).
+   Strips leading zeros per X.690 8.3.2 and adds a 0x00 pad when
+   the first significant byte has bit 7 set (sign preservation)."
+  (let ((start offset)
+        (end (+ offset 32)))
+    ;; Strip leading zeros, keep at least one byte
+    (loop while (and (< (1+ start) end)
+                     (zerop (aref sig-bytes start)))
+          do (incf start))
+    (let* ((pad (logbitp 7 (aref sig-bytes start)))
+           (raw-len (- end start))
+           (len (if pad (1+ raw-len) raw-len)))
+      (values start len pad))))
+
 (defun der-encode-ecdsa-signature (sig-bytes)
-  "DER-encode a raw 64-byte ECDSA signature (r || s, each 32 bytes
-   big-endian) as an ASN.1 SEQUENCE { INTEGER r, INTEGER s }. Returns
-   a fresh 70- to 72-byte vector depending on whether r or s has its
-   high bit set — each such case needs a 0x00 prefix to keep the
-   ASN.1 INTEGER positive."
-  (let* ((r-pad (logbitp 7 (aref sig-bytes 0)))
-         (s-pad (logbitp 7 (aref sig-bytes 32)))
-         (r-len (if r-pad 33 32))
-         (s-len (if s-pad 33 32))
-         (content-len (+ 2 r-len 2 s-len))
-         (out (make-array (+ 2 content-len) :element-type '(unsigned-byte 8)))
-         (pos 0))
-    (setf (aref out pos) #x30) (incf pos)         ; SEQUENCE tag
-    (setf (aref out pos) content-len) (incf pos)  ; SEQUENCE length
-    (setf (aref out pos) #x02) (incf pos)         ; INTEGER tag (r)
-    (setf (aref out pos) r-len) (incf pos)        ; r length
-    (when r-pad (setf (aref out pos) #x00) (incf pos))
-    (replace out sig-bytes :start1 pos :start2 0 :end2 32)
-    (incf pos 32)
-    (setf (aref out pos) #x02) (incf pos)         ; INTEGER tag (s)
-    (setf (aref out pos) s-len) (incf pos)        ; s length
-    (when s-pad (setf (aref out pos) #x00) (incf pos))
-    (replace out sig-bytes :start1 pos :start2 32 :end2 64)
-    out))
+  "DER-encode a raw 64-byte ECDSA signature (r || s) as a minimal
+   ASN.1 SEQUENCE { INTEGER r, INTEGER s }. Strips leading zeros
+   and adds sign-preservation padding per X.690 8.3.2."
+  (multiple-value-bind (r-start r-len r-pad) (%der-integer-bounds sig-bytes 0)
+    (multiple-value-bind (s-start s-len s-pad) (%der-integer-bounds sig-bytes 32)
+      (let* ((content-len (+ 2 r-len 2 s-len))
+             (out (make-array (+ 2 content-len) :element-type '(unsigned-byte 8)))
+             (pos 0))
+        (setf (aref out pos) #x30) (incf pos)         ; SEQUENCE tag
+        (setf (aref out pos) content-len) (incf pos)   ; SEQUENCE length
+        ;; r
+        (setf (aref out pos) #x02) (incf pos)          ; INTEGER tag
+        (setf (aref out pos) r-len) (incf pos)         ; r length
+        (when r-pad (setf (aref out pos) #x00) (incf pos))
+        (replace out sig-bytes :start1 pos :start2 r-start :end2 32)
+        (incf pos (- 32 r-start))
+        ;; s
+        (setf (aref out pos) #x02) (incf pos)          ; INTEGER tag
+        (setf (aref out pos) s-len) (incf pos)         ; s length
+        (when s-pad (setf (aref out pos) #x00) (incf pos))
+        (replace out sig-bytes :start1 pos :start2 s-start :end2 64)
+        out))))
 
 (defun ecdsa-verify-p256-libssl (hash sig-bytes pubkey-x pubkey-y)
   "libssl-accelerated ECDSA P-256 signature verification. Matches
