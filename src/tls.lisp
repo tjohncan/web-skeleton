@@ -500,6 +500,7 @@
         (body-consumed 0)
         (terminated nil)
         (in-headers t)
+        (header-count 0)
         (first-line t)
         ;; Chunked state
         (in-chunk-size nil)
@@ -560,6 +561,10 @@
                                       (setf in-headers nil)
                                       (when chunked (setf in-chunk-size t)))
                                     (progn
+                                      (incf header-count)
+                                      (when (> header-count *max-header-count*)
+                                        (error "https streaming: too many headers (~d)"
+                                               header-count))
                                       (when first-line
                                         (let ((sp (position #\Space line)))
                                           (when (and sp (<= (+ sp 4) (length line)))
@@ -604,6 +609,8 @@
                                                               value))
                                             (error "https streaming: malformed Content-Length ~s"
                                                    value))
+                                          (unless (<= (length value) 10)
+                                            (error "https streaming: Content-Length too many digits"))
                                           (let ((n (parse-integer value)))
                                             (when (and content-length (/= n content-length))
                                               (error "https streaming: conflicting Content-Length ~d vs ~d"
@@ -644,7 +651,9 @@
                                     (t (setf chunk-remaining size
                                              in-chunk-size nil))))))
                              ((= byte 13) nil)
-                             (t (vector-push-extend byte chunk-size-buf))))
+                             (t (when (>= (fill-pointer chunk-size-buf) 256)
+                                 (error "chunked stream: chunk-size line too long"))
+                               (vector-push-extend byte chunk-size-buf))))
                           ;; Strict CRLF after chunk-data (RFC 7230 4.1).
                           ;; Symmetric with decode-chunked-body and
                           ;; reader-expect-crlf on the plain paths.
