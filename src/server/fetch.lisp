@@ -750,6 +750,19 @@
         (funcall on-line (sb-ext:octets-to-string
                           line-buf :external-format :utf-8))))))
 
+(defun strip-body-for-head (bytes conn)
+  "If CONN's parsed request method is HEAD, truncate BYTES at the
+   CRLFCRLF header boundary so only status line + headers go on
+   the wire (RFC 7231 §4.3.2). Returns BYTES unchanged when CONN
+   is nil, its request is nil, the method is not HEAD, or no
+   CRLFCRLF is found."
+  (if (and conn
+           (connection-request conn)
+           (eq (http-request-method (connection-request conn)) :HEAD))
+      (let ((end (scan-crlf-crlf bytes 0 (length bytes))))
+        (if end (subseq bytes 0 (+ end 4)) bytes))
+      bytes))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------
@@ -779,7 +792,9 @@
           (funcall (http-fetch-continuation-callback fetch-req) nil nil nil)
         (error (e2)
           (log-warn "fetch cleanup callback raised: ~a" e2)))
-      (let ((error-response (format-response (make-error-response 502))))
+      (let ((error-response (strip-body-for-head
+                           (format-response (make-error-response 502))
+                           conn)))
         (connection-queue-write conn error-response)
         (setf (connection-state conn) :write-response)
         (epoll-modify epoll-fd (connection-fd conn)
@@ -1187,12 +1202,12 @@
     ;; deliver-fetch-error so the callback fires its cleanup path
     ;; and the inbound gets a 502 instead of a short body.
     ;;
-    ;; Known limitation: HEAD responses carry Content-Length with
-    ;; zero body bytes (RFC 7230 §3.3), so this guard fires a 502.
-    ;; The request method is not threaded through to the completion
-    ;; path. Apps must not use http-fetch :head against upstreams
-    ;; that set Content-Length.
+    ;; Skipped for 1xx/204/304 — these carry CL but have no body
+    ;; (RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1).
+    ;; Known limitation: HEAD responses still trip this guard — the
+    ;; request method is not available in the completion path.
     (when (and content-length
+               (not (or (<= 100 status 199) (= status 204) (= status 304)))
                (< (- pos body-start) content-length))
       (deliver-fetch-error out-conn epoll-fd
                            (format nil "short body: ~d of ~d bytes"
@@ -1205,6 +1220,11 @@
     (let* ((body-end (if content-length
                          (min pos (+ body-start content-length))
                          pos))
+           ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
+           ;; Force empty even if the upstream sent bytes.
+           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304))
+                         body-start
+                         body-end))
            (raw-body (when (> body-end body-start)
                        (subseq buf body-start body-end)))
            (body (if (and raw-body chunked-p)
@@ -1239,6 +1259,7 @@
                                 (initiate-fetch inbound epoll-fd response)
                                 (return-from complete-fetch))
                                (t (format-response response)))))
+                  (setf bytes (strip-body-for-head bytes inbound))
                   (connection-queue-write inbound bytes)
                   (setf (connection-state inbound) :write-response
                         (connection-awaiting-fd inbound) -1
@@ -1248,7 +1269,9 @@
                   (log-debug "fetch: resumed fd ~d" inbound-fd)))
             (error (e)
               (log-error "fetch callback error: ~a" e)
-              (let ((err-bytes (format-response (make-error-response 500))))
+              (let ((err-bytes (strip-body-for-head
+                                (format-response (make-error-response 500))
+                                inbound)))
                 (connection-queue-write inbound err-bytes)
                 (setf (connection-state inbound) :write-response
                       (connection-awaiting-fd inbound) -1
@@ -1271,7 +1294,9 @@
     (close-outbound out-conn epoll-fd)
     (let ((inbound (lookup-connection inbound-fd)))
       (when inbound
-        (let ((err-bytes (format-response (make-error-response 502))))
+        (let ((err-bytes (strip-body-for-head
+                         (format-response (make-error-response 502))
+                         inbound)))
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response
                 (connection-awaiting-fd inbound) -1
