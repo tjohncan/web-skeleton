@@ -12,7 +12,7 @@
 ;;; Usage
 ;;;
 ;;;   (defun handle-proxy (req)
-;;;     (let* ((url  (get-query-param (http-request-query req) "url"))
+;;;     (let* ((url  (get-query-param req "url"))
 ;;;            (host (and url (host-from-url url)))    ; app-level parser
 ;;;            (ip   (and host (parse-ipv4-literal host))))
 ;;;       (unless (and ip (is-public-address-p ip :inet))

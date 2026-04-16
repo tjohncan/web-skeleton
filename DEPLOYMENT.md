@@ -286,7 +286,7 @@ what "host" means:
 
 ```lisp
 (defun handle-proxy (req)
-  (let ((url (get-query-param (http-request-query req) "url")))
+  (let ((url (get-query-param req "url")))
     (unless url
       (return-from handle-proxy (make-error-response 400)))
     (multiple-value-bind (scheme host port path)
