@@ -704,6 +704,10 @@
                  (build-cookie "s" "v" :path (format nil "/~c" #\Return)))
     (check-error "build-cookie: semicolon in domain"
                  (build-cookie "s" "v" :domain "example.com; Max-Age=0"))
+    ;; delete-cookie with explicit :path nil must not crash
+    (let ((cookie (delete-cookie "session" :path nil)))
+      (check "delete-cookie :path nil"
+             (not (null (search "session=" cookie))) t))
     ;; delete-cookie path/domain validation
     (check-error "delete-cookie: semicolon in path"
                  (delete-cookie "s" :path "/; Secure"))
