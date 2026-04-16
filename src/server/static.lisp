@@ -68,7 +68,8 @@
   (get-response          nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (head-response         nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (not-modified-response nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (etag                  nil :type (or null string)))
+  (etag                  nil :type (or null string))
+  (last-modified         ""  :type string))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
   "Maps URL path (string) to STATIC-ENTRY struct.
@@ -113,7 +114,8 @@
      :not-modified-response (serialize-http-message
                              "HTTP/1.1 304 Not Modified"
                              not-modified-headers nil)
-     :etag etag)))
+     :etag etag
+     :last-modified (http-date file-mtime))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; File I/O (startup only)
@@ -294,6 +296,14 @@
                 (cond
                   ((if-none-match-hit-p (get-header request "if-none-match")
                                         (static-entry-etag entry))
+                   (static-entry-not-modified-response entry))
+                  ;; If-Modified-Since: exact string match against our
+                  ;; stored Last-Modified value (no date arithmetic).
+                  ;; RFC 7232 §3.3: MUST ignore IMS when INM is present.
+                  ((and (null (get-header request "if-none-match"))
+                        (let ((ims (get-header request "if-modified-since")))
+                          (and ims
+                               (string= ims (static-entry-last-modified entry)))))
                    (static-entry-not-modified-response entry))
                   ((eq method :GET)
                    (static-entry-get-response entry))
