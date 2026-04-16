@@ -27,6 +27,7 @@
            #:http-response-headers
            #:http-response-body
            #:set-response-header
+           #:add-response-header
            #:format-response
            #:make-text-response
            #:make-html-response

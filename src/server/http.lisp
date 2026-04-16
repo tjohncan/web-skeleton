@@ -187,7 +187,8 @@
    :MAX-AGE is an integer (seconds) or NIL (session cookie, drops on
    browser close).
    :PATH defaults to '/'; :DOMAIN is omitted by default.
-   Use SET-RESPONSE-HEADER to attach the result to an HTTP-RESPONSE."
+   Use ADD-RESPONSE-HEADER to attach the result — SET-RESPONSE-HEADER
+   would replace a previously set cookie."
   (validate-cookie-field "name" name)
   (validate-cookie-field "value" value)
   (when path (validate-cookie-field "path" path))
@@ -808,6 +809,15 @@
           (cons (cons key value)
                 (remove key (http-response-headers response)
                         :key #'car :test #'string-equal))))
+  response)
+
+(defun add-response-header (response name value)
+  "Add a header to RESPONSE without removing existing headers with the
+   same name. Required for multi-instance headers like Set-Cookie —
+   RFC 6265 §4.1 forbids comma-folding Set-Cookie, so each cookie
+   must be a separate header. SET-RESPONSE-HEADER replaces; this appends."
+  (push (cons (string-downcase name) value)
+        (http-response-headers response))
   response)
 
 (defun http-date (&optional (universal-time (get-universal-time)))
