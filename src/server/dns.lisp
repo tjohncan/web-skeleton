@@ -170,7 +170,9 @@
     (close-outbound dns-conn epoll-fd)
     (let ((inbound (lookup-connection inbound-fd)))
       (when inbound
-        (let ((err-bytes (format-response (make-error-response 502))))
+        (let ((err-bytes (strip-body-for-head
+                         (format-response (make-error-response 502))
+                         inbound)))
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response
                 (connection-awaiting-fd inbound) -1
