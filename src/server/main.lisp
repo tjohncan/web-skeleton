@@ -756,24 +756,27 @@
                                   ;; Readable
                                   (when (logtest flags +epollin+)
                                     (handle-client-read conn epoll-fd handler ws-handler))
-                                  ;; Writable (check still alive after read)
-                                  (when (and (logtest flags +epollout+)
-                                             (lookup-connection fd))
-                                    (when (eq (handle-client-write conn epoll-fd)
-                                              :keep-alive)
-                                      ;; Keep-alive reset — read immediately in case
-                                      ;; the next request is already buffered
-                                      ;; (edge-triggered epoll won't re-notify)
-                                      (when (lookup-connection fd)
-                                        (handle-client-read conn epoll-fd
-                                                            handler ws-handler))))
+                                  ;; Writable (rebind from table — fd may
+                                  ;; have been reused since the batch start)
+                                  (when (logtest flags +epollout+)
+                                    (let ((live (lookup-connection fd)))
+                                      (when live
+                                        (when (eq (handle-client-write live epoll-fd)
+                                                  :keep-alive)
+                                          ;; Keep-alive reset — read immediately in case
+                                          ;; the next request is already buffered
+                                          ;; (edge-triggered epoll won't re-notify)
+                                          (when (lookup-connection fd)
+                                            (handle-client-read live epoll-fd
+                                                                handler ws-handler))))))
                                   ;; Error/hangup — close only if the
                                   ;; read/write path didn't already
                                   ;; tear the connection down.
-                                  (when (and (or (logtest flags +epollerr+)
-                                                 (logtest flags +epollhup+))
-                                             (lookup-connection fd))
-                                    (close-connection conn epoll-fd))))))))))))
+                                  (when (or (logtest flags +epollerr+)
+                                           (logtest flags +epollhup+))
+                                    (let ((live (lookup-connection fd)))
+                                      (when live
+                                        (close-connection live epoll-fd))))))))))))))
       ;; Periodic maintenance — both scans gated on elapsed wall
       ;; clock so a busy epoll loop doesn't walk the connection
       ;; table multiple times per second. 1 s is fine: idle
