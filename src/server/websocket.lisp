@@ -36,15 +36,15 @@
 
 (defun clamp-close-code (raw-code)
   "Map a client-supplied WebSocket close code to the code we echo
-   back (RFC 6455 §7.4.1). Reserved codes 1004/1005/1006/1015 and
-   the private range 1016-2999 must not be echoed; anything below
-   1000 is invalid. Clamp those to 1000; pass everything else
-   through unchanged. Lifted out of WEBSOCKET-ON-READ so the
-   reserved-code logic has a single definition instead of one in
-   the server and a duplicate in the test suite."
+   back (RFC 6455 §7.4.1 / §7.4.2). Allowed ranges: 1000-1003,
+   1007-1014, 3000-4999. Everything else (< 1000, reserved
+   1004/1005/1006/1015, unassigned 1016-2999, undefined >= 5000)
+   is clamped to 1000. Lifted out of WEBSOCKET-ON-READ so the
+   reserved-code logic has a single definition."
   (if (or (< raw-code 1000)
           (member raw-code '(1004 1005 1006 1015))
-          (and (>= raw-code 1016) (<= raw-code 2999)))
+          (and (>= raw-code 1016) (<= raw-code 2999))
+          (> raw-code 4999))
       1000
       raw-code))
 
