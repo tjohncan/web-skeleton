@@ -602,7 +602,15 @@
     (let* ((bytes (serialize "HTTP/1.1 200 OK" '(("x" . "café ✓")) nil))
            (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
       (check "non-ASCII value UTF-8 encoded"
-             (not (null (search "café ✓" text))) t))))
+             (not (null (search "café ✓" text))) t)))
+
+  ;; format-response rejects out-of-range status codes
+  (check-error "status -1 rejected"
+               (format-response (web-skeleton::make-http-response :status -1)))
+  (check-error "status 999 rejected"
+               (format-response (web-skeleton::make-http-response :status 999)))
+  (check-error "status 0 rejected"
+               (format-response (web-skeleton::make-http-response :status 0))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cookie builder tests
@@ -687,7 +695,20 @@
            t)
     (check "delete: name validation"
            (signals-error-p (lambda () (delete-cookie "bad;name")))
-           t)))
+           t)
+    ;; Cookie path/domain must be validated — ';' in path enables
+    ;; attribute injection (e.g. path "/; Max-Age=0" deletes the cookie).
+    (check-error "build-cookie: semicolon in path"
+                 (build-cookie "s" "v" :path "/; Max-Age=0"))
+    (check-error "build-cookie: CR in path"
+                 (build-cookie "s" "v" :path (format nil "/~c" #\Return)))
+    (check-error "build-cookie: semicolon in domain"
+                 (build-cookie "s" "v" :domain "example.com; Max-Age=0"))
+    ;; delete-cookie path/domain validation
+    (check-error "delete-cookie: semicolon in path"
+                 (delete-cookie "s" :path "/; Secure"))
+    (check-error "delete-cookie: semicolon in domain"
+                 (delete-cookie "s" :domain "evil.com; Secure"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP client (fetch) tests — pure functions only, no networking
@@ -747,6 +768,10 @@
   (check-error "parse-url: LF in host rejected"
                (web-skeleton::parse-url
                 (format nil "http://examp~cle.com/" #\Newline)))
+  (check-error "parse-url: SP in path rejected"
+               (web-skeleton::parse-url "http://example.com/foo bar"))
+  (check-error "parse-url: empty host rejected"
+               (web-skeleton::parse-url "http:///path"))
 
   ;; HTTPS with an IP-literal host is rejected — SSL_set1_host wants a
   ;; DNS name and the framework does not wire up IP SAN verification
@@ -787,6 +812,12 @@
   ;; error instead of a raw SIMPLE-TYPE-ERROR from parse-integer.
   (check-error "url: non-numeric port rejected"
                (web-skeleton::parse-url "http://example.com:abc/"))
+  (check-error "parse-url: negative port rejected"
+               (web-skeleton::parse-url "http://host:-80/"))
+  (check-error "parse-url: port > 65535 rejected"
+               (web-skeleton::parse-url "http://host:99999/"))
+  (check-error "parse-url: port 0 rejected"
+               (web-skeleton::parse-url "http://host:0/"))
 
   ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4) —
   ;; without this, 'http://host?q=1' would parse the whole
@@ -1407,6 +1438,26 @@
                t)
       (close stream)))
 
+  ;; TE: identity + CL should ignore CL per RFC 7230 §3.3.3 rule 3.
+  ;; The response is close-delimited, not CL-framed.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: identity" (string #\Return) (string #\Newline)
+                "Content-Length: 5" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "hello world extra")))
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (let ((status (web-skeleton::stream-response-lines
+                       stream (lambda (line) (push line lines)))))
+          (setf lines (nreverse lines))
+          (check "te-identity: status" status 200)
+          ;; All body bytes delivered, not truncated to CL=5
+          (check "te-identity: full body delivered"
+                 (not (null (find "hello world extra" lines :test #'string=))) t))
+      (close stream)))
+
   ;; Stream-chunked-lines trailing CRLF is now strict via
   ;; reader-expect-crlf: bare LF after chunk-data is rejected,
   ;; matching decode-chunked-body's buffered discipline.
@@ -1571,7 +1622,10 @@
   (check-error "chunked size: rejects extension-only"
                (web-skeleton::parse-chunked-size-line ";foo=bar"))
   (check-error "chunked size: rejects trailing garbage"
-               (web-skeleton::parse-chunked-size-line "5g")))
+               (web-skeleton::parse-chunked-size-line "5g"))
+  (check-error "chunked size: exceeds response cap"
+               (let ((web-skeleton:*max-outbound-response-size* 1000))
+                 (web-skeleton::parse-chunked-size-line "FFFFFFFF"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket tests
