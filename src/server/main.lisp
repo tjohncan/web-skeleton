@@ -907,66 +907,64 @@
   ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
   ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
   ;;
-  ;; The restore lives in an OUTER unwind-protect wrapping the entire
-  ;; thread lifecycle — it MUST NOT be nested inside the same unwind-
-  ;; protect that drains the worker threads, because a MAKE-THREAD
-  ;; raise partway through the spawn loop (thread exhaustion,
-  ;; setrlimit, etc.) would blow past both the drain and the restore
-  ;; and leave the host image with the framework's SIGPIPE / SIGTERM
-  ;; handlers installed forever.
-  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore))
-        (prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
-                        (lambda (signal info context)
-                          (declare (ignore signal info context))
-                          (setf *shutdown* t)))))
+  ;; Two nested unwind-protects, one per signal: SIGPIPE in the
+  ;; outer, SIGTERM in the inner. If SIGTERM install raises, the
+  ;; outer cleanup still restores SIGPIPE. If both succeed and the
+  ;; body raises (MAKE-THREAD exhaustion, etc.), both cleanups run.
+  ;; A single parallel let would leak SIGPIPE if the SIGTERM init
+  ;; form raised before the body was entered.
+  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)))
     (unwind-protect
-         (progn
-           (log-info "starting ~d worker~:p on ~a"
-                     workers (format-peer-addr host port))
-           ;; Accumulate threads incrementally rather than via LOOP
-           ;; COLLECT: if MAKE-THREAD raises on iteration N, the
-           ;; partial list in THREADS still covers workers 0..N-1 so
-           ;; the drain cleanup can signal and join them.
-           (let ((threads nil))
-             (unwind-protect
-                  (progn
-                    (dotimes (i workers)
-                      (let ((id i))
-                        (push (sb-thread:make-thread
-                               (lambda ()
-                                 (run-worker host port id
-                                             handler ws-handler))
-                               :name (format nil "web-skeleton-~d" i))
-                              threads)))
-                    (handler-case
-                        ;; Main thread waits for interrupt or SIGTERM
-                        (loop (sleep *shutdown-poll-interval*)
-                              (when *shutdown*
-                                (log-info "shutting down")
-                                (return)))
-                      (sb-sys:interactive-interrupt ()
-                        (format t "~%")
-                        (log-info "interrupted — shutting down"))))
-               ;; Signal workers to drain and stop. Runs on normal
-               ;; exit, interactive-interrupt, AND a MAKE-THREAD
-               ;; raise partway through the spawn loop.
-               (setf *shutdown* t)
-               (dolist (thread threads)
-                 (ignore-errors
-                  (sb-thread:join-thread thread
-                                         :timeout (+ *drain-timeout* 3))))
-               ;; Workers have drained; run any app-registered cleanup
-               ;; before returning. Hooks own their own error handling —
-               ;; one raising hook cannot block the rest, cannot block
-               ;; the "stopped" log, and cannot prevent START-SERVER
-               ;; from returning to its caller.
-               (run-shutdown-hooks)
-               (log-info "stopped"))))
-      ;; Hand the signals back to whoever had them before we started.
-      ;; Each restore gets its own IGNORE-ERRORS — a single wrapper
-      ;; would short-circuit SIGPIPE if SIGTERM restore raised,
-      ;; leaking the framework's SIGPIPE handler into the host image.
-      (ignore-errors
-       (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))
+         (let ((prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
+                               (lambda (signal info context)
+                                 (declare (ignore signal info context))
+                                 (setf *shutdown* t)))))
+           (unwind-protect
+                (progn
+                  (log-info "starting ~d worker~:p on ~a"
+                            workers (format-peer-addr host port))
+                  ;; Accumulate threads incrementally rather than via LOOP
+                  ;; COLLECT: if MAKE-THREAD raises on iteration N, the
+                  ;; partial list in THREADS still covers workers 0..N-1 so
+                  ;; the drain cleanup can signal and join them.
+                  (let ((threads nil))
+                    (unwind-protect
+                         (progn
+                           (dotimes (i workers)
+                             (let ((id i))
+                               (push (sb-thread:make-thread
+                                      (lambda ()
+                                        (run-worker host port id
+                                                    handler ws-handler))
+                                      :name (format nil "web-skeleton-~d" i))
+                                     threads)))
+                           (handler-case
+                               ;; Main thread waits for interrupt or SIGTERM
+                               (loop (sleep *shutdown-poll-interval*)
+                                     (when *shutdown*
+                                       (log-info "shutting down")
+                                       (return)))
+                             (sb-sys:interactive-interrupt ()
+                               (format t "~%")
+                               (log-info "interrupted — shutting down"))))
+                      ;; Signal workers to drain and stop. Runs on normal
+                      ;; exit, interactive-interrupt, AND a MAKE-THREAD
+                      ;; raise partway through the spawn loop.
+                      (setf *shutdown* t)
+                      (dolist (thread threads)
+                        (ignore-errors
+                         (sb-thread:join-thread thread
+                                                :timeout (+ *drain-timeout* 3))))
+                      ;; Workers have drained; run any app-registered cleanup
+                      ;; before returning. Hooks own their own error handling —
+                      ;; one raising hook cannot block the rest, cannot block
+                      ;; the "stopped" log, and cannot prevent START-SERVER
+                      ;; from returning to its caller.
+                      (run-shutdown-hooks)
+                      (log-info "stopped"))))
+             ;; Inner cleanup: restore SIGTERM
+             (ignore-errors
+              (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
+      ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
       (ignore-errors
        (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe)))))
