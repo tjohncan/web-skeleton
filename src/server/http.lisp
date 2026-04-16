@@ -191,6 +191,8 @@
    Use ADD-RESPONSE-HEADER to attach the result — SET-RESPONSE-HEADER
    would replace a previously set cookie."
   (validate-cookie-field "name" name)
+  (when (zerop (length name))
+    (error "build-cookie: empty cookie name"))
   (validate-cookie-field "value" value)
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
@@ -230,6 +232,8 @@
    browsers match cookies to Set-Cookie by (name, domain, path);
    HttpOnly / Secure / SameSite do not participate in matching."
   (validate-cookie-field "name" name)
+  (when (zerop (length name))
+    (error "delete-cookie: empty cookie name"))
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
   (with-output-to-string (out)
