@@ -378,6 +378,33 @@
                  (error () t))
                t))))
 
+  ;; A \r\n injected in the request-target must not trick the
+  ;; header scanners into seeing a fake Content-Length. The
+  ;; request-line shape check (2 SPs required) catches the
+  ;; injection before scanners run — "GET /\r\n..." has only
+  ;; 1 SP, so it's rejected as a malformed request line.
+  (check-error "CRLF injection in request-target rejected"
+               (parse-request
+                (concatenate 'string
+                  "GET /" (string #\Return) (string #\Newline)
+                  "Content-Length: 999999" (string #\Return) (string #\Newline)
+                  "Host: x" (string #\Return) (string #\Newline)
+                  (string #\Return) (string #\Newline))))
+  (check-error "CRLF injection: TE variant rejected"
+               (parse-request
+                (concatenate 'string
+                  "GET /" (string #\Return) (string #\Newline)
+                  "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                  "Host: x" (string #\Return) (string #\Newline)
+                  (string #\Return) (string #\Newline))))
+  (check-error "CRLF injection: Expect variant rejected"
+               (parse-request
+                (concatenate 'string
+                  "GET /" (string #\Return) (string #\Newline)
+                  "Expect: 100-continue" (string #\Return) (string #\Newline)
+                  "Host: x" (string #\Return) (string #\Newline)
+                  (string #\Return) (string #\Newline))))
+
   ;; Host header validation (RFC 7230 §5.4)
   ;; connection-parse-request enforces this; parse-request does not.
   (let ((conn (web-skeleton::make-connection
