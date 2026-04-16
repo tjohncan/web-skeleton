@@ -489,8 +489,8 @@
               (loop for i from pos below lf
                     for b = (aref buf i)
                     unless (= b 13)
-                    do (when (> (fill-pointer line-buf)
-                                *max-streaming-line-size*)
+                    do (when (>= (fill-pointer line-buf)
+                                 *max-streaming-line-size*)
                          (error "streaming response line too large (max ~d)"
                                 *max-streaming-line-size*))
                        (vector-push-extend b line-buf))
@@ -501,8 +501,8 @@
               (loop for i from pos below end
                     for b = (aref buf i)
                     unless (= b 13)
-                    do (when (> (fill-pointer line-buf)
-                                *max-streaming-line-size*)
+                    do (when (>= (fill-pointer line-buf)
+                                 *max-streaming-line-size*)
                          (error "streaming response line too large (max ~d)"
                                 *max-streaming-line-size*))
                        (vector-push-extend b line-buf))
@@ -555,8 +555,8 @@
                                         :external-format :utf-8)))
                     (setf (fill-pointer line-buf) 0))
                    ((= byte 13) nil)
-                   (t (when (> (fill-pointer line-buf)
-                               *max-streaming-line-size*)
+                   (t (when (>= (fill-pointer line-buf)
+                                *max-streaming-line-size*)
                         (error "streaming response line too large (max ~d)"
                                *max-streaming-line-size*))
                       (vector-push-extend byte line-buf))))
