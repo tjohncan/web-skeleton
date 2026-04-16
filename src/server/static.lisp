@@ -99,11 +99,12 @@
                 ;; Omission is the least-harmful option: caches fall back to
                 ;; received time (RFC 7234 §4.2.3), preserving correct freshness.
                 (cons "last-modified" (http-date file-mtime))))
-         ;; 304 responses carry validator headers (ETag, Cache-Control)
-         ;; and nothing else. No Content-Type / Content-Length / body.
+         ;; 304 responses carry validator and cache headers (ETag,
+         ;; Cache-Control, Last-Modified). No Content-Type / Content-Length / body.
          (not-modified-headers
           (list (cons "etag" etag)
-                (cons "cache-control" "public, max-age=3600"))))
+                (cons "cache-control" "public, max-age=3600")
+                (cons "last-modified" (http-date file-mtime)))))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK"
                                             full-headers content)
