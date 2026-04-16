@@ -1026,10 +1026,14 @@
 
 (defun response-chunked-p (headers)
   "Return T if HEADERS indicate chunked transfer encoding.
-   Uses token-aware matching (RFC 7230 §3.2.6) so 'identity' or
-   'unchunked-foo' don't false-match on substring 'chunked'."
-  (let ((te (cdr (assoc "transfer-encoding" headers :test #'string-equal))))
-    (and te (connection-header-has-token-p te "chunked"))))
+   Scans every Transfer-Encoding header in the alist — not just the
+   first — because split headers are valid HTTP (RFC 7230 §3.2.2)
+   and reverse proxies can produce them. Uses token-aware matching
+   (RFC 7230 §3.2.6) so 'identity' or 'unchunked-foo' don't
+   false-match on substring 'chunked'."
+  (loop for (name . value) in headers
+        thereis (and (string-equal name "transfer-encoding")
+                     (connection-header-has-token-p value "chunked"))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).
