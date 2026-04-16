@@ -133,7 +133,7 @@
    A wrong-length BYTES or unknown FAMILY returns NIL — callers get
    the conservative answer.
 
-   Rejects: loopback (127/8, ::1), link-local (169.254/16, fe80::/10),
+   Rejects: loopback (127/8, ::1), link-local (169.254/16, fe00::/8 superset incl. fe80::/10),
    RFC 1918 private (10/8, 172.16/12, 192.168/16), RFC 6598 CGNAT
    (100.64/10), RFC 4193 unique local (fc00::/7), multicast (224/4,
    ff00::/8), documentation prefixes (TEST-NET-1/2/3, 2001:db8::/32),
