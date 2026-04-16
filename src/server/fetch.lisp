@@ -1054,12 +1054,16 @@
     (loop
       ;; Parse chunk size (hex digits)
       (let ((size 0)
-            (found nil))
+            (found nil)
+            (digits 0))
         (loop while (< pos end)
               for byte = (aref buf pos)
               do (let ((digit (hex-digit-value byte)))
                    (if digit
-                       (progn (setf size (+ (ash size 4) digit)
+                       (progn (incf digits)
+                              (when (> digits 16)
+                                (error "chunked: chunk-size too many hex digits"))
+                              (setf size (+ (ash size 4) digit)
                                     found t)
                               (incf pos))
                        (return))))
@@ -1145,6 +1149,11 @@
       (deliver-fetch-error out-conn epoll-fd
                            "upstream response has no parseable headers")
       (return-from complete-fetch))
+    ;; Known limitation: 1xx interim responses (e.g. 100 Continue
+    ;; from an upstream) are not stripped — scan-crlf-crlf anchors
+    ;; on the first CRLFCRLF, which is the interim response's
+    ;; terminator. Apps must not add Expect: 100-continue to
+    ;; outbound fetch headers.
     (let* ((status (parse-response-status buf 0 pos))
            (body-start (+ header-end 4))
            (headers (let ((first-crlf (scan-crlf buf 0 header-end)))
