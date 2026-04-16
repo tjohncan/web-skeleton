@@ -605,6 +605,17 @@
       (check "non-ASCII value UTF-8 encoded"
              (not (null (search "café ✓" text))) t)))
 
+  ;; add-response-header appends without replacing — required for
+  ;; multi-instance headers like Set-Cookie (RFC 6265 §4.1).
+  (let ((resp (web-skeleton::make-http-response :status 200)))
+    (add-response-header resp "set-cookie" "a=1")
+    (add-response-header resp "set-cookie" "b=2")
+    (let ((cookies (remove-if-not
+                    (lambda (h) (string-equal (car h) "set-cookie"))
+                    (http-response-headers resp))))
+      (check "add-response-header: both cookies present"
+             (length cookies) 2)))
+
   ;; format-response rejects out-of-range status codes
   (check-error "status -1 rejected"
                (format-response (web-skeleton::make-http-response :status -1)))
@@ -1609,6 +1620,15 @@
   (check "chunked-p case-insensitive"
          (not (null (web-skeleton::response-chunked-p
                      '(("transfer-encoding" . "Chunked"))))) t)
+  ;; Split TE headers: chunked in the second header must still be detected.
+  (check "chunked-p split headers"
+         (not (null (web-skeleton::response-chunked-p
+                     '(("transfer-encoding" . "gzip")
+                       ("transfer-encoding" . "chunked"))))) t)
+  (check "chunked-p split headers no match"
+         (web-skeleton::response-chunked-p
+          '(("transfer-encoding" . "gzip")
+            ("transfer-encoding" . "identity"))) nil)
 
   ;; parse-chunked-size-line — shared by the streaming chunk parsers
   ;; in stream-chunked-lines and tls-stream-response. Strict hex,
