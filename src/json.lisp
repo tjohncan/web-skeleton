@@ -338,6 +338,9 @@
     ((stringp value)   (json-write-string value stream))
     ((integerp value)  (format stream "~d" value))
     ((floatp value)
+     (when (typep value 'single-float)
+       (error "json: single-float ~a loses precision; use ~ad0 for double-float"
+              value value))
      (when (or (sb-ext:float-nan-p value)
                (sb-ext:float-infinity-p value))
        (error "json-serialize: cannot encode ~a" value))
