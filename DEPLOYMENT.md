@@ -205,6 +205,17 @@ LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
 For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
+**Chunked completion on the async path.** The non-blocking `http-fetch`
+path detects response completion by Content-Length (immediate) or by
+EOF (Connection: close). For chunked responses where the upstream
+keeps the TCP connection alive after sending the `0\r\n\r\n`
+terminator, completion is detected only when the upstream eventually
+closes or `*fetch-timeout*` expires — up to 30 seconds of unnecessary
+delay. The framework sends `Connection: close` on all outbound
+requests, so well-behaved upstreams close promptly; the stall appears
+only against upstreams that ignore the header. A future optimization
+could scan for the zero-size chunk terminator in-buffer.
+
 **`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns
 `SSL_ERROR_SYSCALL` for four distinct conditions — unexpected peer
 close without `close_notify` (benign for legacy HTTP/1.0-style
@@ -332,7 +343,7 @@ fast path.
 subprocess synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
 The only difference from the async path is that the subprocess runs
-with `:wait t` and the caller blocks on `sb-ext:process-wait` instead
+with `:wait nil` and the caller deadline-polls in short slices instead
 of parking in epoll. There is one DNS primitive across the framework.
 
 Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
@@ -376,7 +387,7 @@ belongs to the app, not the framework.
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed (up to 10 seconds). Call it from
+blocking until all bytes are flushed (fixed 10-second timeout). Call it from
 within `ws-handler` to send multiple frames during a single handler
 invocation — the event loop is paused while the handler runs, so there
 is no write contention.
@@ -516,12 +527,16 @@ three characters that would break the Set-Cookie header structure.
 Apps needing stricter RFC 6265 §4.1.1 token validation can layer it
 on top.
 
-Attach the result to a response via `set-response-header`:
+Attach cookies via `add-response-header` (not `set-response-header`,
+which replaces — a second `set-response-header` for Set-Cookie would
+silently drop the first cookie):
 
 ```lisp
-(set-response-header resp "set-cookie"
+(add-response-header resp "set-cookie"
                      (build-cookie "session" sid
                                    :max-age (* 8 60 60)))
+(add-response-header resp "set-cookie"
+                     (build-cookie "theme" "dark" :http-only nil))
 ```
 
 For removal — note that `:path` and `:domain` must match the
@@ -529,7 +544,7 @@ originally-set cookie, since browsers match Set-Cookie to stored
 cookies on those two fields:
 
 ```lisp
-(set-response-header resp "set-cookie" (delete-cookie "session"))
+(add-response-header resp "set-cookie" (delete-cookie "session"))
 ```
 
 ### JSON empty containers
