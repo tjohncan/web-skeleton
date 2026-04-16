@@ -745,6 +745,11 @@
                  (build-cookie "s" "v" :path (format nil "/~c" #\Return)))
     (check-error "build-cookie: semicolon in domain"
                  (build-cookie "s" "v" :domain "example.com; Max-Age=0"))
+    ;; Empty cookie name rejected (both build and delete)
+    (check-error "build-cookie: empty name"
+                 (build-cookie "" "v"))
+    (check-error "delete-cookie: empty name"
+                 (delete-cookie ""))
     ;; delete-cookie with explicit :path nil must not crash
     (let ((cookie (delete-cookie "session" :path nil)))
       (check "delete-cookie :path nil"
@@ -813,6 +818,9 @@
   (check-error "parse-url: LF in host rejected"
                (web-skeleton::parse-url
                 (format nil "http://examp~cle.com/" #\Newline)))
+  ;; Non-ASCII bytes must be percent-encoded per RFC 3986 §2.1
+  (check-error "parse-url: non-ASCII rejected"
+               (web-skeleton::parse-url "http://example.com/café"))
   (check-error "parse-url: SP in path rejected"
                (web-skeleton::parse-url "http://example.com/foo bar"))
   (check-error "parse-url: empty host rejected"
@@ -1492,6 +1500,27 @@
                t)
       (close stream)))
 
+  ;; Streaming header-count cap — *max-header-count* applies to
+  ;; outbound streaming responses, not just inbound requests.
+  (let* ((headers (with-output-to-string (s)
+                    (write-string "HTTP/1.1 200 OK" s)
+                    (write-char #\Return s) (write-char #\Newline s)
+                    (loop repeat 200 do
+                      (write-string "X-Spam: 1" s)
+                      (write-char #\Return s) (write-char #\Newline s))
+                    (write-char #\Return s) (write-char #\Newline s)))
+         (raw (ascii-bytes headers))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming: header-count cap"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
   ;; TE: identity + CL should ignore CL per RFC 7230 §3.3.3 rule 3.
   ;; The response is close-delimited, not CL-framed.
   (let* ((raw (ascii-bytes (concatenate 'string
@@ -2152,7 +2181,19 @@
   (let* ((jwks-json "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"test-key\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},{\"kty\":\"RSA\",\"kid\":\"rsa-key\",\"n\":\"abc\",\"e\":\"def\"}]}")
          (keys (parse-jwks jwks-json)))
     (check "jwks parses EC keys only" (length keys) 1)
-    (check "jwks kid" (jwt-key-kid (first keys)) "test-key")))
+    (check "jwks kid" (jwt-key-kid (first keys)) "test-key"))
+
+  ;; Duplicate empty-kid keys rejected (same discipline as non-empty kids)
+  (check-error "jwks: duplicate empty kid"
+               (parse-jwks (concatenate 'string
+                 "{\"keys\":["
+                 "{\"kty\":\"EC\",\"crv\":\"P-256\","
+                 "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+                 "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},"
+                 "{\"kty\":\"EC\",\"crv\":\"P-256\","
+                 "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+                 "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+                 "]}"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Shutdown hook tests
