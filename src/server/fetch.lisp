@@ -177,9 +177,12 @@
   "Parse a decimal port number from AUTHORITY starting at START.
    Raises a clean error on non-numeric input instead of letting
    parse-integer's SIMPLE-TYPE-ERROR leak out of parse-url."
-  (handler-case (parse-integer authority :start start)
-    (error ()
-      (error "malformed URL authority: non-numeric port in ~a" authority))))
+  (let ((p (handler-case (parse-integer authority :start start)
+             (error ()
+               (error "malformed URL authority: non-numeric port in ~a" authority)))))
+    (unless (<= 1 p 65535)
+      (error "malformed URL authority: port ~d out of range in ~a" p authority))
+    p))
 
 (defun parse-authority (authority default-port)
   "Split an HTTP authority string into (values HOST PORT). Handles
@@ -232,7 +235,7 @@
            (length url) *max-request-line-length*))
   (loop for i from 0 below (length url)
         for code = (char-code (char url i))
-        when (or (< code #x20) (= code #x7F))
+        when (or (<= code #x20) (= code #x7F))
         do (error "URL contains control character"))
   (let ((scheme nil) (authority-start nil) (default-port nil))
     (cond
@@ -273,6 +276,8 @@
                (concatenate 'string "/"
                             (subseq url path-start request-end))))))
       (multiple-value-bind (host port) (parse-authority authority default-port)
+        (when (zerop (length host))
+          (error "malformed URL: empty host"))
         ;; Reject https:// with an IP-literal host. SSL_set1_host sets
         ;; a DNS name for peer verification; matching an IP SAN requires
         ;; X509_VERIFY_PARAM_set1_ip_asc, which we do not wire up. A
@@ -586,6 +591,7 @@
   (let ((r (make-stream-reader stream))
         (status nil)
         (chunked nil)
+        (te-present nil)
         (content-length nil))
     ;; Read status line + headers
     (loop for line = (reader-read-line r)
@@ -600,6 +606,7 @@
              (when (and (>= (length line) 18)
                         (string-equal line "transfer-encoding:"
                                       :end1 18))
+               (setf te-present t)
                (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
                  (when (connection-header-has-token-p value "chunked")
                    (setf chunked t))))
@@ -634,7 +641,7 @@
     (cond
       (chunked
        (stream-chunked-lines r on-line))
-      (content-length
+      ((and content-length (not te-present))
        ;; Framed non-chunked. Track bytes against CL so SO_RCVTIMEO
        ;; or peer RST mid-body raises loud instead of quietly ending
        ;; the stream. RFC 7230 §3.3.3 order: TE wins over CL, so we
@@ -682,7 +689,10 @@
           unless (or (char<= #\0 ch #\9)
                      (char<= #\A (char-upcase ch) #\F))
           do (error "chunked: non-hex byte in chunk-size ~s" hex))
-    (parse-integer hex :radix 16)))
+    (let ((n (parse-integer hex :radix 16)))
+      (when (> n *max-outbound-response-size*)
+        (error "chunked: chunk-size ~d exceeds response cap" n))
+      n)))
 
 (defun parse-chunked-size-bytes (bytes start end)
   "Byte-buffer entry point for PARSE-CHUNKED-SIZE-LINE. Used by
@@ -1123,7 +1133,10 @@
                         (parse-headers-bytes buf (+ first-crlf 2)
                                              (+ header-end 4)))))
            (chunked-p (response-chunked-p headers))
-           (content-length (unless chunked-p
+           ;; RFC 7230 §3.3.3 rule 3: any TE present means CL is
+           ;; ignored — read-until-close, not CL-framed.
+           (te-present (scan-transfer-encoding buf header-end))
+           (content-length (unless te-present
                              (scan-content-length buf header-end))))
     ;; Status line must parse too. PARSE-RESPONSE-STATUS returns
     ;; NIL on a malformed status line ('HTTP/1.1 ABC OK', status
