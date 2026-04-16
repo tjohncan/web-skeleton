@@ -279,7 +279,9 @@
                                           :fill-pointer 0 :adjustable t)))
                     (loop for byte = (read-byte stream nil nil)
                           while byte
-                          do (vector-push-extend byte buf))
+                          do (when (> (fill-pointer buf) 8192)
+                               (error "dns: getent output exceeds 8KB"))
+                             (vector-push-extend byte buf))
                     (let ((parsed (parse-getent-output buf (length buf))))
                       (when parsed
                         (values (car parsed) (cdr parsed))))))))
