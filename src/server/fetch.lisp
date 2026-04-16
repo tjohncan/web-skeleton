@@ -760,6 +760,13 @@
             (initiate-http-fetch conn epoll-fd fetch-req host port path)))
     (error (e)
       (log-error "fetch setup failed: ~a" e)
+      ;; Fire the cleanup sentinel so the app's :then closure runs
+      ;; exactly once even on pre-connection errors (malformed URL,
+      ;; DNS spawn failure, HTTPS not loaded).
+      (handler-case
+          (funcall (http-fetch-continuation-callback fetch-req) nil nil nil)
+        (error (e2)
+          (log-warn "fetch cleanup callback raised: ~a" e2)))
       (let ((error-response (format-response (make-error-response 502))))
         (connection-queue-write conn error-response)
         (setf (connection-state conn) :write-response)
