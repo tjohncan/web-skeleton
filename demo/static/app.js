@@ -24,7 +24,8 @@ function connect(onOpen) {
     appendLog('[recv] ' + e.data, 'recv');
   };
   ws.onclose = function() {
-    appendLog('[status] disconnected', 'status');
+    appendLog('[status] disconnected — reconnecting...', 'status');
+    setTimeout(connect, 2000);
   };
   ws.onerror = function(e) {
     appendLog('[error] connection error', 'err');
