@@ -156,7 +156,13 @@
     (setf (store-reaper-thread store)
           (sb-thread:make-thread
            (lambda ()
-             (loop until (store-stop-requested store) do
+             ;; ARM visibility: read stop-requested under the mutex so
+             ;; the write in stop-store-reaper is fenced. The reaper
+             ;; already acquires the lock during sweeps, so this adds
+             ;; zero contention.
+             (loop until (sb-thread:with-mutex ((store-lock store))
+                           (store-stop-requested store))
+                   do
                ;; Sleep the configured interval in 100 ms slices so a
                ;; shutdown request is noticed within one slice regardless
                ;; of how long REAP-INTERVAL is. Polling beats
@@ -166,10 +172,12 @@
                (let ((deadline (+ (get-internal-real-time)
                                   (* interval
                                      internal-time-units-per-second))))
-                 (loop until (or (store-stop-requested store)
+                 (loop until (or (sb-thread:with-mutex ((store-lock store))
+                                   (store-stop-requested store))
                                  (>= (get-internal-real-time) deadline))
                        do (sleep 0.1)))
-               (unless (store-stop-requested store)
+               (unless (sb-thread:with-mutex ((store-lock store))
+                         (store-stop-requested store))
                  (handler-case
                      (let ((n (reap-store store)))
                        (when (> n 0)
@@ -185,9 +193,10 @@
    the reaper to notice on its next slice — within ~100 ms in the
    common case, capped at 5 s if the reaper is stuck inside a sweep
    that the expiry predicate made slow."
-  (let ((thread (store-reaper-thread store)))
-    (setf (store-stop-requested store) t
-          (store-reaper-thread store)  nil)
+  (let ((thread (sb-thread:with-mutex ((store-lock store))
+                  (prog1 (store-reaper-thread store)
+                    (setf (store-stop-requested store) t
+                          (store-reaper-thread store)  nil)))))
     (when (and thread (sb-thread:thread-alive-p thread))
       (handler-case
           (sb-thread:join-thread thread :default nil :timeout 5)
