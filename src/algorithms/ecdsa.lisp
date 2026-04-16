@@ -166,6 +166,8 @@
   ;; subseq error instead of returning NIL.
   (unless (= (length sig-bytes) 64)
     (return-from ecdsa-verify-p256-lisp nil))
+  (unless (and (= (length pubkey-x) 32) (= (length pubkey-y) 32))
+    (return-from ecdsa-verify-p256-lisp nil))
   (let ((r (bytes-to-integer (subseq sig-bytes 0 32)))
         (s (bytes-to-integer (subseq sig-bytes 32 64)))
         (qx (bytes-to-integer pubkey-x))
