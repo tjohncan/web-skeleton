@@ -233,8 +233,9 @@
   (with-output-to-string (out)
     (write-string name out)
     (write-char #\= out)
-    (write-string "; Path=" out)
-    (write-string path out)
+    (when path
+      (write-string "; Path=" out)
+      (write-string path out))
     (when domain
       (write-string "; Domain=" out)
       (write-string domain out))
