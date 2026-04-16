@@ -63,7 +63,7 @@
     (let ((seen (make-hash-table :test 'equal)))
       (dolist (k keys)
         (let ((kid (jwt-key-kid k)))
-          (when (and (> (length kid) 0) (gethash kid seen))
+          (when (gethash kid seen)
             (error "JWKS: duplicate kid ~s" kid))
           (setf (gethash kid seen) t))))
     keys))
