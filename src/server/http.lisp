@@ -190,6 +190,8 @@
    Use SET-RESPONSE-HEADER to attach the result to an HTTP-RESPONSE."
   (validate-cookie-field "name" name)
   (validate-cookie-field "value" value)
+  (when path (validate-cookie-field "path" path))
+  (when domain (validate-cookie-field "domain" domain))
   (unless (or (null same-site)
               (member same-site '(:lax :strict :none)))
     (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
@@ -226,6 +228,8 @@
    browsers match cookies to Set-Cookie by (name, domain, path);
    HttpOnly / Secure / SameSite do not participate in matching."
   (validate-cookie-field "name" name)
+  (when path (validate-cookie-field "path" path))
+  (when domain (validate-cookie-field "domain" domain))
   (with-output-to-string (out)
     (write-string name out)
     (write-char #\= out)
@@ -835,6 +839,8 @@
          (headers (if (assoc "date" headers :test #'string-equal)
                       headers
                       (cons (cons "date" (http-date)) headers))))
+    (unless (<= 100 status 599)
+      (error "HTTP status ~d out of range (must be 100-599)" status))
     (serialize-http-message
      (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
      headers body-bytes)))
