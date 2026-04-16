@@ -358,7 +358,9 @@
      (json-write-object value stream))
     ;; List (array)
     ((consp value)
-     (json-write-array value stream))
+     (if (listp (cdr value))
+         (json-write-array value stream)
+         (error "json: cannot serialize dotted pair ~s" value)))
     (t (error "json-serialize: unsupported type ~a" (type-of value)))))
 
 (defun json-write-string (str stream)
