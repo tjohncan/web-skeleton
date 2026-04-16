@@ -844,13 +844,23 @@
          (body-bytes (when body
                        (sb-ext:string-to-octets body :external-format :utf-8)))
          (headers (http-response-headers response))
-         (headers (if (and body-bytes
-                           (not (assoc "content-length" headers
-                                       :test #'string-equal)))
-                      (cons (cons "content-length"
-                                  (write-to-string (length body-bytes)))
-                            headers)
-                      headers))
+         (headers (cond
+                   ;; Body present — add CL if not already set
+                   ((and body-bytes
+                         (not (assoc "content-length" headers
+                                     :test #'string-equal)))
+                    (cons (cons "content-length"
+                                (write-to-string (length body-bytes)))
+                          headers))
+                   ;; No body, status requires CL:0 to prevent
+                   ;; keep-alive clients from waiting forever
+                   ((and (null body-bytes)
+                         (not (or (<= 100 status 199)
+                                  (= status 204) (= status 304)))
+                         (not (assoc "content-length" headers
+                                     :test #'string-equal)))
+                    (cons (cons "content-length" "0") headers))
+                   (t headers)))
          ;; RFC 7231 §7.1.1.2: origin server MUST send Date
          (headers (if (assoc "date" headers :test #'string-equal)
                       headers
