@@ -232,6 +232,20 @@
              (ecdsa-verify-p256 hash empty x y)
              nil)))
 
+  ;; DER encoding strips leading zeros per X.690 8.3.2.
+  ;; der-encode-ecdsa-signature lives in the optional TLS system —
+  ;; skip when libssl is not loaded.
+  (when (fboundp 'web-skeleton::der-encode-ecdsa-signature)
+    (let* ((sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x42))
+           (dummy (progn (setf (aref sig 0) #x00 (aref sig 1) #x4A) nil))
+           (der (funcall 'web-skeleton::der-encode-ecdsa-signature sig)))
+      (declare (ignore dummy))
+      ;; The r INTEGER should be 31 bytes (stripped zero) not 32
+      ;; Tag=0x02, then length byte
+      (check "der minimal: r length stripped"
+             (aref der 3)
+             31)))
+
   ;; Generator point self-test: n*G should be the point at infinity
   (check "n*G = infinity"
          (web-skeleton::ec-mul web-skeleton::+p256-n+
