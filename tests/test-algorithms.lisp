@@ -253,6 +253,14 @@
                                      web-skeleton::+p256-gy+))
          nil)
 
+  ;; Short pubkey coordinate rejected
+  (let ((short-x (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+        (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+        (sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1)))
+    (check "short pubkey-x rejected"
+           (ecdsa-verify-p256 hash sig short-x y) nil))
+
   ;; Invalid-curve point rejected (FIPS 186-4 §5.6.2.3.3)
   ;; Use the valid RFC 7515 key but flip one byte in y — point no longer
   ;; satisfies y² ≡ x³ + ax + b (mod p)
