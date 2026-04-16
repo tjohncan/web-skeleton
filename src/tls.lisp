@@ -145,7 +145,8 @@
   (sb-thread:with-mutex (*ssl-ctx-lock*)
     (unless *ssl-ctx*
       ;; Initialize OpenSSL
-      (%openssl-init-ssl 0 (sb-sys:int-sap 0))
+      (unless (= 1 (%openssl-init-ssl 0 (sb-sys:int-sap 0)))
+        (error "OPENSSL_init_ssl failed"))
       ;; Create context with modern TLS client method
       (let ((ctx (%ssl-ctx-new (%tls-client-method))))
         (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
@@ -402,12 +403,18 @@
                     ;; handler-case converts it into a 502 and fires
                     ;; the cleanup sentinel.
                     (when (and content-length
+                               (not (or (<= 100 status 199) (= status 204) (= status 304)))
                                (< (- buf-len body-start) content-length))
                       (error "https: short body (~d of ~d bytes)"
                              (- buf-len body-start) content-length))
                     (let* ((body-end (if content-length
                                          (min buf-len (+ body-start content-length))
                                          buf-len))
+                           ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
+                           ;; Force empty even if the upstream sent bytes.
+                           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304))
+                                         body-start
+                                         body-end))
                            (raw-body (when (> body-end body-start)
                                        (subseq response-buf body-start body-end)))
                            (body (if (and raw-body chunked-p)
@@ -430,6 +437,7 @@
                                       (initiate-fetch conn epoll-fd response)
                                       (return-from https-fetch))
                                      (t (format-response response)))))
+                        (setf bytes (strip-body-for-head bytes conn))
                         (connection-queue-write conn bytes)
                         (setf (connection-state conn) :write-response
                               (connection-last-active conn) (get-universal-time))
@@ -448,7 +456,9 @@
           (handler-case (funcall callback nil nil nil)
             (error (e2)
               (log-warn "fetch cleanup callback raised: ~a" e2))))
-        (let ((err-bytes (format-response (make-error-response 502))))
+        (let ((err-bytes (strip-body-for-head
+                         (format-response (make-error-response 502))
+                         conn)))
           (connection-queue-write conn err-bytes)
           (setf (connection-state conn) :write-response
                 (connection-last-active conn) (get-universal-time))
@@ -868,7 +878,7 @@
 (defun build-p256-spki (x y)
   "Assemble a 91-byte DER SubjectPublicKeyInfo for a P-256 public key
    from raw 32-byte X and Y coordinates. Fresh byte vector each call."
-  (let ((out (make-array 91 :element-type '(unsigned-byte 8))))
+  (let ((out (make-array 91 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace out *p256-spki-prefix*)
     (replace out x :start1 27 :end1 59)
     (replace out y :start1 59 :end1 91)
@@ -931,6 +941,8 @@
   ;; silently truncated to the first 64 bytes and verified against
   ;; whatever that prefix happened to decode to.
   (unless (= (length sig-bytes) 64)
+    (return-from ecdsa-verify-p256-libssl nil))
+  (unless (and (= (length pubkey-x) 32) (= (length pubkey-y) 32))
     (return-from ecdsa-verify-p256-libssl nil))
   (let ((spki (build-p256-spki pubkey-x pubkey-y))
         (sig-der (der-encode-ecdsa-signature sig-bytes))
