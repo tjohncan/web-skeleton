@@ -235,8 +235,8 @@
            (length url) *max-request-line-length*))
   (loop for i from 0 below (length url)
         for code = (char-code (char url i))
-        when (or (<= code #x20) (= code #x7F))
-        do (error "URL contains control character"))
+        when (or (<= code #x20) (>= code #x7F))
+        do (error "URL contains non-ASCII or control character"))
   (let ((scheme nil) (authority-start nil) (default-port nil))
     (cond
       ((and (>= (length url) 8) (string-equal url "https://" :end1 8))
@@ -594,59 +594,56 @@
         (te-present nil)
         (content-length nil))
     ;; Read status line + headers
-    (loop for line = (reader-read-line r)
-          for first = t then nil
-          while (and line (> (length line) 0))
-          do (when first
-               (let ((sp (position #\Space line)))
-                 (when (and sp (<= (+ sp 4) (length line)))
-                   (let ((d1 (char line (+ sp 1)))
-                         (d2 (char line (+ sp 2)))
-                         (d3 (char line (+ sp 3))))
-                     (when (and (digit-char-p d1)
-                                (digit-char-p d2)
-                                (digit-char-p d3)
-                                (or (= (+ sp 4) (length line))
-                                    (char= (char line (+ sp 4)) #\Space)))
-                       (let ((code (+ (* 100 (digit-char-p d1))
-                                      (* 10 (digit-char-p d2))
-                                      (digit-char-p d3))))
-                         (when (<= 100 code 599)
-                           (setf status code))))))))
-             (when (and (>= (length line) 18)
-                        (string-equal line "transfer-encoding:"
-                                      :end1 18))
-               (setf te-present t)
-               (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
-                 (when (connection-header-has-token-p value "chunked")
-                   (setf chunked t))))
-             (when (and (>= (length line) 15)
-                        (string-equal line "content-length:"
-                                      :end1 15))
-               ;; Strict digits-only parse, symmetric with the
-               ;; inbound SCAN-CONTENT-LENGTH byte scanner so a
-               ;; future edit can't let one path accept a value
-               ;; the other rejects. Rejects '+10', '-5', and
-               ;; anything with non-digit bytes, and raises on
-               ;; duplicate CL headers with differing values —
-               ;; the same CL-TE smuggling discipline applied to
-               ;; streaming responses. A negative CL matters in
-               ;; particular: READER-READ-BYTES short-circuits on
-               ;; (while (> remaining 0)) at count=-5, returns 0,
-               ;; and the (< 0 -5) truncation guard would be false,
-               ;; so a permissive parse would let the stream deliver
-               ;; an empty body as success.
-               (let ((value (string-trim '(#\Space #\Tab) (subseq line 15))))
-                 (unless (and (> (length value) 0)
-                              (every (lambda (c) (char<= #\0 c #\9)) value))
-                   (error "streaming response: malformed Content-Length ~s"
-                          value))
-                 (let ((n (parse-integer value)))
-                   (when (and content-length (/= n content-length))
-                     (error "streaming response: conflicting Content-Length ~
-                             ~d vs ~d"
-                            content-length n))
-                   (setf content-length n)))))
+    (let ((header-count 0))
+      (loop for line = (reader-read-line r)
+            for first = t then nil
+            while (and line (> (length line) 0))
+            do (incf header-count)
+               (when (> header-count *max-header-count*)
+                 (error "streaming response: too many headers (~d)" header-count))
+               (when first
+                 (let ((sp (position #\Space line)))
+                   (when (and sp (<= (+ sp 4) (length line)))
+                     (let ((d1 (char line (+ sp 1)))
+                           (d2 (char line (+ sp 2)))
+                           (d3 (char line (+ sp 3))))
+                       (when (and (digit-char-p d1)
+                                  (digit-char-p d2)
+                                  (digit-char-p d3)
+                                  (or (= (+ sp 4) (length line))
+                                      (char= (char line (+ sp 4)) #\Space)))
+                         (let ((code (+ (* 100 (digit-char-p d1))
+                                        (* 10 (digit-char-p d2))
+                                        (digit-char-p d3))))
+                           (when (<= 100 code 599)
+                             (setf status code))))))))
+               (when (and (>= (length line) 18)
+                          (string-equal line "transfer-encoding:"
+                                        :end1 18))
+                 (setf te-present t)
+                 (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
+                   (when (connection-header-has-token-p value "chunked")
+                     (setf chunked t))))
+               (when (and (>= (length line) 15)
+                          (string-equal line "content-length:"
+                                        :end1 15))
+                 ;; Strict digits-only parse, symmetric with the
+                 ;; inbound SCAN-CONTENT-LENGTH byte scanner so a
+                 ;; future edit can't let one path accept a value
+                 ;; the other rejects.
+                 (let ((value (string-trim '(#\Space #\Tab) (subseq line 15))))
+                   (unless (and (> (length value) 0)
+                                (every (lambda (c) (char<= #\0 c #\9)) value))
+                     (error "streaming response: malformed Content-Length ~s"
+                            value))
+                   (unless (<= (length value) 10)
+                     (error "streaming response: Content-Length too many digits"))
+                   (let ((n (parse-integer value)))
+                     (when (and content-length (/= n content-length))
+                       (error "streaming response: conflicting Content-Length ~
+                               ~d vs ~d"
+                              content-length n))
+                     (setf content-length n))))))
     ;; Stream body lines
     (cond
       (chunked
