@@ -736,7 +736,10 @@
           (when (zerop chunk-size)
             (setf terminated t)
             (return))
-          (reader-read-bytes r chunk-size line-buf on-line)
+          (let ((consumed (reader-read-bytes r chunk-size line-buf on-line)))
+            (when (< consumed chunk-size)
+              (error "chunked stream: short chunk-data (~d of ~d bytes)"
+                     consumed chunk-size)))
           ;; Strict trailing CRLF after chunk-data (RFC 7230 §4.1).
           ;; READER-READ-LINE would silently tolerate a bare LF or
           ;; garbage followed by LF — READER-EXPECT-CRLF requires
@@ -1186,6 +1189,12 @@
     ;; the attacker can RST at any point. Abort through
     ;; deliver-fetch-error so the callback fires its cleanup path
     ;; and the inbound gets a 502 instead of a short body.
+    ;;
+    ;; Known limitation: HEAD responses carry Content-Length with
+    ;; zero body bytes (RFC 7230 §3.3), so this guard fires a 502.
+    ;; The request method is not threaded through to the completion
+    ;; path. Apps must not use http-fetch :head against upstreams
+    ;; that set Content-Length.
     (when (and content-length
                (< (- pos body-start) content-length))
       (deliver-fetch-error out-conn epoll-fd
