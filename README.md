@@ -100,12 +100,14 @@ web-skeleton-demo.asd        ASDF system definition (demo app)
 build.lisp                   Build standalone demo binary via save-lisp-and-die
 run-server.lisp              Entry point — load demo system and start server
 run-tests.lisp               Entry point — load test suite and run
+run-pure-lisp-tests.lisp     Entry point — verify pure-Lisp crypto paths
 src/
   package.lisp               Package (namespace) declaration
   log.lisp                   Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   epoll.lisp                 Linux epoll + fcntl + read/write FFI bindings
   json.lisp                  JSON parser and serializer (RFC 8259)
   random.lisp                Crypto random bytes and tokens (/dev/urandom)
+  address.lisp               IP address classification (SSRF allowlisting)
   store.lisp                 Concurrent keyed store with optional reaper
   tls.lisp                   libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
