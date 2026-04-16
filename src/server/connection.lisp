@@ -150,6 +150,11 @@
    Keeping the inbound and outbound caps separate means a 1 MiB+ HTTPS
    response (which a real upstream will routinely send) doesn't get
    truncated by the inbound request-body budget."
+  ;; Known coupling: the :read-http phase cap is *max-body-size*
+  ;; which must also accommodate headers. At default 1 MiB this
+  ;; is generous; an operator setting *max-body-size* very low
+  ;; (e.g. 64 KB) while allowing large headers will hit the cap
+  ;; before headers are fully buffered.
   (let ((any-read nil)
         (max-size (cond
                     ((eq (connection-state conn) :websocket)
@@ -184,8 +189,8 @@
 ;;; Extract Content-Length from raw header bytes
 ;;; ---------------------------------------------------------------------------
 
-(defun scan-content-length (buf end)
-  "Scan BUF[0..END) for a Content-Length header value.
+(defun scan-content-length (buf end &optional (start 0))
+  "Scan BUF[START..END) for a Content-Length header value.
    Returns the integer value, or NIL if not found.
    Signals http-parse-error on duplicate conflicting values
    (RFC 7230 §3.3.3 — 'if a message is received without
@@ -196,7 +201,7 @@
                (sb-ext:string-to-octets "content-length:"
                                          :external-format :ascii)))
         (result nil))
-    (loop for i from 0 below end
+    (loop for i from start below end
           do (when (and ;; Only match at start of a header line (after CRLF)
                         (and (>= i 2)
                              (= (aref buf (- i 2)) 13)
@@ -257,8 +262,8 @@
 ;;; Reject Transfer-Encoding (inbound chunked not implemented)
 ;;; ---------------------------------------------------------------------------
 
-(defun scan-transfer-encoding (buf end)
-  "Return T if BUF[0..END) contains a Transfer-Encoding header.
+(defun scan-transfer-encoding (buf end &optional (start 0))
+  "Return T if BUF[START..END) contains a Transfer-Encoding header.
 
    Used on two paths with different consequences:
      Inbound: any Transfer-Encoding is rejected as an unimplemented
@@ -278,7 +283,7 @@
   (let ((name (load-time-value
                (sb-ext:string-to-octets "transfer-encoding:"
                                          :external-format :ascii))))
-    (loop for i from 0 below end
+    (loop for i from start below end
           thereis (and (and (>= i 2)
                             (= (aref buf (- i 2)) 13)
                             (= (aref buf (- i 1)) 10))
@@ -308,8 +313,8 @@
   "Pre-built bytes for the HTTP/1.1 100 Continue interim response.
    Queued before reading the body when the client asks for it.")
 
-(defun scan-expect-100-continue (buf end)
-  "Return T if BUF[0..END) contains an Expect header whose value is
+(defun scan-expect-100-continue (buf end &optional (start 0))
+  "Return T if BUF[START..END) contains an Expect header whose value is
    100-continue (case-insensitive). Start-of-line match only — suffixed
    names like X-Expect do not match. The token terminator check blocks
    near-miss matches like 100-continued."
@@ -319,7 +324,7 @@
         (token (load-time-value
                 (sb-ext:string-to-octets "100-continue"
                                           :external-format :ascii))))
-    (loop for i from 0 below end
+    (loop for i from start below end
           do (when (and (>= i 2)
                         (= (aref buf (- i 2)) 13)
                         (= (aref buf (- i 1)) 10)
@@ -402,68 +407,96 @@
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
                                           0 (connection-read-pos conn))))
          (if header-end
-             (progn
-               ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
-               (when (scan-transfer-encoding (connection-read-buf conn) header-end)
-                 (http-parse-error "Transfer-Encoding not supported"))
-               ;; Check if there's a body to read
-               (let* ((body-start (+ header-end 4))
-                      (content-length (scan-content-length
-                                       (connection-read-buf conn) header-end)))
-               (if (and content-length (> content-length 0))
-                   ;; Need to read a body
-                   (progn
-                     ;; Reject oversized bodies before allocating
-                     (when (> content-length *max-body-size*)
-                       (http-parse-error "body too large (~d bytes, max ~d)"
-                                         content-length *max-body-size*))
-                     ;; Grow read buffer if needed
-                     (let ((total-needed (+ body-start content-length)))
-                       (when (> total-needed (length (connection-read-buf conn)))
-                         (let ((new-buf (make-array total-needed
-                                                    :element-type '(unsigned-byte 8)
-                                                    :initial-element 0)))
-                           (replace new-buf (connection-read-buf conn)
-                                    :end2 (connection-read-pos conn))
-                           (setf (connection-read-buf conn) new-buf))
-                         ;; Re-drain: buffer grew past connection-read-available's
-                         ;; original cap, kernel may still have data (edge-triggered).
-                         ;; Both :EOF (peer hung up before the body completed) and
-                         ;; :FULL (pipelined bytes would overflow the body cap)
-                         ;; are terminal; :OK and :AGAIN continue normally.
-                         ;; Handling :FULL is what keeps the cap a hard
-                         ;; boundary — without it the connection would
-                         ;; sit on bytes the cap had already rejected.
-                         (case (connection-read-available conn)
-                           ((:eof :full)
-                            (return-from connection-on-read :close)))))
-                     (let ((body-available (- (connection-read-pos conn) body-start)))
-                       (setf (connection-body-expected conn) content-length
-                             (connection-header-end conn) header-end)
-                       (cond
-                         ;; Already have the full body — dispatch even if
-                         ;; Expect: 100-continue is set. The client chose
-                         ;; not to wait, and sending 100 now is pointless.
-                         ((>= body-available content-length)
-                          (setf (connection-state conn) :read-body)
-                          :dispatch)
-                         ;; Body still incoming and the client asked us to
-                         ;; confirm before sending it. Queue the interim
-                         ;; response; the worker flushes it and the body
-                         ;; arrives next.
-                         ((scan-expect-100-continue (connection-read-buf conn)
-                                                    header-end)
-                          (connection-queue-write conn *http-100-continue-bytes*)
-                          (setf (connection-state conn) :sending-100-continue)
-                          :send-continue)
-                         ;; Plain body wait.
-                         (t
-                          (setf (connection-state conn) :read-body)
-                          :continue))))
-                   ;; No body — request is complete
-                   (progn
-                     (setf (connection-header-end conn) header-end)
-                     :dispatch))))
+             (let* ((buf (connection-read-buf conn))
+                    ;; Scanners match on CRLF-anchored header patterns,
+                    ;; so starting at byte 0 lets a \r\n injected in the
+                    ;; request-target create a fake header boundary before
+                    ;; parse-request-bytes validates CTL bytes.
+                    (req-line-end (scan-crlf buf 0 header-end)))
+               (unless req-line-end
+                 (http-parse-error "no CRLF in request line"))
+               ;; Verify the request line ends with HTTP/1.x before
+               ;; the scanners run. A \r\n injected in the request-
+               ;; target makes scan-crlf anchor on the injection point,
+               ;; producing a truncated "request line" with no version.
+               ;; The scanners would then see the injected bytes as
+               ;; real headers and act on a fake Content-Length. This
+               ;; version check catches every injection shape: the
+               ;; attacker cannot fit a valid HTTP/1.x suffix before
+               ;; the injected CRLF without making the line valid.
+               (let ((sp (position 32 buf :start 0 :end req-line-end
+                                        :from-end t)))
+                 (unless (and sp
+                              (= (- req-line-end sp) 9)
+                              (= (aref buf (+ sp 1)) 72)   ; H
+                              (= (aref buf (+ sp 2)) 84)   ; T
+                              (= (aref buf (+ sp 3)) 84)   ; T
+                              (= (aref buf (+ sp 4)) 80)   ; P
+                              (= (aref buf (+ sp 5)) 47)   ; /
+                              (= (aref buf (+ sp 6)) 49)   ; 1
+                              (= (aref buf (+ sp 7)) 46))  ; .
+                   (http-parse-error "malformed request line")))
+               (let ((hdr-start (+ req-line-end 2)))
+                 ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
+                 (when (scan-transfer-encoding buf header-end hdr-start)
+                   (http-parse-error "Transfer-Encoding not supported"))
+                 ;; Check if there's a body to read
+                 (let* ((body-start (+ header-end 4))
+                        (content-length (scan-content-length
+                                         buf header-end hdr-start)))
+                 (if (and content-length (> content-length 0))
+                     ;; Need to read a body
+                     (progn
+                       ;; Reject oversized bodies before allocating
+                       (when (> content-length *max-body-size*)
+                         (http-parse-error "body too large (~d bytes, max ~d)"
+                                           content-length *max-body-size*))
+                       ;; Grow read buffer if needed
+                       (let ((total-needed (+ body-start content-length)))
+                         (when (> total-needed (length (connection-read-buf conn)))
+                           (let ((new-buf (make-array total-needed
+                                                      :element-type '(unsigned-byte 8)
+                                                      :initial-element 0)))
+                             (replace new-buf (connection-read-buf conn)
+                                      :end2 (connection-read-pos conn))
+                             (setf (connection-read-buf conn) new-buf))
+                           ;; Re-drain: buffer grew past connection-read-available's
+                           ;; original cap, kernel may still have data (edge-triggered).
+                           ;; Both :EOF (peer hung up before the body completed) and
+                           ;; :FULL (pipelined bytes would overflow the body cap)
+                           ;; are terminal; :OK and :AGAIN continue normally.
+                           ;; Handling :FULL is what keeps the cap a hard
+                           ;; boundary — without it the connection would
+                           ;; sit on bytes the cap had already rejected.
+                           (case (connection-read-available conn)
+                             ((:eof :full)
+                              (return-from connection-on-read :close)))))
+                       (let ((body-available (- (connection-read-pos conn) body-start)))
+                         (setf (connection-body-expected conn) content-length
+                               (connection-header-end conn) header-end)
+                         (cond
+                           ;; Already have the full body — dispatch even if
+                           ;; Expect: 100-continue is set. The client chose
+                           ;; not to wait, and sending 100 now is pointless.
+                           ((>= body-available content-length)
+                            (setf (connection-state conn) :read-body)
+                            :dispatch)
+                           ;; Body still incoming and the client asked us to
+                           ;; confirm before sending it. Queue the interim
+                           ;; response; the worker flushes it and the body
+                           ;; arrives next.
+                           ((scan-expect-100-continue buf header-end hdr-start)
+                            (connection-queue-write conn *http-100-continue-bytes*)
+                            (setf (connection-state conn) :sending-100-continue)
+                            :send-continue)
+                           ;; Plain body wait.
+                           (t
+                            (setf (connection-state conn) :read-body)
+                            :continue))))
+                     ;; No body — request is complete
+                     (progn
+                       (setf (connection-header-end conn) header-end)
+                       :dispatch)))))
              ;; No CRLFCRLF yet — keep reading
              :continue)))
       (:read-body
