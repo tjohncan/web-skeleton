@@ -254,6 +254,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-line-length*` | `8192` | Max single header line (bytes) |
 | `*max-body-size*` | `1048576` | Max request body (bytes, default 1MB) |
 | `*max-outbound-response-size*` | `8388608` | Max buffered outbound HTTPS response total (headers + body, bytes, default 8MB). Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected |
+| `*max-streaming-line-size*` | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound) |
 | `*max-ws-payload-size*` | `65536` | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path |
 | `*max-ws-message-size*` | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
 | `*max-connections*` | `10000` | Max connections per worker (new accepts dropped when full) |
