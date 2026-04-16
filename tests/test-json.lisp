@@ -177,7 +177,11 @@
     (check "ser Infinity rejected"
            (signals-error-p
             (lambda ()
-              (json-serialize sb-ext:double-float-positive-infinity))) t)))
+              (json-serialize sb-ext:double-float-positive-infinity))) t)
+    (check "ser single-float rejected"
+           (signals-error-p
+            (lambda () (json-serialize 3.14)))
+           t)))
 
 (defun test-json ()
   (setf *tests-passed* 0
