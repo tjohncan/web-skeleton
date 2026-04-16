@@ -192,17 +192,19 @@
          (cond
            (parsed
             (let ((dns-then (connection-dns-then dns-conn)))
-              ;; DNS succeeded — dns-then will chain to
-              ;; initiate-http-fetch-to-address which creates a
-              ;; fresh outbound carrying the same fetch callback.
-              ;; Clear the slot on the dns-conn so close-outbound
-              ;; doesn't fire the callback here (that would be a
-              ;; double-fire against the fresh outbound's own
-              ;; teardown path).
-              (setf (connection-fetch-callback dns-conn) nil)
-              (close-outbound dns-conn epoll-fd)
-              (destructuring-bind (ip . family) parsed
-                (funcall dns-then ip family))))
+              (handler-case
+                  (destructuring-bind (ip . family) parsed
+                    (funcall dns-then ip family)
+                    ;; dns-then succeeded — the new outbound now carries the
+                    ;; callback. Clear it on dns-conn so close-outbound
+                    ;; doesn't double-fire.
+                    (setf (connection-fetch-callback dns-conn) nil)
+                    (close-outbound dns-conn epoll-fd))
+                (error (e)
+                  ;; dns-then failed — callback still on dns-conn, so
+                  ;; close-outbound fires the cleanup sentinel.
+                  (log-warn "dns: chain to TCP failed: ~a" e)
+                  (deliver-dns-error dns-conn epoll-fd)))))
            ((eq result :eof)
             (log-warn "dns: no usable address in getent output")
             (deliver-dns-error dns-conn epoll-fd))
@@ -279,7 +281,7 @@
                                           :fill-pointer 0 :adjustable t)))
                     (loop for byte = (read-byte stream nil nil)
                           while byte
-                          do (when (> (fill-pointer buf) 8192)
+                          do (when (>= (fill-pointer buf) 8192)
                                (error "dns: getent output exceeds 8KB"))
                              (vector-push-extend byte buf))
                     (let ((parsed (parse-getent-output buf (length buf))))
