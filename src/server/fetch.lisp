@@ -599,10 +599,20 @@
           while (and line (> (length line) 0))
           do (when first
                (let ((sp (position #\Space line)))
-                 (when (and sp (< (+ sp 3) (length line)))
-                   (setf status (parse-integer line :start (1+ sp)
-                                                    :end (+ sp 4)
-                                                    :junk-allowed t)))))
+                 (when (and sp (<= (+ sp 4) (length line)))
+                   (let ((d1 (char line (+ sp 1)))
+                         (d2 (char line (+ sp 2)))
+                         (d3 (char line (+ sp 3))))
+                     (when (and (digit-char-p d1)
+                                (digit-char-p d2)
+                                (digit-char-p d3)
+                                (or (= (+ sp 4) (length line))
+                                    (char= (char line (+ sp 4)) #\Space)))
+                       (let ((code (+ (* 100 (digit-char-p d1))
+                                      (* 10 (digit-char-p d2))
+                                      (digit-char-p d3))))
+                         (when (<= 100 code 599)
+                           (setf status code))))))))
              (when (and (>= (length line) 18)
                         (string-equal line "transfer-encoding:"
                                       :end1 18))
@@ -665,7 +675,9 @@
        (loop for line = (reader-read-line r)
              while line
              do (when on-line (funcall on-line line)))))
-    (or status 0)))
+    (unless status
+      (error "streaming response: no parseable status line"))
+    status))
 
 (defun parse-chunked-size-line (size-line)
   "Parse a chunked-transfer size token from SIZE-LINE. Strips
@@ -998,8 +1010,8 @@
            ;; Have complete headers — check if body is complete.
            ;; RFC 7230 §3.3.3: Transfer-Encoding takes precedence over CL.
            (let* ((body-start (+ header-end 4))
-                  (chunked (scan-transfer-encoding buf header-end))
-                  (content-length (unless chunked
+                  (te-present (scan-transfer-encoding buf header-end))
+                  (content-length (unless te-present
                                     (scan-content-length buf header-end))))
              (if content-length
                  ;; Have Content-Length (no TE) — complete when body received
