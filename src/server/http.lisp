@@ -174,8 +174,9 @@
    structural injection."
   (when (or (find #\Return field)
             (find #\Newline field)
-            (find #\; field))
-    (error "build-cookie: ~a contains a forbidden character (CR, LF, or ';')"
+            (find #\; field)
+            (find (code-char 0) field))
+    (error "build-cookie: ~a contains a forbidden character (NUL, CR, LF, or ';')"
            kind)))
 
 (defun build-cookie (name value &key (path "/") (http-only t) (secure t)
