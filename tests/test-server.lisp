@@ -737,6 +737,8 @@
            t)
     ;; Cookie path/domain must be validated — ';' in path enables
     ;; attribute injection (e.g. path "/; Max-Age=0" deletes the cookie).
+    (check-error "build-cookie: NUL in value"
+                 (build-cookie "s" (format nil "v~c" (code-char 0))))
     (check-error "build-cookie: semicolon in path"
                  (build-cookie "s" "v" :path "/; Max-Age=0"))
     (check-error "build-cookie: CR in path"
