@@ -228,6 +228,10 @@
    missing inputs or any parse miss."
   (unless (and header-value our-etag (> (length header-value) 0))
     (return-from if-none-match-hit-p nil))
+  ;; RFC 7232 §3.2: wildcard is "*" as the entire field-value,
+  ;; not mixed with entity-tags. Check upfront before the list walk.
+  (when (string= (string-trim '(#\Space #\Tab) header-value) "*")
+    (return-from if-none-match-hit-p t))
   (let ((len (length header-value))
         (pos 0))
     (loop
@@ -237,9 +241,6 @@
                            (char= (char header-value pos) #\Tab)))
             do (incf pos))
       (when (>= pos len) (return nil))
-      ;; Wildcard — matches immediately.
-      (when (char= (char header-value pos) #\*)
-        (return t))
       ;; Next comma marks the end of this entry.
       (let ((end (or (position #\, header-value :start pos) len))
             (start pos))
