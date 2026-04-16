@@ -348,19 +348,20 @@
                                    header *crlf* *crlf*)))
              (sb-ext:string-to-octets raw :external-format :ascii))))
     ;; Valid shapes — both parsers must agree on the same integer.
-    (dolist (v '(("Content-Length: 0"     0)
-                 ("Content-Length: 10"    10)
-                 ("Content-Length: 42"    42)
-                 ("content-length: 99"    99)
-                 ("Content-Length:   7"    7)  ; extra SP OWS
-                 (#.(format nil "Content-Length:~c13" #\Tab)  13)))  ; TAB OWS
+    (let ((tab-header (format nil "Content-Length:~c13" #\Tab)))
+    (dolist (v (list '("Content-Length: 0"     0)
+                     '("Content-Length: 10"    10)
+                     '("Content-Length: 42"    42)
+                     '("content-length: 99"    99)
+                     '("Content-Length:   7"    7)  ; extra SP OWS
+                     (list tab-header 13)))         ; TAB OWS
       (destructuring-bind (header expected) v
         (let* ((bytes (block-bytes header))
                (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
           (check (format nil "CL agreement scanner ~s" header)
                  (web-skeleton::scan-content-length bytes header-end) expected)
           (check (format nil "CL agreement alist ~s" header)
-                 (alist-cl bytes header-end) expected))))
+                 (alist-cl bytes header-end) expected)))))
     ;; Invalid shapes — scanner must reject. The alist path is lax by
     ;; design (it's a string value, not a validated integer), so we
     ;; only assert the authoritative side: scan-content-length must
