@@ -299,13 +299,14 @@
 
 (defun set-socket-timeout (fd seconds)
   "Set SO_RCVTIMEO and SO_SNDTIMEO on FD.
-   SECONDS is an integer. struct timeval on 64-bit Linux is 16
+   SECONDS is a positive real (floats are ceiling'd to the next
+   whole second, clamped to a minimum of 1). struct timeval on 64-bit Linux is 16
    bytes: tv_sec (8) + tv_usec (8), both little-endian. We write
    only the low 32 bits of tv_sec via PACK-LE-U32; the upper 32
    bits and tv_usec stay zero from :INITIAL-ELEMENT 0, which is
    correct for every SECONDS under 2^32 (≈136 years)."
   (let ((buf (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (pack-le-u32 buf 0 seconds)
+    (pack-le-u32 buf 0 (max 1 (ceiling seconds)))
     (sb-sys:with-pinned-objects (buf)
       (let ((result (%setsockopt fd +sol-socket+ +so-rcvtimeo+
                                  (sb-sys:vector-sap buf) 16)))
