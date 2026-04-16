@@ -219,7 +219,8 @@
             (when (zerop (%ssl-set1-host ssl hostname))
               (error "SSL_set1_host failed"))
             ;; Attach to socket fd
-            (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket))
+            (unless (= 1 (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket)))
+              (error "SSL_set_fd failed"))
             ;; TLS handshake
             (let ((result (%ssl-connect ssl)))
               (unless (= result 1)
@@ -381,7 +382,11 @@
                          (body-start (+ header-end 4))
                          ;; RFC 7230 §3.3.3: TE takes precedence over CL
                          (chunked-p (response-chunked-p headers))
-                         (content-length (unless chunked-p
+                         ;; RFC 7230 §3.3.3 rule 3: any TE present means
+                         ;; CL is ignored — read-until-close, not CL-framed.
+                         (te-present (scan-transfer-encoding response-buf
+                                                             header-end))
+                         (content-length (unless te-present
                                            (scan-content-length response-buf
                                                                 header-end))))
                     (unless status
@@ -488,6 +493,7 @@
                                    :fill-pointer 0 :adjustable t))
         (status nil)
         (chunked nil)
+        (te-present nil)
         (content-length nil)
         (body-consumed 0)
         (terminated nil)
@@ -512,7 +518,8 @@
                (when on-line (funcall on-line line)))))
       (loop
         (when terminated (return))
-        (when (and content-length (>= body-consumed content-length))
+        (when (and content-length (not te-present)
+                   (>= body-consumed content-length))
           (return))
         (sb-sys:with-pinned-objects (buf)
           (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
@@ -557,6 +564,7 @@
                                       (when (and (>= (length line) 18)
                                                  (string-equal line "transfer-encoding:"
                                                                :end1 18))
+                                        (setf te-present t)
                                         (let ((value (string-trim '(#\Space #\Tab)
                                                                    (subseq line 18))))
                                           (when (connection-header-has-token-p value "chunked")
@@ -639,7 +647,7 @@
                              ((= byte 10) (emit-body-line))
                              ((= byte 13) nil)
                              (t (vector-push-extend byte line-buf)))
-                           (when (and content-length
+                           (when (and content-length (not te-present)
                                       (>= body-consumed content-length))
                              ;; Hit declared length — stop processing
                              ;; and let the outer loop exit via its
@@ -653,7 +661,8 @@
     ;; stream is no longer presented as 'success with short body'.
     (when (and chunked (not terminated))
       (error "https streaming: chunked response missing zero-size terminator"))
-    (when (and content-length (< body-consumed content-length))
+    (when (and content-length (not te-present)
+               (< body-consumed content-length))
       (error "https streaming: short body (~d of ~d bytes)"
              body-consumed content-length))
     ;; Flush any remaining unterminated line
