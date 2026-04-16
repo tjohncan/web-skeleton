@@ -545,7 +545,7 @@
               (t
                (loop for i from 0 below n
                      for byte = (aref buf i)
-                     do (when (> (fill-pointer line-buf) *max-streaming-line-size*)
+                     do (when (>= (fill-pointer line-buf) *max-streaming-line-size*)
                           (error "streaming response line too large (~d bytes, max ~d)"
                                  (fill-pointer line-buf)
                                  *max-streaming-line-size*))
