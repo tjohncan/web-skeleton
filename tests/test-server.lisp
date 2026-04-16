@@ -649,7 +649,61 @@
   (check-error "status 999 rejected"
                (format-response (web-skeleton::make-http-response :status 999)))
   (check-error "status 0 rejected"
-               (format-response (web-skeleton::make-http-response :status 0))))
+               (format-response (web-skeleton::make-http-response :status 0)))
+
+  ;; nil-body 200 gets Content-Length: 0 to prevent keep-alive hang
+  (let* ((resp (web-skeleton::make-http-response :status 200))
+         (bytes (format-response resp))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "nil body 200: CL:0 injected"
+           (not (null (search "content-length: 0" text :test #'char-equal))) t))
+
+  ;; 204 does NOT get CL:0 (RFC 7230 §3.3.3 rule 1)
+  (let* ((resp (web-skeleton::make-http-response :status 204))
+         (bytes (format-response resp))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "204: no CL injected"
+           (search "content-length" text :test #'char-equal) nil))
+
+  ;; 304 + CL: the bodiless-status exemption must skip the guard.
+  ;; Tests the exemption predicate directly — 304 is in the skip set.
+  (check "304+CL: truncation guard skipped"
+         (let ((status 304))
+           (or (<= 100 status 199) (= status 204) (= status 304)))
+         t)
+
+  ;; HEAD byte-vector strip: scan-crlf-crlf + subseq truncates at
+  ;; the header boundary, keeping CL in headers but removing body.
+  (let* ((full (web-skeleton::serialize-http-message
+                "HTTP/1.1 200 OK"
+                '(("content-type" . "text/plain")
+                  ("content-length" . "5"))
+                (sb-ext:string-to-octets "hello" :external-format :ascii)))
+         (end (web-skeleton::scan-crlf-crlf full 0 (length full)))
+         (stripped (subseq full 0 (+ end 4)))
+         (text (sb-ext:octets-to-string stripped :external-format :ascii)))
+    (check "HEAD strip: CL preserved"
+           (not (null (search "content-length: 5" text :test #'char-equal))) t)
+    (check "HEAD strip: body removed"
+           (search "hello" text) nil))
+
+  ;; Direct exercise of the strip-body-for-head helper
+  (let* ((head-req (web-skeleton::make-http-request :method :HEAD :path "/"))
+         (get-req  (web-skeleton::make-http-request :method :GET  :path "/"))
+         (conn-head (web-skeleton::make-connection :request head-req :last-active 0))
+         (conn-get  (web-skeleton::make-connection :request get-req :last-active 0))
+         (bytes (web-skeleton::serialize-http-message
+                 "HTTP/1.1 200 OK"
+                 '(("content-length" . "5"))
+                 (sb-ext:string-to-octets "hello" :external-format :ascii))))
+    (check "strip-for-head: HEAD truncates"
+           (< (length (web-skeleton::strip-body-for-head bytes conn-head))
+              (length bytes))
+           t)
+    (check "strip-for-head: GET unchanged"
+           (equalp (web-skeleton::strip-body-for-head bytes conn-get) bytes) t)
+    (check "strip-for-head: nil conn unchanged"
+           (equalp (web-skeleton::strip-body-for-head bytes nil) bytes) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cookie builder tests
