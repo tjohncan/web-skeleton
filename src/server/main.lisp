@@ -237,6 +237,13 @@
        (log-debug "~a ~a -> static"
                   (http-request-method request)
                   (http-request-path request))
+       ;; HEAD must not send a body (RFC 7231 §4.3.2). Byte-vector
+       ;; responses are pre-formatted (headers + CRLFCRLF + body) —
+       ;; truncate at the header boundary so only headers go on the wire.
+       (when (eq (http-request-method request) :HEAD)
+         (let ((end (scan-crlf-crlf response 0 (length response))))
+           (when end
+             (setf response (subseq response 0 (+ end 4))))))
        (values response nil))
       ;; Normal HTTP response — must be an HTTP-RESPONSE struct. The
       ;; previous catch-all let a handler that forgot MAKE-TEXT-RESPONSE
@@ -597,7 +604,8 @@
       (handler-case
           (let ((resp (make-error-response 500)))
             (set-response-header resp "connection" "close")
-            (let ((err-bytes (format-response resp)))
+            (let ((err-bytes (strip-body-for-head
+                              (format-response resp) conn)))
               (connection-queue-write conn err-bytes)
               (setf (connection-state conn) :write-response
                     (connection-close-after-p conn) t)
