@@ -132,6 +132,10 @@
        (when (sb-ext:process-alive-p process)
          (sb-ext:process-kill process 9)))
       (ignore-errors (sb-ext:process-close process))
+      ;; process-close already closed the pipe fd — mark it so
+      ;; connection-close's (when (>= fd 0) (%close fd)) skips
+      ;; the double-close.
+      (setf (connection-fd conn) -1)
       (setf (connection-dns-process conn) nil))))
 
 ;;; ---------------------------------------------------------------------------
