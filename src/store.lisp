@@ -99,7 +99,7 @@
                          :expires-at exp)"
   (store-update store key
                 (lambda (old)
-                  (let ((result old))
+                  (let ((result (copy-list old)))
                     (loop for (k v) on kv by #'cddr
                           do (setf (getf result k) v))
                     result))))
