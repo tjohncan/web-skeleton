@@ -562,10 +562,20 @@
                                     (progn
                                       (when first-line
                                         (let ((sp (position #\Space line)))
-                                          (when (and sp (< (+ sp 3) (length line)))
-                                            (setf status (parse-integer line :start (1+ sp)
-                                                                             :end (+ sp 4)
-                                                                             :junk-allowed t))))
+                                          (when (and sp (<= (+ sp 4) (length line)))
+                                            (let ((d1 (char line (+ sp 1)))
+                                                  (d2 (char line (+ sp 2)))
+                                                  (d3 (char line (+ sp 3))))
+                                              (when (and (digit-char-p d1)
+                                                         (digit-char-p d2)
+                                                         (digit-char-p d3)
+                                                         (or (= (+ sp 4) (length line))
+                                                             (char= (char line (+ sp 4)) #\Space)))
+                                                (let ((code (+ (* 100 (digit-char-p d1))
+                                                               (* 10 (digit-char-p d2))
+                                                               (digit-char-p d3))))
+                                                  (when (<= 100 code 599)
+                                                    (setf status code)))))))
                                         (setf first-line nil))
                                       (when (and (>= (length line) 18)
                                                  (string-equal line "transfer-encoding:"
@@ -695,7 +705,9 @@
         (funcall on-line (sb-ext:octets-to-string
                           (subseq line-buf 0 (fill-pointer line-buf))
                           :external-format :utf-8))))
-    (or status 0)))
+    (unless status
+      (error "https streaming: no parseable status line"))
+    status))
 
 ;;; ===========================================================================
 ;;; Crypto primitives — EVP digest + ECDSA verify
