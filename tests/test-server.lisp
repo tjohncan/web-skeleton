@@ -1157,6 +1157,15 @@
          (is-public-address-p
           #(#x20 #x02 8 8 8 8 0 0 0 0 0 0 0 0 0 0) :inet6) t)
 
+  ;; NAT64 well-known prefix (64:ff9b::/96). Same v4-in-v6
+  ;; unwrap as ::ffff: and 2002:: — classify via embedded v4.
+  (check "v6 nat64 64:ff9b::10.0.0.1 carries private"
+         (is-public-address-p
+          #(0 #x64 #xff #x9b 0 0 0 0 0 0 0 0 10 0 0 1) :inet6) nil)
+  (check "v6 nat64 64:ff9b::8.8.8.8 carries public"
+         (is-public-address-p
+          #(0 #x64 #xff #x9b 0 0 0 0 0 0 0 0 8 8 8 8) :inet6) t)
+
   ;; Wrong length / unknown family returns NIL (conservative)
   (check "v4 wrong length"   (is-public-address-p #(1 2 3) :inet)           nil)
   (check "v6 wrong length"   (is-public-address-p #(1 2 3 4) :inet6)        nil)
@@ -1786,6 +1795,12 @@
            (web-skeleton::clamp-close-code 1001) 1001)
     (check "close code 3000 passes"
            (web-skeleton::clamp-close-code 3000) 3000)
+    (check "close code 5000 clamped"
+           (web-skeleton::clamp-close-code 5000) 1000)
+    (check "close code 65535 clamped"
+           (web-skeleton::clamp-close-code 65535) 1000)
+    (check "close code 4999 passes"
+           (web-skeleton::clamp-close-code 4999) 4999)
 
     ;; Close frame with invalid UTF-8 reason — must fail with 1007
     ;; (RFC 6455 §5.5.1: reason text after the 2-byte code must be valid UTF-8)
