@@ -395,6 +395,38 @@
 ;;; Parse response status line
 ;;; ---------------------------------------------------------------------------
 
+(defun parse-status-line-string (line)
+  "String-level twin of PARSE-RESPONSE-STATUS. LINE is the first
+   response line with CRLF already stripped (how the streaming
+   readers hand it over). Used by STREAM-RESPONSE-LINES and
+   TLS-STREAM-RESPONSE so their acceptance set is identical to
+   the buffered path's byte-level check — without this, a non-HTTP
+   upstream whose first line is '<junk> 200 OK' ('FUBAR 200 OK',
+   'NOT-HTTP 418 Z') parses as status 200 on the streaming paths
+   while the buffered path correctly rejects, a parser-disagreement
+   smuggling primitive. Requires a literal 'HTTP/1.0 ' or 'HTTP/1.1 '
+   prefix (9 chars), then three digits in 100-599, then SP or
+   end-of-line. Returns the status integer or NIL."
+  (when (and line (>= (length line) 12))
+    (let ((c0 (char line 0)) (c1 (char line 1)) (c2 (char line 2))
+          (c3 (char line 3)) (c4 (char line 4)) (c5 (char line 5))
+          (c6 (char line 6)) (c7 (char line 7)) (c8 (char line 8)))
+      (when (and (char= c0 #\H) (char= c1 #\T) (char= c2 #\T)
+                 (char= c3 #\P) (char= c4 #\/) (char= c5 #\1)
+                 (char= c6 #\.) (or (char= c7 #\0) (char= c7 #\1))
+                 (char= c8 #\Space))
+        (let ((d1 (char line 9))
+              (d2 (char line 10))
+              (d3 (char line 11)))
+          (when (and (digit-char-p d1) (digit-char-p d2) (digit-char-p d3)
+                     (or (= (length line) 12)
+                         (char= (char line 12) #\Space)))
+            (let ((status (+ (* (digit-char-p d1) 100)
+                             (* (digit-char-p d2) 10)
+                             (digit-char-p d3))))
+              (when (<= 100 status 599)
+                status))))))))
+
 (defun parse-response-status (buf start end)
   "Extract the integer status code from a response line in BUF[START..END).
    Expects 'HTTP/1.x NNN' or 'HTTP/1.x NNN reason' (RFC 7230 §3.1.2).
@@ -719,21 +751,7 @@
                (when (> header-count *max-header-count*)
                  (error "streaming response: too many headers (~d)" header-count))
                (when first
-                 (let ((sp (position #\Space line)))
-                   (when (and sp (<= (+ sp 4) (length line)))
-                     (let ((d1 (char line (+ sp 1)))
-                           (d2 (char line (+ sp 2)))
-                           (d3 (char line (+ sp 3))))
-                       (when (and (digit-char-p d1)
-                                  (digit-char-p d2)
-                                  (digit-char-p d3)
-                                  (or (= (+ sp 4) (length line))
-                                      (char= (char line (+ sp 4)) #\Space)))
-                         (let ((code (+ (* 100 (digit-char-p d1))
-                                        (* 10 (digit-char-p d2))
-                                        (digit-char-p d3))))
-                           (when (<= 100 code 599)
-                             (setf status code))))))))
+                 (setf status (parse-status-line-string line)))
                (when (and (>= (length line) 18)
                           (string-equal line "transfer-encoding:"
                                         :end1 18))

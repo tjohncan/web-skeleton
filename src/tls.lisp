@@ -643,22 +643,9 @@
                                         (error "https streaming: too many headers (~d)"
                                                header-count))
                                       (when first-line
-                                        (let ((sp (position #\Space line)))
-                                          (when (and sp (<= (+ sp 4) (length line)))
-                                            (let ((d1 (char line (+ sp 1)))
-                                                  (d2 (char line (+ sp 2)))
-                                                  (d3 (char line (+ sp 3))))
-                                              (when (and (digit-char-p d1)
-                                                         (digit-char-p d2)
-                                                         (digit-char-p d3)
-                                                         (or (= (+ sp 4) (length line))
-                                                             (char= (char line (+ sp 4)) #\Space)))
-                                                (let ((code (+ (* 100 (digit-char-p d1))
-                                                               (* 10 (digit-char-p d2))
-                                                               (digit-char-p d3))))
-                                                  (when (<= 100 code 599)
-                                                    (setf status code)))))))
-                                        (setf first-line nil))
+                                        (setf status
+                                              (parse-status-line-string line)
+                                              first-line nil))
                                       (when (and (>= (length line) 18)
                                                  (string-equal line "transfer-encoding:"
                                                                :end1 18))

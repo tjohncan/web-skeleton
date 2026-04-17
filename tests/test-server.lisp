@@ -1223,6 +1223,39 @@
       (check (format nil "status reject ~s" prefix)
              (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
 
+  ;; String-level twin PARSE-STATUS-LINE-STRING is what the streaming
+  ;; paths (stream-response-lines, tls-stream-response) now delegate to.
+  ;; Its acceptance set MUST match the buffered byte-level parse —
+  ;; without the prefix check, a non-HTTP upstream whose first line
+  ;; contains '<junk> 200' masquerades as HTTP status 200 on the
+  ;; streaming paths only, a parser-disagreement smuggling primitive.
+  ;; Cases parallel the buffered block above — if one parser drifts,
+  ;; both test groups should catch it.
+  (check "string status 200"
+         (web-skeleton::parse-status-line-string "HTTP/1.1 200 OK") 200)
+  (check "string status 404"
+         (web-skeleton::parse-status-line-string "HTTP/1.1 404 Not Found") 404)
+  (check "string status 302 http/1.0"
+         (web-skeleton::parse-status-line-string "HTTP/1.0 302 Found") 302)
+  (check "string status 204 no reason"
+         (web-skeleton::parse-status-line-string "HTTP/1.1 204") 204)
+  (dolist (line '("FUBAR 200 OK"             ; non-HTTP masquerade
+                  "NOT-HTTP 418 Z"           ; another non-HTTP masquerade
+                  "HTTP/2.0 200 OK"          ; wrong major
+                  "HTTP/1.2 200 OK"          ; wrong minor
+                  "HTTP/1.1  200 OK"         ; double space
+                  "http/1.1 200 OK"          ; wrong case
+                  "HTTP/1.1"                 ; no status digits
+                  "HTTP/1.1 20"              ; two digits
+                  "HTTP/1.1 99 OK"           ; two digits + junk
+                  "HTTP/1.1 600 OK"          ; out of 100-599
+                  "HTTP/1.1 099 OK"          ; out of 100-599
+                  "HTTP/1.1 2OO OK"          ; non-digit
+                  ""
+                  nil))
+    (check (format nil "string status reject ~s" line)
+           (web-skeleton::parse-status-line-string line) nil))
+
   ;; defer-to-fetch is a thin readability wrapper over http-fetch; check
   ;; that it returns the same continuation the framework recognizes as
   ;; an async signal.
