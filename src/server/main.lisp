@@ -232,18 +232,15 @@
                   (http-request-path request)
                   (http-fetch-continuation-url response))
        (values response nil))
-      ;; Pre-formatted response (e.g., static file — already bytes)
+      ;; Pre-formatted response (e.g., static file — already bytes).
+      ;; HEAD truncation happens centrally in HANDLE-CLIENT-READ via
+      ;; STRIP-BODY-FOR-HEAD on the way to CONNECTION-QUEUE-WRITE, so
+      ;; both byte-vector and HTTP-RESPONSE paths funnel through one
+      ;; strip site instead of two.
       ((typep response '(simple-array (unsigned-byte 8) (*)))
        (log-debug "~a ~a -> static"
                   (http-request-method request)
                   (http-request-path request))
-       ;; HEAD must not send a body (RFC 7231 §4.3.2). Byte-vector
-       ;; responses are pre-formatted (headers + CRLFCRLF + body) —
-       ;; truncate at the header boundary so only headers go on the wire.
-       (when (eq (http-request-method request) :HEAD)
-         (let ((end (scan-crlf-crlf response 0 (length response))))
-           (when end
-             (setf response (subseq response 0 (+ end 4))))))
        (values response nil))
       ;; Normal HTTP response — must be an HTTP-RESPONSE struct. The
       ;; previous catch-all let a handler that forgot MAKE-TEXT-RESPONSE
@@ -465,48 +462,65 @@
                            (or (connection-remote-addr conn) ""))
                 ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
                 ;; HTTP/1.0 default is close. Connection header overrides.
-                (let ((conn-header (get-header request "connection")))
+                ;; RFC 7230 §6.1 + §3.2.2: Connection is a list-valued
+                ;; header, and multiple occurrences are semantically
+                ;; equivalent to one comma-joined value. Walk
+                ;; GET-HEADERS rather than GET-HEADER so a split
+                ;; Connection: keep-alive / Connection: close pair
+                ;; from a cooperating proxy is read as "close" instead
+                ;; of silently dropping the second value.
+                (let ((conn-values (get-headers request "connection")))
                   (setf (connection-close-after-p conn)
                         (cond
-                          ((and conn-header
-                                (connection-header-has-token-p conn-header "close"))
+                          ((some (lambda (v)
+                                   (connection-header-has-token-p v "close"))
+                                 conn-values)
                            t)
-                          ((and conn-header
-                                (connection-header-has-token-p conn-header "keep-alive"))
+                          ((some (lambda (v)
+                                   (connection-header-has-token-p v "keep-alive"))
+                                 conn-values)
                            nil)
                           ((string= (http-request-version request) "1.0") t)
                           (t nil))))
                 (multiple-value-bind (response upgrade-p)
                     (dispatch-request request handler)
+                  ;; Sync close-after-p from a handler-set Connection: close
+                  ;; header. Without this step an HTTP/1.1 handler that
+                  ;; explicitly asks to close the socket would advertise
+                  ;; 'Connection: close' on the wire while the server
+                  ;; happily held the socket open — framing mismatch vs
+                  ;; the client's expectation. Shared helper with the
+                  ;; fetch-callback path (fetch.lisp / tls.lisp) walks
+                  ;; every 'connection' header via GET-HEADERS-equivalent,
+                  ;; symmetric with the inbound-side walk ten lines up.
+                  (sync-close-after-p-from-response conn response)
                   (cond
                     ;; Outbound fetch — park and initiate
                     ((typep response 'http-fetch-continuation)
                      (initiate-fetch conn epoll-fd response))
-                    ;; Normal response — queue for writing
+                    ;; Normal response — queue for writing.
+                    ;; Handler-returned response structs are treated as
+                    ;; immutable: a caller that caches a (make-error-response
+                    ;; 404) across requests must not have HEAD strip the
+                    ;; body slot or HTTP/1.0 keep-alive stamp a Connection
+                    ;; header onto it. The :keep-alive-hint keyword on
+                    ;; FORMAT-RESPONSE stamps the header at serialize time
+                    ;; instead, and STRIP-BODY-FOR-HEAD truncates bytes
+                    ;; post-serialize — neither touches the struct.
                     (t
-                     ;; HTTP/1.0 keep-alive: echo the header so the client
-                     ;; knows the connection will persist
-                     (when (and (not (connection-close-after-p conn))
-                                (string= (http-request-version request) "1.0")
-                                (typep response 'http-response))
-                       (set-response-header response "connection" "keep-alive"))
-                     ;; HEAD responses: set Content-Length but strip body
-                     (when (and (eq (http-request-method request) :HEAD)
-                                (typep response 'http-response)
-                                (http-response-body response))
-                       (let ((body (sb-ext:string-to-octets
-                                    (http-response-body response)
-                                    :external-format :utf-8)))
-                         (unless (assoc "content-length"
-                                        (http-response-headers response)
-                                        :test #'string-equal)
-                           (set-response-header response "content-length"
-                                                (write-to-string (length body)))))
-                       (setf (http-response-body response) nil))
-                     (let ((bytes (if (typep response
-                                            '(simple-array (unsigned-byte 8) (*)))
-                                      response
-                                      (format-response response))))
+                     (let* ((keep-alive-hint
+                             (and (not (connection-close-after-p conn))
+                                  (string= (http-request-version request) "1.0")
+                                  (typep response 'http-response)))
+                            (bytes
+                             (strip-body-for-head
+                              (if (typep response
+                                         '(simple-array (unsigned-byte 8) (*)))
+                                  response
+                                  (format-response
+                                   response
+                                   :keep-alive-hint keep-alive-hint))
+                              conn)))
                        (connection-queue-write conn bytes)
                        (setf (connection-state conn)
                              (if upgrade-p :ws-upgrade :write-response))
@@ -586,11 +600,17 @@
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
-      ;; Send 400 before closing so the client gets a proper HTTP response
+      ;; Send 400 before closing so the client gets a proper HTTP response.
+      ;; Runs through STRIP-BODY-FOR-HEAD for symmetry with the 500 path
+      ;; below — typically a no-op here because CONNECTION-REQUEST isn't
+      ;; set until PARSE-REQUEST-BYTES fully succeeds, but harmless and
+      ;; correct on any future path that raises HTTP-PARSE-ERROR after
+      ;; the request is parsed.
       (handler-case
           (let ((resp (make-error-response 400)))
             (set-response-header resp "connection" "close")
-            (let ((err-bytes (format-response resp)))
+            (let ((err-bytes (strip-body-for-head
+                              (format-response resp) conn)))
               (connection-queue-write conn err-bytes)
               (setf (connection-state conn) :write-response
                     (connection-close-after-p conn) t)
@@ -651,6 +671,23 @@
                       (replace (connection-read-buf conn)
                                (connection-read-buf conn)
                                :start1 0 :start2 consumed :end2 buffered))
+                    ;; Shrink the read buffer back to the default 4 KiB
+                    ;; when a prior large body grew it and the shifted
+                    ;; pipelined bytes fit in the default. 10k idle
+                    ;; keep-alives × 1 MiB grown buffers would otherwise
+                    ;; sit on ~10 GiB after a burst of large POSTs.
+                    ;; Heuristic: a uniform-large-POST workload will
+                    ;; shrink-then-grow each cycle — fine for bursty
+                    ;; traffic (the common case), measurable if traffic
+                    ;; happens to be uniform-large.
+                    (let ((buf (connection-read-buf conn)))
+                      (when (and (> (length buf) 4096)
+                                 (< extra 4096))
+                        (let ((fresh (make-array 4096
+                                                  :element-type '(unsigned-byte 8))))
+                          (when (> extra 0)
+                            (replace fresh buf :end2 extra))
+                          (setf (connection-read-buf conn) fresh))))
                     (setf (connection-read-pos conn) (max extra 0)
                           (connection-write-buf conn) nil
                           (connection-write-pos conn) 0
@@ -916,6 +953,9 @@
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
+  (unless (and (integerp workers) (plusp workers))
+    (error "start-server: :workers must be a positive integer, got ~a"
+           workers))
   (setf *shutdown* nil)
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an
