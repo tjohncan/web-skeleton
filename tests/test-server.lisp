@@ -804,6 +804,18 @@
                  (build-cookie "" "v"))
     (check-error "delete-cookie: empty name"
                  (delete-cookie ""))
+    ;; '=' in the NAME is rejected. RFC 6265 §5.2: browsers parse
+    ;; 'foo=bar=baz' as name='foo', value='bar=baz'. Accepting '='
+    ;; in the caller-supplied name would silently rename the cookie
+    ;; to the substring before the first '='. '=' in the VALUE is
+    ;; accepted — a value can legally contain '=' (e.g. base64).
+    (check-error "build-cookie: '=' in name rejected"
+                 (build-cookie "foo=bar" "baz"))
+    (check-error "delete-cookie: '=' in name rejected"
+                 (delete-cookie "foo=bar"))
+    (let ((c (build-cookie "k" "opaque==value")))
+      (check "'=' in value still accepted (base64 padding)"
+             (not (null (search "k=opaque==value" c))) t))
     ;; delete-cookie with explicit :path nil must not crash
     (let ((cookie (delete-cookie "session" :path nil)))
       (check "delete-cookie :path nil"
@@ -1042,6 +1054,24 @@
     (check "status 302 http/1.0"
            (web-skeleton::parse-response-status buf 0 (length buf)) 302))
 
+  ;; Non-HTTP prefixes must reject. Without the prefix check a wrong-
+  ;; protocol upstream whose first line happens to contain '<junk> 200'
+  ;; would parse as status 200 and masquerade as an HTTP response —
+  ;; same shape as the parse-request-bytes version check on the inbound
+  ;; side.
+  (dolist (prefix '("FOOBAR 200 OK"          ; not HTTP
+                    "HTTP/2.0 200 OK"        ; wrong major
+                    "HTTP/1.2 200 OK"        ; wrong minor
+                    "HTTP/1.1  200 OK"       ; double space (missing SP after 1.1)
+                    "http/1.1 200 OK"        ; wrong case
+                    "HTTP/1.1"               ; no status
+                    ""))
+    (let ((buf (sb-ext:string-to-octets
+                (concatenate 'string prefix *crlf*)
+                :external-format :ascii)))
+      (check (format nil "status reject ~s" prefix)
+             (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
+
   ;; defer-to-fetch is a thin readability wrapper over http-fetch; check
   ;; that it returns the same continuation the framework recognizes as
   ;; an async signal.
@@ -1135,6 +1165,42 @@
            (buf (bytes text))
            (result (web-skeleton::parse-getent-output buf (length buf))))
       (check "getent: partial line (no LF) -> nil" result nil))
+    ;; STREAM must be the token immediately after the address, not
+    ;; any substring in the line. A DGRAM / RAW row whose hostname
+    ;; happens to contain ' STREAM' does not masquerade as a STREAM
+    ;; row — only a token-anchored parse qualifies.
+    (let* ((text (format nil "127.0.0.1       DGRAM my.STREAM.example~%~
+                              127.0.0.1       RAW  ~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: DGRAM with STREAM in hostname rejected" result nil))
+    ;; Mixed output: DGRAM rows whose hostnames contain 'STREAM' are
+    ;; skipped; the real STREAM row below matches.
+    (let* ((text (format nil "127.0.0.1       DGRAM my.STREAM.example~%~
+                              10.0.0.1        STREAM real.example~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: STREAM after DGRAM-with-STREAM-hostname matches"
+             (coerce (car result) 'list) '(10 0 0 1)))
+    ;; Unspecified addresses (0.0.0.0, ::) rejected at the parser.
+    ;; 0.0.0.0 is routed to loopback on Linux, :: typically fails
+    ;; with EADDRNOTAVAIL — either way, a meaningless dial target.
+    (let* ((text (format nil "0.0.0.0         STREAM any~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: 0.0.0.0 rejected" result nil))
+    (let* ((text (format nil "::              STREAM any~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: :: rejected" result nil))
+    ;; Unspecified rejection only skips that entry — a later STREAM
+    ;; row with a real address still matches.
+    (let* ((text (format nil "0.0.0.0         STREAM any~%~
+                              127.0.0.1       STREAM localhost~%"))
+           (buf (bytes text))
+           (result (web-skeleton::parse-getent-output buf (length buf))))
+      (check "getent: real STREAM after 0.0.0.0 matches"
+             (coerce (car result) 'list) '(127 0 0 1)))
 
     ;; ---- parse-url with IPv6 brackets ----
     (multiple-value-bind (scheme host port path)
@@ -1615,6 +1681,78 @@
                           nil)
                  (error () t))
                t)
+      (close stream)))
+
+  ;; Body lines terminated by bare CR (WHATWG EventStream §9.2 —
+  ;; lone U+000D is a valid separator). The reader splits on any
+  ;; of CR / LF / CRLF without stripping CR from accumulated
+  ;; content.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Content-Length: 16" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                ;; body: "event a\revent b\r" — two lines separated by
+                ;; lone CR, final CR terminates the last line.
+                "event a" (string #\Return)
+                "event b" (string #\Return))))
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (let ((status (web-skeleton::stream-response-lines
+                       stream (lambda (l) (push l lines)))))
+          (setf lines (nreverse lines))
+          (check "sse-CR: status" status 200)
+          (check "sse-CR: line count" (length lines) 2)
+          (check "sse-CR: first line"  (first lines)  "event a")
+          (check "sse-CR: second line" (second lines) "event b"))
+      (close stream)))
+
+  ;; Mixed CR / LF / CRLF terminators in one body. Each is equally
+  ;; a line separator; content stays intact between terminators.
+  ;; Body: a\rb\nc\r\nd\r\re\r\n = 13 bytes.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Content-Length: 13" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "a" (string #\Return)                           ; CR
+                "b" (string #\Newline)                          ; LF
+                "c" (string #\Return) (string #\Newline)        ; CRLF
+                "d" (string #\Return) (string #\Return)         ; CR then CR
+                "e" (string #\Return) (string #\Newline))))     ; CRLF
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (progn
+          (web-skeleton::stream-response-lines
+           stream (lambda (l) (push l lines)))
+          (setf lines (nreverse lines))
+          (check "mixed-term: line count" (length lines) 6)
+          (check "mixed-term: a"  (first lines)  "a")
+          (check "mixed-term: b"  (second lines) "b")
+          (check "mixed-term: c"  (third lines)  "c")
+          (check "mixed-term: d"  (fourth lines) "d")
+          (check "mixed-term: blank from CRCR"
+                 (fifth lines) "")
+          (check "mixed-term: e"  (sixth lines)  "e"))
+      (close stream)))
+
+  ;; HEAD response with Content-Length: N — the reader skips the
+  ;; body phase entirely (RFC 7231 §4.3.2), so stream-response-lines
+  ;; returns status without waiting for N bytes of body that the
+  ;; upstream will not send.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Content-Length: 42" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         ;; no body bytes — upstream HEAD response shape
+         (stream (make-mock-stream raw))
+         (lines nil))
+    (unwind-protect
+        (let ((status (web-skeleton::stream-response-lines
+                       stream (lambda (l) (push l lines))
+                       :method :HEAD)))
+          (check "HEAD stream: status" status 200)
+          (check "HEAD stream: zero body lines" (length lines) 0))
       (close stream))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1833,7 +1971,61 @@
     ;; Incomplete frame — not enough bytes
     (multiple-value-setq (result consumed)
       (web-skeleton::try-parse-ws-frame frame 0 1))
-    (check "parse incomplete" result nil)))
+    (check "parse incomplete" result nil))
+
+  ;; RFC 6455 §5.2: "the minimal number of bytes MUST be used to
+  ;; encode the length." A peer sending len7=126 with a 16-bit value
+  ;; below 126, or len7=127 with a 64-bit value below 65536, is
+  ;; non-canonical. Accepting it opens a length-parser disagreement
+  ;; vector against strict downstreams.
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    ;; Non-canonical 16-bit length (value 100, should have used 7-bit form).
+    ;; Build: b0=#x81 (FIN+text), b1=#x80+126 (MASK+126), length=0x0064=100,
+    ;; mask 4 bytes, payload 100 bytes — but parser rejects before unmask.
+    (let* ((frame (make-array (+ 8 100) :element-type '(unsigned-byte 8)
+                                        :initial-element 0)))
+      (setf (aref frame 0) #x81
+            (aref frame 1) (logior #x80 126)
+            (aref frame 2) 0
+            (aref frame 3) 100)
+      (check "reject non-canonical 2-byte length"
+             (signals-error-p
+              (lambda ()
+                (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
+             t))
+    ;; Canonical: len7=126, value=126 — accepted (boundary).
+    (let* ((payload (make-array 126 :element-type '(unsigned-byte 8)
+                                    :initial-element 97))  ; all 'a'
+           (frame (make-array (+ 8 126) :element-type '(unsigned-byte 8)
+                                        :initial-element 0)))
+      (setf (aref frame 0) #x81
+            (aref frame 1) (logior #x80 126)
+            (aref frame 2) 0
+            (aref frame 3) 126
+            ;; Mask key 0x00000000 so unmask is identity — skip XOR bookkeeping.
+            (aref frame 4) 0 (aref frame 5) 0
+            (aref frame 6) 0 (aref frame 7) 0)
+      (replace frame payload :start1 8)
+      (multiple-value-bind (f consumed)
+          (web-skeleton::try-parse-ws-frame frame 0 (length frame))
+        (declare (ignore consumed))
+        (check "accept canonical 2-byte length (126)"
+               (not (null f)) t)))
+    ;; Non-canonical 64-bit length (value 1000, should have used 16-bit form).
+    (let* ((frame (make-array (+ 14 1000) :element-type '(unsigned-byte 8)
+                                          :initial-element 0)))
+      (setf (aref frame 0) #x81
+            (aref frame 1) (logior #x80 127)
+            ;; 8 bytes big-endian: 1000 = 0x00000000_000003E8
+            (aref frame 8) #x03
+            (aref frame 9) #xE8)
+      (check "reject non-canonical 8-byte length"
+             (signals-error-p
+              (lambda ()
+                (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
+             t))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket fragmentation and control frame tests
@@ -2289,7 +2481,8 @@
 
 (defun test-server ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
@@ -2312,5 +2505,5 @@
   (test-static-etag)
   (test-jwt)
   (test-shutdown-hooks)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (report-suite "Server")
   (zerop *tests-failed*))
