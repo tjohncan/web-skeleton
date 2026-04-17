@@ -137,11 +137,37 @@
         (push (subseq s start i) groups)
         (setf start (1+ i))))))
 
+(defun %ipv6-maybe-unfold-ipv4-tail (groups)
+  "If the last entry of GROUPS is a dotted-quad IPv4 literal, expand
+   it to two 16-bit hex-string groups and return the new list.
+   Otherwise return GROUPS unchanged. Supports the IPv4-mapped and
+   IPv4-compatible IPv6 address forms (RFC 4291 §2.5.5) — e.g.
+   '::ffff:127.0.0.1' — so PARSE-IPV6-LITERAL and IS-PUBLIC-ADDRESS-P
+   agree on URL-literal classification.
+
+   The last-contains-dot branch uses OR so a failed PARSE-IPV4-LITERAL
+   falls back to GROUPS unchanged (the downstream %PARSE-IPV6-GROUP
+   then rejects the dotted tail as non-hex). Returning NIL on a
+   failed unfold would mask the rejection and let PARSE-IPV6-LITERAL
+   silently accept malformed literals like '::1.2.3' as '::'."
+  (let ((last (car (last groups))))
+    (if (and last (find #\. last))
+        (or (let ((v4 (parse-ipv4-literal last)))
+              (when v4
+                (let ((hi (logior (ash (aref v4 0) 8) (aref v4 1)))
+                      (lo (logior (ash (aref v4 2) 8) (aref v4 3))))
+                  (append (butlast groups)
+                          (list (format nil "~x" hi)
+                                (format nil "~x" lo))))))
+            groups)
+        groups)))
+
 (defun parse-ipv6-literal (str)
   "Parse STR as an IPv6 literal. Returns a 16-byte vector on success,
-   NIL on failure. Handles :: compression. Does not handle IPv4-mapped
-   addresses (::ffff:1.2.3.4) or zone identifiers (fe80::1%eth0) — both
-   are rare in URL contexts and v1 rejects them cleanly."
+   NIL on failure. Handles :: compression and the IPv4-mapped /
+   IPv4-compatible tail form (::ffff:1.2.3.4 — RFC 4291 §2.5.5).
+   Does not handle zone identifiers (fe80::1%eth0) — rare in URL
+   contexts and v1 rejects them cleanly."
   (unless (and (stringp str) (> (length str) 0))
     (return-from parse-ipv6-literal nil))
   (let ((dcolon (search "::" str)))
@@ -152,6 +178,7 @@
               (suffix (subseq str (+ dcolon 2)))
               (pre (if (zerop (length prefix)) '() (%split-ipv6-groups prefix)))
               (suf (if (zerop (length suffix)) '() (%split-ipv6-groups suffix)))
+              (suf (%ipv6-maybe-unfold-ipv4-tail suf))
               (pre-vals (mapcar #'%parse-ipv6-group pre))
               (suf-vals (mapcar #'%parse-ipv6-group suf))
               (filled (+ (length pre-vals) (length suf-vals))))
@@ -162,9 +189,10 @@
             (append pre-vals
                     (make-list (- 8 filled) :initial-element 0)
                     suf-vals)))))
-      ;; No "::" — must be exactly 8 groups
+      ;; No "::" — must be exactly 8 groups (or 6 groups + IPv4 tail)
       (t
-       (let* ((groups (%split-ipv6-groups str))
+       (let* ((groups (%ipv6-maybe-unfold-ipv4-tail
+                       (%split-ipv6-groups str)))
               (vals (mapcar #'%parse-ipv6-group groups)))
          (when (and (= (length vals) 8) (every #'identity vals))
            (%ipv6-groups-to-bytes vals)))))))
@@ -309,9 +337,25 @@
    mandatory. A bare 'Host: ::1:8080' is unparseable — no reader
    can tell where the address ends and the port begins — and
    strict upstreams 400 it. The re-bracket here keeps the
-   parse-url → wire-form pipeline symmetric."
-  (let* ((method-str (symbol-name method))
-         (default-port-p (or (and (eq scheme :http) (= port 80))
+   parse-url → wire-form pipeline symmetric.
+
+   METHOD must be a keyword whose symbol-name is uppercase ASCII.
+   Apps hardcode methods in practice, but validating the charset
+   closes a theoretical smuggling primitive — an intern'd keyword
+   from attacker-influenced data containing a space or CRLF would
+   otherwise emit a first line like 'GET HTTP/1.1 /path HTTP/1.1',
+   i.e. two valid request lines to a permissive upstream parser.
+   Symmetric with the MATCH-METHOD-BYTES acceptance set on ingress."
+  (let ((method-str (symbol-name method)))
+    ;; Validate method BEFORE the body-bytes UTF-8 encoding and
+    ;; header-list build below — an invalid method throws away the
+    ;; allocation otherwise. Check shape: uppercase ASCII letters
+    ;; only, non-empty.
+    (unless (and (> (length method-str) 0)
+                 (every (lambda (c) (char<= #\A c #\Z)) method-str))
+      (error "build-outbound-request: method must be uppercase ASCII ~
+              letters, got ~s" method-str))
+  (let* ((default-port-p (or (and (eq scheme :http) (= port 80))
                              (and (eq scheme :https) (= port 443))))
          ;; Re-bracket IPv6 literals. An IPv6 address always contains
          ;; at least one ':'; no DNS name, IPv4 literal, or port-qualified
@@ -345,7 +389,7 @@
                                        (length body-bytes)))))))))
     (serialize-http-message
      (format nil "~a ~a HTTP/1.1" method-str path)
-     all-headers body-bytes)))
+     all-headers body-bytes))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parse response status line
@@ -827,6 +871,37 @@
         (funcall on-line (sb-ext:octets-to-string
                           line-buf :external-format :utf-8))))))
 
+(defun keep-alive-hint-for (inbound)
+  "Compute the :keep-alive-hint flag for FORMAT-RESPONSE based on
+   INBOUND's parsed request. Returns T when the inbound is an
+   HTTP/1.0 keep-alive session — the only case where stamping
+   Connection: keep-alive on the wire is meaningful (HTTP/1.1's
+   default is keep-alive, so the header would be redundant). Used
+   by COMPLETE-FETCH / DELIVER-FETCH-ERROR / the TLS happy and
+   error paths so responses returned through the async fetch path
+   echo the same header the sync dispatch path does."
+  (let ((req (and inbound (connection-request inbound))))
+    (and req
+         (not (connection-close-after-p inbound))
+         (string= (http-request-version req) "1.0"))))
+
+(defun sync-close-after-p-from-response (inbound response)
+  "Flip INBOUND's CONNECTION-CLOSE-AFTER-P to T when RESPONSE's
+   headers carry any Connection: close token. Parallels the
+   inbound-request parse in HANDLE-CLIENT-READ and the direct-
+   dispatch sync there — without this step a fetch callback that
+   sets Connection: close advertises the header on the wire but
+   the server holds the socket open, framing-mismatch vs the
+   client's expectation. Walks every 'connection' header via
+   GET-HEADERS-equivalent (apps might ADD-RESPONSE-HEADER the
+   same name twice) so any instance with 'close' wins."
+  (when (and inbound (typep response 'http-response))
+    (let ((values (loop for (k . v) in (http-response-headers response)
+                        when (string-equal k "connection") collect v)))
+      (when (some (lambda (v) (connection-header-has-token-p v "close"))
+                  values)
+        (setf (connection-close-after-p inbound) t)))))
+
 (defun strip-body-for-head (bytes conn)
   "If CONN's parsed request method is HEAD, truncate BYTES at the
    CRLFCRLF header boundary so only status line + headers go on
@@ -870,8 +945,10 @@
         (error (e2)
           (log-warn "fetch cleanup callback raised: ~a" e2)))
       (let ((error-response (strip-body-for-head
-                           (format-response (make-error-response 502))
-                           conn)))
+                             (format-response
+                              (make-error-response 502)
+                              :keep-alive-hint (keep-alive-hint-for conn))
+                             conn)))
         (connection-queue-write conn error-response)
         (setf (connection-state conn) :write-response)
         (epoll-modify epoll-fd (connection-fd conn)
@@ -1355,6 +1432,10 @@
               (let ((response (funcall callback
                                        status (or headers nil)
                                        (or body nil))))
+                ;; Sync close-after-p from the callback's response BEFORE
+                ;; computing the keep-alive-hint — a handler-set
+                ;; Connection: close should zero out the hint too.
+                (sync-close-after-p-from-response inbound response)
                 ;; Queue the response on the inbound connection
                 (let ((bytes (cond
                                ((typep response '(simple-array (unsigned-byte 8) (*)))
@@ -1363,7 +1444,10 @@
                                 ;; Chained fetch — initiate another outbound call
                                 (initiate-fetch inbound epoll-fd response)
                                 (return-from complete-fetch))
-                               (t (format-response response)))))
+                               (t (format-response
+                                   response
+                                   :keep-alive-hint
+                                   (keep-alive-hint-for inbound))))))
                   (setf bytes (strip-body-for-head bytes inbound))
                   (connection-queue-write inbound bytes)
                   (setf (connection-state inbound) :write-response
@@ -1375,7 +1459,10 @@
             (error (e)
               (log-error "fetch callback error: ~a" e)
               (let ((err-bytes (strip-body-for-head
-                                (format-response (make-error-response 500))
+                                (format-response
+                                 (make-error-response 500)
+                                 :keep-alive-hint
+                                 (keep-alive-hint-for inbound))
                                 inbound)))
                 (connection-queue-write inbound err-bytes)
                 (setf (connection-state inbound) :write-response
@@ -1400,7 +1487,9 @@
     (let ((inbound (lookup-connection inbound-fd)))
       (when inbound
         (let ((err-bytes (strip-body-for-head
-                         (format-response (make-error-response 502))
+                         (format-response
+                          (make-error-response 502)
+                          :keep-alive-hint (keep-alive-hint-for inbound))
                          inbound)))
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response
