@@ -271,7 +271,42 @@
     (setf (aref bad-y 0) (logxor (aref bad-y 0) #xFF))
     (check "invalid-curve point rejected"
            (ecdsa-verify-p256 hash sig x bad-y)
+           nil))
+
+  ;; FIPS 186-4 §5.6.2.3.3: public-key coordinates must be < p.
+  ;; The 32-byte input range exceeds +p256-p+, so unreduced coords
+  ;; slip past the curve-equation check (which uses MOD-MUL). Pass
+  ;; all-0xFF coords which integer-wise exceed p; verify rejected
+  ;; without raising. Exercised via the pure-Lisp path directly so
+  ;; the libssl swap's own range check doesn't shadow this test.
+  (let* ((hash (sha256 (sb-ext:string-to-octets "test")))
+         (sig  (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1))
+         (huge (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xFF)))
+    (check "unreduced pubkey-x (>= p) rejected"
+           (web-skeleton::ecdsa-verify-p256-lisp hash sig huge huge)
            nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; mod-inv raises on non-invertible input (pure-Lisp primitive)
+;;;
+;;; Exercised separately because the bug only surfaces when a caller
+;;; skips coordinate range validation — the ECDSA verifier above does
+;;; check, but the primitive's contract should raise for 0 / any input
+;;; whose gcd with p isn't 1 rather than silently return 0.
+;;; ---------------------------------------------------------------------------
+
+(defun test-mod-inv-raise ()
+  (format t "~%mod-inv primitive~%")
+  (flet ((raises-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "mod-inv: 0 mod 13 raises"
+           (raises-p (lambda () (web-skeleton::mod-inv 0 13))) t)
+    (check "mod-inv: 13 mod 13 raises (reduces to 0)"
+           (raises-p (lambda () (web-skeleton::mod-inv 13 13))) t)
+    ;; Normal-case: inverse of 3 mod 11 is 4 (3 * 4 = 12 ≡ 1 mod 11)
+    (check "mod-inv: 3 mod 11 = 4"
+           (web-skeleton::mod-inv 3 11) 4)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HMAC-SHA256 test vectors (RFC 4231)
@@ -442,6 +477,7 @@
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)
+  (test-mod-inv-raise)
   (test-hmac-sha256)
   (test-constant-time-equal)
   (test-hex)
