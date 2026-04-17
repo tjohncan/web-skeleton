@@ -110,6 +110,7 @@
            #:*max-request-line-length*
            #:*max-header-count*
            #:*max-header-line-length*
+           #:*max-total-header-bytes*
            #:*max-body-size*
            #:*max-outbound-response-size*
            #:*max-streaming-line-size*
