@@ -1001,7 +1001,17 @@
    the server holds the socket open, framing-mismatch vs the
    client's expectation. Walks every 'connection' header via
    GET-HEADERS-equivalent (apps might ADD-RESPONSE-HEADER the
-   same name twice) so any instance with 'close' wins."
+   same name twice) so any instance with 'close' wins.
+   Byte-vector responses (pre-serialized from SERVE-STATIC or an
+   app's hand-built bytes) are NOT scanned — the header bytes are
+   opaque here and re-parsing them just to catch an embedded
+   Connection: close would duplicate PARSE-HEADERS-BYTES. Apps
+   that want close semantics on a byte-vector path must use an
+   HTTP-RESPONSE struct instead, or close the connection
+   explicitly via the handler-owned path. The self-heals gap
+   when a byte-vector embeds Connection: close but the server
+   doesn't close is bounded: the client eventually drops on
+   idle, just later than the header advertised."
   (when (and inbound (typep response 'http-response))
     (let ((values (loop for (k . v) in (http-response-headers response)
                         when (string-equal k "connection") collect v)))
