@@ -181,7 +181,39 @@
     (check "ser single-float rejected"
            (signals-error-p
             (lambda () (json-serialize 3.14)))
-           t)))
+           t))
+
+  ;; Leading UTF-8 BOM (U+FEFF) silently skipped per RFC 8259 §8.1.
+  ;; Windows text editors and some encoders prepend one.
+  (check "BOM stripped from JSON input"
+         (json-parse (format nil "~a{\"x\":1}" (string (code-char #xFEFF))))
+         '(("x" . 1)))
+  (check "BOM-only input still errors cleanly"
+         (handler-case
+             (progn (json-parse (string (code-char #xFEFF))) nil)
+           (error () t))
+         t)
+
+  ;; *JSON-MAX-STRING-LENGTH* caps the JSON-PARSE-STRING accumulator
+  ;; so an attacker-controlled response body cannot force a multi-MiB
+  ;; per-string allocation.
+  (let ((saved web-skeleton:*json-max-string-length*)
+        (at-cap   (make-string 32 :initial-element #\a))
+        (over-cap (make-string 33 :initial-element #\a)))
+    (setf web-skeleton:*json-max-string-length* 32)
+    (unwind-protect
+         (progn
+           (check "json: string at cap accepted"
+                  (json-parse (concatenate 'string "\"" at-cap "\""))
+                  at-cap)
+           (check "json: string over cap rejected"
+                  (handler-case
+                      (progn (json-parse
+                              (concatenate 'string "\"" over-cap "\""))
+                             nil)
+                    (error () t))
+                  t))
+      (setf web-skeleton:*json-max-string-length* saved))))
 
 (defun test-json ()
   (setf *tests-passed* 0
