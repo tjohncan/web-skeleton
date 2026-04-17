@@ -38,14 +38,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; fd extraction from the SBCL stream
 ;;;
-;;; sb-impl::fd-stream-fd is the internal reader for the struct slot.
-;;; Using it directly via double-colon access is the stable pattern —
-;;; sb-sys:fd-stream-fd is not always exported in every SBCL version.
+;;; sb-sys:fd-stream-fd has been an external symbol on SBCL 2.2+
+;;; (the framework targets modern SBCL on Linux). Previous code here
+;;; reached into sb-impl:: for the struct-slot reader; that works
+;;; but uses an internal symbol that has no export contract and
+;;; could be renamed across releases. sb-sys: is the stable path.
 ;;; ---------------------------------------------------------------------------
 
 (defun %process-output-fd (process)
   "Return the integer file descriptor of PROCESS's stdout stream."
-  (sb-impl::fd-stream-fd (sb-ext:process-output process)))
+  (sb-sys:fd-stream-fd (sb-ext:process-output process)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parsing getent ahosts output
