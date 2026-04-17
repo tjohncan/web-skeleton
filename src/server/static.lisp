@@ -163,22 +163,34 @@
           (when (and (pathname-name file)
                      (> (length (pathname-name file)) 0)
                      (not (char= (char (pathname-name file) 0) #\.)))
-            (let* ((fs-path (namestring file))
-                   (relative (subseq fs-path (length base))))
-              ;; Skip files inside dot-directories (.git/, .secret/, etc.)
-              ;; Search url-path (not relative) to catch root-level dot-dirs
-              (unless (search "/." (concatenate 'string "/" relative))
-                (let* ((url-path (concatenate 'string "/" relative))
-                       (content (read-file-bytes fs-path))
-                       (mime (mime-type-for-path url-path))
-                       (mtime (file-write-date file))
-                       (response (build-static-response mime content mtime)))
-                  (when (gethash url-path *static-cache*)
-                    (log-debug "static: replacing ~a" url-path))
-                  (setf (gethash url-path *static-cache*) response)
-                  (incf count)
-                  (incf total-bytes (length content))
-                  (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content)))))))
+            (let ((fs-path (namestring file)))
+              ;; SBCL's DIRECTORY resolves symlinks by default — a symlink
+              ;; inside the tree that points outside (demo/static/leak ->
+              ;; /etc/passwd) returns the resolved target path, which
+              ;; does not prefix-match BASE. A blind (subseq fs-path
+              ;; (length base)) on that path either raises on short
+              ;; targets or produces a bogus URL that silently serves
+              ;; arbitrary filesystem bytes. Skip anything not under BASE.
+              (cond
+                ((not (and (>= (length fs-path) (length base))
+                           (string= fs-path base :end1 (length base))))
+                 (log-warn "static: skipping out-of-tree path ~a" fs-path))
+                (t
+                 (let ((relative (subseq fs-path (length base))))
+                   ;; Skip files inside dot-directories (.git/, .secret/, etc.)
+                   ;; Search url-path (not relative) to catch root-level dot-dirs
+                   (unless (search "/." (concatenate 'string "/" relative))
+                     (let* ((url-path (concatenate 'string "/" relative))
+                            (content (read-file-bytes fs-path))
+                            (mime (mime-type-for-path url-path))
+                            (mtime (file-write-date file))
+                            (response (build-static-response mime content mtime)))
+                       (when (gethash url-path *static-cache*)
+                         (log-debug "static: replacing ~a" url-path))
+                       (setf (gethash url-path *static-cache*) response)
+                       (incf count)
+                       (incf total-bytes (length content))
+                       (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content))))))))))
         ;; Second pass: register extensionless aliases for .html files
         ;; e.g., /login.html also serves at /login
         ;; Actual files take priority — don't overwrite existing entries
