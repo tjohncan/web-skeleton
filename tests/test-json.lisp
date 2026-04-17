@@ -153,6 +153,21 @@
          (json-serialize '(1 "two" t))
          "[1,\"two\",true]")
 
+  ;; Improper lists must reject, not silently emit invalid JSON. A
+  ;; one-cell LISTP check was the original guard — it only inspected
+  ;; (CDR value), so (1 2 . 3) passed through and json-write-array
+  ;; emitted "[1,2,]" (trailing comma). Guarded now by PROPER-LIST-P.
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "ser dotted pair rejected"
+           (signals-error-p (lambda () (json-serialize '(1 . 2)))) t)
+    (check "ser improper 3-list rejected"
+           (signals-error-p (lambda () (json-serialize '(1 2 . 3)))) t)
+    (check "ser improper alist-shape rejected"
+           (signals-error-p
+            (lambda () (json-serialize '(("a" . 1) ("b" . 2) . 3)))) t))
+
   ;; Objects (alists with string keys)
   (check "ser object"
          (json-serialize '(("name" . "ankle") ("size" . 4444)))

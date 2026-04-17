@@ -355,6 +355,22 @@
 ;;; Serializer
 ;;; ---------------------------------------------------------------------------
 
+(defun proper-list-p (x)
+  "Return T if X is a proper list — every CDR is a cons until NIL.
+   Local to the JSON serializer: JSON arrays and objects require
+   proper-list shape, and a one-cell LISTP check misses the deeper
+   improper case. Input (1 2 . 3) has (CDR x) = (2 . 3) — a cons —
+   so LISTP says T, but JSON-WRITE-ARRAY's LOOP would emit a
+   trailing comma for the final non-NIL tail. ALSO used to guard
+   the alist-detection EVERY call: per CLHS, EVERY on an improper
+   list has undefined behavior. Iterative walk so very long lists
+   don't blow the stack. No circular-list detection — a circular
+   structure fed to JSON-SERIALIZE is pathological regardless."
+  (loop
+    (cond ((null x) (return t))
+          ((atom x) (return nil))
+          (t (setf x (cdr x))))))
+
 (defun json-serialize (value)
   "Serialize a Lisp value to a JSON string.
    Alists with string keys serialize as objects; other lists as arrays."
@@ -386,6 +402,13 @@
      (let* ((*read-default-float-format* 'double-float)
             (s (write-to-string (coerce value 'double-float))))
        (write-string s stream)))
+    ;; Improper lists reject up front — a dotted tail would emit a
+    ;; trailing comma through json-write-array, producing invalid
+    ;; JSON. Must come before the cons branches so EVERY on an
+    ;; improper alist shape doesn't run with undefined behavior
+    ;; (CLHS — EVERY requires proper lists).
+    ((and (consp value) (not (proper-list-p value)))
+     (error "json: cannot serialize improper list ~s" value))
     ;; Alist (object) — every element must be a cons with a string car.
     ;; Checking only the first element was a footgun: a mixed list like
     ;; '(("foo" . 1) "bar") would route to json-write-object and crash
@@ -396,9 +419,7 @@
      (json-write-object value stream))
     ;; List (array)
     ((consp value)
-     (if (listp (cdr value))
-         (json-write-array value stream)
-         (error "json: cannot serialize dotted pair ~s" value)))
+     (json-write-array value stream))
     (t (error "json-serialize: unsupported type ~a" (type-of value)))))
 
 (defun json-write-string (str stream)
