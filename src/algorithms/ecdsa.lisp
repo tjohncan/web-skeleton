@@ -51,13 +51,21 @@
   (mod (* a b) p))
 
 (defun mod-inv (a p)
-  "Modular multiplicative inverse of A mod P via extended Euclidean algorithm."
+  "Modular multiplicative inverse of A mod P via extended Euclidean
+   algorithm. Raises when A has no inverse mod P (input reduces to 0,
+   or gcd(A, P) != 1). Silently returning 0 for non-invertible input
+   is a primitive-level footgun — a caller that skips pre-validation
+   of public-key coordinates could otherwise route garbage through
+   EC-ADD and get a verifier that never errors but never verifies
+   either."
   (let ((old-r p) (r (mod a p))
         (old-s 0) (s 1))
     (loop until (zerop r)
           do (let ((q (floor old-r r)))
                (psetf old-r r  r (- old-r (* q r)))
                (psetf old-s s  s (- old-s (* q s)))))
+    (unless (= old-r 1)
+      (error "mod-inv: ~d has no inverse mod ~d" a p))
     (mod old-s p)))
 
 ;;; ---------------------------------------------------------------------------
@@ -173,6 +181,15 @@
         (qx (bytes-to-integer pubkey-x))
         (qy (bytes-to-integer pubkey-y))
         (z (bytes-to-integer hash)))
+    ;; FIPS 186-4 §5.6.2.3.3: public-key coordinates must lie in
+    ;; [0, p-1]. The 32-byte input range is [0, 2^256 - 1] which
+    ;; exceeds +p256-p+ (= 2^256 - 2^224 + 2^192 + 2^96 - 1), so
+    ;; unreduced coords slip past the curve-equation check below
+    ;; (it uses MOD-MUL / MOD-ADD throughout) and then break
+    ;; EC-ADD's (= x1 x2) equality test, routing into MOD-INV on
+    ;; a value that reduces to 0. Reject unreduced coords loud.
+    (unless (and (< qx +p256-p+) (< qy +p256-p+))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; Check r, s in [1, n-1]
     ;; Both (r, s) and (r, n-s) are valid ES256 signatures per
     ;; RFC 7515 / 7518 — JOSE does not mandate low-S normalization
