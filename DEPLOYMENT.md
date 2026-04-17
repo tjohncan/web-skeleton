@@ -205,6 +205,17 @@ LLM response), but avoid calling them from HTTP handlers under load.
 `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
 For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
+**Async fetch timeout budget.** On the non-blocking `http-fetch`
+path for `http://` URLs, `*fetch-timeout*` applies as a **single
+end-to-end budget** rather than per-phase: the inbound connection's
+`:awaiting` idle timer covers DNS + TCP connect + request I/O
+together. A slow DNS phase shortens the budget remaining for
+connect and response read. Blocking paths (`http-fetch-stream`,
+HTTPS) get the three per-phase bounds above; the async path gets
+one total. Tune `*fetch-timeout*` with this in mind — it is the
+worst-case wall time the parked inbound will sit in `:awaiting`
+before the idle sweeper hands back a 502.
+
 **Chunked completion on the async path.** The non-blocking `http-fetch`
 path detects response completion by Content-Length (immediate) or by
 EOF (Connection: close). For chunked responses where the upstream
