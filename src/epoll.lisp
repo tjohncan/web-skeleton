@@ -61,6 +61,7 @@
 (defconstant +eagain+      11)
 (defconstant +ewouldblock+ 11)    ; same as EAGAIN on Linux
 (defconstant +eintr+        4)
+(defconstant +einprogress+ 115)   ; non-blocking connect in progress
 
 ;;; ---------------------------------------------------------------------------
 ;;; errno access
@@ -407,12 +408,23 @@
    timeout or any connect failure. Returns SOCKET."
   (let ((fd (socket-fd socket)))
     (set-nonblocking fd)
-    ;; Mirror the async path: a non-blocking connect either succeeds
-    ;; immediately (localhost) or raises with EINPROGRESS. Either way,
-    ;; the SO_ERROR check below after POLL-WRITABLE is authoritative.
+    ;; Non-blocking connect either succeeds immediately (localhost),
+    ;; raises with EINPROGRESS (expected — POLL-WRITABLE will unblock
+    ;; on completion), or raises with an immediate failure (EACCES,
+    ;; EADDRNOTAVAIL, EHOSTUNREACH cached). Swallowing immediate
+    ;; failures would mask the real errno behind a generic 'timed out'
+    ;; after the full TIMEOUT-SECONDS — operators diagnosing a config
+    ;; error (privileged port, bad local address) would chase the
+    ;; wrong thread. Distinguish and re-raise non-EINPROGRESS cleanly.
     (handler-case
         (sb-bsd-sockets:socket-connect socket ip port)
-      (sb-bsd-sockets:socket-error () nil))
+      (sb-bsd-sockets:socket-error (e)
+        ;; SOCKET-ERROR-ERRNO is internal to SB-BSD-SOCKETS, not on
+        ;; the external symbol list — use the :: accessor.
+        (let ((errno (sb-bsd-sockets::socket-error-errno e)))
+          (unless (or (= errno +einprogress+)
+                      (= errno +eagain+))
+            (error "connect: ~a" (errno-string errno))))))
     (unless (poll-writable fd (* timeout-seconds 1000))
       (error "connect: timed out after ~a seconds" timeout-seconds))
     (let ((err (get-socket-option-int fd +sol-socket+ +so-error+)))
