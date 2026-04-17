@@ -30,6 +30,14 @@
   "Maximum nesting depth for JSON parsing. Prevents stack overflow on
    deeply nested input.")
 
+(defparameter *json-max-string-length* (* 1 1024 1024)
+  "Maximum decoded length of a single JSON string in characters.
+   Default 1 MiB. Bounds the accumulator in JSON-PARSE-STRING so an
+   attacker feeding a giant base64/hex-looking value at the outbound
+   response boundary (bodies up to *MAX-OUTBOUND-RESPONSE-SIZE* =
+   8 MiB) cannot force an 8 MiB per-string allocation. Raise for apps
+   that need larger strings; do not disable.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parser internals
 ;;; ---------------------------------------------------------------------------
@@ -49,6 +57,16 @@
   (incf pos)
   (let ((out (make-array 64 :element-type 'character :fill-pointer 0 :adjustable t))
         (len (length str)))
+    (flet ((push-char (c)
+             ;; Bound the per-string accumulator at
+             ;; *JSON-MAX-STRING-LENGTH*. Without this cap an attacker-
+             ;; controlled response body (up to *MAX-OUTBOUND-RESPONSE-
+             ;; SIZE* = 8 MiB) could force an 8 MiB per-string allocation
+             ;; across many keys and values.
+             (when (>= (fill-pointer out) *json-max-string-length*)
+               (error "json: string exceeds ~d characters"
+                      *json-max-string-length*))
+             (vector-push-extend c out)))
     (loop
       (when (>= pos len)
         (error "json: unterminated string"))
@@ -62,14 +80,14 @@
              (error "json: unterminated escape"))
            (let ((esc (char str pos)))
              (case esc
-               (#\n (vector-push-extend #\Newline out))
-               (#\t (vector-push-extend #\Tab out))
-               (#\r (vector-push-extend #\Return out))
-               (#\" (vector-push-extend #\" out))
-               (#\\ (vector-push-extend #\\ out))
-               (#\/ (vector-push-extend #\/ out))
-               (#\b (vector-push-extend (code-char 8) out))
-               (#\f (vector-push-extend (code-char 12) out))
+               (#\n (push-char #\Newline))
+               (#\t (push-char #\Tab))
+               (#\r (push-char #\Return))
+               (#\" (push-char #\"))
+               (#\\ (push-char #\\))
+               (#\/ (push-char #\/))
+               (#\b (push-char (code-char 8)))
+               (#\f (push-char (code-char 12)))
                (#\u
                 ;; \uXXXX — exactly 4 hex digits required (RFC 8259 §7)
                 (when (> (+ pos 5) len)
@@ -107,7 +125,7 @@
                              (let ((cp (+ #x10000
                                           (ash (- code #xD800) 10)
                                           (- low #xDC00))))
-                               (vector-push-extend (code-char cp) out))
+                               (push-char (code-char cp)))
                              (incf pos 10))
                            (error "json: lone high surrogate \\u~4,'0X at ~d"
                                   code (1- pos)))))
@@ -115,7 +133,7 @@
                      (error "json: lone low surrogate \\u~4,'0X at ~d"
                             code (1- pos)))
                     (t
-                     (vector-push-extend (code-char code) out)
+                     (push-char (code-char code))
                      (incf pos 4)))))
                (t (error "json: invalid escape \\~c at ~d" esc (1- pos)))))
            (incf pos))
@@ -124,8 +142,8 @@
            (when (< (char-code ch) #x20)
              (error "json: unescaped control character U+~4,'0X at ~d"
                     (char-code ch) pos))
-           (vector-push-extend ch out)
-           (incf pos)))))))
+           (push-char ch)
+           (incf pos))))))))
 
 (defun json-parse-number (str pos)
   "Parse a JSON number starting at POS. Returns (values number new-pos)."
@@ -313,12 +331,21 @@
 (defun json-parse (str)
   "Parse a JSON string into Lisp data.
    Objects become alists, arrays become lists.
-   false -> :FALSE, null -> :NULL (to distinguish from NIL/empty list)."
-  (multiple-value-bind (val pos) (json-parse-value str 0)
-    (let ((end (json-skip-whitespace str pos)))
-      (when (< end (length str))
-        (error "json: unexpected content at position ~d" end)))
-    val))
+   false -> :FALSE, null -> :NULL (to distinguish from NIL/empty list).
+
+   A leading U+FEFF (UTF-8 BOM when decoded via UTF-8) is silently
+   skipped per RFC 8259 §8.1. Windows text editors, older .NET
+   APIs, and some Python encoders on Windows prepend one; rejecting
+   it would make the parser more strict than the spec requires."
+  (let ((start (if (and (> (length str) 0)
+                        (char= (char str 0) (code-char #xFEFF)))
+                   1
+                   0)))
+    (multiple-value-bind (val pos) (json-parse-value str start)
+      (let ((end (json-skip-whitespace str pos)))
+        (when (< end (length str))
+          (error "json: unexpected content at position ~d" end)))
+      val)))
 
 (defun json-get (obj key)
   "Look up KEY (string) in a JSON object (alist). Returns value or NIL."
