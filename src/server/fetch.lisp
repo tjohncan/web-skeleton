@@ -354,26 +354,43 @@
 (defun parse-response-status (buf start end)
   "Extract the integer status code from a response line in BUF[START..END).
    Expects 'HTTP/1.x NNN' or 'HTTP/1.x NNN reason' (RFC 7230 §3.1.2).
+   Requires a byte-for-byte 'HTTP/1.0 ' or 'HTTP/1.1 ' prefix before
+   reading digits. Without the prefix check a non-HTTP upstream whose
+   first line happened to contain '<junk> 200' ('FOOBAR 200 OK',
+   'NOT-HTTP 418 Z') would parse as status 200 — masquerading as HTTP
+   to any app pattern-matching on the returned status. Symmetric with
+   PARSE-REQUEST-BYTES' byte-level version check on the inbound side.
    Returns the status only if it is a 3-digit number in the 100-599
    range (RFC 7231 §6) followed by SP or CR. Rejects 4-digit codes,
    junk-terminated digits, and anything outside the defined ranges."
   (let ((crlf (scan-crlf buf start end)))
     (unless crlf (return-from parse-response-status nil))
-    (let ((sp (position 32 buf :start start :end crlf)))
-      (unless sp (return-from parse-response-status nil))
-      (let ((s (1+ sp)))
-        ;; Need three digits plus a terminator byte (SP before reason,
-        ;; or CR at end-of-line if the reason-phrase is omitted).
-        (when (<= (+ s 3) crlf)
-          (let ((d1 (- (aref buf s) 48))
-                (d2 (- (aref buf (+ s 1)) 48))
-                (d3 (- (aref buf (+ s 2)) 48))
-                (after (aref buf (+ s 3))))
-            (when (and (<= 0 d1 9) (<= 0 d2 9) (<= 0 d3 9)
-                       (or (= after 32) (= after 13)))
-              (let ((status (+ (* d1 100) (* d2 10) d3)))
-                (when (<= 100 status 599)
-                  status)))))))))
+    ;; HTTP/1.x prefix: 9 bytes (HTTP/1.0 or HTTP/1.1 + SP).
+    (unless (and (>= (- crlf start) 9)
+                 (= (aref buf start)       72)  ; H
+                 (= (aref buf (+ start 1)) 84)  ; T
+                 (= (aref buf (+ start 2)) 84)  ; T
+                 (= (aref buf (+ start 3)) 80)  ; P
+                 (= (aref buf (+ start 4)) 47)  ; /
+                 (= (aref buf (+ start 5)) 49)  ; 1
+                 (= (aref buf (+ start 6)) 46)  ; .
+                 (or (= (aref buf (+ start 7)) 48)    ; 0
+                     (= (aref buf (+ start 7)) 49))   ; 1
+                 (= (aref buf (+ start 8)) 32))       ; SP
+      (return-from parse-response-status nil))
+    (let ((s (+ start 9)))
+      ;; Need three digits plus a terminator byte (SP before reason,
+      ;; or CR at end-of-line if the reason-phrase is omitted).
+      (when (<= (+ s 3) crlf)
+        (let ((d1 (- (aref buf s) 48))
+              (d2 (- (aref buf (+ s 1)) 48))
+              (d3 (- (aref buf (+ s 2)) 48))
+              (after (aref buf (+ s 3))))
+          (when (and (<= 0 d1 9) (<= 0 d2 9) (<= 0 d3 9)
+                     (or (= after 32) (= after 13)))
+            (let ((status (+ (* d1 100) (* d2 10) d3)))
+              (when (<= 100 status 599)
+                status))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
@@ -443,7 +460,7 @@
                                        :headers headers :body body)))
                     (write-sequence request-bytes stream)
                     (force-output stream)
-                    (stream-response-lines stream on-line))
+                    (stream-response-lines stream on-line :method method))
                 (close stream))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
@@ -458,7 +475,16 @@
   (stream nil)
   (buf    (make-array 8192 :element-type '(unsigned-byte 8)))
   (pos    0 :type fixnum)
-  (end    0 :type fixnum))
+  (end    0 :type fixnum)
+  ;; PREV-CR: CR-partner state for CONTENT reads through
+  ;; READER-READ-BYTES only. Set when a CR emits a body line, consumed
+  ;; when the next content byte is LF (CRLF collapses to one
+  ;; terminator even when split across chunk-data boundaries).
+  ;; READER-READ-LINE handles its own CRLF pair inline via lookahead
+  ;; and does not touch this slot — a framing CR (chunk-size line,
+  ;; header line) must not leak state into the next
+  ;; READER-READ-BYTES or the content byte count falls short.
+  (prev-cr nil :type boolean))
 
 (defun reader-fill (r)
   "Refill the buffer. Returns bytes read (0 = EOF)."
@@ -468,10 +494,17 @@
     n))
 
 (defun reader-read-line (r)
-  "Read a line from the buffered reader. Returns a string, or NIL at
-   EOF with no pending line bytes. An EOF mid-line (no trailing LF)
-   flushes the accumulated partial line as the return value and
-   the next call returns NIL."
+  "Read a line from the buffered reader. Treats CR, LF, and CRLF as
+   equivalent line terminators (WHATWG EventStream §9.2). The CRLF
+   pair is consumed in one call via lookahead past the CR — the LF
+   partner is taken from the current buffer, or from a refill when
+   the pair straddles a boundary. Does not touch the struct's
+   PREV-CR slot: that slot is owned by READER-READ-BYTES for
+   cross-call content tracking, and setting it from framing reads
+   (chunk-size lines, headers) would leak into the next
+   READER-READ-BYTES call and mis-align the byte count against
+   framing bytes. Returns a string, or NIL at EOF with no pending
+   bytes; EOF mid-line flushes the partial line once."
   (let ((line-buf (make-array 256 :element-type '(unsigned-byte 8)
                                   :fill-pointer 0 :adjustable t)))
     (loop
@@ -481,32 +514,44 @@
                       (sb-ext:octets-to-string line-buf
                                                :external-format :utf-8)))))
       (let* ((buf (stream-reader-buf r))
-             (pos (stream-reader-pos r))
+             (start (stream-reader-pos r))
              (end (stream-reader-end r))
-             (lf  (position 10 buf :start pos :end end)))
-        (if lf
-            (progn
-              (loop for i from pos below lf
-                    for b = (aref buf i)
-                    unless (= b 13)
-                    do (when (>= (fill-pointer line-buf)
-                                 *max-streaming-line-size*)
-                         (error "streaming response line too large (max ~d)"
-                                *max-streaming-line-size*))
-                       (vector-push-extend b line-buf))
-              (setf (stream-reader-pos r) (1+ lf))
-              (return (sb-ext:octets-to-string line-buf
-                                               :external-format :utf-8)))
-            (progn
-              (loop for i from pos below end
-                    for b = (aref buf i)
-                    unless (= b 13)
-                    do (when (>= (fill-pointer line-buf)
-                                 *max-streaming-line-size*)
-                         (error "streaming response line too large (max ~d)"
-                                *max-streaming-line-size*))
-                       (vector-push-extend b line-buf))
-              (setf (stream-reader-pos r) end)))))))
+             ;; First CR or LF in the remaining buffer, whichever comes first.
+             (term-idx (loop for i from start below end
+                             when (or (= (aref buf i) 13)
+                                      (= (aref buf i) 10))
+                             return i)))
+        (cond
+          (term-idx
+           (loop for i from start below term-idx
+                 do (when (>= (fill-pointer line-buf)
+                              *max-streaming-line-size*)
+                      (error "streaming response line too large (max ~d)"
+                             *max-streaming-line-size*))
+                    (vector-push-extend (aref buf i) line-buf))
+           (setf (stream-reader-pos r) (1+ term-idx))
+           ;; If we terminated on CR, consume a following LF as the
+           ;; second half of a CRLF pair. Refill once if the LF is
+           ;; past the current buffer so a pair split at a read
+           ;; boundary still collapses to one terminator.
+           (when (= (aref buf term-idx) 13)
+             (when (>= (stream-reader-pos r) (stream-reader-end r))
+               (reader-fill r))
+             (when (and (< (stream-reader-pos r) (stream-reader-end r))
+                        (= (aref (stream-reader-buf r)
+                                 (stream-reader-pos r))
+                           10))
+               (incf (stream-reader-pos r))))
+           (return (sb-ext:octets-to-string line-buf
+                                            :external-format :utf-8)))
+          (t
+           (loop for i from start below end
+                 do (when (>= (fill-pointer line-buf)
+                              *max-streaming-line-size*)
+                      (error "streaming response line too large (max ~d)"
+                             *max-streaming-line-size*))
+                    (vector-push-extend (aref buf i) line-buf))
+           (setf (stream-reader-pos r) end)))))))
 
 (defun reader-expect-crlf (r)
   "Consume exactly two bytes from R and raise if they are not
@@ -535,7 +580,18 @@
    actually consumed — the caller compares against COUNT to detect
    truncation (EOF before the requested body was delivered, which
    is indistinguishable on the SBCL stream layer from SO_RCVTIMEO
-   firing mid-stream)."
+   firing mid-stream).
+
+   Terminators: CR, LF, CRLF all recognized (WHATWG EventStream
+   §9.2). PREV-CR on the reader struct carries the CR-partner state
+   across READER-READ-BYTES calls so a CRLF pair split at a chunk-
+   data boundary collapses to one terminator instead of emitting a
+   spurious empty line on the chunk-2 leading LF. READER-READ-LINE
+   deliberately does not touch that slot — framing reads
+   (chunk-size lines) must not set it, or the next
+   READER-READ-BYTES would consume the framing LF as if it were a
+   content CRLF-partner and the chunk-data byte count would fall
+   short by one."
   (let ((remaining count))
     (loop while (> remaining 0) do
       (when (>= (stream-reader-pos r) (stream-reader-end r))
@@ -548,18 +604,30 @@
         (loop for i from pos below (+ pos take)
               for byte = (aref buf i)
               do (cond
-                   ((= byte 10)
+                   ((= byte 13)
                     (when on-line
                       (funcall on-line (sb-ext:octets-to-string
                                         (subseq line-buf 0 (fill-pointer line-buf))
                                         :external-format :utf-8)))
-                    (setf (fill-pointer line-buf) 0))
-                   ((= byte 13) nil)
-                   (t (when (>= (fill-pointer line-buf)
-                                *max-streaming-line-size*)
-                        (error "streaming response line too large (max ~d)"
-                               *max-streaming-line-size*))
-                      (vector-push-extend byte line-buf))))
+                    (setf (fill-pointer line-buf) 0)
+                    (setf (stream-reader-prev-cr r) t))
+                   ((= byte 10)
+                    (cond
+                      ((stream-reader-prev-cr r)
+                       (setf (stream-reader-prev-cr r) nil))
+                      (t
+                       (when on-line
+                         (funcall on-line (sb-ext:octets-to-string
+                                           (subseq line-buf 0 (fill-pointer line-buf))
+                                           :external-format :utf-8)))
+                       (setf (fill-pointer line-buf) 0))))
+                   (t
+                    (setf (stream-reader-prev-cr r) nil)
+                    (when (>= (fill-pointer line-buf)
+                              *max-streaming-line-size*)
+                      (error "streaming response line too large (max ~d)"
+                             *max-streaming-line-size*))
+                    (vector-push-extend byte line-buf))))
         (incf (stream-reader-pos r) take)
         (decf remaining take)))
     (- count remaining)))
@@ -568,10 +636,15 @@
 ;;; HTTP response streaming
 ;;; ---------------------------------------------------------------------------
 
-(defun stream-response-lines (stream on-line)
+(defun stream-response-lines (stream on-line &key (method :GET))
   "Read an HTTP response from a byte stream. Skip headers, call
    ON-LINE per body line. Handles chunked transfer encoding.
    Returns the status code.
+
+   METHOD gates the body-framing discipline: for :HEAD, RFC 7231
+   §4.3.2 guarantees an empty body even when the upstream echoes
+   the GET-body Content-Length, so the body phase is skipped and
+   the truncation checks are bypassed.
 
    Truncation discipline on the streaming path:
      - chunked: stream-chunked-lines raises if the zero-size
@@ -646,6 +719,10 @@
                      (setf content-length n))))))
     ;; Stream body lines
     (cond
+      ;; HEAD: RFC 7231 §4.3.2 — no body regardless of declared
+      ;; framing. Skip body entirely and skip the post-body
+      ;; truncation checks.
+      ((eq method :HEAD) nil)
       (chunked
        (stream-chunked-lines r on-line))
       ((and content-length (not te-present))
@@ -834,7 +911,21 @@
                (set-nonblocking (socket-fd socket))
                (handler-case
                    (sb-bsd-sockets:socket-connect socket ip port)
-                 (sb-bsd-sockets:socket-error () nil))
+                 (sb-bsd-sockets:socket-error (e)
+                   ;; Non-blocking connect raises for EINPROGRESS (expected,
+                   ;; the kernel completes via EPOLLOUT) and for immediate
+                   ;; failures (EACCES, EADDRNOTAVAIL, EHOSTUNREACH cached).
+                   ;; Re-raising the immediate failures here surfaces the
+                   ;; real errno via the outer handler-case at INITIATE-FETCH
+                   ;; instead of silently registering a doomed fd and
+                   ;; waiting out *FETCH-TIMEOUT* in :awaiting.
+                   ;; SOCKET-ERROR-ERRNO is internal to SB-BSD-SOCKETS —
+                   ;; the :: accessor matches the one used in epoll.lisp's
+                   ;; BLOCKING-CONNECT.
+                   (let ((errno (sb-bsd-sockets::socket-error-errno e)))
+                     (unless (or (= errno +einprogress+)
+                                 (= errno +eagain+))
+                       (error "connect: ~a" (errno-string errno))))))
                (let* ((out-fd (socket-fd socket))
                       (request-bytes (build-outbound-request
                                       (http-fetch-continuation-method fetch-req)
@@ -849,6 +940,7 @@
                                  :outbound-p t
                                  :inbound-fd (connection-fd conn)
                                  :fetch-callback (http-fetch-continuation-callback fetch-req)
+                                 :fetch-method (http-fetch-continuation-method fetch-req)
                                  :last-active (get-universal-time)))
                  (connection-queue-write out-conn request-bytes)
                  (register-connection out-conn)
@@ -1028,12 +1120,20 @@
                   (te-present (scan-transfer-encoding buf header-end))
                   (content-length (unless te-present
                                     (scan-content-length buf header-end))))
-             (if content-length
-                 ;; Have Content-Length (no TE) — complete when body received
-                 (when (>= (- pos body-start) content-length)
-                   (complete-fetch conn epoll-fd))
-                 ;; Chunked or no CL — wait for EOF (Connection: close)
-                 nil))))))))
+             (cond
+               ;; HEAD response body is empty by RFC 7231 §4.3.2, even
+               ;; when the upstream echoes the GET-body Content-Length.
+               ;; Complete on headers-done — waiting for CL body bytes
+               ;; would hang until EPOLLHUP lands as peer FIN, which
+               ;; is extra round-trip latency for no payload delivery.
+               ((eq (connection-fetch-method conn) :HEAD)
+                (complete-fetch conn epoll-fd))
+               ;; Have Content-Length (no TE) — complete when body received
+               (content-length
+                (when (>= (- pos body-start) content-length)
+                  (complete-fetch conn epoll-fd)))
+               ;; Chunked or no CL — wait for EOF (Connection: close)
+               ))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
@@ -1203,11 +1303,14 @@
     ;; and the inbound gets a 502 instead of a short body.
     ;;
     ;; Skipped for 1xx/204/304 — these carry CL but have no body
-    ;; (RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1).
-    ;; Known limitation: HEAD responses still trip this guard — the
-    ;; request method is not available in the completion path.
+    ;; (RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1). Also skipped for
+    ;; HEAD — RFC 7231 §4.3.2: upstream echoes the CL of the GET
+    ;; body but MUST NOT send a body. The request method lives on
+    ;; out-conn's fetch-method slot (set from the continuation in
+    ;; initiate-http-fetch-to-address).
     (when (and content-length
                (not (or (<= 100 status 199) (= status 204) (= status 304)))
+               (not (eq (connection-fetch-method out-conn) :HEAD))
                (< (- pos body-start) content-length))
       (deliver-fetch-error out-conn epoll-fd
                            (format nil "short body: ~d of ~d bytes"
@@ -1221,8 +1324,10 @@
                          (min pos (+ body-start content-length))
                          pos))
            ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
-           ;; Force empty even if the upstream sent bytes.
-           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304))
+           ;; HEAD responses MUST NOT include a body (RFC 7231 §4.3.2)
+           ;; regardless of what the upstream sent. Force empty on all.
+           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304)
+                             (eq (connection-fetch-method out-conn) :HEAD))
                          body-start
                          body-end))
            (raw-body (when (> body-end body-start)
