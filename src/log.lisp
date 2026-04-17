@@ -25,11 +25,17 @@
   (or (position level *log-levels*) 0))
 
 (defun timestamp ()
-  "Return current UTC time as YYYY-MM-DD hh:mm:ss."
-  (multiple-value-bind (sec min hour day month year)
-      (decode-universal-time (get-universal-time) 0)
-    (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d"
-            year month day hour min sec)))
+  "Return current UTC time as YYYY-MM-DD hh:mm:ss.mmm.
+   Millisecond precision so log-parsing tools can preserve event
+   order within a single second. sb-ext:get-time-of-day returns
+   (values unix-sec microsec); the 2208988800 offset converts Unix
+   epoch (1970) to universal-time epoch (1900) so DECODE-UNIVERSAL-
+   TIME formats the date portion unchanged."
+  (multiple-value-bind (unix-sec usec) (sb-ext:get-time-of-day)
+    (multiple-value-bind (sec min hour day month year)
+        (decode-universal-time (+ unix-sec 2208988800) 0)
+      (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d.~3,'0d"
+              year month day hour min sec (floor usec 1000)))))
 
 (defun log-msg (level format-string &rest args)
   "Log a message at LEVEL. Suppressed if below *log-level*.
