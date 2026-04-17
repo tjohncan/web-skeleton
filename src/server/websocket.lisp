@@ -49,7 +49,12 @@
       raw-code))
 
 (defun websocket-upgrade-p (request)
-  "Check if REQUEST is a valid WebSocket upgrade request."
+  "Check if REQUEST is a valid WebSocket upgrade request.
+   Sec-WebSocket-Key validation includes a base64 charset check —
+   the length test alone accepts any 24-character string, including
+   strings containing non-ASCII bytes that would later trip
+   WEBSOCKET-ACCEPT-KEY's :external-format :ascii conversion and
+   surface as 500 instead of the 400 a malformed key deserves."
   (and (eq (http-request-method request) :GET)
        (string= (http-request-version request) "1.1")
        (let ((upgrade    (get-header request "upgrade"))
@@ -62,6 +67,17 @@
               (connection-header-has-token-p connection "upgrade")
               key
               (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
+              ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
+              ;; with '=' padding. Sec-WebSocket-Key is a fixed-size base64
+              ;; over 16 random bytes so padding is always two '=' — the
+              ;; charset check is strict on the 22 data chars and the
+              ;; trailing '=' pair.
+              (loop for c across key
+                    always (or (char<= #\A c #\Z)
+                               (char<= #\a c #\z)
+                               (char<= #\0 c #\9)
+                               (char= c #\+) (char= c #\/)
+                               (char= c #\=)))
               version
               (string= version "13")))))
 
@@ -222,7 +238,20 @@
                   (sb-ext:string-to-octets text :external-format :utf-8)))
 
 (defun build-ws-close (&optional (code 1000))
-  "Build a close frame with a status code."
+  "Build a close frame with a status code. CODE must be in the
+   server-sendable set per RFC 6455 §7.4.1: 1000-1003, 1007-1014,
+   or 3000-4999. Codes < 1000, the reserved 1004/1005/1006/1015,
+   the unassigned 1016-2999, and 5000+ are rejected here — the
+   stricter counterpart to CLAMP-CLOSE-CODE on the receive path,
+   which accepts any out-of-range peer code by clamping it to
+   1000. A silent u16 truncation on out-of-range input (the old
+   behavior for values > 65535) would put bytes on the wire the
+   application never asked for."
+  (unless (or (<= 1000 code 1003)
+              (<= 1007 code 1014)
+              (<= 3000 code 4999))
+    (error "build-ws-close: code ~a not allowed to be sent per RFC 6455 §7.4.1 ~
+            (use 1000-1003, 1007-1014, or 3000-4999)" code))
   (let ((payload (make-array 2 :element-type '(unsigned-byte 8))))
     (setf (aref payload 0) (logand #xFF (ash code -8))
           (aref payload 1) (logand #xFF code))
