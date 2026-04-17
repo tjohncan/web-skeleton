@@ -19,6 +19,14 @@
 (defparameter *max-header-line-length* 8192
   "Maximum length of a single header line in bytes.")
 
+(defparameter *max-total-header-bytes* (* 64 1024)
+  "Maximum cumulative header byte count per request, default 64 KiB.
+   Individual lines are capped at *MAX-HEADER-LINE-LENGTH* (8 KiB)
+   and the count at *MAX-HEADER-COUNT* (100), so the worst case
+   without this cap is 800 KiB of header-string allocation per
+   request. A running-total guard inside PARSE-HEADERS-BYTES rejects
+   early once the cap is reached.")
+
 (defparameter *max-body-size* (* 1 1024 1024)
   "Maximum request body size in bytes. Default 1MB.")
 
@@ -506,9 +514,14 @@
 (defun parse-headers-bytes (buf start end)
   "Parse headers from BUF[START..END) into an alist of (lowercase-name . value).
    Single-pass, handles obsolete line folding (RFC 7230 §3.2.4).
-   Stops at the first empty line (CRLFCRLF boundary)."
+   Stops at the first empty line (CRLFCRLF boundary). Enforces
+   *MAX-TOTAL-HEADER-BYTES* as a running-total guard — per-line and
+   per-count caps alone permit worst-case 800 KiB of header-string
+   allocation per request; the running total makes the actual bound
+   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB)."
   (let ((headers nil)
         (count 0)
+        (total 0)
         (pos start))
     (loop
       (let ((crlf (scan-crlf buf pos end)))
@@ -518,6 +531,10 @@
           (when (> line-len *max-header-line-length*)
             (http-parse-error "header line too long (~d bytes, max ~d)"
                               line-len *max-header-line-length*))
+          (incf total line-len)
+          (when (> total *max-total-header-bytes*)
+            (http-parse-error "total header bytes exceed ~d"
+                              *max-total-header-bytes*))
           (let ((first-byte (aref buf pos)))
             (if (and headers (or (= first-byte 32) (= first-byte 9)))
                 ;; RFC 7230 §3.2.4: reject obsolete line folding
@@ -718,6 +735,7 @@
     (409 . "Conflict")
     (413 . "Payload Too Large")
     (414 . "URI Too Long")
+    (417 . "Expectation Failed")
     (429 . "Too Many Requests")
     (431 . "Request Header Fields Too Large")
     (500 . "Internal Server Error")
@@ -868,7 +886,7 @@
                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
             year hour min sec)))
 
-(defun format-response (response &key connection-hint)
+(defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
 
    CONNECTION-HINT stamps a Connection header at serialize time:
@@ -885,9 +903,23 @@
    The stamping happens in the emitted bytes only — never on the
    RESPONSE struct — so a cached struct reused across requests does
    not accumulate state. A caller-set Connection header always
-   takes precedence; the hint is ignored when one is present."
-  (let* ((status (http-response-status response))
-         (body   (http-response-body response))
+   takes precedence; the hint is ignored when one is present.
+
+   HEAD-ONLY-P skips the body in the emitted bytes while preserving
+   the Content-Length header computed from the body's byte length
+   (RFC 7231 §4.3.2). Without this, a HEAD response to a handler
+   that returned a 10 MiB body would allocate the body into the
+   serialization buffer only for STRIP-BODY-FOR-HEAD to truncate it
+   back out — two large allocations for the cold HEAD path.
+   Passing :HEAD-ONLY-P T encodes the body once for length, then
+   skips emission. The byte-vector path (static files) still goes
+   through STRIP-BODY-FOR-HEAD post-serialize."
+  (let ((status (http-response-status response)))
+    ;; Validate status up front so an out-of-range value short-
+    ;; circuits before the body encode + header build below.
+    (unless (<= 100 status 599)
+      (error "HTTP status ~d out of range (must be 100-599)" status))
+  (let* ((body   (http-response-body response))
          (body-bytes (when body
                        (sb-ext:string-to-octets body :external-format :utf-8)))
          (headers (http-response-headers response))
@@ -929,11 +961,15 @@
          (headers (if (assoc "date" headers :test #'string-equal)
                       headers
                       (cons (cons "date" (http-date)) headers))))
-    (unless (<= 100 status 599)
-      (error "HTTP status ~d out of range (must be 100-599)" status))
     (serialize-http-message
      (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-     headers body-bytes)))
+     headers
+     ;; HEAD short-circuit: keep the computed Content-Length in the
+     ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
+     ;; response's CL) but omit the body bytes from the emitted
+     ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
+     ;; without the large subseq allocation.
+     (if head-only-p nil body-bytes)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors
