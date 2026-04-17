@@ -462,19 +462,26 @@
                       ;; before format-response — a handler-set
                       ;; Connection: close should zero out the hint too.
                       (sync-close-after-p-from-response conn response)
-                      ;; Deliver to inbound connection
-                      (let ((bytes (cond
-                                     ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                      response)
-                                     ((typep response 'http-fetch-continuation)
-                                      ;; Chained fetch
-                                      (initiate-fetch conn epoll-fd response)
-                                      (return-from https-fetch))
-                                     (t (format-response
-                                         response
-                                         :connection-hint
-                                         (connection-hint-for conn))))))
-                        (setf bytes (strip-body-for-head bytes conn))
+                      ;; Deliver to inbound connection. :HEAD-ONLY-P
+                      ;; short-circuits the body encode on HEAD (matches
+                      ;; the plain COMPLETE-FETCH path); byte-vector
+                      ;; responses still strip post-serialize.
+                      (let* ((head-p (and (connection-request conn)
+                                          (eq (http-request-method
+                                               (connection-request conn))
+                                              :HEAD)))
+                             (bytes (cond
+                                      ((typep response '(simple-array (unsigned-byte 8) (*)))
+                                       (strip-body-for-head response conn))
+                                      ((typep response 'http-fetch-continuation)
+                                       ;; Chained fetch
+                                       (initiate-fetch conn epoll-fd response)
+                                       (return-from https-fetch))
+                                      (t (format-response
+                                          response
+                                          :connection-hint
+                                          (connection-hint-for conn)
+                                          :head-only-p head-p)))))
                         (connection-queue-write conn bytes)
                         (setf (connection-state conn) :write-response
                               (connection-last-active conn) (get-universal-time))
