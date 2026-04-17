@@ -59,6 +59,11 @@
   (outbound-p     nil :type boolean)          ; T for outbound connections
   (inbound-fd     -1  :type fixnum)           ; fd of the parked inbound connection
   (fetch-callback nil)                        ; (status headers body) -> response
+  (fetch-method   :GET :type keyword)         ; method of the outbound request
+                                              ; — needed so COMPLETE-FETCH can
+                                              ; exempt HEAD from its CL
+                                              ; truncation guard (RFC 7230 §3.3.2:
+                                              ; HEAD responses carry CL but no body)
   ;; Awaiting (when this inbound connection is waiting for a fetch)
   (awaiting-fd    -1  :type fixnum)           ; fd of the outbound connection
   ;; Keep-alive
@@ -391,12 +396,30 @@
   "Handle readable event. Reads available data and advances protocol state."
   (let ((read-result (connection-read-available conn)))
     (case read-result
-      (:eof   (return-from connection-on-read :close))
+      (:eof
+       ;; Peer closed. If user-space still has buffered bytes (a pipelined
+       ;; second request shifted to offset 0 after keep-alive reset, or a
+       ;; fire-and-close HTTP/1.0 client) let the state machine process
+       ;; them first — closing unconditionally drops valid requests
+       ;; whose bytes arrived before the FIN.
+       (when (zerop (connection-read-pos conn))
+         (return-from connection-on-read :close)))
       (:full
-       ;; For WebSocket, let frames be parsed and shifted before giving up
-       (if (eq (connection-state conn) :websocket)
-           (return-from connection-on-read :websocket)
-           (http-parse-error "request too large (buffer full)")))
+       (cond
+         ;; WebSocket: let frames be parsed and shifted before giving up.
+         ((eq (connection-state conn) :websocket)
+          (return-from connection-on-read :websocket))
+         ;; :read-body with a complete body means the buffer cap fired
+         ;; after we already had everything we need (content-length
+         ;; near *MAX-BODY-SIZE*, or pipelined bytes queued past the
+         ;; body). Fall through to the state-machine dispatch check.
+         ((and (eq (connection-state conn) :read-body)
+               (>= (- (connection-read-pos conn)
+                      (+ (connection-header-end conn) 4))
+                   (connection-body-expected conn)))
+          nil)
+         (t
+          (http-parse-error "request too large (buffer full)"))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
     ;; Activity timestamp is NOT updated here on partial reads.
@@ -466,15 +489,18 @@
                              (setf (connection-read-buf conn) new-buf))
                            ;; Re-drain: buffer grew past connection-read-available's
                            ;; original cap, kernel may still have data (edge-triggered).
-                           ;; Both :EOF (peer hung up before the body completed) and
-                           ;; :FULL (pipelined bytes would overflow the body cap)
-                           ;; are terminal; :OK and :AGAIN continue normally.
-                           ;; Handling :FULL is what keeps the cap a hard
-                           ;; boundary — without it the connection would
-                           ;; sit on bytes the cap had already rejected.
+                           ;; :EOF (peer FIN'd) and :FULL (buffer at cap) are
+                           ;; terminal only if the body is still incomplete.
+                           ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
+                           ;; the pre-grown buffer exceeds the drain cap and
+                           ;; :FULL fires at pos = body-start+CL — which IS
+                           ;; the complete body. Close only on truly incomplete
+                           ;; bodies so that CL-at-cap requests still dispatch.
                            (case (connection-read-available conn)
                              ((:eof :full)
-                              (return-from connection-on-read :close)))))
+                              (when (< (- (connection-read-pos conn) body-start)
+                                       content-length)
+                                (return-from connection-on-read :close))))))
                        (let ((body-available (- (connection-read-pos conn) body-start)))
                          (setf (connection-body-expected conn) content-length
                                (connection-header-end conn) header-end)
