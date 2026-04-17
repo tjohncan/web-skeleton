@@ -3060,14 +3060,38 @@
     (check "jwks parses EC keys only" (length keys) 1)
     (check "jwks kid" (jwt-key-kid (first keys)) "test-key"))
 
-  ;; Duplicate empty-kid keys rejected (same discipline as non-empty kids)
-  (check-error "jwks: duplicate empty kid"
+  ;; Two kidless keys — RFC 7517 §4.5 says kid is OPTIONAL, so a
+  ;; JWKS with multiple kidless keys is spec-legal. Dedup only on
+  ;; non-empty kids so a minimal static set or a rotation window
+  ;; with omitted kids isn't rejected out of hand. jwt-verify's
+  ;; single-key fallback still handles tokens without a kid when
+  ;; exactly one matching key exists.
+  (let ((kidless-pair
+         (parse-jwks (concatenate 'string
+           "{\"keys\":["
+           "{\"kty\":\"EC\",\"crv\":\"P-256\","
+           "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+           "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},"
+           "{\"kty\":\"EC\",\"crv\":\"P-256\","
+           "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+           "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
+           "]}"))))
+    (check "jwks: two kidless keys accepted" (length kidless-pair) 2)
+    (check "jwks: first kidless key has empty kid"
+           (jwt-key-kid (first kidless-pair)) "")
+    (check "jwks: second kidless key has empty kid"
+           (jwt-key-kid (second kidless-pair)) ""))
+
+  ;; Explicit duplicate kid still rejects — the dedup discipline
+  ;; holds for non-empty kids where an issuer presumably meant
+  ;; each kid to be unique.
+  (check-error "jwks: duplicate explicit kid"
                (parse-jwks (concatenate 'string
                  "{\"keys\":["
-                 "{\"kty\":\"EC\",\"crv\":\"P-256\","
+                 "{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"dup\","
                  "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
                  "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},"
-                 "{\"kty\":\"EC\",\"crv\":\"P-256\","
+                 "{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"dup\","
                  "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
                  "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"
                  "]}"))))

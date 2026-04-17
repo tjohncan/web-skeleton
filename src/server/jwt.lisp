@@ -60,12 +60,20 @@
                             (make-jwt-key
                              :kid (or (json-get key-obj "kid") "")
                              :x x :y y))))))
+    ;; Only dedup explicit (non-empty) kids. RFC 7517 §4.5 says kid
+    ;; is OPTIONAL; a minimal static JWKS or a rotation-window set
+    ;; with two kidless keys is spec-legal. Treating the "" default
+    ;; as a real kid collapsed both into a single-slot collision and
+    ;; raised on legitimate input. jwt-verify's single-key fallback
+    ;; (no kid in the token) still works — it picks when the key
+    ;; list has exactly one entry.
     (let ((seen (make-hash-table :test 'equal)))
       (dolist (k keys)
         (let ((kid (jwt-key-kid k)))
-          (when (gethash kid seen)
-            (error "JWKS: duplicate kid ~s" kid))
-          (setf (gethash kid seen) t))))
+          (unless (zerop (length kid))
+            (when (gethash kid seen)
+              (error "JWKS: duplicate kid ~s" kid))
+            (setf (gethash kid seen) t)))))
     keys))
 
 ;;; ---------------------------------------------------------------------------
