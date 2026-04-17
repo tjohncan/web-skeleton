@@ -425,7 +425,11 @@
           (unless (or (= errno +einprogress+)
                       (= errno +eagain+))
             (error "connect: ~a" (errno-string errno))))))
-    (unless (poll-writable fd (* timeout-seconds 1000))
+    ;; ROUND here: POLL-WRITABLE takes an int (SB-ALIEN declaration in
+    ;; %POLL). A fractional *FETCH-TIMEOUT* (e.g., 2.5) would flow
+    ;; through as 2500.0 and either trap on the alien boundary or
+    ;; silently truncate depending on compile safety.
+    (unless (poll-writable fd (round (* timeout-seconds 1000)))
       (error "connect: timed out after ~a seconds" timeout-seconds))
     (let ((err (get-socket-option-int fd +sol-socket+ +so-error+)))
       (unless (zerop err)
