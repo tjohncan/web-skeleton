@@ -562,6 +562,7 @@
         (terminated nil)
         (in-headers t)
         (header-count 0)
+        (total-header-bytes 0)
         ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
         ;; line terminators. PREV-CR carries across SSL-read
         ;; iterations so a CRLF pair split at a TLS record boundary
@@ -615,10 +616,16 @@
               (t
                (loop for i from 0 below n
                      for byte = (aref buf i)
-                     do (when (>= (fill-pointer line-buf) *max-streaming-line-size*)
-                          (error "streaming response line too large (~d bytes, max ~d)"
-                                 (fill-pointer line-buf)
-                                 *max-streaming-line-size*))
+                     do (let ((cap (if in-headers
+                                       *max-header-line-length*
+                                       *max-streaming-line-size*)))
+                          ;; Tighter cap during the header phase keeps a
+                          ;; 1 MiB attacker-framed "header" from coasting
+                          ;; on the body-line budget — symmetric with the
+                          ;; buffered parse-headers-bytes per-line cap.
+                          (when (>= (fill-pointer line-buf) cap)
+                            (error "streaming response line too large (~d bytes, max ~d)"
+                                   (fill-pointer line-buf) cap)))
                         (cond
                           ;; Header phase
                           (in-headers
@@ -642,6 +649,22 @@
                                       (when (> header-count *max-header-count*)
                                         (error "https streaming: too many headers (~d)"
                                                header-count))
+                                      (incf total-header-bytes (length line))
+                                      (when (> total-header-bytes
+                                               *max-total-header-bytes*)
+                                        (error "https streaming: total header bytes exceed ~d"
+                                               *max-total-header-bytes*))
+                                      ;; RFC 7230 §3.2.4 — obs-fold.
+                                      ;; Buffered parse-headers-bytes
+                                      ;; rejects; streaming mirrors so
+                                      ;; the acceptance set doesn't
+                                      ;; drift. Skip the check on the
+                                      ;; status line.
+                                      (when (and (not first-line)
+                                                 (> (length line) 0)
+                                                 (or (char= (char line 0) #\Space)
+                                                     (char= (char line 0) #\Tab)))
+                                        (error "https streaming: obsolete line folding not accepted"))
                                       (when first-line
                                         (setf status
                                               (parse-status-line-string line)

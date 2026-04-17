@@ -569,7 +569,7 @@
     (setf (stream-reader-end r) n)
     n))
 
-(defun reader-read-line (r)
+(defun reader-read-line (r &key (max-size *max-streaming-line-size*))
   "Read a line from the buffered reader. Treats CR, LF, and CRLF as
    equivalent line terminators (WHATWG EventStream §9.2). The CRLF
    pair is consumed in one call via lookahead past the CR — the LF
@@ -580,7 +580,12 @@
    (chunk-size lines, headers) would leak into the next
    READER-READ-BYTES call and mis-align the byte count against
    framing bytes. Returns a string, or NIL at EOF with no pending
-   bytes; EOF mid-line flushes the partial line once."
+   bytes; EOF mid-line flushes the partial line once.
+   MAX-SIZE bounds the accumulated line length. Defaults to
+   *MAX-STREAMING-LINE-SIZE* for body lines; header-phase callers
+   pass a tighter *MAX-HEADER-LINE-LENGTH* so a 1 MiB attacker-
+   framed 'header' is rejected on the same budget as the buffered
+   parse-headers-bytes path rather than the body-line budget."
   (let ((line-buf (make-array 256 :element-type '(unsigned-byte 8)
                                   :fill-pointer 0 :adjustable t)))
     (loop
@@ -600,10 +605,9 @@
         (cond
           (term-idx
            (loop for i from start below term-idx
-                 do (when (>= (fill-pointer line-buf)
-                              *max-streaming-line-size*)
+                 do (when (>= (fill-pointer line-buf) max-size)
                       (error "streaming response line too large (max ~d)"
-                             *max-streaming-line-size*))
+                             max-size))
                     (vector-push-extend (aref buf i) line-buf))
            (setf (stream-reader-pos r) (1+ term-idx))
            ;; If we terminated on CR, consume a following LF as the
@@ -622,10 +626,9 @@
                                             :external-format :utf-8)))
           (t
            (loop for i from start below end
-                 do (when (>= (fill-pointer line-buf)
-                              *max-streaming-line-size*)
+                 do (when (>= (fill-pointer line-buf) max-size)
                       (error "streaming response line too large (max ~d)"
-                             *max-streaming-line-size*))
+                             max-size))
                     (vector-push-extend (aref buf i) line-buf))
            (setf (stream-reader-pos r) end)))))))
 
@@ -742,14 +745,32 @@
         (chunked nil)
         (te-present nil)
         (content-length nil))
-    ;; Read status line + headers
-    (let ((header-count 0))
-      (loop for line = (reader-read-line r)
+    ;; Read status line + headers. Tighter MAX-SIZE for header lines
+    ;; matches the buffered parse-headers-bytes budget so a 1 MiB
+    ;; attacker-framed "header" can't coast on the body-line cap.
+    ;; TOTAL-HEADER-BYTES enforces the aggregate cap symmetrically
+    ;; with parse-headers-bytes' running-total guard.
+    (let ((header-count 0)
+          (total-header-bytes 0))
+      (loop for line = (reader-read-line r :max-size *max-header-line-length*)
             for first = t then nil
             while (and line (> (length line) 0))
             do (incf header-count)
                (when (> header-count *max-header-count*)
                  (error "streaming response: too many headers (~d)" header-count))
+               (incf total-header-bytes (length line))
+               (when (> total-header-bytes *max-total-header-bytes*)
+                 (error "streaming response: total header bytes exceed ~d"
+                        *max-total-header-bytes*))
+               ;; RFC 7230 §3.2.4 — obsolete line folding. Buffered
+               ;; parse-headers-bytes rejects; streaming mirrors so
+               ;; the acceptance set doesn't drift. Skip the check on
+               ;; the status line (it would have failed
+               ;; parse-status-line-string anyway).
+               (when (and (not first)
+                          (or (char= (char line 0) #\Space)
+                              (char= (char line 0) #\Tab)))
+                 (error "streaming response: obsolete line folding not accepted"))
                (when first
                  (setf status (parse-status-line-string line)))
                (when (and (>= (length line) 18)

@@ -1884,6 +1884,77 @@
                t)
       (close stream)))
 
+  ;; Obs-fold rejection — RFC 7230 §3.2.4. Buffered parse-headers-bytes
+  ;; rejects a continuation line starting with SP or TAB; streaming
+  ;; mirrors so the acceptance sets stay aligned.
+  (dolist (spec `((" "              "SP")
+                  (,(string #\Tab) "TAB")))
+    (destructuring-bind (fold label) spec
+      (let* ((raw (ascii-bytes (concatenate 'string
+                    "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                    "Content-Type: text/plain" (string #\Return) (string #\Newline)
+                    fold "continued-via-fold" (string #\Return) (string #\Newline)
+                    (string #\Return) (string #\Newline) "x")))
+             (stream (make-mock-stream raw)))
+        (unwind-protect
+            (check (format nil "streaming: obs-fold rejected (~a)" label)
+                   (handler-case
+                       (progn (web-skeleton::stream-response-lines
+                               stream (lambda (line) (declare (ignore line))))
+                              nil)
+                     (error () t))
+                   t)
+          (close stream)))))
+
+  ;; Per-header line length cap — *max-header-line-length*. Tighter
+  ;; than *max-streaming-line-size* (the body-line budget). Without
+  ;; this, a 1 MiB attacker-framed "header" would coast on the body-
+  ;; line budget while the buffered parse-headers-bytes would reject
+  ;; at 8 KiB.
+  (let* ((long-value (make-string (1+ web-skeleton:*max-header-line-length*)
+                                  :initial-element #\x))
+         (raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "X-Big: " long-value (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline) "y")))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming: header line over *max-header-line-length* rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
+  ;; Running-total header-bytes cap — *max-total-header-bytes*.
+  ;; Sum of header lines past the cap raises before dispatch. Uses
+  ;; near-max-line-length headers so the count stays under the
+  ;; per-count cap while the aggregate trips.
+  (let* ((per-line-bytes (- web-skeleton:*max-header-line-length* 100))
+         (val (make-string per-line-bytes :initial-element #\x))
+         (line-text (concatenate 'string "X-Spam: " val
+                                 (string #\Return) (string #\Newline)))
+         (lines-needed (1+ (ceiling web-skeleton:*max-total-header-bytes*
+                                    per-line-bytes)))
+         (headers (with-output-to-string (s)
+                    (write-string "HTTP/1.1 200 OK" s)
+                    (write-char #\Return s) (write-char #\Newline s)
+                    (loop repeat lines-needed do (write-string line-text s))
+                    (write-char #\Return s) (write-char #\Newline s)))
+         (raw (ascii-bytes headers))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming: total header bytes cap"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
   ;; TE: identity + CL should ignore CL per RFC 7230 §3.3.3 rule 3.
   ;; The response is close-delimited, not CL-framed.
   (let* ((raw (ascii-bytes (concatenate 'string
