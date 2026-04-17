@@ -59,12 +59,28 @@
 ;;; line wins — order respects system preference.
 ;;; ---------------------------------------------------------------------------
 
+(defun %unspecified-address-p (bytes)
+  "T if BYTES are all zero — the unspecified IPv4 0.0.0.0 or IPv6 ::.
+   Meaningless as a destination: 0.0.0.0 is routed to loopback on
+   Linux, :: is typically rejected with EADDRNOTAVAIL. Either way,
+   spending a connect syscall on it is wasted work."
+  (every #'zerop bytes))
+
 (defun parse-getent-output (buf end)
   "Scan BUF[0..END) for the first `<address> STREAM ...` line with a
    parseable IPv4 or IPv6 address. Returns (IP . FAMILY) where FAMILY
    is :INET or :INET6, or NIL if no complete parseable line yet.
    Safe to call on partial buffers — returns NIL until at least one
-   line with a newline terminator has been received."
+   line with a newline terminator has been received.
+
+   Token boundary: STREAM must appear as the token immediately after
+   the address, not as a substring anywhere in the line. A substring
+   match (`(search \" STREAM\" line)`) would classify a DGRAM row
+   whose hostname happens to contain ' STREAM' ('127.0.0.1 DGRAM
+   my.STREAM.example') as a STREAM match.
+
+   Rejects the unspecified addresses (0.0.0.0, ::) — dialing them is
+   meaningless and some systems quietly route 0.0.0.0 to loopback."
   (let ((line-start 0))
     (loop while (< line-start end) do
       (let ((lf (position 10 buf :start line-start :end end)))
@@ -74,14 +90,32 @@
                          buf :start line-start :end lf
                              :external-format :ascii)
                       (error () nil))))
-          (when (and line (search " STREAM" line))
+          (when line
             (let* ((sp (position #\Space line))
-                   (addr-str (and sp (subseq line 0 sp))))
-              (when addr-str
+                   (addr-str (and sp (subseq line 0 sp)))
+                   ;; First non-whitespace token after the address.
+                   (tok-start
+                    (and sp (position-if-not
+                              (lambda (c)
+                                (or (char= c #\Space) (char= c #\Tab)))
+                              line :start sp)))
+                   (stream-token-p
+                    (and tok-start
+                         (>= (- (length line) tok-start) 6)
+                         (string= line "STREAM"
+                                  :start1 tok-start
+                                  :end1 (+ tok-start 6))
+                         (or (= (length line) (+ tok-start 6))
+                             (let ((after (char line (+ tok-start 6))))
+                               (or (char= after #\Space)
+                                   (char= after #\Tab)))))))
+              (when (and stream-token-p addr-str)
                 (let ((v4 (parse-ipv4-literal addr-str)))
-                  (when v4 (return (cons v4 :inet))))
+                  (when (and v4 (not (%unspecified-address-p v4)))
+                    (return (cons v4 :inet))))
                 (let ((v6 (parse-ipv6-literal addr-str)))
-                  (when v6 (return (cons v6 :inet6))))))))
+                  (when (and v6 (not (%unspecified-address-p v6)))
+                    (return (cons v6 :inet6))))))))
         (setf line-start (1+ lf))))))
 
 ;;; ---------------------------------------------------------------------------
