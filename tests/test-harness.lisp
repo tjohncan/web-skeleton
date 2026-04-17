@@ -234,7 +234,13 @@
                           :element-type '(unsigned-byte 8))))
              (write-sequence bytes stream)
              (force-output stream)
-             (sb-bsd-sockets:socket-shutdown socket :direction :output)
+             ;; Half-close is advisory — if the server has already
+             ;; processed + closed, SBCL's fd-stream may have torn
+             ;; down the fd during flush and the shutdown syscall
+             ;; would EBADF. We already have the write out; the
+             ;; subsequent read-until-EOF validates what came back.
+             (ignore-errors
+              (sb-bsd-sockets:socket-shutdown socket :direction :output))
              (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
                                          :fill-pointer 0 :adjustable t)))
                (loop for byte = (handler-case (read-byte stream nil nil)
@@ -294,7 +300,10 @@
              (sleep 0.1)
              (write-sequence body-bytes stream)
              (force-output stream)
-             (sb-bsd-sockets:socket-shutdown socket :direction :output)
+             ;; Half-close is advisory — tolerate ENOTCONN/EBADF
+             ;; when the server has already closed after processing.
+             (ignore-errors
+              (sb-bsd-sockets:socket-shutdown socket :direction :output))
              (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
                                          :fill-pointer 0 :adjustable t)))
                (loop for byte = (handler-case (read-byte stream nil nil)
@@ -773,8 +782,13 @@
                (force-output stream)
                ;; Half-close so the server sees FIN after having both
                ;; requests already in its buffer. This is the shape
-               ;; that reproduced the drop.
-               (sb-bsd-sockets:socket-shutdown socket :direction :output)
+               ;; that reproduced the drop. Advisory — if the server
+               ;; has already processed + closed, the fd-stream may
+               ;; have torn down the fd during flush and the syscall
+               ;; raises EBADF. The write is already out; assertions
+               ;; run against what came back.
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
                (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
                                             :fill-pointer 0 :adjustable t)))
                  (loop for byte = (handler-case (read-byte stream nil nil)
