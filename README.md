@@ -199,9 +199,11 @@ tests/
   as they arrive) without returning from the handler until the work is done
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built
-  response. MIME detection, extensionless HTML aliases, directory traversal
+  response. MIME detection, extensionless HTML aliases (`/login.html` → `/login`),
+  directory-index aliases (`/docs/index.html` → `/docs`), directory traversal
   protection, ETag-based revalidation (`If-None-Match` → `304 Not Modified`
-  using a SHA-256 strong entity tag computed at load time)
+  using a SHA-256 strong entity tag computed at load time), per-path
+  `:cache-control` override (string or function of URL path)
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit
   counters). Optional background reaper sweeps entries on an
