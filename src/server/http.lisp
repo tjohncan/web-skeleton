@@ -169,15 +169,21 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun validate-cookie-field (kind field)
-  "Reject CR, LF, and semicolon in a cookie name or value — the three
-   characters that would break the Set-Cookie header grammar or enable
-   structural injection."
+  "Reject characters that would break the Set-Cookie header grammar
+   or enable structural injection. CR / LF / NUL / ';' are rejected
+   for every field. '=' is rejected for the cookie name only:
+   browsers parse 'foo=bar=baz' as name='foo', value='bar=baz' per
+   RFC 6265 §5.2, so accepting '=' in a caller-supplied name would
+   silently rename the cookie to the substring before the first '='."
   (when (or (find #\Return field)
             (find #\Newline field)
             (find #\; field)
             (find (code-char 0) field))
     (error "build-cookie: ~a contains a forbidden character (NUL, CR, LF, or ';')"
-           kind)))
+           kind))
+  (when (and (string= kind "name") (find #\= field))
+    (error "build-cookie: name contains '=' — browsers would split ~
+            the cookie at it")))
 
 (defun build-cookie (name value &key (path "/") (http-only t) (secure t)
                                      (same-site :lax) max-age domain)
