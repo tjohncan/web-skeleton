@@ -168,6 +168,16 @@
         (max-size (cond
                     ((eq (connection-state conn) :websocket)
                      (+ *max-ws-payload-size* 14))
+                    ;; DNS pipe output is 'getent ahosts <host>' stdout —
+                    ;; a handful of STREAM / DGRAM / RAW lines per
+                    ;; address family, typically well under 1 KiB. Cap
+                    ;; at 8 KiB to match RESOLVE-HOST-BLOCKING's
+                    ;; explicit 8192-byte cap on the synchronous path;
+                    ;; reusing *MAX-OUTBOUND-RESPONSE-SIZE* here would
+                    ;; let a pathological NSS module produce an 8 MiB
+                    ;; buffer for what is definitionally a few lines.
+                    ((eq (connection-state conn) :out-dns)
+                     8192)
                     ((connection-outbound-p conn)
                      *max-outbound-response-size*)
                     (t
@@ -462,8 +472,13 @@
                               (= (aref buf (+ sp 5)) 47)   ; /
                               (= (aref buf (+ sp 6)) 49)   ; 1
                               (= (aref buf (+ sp 7)) 46))  ; .
-                   (http-parse-error "malformed request line")))
-               (let ((hdr-start (+ req-line-end 2)))
+                   (http-parse-error "malformed request line"))
+                 ;; Capture the minor-version byte (48 = HTTP/1.0,
+                 ;; 49 = HTTP/1.1) so SCAN-EXPECT-100-CONTINUE can be
+                 ;; gated on 1.1 below — RFC 7231 §5.1.1 scopes the
+                 ;; interim 100 Continue response to HTTP/1.1.
+                 (let ((minor-version-byte (aref buf (+ sp 8)))
+                       (hdr-start (+ req-line-end 2)))
                  ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
                  (when (scan-transfer-encoding buf header-end hdr-start)
                    (http-parse-error "Transfer-Encoding not supported"))
@@ -514,8 +529,15 @@
                            ;; Body still incoming and the client asked us to
                            ;; confirm before sending it. Queue the interim
                            ;; response; the worker flushes it and the body
-                           ;; arrives next.
-                           ((scan-expect-100-continue buf header-end hdr-start)
+                           ;; arrives next. Gated on HTTP/1.1 —
+                           ;; RFC 7231 §5.1.1 scopes the 1xx interim
+                           ;; response to HTTP/1.1 and explicitly says
+                           ;; a server MUST NOT send 1xx to an HTTP/1.0
+                           ;; client. Some 1.0-only clients don't
+                           ;; understand 1xx and fail the request when
+                           ;; they see one.
+                           ((and (= minor-version-byte 49)  ; '1' — HTTP/1.1
+                                 (scan-expect-100-continue buf header-end hdr-start))
                             (connection-queue-write conn *http-100-continue-bytes*)
                             (setf (connection-state conn) :sending-100-continue)
                             :send-continue)
@@ -526,7 +548,7 @@
                      ;; No body — request is complete
                      (progn
                        (setf (connection-header-end conn) header-end)
-                       :dispatch)))))
+                       :dispatch))))))
              ;; No CRLFCRLF yet — keep reading
              :continue)))
       (:read-body
