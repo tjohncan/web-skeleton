@@ -472,8 +472,8 @@
                                       (return-from https-fetch))
                                      (t (format-response
                                          response
-                                         :keep-alive-hint
-                                         (keep-alive-hint-for conn))))))
+                                         :connection-hint
+                                         (connection-hint-for conn))))))
                         (setf bytes (strip-body-for-head bytes conn))
                         (connection-queue-write conn bytes)
                         (setf (connection-state conn) :write-response
@@ -496,7 +496,7 @@
         (let ((err-bytes (strip-body-for-head
                          (format-response
                           (make-error-response 502)
-                          :keep-alive-hint (keep-alive-hint-for conn))
+                          :connection-hint (connection-hint-for conn))
                          conn)))
           (connection-queue-write conn err-bytes)
           (setf (connection-state conn) :write-response

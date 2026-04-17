@@ -207,7 +207,7 @@
         (let ((err-bytes (strip-body-for-head
                          (format-response
                           (make-error-response 502)
-                          :keep-alive-hint (keep-alive-hint-for inbound))
+                          :connection-hint (connection-hint-for inbound))
                          inbound)))
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response

@@ -868,16 +868,24 @@
                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
             year hour min sec)))
 
-(defun format-response (response &key keep-alive-hint)
+(defun format-response (response &key connection-hint)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
 
-   KEEP-ALIVE-HINT stamps 'Connection: keep-alive' at serialize time
-   when the caller has negotiated a keep-alive session with an
-   HTTP/1.0 client (HTTP/1.1's default is keep-alive, so the hint is
-   only meaningful for 1.0). The stamping happens in the emitted
-   bytes — never on the RESPONSE struct — so a cached struct reused
-   across requests does not accumulate state. A caller-set Connection
-   header takes precedence and the hint is ignored."
+   CONNECTION-HINT stamps a Connection header at serialize time:
+     :CLOSE      — stamps 'Connection: close' when the server has
+                   decided to close the socket after this response.
+                   RFC 7230 §6.1 says a sender that wishes to close
+                   SHOULD send the close option in the final message.
+     :KEEP-ALIVE — stamps 'Connection: keep-alive' for an HTTP/1.0
+                   client that negotiated keep-alive (HTTP/1.1's
+                   default is keep-alive, so the header would be
+                   redundant there).
+     NIL         — do not stamp; caller didn't care or the default
+                   framing is sufficient.
+   The stamping happens in the emitted bytes only — never on the
+   RESPONSE struct — so a cached struct reused across requests does
+   not accumulate state. A caller-set Connection header always
+   takes precedence; the hint is ignored when one is present."
   (let* ((status (http-response-status response))
          (body   (http-response-body response))
          (body-bytes (when body
@@ -900,12 +908,22 @@
                                      :test #'string-equal)))
                     (cons (cons "content-length" "0") headers))
                    (t headers)))
-         ;; HTTP/1.0 keep-alive: stamp the header without touching the
-         ;; caller's struct. App-set Connection header wins.
-         (headers (if (and keep-alive-hint
+         ;; Stamp the Connection header from the hint without touching
+         ;; the caller's struct. App-set Connection header wins — if
+         ;; the handler already put one in the alist, the hint is
+         ;; ignored. :CLOSE maps to 'close' (RFC 7230 §6.1 SHOULD on
+         ;; server-initiated close); :KEEP-ALIVE maps to 'keep-alive'
+         ;; (only meaningful for HTTP/1.0 — 1.1 defaults to keep-alive
+         ;; so the header would be redundant); NIL leaves framing to
+         ;; the default for the request's HTTP version.
+         (headers (if (and connection-hint
                            (not (assoc "connection" headers
                                        :test #'string-equal)))
-                      (cons (cons "connection" "keep-alive") headers)
+                      (cons (cons "connection"
+                                  (ecase connection-hint
+                                    (:close      "close")
+                                    (:keep-alive "keep-alive")))
+                            headers)
                       headers))
          ;; RFC 7231 §7.1.1.2: origin server MUST send Date
          (headers (if (assoc "date" headers :test #'string-equal)

@@ -503,24 +503,24 @@
                     ;; immutable: a caller that caches a (make-error-response
                     ;; 404) across requests must not have HEAD strip the
                     ;; body slot or HTTP/1.0 keep-alive stamp a Connection
-                    ;; header onto it. The :keep-alive-hint keyword on
+                    ;; header onto it. The :CONNECTION-HINT keyword on
                     ;; FORMAT-RESPONSE stamps the header at serialize time
                     ;; instead, and STRIP-BODY-FOR-HEAD truncates bytes
-                    ;; post-serialize — neither touches the struct.
+                    ;; post-serialize — neither touches the struct. The
+                    ;; hint is derived from CONNECTION-HINT-FOR, shared
+                    ;; with the async fetch paths so every response site
+                    ;; emits the same Connection header.
                     (t
-                     (let* ((keep-alive-hint
-                             (and (not (connection-close-after-p conn))
-                                  (string= (http-request-version request) "1.0")
-                                  (typep response 'http-response)))
-                            (bytes
-                             (strip-body-for-head
-                              (if (typep response
-                                         '(simple-array (unsigned-byte 8) (*)))
+                     (let ((bytes
+                            (strip-body-for-head
+                             (if (typep response
+                                        '(simple-array (unsigned-byte 8) (*)))
+                                 response
+                                 (format-response
                                   response
-                                  (format-response
-                                   response
-                                   :keep-alive-hint keep-alive-hint))
-                              conn)))
+                                  :connection-hint
+                                  (connection-hint-for conn)))
+                             conn)))
                        (connection-queue-write conn bytes)
                        (setf (connection-state conn)
                              (if upgrade-p :ws-upgrade :write-response))
