@@ -24,12 +24,26 @@
   ;; comes with the -dev package, which slim images don't install.
   ;; Loading the unversioned name first would have worked on a dev
   ;; workstation and silently failed in the container.
+  ;;
+  ;; NOT using :dont-save t. The function-cell swaps at the bottom of
+  ;; this file (sha1 / sha256 / ecdsa-verify-p256 → libssl-backed
+  ;; versions) survive SAVE-LISP-AND-DIE, so the shared library MUST
+  ;; be reachable when the dumped image is restored or the first call
+  ;; to any swapped function crashes with "undefined alien function"
+  ;; deep in the request path. The SBCL default (record the SONAME in
+  ;; sb-sys:*shared-objects* and re-dlopen on restore) is exactly the
+  ;; contract we need: if libssl is missing at image-restore time,
+  ;; SBCL errors loudly at startup rather than deferring to a
+  ;; mysterious crash on the hot path. Loading web-skeleton-tls
+  ;; commits the image to having libssl at runtime — that's an
+  ;; implied contract of the crypto swap, and removing :dont-save t
+  ;; makes the contract explicit.
   (labels ((try-load (candidates)
              "Walk CANDIDATES and return the first SONAME that loads,
               or NIL if none did."
              (dolist (name candidates)
                (when (ignore-errors
-                      (sb-alien:load-shared-object name :dont-save t)
+                      (sb-alien:load-shared-object name)
                       t)
                  (return name)))))
     (let ((crypto (try-load '("libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so")))
