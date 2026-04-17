@@ -74,6 +74,20 @@
   (let ((req (parse-request (crlf "GET / HTTP/1.1" "Host: localhost"))))
     (check "cookie no header" (get-cookie req "session") nil))
 
+  ;; Whitespace around cookie values trimmed — a misbehaving proxy or
+  ;; test harness can emit 'foo=bar ; baz=qux' with a stray space
+  ;; before the semicolon. Returning the raw substring silently breaks
+  ;; STRING= comparisons in the handler.
+  (let ((req (parse-request
+              (crlf "GET / HTTP/1.1"
+                    "Cookie: session=abc123 ; theme= dark ;lang=en"))))
+    (check "cookie trim: trailing space"
+           (get-cookie req "session") "abc123")
+    (check "cookie trim: leading space"
+           (get-cookie req "theme") "dark")
+    (check "cookie trim: last unaffected"
+           (get-cookie req "lang") "en"))
+
   ;; All methods (TRACE is deliberately rejected — see parser test below)
   (dolist (method '("GET" "POST" "PUT" "DELETE" "HEAD" "OPTIONS" "PATCH"))
     (let ((req (parse-request (crlf (format nil "~a / HTTP/1.1" method)
@@ -146,6 +160,19 @@
   (check-error "tab in URL"
                (parse-request
                 (crlf (format nil "GET /foo~cbar HTTP/1.1" #\Tab)
+                      "Host: localhost")))
+  ;; Non-ASCII bytes in URI rejected at parse time. Raw UTF-8 in the
+  ;; request-target violates RFC 3986 §2.1 (non-ASCII must be
+  ;; percent-encoded); rejecting at parse-time keeps URL-DECODE's
+  ;; :ascii conversion from firing mid-handler and surfacing
+  ;; symmetrical with the outbound PARSE-URL check.
+  (check-error "non-ASCII byte in URI path"
+               (parse-request
+                (crlf (format nil "GET /caf~c HTTP/1.1" (code-char #xe9))
+                      "Host: localhost")))
+  (check-error "non-ASCII byte in URI query"
+               (parse-request
+                (crlf (format nil "GET /?q=~c HTTP/1.1" (code-char #xe9))
                       "Host: localhost")))
 
   ;; CTL / DEL bytes in header NAMES rejected (RFC 7230 §3.2).
@@ -1019,6 +1046,35 @@
       (check "ipv6 end-to-end host bracketed"
              (not (null (search "host: [::1]:8080" text))) t)))
 
+  ;; Method charset: must be uppercase ASCII letters. Apps hardcode
+  ;; methods in practice, but a keyword interned from attacker-
+  ;; influenced data containing a space or CR would otherwise emit
+  ;; two valid request lines on the wire — request smuggling shape.
+  (flet ((raises-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    ;; (intern "get" :keyword) preserves the lowercase name on the
+    ;; keyword; :GET (the natural-syntax read) uppercases to "GET"
+    ;; and passes, which is what apps hardcode in practice.
+    (check "method charset: lowercase rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        (intern "get" :keyword)
+                        "localhost" "/"))) t)
+    (check "method charset: space rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        (intern "GET HTTP/1.1" :keyword)
+                        "localhost" "/"))) t)
+    (check "method charset: digits rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        (intern "GET1" :keyword)
+                        "localhost" "/"))) t)
+    (check "method charset: HEAD accepted"
+           (not (null (web-skeleton::build-outbound-request
+                       :HEAD "localhost" "/"))) t))
+
   ;; Config knobs that DEPLOYMENT.md tells users to setf from their
   ;; own packages must be exported from :WEB-SKELETON. An unqualified
   ;; reference inside another package's setf form would otherwise
@@ -1130,6 +1186,44 @@
     (check "ipv6: empty"                   (v6 "") nil)
     (check "ipv6: hostname"                (v6 "example.com") nil)
     (check "ipv6: ipv4 rejected"           (v6 "127.0.0.1") nil)
+    ;; IPv4-mapped / IPv4-compatible forms (RFC 4291 §2.5.5) — the
+    ;; final 32 bits are written as dotted-quad. Required for
+    ;; consistency with IS-PUBLIC-ADDRESS-P which already unwraps
+    ;; these to classify via the embedded v4.
+    (let ((mapped (v6 "::ffff:127.0.0.1")))
+      (check "ipv6: ::ffff:127.0.0.1 length"  (length mapped) 16)
+      (check "ipv6: ::ffff:127.0.0.1 bytes 10-11 ffff"
+             (list (aref mapped 10) (aref mapped 11)) '(255 255))
+      (check "ipv6: ::ffff:127.0.0.1 carries 127"
+             (aref mapped 12) 127)
+      (check "ipv6: ::ffff:127.0.0.1 last"
+             (aref mapped 15) 1))
+    (let ((compat (v6 "::127.0.0.1")))
+      (check "ipv6: ::127.0.0.1 length"  (length compat) 16)
+      (check "ipv6: ::127.0.0.1 bytes 10-11 zero"
+             (list (aref compat 10) (aref compat 11)) '(0 0))
+      (check "ipv6: ::127.0.0.1 carries 127"
+             (aref compat 12) 127))
+    (check "ipv6: dotted-quad without embedded rejected"
+           (v6 "1.2.3.4") nil)
+    ;; Malformed IPv4 tails after :: — each must reject cleanly.
+    ;; A broken %IPV6-MAYBE-UNFOLD-IPV4-TAIL that returned NIL on
+    ;; failed parse would let these parse as '::' (all zeros)
+    ;; because the dropped suffix collapses to zero pad groups.
+    (check "ipv6: ::1.2.3 too few octets rejected"
+           (v6 "::1.2.3") nil)
+    (check "ipv6: ::1.2.3.4.5 too many octets rejected"
+           (v6 "::1.2.3.4.5") nil)
+    (check "ipv6: ::256.1.2.3 out-of-range octet rejected"
+           (v6 "::256.1.2.3") nil)
+    (check "ipv6: ::01.2.3.4 leading-zero octet rejected"
+           (v6 "::01.2.3.4") nil)
+    (check "ipv6: ::garbage.com rejected"
+           (v6 "::garbage.com") nil)
+    (check "ipv6: abcd::1.2.3 non-suffix-pad rejected"
+           (v6 "abcd::1.2.3") nil)
+    (check "ipv6: ::ffff:invalid.host rejected"
+           (v6 "::ffff:invalid.host") nil)
 
     ;; ---- parse-getent-output ----
     (let* ((text (format nil "127.0.0.1       STREAM localhost~%~
@@ -1923,6 +2017,77 @@
          (web-skeleton::websocket-accept-key "dGhlIHNhbXBsZSBub25jZQ==")
          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 
+  ;; websocket-upgrade-p validates the Sec-WebSocket-Key charset.
+  ;; Length alone accepts any 24-char string — including one with a
+  ;; non-ASCII byte that would later trip websocket-accept-key's
+  ;; :external-format :ascii conversion and surface as 500 instead
+  ;; of the 400 a malformed key deserves.
+  (flet ((ws-req (key)
+           (make-test-request
+            :method :GET
+            :headers `(("host" . "localhost")
+                       ("upgrade" . "websocket")
+                       ("connection" . "Upgrade")
+                       ("sec-websocket-key" . ,key)
+                       ("sec-websocket-version" . "13")))))
+    (check "ws-upgrade: valid base64 key accepted"
+           (not (null (web-skeleton::websocket-upgrade-p
+                       (ws-req "dGhlIHNhbXBsZSBub25jZQ==")))) t)
+    ;; 24 chars including one non-ASCII — passes the length check so
+    ;; the charset check is actually exercised (not short-circuited).
+    (check "ws-upgrade: non-ASCII in key rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req (concatenate 'string
+                                 "dGhlIHNhbXBsZSBub25"
+                                 (string (code-char #xe9))
+                                 "ZQ==")))
+           nil)
+    (check "ws-upgrade: space in key rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub 5jZQ=="))
+           nil)
+    (check "ws-upgrade: short key (length) rejected"
+           (web-skeleton::websocket-upgrade-p (ws-req "dGhlIHNhbXBsZQ=="))
+           nil))
+
+  ;; build-ws-close only accepts the send-allowed set per RFC 6455
+  ;; §7.4.1: 1000-1003, 1007-1014, 3000-4999. Clamp-on-receive is
+  ;; interop-friendly; send-strict is symmetric with the RFC's MUST
+  ;; NOT on 1004/1005/1006/1015.
+  (flet ((raises-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    ;; Out-of-u16 range.
+    (check "build-ws-close: code > 65535 rejected"
+           (raises-p (lambda () (build-ws-close 99999))) t)
+    (check "build-ws-close: negative rejected"
+           (raises-p (lambda () (build-ws-close -1))) t)
+    ;; Reserved-on-send: MUST NOT be sent per §7.4.1.
+    (check "build-ws-close: 1004 reserved rejected"
+           (raises-p (lambda () (build-ws-close 1004))) t)
+    (check "build-ws-close: 1005 reserved rejected"
+           (raises-p (lambda () (build-ws-close 1005))) t)
+    (check "build-ws-close: 1006 reserved rejected"
+           (raises-p (lambda () (build-ws-close 1006))) t)
+    (check "build-ws-close: 1015 reserved rejected"
+           (raises-p (lambda () (build-ws-close 1015))) t)
+    ;; Unassigned / future-use bands.
+    (check "build-ws-close: 999 rejected"
+           (raises-p (lambda () (build-ws-close 999))) t)
+    (check "build-ws-close: 2000 unassigned rejected"
+           (raises-p (lambda () (build-ws-close 2000))) t)
+    (check "build-ws-close: 5000 out-of-band rejected"
+           (raises-p (lambda () (build-ws-close 5000))) t)
+    ;; Valid send codes.
+    (check "build-ws-close: 1000 accepted"
+           (not (null (build-ws-close 1000))) t)
+    (check "build-ws-close: 1001 accepted"
+           (not (null (build-ws-close 1001))) t)
+    (check "build-ws-close: 1011 accepted"
+           (not (null (build-ws-close 1011))) t)
+    (check "build-ws-close: 4000 app-range accepted"
+           (not (null (build-ws-close 4000))) t))
+
   ;; connection-header-has-token-p
   (check "token single"
          (web-skeleton::connection-header-has-token-p "upgrade" "upgrade") t)
@@ -2093,16 +2258,12 @@
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
            t)
 
-    ;; Reserved close code clamped to 1000
-    ;; Build a close frame with code 1006 (reserved, must not echo)
-    (let ((close-frame (build-ws-close 1006)))
-      ;; Verify build-ws-close produces the code we asked for
-      (check "close frame code 1006 built"
-             (logior (ash (aref close-frame 2) 8) (aref close-frame 3))
-             1006))
-    ;; The clamping happens in websocket-on-read (requires a connection),
-    ;; but we verify the reserved-code logic directly against the
-    ;; extracted helper — same function the server calls, no duplicate.
+    ;; Reserved close code handling on the receive side: clients can
+    ;; send any code and the server CLAMPS (not fails) on receive for
+    ;; interop. BUILD-WS-CLOSE on the send side is strict and rejects
+    ;; reserved codes — see the test-websocket section that covers
+    ;; BUILD-WS-CLOSE's allowed set directly. The clamp tests below
+    ;; exercise the receive classifier.
     (check "close code 1004 clamped"
            (web-skeleton::clamp-close-code 1004) 1000)
     (check "close code 1005 clamped"
@@ -2491,6 +2652,17 @@
     ;; Test the pieces individually instead.
     (check "jwt split"
            (length (web-skeleton::jwt-split token)) 3)
+    ;; Malformed tokens (≠ 2 dots) return NIL with early-bail — a
+    ;; pathological 8 KiB token with many dots no longer allocates
+    ;; O(dots) substrings before rejection.
+    (check "jwt split: no dots returns nil"
+           (web-skeleton::jwt-split "nodotshere") nil)
+    (check "jwt split: one dot returns nil"
+           (web-skeleton::jwt-split "only.one") nil)
+    (check "jwt split: four dots returns nil"
+           (web-skeleton::jwt-split "a.b.c.d.e") nil)
+    (check "jwt split: three dots returns nil (early bail)"
+           (web-skeleton::jwt-split "a.b.c.d") nil)
 
     ;; Verify signature is valid by calling ecdsa-verify-p256 directly
     (let* ((signing-input (format nil "~a.~a" header-b64 payload-b64))
