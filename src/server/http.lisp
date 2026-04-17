@@ -148,7 +148,15 @@
                      (char= (char header (+ pos name-len)) #\=))
             (let* ((val-start (+ pos name-len 1))
                    (val-end (or (position #\; header :start val-start) len)))
-              (return (subseq header val-start val-end))))
+              ;; Trim stray leading/trailing SP/TAB from the value.
+              ;; RFC 6265 §4.1.1 cookie-octet excludes whitespace —
+              ;; a spec-compliant value doesn't carry any — but
+              ;; misbehaving proxies and test harnesses can inject
+              ;; 'foo=bar ; baz=qux'. Silently including the trailing
+              ;; space in the returned value is a footgun for apps
+              ;; that compare via STRING=. Trim at read time.
+              (return (string-trim '(#\Space #\Tab)
+                                   (subseq header val-start val-end)))))
           ;; Skip to next pair
           (let ((semi (position #\; header :start pos)))
             (unless semi (return nil))
@@ -551,13 +559,17 @@
                                      (= b #x7F))
                             do (http-parse-error
                                 "invalid byte 0x~2,'0x in header value" b))
-                      (push (cons name (if (= vs ve) ""
-                                           (bytes-to-string buf vs ve)))
-                            headers)
+                      ;; Check the count before pushing so the over-
+                      ;; budget header is not allocated into the alist
+                      ;; before we reject. Matches the pre-check
+                      ;; pattern used elsewhere (e.g. JSON depth).
                       (incf count)
                       (when (> count *max-header-count*)
                         (http-parse-error "too many headers (~d, max ~d)"
-                                          count *max-header-count*))))))))
+                                          count *max-header-count*))
+                      (push (cons name (if (= vs ve) ""
+                                           (bytes-to-string buf vs ve)))
+                            headers)))))))
         (setf pos (+ crlf 2))))
     (nreverse headers)))
 
@@ -636,10 +648,23 @@
               ;; matches the CRLF pair) and ends up in the parsed PATH
               ;; string, giving an attacker a log-injection primitive via
               ;; any ~a-interpolated log call that names the path.
+              ;; Non-ASCII bytes (>= 0x80) rejected at parse time too.
+              ;; RFC 3986 §2.1 requires non-ASCII characters in URLs to
+              ;; be percent-encoded — raw UTF-8 bytes are non-compliant
+              ;; from a spec-adhering client. Without this check the
+              ;; bytes survive into the parsed PATH/QUERY strings; a
+              ;; later GET-QUERY-PARAM call trips URL-DECODE's
+              ;; :external-format :ascii conversion and the handler
+              ;; answers 400 at dispatch time with a misleading
+              ;; "parse error" log line. Rejecting at parse-time keeps
+              ;; the parser's contract honest and the error path
+              ;; consistent with the outbound PARSE-URL check.
               (loop for i from uri-start below sp2
                     for b = (aref buf i)
                     when (or (< b #x20) (= b #x7F))
-                    do (http-parse-error "control character in request-target"))
+                    do (http-parse-error "control character in request-target")
+                    when (>= b #x80)
+                    do (http-parse-error "non-ASCII byte in request-target"))
               (let ((path (bytes-to-string buf uri-start path-end))
                     (query (when qmark
                              (bytes-to-string buf (1+ qmark) sp2))))
@@ -843,8 +868,16 @@
                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
             year hour min sec)))
 
-(defun format-response (response)
-  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket."
+(defun format-response (response &key keep-alive-hint)
+  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
+
+   KEEP-ALIVE-HINT stamps 'Connection: keep-alive' at serialize time
+   when the caller has negotiated a keep-alive session with an
+   HTTP/1.0 client (HTTP/1.1's default is keep-alive, so the hint is
+   only meaningful for 1.0). The stamping happens in the emitted
+   bytes — never on the RESPONSE struct — so a cached struct reused
+   across requests does not accumulate state. A caller-set Connection
+   header takes precedence and the hint is ignored."
   (let* ((status (http-response-status response))
          (body   (http-response-body response))
          (body-bytes (when body
@@ -867,6 +900,13 @@
                                      :test #'string-equal)))
                     (cons (cons "content-length" "0") headers))
                    (t headers)))
+         ;; HTTP/1.0 keep-alive: stamp the header without touching the
+         ;; caller's struct. App-set Connection header wins.
+         (headers (if (and keep-alive-hint
+                           (not (assoc "connection" headers
+                                       :test #'string-equal)))
+                      (cons (cons "connection" "keep-alive") headers)
+                      headers))
          ;; RFC 7231 §7.1.1.2: origin server MUST send Date
          (headers (if (assoc "date" headers :test #'string-equal)
                       headers
