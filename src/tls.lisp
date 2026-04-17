@@ -234,8 +234,29 @@
           (ignore-errors (sb-bsd-sockets:socket-close socket))
           (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
 
+(defun ssl-write-error-raise (ssl n)
+  "Classify a non-positive SSL_write return and raise with the same
+   errno discipline as SSL-READ-EOF-OR-RAISE: distinguish a
+   SO_SNDTIMEO expiry (errno = EAGAIN/EWOULDBLOCK) from a real
+   transport failure so operators chasing timeouts can tell them
+   apart in the log. Write has no benign-EOF case — every
+   non-positive return is an error."
+  (let ((err (%ssl-get-error ssl n)))
+    (cond
+      ((= err +ssl-error-syscall+)
+       (let ((errno (get-errno)))
+         (cond
+           ((or (= errno +eagain+) (= errno +ewouldblock+))
+            (error "SSL_write: timed out (~a)" (errno-string errno)))
+           (t
+            (error "SSL_write: transport error ~a" (errno-string errno))))))
+      (t (error "SSL_write failed: error ~d" err)))))
+
 (defun tls-write-all (ssl bytes)
-  "Write all BYTES through the SSL connection. Blocks until complete."
+  "Write all BYTES through the SSL connection. Blocks until complete.
+   Surfaces SO_SNDTIMEO as a distinct error from transport failures
+   via SSL-WRITE-ERROR-RAISE — symmetric with SSL-READ-EOF-OR-RAISE
+   on the read path."
   (let ((pos 0)
         (len (length bytes)))
     (loop while (< pos len)
@@ -244,7 +265,7 @@
                                     (sb-sys:sap+ (sb-sys:vector-sap bytes) pos)
                                     (- len pos))))
                  (when (<= n 0)
-                   (error "SSL_write failed: error ~d" (%ssl-get-error ssl n)))
+                   (ssl-write-error-raise ssl n))
                  (incf pos n))))))
 
 (defun ssl-read-eof-or-raise (ssl n)
@@ -437,6 +458,10 @@
                     (let ((response (funcall callback
                                              status (or headers nil)
                                              (or body nil))))
+                      ;; Sync close-after-p from the callback's response
+                      ;; before format-response — a handler-set
+                      ;; Connection: close should zero out the hint too.
+                      (sync-close-after-p-from-response conn response)
                       ;; Deliver to inbound connection
                       (let ((bytes (cond
                                      ((typep response '(simple-array (unsigned-byte 8) (*)))
@@ -445,7 +470,10 @@
                                       ;; Chained fetch
                                       (initiate-fetch conn epoll-fd response)
                                       (return-from https-fetch))
-                                     (t (format-response response)))))
+                                     (t (format-response
+                                         response
+                                         :keep-alive-hint
+                                         (keep-alive-hint-for conn))))))
                         (setf bytes (strip-body-for-head bytes conn))
                         (connection-queue-write conn bytes)
                         (setf (connection-state conn) :write-response
@@ -466,7 +494,9 @@
             (error (e2)
               (log-warn "fetch cleanup callback raised: ~a" e2))))
         (let ((err-bytes (strip-body-for-head
-                         (format-response (make-error-response 502))
+                         (format-response
+                          (make-error-response 502)
+                          :keep-alive-hint (keep-alive-hint-for conn))
                          conn)))
           (connection-queue-write conn err-bytes)
           (setf (connection-state conn) :write-response
