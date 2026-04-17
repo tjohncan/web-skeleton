@@ -315,13 +315,16 @@
                                              (= b (- n 32)))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Expect: 100-continue
+;;; Expect: disposition scanning (RFC 7231 §5.1.1)
 ;;;
-;;; When a request carries "Expect: 100-continue" and we intend to read the
-;;; body, RFC 7231 §5.1.1 wants the server to answer with an interim
-;;; "HTTP/1.1 100 Continue" status before the body arrives. Without it,
-;;; curl / Go / Python / Java HTTP clients all pause 1-3s after sending
-;;; headers on large POSTs before giving up and sending the body.
+;;; The Expect header carries one or more expectations. The only one
+;;; defined by RFC 7231 is "100-continue" — the server MUST answer with
+;;; an interim "HTTP/1.1 100 Continue" before the body arrives, or
+;;; curl / Go / Python / Java clients pause 1-3s on large POSTs before
+;;; giving up and sending the body anyway. Any other token is an
+;;; "unknown expectation" which §5.1.1 says MUST be answered with 417
+;;; Expectation Failed. Tokens we accept silently become
+;;; interoperability hazards against strict upstreams, so reject.
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *http-100-continue-bytes*
@@ -332,11 +335,29 @@
   "Pre-built bytes for the HTTP/1.1 100 Continue interim response.
    Queued before reading the body when the client asks for it.")
 
-(defun scan-expect-100-continue (buf end &optional (start 0))
-  "Return T if BUF[START..END) contains an Expect header whose value is
-   100-continue (case-insensitive). Start-of-line match only — suffixed
-   names like X-Expect do not match. The token terminator check blocks
-   near-miss matches like 100-continued."
+(defparameter *http-417-bytes*
+  (sb-ext:string-to-octets
+   (format nil "HTTP/1.1 417 Expectation Failed~c~c~
+                Content-Length: 0~c~c~
+                Connection: close~c~c~c~c"
+           #\Return #\Newline #\Return #\Newline
+           #\Return #\Newline #\Return #\Newline)
+   :external-format :ascii)
+  "Pre-built bytes for the HTTP/1.1 417 Expectation Failed response
+   sent on any Expect token other than 100-continue (RFC 7231 §5.1.1).
+   Carries Content-Length: 0 and Connection: close — the framework
+   closes after sending.")
+
+(defun scan-expect-disposition (buf end &optional (start 0))
+  "Classify the Expect header in BUF[START..END). Returns
+     :100-CONTINUE — an Expect: 100-continue header (case-insensitive)
+                     with a valid token terminator. Near-miss values
+                     like 100-continued are classified as :UNKNOWN.
+     :UNKNOWN      — an Expect header whose value is not 100-continue.
+                     RFC 7231 §5.1.1 MUSTs a 417 response on these.
+     :NONE         — no Expect header present.
+   Start-of-line match only — suffixed names like X-Expect do not
+   match. First Expect header wins (early return)."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "expect:"
                                          :external-format :ascii)))
@@ -354,6 +375,7 @@
                               always (or (= b n)
                                          (and (<= 97 n 122)
                                               (= b (- n 32))))))
+               ;; Found an Expect header. Classify it.
                (let ((pos (+ i (length name))))
                  ;; Skip OWS after the colon.
                  (loop while (and (< pos end)
@@ -387,7 +409,10 @@
                                (let ((b (aref buf after)))
                                  (or (= b 13) (= b 32) (= b 9)
                                      (= b 59) (= b 44))))
-                       (return t)))))))))
+                       (return-from scan-expect-disposition :100-continue))))
+                 ;; Header present but value not 100-continue.
+                 (return-from scan-expect-disposition :unknown))))
+    :none))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-read
@@ -516,7 +541,9 @@
                               (when (< (- (connection-read-pos conn) body-start)
                                        content-length)
                                 (return-from connection-on-read :close))))))
-                       (let ((body-available (- (connection-read-pos conn) body-start)))
+                       (let ((body-available (- (connection-read-pos conn) body-start))
+                             (expect (scan-expect-disposition
+                                      buf header-end hdr-start)))
                          (setf (connection-body-expected conn) content-length
                                (connection-header-end conn) header-end)
                          (cond
@@ -526,20 +553,23 @@
                            ((>= body-available content-length)
                             (setf (connection-state conn) :read-body)
                             :dispatch)
-                           ;; Body still incoming and the client asked us to
-                           ;; confirm before sending it. Queue the interim
-                           ;; response; the worker flushes it and the body
-                           ;; arrives next. Gated on HTTP/1.1 —
-                           ;; RFC 7231 §5.1.1 scopes the 1xx interim
-                           ;; response to HTTP/1.1 and explicitly says
-                           ;; a server MUST NOT send 1xx to an HTTP/1.0
-                           ;; client. Some 1.0-only clients don't
-                           ;; understand 1xx and fail the request when
-                           ;; they see one.
-                           ((and (= minor-version-byte 49)  ; '1' — HTTP/1.1
-                                 (scan-expect-100-continue buf header-end hdr-start))
-                            (connection-queue-write conn *http-100-continue-bytes*)
+                           ;; Body still incoming and client asked for
+                           ;; 100 Continue. RFC 7231 §5.1.1 scopes 1xx to
+                           ;; HTTP/1.1; a 1.0 client with Expect gets its
+                           ;; body read without the interim.
+                           ((and (= minor-version-byte 49)
+                                 (eq expect :100-continue))
+                            (connection-queue-write
+                             conn *http-100-continue-bytes*)
                             (setf (connection-state conn) :sending-100-continue)
+                            :send-continue)
+                           ;; Any other Expect token → 417 per §5.1.1.
+                           ;; Silently accepting unknown expectations is
+                           ;; an interop hazard against strict upstreams.
+                           ((eq expect :unknown)
+                            (connection-queue-write conn *http-417-bytes*)
+                            (setf (connection-state conn) :write-response
+                                  (connection-close-after-p conn) t)
                             :send-continue)
                            ;; Plain body wait.
                            (t
