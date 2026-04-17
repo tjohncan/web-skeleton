@@ -802,10 +802,19 @@
                      (setf content-length n))))))
     ;; Stream body lines
     (cond
-      ;; HEAD: RFC 7231 §4.3.2 — no body regardless of declared
-      ;; framing. Skip body entirely and skip the post-body
-      ;; truncation checks.
-      ((eq method :HEAD) nil)
+      ;; Bodiless responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1,
+      ;; RFC 7231 §4.3.2. 1xx / 204 / 304 are always terminated by
+      ;; the empty-line header boundary regardless of CL / TE, and
+      ;; HEAD responses carry no body even when the upstream echoes
+      ;; the GET Content-Length. Skip body phase and its truncation
+      ;; checks. Symmetric with complete-fetch's exempt set on the
+      ;; buffered path — without this, a 204 with a leftover CL or
+      ;; a 304 with chunked framing would either raise "short body"
+      ;; or block forever waiting for framing that will never arrive.
+      ((or (eq method :HEAD)
+           (and status
+                (or (<= 100 status 199) (= status 204) (= status 304))))
+       nil)
       (chunked
        (stream-chunked-lines r on-line))
       ((and content-length (not te-present))

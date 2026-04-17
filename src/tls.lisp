@@ -636,11 +636,21 @@
                                     (progn
                                       (setf in-headers nil)
                                       (when chunked (setf in-chunk-size t))
-                                      ;; HEAD: RFC 7231 §4.3.2 — no body
-                                      ;; regardless of CL / chunked framing.
-                                      ;; Return status directly and skip
-                                      ;; the post-loop truncation checks.
-                                      (when (eq method :HEAD)
+                                      ;; Bodiless responses — 1xx / 204
+                                      ;; / 304 / HEAD. RFC 7230 §3.3.3
+                                      ;; rule 1, RFC 7232 §4.1, RFC 7231
+                                      ;; §4.3.2: empty-line header
+                                      ;; boundary terminates regardless
+                                      ;; of CL / TE. Skip body phase and
+                                      ;; its truncation checks.
+                                      ;; Symmetric with the exempt set
+                                      ;; in complete-fetch's buffered
+                                      ;; path.
+                                      (when (or (eq method :HEAD)
+                                                (and status
+                                                     (or (<= 100 status 199)
+                                                         (= status 204)
+                                                         (= status 304))))
                                         (return-from tls-stream-response
                                           (or status
                                               (error "https streaming: no parseable status line")))))

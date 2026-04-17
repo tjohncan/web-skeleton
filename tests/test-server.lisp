@@ -1955,6 +1955,44 @@
                t)
       (close stream)))
 
+  ;; Bodiless responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1, RFC
+  ;; 7231 §4.3.2. 1xx / 204 / 304 / HEAD terminate at the header-end
+  ;; empty line regardless of CL / TE. Before the exempt was ported
+  ;; to streaming, a 204 with a leftover CL raised "short body" and a
+  ;; 304 with chunked framing blocked waiting for chunk-size bytes
+  ;; that would never arrive. Symmetric with complete-fetch's
+  ;; exempt set on the buffered path.
+  (dolist (spec '((204 "Content-Length: 500")
+                  (304 "Content-Length: 500")
+                  (304 "Transfer-Encoding: chunked")
+                  (100 "Content-Length: 500")
+                  (199 "Content-Length: 500")))
+    (destructuring-bind (status-code framing-line) spec
+      (let* ((reason (case status-code
+                       (100 "Continue")
+                       (199 "Experimental")
+                       (204 "No Content")
+                       (304 "Not Modified")))
+             (raw (ascii-bytes
+                   (concatenate 'string
+                                (format nil "HTTP/1.1 ~d ~a" status-code reason)
+                                (string #\Return) (string #\Newline)
+                                framing-line
+                                (string #\Return) (string #\Newline)
+                                (string #\Return) (string #\Newline))))
+             (stream (make-mock-stream raw))
+             (body-lines 0))
+        (unwind-protect
+            (let ((status (web-skeleton::stream-response-lines
+                           stream (lambda (line)
+                                    (declare (ignore line))
+                                    (incf body-lines)))))
+              (check (format nil "streaming ~d: exempt returns status" status-code)
+                     status status-code)
+              (check (format nil "streaming ~d: callback not invoked" status-code)
+                     body-lines 0))
+          (close stream)))))
+
   ;; TE: identity + CL should ignore CL per RFC 7230 §3.3.3 rule 3.
   ;; The response is close-delimited, not CL-framed.
   (let* ((raw (ascii-bytes (concatenate 'string
