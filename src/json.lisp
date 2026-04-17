@@ -186,8 +186,16 @@
                   (let* ((*read-default-float-format* 'double-float)
                          (*read-eval* nil)
                          (*read-base* 10)
+                         ;; Broad catch: READ-FROM-STRING can signal
+                         ;; ARITHMETIC-ERROR on overflow, but also
+                         ;; READER-ERROR / SIMPLE-ERROR on shapes the
+                         ;; pre-scan did not rule out. All of them
+                         ;; route to the same 'out of range at N'
+                         ;; error so an app sees one consistent
+                         ;; failure shape instead of a raw SBCL
+                         ;; condition leaking through.
                          (val (handler-case (read-from-string num-str)
-                                (arithmetic-error ()
+                                (error ()
                                   (error "json: number out of range at ~d"
                                          start)))))
                     (when (or (sb-ext:float-infinity-p val)
