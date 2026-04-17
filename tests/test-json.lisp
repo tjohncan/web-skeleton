@@ -185,10 +185,11 @@
 
 (defun test-json ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== JSON Tests ===~%")
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-serialize)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (report-suite "JSON")
   (zerop *tests-failed*))

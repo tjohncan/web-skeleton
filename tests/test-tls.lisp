@@ -6,7 +6,8 @@
 
 (defun test-tls ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== TLS Tests ===~%")
   (if (null web-skeleton:*https-fetch-fn*)
       (progn
@@ -15,7 +16,7 @@
         t)
       (progn
         (test-tls-registration)
-        (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+        (report-suite "TLS")
         (zerop *tests-failed*))))
 
 (defun test-tls-registration ()

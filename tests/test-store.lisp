@@ -176,7 +176,8 @@
 
 (defun test-store ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== Store Tests ===~%")
   (test-store-basics)
   (test-store-update)
@@ -184,5 +185,5 @@
   (test-store-validation)
   (test-store-reaper)
   (test-store-thread-safety)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (report-suite "Store")
   (zerop *tests-failed*))

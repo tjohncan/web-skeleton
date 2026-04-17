@@ -433,7 +433,8 @@
 
 (defun test-algorithms ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== Algorithm Tests ===~%")
   (test-sha1)
   (test-sha256)
@@ -445,7 +446,7 @@
   (test-constant-time-equal)
   (test-hex)
   (test-random)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (report-suite "Algorithms")
   (zerop *tests-failed*))
 
 ;;; ---------------------------------------------------------------------------
@@ -475,7 +476,8 @@
    the default TEST runner — invoke manually when editing pure-Lisp
    algorithm sources."
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== Pure-Lisp crypto re-verification ===~%")
   (let ((saved-sha1   (symbol-function 'sha1))
         (saved-sha256 (symbol-function 'sha256))
@@ -492,6 +494,5 @@
       (setf (symbol-function 'sha1)              saved-sha1
             (symbol-function 'sha256)            saved-sha256
             (symbol-function 'ecdsa-verify-p256) saved-ecdsa)))
-  (format t "~%~d passed, ~d failed (pure-Lisp)~%~%"
-          *tests-passed* *tests-failed*)
+  (report-suite "Pure-Lisp Crypto" "(pure-Lisp)")
   (zerop *tests-failed*))
