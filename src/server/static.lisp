@@ -80,19 +80,23 @@
 ;;; Pre-build complete HTTP response bytes
 ;;; ---------------------------------------------------------------------------
 
-(defun build-static-response (mime-type content file-mtime)
+(defun build-static-response (mime-type content file-mtime
+                              &optional (cache-control "public, max-age=3600"))
   "Build pre-built 200 GET, 200 HEAD, and 304 Not Modified response
    byte vectors for a static file. CONTENT is the file's bytes;
-   FILE-MTIME is its modification time (universal-time). The ETag
-   is a strong entity tag derived from the content's SHA-256 — so
-   revalidation via If-None-Match happens automatically the moment
-   LOAD-STATIC-FILES runs. Returns a STATIC-ENTRY."
+   FILE-MTIME is its modification time (universal-time). CACHE-CONTROL
+   is the Cache-Control header value — a string, defaulting to
+   'public, max-age=3600'. LOAD-STATIC-FILES resolves its :CACHE-CONTROL
+   argument (string or function of URL path) before calling here.
+   The ETag is a strong entity tag derived from the content's
+   SHA-256 — so revalidation via If-None-Match happens automatically
+   the moment LOAD-STATIC-FILES runs. Returns a STATIC-ENTRY."
   (let* ((etag (format nil "\"~a\"" (sha256-hex content)))
          (full-headers
           (list (cons "content-type" mime-type)
                 (cons "content-length" (write-to-string (length content)))
                 (cons "etag" etag)
-                (cons "cache-control" "public, max-age=3600")
+                (cons "cache-control" cache-control)
                 (cons "x-content-type-options" "nosniff")
                 ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
                 ;; Pre-built responses cannot carry a per-request timestamp,
@@ -104,7 +108,7 @@
          ;; Cache-Control, Last-Modified). No Content-Type / Content-Length / body.
          (not-modified-headers
           (list (cons "etag" etag)
-                (cons "cache-control" "public, max-age=3600")
+                (cons "cache-control" cache-control)
                 (cons "last-modified" (http-date file-mtime)))))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK"
@@ -139,11 +143,31 @@
 ;;; Directory scanning and cache loading
 ;;; ---------------------------------------------------------------------------
 
-(defun load-static-files (directory)
+(defun load-static-files (directory &key (cache-control "public, max-age=3600"))
   "Load all files under DIRECTORY into the static file cache.
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
-   Additive — can be called multiple times. Collisions: last wins."
+   Additive — can be called multiple times. Collisions: last wins.
+
+   CACHE-CONTROL is either a string (used for every file) or a
+   function of one argument (the URL path) that returns a string.
+   Defaults to 'public, max-age=3600'. The function form lets apps
+   vary the header by path — e.g. long max-age + immutable for
+   fingerprinted bundle filenames, a short max-age for index.html
+   so SPA deploys become visible promptly:
+
+     (load-static-files
+       \"static/\"
+       :cache-control
+       (lambda (url-path)
+         (if (search \".immutable.\" url-path)
+             \"public, max-age=31536000, immutable\"
+             \"public, max-age=60\")))
+
+   The resolved string is validated by SERIALIZE-HTTP-MESSAGE on
+   the first request serving, so a value containing CR / LF / NUL
+   raises a pointed error at response-build time rather than going
+   on the wire."
   (let ((dir-path (probe-file (pathname directory))))
     (unless dir-path
       (log-warn "static: directory not found: ~a" directory)
@@ -184,7 +208,10 @@
                             (content (read-file-bytes fs-path))
                             (mime (mime-type-for-path url-path))
                             (mtime (file-write-date file))
-                            (response (build-static-response mime content mtime)))
+                            (cc (if (functionp cache-control)
+                                    (funcall cache-control url-path)
+                                    cache-control))
+                            (response (build-static-response mime content mtime cc)))
                        (when (gethash url-path *static-cache*)
                          (log-debug "static: replacing ~a" url-path))
                        (setf (gethash url-path *static-cache*) response)
@@ -200,11 +227,29 @@
           ;; is undefined per the CL spec
           (maphash (lambda (url-path response)
                      (let ((len (length url-path)))
+                       ;; /foo.html → /foo
                        (when (and (> len 5)
                                   (string= url-path ".html"
                                            :start1 (- len 5)))
                          (let ((alias (subseq url-path 0 (- len 5))))
                            (unless (gethash alias *static-cache*)
+                             (push (cons alias response) pending))))
+                       ;; /dir/index.html → /dir (no trailing slash).
+                       ;; /dir/ already falls through to index.html via
+                       ;; the runtime lookup in SERVE-STATIC; this alias
+                       ;; closes the /dir (bare) gap so both forms hit
+                       ;; the same entry, consistent with the .html
+                       ;; extensionless alias above.
+                       (when (and (>= len 11)
+                                  (string= url-path "/index.html"
+                                           :start1 (- len 11)))
+                         (let ((alias (subseq url-path 0 (- len 11))))
+                           ;; /index.html at root would alias to empty —
+                           ;; skip, the root case is served via exact
+                           ;; match on /index.html plus the /-prefix
+                           ;; runtime fallback.
+                           (when (and (> (length alias) 0)
+                                      (not (gethash alias *static-cache*)))
                              (push (cons alias response) pending))))))
                    *static-cache*)
           (dolist (entry pending)
