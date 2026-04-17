@@ -351,11 +351,10 @@
         (multiple-value-bind (ssl socket)
             (tls-connect host port)
           (unwind-protect
-              (progn
+              (let ((method (http-fetch-continuation-method fetch-req)))
                 ;; Build and send the HTTP request
                 (let ((request-bytes (build-outbound-request
-                                     (http-fetch-continuation-method fetch-req)
-                                     host path
+                                     method host path
                                      :scheme :https :port port
                                      :headers (http-fetch-continuation-headers fetch-req)
                                      :body (http-fetch-continuation-body fetch-req))))
@@ -402,8 +401,16 @@
                     ;; indication. Signal an error so the outer
                     ;; handler-case converts it into a 502 and fires
                     ;; the cleanup sentinel.
+                    ;;
+                    ;; Skipped for 1xx/204/304 (carry CL but MUST NOT
+                    ;; have a body per RFC 7230 §3.3.3 rule 1 / RFC 7232
+                    ;; §4.1) and for HEAD (RFC 7231 §4.3.2 — upstream
+                    ;; echoes the GET-body CL but MUST NOT send a body).
+                    ;; Twin of the exemption in fetch.lisp COMPLETE-FETCH
+                    ;; on the plain-HTTP path.
                     (when (and content-length
                                (not (or (<= 100 status 199) (= status 204) (= status 304)))
+                               (not (eq method :HEAD))
                                (< (- buf-len body-start) content-length))
                       (error "https: short body (~d of ~d bytes)"
                              (- buf-len body-start) content-length))
@@ -411,8 +418,10 @@
                                          (min buf-len (+ body-start content-length))
                                          buf-len))
                            ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
-                           ;; Force empty even if the upstream sent bytes.
-                           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304))
+                           ;; HEAD MUST NOT include a body (RFC 7231 §4.3.2).
+                           ;; Force empty regardless of what the upstream sent.
+                           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304)
+                                             (eq method :HEAD))
                                          body-start
                                          body-end))
                            (raw-body (when (> body-end body-start)
@@ -478,12 +487,17 @@
           (tls-write-all ssl (build-outbound-request method host path
                                                      :scheme :https :port port
                                                      :headers headers :body body))
-          (tls-stream-response ssl on-line))
+          (tls-stream-response ssl on-line :method method))
       (tls-close ssl socket))))
 
-(defun tls-stream-response (ssl on-line)
+(defun tls-stream-response (ssl on-line &key (method :GET))
   "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
    Handles chunked transfer encoding. Returns the status code.
+
+   METHOD gates the body-framing discipline: for :HEAD, RFC 7231
+   §4.3.2 guarantees an empty body even when the upstream echoes
+   the GET-body Content-Length, so the body phase is skipped
+   entirely and the post-loop truncation checks are bypassed.
 
    Truncation discipline on the TLS streaming path (twin of the
    plain-path STREAM-RESPONSE-LINES):
@@ -511,6 +525,14 @@
         (terminated nil)
         (in-headers t)
         (header-count 0)
+        ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
+        ;; line terminators. PREV-CR carries across SSL-read
+        ;; iterations so a CRLF pair split at a TLS record boundary
+        ;; collapses to one terminator. Scoped to content-phase use —
+        ;; header and chunk-size phases still use the lenient strip-CR
+        ;; behavior (headers and framing are strict CRLF in practice
+        ;; and a lone CR there is malformed either way).
+        (prev-cr nil)
         (first-line t)
         ;; Chunked state
         (in-chunk-size nil)
@@ -569,7 +591,15 @@
                                 (if (zerop (length line))
                                     (progn
                                       (setf in-headers nil)
-                                      (when chunked (setf in-chunk-size t)))
+                                      (when chunked (setf in-chunk-size t))
+                                      ;; HEAD: RFC 7231 §4.3.2 — no body
+                                      ;; regardless of CL / chunked framing.
+                                      ;; Return status directly and skip
+                                      ;; the post-loop truncation checks.
+                                      (when (eq method :HEAD)
+                                        (return-from tls-stream-response
+                                          (or status
+                                              (error "https streaming: no parseable status line")))))
                                     (progn
                                       (incf header-count)
                                       (when (> header-count *max-header-count*)
@@ -677,14 +707,25 @@
                              (error "chunked stream: expected LF after chunk-data"))
                            (setf expect-lf nil
                                  in-chunk-size t))
-                          ;; Chunked body — reading chunk data
+                          ;; Chunked body — reading chunk data. Content-
+                          ;; phase terminators are CR / LF / CRLF
+                          ;; (WHATWG EventStream §9.2); PREV-CR carries
+                          ;; a CR's LF-partner across subsequent bytes
+                          ;; so the LF does not emit a second line.
                           (chunked
                            (when (> chunk-remaining 0)
                              (decf chunk-remaining)
                              (cond
-                               ((= byte 10) (emit-body-line))
-                               ((= byte 13) nil)
-                               (t (vector-push-extend byte line-buf))))
+                               ((= byte 13)
+                                (emit-body-line)
+                                (setf prev-cr t))
+                               ((= byte 10)
+                                (cond
+                                  (prev-cr (setf prev-cr nil))
+                                  (t (emit-body-line))))
+                               (t
+                                (setf prev-cr nil)
+                                (vector-push-extend byte line-buf))))
                            (when (zerop chunk-remaining)
                              (setf expect-cr t)))
                           ;; Non-chunked body. BODY-CONSUMED tracks
@@ -693,13 +734,22 @@
                           ;; compare against declared length. For
                           ;; close-delimited responses (no CL set),
                           ;; the count is still maintained but never
-                          ;; compared.
+                          ;; compared. CR / LF / CRLF treated as
+                          ;; equivalent terminators (same as chunked
+                          ;; and the plain-path reader).
                           (t
                            (incf body-consumed)
                            (cond
-                             ((= byte 10) (emit-body-line))
-                             ((= byte 13) nil)
-                             (t (vector-push-extend byte line-buf)))
+                             ((= byte 13)
+                              (emit-body-line)
+                              (setf prev-cr t))
+                             ((= byte 10)
+                              (cond
+                                (prev-cr (setf prev-cr nil))
+                                (t (emit-body-line))))
+                             (t
+                              (setf prev-cr nil)
+                              (vector-push-extend byte line-buf)))
                            (when (and content-length (not te-present)
                                       (>= body-consumed content-length))
                              ;; Hit declared length — stop processing
