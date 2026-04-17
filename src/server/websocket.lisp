@@ -127,14 +127,25 @@
            (return-from try-parse-ws-frame (values nil 0)))
          (setf payload-length (logior (ash (aref buf (+ start 2)) 8)
                                       (aref buf (+ start 3)))
-               header-size 4))
+               header-size 4)
+         ;; RFC 6455 §5.2: "the minimal number of bytes MUST be used
+         ;; to encode the length." A 16-bit extended length < 126 is
+         ;; non-canonical — the peer should have used the 7-bit form.
+         ;; Accepting it opens a length-parser disagreement vector
+         ;; against strict downstreams.
+         (when (< payload-length 126)
+           (error "WebSocket: non-canonical 2-byte length")))
         ((= len7 127)
          (when (< available 10)
            (return-from try-parse-ws-frame (values nil 0)))
          (setf payload-length
                (loop for i from 0 below 8
                      sum (ash (aref buf (+ start 2 i)) (* 8 (- 7 i))))
-               header-size 10)))
+               header-size 10)
+         ;; RFC 6455 §5.2 minimal-encoding rule: a 64-bit extended
+         ;; length < 65536 is non-canonical.
+         (when (< payload-length 65536)
+           (error "WebSocket: non-canonical 8-byte length"))))
       ;; RFC 6455 §5.2: 64-bit length MSB must be 0
       (when (logbitp 63 payload-length)
         (error "WebSocket: invalid payload length (MSB set)"))
@@ -251,13 +262,25 @@
         (deadline (when (> *ws-send-timeout* 0)
                     (+ (get-internal-real-time)
                        (* *ws-send-timeout* internal-time-units-per-second)))))
-    (loop while (< pos end)
-          do (when (and deadline (>= (get-internal-real-time) deadline))
-               (error "ws-send: timed out after ~ds" *ws-send-timeout*))
-             (let ((result (nb-write fd frame-bytes pos (- end pos))))
-               (if (eq result :again)
-                   (poll-writable fd 1000)
-                   (incf pos result))))))
+    (flet ((remaining-ms ()
+             ;; Milliseconds to deadline, clamped non-negative. No
+             ;; deadline configured → use 1000 ms so the poll still
+             ;; drains as before.
+             (if deadline
+                 (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
+                               internal-time-units-per-second))
+                 1000)))
+      (loop while (< pos end)
+            do (when (and deadline (>= (get-internal-real-time) deadline))
+                 (error "ws-send: timed out after ~ds" *ws-send-timeout*))
+               (let ((result (nb-write fd frame-bytes pos (- end pos))))
+                 (if (eq result :again)
+                     ;; Clamp the poll wait to the remaining deadline so a
+                     ;; peer stalled with a partial flush in flight cannot
+                     ;; push the effective timeout past *ws-send-timeout* by
+                     ;; up to 1000 ms on each :again.
+                     (poll-writable fd (min 1000 (remaining-ms)))
+                     (incf pos result)))))))
 
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."
