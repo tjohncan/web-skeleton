@@ -339,6 +339,61 @@
       (check "http/1.0 + Expect: final response delivered"
              (not (null (search "HTTP/1.1 200" raw))) t))))
 
+(defun test-harness-expect-417-on-unknown-e2e ()
+  "An HTTP/1.1 request carrying an Expect token other than
+   100-continue must receive a 417 Expectation Failed (RFC 7231
+   §5.1.1 MUST), with the body never reaching the handler. Sends
+   headers only (Content-Length: 4 declared, body bytes withheld):
+   body-available=0 < CL=4 keeps the request out of the already-
+   have-full-body fast path, so SCAN-EXPECT-DISPOSITION actually
+   runs. The :UNKNOWN arm queues 417, sets close-after-p=T, and
+   advances state to :write-response — the server writes then
+   closes. Reads to EOF without a client-side shutdown, which
+   would race the server's close and raise ENOTCONN once the
+   server RSTs."
+  (format t "~%Harness: Expect: unknown returns 417~%")
+  (let ((reached-handler nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    (setf reached-handler t)
+                    (make-text-response 200 "should not reach")))
+      (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+               (let* ((stream (sb-bsd-sockets:socket-make-stream
+                               socket :input t :output t
+                               :element-type '(unsigned-byte 8)))
+                      (headers (concatenate 'string
+                                            "POST /upload HTTP/1.1" *crlf*
+                                            "Host: localhost" *crlf*
+                                            "Expect: x-custom-unknown" *crlf*
+                                            "Content-Length: 4" *crlf*
+                                            *crlf*)))
+                 (write-sequence (sb-ext:string-to-octets
+                                  headers :external-format :ascii)
+                                 stream)
+                 (force-output stream)
+                 (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
+                                             :fill-pointer 0 :adjustable t)))
+                   (loop for byte = (handler-case (read-byte stream nil nil)
+                                      (error () nil))
+                         while byte
+                         do (vector-push-extend byte buf))
+                   (let ((raw (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8)))
+                     (check "417: handler not reached" reached-handler nil)
+                     (check "417: status line on wire"
+                            (not (null (search "HTTP/1.1 417" raw))) t)
+                     (check "417: Content-Length: 0 on wire"
+                            (not (null (search "Content-Length: 0" raw))) t)
+                     (check "417: Connection: close on wire"
+                            (not (null (search "Connection: close" raw))) t)))))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
 (defun test-harness-handler-connection-close-honored-e2e ()
   "A handler that explicitly sets 'Connection: close' on an HTTP/1.1
    response must actually close the TCP socket after the response —
@@ -346,7 +401,13 @@
    write path runs, so the wire framing matches what the client
    reads. Without the sync, the handler advertises close but the
    server holds the socket open and the client waits for more bytes
-   until the idle sweeper reaps."
+   until the idle sweeper reaps.
+
+   Strengthened: after reading the first response we attempt a
+   second request on the same socket. If the sync regresses and
+   the server holds the socket open, the second request would
+   receive a response and GOT-SECOND flips to T — catching the
+   regression as a test failure rather than a slow-down."
   (format t "~%Harness: handler-set Connection: close is honored~%")
   (with-test-server
       (:handler (lambda (req)
@@ -354,22 +415,164 @@
                   (let ((resp (make-text-response 200 "bye")))
                     (set-response-header resp "connection" "close")
                     resp)))
-    ;; HTTP/1.1 default is keep-alive; the handler's Connection: close
-    ;; overrides. %raw-http-request reads until EOF — if the server
-    ;; doesn't close, it blocks on read and the test times out; if
-    ;; it does close, EOF comes promptly and the full response is
-    ;; captured.
-    (let ((raw (%raw-http-request
-                (sb-ext:string-to-octets
-                 (concatenate 'string
-                              "GET / HTTP/1.1" *crlf*
-                              "Host: localhost" *crlf* *crlf*)
-                 :external-format :ascii))))
-      (check "handler close: response present"
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (req1 (sb-ext:string-to-octets
+                           (concatenate 'string
+                                        "GET / HTTP/1.1" *crlf*
+                                        "Host: localhost" *crlf* *crlf*)
+                           :external-format :ascii))
+                    (req2 (sb-ext:string-to-octets
+                           (concatenate 'string
+                                        "GET /next HTTP/1.1" *crlf*
+                                        "Host: localhost" *crlf* *crlf*)
+                           :external-format :ascii)))
+               (write-sequence req1 stream)
+               (force-output stream)
+               ;; Drain first response until EOF. Correct close →
+               ;; EOF arrives promptly; regression would block here,
+               ;; caught by the per-test join timeout in with-test-
+               ;; server's teardown (still a failure shape rather
+               ;; than a pass).
+               (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
+                                           :fill-pointer 0 :adjustable t)))
+                 (loop for byte = (handler-case (read-byte stream nil nil)
+                                    (error () nil))
+                       while byte
+                       do (vector-push-extend byte buf))
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 (fill-pointer buf))
+                              :external-format :utf-8)))
+                   (check "handler close: response present"
+                          (not (null (search "HTTP/1.1 200" text))) t)
+                   (check "handler close: body delivered"
+                          (not (null (search "bye" text))) t)
+                   (check "handler close: Connection: close stamped on wire"
+                          (not (null (search "connection: close" text))) t)))
+               ;; Probe: attempt a second request. Socket should be
+               ;; closed — write may succeed buffering to the closed
+               ;; socket or raise EPIPE; either way the read returns
+               ;; NIL and GOT-SECOND stays NIL. A regression that
+               ;; held the socket open would accept the second
+               ;; request and respond, flipping GOT-SECOND to T.
+               ;; SB-EXT:WITH-TIMEOUT bounds the probe so a pathological
+               ;; regression doesn't hang the suite.
+               (let ((got-second nil))
+                 (handler-case
+                     (sb-ext:with-timeout 1
+                       (write-sequence req2 stream)
+                       (force-output stream)
+                       (let ((b (read-byte stream nil nil)))
+                         (when b (setf got-second t))))
+                   (error () nil))
+                 (check "handler close: second request on same socket fails"
+                        got-second nil))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-fetch-callback-connection-close-honored-e2e ()
+  "When a DEFER-TO-FETCH callback returns a response with
+   'Connection: close' set, COMPLETE-FETCH must sync close-after-p
+   from the response headers so the server actually closes the
+   socket after delivering it. Parallel to the handler-close case,
+   but through the fetch resumption path. Without SYNC-CLOSE-AFTER-
+   P-FROM-RESPONSE in complete-fetch, the header lands on the wire
+   but the socket stays open — framing-mismatch vs the client's
+   expectation. Second-request probe on the same socket catches
+   the regression."
+  (format t "~%Harness: fetch-callback Connection: close is honored~%")
+  (let ((upstream-port nil))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (cond
+             ((string= (http-request-path req) "/upstream")
+              (make-text-response 200 "upstream-body"))
+             ((string= (http-request-path req) "/proxy")
+              (defer-to-fetch :GET
+                (format nil "http://127.0.0.1:~d/upstream" upstream-port)
+                :then (lambda (status headers body)
+                        (declare (ignore status headers body))
+                        (let ((resp (make-text-response 200 "bye")))
+                          (set-response-header resp "connection" "close")
+                          resp))))
+             (t (make-error-response 404)))))
+      (setf upstream-port *test-port*)
+      (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+               (let* ((stream (sb-bsd-sockets:socket-make-stream
+                               socket :input t :output t
+                               :element-type '(unsigned-byte 8)))
+                      (req1 (sb-ext:string-to-octets
+                             (concatenate 'string
+                                          "GET /proxy HTTP/1.1" *crlf*
+                                          "Host: localhost" *crlf* *crlf*)
+                             :external-format :ascii))
+                      (req2 (sb-ext:string-to-octets
+                             (concatenate 'string
+                                          "GET /proxy HTTP/1.1" *crlf*
+                                          "Host: localhost" *crlf* *crlf*)
+                             :external-format :ascii)))
+                 (write-sequence req1 stream)
+                 (force-output stream)
+                 (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
+                                             :fill-pointer 0 :adjustable t)))
+                   (loop for byte = (handler-case (read-byte stream nil nil)
+                                      (error () nil))
+                         while byte
+                         do (vector-push-extend byte buf))
+                   (let ((text (sb-ext:octets-to-string
+                                (subseq buf 0 (fill-pointer buf))
+                                :external-format :utf-8)))
+                     (check "fetch close: response present"
+                            (not (null (search "HTTP/1.1 200" text))) t)
+                     (check "fetch close: body delivered"
+                            (not (null (search "bye" text))) t)
+                     (check "fetch close: Connection: close stamped on wire"
+                            (not (null (search "connection: close" text))) t)))
+                 (let ((got-second nil))
+                   (handler-case
+                       (sb-ext:with-timeout 1
+                         (write-sequence req2 stream)
+                         (force-output stream)
+                         (let ((b (read-byte stream nil nil)))
+                           (when b (setf got-second t))))
+                     (error () nil))
+                   (check "fetch close: second request on same socket fails"
+                          got-second nil))))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
+(defun test-harness-http11-server-close-stamps-connection-close-e2e ()
+  "When an HTTP/1.1 client sends 'Connection: close', the server's
+   response MUST carry 'Connection: close' (RFC 7230 §6.1: a sender
+   that receives a close option SHOULD echo it). Exercises the
+   CONNECTION-HINT-FOR path for a handler that doesn't explicitly
+   set Connection — close-after-p=T set by request parse → hint
+   returns :CLOSE → FORMAT-RESPONSE stamps the header on the wire."
+  (format t "~%Harness: HTTP/1.1 client close stamps Connection: close~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "body")))
+    (let* ((req (concatenate 'string
+                             "GET / HTTP/1.1" *crlf*
+                             "Host: localhost" *crlf*
+                             "Connection: close" *crlf* *crlf*))
+           (raw (%raw-http-request
+                 (sb-ext:string-to-octets req :external-format :ascii))))
+      (check "http/1.1 client-close: response present"
              (not (null (search "HTTP/1.1 200" raw))) t)
-      (check "handler close: body delivered"
-             (not (null (search "bye" raw))) t)
-      (check "handler close: Connection: close stamped on wire"
+      (check "http/1.1 client-close: body delivered"
+             (not (null (search "body" raw))) t)
+      (check "http/1.1 client-close: Connection: close stamped on wire"
              (not (null (search "connection: close" raw))) t))))
 
 (defun test-harness-connection-header-split-e2e ()
@@ -514,8 +717,11 @@
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
+  (test-harness-expect-417-on-unknown-e2e)
   (test-harness-connection-header-split-e2e)
   (test-harness-handler-connection-close-honored-e2e)
+  (test-harness-fetch-callback-connection-close-honored-e2e)
+  (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-harness-workers-zero-rejected)
   (report-suite "Harness")
   (zerop *tests-failed*))
