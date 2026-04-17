@@ -148,13 +148,23 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun jwt-split (token)
-  "Split a JWT token on dots. Returns a list of strings."
+  "Split a JWT token on dots. Returns a list of 3 strings for a
+   well-formed JWS Compact Serialization, or NIL for any token with
+   more or fewer dots. Bails out as soon as a fourth dot appears so
+   a malformed token with many dots does not allocate O(dots)
+   substrings before rejection."
   (let ((parts nil)
-        (start 0))
+        (start 0)
+        (dots 0))
     (loop for i from 0 below (length token)
           when (char= (char token i) #\.)
-          do (push (subseq token start i) parts)
+          do (incf dots)
+             (when (> dots 2)
+               (return-from jwt-split nil))
+             (push (subseq token start i) parts)
              (setf start (1+ i)))
+    (unless (= dots 2)
+      (return-from jwt-split nil))
     (push (subseq token start) parts)
     (nreverse parts)))
 
