@@ -811,38 +811,46 @@
               (*epoll-ctl-buf* (make-array +epoll-event-size+
                                            :element-type '(unsigned-byte 8)))
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
-          (let* ((listener (make-tcp-listener host port))
-                 (epoll-fd (epoll-create)))
-            (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
-            (epoll-add epoll-fd (socket-fd listener)
-                       (logior +epollin+ +epollet+))
+          ;; Split the listener and epoll-fd bindings so a failure of
+          ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
+          ;; listener socket — a shared let* would leak it because the
+          ;; cleanup form references EPOLL-FD which is never bound on
+          ;; that path.
+          (let ((listener (make-tcp-listener host port)))
             (unwind-protect
-                (run-event-loop listener epoll-fd handler ws-handler)
-              ;; Cleanup on worker crash or normal exit. Split the
-              ;; table into outbounds and everything else — outbounds
-              ;; go through CLOSE-OUTBOUND so their fetch callbacks
-              ;; fire even when the worker dies with requests in
-              ;; flight, matching the contract that every fetch's
-              ;; :then closure runs exactly once. Non-outbounds get
-              ;; the raw CONNECTION-CLOSE; we can't deliver anything
-              ;; to their clients at this point and the epoll fd is
-              ;; about to be torn down anyway. The collect step
-              ;; avoids mutating the hash table during MAPHASH — we
-              ;; only call UNREGISTER-CONNECTION (via close-outbound)
-              ;; in the dolist after the walk.
-              (let ((outbounds nil))
-                (maphash (lambda (fd conn)
-                           (declare (ignore fd))
-                           (if (connection-outbound-p conn)
-                               (push conn outbounds)
-                               (progn
-                                 (maybe-reap-dns-process conn)
-                                 (connection-close conn))))
-                         *connections*)
-                (dolist (conn outbounds)
-                  (close-outbound conn epoll-fd)))
-              (sb-bsd-sockets:socket-close listener)
-              (%close epoll-fd)))
+                 (let ((epoll-fd (epoll-create)))
+                   (log-info "worker ~d started (epoll fd ~d)"
+                             worker-id epoll-fd)
+                   (epoll-add epoll-fd (socket-fd listener)
+                              (logior +epollin+ +epollet+))
+                   (unwind-protect
+                       (run-event-loop listener epoll-fd handler ws-handler)
+                     ;; Cleanup on worker crash or normal exit. Split the
+                     ;; table into outbounds and everything else — outbounds
+                     ;; go through CLOSE-OUTBOUND so their fetch callbacks
+                     ;; fire even when the worker dies with requests in
+                     ;; flight, matching the contract that every fetch's
+                     ;; :then closure runs exactly once. Non-outbounds get
+                     ;; the raw CONNECTION-CLOSE; we can't deliver anything
+                     ;; to their clients at this point and the epoll fd is
+                     ;; about to be torn down anyway. The collect step
+                     ;; avoids mutating the hash table during MAPHASH — we
+                     ;; only call UNREGISTER-CONNECTION (via close-outbound)
+                     ;; in the dolist after the walk.
+                     (let ((outbounds nil))
+                       (maphash (lambda (fd conn)
+                                  (declare (ignore fd))
+                                  (if (connection-outbound-p conn)
+                                      (push conn outbounds)
+                                      (progn
+                                        (maybe-reap-dns-process conn)
+                                        (connection-close conn))))
+                                *connections*)
+                       (dolist (conn outbounds)
+                         (close-outbound conn epoll-fd)))
+                     (%close epoll-fd)))
+              ;; Runs whether EPOLL-CREATE succeeded or raised.
+              (sb-bsd-sockets:socket-close listener)))
           ;; Normal exit (shutdown requested)
           (log-info "worker ~d stopped" worker-id)
           (return))
