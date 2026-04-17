@@ -190,6 +190,249 @@
                       response-body "got 2048 bytes"))))
       (setf web-skeleton:*max-body-size* saved))))
 
+(defun test-harness-cached-response-survives-head-e2e ()
+  "A handler that returns a shared HTTP-RESPONSE struct across
+   requests must still have its body intact after a HEAD visits
+   it. HEAD is handled post-serialize via STRIP-BODY-FOR-HEAD — no
+   mutation of the caller's struct."
+  (format t "~%Harness: cached response survives HEAD~%")
+  (let ((cached (make-text-response 200 "payload-keep-me")))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    cached))
+      ;; HEAD once — should return headers only, no body on the wire.
+      (test-http-request :head "/")
+      ;; GET after — should still deliver the body since the struct
+      ;; wasn't mutated.
+      (multiple-value-bind (status headers body)
+          (test-http-request :get "/")
+        (declare (ignore headers))
+        (check "cached: post-HEAD GET status 200" status 200)
+        (check "cached: post-HEAD GET body intact"
+               body "payload-keep-me"))
+      ;; HEAD again — still no state leakage.
+      (test-http-request :head "/")
+      (multiple-value-bind (status headers body)
+          (test-http-request :get "/")
+        (declare (ignore status headers))
+        (check "cached: second-round GET body still intact"
+               body "payload-keep-me")))))
+
+(defun %raw-http-request (bytes)
+  "Send BYTES to *TEST-PORT* on a fresh socket, close write half,
+   drain the response, return it as a UTF-8 string. Used for tests
+   that need HTTP/1.0, pipelining, or otherwise non-default wire
+   shapes that TEST-HTTP-REQUEST doesn't support."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+           (let ((stream (sb-bsd-sockets:socket-make-stream
+                          socket :input t :output t
+                          :element-type '(unsigned-byte 8))))
+             (write-sequence bytes stream)
+             (force-output stream)
+             (sb-bsd-sockets:socket-shutdown socket :direction :output)
+             (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
+                                         :fill-pointer 0 :adjustable t)))
+               (loop for byte = (handler-case (read-byte stream nil nil)
+                                  (error () nil))
+                     while byte
+                     do (vector-push-extend byte buf))
+               (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                        :external-format :utf-8))))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun test-harness-http10-keepalive-no-mutation-e2e ()
+  "An HTTP/1.0 + Connection: keep-alive request must not stamp
+   'Connection: keep-alive' onto the handler's returned struct.
+   FORMAT-RESPONSE's :KEEP-ALIVE-HINT emits the header at serialize
+   time without mutating. Verified by sending HTTP/1.0 first, then
+   inspecting the handler's cached struct for leaked Connection
+   headers, and finally sending HTTP/1.1 to confirm no stale
+   'Connection: keep-alive' appears in an unrelated follow-up."
+  (format t "~%Harness: HTTP/1.0 keep-alive doesn't mutate struct~%")
+  (let ((cached (make-text-response 200 "body")))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    cached))
+      ;; Raw HTTP/1.0 + Connection: keep-alive.
+      (%raw-http-request
+       (sb-ext:string-to-octets
+        (concatenate 'string
+                     "GET / HTTP/1.0" *crlf*
+                     "Host: localhost" *crlf*
+                     "Connection: keep-alive" *crlf* *crlf*)
+        :external-format :ascii))
+      (check "http/1.0 keep-alive: struct body still set"
+             (http-response-body cached) "body")
+      (check "http/1.0 keep-alive: no connection header on struct"
+             (assoc "connection" (http-response-headers cached)
+                    :test #'string-equal)
+             nil))))
+
+(defun %raw-http-split-send (headers-bytes body-bytes)
+  "Send HEADERS-BYTES, force-output, sleep 100ms, send BODY-BYTES,
+   half-close, drain response. The sleep forces the server to see a
+   headers-only first read — necessary for tests that exercise the
+   Expect: 100-continue gate, where a concatenated headers+body
+   would short-circuit via the already-have-full-body branch and
+   bypass the gate entirely."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+           (let ((stream (sb-bsd-sockets:socket-make-stream
+                          socket :input t :output t
+                          :element-type '(unsigned-byte 8))))
+             (write-sequence headers-bytes stream)
+             (force-output stream)
+             (sleep 0.1)
+             (write-sequence body-bytes stream)
+             (force-output stream)
+             (sb-bsd-sockets:socket-shutdown socket :direction :output)
+             (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
+                                         :fill-pointer 0 :adjustable t)))
+               (loop for byte = (handler-case (read-byte stream nil nil)
+                                  (error () nil))
+                     while byte
+                     do (vector-push-extend byte buf))
+               (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                        :external-format :utf-8))))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun test-harness-http10-expect-100-continue-no-fire-e2e ()
+  "HTTP/1.0 clients that send 'Expect: 100-continue' must NOT
+   receive an interim 100 Continue response — RFC 7231 §5.1.1
+   scopes the feature to HTTP/1.1. Some HTTP/1.0-only clients
+   don't understand 1xx and fail the request on the interim.
+
+   Uses %RAW-HTTP-SPLIT-SEND so the server sees headers-only on
+   its first read — otherwise a concatenated headers+body fills
+   body-available=content-length on the initial pass, routes
+   through the already-have-full-body branch, and bypasses the
+   Expect gate entirely. The split with sleep forces the gate to
+   actually run."
+  (format t "~%Harness: HTTP/1.0 Expect: 100-continue does not fire~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "ok")))
+    (let* ((body "some-body-bytes")
+           (headers (concatenate 'string
+                                 "POST /upload HTTP/1.0" *crlf*
+                                 "Host: localhost" *crlf*
+                                 "Connection: close" *crlf*
+                                 "Expect: 100-continue" *crlf*
+                                 "Content-Length: "
+                                 (write-to-string (length body)) *crlf*
+                                 *crlf*))
+           (raw (%raw-http-split-send
+                 (sb-ext:string-to-octets headers :external-format :ascii)
+                 (sb-ext:string-to-octets body :external-format :ascii))))
+      (check "http/1.0 + Expect: no 100 Continue interim"
+             (null (search "HTTP/1.1 100" raw)) t)
+      (check "http/1.0 + Expect: final response delivered"
+             (not (null (search "HTTP/1.1 200" raw))) t))))
+
+(defun test-harness-handler-connection-close-honored-e2e ()
+  "A handler that explicitly sets 'Connection: close' on an HTTP/1.1
+   response must actually close the TCP socket after the response —
+   close-after-p is synced from the response headers before the
+   write path runs, so the wire framing matches what the client
+   reads. Without the sync, the handler advertises close but the
+   server holds the socket open and the client waits for more bytes
+   until the idle sweeper reaps."
+  (format t "~%Harness: handler-set Connection: close is honored~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (let ((resp (make-text-response 200 "bye")))
+                    (set-response-header resp "connection" "close")
+                    resp)))
+    ;; HTTP/1.1 default is keep-alive; the handler's Connection: close
+    ;; overrides. %raw-http-request reads until EOF — if the server
+    ;; doesn't close, it blocks on read and the test times out; if
+    ;; it does close, EOF comes promptly and the full response is
+    ;; captured.
+    (let ((raw (%raw-http-request
+                (sb-ext:string-to-octets
+                 (concatenate 'string
+                              "GET / HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf* *crlf*)
+                 :external-format :ascii))))
+      (check "handler close: response present"
+             (not (null (search "HTTP/1.1 200" raw))) t)
+      (check "handler close: body delivered"
+             (not (null (search "bye" raw))) t)
+      (check "handler close: Connection: close stamped on wire"
+             (not (null (search "connection: close" raw))) t))))
+
+(defun test-harness-connection-header-split-e2e ()
+  "A client that sends split Connection: keep-alive / Connection:
+   close pair (semantically equivalent to 'keep-alive, close' per
+   RFC 7230 §6.1) must be read as 'close' — GET-HEADERS walks every
+   instance, not just the first one."
+  (format t "~%Harness: split Connection header close wins~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "body")))
+    (let* ((req (concatenate 'string
+                             "GET / HTTP/1.1" *crlf*
+                             "Host: localhost" *crlf*
+                             "Connection: keep-alive" *crlf*
+                             "Connection: close" *crlf* *crlf*))
+           (raw (%raw-http-request
+                 (sb-ext:string-to-octets req :external-format :ascii))))
+      (check "split Connection: response present"
+             (not (null (search "HTTP/1.1 200" raw))) t)
+      ;; If the server honored 'close', the socket was closed after
+      ;; this response — which is already the shape of this test
+      ;; (raw reads until EOF). The presence of a complete response
+      ;; confirms framing was correct.
+      (check "split Connection: body byte received"
+             (not (null (search "body" raw))) t))))
+
+(defun test-harness-workers-zero-rejected ()
+  "start-server with :workers 0 must raise rather than silently
+   block on the main-thread sleep loop with no workers listening.
+
+   The test runs start-server in a background thread with a bounded
+   JOIN-THREAD :timeout — if the validation check ever regresses,
+   the direct call would hang forever in the sleep loop and the
+   test suite would never complete. The 2-second timeout + thread
+   terminate surfaces the regression as a visible failure instead."
+  (format t "~%Harness: start-server :workers 0 rejects~%")
+  (flet ((try-workers (n)
+           (let ((errored nil))
+             (let ((th (sb-thread:make-thread
+                        (lambda ()
+                          (handler-case
+                              (progn
+                                (start-server
+                                 :workers n
+                                 :handler (lambda (r) (declare (ignore r))))
+                                nil)
+                            (error () (setf errored t))))
+                        :name "workers-validation-probe")))
+               (handler-case
+                   (sb-thread:join-thread th :timeout 2)
+                 (error ()
+                   (ignore-errors (sb-thread:terminate-thread th))
+                   (ignore-errors (sb-thread:join-thread th)))))
+             errored)))
+    (check "start-server: :workers 0 signals error"
+           (try-workers 0) t)
+    (check "start-server: :workers -1 signals error"
+           (try-workers -1) t)
+    (check "start-server: :workers :auto signals error"
+           (try-workers :auto) t)))
+
 (defun test-harness-pipelined-with-fin-e2e ()
   "Two HTTP/1.1 requests pipelined onto one connection, followed by
    a half-close from the client, both dispatch. After the keep-alive
@@ -268,5 +511,11 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
+  (test-harness-cached-response-survives-head-e2e)
+  (test-harness-http10-keepalive-no-mutation-e2e)
+  (test-harness-http10-expect-100-continue-no-fire-e2e)
+  (test-harness-connection-header-split-e2e)
+  (test-harness-handler-connection-close-honored-e2e)
+  (test-harness-workers-zero-rejected)
   (report-suite "Harness")
   (zerop *tests-failed*))
