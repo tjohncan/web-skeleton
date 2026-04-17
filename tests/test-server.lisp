@@ -286,6 +286,28 @@
                                       "A: 1"
                                       "B: 2"))))
 
+  ;; Total header bytes exceed *MAX-TOTAL-HEADER-BYTES*. Per-line
+  ;; and per-count caps alone permit 800 KiB of header-string
+  ;; allocation worst-case; the running-total guard in
+  ;; PARSE-HEADERS-BYTES rejects once the cumulative line bytes
+  ;; exceed the cap. Cap at 64 bytes for the test, feed two
+  ;; 50-byte header lines.
+  (check-error "total header bytes exceeded"
+               (let ((web-skeleton:*max-total-header-bytes* 64))
+                 (parse-request
+                  (crlf "GET / HTTP/1.1"
+                        (format nil "A: ~vA" 50 #\a)
+                        (format nil "B: ~vA" 50 #\b)))))
+  ;; Under the cap succeeds.
+  (let ((web-skeleton:*max-total-header-bytes* 4096))
+    (check "total header bytes under cap accepts"
+           (let ((req (parse-request
+                       (crlf "GET / HTTP/1.1"
+                             "Host: localhost"
+                             "A: small"))))
+             (http-request-method req))
+           :GET))
+
   ;; Obsolete line folding
   (check-error "obs-fold rejected"
                (parse-request (concatenate 'string
@@ -463,41 +485,45 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun test-expect-100-continue ()
-  (format t "~%Expect: 100-continue~%")
-  (flet ((scan-p (&rest header-lines)
+  (format t "~%Expect: disposition~%")
+  (flet ((disp (&rest header-lines)
            (let* ((raw   (apply #'crlf "POST /foo HTTP/1.1" header-lines))
                   (bytes (sb-ext:string-to-octets raw :external-format :ascii))
                   (end   (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
-             (not (null
-                   (web-skeleton::scan-expect-100-continue bytes end))))))
-    ;; Positive matches
+             (web-skeleton::scan-expect-disposition bytes end))))
+    ;; :100-CONTINUE matches — exact, case variants, whitespace variants.
     (check "exact match"
-           (scan-p "Host: localhost" "Expect: 100-continue") t)
+           (disp "Host: localhost" "Expect: 100-continue") :100-continue)
     (check "case-insensitive header name"
-           (scan-p "Host: localhost" "EXPECT: 100-continue") t)
+           (disp "Host: localhost" "EXPECT: 100-continue") :100-continue)
     (check "case-insensitive value"
-           (scan-p "Host: localhost" "Expect: 100-Continue") t)
+           (disp "Host: localhost" "Expect: 100-Continue") :100-continue)
     (check "extra spaces after colon"
-           (scan-p "Host: localhost" "Expect:   100-continue") t)
+           (disp "Host: localhost" "Expect:   100-continue") :100-continue)
     (check "tab after colon"
-           (scan-p "Host: localhost"
-                   (format nil "Expect:~c100-continue" #\Tab))
-           t)
+           (disp "Host: localhost"
+                 (format nil "Expect:~c100-continue" #\Tab))
+           :100-continue)
     ;; RFC 7231 §5.1.1: Expect is 1#expectation — a list. Comma
     ;; terminates the 100-continue token just like ';' or CR.
     (check "comma separator accepted"
-           (scan-p "Host: localhost" "Expect: 100-continue, x-foo=y") t)
+           (disp "Host: localhost" "Expect: 100-continue, x-foo=y") :100-continue)
     (check "comma immediately after token"
-           (scan-p "Host: localhost" "Expect: 100-continue,x-foo=y") t)
-    ;; Negative matches
+           (disp "Host: localhost" "Expect: 100-continue,x-foo=y") :100-continue)
+    ;; :NONE — no Expect header at all.
     (check "no Expect header"
-           (scan-p "Host: localhost" "Content-Length: 10") nil)
-    (check "different expect value"
-           (scan-p "Host: localhost" "Expect: something-else") nil)
+           (disp "Host: localhost" "Content-Length: 10") :none)
     (check "suffixed header name does not match"
-           (scan-p "Host: localhost" "X-Expect: 100-continue") nil)
-    (check "token must have a valid terminator"
-           (scan-p "Host: localhost" "Expect: 100-continued") nil))
+           (disp "Host: localhost" "X-Expect: 100-continue") :none)
+    ;; :UNKNOWN — Expect header present with a non-100-continue value.
+    ;; RFC 7231 §5.1.1 MUSTs a 417 response on these; the scanner just
+    ;; reports the classification, the state machine handles the 417.
+    (check "different expect value → :unknown"
+           (disp "Host: localhost" "Expect: something-else") :unknown)
+    (check "100-continued (trailing garbage) → :unknown"
+           (disp "Host: localhost" "Expect: 100-continued") :unknown)
+    (check "x-custom-expectation → :unknown"
+           (disp "Host: localhost" "Expect: x-custom-expect") :unknown))
   ;; Constant sanity — the pre-built bytes are exactly the status line.
   (let ((bytes web-skeleton::*http-100-continue-bytes*))
     (check "100 Continue ends with CRLFCRLF"
@@ -509,7 +535,21 @@
     (check "100 Continue status line"
            (sb-ext:octets-to-string bytes :external-format :ascii)
            (format nil "HTTP/1.1 100 Continue~c~c~c~c"
-                   #\Return #\Newline #\Return #\Newline))))
+                   #\Return #\Newline #\Return #\Newline)))
+  ;; 417 response bytes — pre-built, carries CL:0 + Connection: close.
+  (let ((bytes web-skeleton::*http-417-bytes*))
+    (check "417 starts with status line"
+           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
+             (not (null (search "HTTP/1.1 417 Expectation Failed" text))))
+           t)
+    (check "417 stamps Connection: close"
+           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
+             (not (null (search "Connection: close" text))))
+           t)
+    (check "417 Content-Length: 0"
+           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
+             (not (null (search "Content-Length: 0" text))))
+           t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests
@@ -730,7 +770,75 @@
     (check "strip-for-head: GET unchanged"
            (equalp (web-skeleton::strip-body-for-head bytes conn-get) bytes) t)
     (check "strip-for-head: nil conn unchanged"
-           (equalp (web-skeleton::strip-body-for-head bytes nil) bytes) t)))
+           (equalp (web-skeleton::strip-body-for-head bytes nil) bytes) t))
+
+  ;; format-response :head-only-p — HEAD short-circuit. Headers
+  ;; emitted (including Content-Length matching the body's length)
+  ;; but the body bytes are not. Avoids the double-allocation that
+  ;; the post-serialize STRIP-BODY-FOR-HEAD incurred on large bodies.
+  (let* ((resp (make-text-response 200 "payload-12345"))
+         (full (web-skeleton::format-response resp))
+         (head (web-skeleton::format-response resp :head-only-p t)))
+    (check "head-only-p: shorter than full"
+           (< (length head) (length full)) t)
+    (check "head-only-p: Content-Length header preserved"
+           (let ((text (sb-ext:octets-to-string head :external-format :utf-8)))
+             (not (null (search "content-length: 13" text))))
+           t)
+    (check "head-only-p: no body on the wire"
+           (let ((text (sb-ext:octets-to-string head :external-format :utf-8)))
+             (null (search "payload-12345" text)))
+           t)
+    (check "head-only-p: ends with CRLFCRLF"
+           (list (aref head (- (length head) 4))
+                 (aref head (- (length head) 3))
+                 (aref head (- (length head) 2))
+                 (aref head (- (length head) 1)))
+           '(13 10 13 10)))
+
+  ;; sync-close-after-p-from-response — handler's Connection: close
+  ;; flips INBOUND's CONNECTION-CLOSE-AFTER-P to T. Test edge shapes:
+  ;;  (a) no Connection header → no-op
+  ;;  (b) Connection: upgrade → no-op (not a close token)
+  ;;  (c) Connection: close (single header) → syncs
+  ;;  (d) Connection: close, upgrade (comma list) → syncs
+  ;;  (e) two Connection entries via ADD-RESPONSE-HEADER, one "close"
+  ;;      → syncs (walks every instance, not just first)
+  (flet ((make-conn () (web-skeleton::make-connection :fd -1 :last-active 0))
+         (sync (conn response)
+           (web-skeleton::sync-close-after-p-from-response conn response)
+           (web-skeleton::connection-close-after-p conn)))
+    (let ((c (make-conn)))
+      (check "sync-close: no Connection header — no-op"
+             (sync c (make-text-response 200 "x")) nil))
+    (let ((c (make-conn))
+          (r (make-text-response 200 "x")))
+      (set-response-header r "connection" "upgrade")
+      (check "sync-close: Connection: upgrade — no-op"
+             (sync c r) nil))
+    (let ((c (make-conn))
+          (r (make-text-response 200 "x")))
+      (set-response-header r "connection" "close")
+      (check "sync-close: Connection: close — syncs"
+             (sync c r) t))
+    (let ((c (make-conn))
+          (r (make-text-response 200 "x")))
+      (set-response-header r "connection" "close, upgrade")
+      (check "sync-close: comma-list with close — syncs"
+             (sync c r) t))
+    (let ((c (make-conn))
+          (r (make-text-response 200 "x")))
+      (add-response-header r "connection" "keep-alive")
+      (add-response-header r "connection" "close")
+      (check "sync-close: duplicate entries, one close — syncs"
+             (sync c r) t))
+    ;; Nil inbound — safe (no-op, no error).
+    (let ((r (make-text-response 200 "x")))
+      (set-response-header r "connection" "close")
+      (check "sync-close: nil inbound is safe"
+             (progn (web-skeleton::sync-close-after-p-from-response nil r)
+                    :ok)
+             :ok))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cookie builder tests
@@ -1431,7 +1539,28 @@
   ;; Wrong length / unknown family returns NIL (conservative)
   (check "v4 wrong length"   (is-public-address-p #(1 2 3) :inet)           nil)
   (check "v6 wrong length"   (is-public-address-p #(1 2 3 4) :inet6)        nil)
-  (check "unknown family"    (is-public-address-p #(1 1 1 1) :inet7)        nil))
+  (check "unknown family"    (is-public-address-p #(1 1 1 1) :inet7)        nil)
+
+  ;; Integration: parse-ipv6-literal → bytes → is-public-address-p.
+  ;; An attacker-supplied '::ffff:127.0.0.1' URL literal must not
+  ;; launder loopback through the IPv6 type. The parser now unfolds
+  ;; the IPv4 tail, is-public-address-p unwraps via the embedded v4,
+  ;; and the whole chain rejects as non-public.
+  (flet ((public-via-literal-p (s)
+           (let ((bytes (web-skeleton::parse-ipv6-literal s)))
+             (and bytes (is-public-address-p bytes :inet6)))))
+    (check "literal ::ffff:127.0.0.1 → not public"
+           (public-via-literal-p "::ffff:127.0.0.1") nil)
+    (check "literal ::ffff:10.0.0.1 → not public"
+           (public-via-literal-p "::ffff:10.0.0.1") nil)
+    (check "literal ::ffff:8.8.8.8 → public"
+           (public-via-literal-p "::ffff:8.8.8.8") t)
+    (check "literal ::127.0.0.1 → not public"
+           (public-via-literal-p "::127.0.0.1") nil)
+    (check "literal 2001:db8::1 → not public (documentation range)"
+           (public-via-literal-p "2001:db8::1") nil)
+    (check "literal fe80::1 → not public (link-local)"
+           (public-via-literal-p "fe80::1") nil)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Peer address formatter — both families
