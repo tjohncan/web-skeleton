@@ -2327,7 +2327,112 @@
   (check "nil client header returns nil"
          (web-skeleton::if-none-match-hit-p nil "\"abc\"") nil)
   (check "nil our etag returns nil"
-         (web-skeleton::if-none-match-hit-p "\"abc\"" nil) nil))
+         (web-skeleton::if-none-match-hit-p "\"abc\"" nil) nil)
+
+  ;; ---- Cache-Control override ----
+  ;; build-static-response accepts a caller-supplied Cache-Control
+  ;; string in the optional 4th arg. LOAD-STATIC-FILES resolves its
+  ;; :CACHE-CONTROL keyword (string or function-of-path) before
+  ;; reaching here.
+  (flet ((header-present-p (bytes header-text)
+           (let* ((str (sb-ext:octets-to-string bytes :external-format :utf-8))
+                  (probe (concatenate 'string header-text)))
+             (not (null (search probe str))))))
+    (let* ((content (sb-ext:string-to-octets "cache-ctl"
+                                              :external-format :utf-8))
+           (default-entry (web-skeleton::build-static-response
+                           "text/plain" content 0))
+           (custom-entry  (web-skeleton::build-static-response
+                           "text/plain" content 0
+                           "public, max-age=31536000, immutable")))
+      (check "cache-control: default present on GET"
+             (header-present-p
+              (web-skeleton::static-entry-get-response default-entry)
+              "cache-control: public, max-age=3600") t)
+      (check "cache-control: default present on 304"
+             (header-present-p
+              (web-skeleton::static-entry-not-modified-response default-entry)
+              "cache-control: public, max-age=3600") t)
+      (check "cache-control: custom string present on GET"
+             (header-present-p
+              (web-skeleton::static-entry-get-response custom-entry)
+              "cache-control: public, max-age=31536000, immutable") t)
+      (check "cache-control: custom string present on 304"
+             (header-present-p
+              (web-skeleton::static-entry-not-modified-response custom-entry)
+              "cache-control: public, max-age=31536000, immutable") t)))
+
+  ;; ---- LOAD-STATIC-FILES aliases ----
+  ;; Build a tiny tree in a scratch directory, load it, and verify
+  ;; the alias passes populate the cache:
+  ;;   /page.html        → /page          (.html extensionless alias)
+  ;;   /sub/index.html   → /sub           (directory-index alias, new)
+  ;;   /index.html       stays only as /index.html (root alias would
+  ;;                     resolve to empty string — skipped by design)
+  ;; Also verifies :CACHE-CONTROL function form receives the URL
+  ;; path for per-file tailoring.
+  (let* ((scratch (merge-pathnames "tests/tmp-static/"
+                                    (truename ".")))
+         (cc-seen nil))
+    (ensure-directories-exist (merge-pathnames "sub/" scratch))
+    (flet ((write-file (rel text)
+             (with-open-file (s (merge-pathnames rel scratch)
+                                :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+               (write-sequence (sb-ext:string-to-octets
+                                text :external-format :utf-8)
+                               s))))
+      (write-file "index.html"    "<!doctype html><title>root</title>")
+      (write-file "page.html"     "<!doctype html><title>page</title>")
+      (write-file "sub/index.html" "<!doctype html><title>sub</title>"))
+    (let ((saved-cache web-skeleton::*static-cache*))
+      (unwind-protect
+           (progn
+             (setf web-skeleton::*static-cache*
+                   (make-hash-table :test #'equal))
+             (web-skeleton::load-static-files
+              (namestring scratch)
+              :cache-control
+              (lambda (url-path)
+                (push url-path cc-seen)
+                (if (search "/sub/" url-path)
+                    "public, max-age=60"
+                    "public, max-age=3600")))
+             (check "alias: /page.html cached"
+                    (not (null (gethash "/page.html"
+                                        web-skeleton::*static-cache*))) t)
+             (check "alias: /page extensionless"
+                    (not (null (gethash "/page"
+                                        web-skeleton::*static-cache*))) t)
+             (check "alias: /sub/index.html cached"
+                    (not (null (gethash "/sub/index.html"
+                                        web-skeleton::*static-cache*))) t)
+             (check "alias: /sub directory-index"
+                    (not (null (gethash "/sub"
+                                        web-skeleton::*static-cache*))) t)
+             (check "alias: root /index.html cached"
+                    (not (null (gethash "/index.html"
+                                        web-skeleton::*static-cache*))) t)
+             (check "alias: root \"\" not registered"
+                    (gethash ""
+                             web-skeleton::*static-cache*) nil)
+             (check "cache-control fn: saw /sub/index.html url"
+                    (not (null (member "/sub/index.html" cc-seen
+                                       :test #'string=))) t))
+        (setf web-skeleton::*static-cache* saved-cache)
+        ;; Cleanup scratch tree. Files first, then nested dir, then
+        ;; scratch root. IGNORE-ERRORS wraps each so a missing file
+        ;; from a previous partial run does not mask a real test
+        ;; failure.
+        (dolist (rel '("index.html" "page.html" "sub/index.html"))
+          (ignore-errors
+           (delete-file (merge-pathnames rel scratch))))
+        (ignore-errors
+         (sb-ext:delete-directory (merge-pathnames "sub/" scratch)))
+        (ignore-errors
+         (sb-ext:delete-directory scratch))))))
 
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
