@@ -574,6 +574,7 @@
         (first-line t)
         ;; Chunked state
         (in-chunk-size nil)
+        (chunk-size-saw-cr nil)  ; CR seen, awaiting LF to complete CRLF
         (chunk-remaining 0)
         (expect-cr nil)    ; awaiting CR after chunk-data
         (expect-lf nil)    ; awaiting LF after chunk-data
@@ -727,30 +728,50 @@
                           ;; smuggling primitive between us and any
                           ;; stricter downstream.
                           ((and chunked in-chunk-size)
+                           ;; Strict CRLF only. Bare LF and bare CR
+                           ;; both reject. Empty chunk-size lines
+                           ;; reject via PARSE-CHUNKED-SIZE-LINE's
+                           ;; own empty-hex guard. Symmetric with
+                           ;; the plain path's READER-READ-CRLF-LINE
+                           ;; and the buffered path's
+                           ;; DECODE-CHUNKED-BODY — without this,
+                           ;; bare-LF or bare-CR terminators were a
+                           ;; parser-disagreement primitive against
+                           ;; strict downstream re-parsers.
                            (cond
+                             ((= byte 13)
+                              (when chunk-size-saw-cr
+                                (error "https streaming: double CR in chunk-size"))
+                              (setf chunk-size-saw-cr t))
                              ((= byte 10)
-                              (when (> (fill-pointer chunk-size-buf) 0)
-                                (let ((size (parse-chunked-size-bytes
-                                             chunk-size-buf 0
-                                             (fill-pointer chunk-size-buf))))
-                                  (setf (fill-pointer chunk-size-buf) 0)
-                                  (cond
-                                    ((zerop size)
-                                     ;; Final chunk — mark terminated
-                                     ;; so the outer loop's guard
-                                     ;; exits cleanly. The post-loop
-                                     ;; check then passes, and a
-                                     ;; stream that closed mid-body
-                                     ;; without reaching this point
-                                     ;; will raise.
-                                     (setf terminated t)
-                                     (return))
-                                    (t (setf chunk-remaining size
-                                             in-chunk-size nil))))))
-                             ((= byte 13) nil)
-                             (t (when (>= (fill-pointer chunk-size-buf) 256)
-                                 (error "chunked stream: chunk-size line too long"))
-                               (vector-push-extend byte chunk-size-buf))))
+                              (unless chunk-size-saw-cr
+                                (error "https streaming: bare LF in chunk-size line"))
+                              (let ((size (parse-chunked-size-bytes
+                                           chunk-size-buf 0
+                                           (fill-pointer chunk-size-buf))))
+                                (setf (fill-pointer chunk-size-buf) 0
+                                      chunk-size-saw-cr nil)
+                                (cond
+                                  ((zerop size)
+                                   ;; Final chunk — mark terminated
+                                   ;; so the outer loop's guard
+                                   ;; exits cleanly. The post-loop
+                                   ;; check then passes, and a
+                                   ;; stream that closed mid-body
+                                   ;; without reaching this point
+                                   ;; will raise.
+                                   (setf terminated t)
+                                   (return))
+                                  (t (setf chunk-remaining size
+                                           in-chunk-size nil)))))
+                             (t
+                              (when chunk-size-saw-cr
+                                (error "https streaming: bare CR in chunk-size line"))
+                              (when (>= (fill-pointer chunk-size-buf)
+                                        *max-header-line-length*)
+                                (error "https streaming: chunk-size line too long (max ~d)"
+                                       *max-header-line-length*))
+                              (vector-push-extend byte chunk-size-buf))))
                           ;; Strict CRLF after chunk-data (RFC 7230 4.1).
                           ;; Symmetric with decode-chunked-body and
                           ;; reader-expect-crlf on the plain paths.

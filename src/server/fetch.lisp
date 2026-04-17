@@ -653,6 +653,50 @@
     (unless (= (next-byte) 10)
       (error "chunked stream: expected LF after chunk-data"))))
 
+(defun reader-read-crlf-line (r &key (max-size *max-header-line-length*))
+  "Strict-CRLF twin of READER-READ-LINE for chunk-size lines.
+   Rejects bare CR and bare LF; requires a literal CR+LF pair to
+   terminate. Symmetric with DECODE-CHUNKED-BODY's buffered strict
+   CRLF discipline (RFC 7230 §4.1) — without this, a bare-LF or
+   bare-CR chunk-size terminator would silently pass through
+   READER-READ-LINE's WHATWG-style lenient parse, a parser-
+   disagreement primitive. Returns the line string (terminator
+   stripped), or NIL on clean EOF before any bytes. MAX-SIZE
+   defaults to *MAX-HEADER-LINE-LENGTH*, mirroring the header-line
+   budget — chunk-size lines with chunk-extensions rarely exceed
+   this in practice."
+  (let ((line-buf (make-array 64 :element-type '(unsigned-byte 8)
+                                 :fill-pointer 0 :adjustable t))
+        (saw-any nil))
+    (loop
+      (when (>= (stream-reader-pos r) (stream-reader-end r))
+        (when (zerop (reader-fill r))
+          (return (if saw-any
+                      (error "chunked stream: truncated chunk-size line")
+                      nil))))
+      (let ((byte (aref (stream-reader-buf r) (stream-reader-pos r))))
+        (incf (stream-reader-pos r))
+        (setf saw-any t)
+        (cond
+          ((= byte 13)
+           ;; CR — must be followed immediately by LF.
+           (when (>= (stream-reader-pos r) (stream-reader-end r))
+             (when (zerop (reader-fill r))
+               (error "chunked stream: bare CR at EOF in chunk-size line")))
+           (let ((next (aref (stream-reader-buf r) (stream-reader-pos r))))
+             (unless (= next 10)
+               (error "chunked stream: bare CR in chunk-size line"))
+             (incf (stream-reader-pos r))
+             (return (sb-ext:octets-to-string
+                      line-buf :external-format :ascii))))
+          ((= byte 10)
+           (error "chunked stream: bare LF in chunk-size line"))
+          (t
+           (when (>= (fill-pointer line-buf) max-size)
+             (error "chunked stream: chunk-size line too long (max ~d)"
+                    max-size))
+           (vector-push-extend byte line-buf)))))))
+
 (defun reader-read-bytes (r count line-buf on-line)
   "Read COUNT bytes through the buffered reader, splitting into lines.
    Calls ON-LINE per complete line. Returns the number of bytes
@@ -848,8 +892,9 @@
 (defun parse-chunked-size-line (size-line)
   "Parse a chunked-transfer size token from SIZE-LINE. Strips
    chunk-extensions (RFC 7230 §4.1.1 — everything from ';' onwards),
-   requires at least one hex digit, and raises on parse failure.
-   Returns the integer size (0 for the final chunk).
+   requires at least one hex digit, caps at 16 hex digits, and
+   raises on parse failure. Returns the integer size (0 for the
+   final chunk).
 
    Shared between stream-chunked-lines (plain streaming) and
    tls-stream-response (tls streaming) so both paths reject the
@@ -857,12 +902,17 @@
    permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
    the decoder loop as if the stream were complete — a parser-
    disagreement smuggling primitive against any stricter
-   downstream that re-parses the body."
+   downstream that re-parses the body. The 16-digit cap mirrors
+   decode-chunked-body's buffered-path guard: without it, a 1 MiB
+   attacker-framed hex string lands in parse-integer, which is
+   super-linear in digit count."
   (let* ((semi (position #\; size-line))
          (hex-end (or semi (length size-line)))
          (hex (string-trim '(#\Space #\Tab) (subseq size-line 0 hex-end))))
     (when (zerop (length hex))
       (error "chunked: empty chunk-size line"))
+    (when (> (length hex) 16)
+      (error "chunked: chunk-size too many hex digits (~d)" (length hex)))
     (loop for ch across hex
           unless (or (char<= #\0 ch #\9)
                      (char<= #\A (char-upcase ch) #\F))
@@ -892,12 +942,14 @@
                                    :fill-pointer 0 :adjustable t))
         (terminated nil))
     (loop
-      (let ((size-line (reader-read-line r)))
+      (let ((size-line (reader-read-crlf-line r)))
         (unless size-line
           (return))  ; stream EOF — handled by terminated check below
-        ;; PARSE-CHUNKED-SIZE-LINE raises on empty input, non-hex,
-        ;; and trailing garbage, so a lax or truncated chunk-size
-        ;; line fails loudly here.
+        ;; READER-READ-CRLF-LINE enforces strict CRLF (rejecting
+        ;; bare CR and bare LF) + a *max-header-line-length* cap;
+        ;; PARSE-CHUNKED-SIZE-LINE then rejects empty input, non-
+        ;; hex bytes, and over-16 hex digits. Both layers mirror
+        ;; DECODE-CHUNKED-BODY's buffered guards.
         (let ((chunk-size (parse-chunked-size-line size-line)))
           (when (zerop chunk-size)
             (setf terminated t)

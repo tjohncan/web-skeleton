@@ -2035,6 +2035,102 @@
                t)
       (close stream)))
 
+  ;; Chunk-size line terminator strictness — reader-read-crlf-line
+  ;; rejects bare LF and bare CR on the size line itself (RFC 7230
+  ;; §4.1). Before the fix, the lenient reader-read-line accepted
+  ;; any of CR / LF / CRLF; streaming decoded "5\nhello\n0\n\n" as
+  ;; valid while the buffered decode-chunked-body rejected the same
+  ;; bytes — a parser-disagreement primitive.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "5" (string #\Newline)                      ; bare LF on size
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming chunked: bare LF on chunk-size line rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
+  ;; Bare CR inside a chunk-size line — CR not followed by LF is
+  ;; malformed. "5\rhello..." would previously have been read as
+  ;; chunk-size "5" with "hello" silently becoming chunk-data.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "5" (string #\Return)                       ; CR without LF
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming chunked: bare CR on chunk-size line rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
+  ;; Chunk-size hex-digit cap — parse-chunked-size-line mirrors
+  ;; decode-chunked-body's 16-digit guard. 17 hex digits land in
+  ;; parse-integer, which is super-linear in digit count; an
+  ;; attacker-framed 1 MiB hex string would pin CPU before the
+  ;; value check fires.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                "00000000000000001"                         ; 17 hex digits
+                (string #\Return) (string #\Newline)
+                "x" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming chunked: over-16 hex digits rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
+  ;; Empty chunk-size line — parse-chunked-size-line already raises
+  ;; on empty hex, but the streaming path must not silently skip
+  ;; past it. "\r\n\r\n" between headers and first chunk would have
+  ;; been accepted before.
+  (let* ((raw (ascii-bytes (concatenate 'string
+                "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
+                "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline)        ; empty size line
+                "5" (string #\Return) (string #\Newline)
+                "hello" (string #\Return) (string #\Newline)
+                "0" (string #\Return) (string #\Newline)
+                (string #\Return) (string #\Newline))))
+         (stream (make-mock-stream raw)))
+    (unwind-protect
+        (check "streaming chunked: empty chunk-size line rejected"
+               (handler-case
+                   (progn (web-skeleton::stream-response-lines
+                           stream (lambda (line) (declare (ignore line))))
+                          nil)
+                 (error () t))
+               t)
+      (close stream)))
+
   ;; Body lines terminated by bare CR (WHATWG EventStream §9.2 —
   ;; lone U+000D is a valid separator). The reader splits on any
   ;; of CR / LF / CRLF without stripping CR from accumulated
