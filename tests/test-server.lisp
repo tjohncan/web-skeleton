@@ -516,8 +516,9 @@
     (check "suffixed header name does not match"
            (disp "Host: localhost" "X-Expect: 100-continue") :none)
     ;; :UNKNOWN — Expect header present with a non-100-continue value.
-    ;; RFC 7231 §5.1.1 MUSTs a 417 response on these; the scanner just
-    ;; reports the classification, the state machine handles the 417.
+    ;; RFC 7231 §5.1.1 MAYs a 417 response on these; the framework
+    ;; chooses to always 417. Scanner just reports the classification,
+    ;; the state machine handles the 417.
     (check "different expect value → :unknown"
            (disp "Host: localhost" "Expect: something-else") :unknown)
     (check "100-continued (trailing garbage) → :unknown"
@@ -535,21 +536,7 @@
     (check "100 Continue status line"
            (sb-ext:octets-to-string bytes :external-format :ascii)
            (format nil "HTTP/1.1 100 Continue~c~c~c~c"
-                   #\Return #\Newline #\Return #\Newline)))
-  ;; 417 response bytes — pre-built, carries CL:0 + Connection: close.
-  (let ((bytes web-skeleton::*http-417-bytes*))
-    (check "417 starts with status line"
-           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
-             (not (null (search "HTTP/1.1 417 Expectation Failed" text))))
-           t)
-    (check "417 stamps Connection: close"
-           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
-             (not (null (search "Connection: close" text))))
-           t)
-    (check "417 Content-Length: 0"
-           (let ((text (sb-ext:octets-to-string bytes :external-format :ascii)))
-             (not (null (search "Content-Length: 0" text))))
-           t)))
+                   #\Return #\Newline #\Return #\Newline))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests

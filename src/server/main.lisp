@@ -526,10 +526,15 @@
                              (if upgrade-p :ws-upgrade :write-response))
                        (epoll-modify epoll-fd (connection-fd conn)
                                     (logior +epollout+ +epollet+))))))))
-             (:send-continue
-              ;; connection-on-read queued the 100 Continue response and
-              ;; set state :sending-100-continue. Flip to EPOLLOUT so
-              ;; handle-client-write flushes it; the body arrives next.
+             (:flush-queued
+              ;; connection-on-read queued response bytes that must flush
+              ;; before further reads happen. Covers two cases:
+              ;;   :sending-100-continue — interim 100, body read resumes
+              ;;                           once the flush completes.
+              ;;   :write-response       — terminal 417 on unknown Expect,
+              ;;                           close-after-p=T closes after.
+              ;; Either way the next step is EPOLLOUT; handle-client-write
+              ;; flushes and state-based dispatch takes it from there.
               (epoll-modify epoll-fd (connection-fd conn)
                             (logior +epollout+ +epollet+)))
              (:close

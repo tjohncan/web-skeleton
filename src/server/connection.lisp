@@ -322,9 +322,12 @@
 ;;; an interim "HTTP/1.1 100 Continue" before the body arrives, or
 ;;; curl / Go / Python / Java clients pause 1-3s on large POSTs before
 ;;; giving up and sending the body anyway. Any other token is an
-;;; "unknown expectation" which §5.1.1 says MUST be answered with 417
-;;; Expectation Failed. Tokens we accept silently become
-;;; interoperability hazards against strict upstreams, so reject.
+;;; "unknown expectation"; §5.1.1 says the server MAY respond with 417
+;;; Expectation Failed. The framework always 417s — silently accepting
+;;; unknown expectations is an interoperability hazard against strict
+;;; upstreams. The 417 fires regardless of body presence so a GET with
+;;; Expect: x-foo can't probe the handler while a POST with the same
+;;; header gets rejected.
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *http-100-continue-bytes*
@@ -335,26 +338,15 @@
   "Pre-built bytes for the HTTP/1.1 100 Continue interim response.
    Queued before reading the body when the client asks for it.")
 
-(defparameter *http-417-bytes*
-  (sb-ext:string-to-octets
-   (format nil "HTTP/1.1 417 Expectation Failed~c~c~
-                Content-Length: 0~c~c~
-                Connection: close~c~c~c~c"
-           #\Return #\Newline #\Return #\Newline
-           #\Return #\Newline #\Return #\Newline)
-   :external-format :ascii)
-  "Pre-built bytes for the HTTP/1.1 417 Expectation Failed response
-   sent on any Expect token other than 100-continue (RFC 7231 §5.1.1).
-   Carries Content-Length: 0 and Connection: close — the framework
-   closes after sending.")
-
 (defun scan-expect-disposition (buf end &optional (start 0))
   "Classify the Expect header in BUF[START..END). Returns
      :100-CONTINUE — an Expect: 100-continue header (case-insensitive)
                      with a valid token terminator. Near-miss values
                      like 100-continued are classified as :UNKNOWN.
      :UNKNOWN      — an Expect header whose value is not 100-continue.
-                     RFC 7231 §5.1.1 MUSTs a 417 response on these.
+                     RFC 7231 §5.1.1 lets the server respond with 417
+                     (MAY); the state machine uses this classification
+                     to do so unconditionally.
      :NONE         — no Expect header present.
    Start-of-line match only — suffixed names like X-Expect do not
    match. First Expect header wins (early return)."
@@ -421,8 +413,12 @@
 ;;; Returns:
 ;;;   :CONTINUE      — stay in current state, wait for more data
 ;;;   :DISPATCH      — full HTTP request ready, route it
-;;;   :SEND-CONTINUE — 100 Continue queued for an Expect: 100-continue
-;;;                    request; caller must flip the fd to EPOLLOUT
+;;;   :FLUSH-QUEUED  — bytes queued on the write buffer that must be
+;;;                    flushed before further reads. Covers both the
+;;;                    interim 100 Continue (Expect: 100-continue →
+;;;                    body read resumes after flush) and the terminal
+;;;                    417 (unknown Expect → close after flush).
+;;;                    Caller must flip the fd to EPOLLOUT.
 ;;;   :WEBSOCKET     — WebSocket frame(s) available to process
 ;;;   :CLOSE         — connection should be closed
 ;;; ---------------------------------------------------------------------------
@@ -507,78 +503,102 @@
                  ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
                  (when (scan-transfer-encoding buf header-end hdr-start)
                    (http-parse-error "Transfer-Encoding not supported"))
-                 ;; Check if there's a body to read
+                 ;; Classify Expect once — disposition gates dispatch
+                 ;; before the body-presence split so a no-body GET with
+                 ;; Expect: x-foo 417s the same as a bodied POST does.
                  (let* ((body-start (+ header-end 4))
                         (content-length (scan-content-length
-                                         buf header-end hdr-start)))
-                 (if (and content-length (> content-length 0))
-                     ;; Need to read a body
-                     (progn
-                       ;; Reject oversized bodies before allocating
-                       (when (> content-length *max-body-size*)
-                         (http-parse-error "body too large (~d bytes, max ~d)"
-                                           content-length *max-body-size*))
-                       ;; Grow read buffer if needed
-                       (let ((total-needed (+ body-start content-length)))
-                         (when (> total-needed (length (connection-read-buf conn)))
-                           (let ((new-buf (make-array total-needed
-                                                      :element-type '(unsigned-byte 8)
-                                                      :initial-element 0)))
-                             (replace new-buf (connection-read-buf conn)
-                                      :end2 (connection-read-pos conn))
-                             (setf (connection-read-buf conn) new-buf))
-                           ;; Re-drain: buffer grew past connection-read-available's
-                           ;; original cap, kernel may still have data (edge-triggered).
-                           ;; :EOF (peer FIN'd) and :FULL (buffer at cap) are
-                           ;; terminal only if the body is still incomplete.
-                           ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
-                           ;; the pre-grown buffer exceeds the drain cap and
-                           ;; :FULL fires at pos = body-start+CL — which IS
-                           ;; the complete body. Close only on truly incomplete
-                           ;; bodies so that CL-at-cap requests still dispatch.
-                           (case (connection-read-available conn)
-                             ((:eof :full)
-                              (when (< (- (connection-read-pos conn) body-start)
-                                       content-length)
-                                (return-from connection-on-read :close))))))
-                       (let ((body-available (- (connection-read-pos conn) body-start))
-                             (expect (scan-expect-disposition
-                                      buf header-end hdr-start)))
-                         (setf (connection-body-expected conn) content-length
-                               (connection-header-end conn) header-end)
-                         (cond
-                           ;; Already have the full body — dispatch even if
-                           ;; Expect: 100-continue is set. The client chose
-                           ;; not to wait, and sending 100 now is pointless.
-                           ((>= body-available content-length)
-                            (setf (connection-state conn) :read-body)
-                            :dispatch)
-                           ;; Body still incoming and client asked for
-                           ;; 100 Continue. RFC 7231 §5.1.1 scopes 1xx to
-                           ;; HTTP/1.1; a 1.0 client with Expect gets its
-                           ;; body read without the interim.
-                           ((and (= minor-version-byte 49)
-                                 (eq expect :100-continue))
-                            (connection-queue-write
-                             conn *http-100-continue-bytes*)
-                            (setf (connection-state conn) :sending-100-continue)
-                            :send-continue)
-                           ;; Any other Expect token → 417 per §5.1.1.
-                           ;; Silently accepting unknown expectations is
-                           ;; an interop hazard against strict upstreams.
-                           ((eq expect :unknown)
-                            (connection-queue-write conn *http-417-bytes*)
-                            (setf (connection-state conn) :write-response
-                                  (connection-close-after-p conn) t)
-                            :send-continue)
-                           ;; Plain body wait.
-                           (t
-                            (setf (connection-state conn) :read-body)
-                            :continue))))
-                     ;; No body — request is complete
-                     (progn
-                       (setf (connection-header-end conn) header-end)
-                       :dispatch))))))
+                                         buf header-end hdr-start))
+                        (expect (scan-expect-disposition
+                                 buf header-end hdr-start)))
+                 (cond
+                   ;; Unknown Expect → 417 regardless of body. RFC 7231
+                   ;; §5.1.1 MAY; framework always 417s so a GET probe
+                   ;; can't bypass the check a matching POST receives.
+                   ;; Silently accepting unknown expectations is an
+                   ;; interop hazard against strict upstreams.
+                   ((eq expect :unknown)
+                    ;; Build the 417 response dynamically via format-
+                    ;; response so Date (RFC 7231 §7.1.1.2 MUST on
+                    ;; origin-server status responses) is current on
+                    ;; each reject. Pre-building at load time bakes a
+                    ;; stale Date; the 417 path is rare enough that
+                    ;; the per-request allocation is free. :head-only-p
+                    ;; suppresses the body on HEAD + Expect shapes per
+                    ;; RFC 7231 §4.3.2 ("MUST NOT send a message body")
+                    ;; — the method bytes are at buf[0..3], cheaper to
+                    ;; match inline than to wait for parse-request-bytes.
+                    (let ((head-p (and (>= req-line-end 5)
+                                       (= (aref buf 0) 72)   ; H
+                                       (= (aref buf 1) 69)   ; E
+                                       (= (aref buf 2) 65)   ; A
+                                       (= (aref buf 3) 68)   ; D
+                                       (= (aref buf 4) 32)))); SP
+                      (connection-queue-write
+                       conn
+                       (format-response (make-error-response 417)
+                                        :connection-hint :close
+                                        :head-only-p head-p)))
+                    (setf (connection-state conn) :write-response
+                          (connection-close-after-p conn) t)
+                    :flush-queued)
+                   ;; Body present — read it, dispatching when complete.
+                   ((and content-length (> content-length 0))
+                    ;; Reject oversized bodies before allocating.
+                    (when (> content-length *max-body-size*)
+                      (http-parse-error "body too large (~d bytes, max ~d)"
+                                        content-length *max-body-size*))
+                    ;; Grow read buffer if needed.
+                    (let ((total-needed (+ body-start content-length)))
+                      (when (> total-needed (length (connection-read-buf conn)))
+                        (let ((new-buf (make-array total-needed
+                                                   :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))
+                          (replace new-buf (connection-read-buf conn)
+                                   :end2 (connection-read-pos conn))
+                          (setf (connection-read-buf conn) new-buf))
+                        ;; Re-drain: buffer grew past connection-read-available's
+                        ;; original cap, kernel may still have data (edge-triggered).
+                        ;; :EOF (peer FIN'd) and :FULL (buffer at cap) are
+                        ;; terminal only if the body is still incomplete.
+                        ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
+                        ;; the pre-grown buffer exceeds the drain cap and
+                        ;; :FULL fires at pos = body-start+CL — which IS
+                        ;; the complete body. Close only on truly incomplete
+                        ;; bodies so that CL-at-cap requests still dispatch.
+                        (case (connection-read-available conn)
+                          ((:eof :full)
+                           (when (< (- (connection-read-pos conn) body-start)
+                                    content-length)
+                             (return-from connection-on-read :close))))))
+                    (let ((body-available (- (connection-read-pos conn) body-start)))
+                      (setf (connection-body-expected conn) content-length
+                            (connection-header-end conn) header-end)
+                      (cond
+                        ;; Already have the full body — dispatch even if
+                        ;; Expect: 100-continue is set. The client chose
+                        ;; not to wait, and sending 100 now is pointless.
+                        ((>= body-available content-length)
+                         (setf (connection-state conn) :read-body)
+                         :dispatch)
+                        ;; Body still incoming and client asked for
+                        ;; 100 Continue. RFC 7231 §5.1.1 scopes 1xx to
+                        ;; HTTP/1.1; a 1.0 client with Expect gets its
+                        ;; body read without the interim.
+                        ((and (= minor-version-byte 49)
+                              (eq expect :100-continue))
+                         (connection-queue-write
+                          conn *http-100-continue-bytes*)
+                         (setf (connection-state conn) :sending-100-continue)
+                         :flush-queued)
+                        ;; Plain body wait.
+                        (t
+                         (setf (connection-state conn) :read-body)
+                         :continue))))
+                   ;; No body — request is complete.
+                   (t
+                    (setf (connection-header-end conn) header-end)
+                    :dispatch))))))
              ;; No CRLFCRLF yet — keep reading
              :continue)))
       (:read-body

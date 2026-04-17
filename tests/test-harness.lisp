@@ -388,11 +388,115 @@
                      (check "417: handler not reached" reached-handler nil)
                      (check "417: status line on wire"
                             (not (null (search "HTTP/1.1 417" raw))) t)
-                     (check "417: Content-Length: 0 on wire"
-                            (not (null (search "Content-Length: 0" raw))) t)
-                     (check "417: Connection: close on wire"
-                            (not (null (search "Connection: close" raw))) t)))))
+                     (check "417: connection: close on wire"
+                            (not (null (search "connection: close" raw))) t)
+                     (check "417: date header present"
+                            (not (null (search "date:" raw))) t)))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
+(defun test-harness-expect-417-on-unknown-no-body-e2e ()
+  "A GET (or any no-body request) with an unknown Expect token
+   must 417 the same way the bodied POST variant does. Before the
+   disposition-first restructure, the body-present branch owned
+   the SCAN-EXPECT-DISPOSITION call and the no-body branch fell
+   straight through to :dispatch — so a GET /admin with Expect:
+   x-foo reached the handler while a POST with the same header
+   got rejected. RFC 7231 §5.1.1 doesn't condition 417 on body
+   presence; the framework now mirrors that."
+  (format t "~%Harness: Expect: unknown on no-body request returns 417~%")
+  (let ((reached-handler nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    (setf reached-handler t)
+                    (make-text-response 200 "should not reach")))
+      (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+               (let* ((stream (sb-bsd-sockets:socket-make-stream
+                               socket :input t :output t
+                               :element-type '(unsigned-byte 8)))
+                      (req (concatenate 'string
+                                        "GET /probe HTTP/1.1" *crlf*
+                                        "Host: localhost" *crlf*
+                                        "Expect: x-custom-unknown" *crlf*
+                                        *crlf*)))
+                 (write-sequence (sb-ext:string-to-octets
+                                  req :external-format :ascii)
+                                 stream)
+                 (force-output stream)
+                 (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
+                                             :fill-pointer 0 :adjustable t)))
+                   (loop for byte = (handler-case (read-byte stream nil nil)
+                                      (error () nil))
+                         while byte
+                         do (vector-push-extend byte buf))
+                   (let ((raw (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8)))
+                     (check "417 no-body: handler not reached" reached-handler nil)
+                     (check "417 no-body: status line on wire"
+                            (not (null (search "HTTP/1.1 417" raw))) t)
+                     (check "417 no-body: connection: close on wire"
+                            (not (null (search "connection: close" raw))) t)
+                     (check "417 no-body: date header present"
+                            (not (null (search "date:" raw))) t)))))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
+(defun test-harness-expect-417-head-no-body-e2e ()
+  "A HEAD request with an unknown Expect must 417 WITHOUT a
+   message body on the wire (RFC 7231 §4.3.2 MUST NOT send a
+   message body in a HEAD response). connection-on-read matches
+   the 'HEAD ' method prefix inline and passes :head-only-p to
+   format-response so Content-Length survives but body bytes
+   are suppressed. Shape is vanishingly rare — HEAD with Expect
+   is meaningless in practice — but the test locks in the fix."
+  (format t "~%Harness: HEAD + Expect: unknown has no body on wire~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "should not reach")))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (req (concatenate 'string
+                                      "HEAD /probe HTTP/1.1" *crlf*
+                                      "Host: localhost" *crlf*
+                                      "Expect: x-custom-unknown" *crlf*
+                                      *crlf*)))
+               (write-sequence (sb-ext:string-to-octets
+                                req :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
+                                           :fill-pointer 0 :adjustable t)))
+                 (loop for byte = (handler-case (read-byte stream nil nil)
+                                    (error () nil))
+                       while byte
+                       do (vector-push-extend byte buf))
+                 (let* ((raw (sb-ext:octets-to-string
+                              (subseq buf 0 (fill-pointer buf))
+                              :external-format :utf-8))
+                        (hdr-end (search (format nil "~c~c~c~c"
+                                                 #\Return #\Newline
+                                                 #\Return #\Newline)
+                                         raw)))
+                   (check "HEAD+417: status line on wire"
+                          (not (null (search "HTTP/1.1 417" raw))) t)
+                   (check "HEAD+417: connection: close on wire"
+                          (not (null (search "connection: close" raw))) t)
+                   (check "HEAD+417: headers terminator present"
+                          (not (null hdr-end)) t)
+                   (check "HEAD+417: no body bytes after headers"
+                          (- (length raw) (+ (or hdr-end 0) 4)) 0)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-handler-connection-close-honored-e2e ()
   "A handler that explicitly sets 'Connection: close' on an HTTP/1.1
@@ -718,6 +822,8 @@
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
   (test-harness-expect-417-on-unknown-e2e)
+  (test-harness-expect-417-on-unknown-no-body-e2e)
+  (test-harness-expect-417-head-no-body-e2e)
   (test-harness-connection-header-split-e2e)
   (test-harness-handler-connection-close-honored-e2e)
   (test-harness-fetch-callback-connection-close-honored-e2e)
