@@ -1,7 +1,7 @@
 # Deployment Guide
 
-Practical notes for building on web-skeleton. Covers project setup,
-configuration, and non-obvious gotchas that the API alone won't tell you.
+Practical notes for building on web-skeleton.
+Covers project setup, configuration, and non-obvious pitfalls.
 
 ## Project setup
 
@@ -105,13 +105,15 @@ Tune parameters before calling `start-server`:
                 :ws-handler #'handle-ws-message))
 ```
 
-`*max-body-size*` caps the inbound request body. `*max-outbound-response-size*`
-caps the total bytes (headers + body) that `tls-read-all` will buffer for an
-HTTPS fetch — tune this when your app's `:then` callback expects responses
-larger than the 8 MiB default. `*max-streaming-line-size*` caps one line inside
-a streamed response (NDJSON, SSE, chunked text) on the `http-fetch-stream`
-paths — the default 1 MiB is generous for JSON, tighten it for known-small
-line protocols or raise it for unusual schemas.
+`*max-body-size*` caps the inbound request body.
+`*max-outbound-response-size*` caps the total bytes (headers + body)
+that `tls-read-all` will buffer for an HTTPS fetch —
+tune this when your app's `:then` callback expects responses
+larger than the 8 MiB default.
+`*max-streaming-line-size*` caps one line inside a streamed response
+(NDJSON, SSE, chunked text) on the `http-fetch-stream` paths —
+the default 1 MiB is generous for JSON,
+tighten it for known-small line protocols or raise it for unusual schemas.
 
 ## Deployment notes
 
@@ -119,17 +121,16 @@ line protocols or raise it for unusual schemas.
 
 web-skeleton has no inbound TLS. In production, put it behind
 nginx, caddy, or a similar reverse proxy for HTTPS termination.
-The default bind address is localhost (`#(127 0 0 1)`), which is
-correct for this setup. Use `:host #(0 0 0 0)` only if the server
-must accept connections directly.
+The default bind address is localhost (`#(127 0 0 1)`), correct for this setup.
+Use `:host #(0 0 0 0)` only if the server must accept connections directly.
 
 ### WebSocket origin validation
 
-The framework validates WebSocket protocol headers but does not
-check the `Origin` header — that's application-level. Without it,
-any webpage can open a WebSocket to your server (cross-site
-WebSocket hijacking). Check Origin in your handler before
-returning `:upgrade`:
+The framework validates WebSocket protocol headers
+but does not check the `Origin` header — that's application-level.
+Without it, any webpage can open a WebSocket to your server
+(cross-site WebSocket hijacking).
+Check Origin in your handler before returning `:upgrade`:
 
 ```lisp
 (defun handle-request (request)
@@ -146,8 +147,8 @@ returning `:upgrade`:
 ### JWT issuer and audience
 
 `jwt-verify` checks the signature, expiration, and not-before claims.
-It does **not** check `iss` (issuer) or `aud` (audience). If your
-JWKS key set is shared across services, always verify these manually:
+It does **not** check `iss` (issuer) or `aud` (audience).
+If your JWKS key set is shared across services, always verify these:
 
 ```lisp
 (let ((claims (jwt-verify token *keys*)))
@@ -161,8 +162,8 @@ JWKS key set is shared across services, always verify these manually:
 ### HMAC signature comparison
 
 When verifying webhook signatures or other HMAC-authenticated messages,
-use `constant-time-equal` — never `equal` or `equalp`. A timing
-side-channel on byte-by-byte comparison can leak the expected MAC:
+use `constant-time-equal` — never `equal` or `equalp`.
+A timing side-channel on byte-by-byte comparison can leak the expected MAC:
 
 ```lisp
 (let ((expected (hmac-sha256 secret-key body))
@@ -174,70 +175,61 @@ side-channel on byte-by-byte comparison can leak the expected MAC:
     ...))
 ```
 
-`hex-decode` signals an error on invalid input (odd length, non-hex
-characters). Wrap it in `handler-case` to reject malformed signatures
-gracefully.
+`hex-decode` signals an error on invalid input (odd length, non-hex characters).
+Wrap it in `handler-case` to reject malformed signatures gracefully.
 
 ### Blocking fetch paths
 
-`http-fetch-stream` and HTTPS fetch are **blocking** — they hold the
-worker thread for the duration of the upstream call, bounded by
-`*fetch-timeout*` (default 30s) across each of three setup phases:
+`http-fetch-stream` and HTTPS fetch are **blocking** —
+they hold the worker thread for the duration of the upstream call,
+bounded by `*fetch-timeout*` (default 30s) across each of three setup phases:
 
-1. **DNS resolution** — shared `getent ahosts` subprocess, spawned
-   with `:wait nil` and deadline-polled until exit or
+1. **DNS resolution** — shared `getent ahosts` subprocess,
+   spawned with `:wait nil` and deadline-polled until exit or
    `*fetch-timeout*` expires. On expiry, the child is killed with
-   SIGKILL so a hung libc resolver (unresponsive nameserver, slow
-   NSS module, hung mDNS responder) cannot pin the worker thread.
-   Same resolver as the async path, so `/etc/hosts`, NSS, Docker
-   DNS, and mDNS all work identically in both modes. IPv4 and IPv6
-   both supported.
-2. **TCP connect** — non-blocking `connect(2)` plus `poll(2)` with
-   the same timeout. `SO_RCVTIMEO` / `SO_SNDTIMEO` do **not** apply
-   to `connect(2)` — without this bound a black-holed peer would
-   pin the worker for ~120s (Linux `tcp_syn_retries`). The socket
-   is returned to blocking mode after the connect completes so the
-   subsequent read/write use the familiar blocking semantics.
-3. **Request I/O** — bounded by `SO_RCVTIMEO` / `SO_SNDTIMEO` on
-   the connected socket.
-This is fine for bounded work inside a `ws-handler` (e.g. streaming an
-LLM response), but avoid calling them from HTTP handlers under load.
-`http-fetch` is non-blocking for `http://` URLs (epoll event loop).
-For `https://` URLs it blocks the worker thread for the full request lifecycle.
+   SIGKILL so a hung libc resolver (unresponsive nameserver,
+   slow NSS module, hung mDNS responder) cannot pin the worker thread.
+   Same resolver as the async path, so `/etc/hosts`, NSS, Docker DNS,
+   and mDNS all work identically in both modes. IPv4 and IPv6 are both supported.
+2. **TCP connect** — non-blocking `connect(2)` plus `poll(2)` with the same timeout.
+   `SO_RCVTIMEO` / `SO_SNDTIMEO` do **not** apply to `connect(2)` —
+   without this bound a black-holed peer would pin a worker for ~120s (Linux `tcp_syn_retries`).
+   The socket is returned to blocking mode after the connect completes
+   so the subsequent read/write use the familiar blocking semantics.
+3. **Request I/O** — bounded by `SO_RCVTIMEO` / `SO_SNDTIMEO` on the connected socket.
+   This is fine for bounded work inside a `ws-handler`,
+   but avoid calling them from HTTP handlers under load.
+   `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
+   For `https://` URLs it blocks the worker thread for the full request lifecycle.
 
-**Async fetch timeout budget.** On the non-blocking `http-fetch`
-path for `http://` URLs, `*fetch-timeout*` applies as a **single
-end-to-end budget** rather than per-phase: the inbound connection's
-`:awaiting` idle timer covers DNS + TCP connect + request I/O
-together. A slow DNS phase shortens the budget remaining for
-connect and response read. Blocking paths (`http-fetch-stream`,
-HTTPS) get the three per-phase bounds above; the async path gets
-one total. Tune `*fetch-timeout*` with this in mind — it is the
-worst-case wall time the parked inbound will sit in `:awaiting`
+**Async fetch timeout budget.** On the non-blocking `http-fetch` path for `http://` URLs,
+`*fetch-timeout*` applies as a **single end-to-end budget** rather than per-phase:
+the inbound connection's `:awaiting` idle timer covers DNS + TCP connect + request I/O
+together. A slow DNS phase shortens the budget remaining for connect and response read.
+Blocking paths (`http-fetch-stream`, HTTPS) get the three per-phase bounds above;
+the async path gets one total. Tune `*fetch-timeout*` with this in mind —
+it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper hands back a 502.
 
-**Chunked completion on the async path.** The non-blocking `http-fetch`
-path detects response completion by Content-Length (immediate) or by
-EOF (Connection: close). For chunked responses where the upstream
-keeps the TCP connection alive after sending the `0\r\n\r\n`
-terminator, completion is detected only when the upstream eventually
-closes or `*fetch-timeout*` expires — up to 30 seconds of unnecessary
-delay. The framework sends `Connection: close` on all outbound
-requests, so well-behaved upstreams close promptly; the stall appears
-only against upstreams that ignore the header. A future optimization
-could scan for the zero-size chunk terminator in-buffer.
+**Chunked completion on the async path.** The non-blocking `http-fetch` path
+detects response completion by Content-Length (immediate) or by EOF (Connection: close).
+For chunked responses where the upstream keeps the TCP connection alive
+after sending the `0\r\n\r\n` terminator, completion is detected only
+when the upstream eventually closes or `*fetch-timeout*` expires —
+up to 30 seconds of unnecessary delay. The framework sends `Connection: close`
+on all outbound requests, so well-behaved upstreams close promptly;
+the stall appears only against upstreams that ignore the header.
+A future optimization could scan for the zero-size chunk terminator in-buffer.
 
-**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns
-`SSL_ERROR_SYSCALL` for four distinct conditions — unexpected peer
-close without `close_notify` (benign for legacy HTTP/1.0-style
-servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`), real transport
-errors (`errno = ECONNRESET` / `EPIPE` / other), and read(2)
-failures. `tls-read-all` and `tls-stream-response` inspect `errno`
-after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign
-cases so `*fetch-timeout*` actually bounds the HTTPS read path
-for close-delimited responses and `http-fetch-stream` over HTTPS.
-Legitimate unexpected-EOF-without-`close_notify` is still accepted
-silently — that's the framing signal for HTTP/1.0-style servers
+**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL`
+for four distinct conditions — unexpected peer close without `close_notify`
+(benign for legacy HTTP/1.0-style servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`),
+real transport errors (`errno = ECONNRESET` / `EPIPE` / other),
+and read(2) failures. `tls-read-all` and `tls-stream-response` inspect `errno`
+after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign cases
+so `*fetch-timeout*` actually bounds the HTTPS read path for close-delimited responses
+and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_notify`
+is still accepted silently — that's the framing signal for HTTP/1.0-style servers
 that never send `close_notify` at all.
 
 ### Fetch callback contract
@@ -245,21 +237,21 @@ that never send `close_notify` at all.
 The `:then` closure supplied to `http-fetch` / `defer-to-fetch`
 fires **exactly once per fetch** with one of two argument shapes:
 
-- **`(status headers body)`** on the happy path — `status` is an
-  integer HTTP status, `headers` is an alist of lowercase-name
-  string pairs, `body` is a byte vector (or `NIL` for empty bodies).
-  The closure's return value becomes the response delivered to the
-  original inbound client.
-- **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal
-  teardown path: upstream TCP / TLS / DNS failure, short-body
-  truncation, inbound connection closed mid-fetch, drain, worker
-  crash. The closure's return value is discarded in this branch
+- **`(status headers body)`** on the happy path — `status` is an integer HTTP status,
+  `headers` is an alist of lowercase-name string pairs,
+  `body` is a byte vector (or `NIL` for empty bodies).
+  The closure's return value becomes the response
+  delivered to the original inbound client.
+- **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal teardown path:
+  upstream TCP / TLS / DNS failure, short-body truncation,
+  inbound connection closed mid-fetch, drain, worker crash.
+  The closure's return value is discarded in this branch
   because there is no inbound to deliver anything to.
 
 The cleanup sentinel exists so apps can release state deterministically
-without ambient try/finally bookkeeping: DB transactions, metrics
-spans, circuit-breaker counters, rate-limit budgets. Handlers that
-interpolate `status` or `body` into log lines or response strings
+without ambient try/finally bookkeeping: DB transactions, metrics spans,
+circuit-breaker counters, rate-limit budgets.
+Handlers that interpolate `status` or `body` into log lines or response strings
 must check for `NIL` explicitly:
 
 ```lisp
@@ -279,32 +271,30 @@ must check for `NIL` explicitly:
 ```
 
 A raising cleanup closure is logged at WARN and swallowed by
-`close-outbound`'s handler-case, so it never blocks the framework's
-own teardown. Don't rely on cleanup-path exceptions propagating
-back to the caller — they don't.
+`close-outbound`'s handler-case, so it never blocks the framework's own teardown.
+Don't rely on cleanup-path exceptions propagating back to the caller — they don't.
 
 ### Fetch URL safety (SSRF)
 
-If your handler constructs fetch URLs from user input, validate the
-destination before dialing. The framework does not filter resolved
-IP addresses — a user-supplied hostname resolving to `169.254.169.254`
-(cloud metadata), `127.0.0.1`, or any private RFC 1918 address will
-be connected to directly unless the app refuses.
+If your handler constructs fetch URLs from user input,
+validate the destination before dialing.
+The framework does not filter resolved IP addresses — a user-supplied hostname
+resolving to `169.254.169.254` (cloud metadata), `127.0.0.1`,
+or any private RFC 1918 address will be connected to directly unless the app refuses.
 
-`is-public-address-p` is the primitive for doing this refusal
-correctly. It takes a byte vector and a family keyword and returns
-T only for publicly routable addresses, rejecting loopback, link-local,
-RFC 1918 private, RFC 6598 CGNAT, RFC 4193 unique local, multicast,
-documentation prefixes, reserved ranges, and cloud metadata IPs. It
-unwraps IPv4-mapped IPv6 and NAT64 so an attacker cannot launder
-`127.0.0.1` as `::ffff:127.0.0.1`.
+`is-public-address-p` is the primitive for doing this refusal correctly.
+It takes a byte vector and a family keyword
+and returns T only for publicly routable addresses,
+rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
+RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
+and cloud metadata IPs. It unwraps IPv4-mapped IPv6 and NAT64
+so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
 
-The framework exports `parse-url`, `parse-ipv4-literal`, and
-`parse-ipv6-literal` specifically so a handler writing this check
-doesn't have to reinvent them. They are the same parsers the
-outbound fetch path uses internally, so a policy decision on the
-inbound side and the actual dial on the outbound side agree on
-what "host" means:
+The framework exports `parse-url`, `parse-ipv4-literal`, and `parse-ipv6-literal`
+specifically so a handler writing this check doesn't have to reinvent them.
+They are the same parsers the outbound fetch path uses internally,
+so a policy decision on the inbound side and the actual dial on the outbound side
+agree on what "host" means:
 
 ```lisp
 (defun handle-proxy (req)
@@ -333,42 +323,41 @@ what "host" means:
            (make-error-response 403)))))))
 ```
 
-The helper deliberately does not resolve hostnames — apps that accept
-hostnames must resolve first and then call `is-public-address-p` on
-each resolved address before dialing.
+The helper deliberately does not resolve hostnames —
+apps that accept hostnames must resolve first and then call `is-public-address-p`
+on each resolved address before dialing.
 
 ### DNS resolution and caching
 
-Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs are
-resolved asynchronously: the framework spawns `getent ahosts <host>`
-via `sb-ext:run-program`, registers the subprocess's stdout pipe with
-the worker's epoll, and parks the inbound connection in an `:out-dns`
-state until the address lands. The first TCP-compatible line
-(`<address> STREAM`) wins. IPv4 and IPv6 are both supported, with
-`AI_ADDRCONFIG` filtering so addresses for unreachable families never
-appear. Numeric literals (including bracketed IPv6 forms like
-`http://[::1]:8080/`) skip the subprocess entirely via the numeric
-fast path.
+Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs
+are resolved asynchronously: the framework spawns `getent ahosts <host>`
+via `sb-ext:run-program`, registers the subprocess's stdout pipe
+with the worker's epoll, and parks the inbound connection in an `:out-dns` state
+until the address lands. The first TCP-compatible line (`<address> STREAM`) wins.
+IPv4 and IPv6 are both supported, with `AI_ADDRCONFIG` filtering
+so addresses for unreachable families never appear.
+Numeric literals (including bracketed IPv6 forms like `http://[::1]:8080/`)
+skip the subprocess entirely via the numeric fast path.
 
-`http-fetch-stream` and the HTTPS paths use the same `getent`
-subprocess synchronously via `resolve-host-blocking` — same parser,
+`http-fetch-stream` and the HTTPS paths use the same `getent` subprocess
+synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
-The only difference from the async path is that the subprocess runs
-with `:wait nil` and the caller deadline-polls in short slices instead
-of parking in epoll. There is one DNS primitive across the framework.
+The only difference from the async path is that the subprocess
+runs with `:wait nil` and the caller deadline-polls in short slices
+instead of parking in epoll. There is one DNS primitive across the framework.
 
 Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 `/etc/hosts`, `/etc/nsswitch.conf`, Docker's embedded DNS, LDAP, mDNS
 — every NSS-configured source is queried via the usual `getaddrinfo(3)`
-code path underneath. Apps that depend on exotic name sources continue
-to work without change.
+code path underneath. Apps that depend on exotic name sources
+continue to work without change.
 
 **Caching is opt-in at the app layer.** `getent` is reinvoked on
-every outbound fetch, which is fine for apps making a handful of
-calls per inbound request. Apps that pound a small set of upstream
-hosts many times can cache DNS themselves using the `store`
-primitive in about fifteen lines, then bypass the framework's DNS
-path by passing the resolved IP literal at the call site:
+every outbound fetch, which is fine for apps making a handful of calls
+per inbound request. Apps that pound a small set of upstream hosts many times
+can cache DNS themselves using the `store` primitive in about fifteen lines,
+then bypass the framework's DNS path by passing the resolved IP literal
+at the call site:
 
 ```lisp
 (defvar *dns-cache*
@@ -384,24 +373,24 @@ path by passing the resolved IP literal at the call site:
   (store-set *dns-cache* host (cons ip (+ (get-universal-time) ttl))))
 ```
 
-At the call site, check `cached-ip-for` first and build the URL with
-the IP literal when there's a hit — the framework's numeric fast
-path skips `getent` entirely. On a miss, fall through to a hostname
-URL (paying the `getent` cost once) and populate the cache when the
-response arrives.
+At the call site, check `cached-ip-for` first and build the URL
+with the IP literal when there's a hit —
+the framework's numeric fast path skips `getent` entirely.
+On a miss, fall through to a hostname URL (paying the `getent` cost once)
+and populate the cache when the response arrives.
 
 The framework deliberately does not ship a DNS cache of its own.
-`getent` output does not surface TTL information, so any built-in
-cache would have to invent its own expiry policy — a choice that
-belongs to the app, not the framework.
+`getent` output does not surface TTL information, so any built-in cache
+would have to invent its own expiry policy — a choice that belongs to the app,
+not the framework.
 
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed (fixed 10-second timeout). Call it from
-within `ws-handler` to send multiple frames during a single handler
-invocation — the event loop is paused while the handler runs, so there
-is no write contention.
+blocking until all bytes are flushed (fixed 10-second timeout).
+Call it from within `ws-handler` to send multiple frames
+during a single handler invocation — the event loop is paused while the handler runs,
+so there is no write contention.
 
 ```lisp
 (defun handle-ws-message (conn frame)
@@ -420,37 +409,38 @@ a slow client holds the worker hostage.
 ### Static files
 
 `load-static-files` reads files into memory at startup and pre-builds
-HTTP responses. Call it **before** `start-server`. It is not thread-safe
-and must not be called while the server is running.
+HTTP responses. Call it **before** `start-server`.
+It is not thread-safe and must not be called while the server is running.
 
-Static responses **omit the `Date` header** — the pre-built bytes are
-frozen at startup time and the framework will not patch each served
-response with a per-request date. This violates the RFC 7231 §7.1.1.2
-`MUST`, but a stale `Date` from 14 hours ago would be strictly worse
-than none (CDN caches would use it as the freshness anchor). Downstream
-caches fall back to the time they received the response, which is
-correct. If you place web-skeleton behind a CDN or reverse proxy, the
-proxy will stamp its own `Date` on the way out — operators should not
-be surprised to see `Date` missing on `/static/*` when watching the
-upstream directly with `curl -v`.
+Static responses **omit the `Date` header** — the pre-built bytes
+are frozen at startup time and the framework will not patch each served
+response with a per-request date. This violates the RFC 7231 §7.1.1.2 `MUST`,
+but a stale `Date` from 14 hours ago would be strictly worse than none
+(CDN caches would use it as the freshness anchor).
+Downstream caches fall back to the time they received the response,
+which is correct.
+If you place web-skeleton behind a CDN or reverse proxy,
+the proxy will stamp its own `Date` on the way out —
+operators should not be surprised to see `Date` missing on `/static/*`
+when watching the upstream directly with `curl -v`.
 
 ### IDN hostnames
 
 `tls-connect` calls `SSL_set1_host` with the hostname as ASCII bytes,
 which means **internationalized domain names must be ACE-encoded**
-(punycode) by the caller before being handed to `http-fetch`. Passing
-`https://café.example/` directly will send raw UTF-8 to the server
-and fail verification. Convert to `https://xn--caf-dma.example/` in
-the app if you deal with IDN — the framework does not ship a
-UTS-46 / Nameprep implementation.
+(punycode) by the caller before being handed to `http-fetch`.
+Passing `https://café.example/` directly will send raw UTF-8 to the server
+and fail verification. Convert to `https://xn--caf-dma.example/` in the app
+if you deal with IDN — the framework does not ship a UTS-46 / Nameprep implementation.
 
 ### Background work and shutdown cleanup
 
-Apps with their own background threads (session reapers, cache flushers,
-metrics exporters) should register a stop function via `register-cleanup`
+Apps with their own background threads
+(session reapers, cache flushers, metrics exporters)
+should register a stop function via `register-cleanup`
 rather than wrapping `start-server` in an app-side `unwind-protect`.
-Cleanup hooks run inside `start-server`'s unwind path after connection
-drain and before the function returns:
+Cleanup hooks run inside `start-server`'s unwind path after connection drain
+and before the function returns:
 
 ```lisp
 (defun start (&key (port 8080))
@@ -462,17 +452,17 @@ drain and before the function returns:
                 :ws-handler #'handle-ws-message))
 ```
 
-Hooks fire in LIFO order (last registered, first called), each wrapped
-in `handler-case` — a raising hook cannot block the rest or prevent
-`start-server` from returning to its caller. SIGTERM from Docker
-exercises the same path as Ctrl-C at the REPL.
+Hooks fire in LIFO order (last registered, first called),
+each wrapped in `handler-case` — a raising hook cannot block the rest
+or prevent `start-server` from returning to its caller.
+SIGTERM from Docker exercises the same path as Ctrl-C at the REPL.
 
 ### Concurrent store
 
-`make-store` returns a thread-safe hash-table-backed store for
-app-level state (sessions, caches, rate-limit counters). All operations
-hold an internal mutex, so stores are safe to share across worker
-threads in the same process.
+`make-store` returns a thread-safe hash-table-backed store for app-level state
+(sessions, caches, rate-limit counters).
+All operations hold an internal mutex,
+so stores are safe to share across worker threads in the same process.
 
 For stores with a reaper, supply both `:expiry-fn` and `:reap-interval`:
 
@@ -491,14 +481,15 @@ an error at `make-store` time rather than silently skipping the reaper.
 
 Two locking hazards to know about:
 
-- `store-map` holds the mutex for the entire iteration. Keep the
-  callback fast, or use it to collect keys and do slow work outside.
-- `expiry-fn` runs under the mutex during every sweep. Keep it a cheap
-  predicate — no I/O, no syscalls, nothing that can block.
+- `store-map` holds the mutex for the entire iteration. Keep the callback fast,
+  or use it to collect keys and do slow work outside.
+- `expiry-fn` runs under the mutex during every sweep. Keep it a cheap predicate —
+  no I/O, no syscalls, nothing that can block.
 
 `store-get` returns two values — `(VALUE PRESENT-P)` — to distinguish
-an explicit NIL value from a missing key. Callers that never store NIL
-can ignore the second value; everyone else should branch on it.
+an explicit NIL value from a missing key.
+Callers that never store NIL can ignore the second value;
+everyone else should branch on it.
 
 `store-update` takes a function rather than a plist:
 
@@ -506,10 +497,10 @@ can ignore the second value; everyone else should branch on it.
 (store-update *counts* "visits" (lambda (old) (1+ (or old 0))))
 ```
 
-The whole read-modify-write runs under the mutex, so concurrent updates
-to the same key serialize without lost writes. For the common
-"merge plist keys into the stored value" pattern, `store-update-plist`
-is a sugar wrapper:
+The whole read-modify-write runs under the mutex,
+so concurrent updates to the same key serialize without lost writes.
+For the common "merge plist keys into the stored value" pattern,
+`store-update-plist` is a sugar wrapper:
 
 ```lisp
 (store-update-plist *sessions* sid
@@ -521,22 +512,21 @@ is a sugar wrapper:
 
 `get-cookie` reads a named cookie from the request's `Cookie` header.
 `build-cookie` / `delete-cookie` emit Set-Cookie header values with
-the usual attributes (`HttpOnly`, `Secure`, `SameSite`, `Max-Age`,
-`Path`, `Domain`).
+the usual attributes (`HttpOnly`, `Secure`, `SameSite`, `Max-Age`, `Path`, `Domain`).
 
-The builder's defaults are deliberately the secure ones: `:http-only t`,
-`:secure t`, `:same-site :lax`, `:path "/"`. Pass NIL to opt out of
-any of them — but know the consequences. Most session cookies should
-keep all four.
+The builder's defaults are deliberately the secure ones:
+`:http-only t`, `:secure t`, `:same-site :lax`, `:path "/"`.
+Pass NIL to opt out of any of them — but know the consequences.
+Most session cookies should keep all four.
 
-`:same-site :none` requires `:secure t`; passing the first without the
-second signals an error at `build-cookie` time rather than a silent
-client-side failure (browsers reject `SameSite=None` without `Secure`).
+`:same-site :none` requires `:secure t`;
+passing the first without the second signals an error at `build-cookie` time
+rather than a silent client-side failure
+(browsers reject `SameSite=None` without `Secure`).
 
-Name and value are validated against CR, LF, and semicolon — the
-three characters that would break the Set-Cookie header structure.
-Apps needing stricter RFC 6265 §4.1.1 token validation can layer it
-on top.
+Name and value are validated against CR, LF, and semicolon —
+the three characters that would break the Set-Cookie header structure.
+Apps needing stricter RFC 6265 §4.1.1 token validation can layer it on top.
 
 Attach cookies via `add-response-header` (not `set-response-header`,
 which replaces — a second `set-response-header` for Set-Cookie would
@@ -550,9 +540,8 @@ silently drop the first cookie):
                      (build-cookie "theme" "dark" :http-only nil))
 ```
 
-For removal — note that `:path` and `:domain` must match the
-originally-set cookie, since browsers match Set-Cookie to stored
-cookies on those two fields:
+For removal — note that `:path` and `:domain` must match the originally-set cookie,
+since browsers match Set-Cookie to stored cookies on those two fields:
 
 ```lisp
 (add-response-header resp "set-cookie" (delete-cookie "session"))
@@ -560,16 +549,17 @@ cookies on those two fields:
 
 ### JSON empty containers
 
-`json-parse` returns NIL for both `{}` and `[]`. `json-serialize` on NIL
-produces `"null"`. This means empty objects and arrays do not round-trip
-— they collapse to null. This is a deliberate design choice (CL's NIL
-is the natural empty representation). If the distinction matters for
-your use case, check the raw JSON string or use `:NULL` for explicit null.
+`json-parse` returns NIL for both `{}` and `[]`.
+`json-serialize` on NIL produces `"null"`.
+This means empty objects and arrays do not round-trip — they collapse to null.
+This is a deliberate design choice (CL's NIL is the natural empty representation).
+If the distinction matters for your use case, check the raw JSON string
+or use `:NULL` for explicit null.
 
 ### Query parameter parsing
 
-`get-query-param` reparses the query string on each call. If a handler
-needs multiple parameters, parse once and reuse:
+`get-query-param` reparses the query string on each call.
+If a handler needs multiple parameters, parse once and reuse:
 
 ```lisp
 (let ((params (parse-query-string (http-request-query request))))
@@ -580,8 +570,8 @@ needs multiple parameters, parse once and reuse:
 
 ### Form body decoding
 
-`parse-query-string` and `get-query-param` decode `+` as space per
-`application/x-www-form-urlencoded` (the HTML form encoding standard).
+`parse-query-string` and `get-query-param` decode `+` as space
+per `application/x-www-form-urlencoded` (the HTML form encoding standard).
 For POST bodies with this content type, parse directly:
 
 ```lisp
@@ -591,17 +581,15 @@ For POST bodies with this content type, parse directly:
   ...)
 ```
 
-Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path
-decoding). The form-aware decoding is in `parse-query-string` and
-`form-decode`.
+Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path decoding).
+The form-aware decoding is in `parse-query-string` and `form-decode`.
 
 ### Testing your handlers
 
-`web-skeleton-test-harness` is an optional ASDF system for driving
-handlers from tests. Depend on it in your test build (typically via a
-`my-app-tests.asd` with `:depends-on ("my-app" "web-skeleton-test-harness")`)
-and use `with-test-server` to spin an ephemeral-port live server
-inside test bodies:
+`web-skeleton-test-harness` is an optional ASDF system for driving handlers from tests.
+Depend on it in your test build (typically via a `my-app-tests.asd`
+with `:depends-on ("my-app" "web-skeleton-test-harness")`)
+and use `with-test-server` to spin an ephemeral-port live server inside test bodies:
 
 ```lisp
 (defpackage :my-app-tests
@@ -618,11 +606,11 @@ inside test bodies:
       (assert (search "welcome" body)))))
 ```
 
-`with-test-server` picks a free port, starts the server in a background
-thread, binds `*test-port*` for the body, and tears it down on scope
-exit (signal shutdown, bounded join, fallback to `terminate-thread`).
-Shutdown hooks registered inside the body are isolated to that
-server's teardown — they do not leak into the caller's state.
+`with-test-server` picks a free port, starts the server in a background thread,
+binds `*test-port*` for the body, and tears it down on scope exit
+(signal shutdown, bounded join, fallback to `terminate-thread`).
+Shutdown hooks registered inside the body are isolated to that server's teardown —
+they do not leak into the caller's state.
 
 For unit-style tests that bypass the network entirely,
 `make-test-request` constructs an `http-request` struct directly:
@@ -634,12 +622,11 @@ For unit-style tests that bypass the network entirely,
     (assert (= (http-response-status resp) 401))))
 ```
 
-`make-test-ws-frame` is the analogue for WebSocket handler unit tests
-— it builds a masked client frame that `ws-handler` code can parse
-and process.
+`make-test-ws-frame` is the analogue for WebSocket handler unit tests —
+it builds a masked client frame that `ws-handler` code can parse and process.
 
-End-to-end tests are slower than unit-style tests (~1-2 seconds per
-`with-test-server` call, mostly shutdown latency). Use unit-style
-tests for handler logic, end-to-end for the request/response path
-itself and for anything that depends on the event loop or graceful
-shutdown machinery.
+End-to-end tests are slower than unit-style tests
+(~1-2 seconds per `with-test-server` call, mostly shutdown latency).
+Use unit-style tests for handler logic,
+end-to-end for the request/response path itself
+and for anything that depends on the event loop or graceful shutdown machinery.
