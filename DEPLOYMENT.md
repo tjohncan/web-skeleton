@@ -408,8 +408,8 @@ a slow client holds the worker hostage.
 
 ### Static files
 
-`load-static-files` reads files into memory at startup and pre-builds
-HTTP responses. Call it **before** `start-server`.
+`load-static-files` reads files into memory at startup and pre-builds HTTP responses.
+Call it **before** `start-server`.
 It is not thread-safe and must not be called while the server is running.
 
 Static responses **omit the `Date` header** — the pre-built bytes
@@ -423,6 +423,42 @@ If you place web-skeleton behind a CDN or reverse proxy,
 the proxy will stamp its own `Date` on the way out —
 operators should not be surprised to see `Date` missing on `/static/*`
 when watching the upstream directly with `curl -v`.
+
+`load-static-files` accepts an optional `:substitutions` argument
+for injecting deploy-time values into static files without a template engine:
+
+```lisp
+(load-static-files
+  "static/"
+  :substitutions
+  '(("index.html" ("__APP_TITLE__"   . "My Great Page")
+                  ("__APP_TAGLINE__" . "A fun page to peruse!"))
+    ("app.js"     ("__API_BASE__"    . "/api/v1"))))
+```
+
+Each entry is `(url-path rule ...)` where each rule is `(literal . replacement)`.
+The leading slash on the file key is optional.
+The framework never invents a delimiter — the caller supplies the exact literal string
+to find and the exact bytes to replace it with.
+Escaping for the target format (HTML, JS, CSS, JSON) is the caller's responsibility;
+if the replacement value contains characters that are special in the target,
+quote them upstream.
+
+Scan semantics are single-pass, left-to-right: at each byte position,
+rules are tried in caller order; the first match wins and the scan jumps
+past the matched span. Emitted replacement bytes are **never re-scanned**,
+so `A`→`B` alongside `B`→`A` is safe by construction.
+When two patterns could match at the same position,
+whichever is listed first in the rules list wins.
+
+The ETag is computed from the **post-substitution** bytes, so two
+deploys with different substituted values will cache-bust correctly.
+Content-Length reflects the substituted size.
+
+Validation is strict and fails at load time, not serve time:
+empty keys or patterns, duplicate file keys, duplicate patterns within one file,
+and file keys that don't match a loaded URL path all signal `ERROR`.
+Typos in a deploy config never silently serve unsubstituted bytes.
 
 ### IDN hostnames
 
