@@ -203,7 +203,10 @@ tests/
   directory-index aliases (`/docs/index.html` → `/docs`),
   directory traversal protection, ETag-based revalidation
   (`If-None-Match` → `304 Not Modified` using a SHA-256 strong entity tag
-  computed at load time), per-path `:cache-control` override (string or function of URL path)
+  computed at load time),
+  per-path `:cache-control` override (string or function of URL path),
+  optional per-file `:substitutions` for injecting deploy-time values
+  (titles, API bases, build ids) via literal-string rewrites
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
   Optional background reaper sweeps entries on an app-supplied predicate
