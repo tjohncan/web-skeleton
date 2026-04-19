@@ -140,10 +140,99 @@
       (if (= n size) buf (subseq buf 0 n)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Substitutions (optional literal-string rewrites at load time)
+;;;
+;;; Lets a deployer inject values (titles, API bases, build ids) into
+;;; static files without a template engine. The caller supplies the
+;;; literal string to match and the bytes to emit — the framework
+;;; never invents a delimiter.
+;;; ---------------------------------------------------------------------------
+
+(defun validate-and-normalize-substitutions (subs)
+  "Parse and validate the :SUBSTITUTIONS argument to LOAD-STATIC-FILES.
+   Returns a hash table keyed on URL path (leading /) whose values are
+   alists of (literal . replacement) in caller order. Signals ERROR on
+   malformed input, empty keys or patterns, or duplicates."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (entry subs)
+      (unless (and (consp entry) (stringp (first entry)))
+        (error "substitutions: malformed entry ~s (expected (\"file\" (\"pat\" . \"rep\") ...))"
+               entry))
+      (let* ((raw-key (first entry))
+             (rules   (rest entry)))
+        (when (zerop (length raw-key))
+          (error "substitutions: empty file key"))
+        (let ((key (if (char= (char raw-key 0) #\/)
+                       raw-key
+                       (concatenate 'string "/" raw-key))))
+          (when (gethash key table)
+            (error "substitutions: duplicate file key ~s" raw-key))
+          (let ((seen (make-hash-table :test #'equal)))
+            (dolist (rule rules)
+              (unless (and (consp rule)
+                           (stringp (car rule))
+                           (stringp (cdr rule)))
+                (error "substitutions ~s: malformed rule ~s (expected (\"pat\" . \"rep\"))"
+                       raw-key rule))
+              (when (zerop (length (car rule)))
+                (error "substitutions ~s: empty pattern" raw-key))
+              (when (gethash (car rule) seen)
+                (error "substitutions ~s: duplicate pattern ~s" raw-key (car rule)))
+              (setf (gethash (car rule) seen) t)))
+          (setf (gethash key table) rules))))
+    table))
+
+(defun apply-substitutions (content rules)
+  "Apply RULES to CONTENT byte vector in a single left-to-right pass.
+   At each position, RULES are tried in caller order; the first match
+   wins, its replacement bytes are emitted, and the scan advances past
+   the matched span. Replacement bytes are never re-scanned, so A->B /
+   B->A cycles are impossible by construction. Returns a fresh
+   (simple-array (unsigned-byte 8)) when any rule fires, or CONTENT
+   unchanged when nothing matches. Patterns and replacements are
+   UTF-8 encoded before matching against CONTENT."
+  (when (null rules)
+    (return-from apply-substitutions content))
+  (let* ((byte-rules
+          (mapcar (lambda (r)
+                    (cons (sb-ext:string-to-octets (car r) :external-format :utf-8)
+                          (sb-ext:string-to-octets (cdr r) :external-format :utf-8)))
+                  rules))
+         (len (length content))
+         (out (make-array (max 16 len)
+                          :element-type '(unsigned-byte 8)
+                          :fill-pointer 0
+                          :adjustable t))
+         (pos 0)
+         (any-match nil))
+    (loop while (< pos len)
+          do (let ((matched nil))
+               (dolist (br byte-rules)
+                 (let* ((pat (car br))
+                        (plen (length pat)))
+                   (when (and (<= (+ pos plen) len)
+                              (not (mismatch content pat
+                                             :start1 pos :end1 (+ pos plen))))
+                     (loop for b across (cdr br)
+                           do (vector-push-extend b out))
+                     (incf pos plen)
+                     (setf matched t any-match t)
+                     (return))))
+               (unless matched
+                 (vector-push-extend (aref content pos) out)
+                 (incf pos))))
+    (if any-match
+        (let ((result (make-array (length out) :element-type '(unsigned-byte 8))))
+          (replace result out)
+          result)
+        content)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Directory scanning and cache loading
 ;;; ---------------------------------------------------------------------------
 
-(defun load-static-files (directory &key (cache-control "public, max-age=3600"))
+(defun load-static-files (directory &key (cache-control "public, max-age=3600")
+                                         substitutions)
   "Load all files under DIRECTORY into the static file cache.
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
@@ -167,8 +256,26 @@
    The resolved string is validated by SERIALIZE-HTTP-MESSAGE on
    the first request serving, so a value containing CR / LF / NUL
    raises a pointed error at response-build time rather than going
-   on the wire."
-  (let ((dir-path (probe-file (pathname directory))))
+   on the wire.
+
+   SUBSTITUTIONS is an optional list of per-file literal-string rewrites
+   applied at load time, before the ETag is computed:
+
+     (load-static-files
+       \"static/\"
+       :substitutions
+       '((\"index.html\" (\"__TITLE__\"   . \"My Great Page\")
+                       (\"__TAGLINE__\" . \"A fun page to peruse!\"))
+         (\"app.js\"    (\"__API_BASE__\" . \"/api/v1\"))))
+
+   Each entry is (url-path rule ...) where each rule is
+   (literal . replacement). Leading slash on the file key is optional.
+   A key that matches no loaded file signals ERROR — typos fail at
+   deploy time rather than serving unsubstituted bytes. Escaping for
+   the target format (HTML, JS, CSS) is the caller's responsibility."
+  (let ((dir-path (probe-file (pathname directory)))
+        (subs-table (when substitutions
+                      (validate-and-normalize-substitutions substitutions))))
     (unless dir-path
       (log-warn "static: directory not found: ~a" directory)
       (return-from load-static-files))
@@ -205,7 +312,11 @@
                    ;; Search url-path (not relative) to catch root-level dot-dirs
                    (unless (search "/." (concatenate 'string "/" relative))
                      (let* ((url-path (concatenate 'string "/" relative))
-                            (content (read-file-bytes fs-path))
+                            (raw-content (read-file-bytes fs-path))
+                            (rules (and subs-table (gethash url-path subs-table)))
+                            (content (if rules
+                                         (apply-substitutions raw-content rules)
+                                         raw-content))
                             (mime (mime-type-for-path url-path))
                             (mtime (file-write-date file))
                             (cc (if (functionp cache-control)
@@ -218,6 +329,15 @@
                        (incf count)
                        (incf total-bytes (length content))
                        (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content))))))))))
+        ;; Validate every :substitutions file key matched a file we
+        ;; actually loaded. Runs before alias generation so aliases
+        ;; can't mask a typo'd key.
+        (when subs-table
+          (maphash (lambda (key rules)
+                     (declare (ignore rules))
+                     (unless (gethash key *static-cache*)
+                       (error "substitutions: ~s is not a loaded file" key)))
+                   subs-table))
         ;; Second pass: register extensionless aliases for .html files
         ;; e.g., /login.html also serves at /login
         ;; Actual files take priority — don't overwrite existing entries
