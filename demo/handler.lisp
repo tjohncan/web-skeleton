@@ -94,7 +94,9 @@
 (defun start-demo (&key (port 8081))
   "Start the demo server."
   (setf *demo-port* port)
-  (load-static-files "demo/static/")
+  (load-static-files "demo/static/"
+                     :substitutions
+                     '(("robots.txt" ("are smart" . "robots are cool and smart"))))
   (start-server :port port
                 :handler #'handle-request
                 :ws-handler #'handle-ws-message))
