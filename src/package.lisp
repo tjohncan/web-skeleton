@@ -13,6 +13,8 @@
            #:get-header
            #:get-headers
            #:get-cookie
+           #:build-cookie
+           #:delete-cookie
            #:get-query-param
            #:parse-request
            #:parse-query-string
@@ -25,6 +27,7 @@
            #:http-response-headers
            #:http-response-body
            #:set-response-header
+           #:add-response-header
            #:format-response
            #:make-text-response
            #:make-html-response
@@ -53,8 +56,13 @@
            ;; HMAC
            #:hmac-sha256
            #:constant-time-equal
+           ;; Random
+           #:random-bytes
+           #:random-token
            ;; ECDSA
            #:ecdsa-verify-p256
+           ;; Address classification
+           #:is-public-address-p
            ;; JWT
            #:jwt-key
            #:make-jwt-key
@@ -89,7 +97,11 @@
            #:serve-static
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
+           #:defer-to-fetch
            #:http-fetch-stream
+           #:parse-url
+           #:parse-ipv4-literal
+           #:parse-ipv6-literal
            #:*https-fetch-fn*
            #:*https-stream-fn*
            ;; Conditions
@@ -98,8 +110,14 @@
            #:*max-request-line-length*
            #:*max-header-count*
            #:*max-header-line-length*
+           #:*max-total-header-bytes*
            #:*max-body-size*
+           #:*max-outbound-response-size*
+           #:*max-streaming-line-size*
+           #:*json-max-depth*
+           #:*json-max-string-length*
            #:*max-ws-payload-size*
+           #:*max-ws-message-size*
            #:*max-connections*
            ;; Connection lifecycle
            #:*idle-timeout*
@@ -108,4 +126,16 @@
            #:*ws-max-missed-pongs*
            #:*fetch-timeout*
            ;; Shutdown
-           #:*drain-timeout*))
+           #:*drain-timeout*
+           #:*shutdown-poll-interval*
+           #:register-cleanup
+           ;; Concurrent store
+           #:storep
+           #:make-store
+           #:store-get
+           #:store-set
+           #:store-update
+           #:store-update-plist
+           #:store-delete
+           #:store-map
+           #:store-count))

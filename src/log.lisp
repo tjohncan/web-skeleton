@@ -25,22 +25,41 @@
   (or (position level *log-levels*) 0))
 
 (defun timestamp ()
-  "Return current UTC time as YYYY-MM-DD hh:mm:ss."
-  (multiple-value-bind (sec min hour day month year)
-      (decode-universal-time (get-universal-time) 0)
-    (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d"
-            year month day hour min sec)))
+  "Return current UTC time as YYYY-MM-DD hh:mm:ss.mmm.
+   Millisecond precision so log-parsing tools can preserve event
+   order within a single second. sb-ext:get-time-of-day returns
+   (values unix-sec microsec); the 2208988800 offset converts Unix
+   epoch (1970) to universal-time epoch (1900) so DECODE-UNIVERSAL-
+   TIME formats the date portion unchanged."
+  (multiple-value-bind (unix-sec usec) (sb-ext:get-time-of-day)
+    (multiple-value-bind (sec min hour day month year)
+        (decode-universal-time (+ unix-sec 2208988800) 0)
+      (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d.~3,'0d"
+              year month day hour min sec (floor usec 1000)))))
 
 (defun log-msg (level format-string &rest args)
-  "Log a message at LEVEL. Suppressed if below *log-level*."
+  "Log a message at LEVEL. Suppressed if below *log-level*.
+   A broken-pipe or closed *log-stream* falls back to *error-output*
+   rather than raising into the worker's hot path — a missed log line
+   is less harmful than a logger that crashes the request pipeline."
   (when (>= (log-level-value level) (log-level-value *log-level*))
     (sb-thread:with-mutex (*log-lock*)
       (let ((stream (or *log-stream* *standard-output*)))
-        (format stream "~a [~a] ~?~%"
-                (timestamp)
-                (string-upcase (symbol-name level))
-                format-string args)
-        (force-output stream)))))
+        (handler-case
+            (progn
+              (format stream "~a [~a] ~?~%"
+                      (timestamp)
+                      (string-upcase (symbol-name level))
+                      format-string args)
+              (force-output stream))
+          (error ()
+            (ignore-errors
+             (format *error-output*
+                     "~a [~a] (log stream failed) ~?~%"
+                     (timestamp)
+                     (string-upcase (symbol-name level))
+                     format-string args)
+             (force-output *error-output*))))))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))

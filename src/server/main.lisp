@@ -14,10 +14,19 @@
 
 (defun make-tcp-listener (host port)
   "Create a TCP socket, bind to HOST:PORT, listen with a backlog of 128.
-   Sets SO_REUSEADDR, SO_REUSEPORT, and non-blocking. Returns the socket."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream
-                               :protocol :tcp)))
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the family
+   is dispatched accordingly. Sets SO_REUSEADDR, SO_REUSEPORT, and
+   non-blocking. Returns the socket."
+  (let* ((family (case (length host)
+                   (4  :inet)
+                   (16 :inet6)
+                   (t (error "make-tcp-listener: :host must be a 4-byte v4 ~
+                              or 16-byte v6 vector, got ~a" host))))
+         (socket (make-instance (if (eq family :inet)
+                                    'sb-bsd-sockets:inet-socket
+                                    'sb-bsd-sockets:inet6-socket)
+                                :type :stream
+                                :protocol :tcp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
     (set-socket-option-int (socket-fd socket)
                            +sol-socket+ +so-reuseport+ 1)
@@ -60,7 +69,6 @@
 
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
-
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -132,8 +140,63 @@
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
 
-(defparameter *max-events* 64
-  "Maximum events to process per epoll_wait call.")
+(defparameter *shutdown-poll-interval* 1
+  "Seconds between shutdown-signal checks in the main thread's wait loop
+   and each worker's event-loop epoll timeout. Also governs the worker's
+   periodic-maintenance cadence (idle-connection sweep, WebSocket ping).
+   Default 1 second balances wake-up overhead against shutdown
+   responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
+   so teardown doesn't wait a full second per call. Float accepted —
+   the worker converts to ms for epoll_wait.")
+
+(defconstant +max-events+ 64
+  "Maximum events to process per epoll_wait call. Internal — not a
+   tunable. A larger batch increases worst-case latency for the
+   tail of the batch without meaningfully improving throughput; a
+   smaller batch adds syscall overhead. 64 is the historical sweet
+   spot that epoll-oriented servers have converged on.")
+
+;;; ---------------------------------------------------------------------------
+;;; User-extensible cleanup hooks
+;;;
+;;; Apps with background work (session reapers, cache flushers, metrics
+;;; exporters) register zero-argument cleanup functions via REGISTER-CLEANUP.
+;;; Hooks run inside start-server's unwind-protect after worker drain, each
+;;; wrapped in HANDLER-CASE so one raising hook cannot prevent the rest from
+;;; firing. This is the integration seam for primitives that own a live
+;;; thread — e.g. a store with an expiry reaper.
+;;; ---------------------------------------------------------------------------
+
+(defvar *shutdown-hooks* nil
+  "List of zero-argument cleanup functions, head = most recently registered.
+   DEFVAR rather than DEFGLOBAL so tests can rebind it locally.
+   Workers spawned via SB-THREAD:MAKE-THREAD see the top-level binding —
+   dynamic bindings are not carried across thread creation.")
+
+(defvar *shutdown-hooks-lock* (sb-thread:make-mutex :name "shutdown-hooks")
+  "Serializes REGISTER-CLEANUP across concurrent threads.")
+
+(defun register-cleanup (fn)
+  "Register FN (a zero-argument function) to run during graceful shutdown.
+   Hooks run after workers have drained, before START-SERVER returns.
+   Thread-safe — callable from any thread, before or during server run.
+   Each invocation is wrapped in HANDLER-CASE, so raising from a hook does
+   not abort the rest. Returns FN."
+  (sb-thread:with-mutex (*shutdown-hooks-lock*)
+    (push fn *shutdown-hooks*))
+  fn)
+
+(defun run-shutdown-hooks ()
+  "Invoke each registered cleanup hook in LIFO order, catching errors.
+   Called from START-SERVER's unwind-protect — do not call directly.
+   Copies the hook list under the mutex before iterating so a hook that
+   registers another hook does not mutate the list we're walking."
+  (let ((hooks (sb-thread:with-mutex (*shutdown-hooks-lock*)
+                 (copy-list *shutdown-hooks*))))
+    (dolist (fn hooks)
+      (handler-case (funcall fn)
+        (error (e)
+          (log-error "shutdown hook error: ~a" e))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request dispatch
@@ -163,25 +226,40 @@
                (set-response-header resp "sec-websocket-version" "13")
                (values resp nil)))))
       ;; Outbound fetch request — handler needs an external call
-      ((typep response 'http-fetch-request)
+      ((typep response 'http-fetch-continuation)
        (log-debug "~a ~a -> fetch ~a"
                   (http-request-method request)
                   (http-request-path request)
-                  (http-fetch-request-url response))
+                  (http-fetch-continuation-url response))
        (values response nil))
-      ;; Pre-formatted response (e.g., static file — already bytes)
+      ;; Pre-formatted response (e.g., static file — already bytes).
+      ;; HEAD truncation happens centrally in HANDLE-CLIENT-READ via
+      ;; STRIP-BODY-FOR-HEAD on the way to CONNECTION-QUEUE-WRITE, so
+      ;; both byte-vector and HTTP-RESPONSE paths funnel through one
+      ;; strip site instead of two.
       ((typep response '(simple-array (unsigned-byte 8) (*)))
        (log-debug "~a ~a -> static"
                   (http-request-method request)
                   (http-request-path request))
        (values response nil))
-      ;; Normal HTTP response
-      (t
+      ;; Normal HTTP response — must be an HTTP-RESPONSE struct. The
+      ;; previous catch-all let a handler that forgot MAKE-TEXT-RESPONSE
+      ;; (returning a raw string or alist) fall through to FORMAT-RESPONSE
+      ;; where it tripped a deep SIMPLE-TYPE-ERROR from the struct
+      ;; accessor, which the outer handler-case converted to a 500.
+      ;; Correct outcome, terrible message — apps debugging their own
+      ;; handler bugs had to trace into HTTP-RESPONSE-STATUS to realize
+      ;; the issue was upstream. Check here and raise a pointed error.
+      ((typep response 'http-response)
        (log-debug "~a ~a -> ~d"
                   (http-request-method request)
                   (http-request-path request)
                   (http-response-status response))
-       (values response nil)))))
+       (values response nil))
+      (t
+       (error "handler returned ~a; expected an HTTP-RESPONSE, ~
+               HTTP-FETCH-CONTINUATION, byte vector, or :UPGRADE"
+              (type-of response))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Accept a new connection
@@ -207,12 +285,24 @@
       (ignore-errors (sb-bsd-sockets:socket-close client-socket))
       (return-from accept-connection t))
     (handler-case
-        (let ((conn (make-client-connection client-socket)))
-          (register-connection conn)
-          (epoll-add epoll-fd (connection-fd conn)
-                     (logior +epollin+ +epollet+))
-          (log-debug "accepted fd ~d ~a" (connection-fd conn)
-                     (or (connection-remote-addr conn) ""))
+        (let ((conn (make-client-connection client-socket))
+              (registered nil)
+              (done nil))
+          (unwind-protect
+               (progn
+                 (register-connection conn)
+                 (setf registered t)
+                 (epoll-add epoll-fd (connection-fd conn)
+                            (logior +epollin+ +epollet+))
+                 (log-debug "accepted fd ~d ~a" (connection-fd conn)
+                            (or (connection-remote-addr conn) ""))
+                 (setf done t))
+            ;; If EPOLL-ADD raised after REGISTER-CONNECTION succeeded,
+            ;; the connection is in *CONNECTIONS* but the kernel never
+            ;; saw the fd — a stale entry that the idle sweeper would
+            ;; later trip over. Drop it so the table stays honest.
+            (when (and registered (not done))
+              (unregister-connection conn)))
           t)
       (error (e)
         (log-error "accept failed: ~a" e)
@@ -225,22 +315,25 @@
 
 (defun close-connection (conn epoll-fd)
   "Remove from epoll, unregister, close fd.
-   If CONN is :awaiting, also closes its outbound connection to prevent
-   use-after-close on fd reuse."
+   If CONN is :awaiting, also closes its outbound connection via
+   CLOSE-OUTBOUND — which fires the app's fetch cleanup callback if
+   the outbound was still carrying one, so DB handles / metrics /
+   rate-limit counters get a defined moment to run their teardown
+   even on inbound-driven aborts (drain, idle timeout, I/O error).
+   MAYBE-REAP-DNS-PROCESS runs on every cleaned-up connection so a
+   half-finished DNS lookup never leaks."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
-      ;; If parked waiting for a fetch, close the orphaned outbound too
+      ;; If parked waiting for a fetch, close the orphaned outbound too.
       (when (eq (connection-state conn) :awaiting)
         (let ((out-fd (connection-awaiting-fd conn)))
           (when (>= out-fd 0)
             (let ((out-conn (lookup-connection out-fd)))
               (when out-conn
-                (ignore-errors (epoll-remove epoll-fd out-fd))
-                (unregister-connection out-conn)
-                (connection-close out-conn)
-                (log-debug "closed orphaned outbound fd ~d" out-fd))))))
+                (close-outbound out-conn epoll-fd))))))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
+      (maybe-reap-dns-process conn)
       (connection-close conn)
       (log-debug "closed fd ~d" fd))))
 
@@ -258,27 +351,60 @@
     (when (zerop count)
       (return-from drain-connections))
     (log-info "draining ~d connection~:p" count))
-  ;; Phase 1: initiate shutdown on each connection
-  (let ((to-close nil))
+  ;; Phase 1: initiate shutdown on each connection. Outbound
+  ;; connections and inbound connections that haven't completed a
+  ;; request are closed immediately. WebSocket connections get a
+  ;; 1001 close frame and are flipped to :closing so the event
+  ;; loop finishes flushing the close before tearing them down.
+  ;; Outbounds and inbounds are split into two lists so outbounds
+  ;; can be routed through close-outbound (which fires the fetch
+  ;; callback); close-connection on a direct outbound wouldn't
+  ;; because its :awaiting branch only handles paired-outbound
+  ;; teardown, not the outbound itself.
+  (let ((outbounds-to-close nil)
+        (inbounds-to-close nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
                (cond
-                 ;; Outbound connections — close immediately
                  ((connection-outbound-p conn)
-                  (push conn to-close))
-                 ;; HTTP connections still reading — nothing to drain
+                  (push conn outbounds-to-close))
                  ((member (connection-state conn) '(:read-http :read-body :awaiting))
-                  (push conn to-close))
-                 ;; WebSocket — send close frame (1001 = going away)
+                  (push conn inbounds-to-close))
                  ((eq (connection-state conn) :websocket)
-                  (connection-queue-write conn (build-ws-close 1001))
-                  (setf (connection-state conn) :closing)
-                  (epoll-modify epoll-fd (connection-fd conn)
-                               (logior +epollout+ +epollet+)))
+                  ;; Must not clobber an in-flight write. The race:
+                  ;; ping-ws-connections queued a 2-byte ping whose
+                  ;; first byte was flushed, write-pos=1 write-end=2
+                  ;; (EAGAIN on byte 2). SIGTERM arrives, drain runs,
+                  ;; connection-queue-write overwrites write-buf with
+                  ;; the close frame bytes and resets write-pos to 0.
+                  ;; What hits the wire: partial ping + close frame
+                  ;; bytes as one contiguous buffer, and the client
+                  ;; interprets the close frame's FIN+opcode byte as
+                  ;; the ping's length, then waits forever. Same
+                  ;; discipline ping-ws-connections itself uses
+                  ;; (queue only when nothing is in flight). If a
+                  ;; write IS in flight, transition to :closing and
+                  ;; let handle-client-write tear the connection
+                  ;; down after the partial write finishes — the
+                  ;; peer sees a truncated frame rather than a
+                  ;; corrupt one.
+                  (cond
+                    ((< (connection-write-pos conn) (connection-write-end conn))
+                     (setf (connection-state conn) :closing))
+                    (t
+                     (connection-queue-write conn (build-ws-close 1001))
+                     (setf (connection-state conn) :closing)
+                     (epoll-modify epoll-fd (connection-fd conn)
+                                   (logior +epollout+ +epollet+)))))
                  ;; :write-response, :ws-upgrade, :closing — let them finish
                  (t nil)))
              *connections*)
-    (dolist (conn to-close)
+    ;; Close outbounds first so their fetch callbacks fire. Inbounds
+    ;; afterward — any that were in :awaiting find their paired
+    ;; outbound already gone and short-circuit cleanly.
+    (dolist (conn outbounds-to-close)
+      (close-outbound conn epoll-fd))
+    (dolist (conn inbounds-to-close)
       (close-connection conn epoll-fd)))
   ;; Phase 2: flush remaining writes until drained or timeout
   (let ((deadline (+ (get-universal-time) *drain-timeout*)))
@@ -290,7 +416,7 @@
         (log-warn "drain timeout — force-closing ~d connection~:p"
                   (hash-table-count *connections*))
         (return))
-      (let ((n (epoll-wait epoll-fd event-buf *max-events* 200)))
+      (let ((n (epoll-wait epoll-fd event-buf +max-events+ 200)))
         (loop for i from 0 below n
               do (let* ((fd (epoll-event-fd event-buf i))
                         (flags (epoll-event-flags event-buf i))
@@ -308,9 +434,18 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-client-read (conn epoll-fd handler ws-handler)
-  "Handle EPOLLIN on a client connection."
+  "Handle EPOLLIN on a client connection.
+   State dispatch is permissive: a stale EPOLLIN for a connection
+   whose state moved to :write-response / :ws-upgrade / :closing /
+   :sending-100-continue earlier in the same epoll batch silently
+   no-ops instead of raising into the outer handler-case and
+   queueing a 500 over the legitimate response that's already in
+   the write buffer. The race is reachable when one event in a
+   batch completes a fetch (setting an inbound's state to
+   :write-response) and a later event in the same batch is a
+   stale EPOLLIN for that inbound."
   (handler-case
-      (ecase (connection-state conn)
+      (case (connection-state conn)
         ;; HTTP request accumulation
         ((:read-http :read-body)
          (let ((result (connection-on-read conn)))
@@ -327,53 +462,81 @@
                            (or (connection-remote-addr conn) ""))
                 ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
                 ;; HTTP/1.0 default is close. Connection header overrides.
-                (let ((conn-header (get-header request "connection")))
+                ;; RFC 7230 §6.1 + §3.2.2: Connection is a list-valued
+                ;; header, and multiple occurrences are semantically
+                ;; equivalent to one comma-joined value. Walk
+                ;; GET-HEADERS rather than GET-HEADER so a split
+                ;; Connection: keep-alive / Connection: close pair
+                ;; from a cooperating proxy is read as "close" instead
+                ;; of silently dropping the second value.
+                (let ((conn-values (get-headers request "connection")))
                   (setf (connection-close-after-p conn)
                         (cond
-                          ((and conn-header
-                                (connection-header-has-token-p conn-header "close"))
+                          ((some (lambda (v)
+                                   (connection-header-has-token-p v "close"))
+                                 conn-values)
                            t)
-                          ((and conn-header
-                                (connection-header-has-token-p conn-header "keep-alive"))
+                          ((some (lambda (v)
+                                   (connection-header-has-token-p v "keep-alive"))
+                                 conn-values)
                            nil)
                           ((string= (http-request-version request) "1.0") t)
                           (t nil))))
                 (multiple-value-bind (response upgrade-p)
                     (dispatch-request request handler)
+                  ;; Sync close-after-p from a handler-set Connection: close
+                  ;; header. Without this step an HTTP/1.1 handler that
+                  ;; explicitly asks to close the socket would advertise
+                  ;; 'Connection: close' on the wire while the server
+                  ;; happily held the socket open — framing mismatch vs
+                  ;; the client's expectation. Shared helper with the
+                  ;; fetch-callback path (fetch.lisp / tls.lisp) walks
+                  ;; every 'connection' header via GET-HEADERS-equivalent,
+                  ;; symmetric with the inbound-side walk ten lines up.
+                  (sync-close-after-p-from-response conn response)
                   (cond
                     ;; Outbound fetch — park and initiate
-                    ((typep response 'http-fetch-request)
+                    ((typep response 'http-fetch-continuation)
                      (initiate-fetch conn epoll-fd response))
-                    ;; Normal response — queue for writing
+                    ;; Normal response — queue for writing.
+                    ;; Handler-returned response structs are treated as
+                    ;; immutable: a caller that caches a (make-error-response
+                    ;; 404) across requests must not have HEAD strip the
+                    ;; body slot or HTTP/1.0 keep-alive stamp a Connection
+                    ;; header onto it. :CONNECTION-HINT stamps the
+                    ;; Connection header at serialize time, :HEAD-ONLY-P
+                    ;; skips body emission for HEAD without allocating —
+                    ;; neither touches the struct. The byte-vector path
+                    ;; (pre-built static files) still goes through
+                    ;; STRIP-BODY-FOR-HEAD since the bytes are already
+                    ;; fully serialized and we have no encode step to
+                    ;; short-circuit.
                     (t
-                     ;; HTTP/1.0 keep-alive: echo the header so the client
-                     ;; knows the connection will persist
-                     (when (and (not (connection-close-after-p conn))
-                                (string= (http-request-version request) "1.0")
-                                (typep response 'http-response))
-                       (set-response-header response "connection" "keep-alive"))
-                     ;; HEAD responses: set Content-Length but strip body
-                     (when (and (eq (http-request-method request) :HEAD)
-                                (typep response 'http-response)
-                                (http-response-body response))
-                       (let ((body (sb-ext:string-to-octets
-                                    (http-response-body response)
-                                    :external-format :utf-8)))
-                         (unless (assoc "content-length"
-                                        (http-response-headers response)
-                                        :test #'string=)
-                           (set-response-header response "content-length"
-                                                (write-to-string (length body)))))
-                       (setf (http-response-body response) nil))
-                     (let ((bytes (if (typep response
-                                            '(simple-array (unsigned-byte 8) (*)))
-                                      response
-                                      (format-response response))))
+                     (let* ((head-p (eq (http-request-method request) :HEAD))
+                            (bytes
+                             (if (typep response
+                                        '(simple-array (unsigned-byte 8) (*)))
+                                 (strip-body-for-head response conn)
+                                 (format-response
+                                  response
+                                  :connection-hint (connection-hint-for conn)
+                                  :head-only-p head-p))))
                        (connection-queue-write conn bytes)
                        (setf (connection-state conn)
                              (if upgrade-p :ws-upgrade :write-response))
                        (epoll-modify epoll-fd (connection-fd conn)
                                     (logior +epollout+ +epollet+))))))))
+             (:flush-queued
+              ;; connection-on-read queued response bytes that must flush
+              ;; before further reads happen. Covers two cases:
+              ;;   :sending-100-continue — interim 100, body read resumes
+              ;;                           once the flush completes.
+              ;;   :write-response       — terminal 417 on unknown Expect,
+              ;;                           close-after-p=T closes after.
+              ;; Either way the next step is EPOLLOUT; handle-client-write
+              ;; flushes and state-based dispatch takes it from there.
+              (epoll-modify epoll-fd (connection-fd conn)
+                            (logior +epollout+ +epollet+)))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — just wait for more data
@@ -432,15 +595,27 @@
              ;; :continue — wait for more data
              )))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
-        (:awaiting nil))
+        (:awaiting nil)
+        ;; Stale EPOLLIN for a state that isn't currently reading.
+        ;; Silently ignored so a late notification can't escalate
+        ;; into a 500 via the handler-case fallback below.
+        (otherwise
+         (log-debug "stale EPOLLIN fd ~d in state ~a — ignoring"
+                    (connection-fd conn) (connection-state conn))))
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
-      ;; Send 400 before closing so the client gets a proper HTTP response
+      ;; Send 400 before closing so the client gets a proper HTTP response.
+      ;; Runs through STRIP-BODY-FOR-HEAD for symmetry with the 500 path
+      ;; below — typically a no-op here because CONNECTION-REQUEST isn't
+      ;; set until PARSE-REQUEST-BYTES fully succeeds, but harmless and
+      ;; correct on any future path that raises HTTP-PARSE-ERROR after
+      ;; the request is parsed.
       (handler-case
           (let ((resp (make-error-response 400)))
             (set-response-header resp "connection" "close")
-            (let ((err-bytes (format-response resp)))
+            (let ((err-bytes (strip-body-for-head
+                              (format-response resp) conn)))
               (connection-queue-write conn err-bytes)
               (setf (connection-state conn) :write-response
                     (connection-close-after-p conn) t)
@@ -454,7 +629,8 @@
       (handler-case
           (let ((resp (make-error-response 500)))
             (set-response-header resp "connection" "close")
-            (let ((err-bytes (format-response resp)))
+            (let ((err-bytes (strip-body-for-head
+                              (format-response resp) conn)))
               (connection-queue-write conn err-bytes)
               (setf (connection-state conn) :write-response
                     (connection-close-after-p conn) t)
@@ -468,13 +644,26 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun handle-client-write (conn epoll-fd)
-  "Handle EPOLLOUT on a client connection."
+  "Handle EPOLLOUT on a client connection.
+   Inner state dispatch is permissive for the same reason as
+   HANDLE-CLIENT-READ: a stale EPOLLOUT can arrive for a state
+   that isn't currently writing, and raising into the handler-case
+   below would overwrite a legitimate in-flight response with a 500.
+
+   Bumps LAST-ACTIVE on entry so a legitimate slow client (mobile
+   3G pulling a 5 MiB response at 200 KB/s) is not reaped by the
+   idle sweeper midway through the download. EPOLLOUT firing means
+   the kernel has room in the socket buffer; treating that as
+   activity is the correct semantics for a slow-pipe client, and
+   dispatch-time + keep-alive-reset bumps alone would not survive
+   a response that takes longer than *IDLE-TIMEOUT* to flush."
+  (setf (connection-last-active conn) (get-universal-time))
   (handler-case
       (let ((result (connection-on-write conn)))
         (case result
           (:done
            ;; All bytes sent — next action depends on state
-           (ecase (connection-state conn)
+           (case (connection-state conn)
              (:write-response
               (if (connection-close-after-p conn)
                   (close-connection conn epoll-fd)
@@ -487,6 +676,23 @@
                       (replace (connection-read-buf conn)
                                (connection-read-buf conn)
                                :start1 0 :start2 consumed :end2 buffered))
+                    ;; Shrink the read buffer back to the default 4 KiB
+                    ;; when a prior large body grew it and the shifted
+                    ;; pipelined bytes fit in the default. 10k idle
+                    ;; keep-alives × 1 MiB grown buffers would otherwise
+                    ;; sit on ~10 GiB after a burst of large POSTs.
+                    ;; Heuristic: a uniform-large-POST workload will
+                    ;; shrink-then-grow each cycle — fine for bursty
+                    ;; traffic (the common case), measurable if traffic
+                    ;; happens to be uniform-large.
+                    (let ((buf (connection-read-buf conn)))
+                      (when (and (> (length buf) 4096)
+                                 (< extra 4096))
+                        (let ((fresh (make-array 4096
+                                                  :element-type '(unsigned-byte 8))))
+                          (when (> extra 0)
+                            (replace fresh buf :end2 extra))
+                          (setf (connection-read-buf conn) fresh))))
                     (setf (connection-read-pos conn) (max extra 0)
                           (connection-write-buf conn) nil
                           (connection-write-pos conn) 0
@@ -530,7 +736,27 @@
                            (logior +epollin+ +epollet+)))
              (:closing
               ;; Close frame sent — disconnect
-              (close-connection conn epoll-fd))))
+              (close-connection conn epoll-fd))
+             (:sending-100-continue
+              ;; 100 Continue flushed — switch to reading the body.
+              ;; Returning :keep-alive tells the main loop to re-enter
+              ;; handle-client-read immediately in case the body is
+              ;; already buffered (edge-triggered epoll won't re-fire
+              ;; on user-space bytes).
+              (setf (connection-write-buf conn) nil
+                    (connection-write-pos conn) 0
+                    (connection-write-end conn) 0
+                    (connection-state conn) :read-body)
+              (epoll-modify epoll-fd (connection-fd conn)
+                            (logior +epollin+ +epollet+))
+              (return-from handle-client-write :keep-alive))
+             ;; Stale EPOLLOUT for a state that isn't currently
+             ;; writing (e.g. a race where read-side completed
+             ;; earlier in the same batch and flipped the state
+             ;; before this event was dispatched). Silently ignore.
+             (otherwise
+              (log-debug "stale EPOLLOUT :done fd ~d in state ~a — ignoring"
+                         (connection-fd conn) (connection-state conn)))))
           ;; :continue — more bytes to write
           (:continue nil)))
     (error (e)
@@ -543,14 +769,16 @@
 
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler)
   "Main event loop. Runs until *shutdown* is set."
-  (let ((listener-fd (socket-fd listener-socket))
-        (last-ping-time (get-universal-time))
-        (event-buf (make-epoll-event-buf *max-events*)))
+  (let ((listener-fd    (socket-fd listener-socket))
+        (last-ping-time  (get-universal-time))
+        (last-sweep-time (get-universal-time))
+        (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when *shutdown*
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
-      (let ((n (epoll-wait epoll-fd event-buf *max-events* 1000)))
+      (let ((n (epoll-wait epoll-fd event-buf +max-events+
+                           (max 10 (round (* *shutdown-poll-interval* 1000))))))
         (loop for i from 0 below n
               do (block handle-event
                    (let ((fd    (epoll-event-fd event-buf i))
@@ -568,30 +796,46 @@
                             (if (connection-outbound-p conn)
                                 ;; Outbound fetch connection
                                 (handle-outbound-event conn epoll-fd flags)
-                                ;; Inbound client connection
+                                ;; Inbound client connection. Process
+                                ;; EPOLLIN before EPOLLHUP so a
+                                ;; fire-and-close HTTP/1.0 client
+                                ;; (sends request, immediately FINs)
+                                ;; gets the request processed instead
+                                ;; of losing it to the HUP arm.
                                 (progn
-                                  ;; Error or hangup — close and skip
-                                  (when (or (logtest flags +epollerr+)
-                                            (logtest flags +epollhup+))
-                                    (close-connection conn epoll-fd)
-                                    (return-from handle-event))
                                   ;; Readable
                                   (when (logtest flags +epollin+)
                                     (handle-client-read conn epoll-fd handler ws-handler))
-                                  ;; Writable (check still alive after read)
-                                  (when (and (logtest flags +epollout+)
-                                             (lookup-connection fd))
-                                    (when (eq (handle-client-write conn epoll-fd)
-                                              :keep-alive)
-                                      ;; Keep-alive reset — read immediately in case
-                                      ;; the next request is already buffered
-                                      ;; (edge-triggered epoll won't re-notify)
-                                      (when (lookup-connection fd)
-                                        (handle-client-read conn epoll-fd
-                                                            handler ws-handler))))))))))))))
-      ;; Periodic maintenance
+                                  ;; Writable (rebind from table — fd may
+                                  ;; have been reused since the batch start)
+                                  (when (logtest flags +epollout+)
+                                    (let ((live (lookup-connection fd)))
+                                      (when live
+                                        (when (eq (handle-client-write live epoll-fd)
+                                                  :keep-alive)
+                                          ;; Keep-alive reset — read immediately in case
+                                          ;; the next request is already buffered
+                                          ;; (edge-triggered epoll won't re-notify)
+                                          (when (lookup-connection fd)
+                                            (handle-client-read live epoll-fd
+                                                                handler ws-handler))))))
+                                  ;; Error/hangup — close only if the
+                                  ;; read/write path didn't already
+                                  ;; tear the connection down.
+                                  (when (or (logtest flags +epollerr+)
+                                           (logtest flags +epollhup+))
+                                    (let ((live (lookup-connection fd)))
+                                      (when live
+                                        (close-connection live epoll-fd))))))))))))))
+      ;; Periodic maintenance — both scans gated on elapsed wall
+      ;; clock so a busy epoll loop doesn't walk the connection
+      ;; table multiple times per second. 1 s is fine: idle
+      ;; timeouts are measured in 10 s+ units, so sub-second sweep
+      ;; granularity is pure waste.
       (let ((now (get-universal-time)))
-        (sweep-idle-connections epoll-fd now)
+        (when (>= (- now last-sweep-time) 1)
+          (sweep-idle-connections epoll-fd now)
+          (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
           (setf last-ping-time now))))))
@@ -606,28 +850,62 @@
   (loop
     (handler-case
         (let ((*connections* (make-hash-table :test #'eql))
-              (*epoll-ctl-buf* (make-array 12 :element-type '(unsigned-byte 8)))
+              (*epoll-ctl-buf* (make-array +epoll-event-size+
+                                           :element-type '(unsigned-byte 8)))
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
-          (let* ((listener (make-tcp-listener host port))
-                 (epoll-fd (epoll-create)))
-            (log-info "worker ~d started (epoll fd ~d)" worker-id epoll-fd)
-            (epoll-add epoll-fd (socket-fd listener)
-                       (logior +epollin+ +epollet+))
+          ;; Split the listener and epoll-fd bindings so a failure of
+          ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
+          ;; listener socket — a shared let* would leak it because the
+          ;; cleanup form references EPOLL-FD which is never bound on
+          ;; that path.
+          (let ((listener (make-tcp-listener host port)))
             (unwind-protect
-                (run-event-loop listener epoll-fd handler ws-handler)
-              ;; Cleanup: close all connections, listener, epoll fd
-              (maphash (lambda (fd conn)
-                         (declare (ignore fd))
-                         (connection-close conn))
-                       *connections*)
-              (sb-bsd-sockets:socket-close listener)
-              (%close epoll-fd)))
+                 (let ((epoll-fd (epoll-create)))
+                   (log-info "worker ~d started (epoll fd ~d)"
+                             worker-id epoll-fd)
+                   (epoll-add epoll-fd (socket-fd listener)
+                              (logior +epollin+ +epollet+))
+                   (unwind-protect
+                       (run-event-loop listener epoll-fd handler ws-handler)
+                     ;; Cleanup on worker crash or normal exit. Split the
+                     ;; table into outbounds and everything else — outbounds
+                     ;; go through CLOSE-OUTBOUND so their fetch callbacks
+                     ;; fire even when the worker dies with requests in
+                     ;; flight, matching the contract that every fetch's
+                     ;; :then closure runs exactly once. Non-outbounds get
+                     ;; the raw CONNECTION-CLOSE; we can't deliver anything
+                     ;; to their clients at this point and the epoll fd is
+                     ;; about to be torn down anyway. The collect step
+                     ;; avoids mutating the hash table during MAPHASH — we
+                     ;; only call UNREGISTER-CONNECTION (via close-outbound)
+                     ;; in the dolist after the walk.
+                     (let ((outbounds nil))
+                       (maphash (lambda (fd conn)
+                                  (declare (ignore fd))
+                                  (if (connection-outbound-p conn)
+                                      (push conn outbounds)
+                                      (progn
+                                        (maybe-reap-dns-process conn)
+                                        (connection-close conn))))
+                                *connections*)
+                       (dolist (conn outbounds)
+                         (close-outbound conn epoll-fd)))
+                     (%close epoll-fd)))
+              ;; Runs whether EPOLL-CREATE succeeded or raised.
+              (sb-bsd-sockets:socket-close listener)))
           ;; Normal exit (shutdown requested)
           (log-info "worker ~d stopped" worker-id)
           (return))
       (error (e)
-        (log-error "worker ~d crashed: ~a — restarting in 1s" worker-id e)
-        (sleep 1)
+        (log-error "worker ~d crashed: ~a — restarting" worker-id e)
+        ;; 1-second backoff, sliced into *shutdown-poll-interval*
+        ;; chunks so a SIGTERM arriving during the backoff is noticed
+        ;; within one slice rather than after the full second.
+        (let ((until (+ (get-internal-real-time)
+                        internal-time-units-per-second)))
+          (loop until (or *shutdown*
+                          (>= (get-internal-real-time) until))
+                do (sleep *shutdown-poll-interval*)))
         (when *shutdown* (return))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -636,15 +914,33 @@
 
 (defun cpu-count ()
   "Return the number of online CPU cores.
-   Parses the 0-N format from /sys/devices/system/cpu/online.
-   Falls back to 1 for exotic topologies (comma-separated ranges, etc.)."
+   Parses /sys/devices/system/cpu/online. Handles both the simple
+   '0-N' shape and the multi-range 'A-B,C,D-E' shape produced by
+   hotplugged or heterogeneous topologies (Intel E-cores offline,
+   VMs with non-contiguous CPU masks, etc.). The old one-shot
+   `dash + parse-integer` parser fell back to 1 on any comma,
+   silently wasting cores on exactly the machines where we cared
+   about parallelism most."
   (handler-case
       (with-open-file (s "/sys/devices/system/cpu/online")
-        (let* ((line (read-line s))
-               (dash (position #\- line)))
-          (if dash
-              (1+ (parse-integer (subseq line (1+ dash))))
-              1)))
+        (let ((line (read-line s)))
+          (loop with total = 0
+                with start = 0
+                with len = (length line)
+                while (< start len)
+                for comma = (or (position #\, line :start start) len)
+                for dash  = (position #\- line :start start :end comma)
+                do (if dash
+                       (let ((lo (parse-integer line :start start :end dash))
+                             (hi (parse-integer line :start (1+ dash)
+                                                     :end comma)))
+                         (incf total (1+ (- hi lo))))
+                       (progn
+                         ;; Single-CPU token — still parse to validate.
+                         (parse-integer line :start start :end comma)
+                         (incf total)))
+                   (setf start (1+ comma))
+                finally (return (max 1 total)))))
     (error ()
       (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")
       1)))
@@ -662,34 +958,74 @@
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers."
+  (unless (and (integerp workers) (plusp workers))
+    (error "start-server: :workers must be a positive integer, got ~a"
+           workers))
   (setf *shutdown* nil)
-  ;; Ignore SIGPIPE — writing to a broken connection must return EPIPE,
-  ;; not kill the process. SBCL typically ignores it, but not guaranteed.
-  (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
-  ;; SIGTERM triggers graceful shutdown (same as Ctrl-C)
-  (sb-sys:enable-interrupt sb-unix:sigterm
-    (lambda (signal info context)
-      (declare (ignore signal info context))
-      (setf *shutdown* t)))
-  (log-info "starting ~d worker~:p on ~{~d~^.~}:~d" workers (coerce host 'list) port)
-  (let ((threads (loop for i from 0 below workers
-                       collect (sb-thread:make-thread
-                                (let ((id i))
-                                  (lambda () (run-worker host port id handler ws-handler)))
-                                :name (format nil "web-skeleton-~d" i)))))
+  ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
+  ;; be called from inside a host SBCL image (a REPL, a test runner, an
+  ;; orchestrator) without permanently stealing the signals.
+  ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
+  ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
+  ;;
+  ;; Two nested unwind-protects, one per signal: SIGPIPE in the
+  ;; outer, SIGTERM in the inner. If SIGTERM install raises, the
+  ;; outer cleanup still restores SIGPIPE. If both succeed and the
+  ;; body raises (MAKE-THREAD exhaustion, etc.), both cleanups run.
+  ;; A single parallel let would leak SIGPIPE if the SIGTERM init
+  ;; form raised before the body was entered.
+  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)))
     (unwind-protect
-        (handler-case
-            ;; Main thread waits for interrupt or SIGTERM
-            (loop (sleep 1)
-                  (when *shutdown*
-                    (log-info "shutting down")
-                    (return)))
-          (sb-sys:interactive-interrupt ()
-            (format t "~%")
-            (log-info "interrupted — shutting down")))
-      ;; Signal workers to drain and stop
-      (setf *shutdown* t)
-      (dolist (thread threads)
-        (ignore-errors (sb-thread:join-thread thread
-                                              :timeout (+ *drain-timeout* 3))))
-      (log-info "stopped"))))
+         (let ((prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
+                               (lambda (signal info context)
+                                 (declare (ignore signal info context))
+                                 (setf *shutdown* t)))))
+           (unwind-protect
+                (progn
+                  (log-info "starting ~d worker~:p on ~a"
+                            workers (format-peer-addr host port))
+                  ;; Accumulate threads incrementally rather than via LOOP
+                  ;; COLLECT: if MAKE-THREAD raises on iteration N, the
+                  ;; partial list in THREADS still covers workers 0..N-1 so
+                  ;; the drain cleanup can signal and join them.
+                  (let ((threads nil))
+                    (unwind-protect
+                         (progn
+                           (dotimes (i workers)
+                             (let ((id i))
+                               (push (sb-thread:make-thread
+                                      (lambda ()
+                                        (run-worker host port id
+                                                    handler ws-handler))
+                                      :name (format nil "web-skeleton-~d" i))
+                                     threads)))
+                           (handler-case
+                               ;; Main thread waits for interrupt or SIGTERM
+                               (loop (sleep *shutdown-poll-interval*)
+                                     (when *shutdown*
+                                       (log-info "shutting down")
+                                       (return)))
+                             (sb-sys:interactive-interrupt ()
+                               (format t "~%")
+                               (log-info "interrupted — shutting down"))))
+                      ;; Signal workers to drain and stop. Runs on normal
+                      ;; exit, interactive-interrupt, AND a MAKE-THREAD
+                      ;; raise partway through the spawn loop.
+                      (setf *shutdown* t)
+                      (dolist (thread threads)
+                        (ignore-errors
+                         (sb-thread:join-thread thread
+                                                :timeout (+ *drain-timeout* 3))))
+                      ;; Workers have drained; run any app-registered cleanup
+                      ;; before returning. Hooks own their own error handling —
+                      ;; one raising hook cannot block the rest, cannot block
+                      ;; the "stopped" log, and cannot prevent START-SERVER
+                      ;; from returning to its caller.
+                      (run-shutdown-hooks)
+                      (log-info "stopped"))))
+             ;; Inner cleanup: restore SIGTERM
+             (ignore-errors
+              (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
+      ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
+      (ignore-errors
+       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe)))))

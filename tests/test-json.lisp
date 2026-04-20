@@ -98,7 +98,28 @@
     (check "\\u with negative rejected"
            (signals-error-p (lambda () (json-parse "\"\\u-001\""))) t)
     (check "\\u truncated rejected"
-           (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)))
+           (signals-error-p (lambda () (json-parse "\"\\u00\""))) t)
+    ;; Exponent overflow — 1e9999 is syntactically valid per the 20
+    ;; exponent-digit cap but overflows IEEE 754. A raw
+    ;; FLOATING-POINT-OVERFLOW from SBCL's reader would be useless
+    ;; to the app; parser error is what the caller should see.
+    (check "exponent overflow rejected"
+           (signals-error-p (lambda () (json-parse "1e9999"))) t)
+    (check "negative exponent overflow rejected"
+           (signals-error-p (lambda () (json-parse "-1e9999"))) t)
+    ;; Duplicate keys — RFC 8259 §4 says SHOULD be unique; we say MUST.
+    (check "duplicate key rejected"
+           (signals-error-p
+            (lambda () (json-parse "{\"a\":1,\"a\":2}")))
+           t)
+    (check "duplicate key rejected nested"
+           (signals-error-p
+            (lambda () (json-parse "{\"o\":{\"k\":1,\"k\":2}}")))
+           t)
+    (check "duplicate key across three rejected"
+           (signals-error-p
+            (lambda () (json-parse "{\"a\":1,\"b\":2,\"a\":3}")))
+           t)))
 
 (defun test-json-serialize ()
   (format t "~%JSON Serializer~%")
@@ -132,6 +153,21 @@
          (json-serialize '(1 "two" t))
          "[1,\"two\",true]")
 
+  ;; Improper lists must reject, not silently emit invalid JSON. A
+  ;; one-cell LISTP check was the original guard — it only inspected
+  ;; (CDR value), so (1 2 . 3) passed through and json-write-array
+  ;; emitted "[1,2,]" (trailing comma). Guarded now by PROPER-LIST-P.
+  (flet ((signals-error-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "ser dotted pair rejected"
+           (signals-error-p (lambda () (json-serialize '(1 . 2)))) t)
+    (check "ser improper 3-list rejected"
+           (signals-error-p (lambda () (json-serialize '(1 2 . 3)))) t)
+    (check "ser improper alist-shape rejected"
+           (signals-error-p
+            (lambda () (json-serialize '(("a" . 1) ("b" . 2) . 3)))) t))
+
   ;; Objects (alists with string keys)
   (check "ser object"
          (json-serialize '(("name" . "ankle") ("size" . 4444)))
@@ -156,14 +192,51 @@
     (check "ser Infinity rejected"
            (signals-error-p
             (lambda ()
-              (json-serialize sb-ext:double-float-positive-infinity))) t)))
+              (json-serialize sb-ext:double-float-positive-infinity))) t)
+    (check "ser single-float rejected"
+           (signals-error-p
+            (lambda () (json-serialize 3.14)))
+           t))
+
+  ;; Leading UTF-8 BOM (U+FEFF) silently skipped per RFC 8259 §8.1.
+  ;; Windows text editors and some encoders prepend one.
+  (check "BOM stripped from JSON input"
+         (json-parse (format nil "~a{\"x\":1}" (string (code-char #xFEFF))))
+         '(("x" . 1)))
+  (check "BOM-only input still errors cleanly"
+         (handler-case
+             (progn (json-parse (string (code-char #xFEFF))) nil)
+           (error () t))
+         t)
+
+  ;; *JSON-MAX-STRING-LENGTH* caps the JSON-PARSE-STRING accumulator
+  ;; so an attacker-controlled response body cannot force a multi-MiB
+  ;; per-string allocation.
+  (let ((saved web-skeleton:*json-max-string-length*)
+        (at-cap   (make-string 32 :initial-element #\a))
+        (over-cap (make-string 33 :initial-element #\a)))
+    (setf web-skeleton:*json-max-string-length* 32)
+    (unwind-protect
+         (progn
+           (check "json: string at cap accepted"
+                  (json-parse (concatenate 'string "\"" at-cap "\""))
+                  at-cap)
+           (check "json: string over cap rejected"
+                  (handler-case
+                      (progn (json-parse
+                              (concatenate 'string "\"" over-cap "\""))
+                             nil)
+                    (error () t))
+                  t))
+      (setf web-skeleton:*json-max-string-length* saved))))
 
 (defun test-json ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== JSON Tests ===~%")
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-serialize)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (report-suite "JSON")
   (zerop *tests-failed*))

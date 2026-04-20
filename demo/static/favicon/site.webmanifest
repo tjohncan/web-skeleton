@@ -1,7 +1,9 @@
 {
+  "id": "/",
   "name": "Web Skeleton Demo",
   "short_name": "web-skeleton",
   "start_url": "/",
+  "scope": "/",
   "icons": [
     {
       "src": "/favicon/icon-192x192.png",

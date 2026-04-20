@@ -19,11 +19,34 @@
 (defparameter *max-header-line-length* 8192
   "Maximum length of a single header line in bytes.")
 
+(defparameter *max-total-header-bytes* (* 64 1024)
+  "Maximum cumulative header byte count per request, default 64 KiB.
+   Individual lines are capped at *MAX-HEADER-LINE-LENGTH* (8 KiB)
+   and the count at *MAX-HEADER-COUNT* (100), so the worst case
+   without this cap is 800 KiB of header-string allocation per
+   request. A running-total guard inside PARSE-HEADERS-BYTES rejects
+   early once the cap is reached.")
+
 (defparameter *max-body-size* (* 1 1024 1024)
   "Maximum request body size in bytes. Default 1MB.")
 
 (defparameter *max-ws-payload-size* 65536
-  "Maximum WebSocket frame payload size in bytes. Default 64KB.")
+  "Maximum WebSocket frame payload size in bytes. Default 64KB.
+   Applies to each individual frame on the read path — per-frame
+   memory bound.")
+
+(defparameter *max-ws-message-size* (* 1 1024 1024)
+  "Maximum reassembled WebSocket message size in bytes. Default 1MB.
+   Applies to the running total of a fragmented message (opcode
+   TEXT/BINARY followed by one or more CONTINUATION frames, final
+   fragment FIN=1). Separate from *MAX-WS-PAYLOAD-SIZE* so that
+   fragmentation is actually useful at the application level —
+   if the two caps were the same, a fragmented message could
+   never carry more bytes than a single frame, which makes the
+   whole fragmentation path pointless. Set higher for apps that
+   stream large messages in fragments; the worst-case memory
+   pressure is (MAX-CONNECTIONS * this-cap) bytes of in-flight
+   reassembly buffers.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Conditions
@@ -68,10 +91,53 @@
   (loop for (n . v) in (http-request-headers request)
         when (string-equal n name) collect v))
 
+(defun connection-header-has-token-p (header-value token)
+  "Check if TOKEN appears in a comma-separated header value (RFC 7230 §3.2.6).
+   Comparison is case-insensitive, tokens are trimmed of whitespace.
+   Zero intermediate string allocation.
+
+   Used for Transfer-Encoding: chunked, Connection: close/keep-alive,
+   and Upgrade: websocket detection. The historical name survives
+   from when this was websocket-specific; it is now a general HTTP
+   token-list primitive, callable from any header-parsing site."
+  (let ((len (length header-value))
+        (token-len (length token)))
+    (loop with pos = 0
+          while (< pos len)
+          do ;; Skip leading whitespace
+             (loop while (and (< pos len)
+                              (let ((ch (char header-value pos)))
+                                (or (char= ch #\Space) (char= ch #\Tab))))
+                   do (incf pos))
+             ;; Find end of token (comma or end of string)
+             (let ((end (or (position #\, header-value :start pos) len)))
+               ;; Trim trailing whitespace
+               (let ((trimmed-end end))
+                 (loop while (and (> trimmed-end pos)
+                                  (let ((ch (char header-value (1- trimmed-end))))
+                                    (or (char= ch #\Space) (char= ch #\Tab))))
+                       do (decf trimmed-end))
+                 ;; Compare bounded region case-insensitively
+                 (when (and (= (- trimmed-end pos) token-len)
+                            (string-equal header-value token
+                                         :start1 pos :end1 trimmed-end))
+                   (return t))
+                 ;; Move past comma
+                 (setf pos (1+ end)))))))
+
 (defun get-cookie (request name)
   "Extract the value of cookie NAME from the request's Cookie header.
    Returns the value string, or NIL if not found.
-   Scans in-place — one allocation for the return value only."
+   Scans in-place — one allocation for the return value only.
+
+   Parses the unquoted form only (cookie-pair = cookie-name \"=\"
+   cookie-value per RFC 6265 §4.1.1). The spec's cookie-octet set
+   excludes ';', '\"', and comma, so the quoted form (name=\"...\")
+   is redundant — a spec-compliant quoted value can't contain any
+   character that the unquoted parser would mishandle. Non-compliant
+   servers (historically Tomcat and Jetty) that emit 'name=\"v;x\"'
+   with literal semicolons inside quotes are unsupported by design —
+   the framework does not condone non-compliant input."
   (let ((header (get-header request "cookie")))
     (when header
       (let ((name-len (length name))
@@ -90,11 +156,118 @@
                      (char= (char header (+ pos name-len)) #\=))
             (let* ((val-start (+ pos name-len 1))
                    (val-end (or (position #\; header :start val-start) len)))
-              (return (subseq header val-start val-end))))
+              ;; Trim stray leading/trailing SP/TAB from the value.
+              ;; RFC 6265 §4.1.1 cookie-octet excludes whitespace —
+              ;; a spec-compliant value doesn't carry any — but
+              ;; misbehaving proxies and test harnesses can inject
+              ;; 'foo=bar ; baz=qux'. Silently including the trailing
+              ;; space in the returned value is a footgun for apps
+              ;; that compare via STRING=. Trim at read time.
+              (return (string-trim '(#\Space #\Tab)
+                                   (subseq header val-start val-end)))))
           ;; Skip to next pair
           (let ((semi (position #\; header :start pos)))
             (unless semi (return nil))
             (setf pos (1+ semi))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Set-Cookie builder (RFC 6265)
+;;;
+;;; Symmetric with GET-COOKIE. Kills the per-app HttpOnly / Secure /
+;;; SameSite / Max-Age typo footgun — one misspelled attribute name in
+;;; hand-rolled Set-Cookie string construction is a silent security
+;;; regression nobody notices until audit time.
+;;;
+;;; Name and value are validated against CR, LF, and semicolon. Apps
+;;; that need strict RFC 6265 §4.1.1 token validation can layer it on
+;;; top; the framework only rejects characters that would break the
+;;; header structure itself.
+;;; ---------------------------------------------------------------------------
+
+(defun validate-cookie-field (kind field)
+  "Reject characters that would break the Set-Cookie header grammar
+   or enable structural injection. CR / LF / NUL / ';' are rejected
+   for every field. '=' is rejected for the cookie name only:
+   browsers parse 'foo=bar=baz' as name='foo', value='bar=baz' per
+   RFC 6265 §5.2, so accepting '=' in a caller-supplied name would
+   silently rename the cookie to the substring before the first '='."
+  (when (or (find #\Return field)
+            (find #\Newline field)
+            (find #\; field)
+            (find (code-char 0) field))
+    (error "build-cookie: ~a contains a forbidden character (NUL, CR, LF, or ';')"
+           kind))
+  (when (and (string= kind "name") (find #\= field))
+    (error "build-cookie: name contains '=' — browsers would split ~
+            the cookie at it")))
+
+(defun build-cookie (name value &key (path "/") (http-only t) (secure t)
+                                     (same-site :lax) max-age domain)
+  "Build a Set-Cookie header value string.
+   :SAME-SITE accepts :LAX (default), :STRICT, :NONE, or NIL (omit).
+   :NONE requires :SECURE T — browsers reject the combination otherwise,
+   and catching it here is friendlier than a silent client-side failure.
+   :MAX-AGE is an integer (seconds) or NIL (session cookie, drops on
+   browser close).
+   :PATH defaults to '/'; :DOMAIN is omitted by default.
+   Use ADD-RESPONSE-HEADER to attach the result — SET-RESPONSE-HEADER
+   would replace a previously set cookie."
+  (validate-cookie-field "name" name)
+  (when (zerop (length name))
+    (error "build-cookie: empty cookie name"))
+  (validate-cookie-field "value" value)
+  (when path (validate-cookie-field "path" path))
+  (when domain (validate-cookie-field "domain" domain))
+  (unless (or (null same-site)
+              (member same-site '(:lax :strict :none)))
+    (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
+  (when (and (eq same-site :none) (not secure))
+    (error "build-cookie: :same-site :none requires :secure t"))
+  (with-output-to-string (out)
+    (write-string name out)
+    (write-char #\= out)
+    (write-string value out)
+    (when path
+      (write-string "; Path=" out)
+      (write-string path out))
+    (when domain
+      (write-string "; Domain=" out)
+      (write-string domain out))
+    (when max-age
+      (format out "; Max-Age=~d" max-age))
+    (when http-only
+      (write-string "; HttpOnly" out))
+    (when secure
+      (write-string "; Secure" out))
+    (when same-site
+      (write-string "; SameSite=" out)
+      (write-string (ecase same-site
+                      (:lax    "Lax")
+                      (:strict "Strict")
+                      (:none   "None"))
+                    out))))
+
+(defun delete-cookie (name &key (path "/") domain)
+  "Build a Set-Cookie header value that removes the cookie NAME.
+   Empty value + Max-Age=0 so the browser drops it on receipt.
+   :PATH and :DOMAIN must match how the cookie was originally set —
+   browsers match cookies to Set-Cookie by (name, domain, path);
+   HttpOnly / Secure / SameSite do not participate in matching."
+  (validate-cookie-field "name" name)
+  (when (zerop (length name))
+    (error "delete-cookie: empty cookie name"))
+  (when path (validate-cookie-field "path" path))
+  (when domain (validate-cookie-field "domain" domain))
+  (with-output-to-string (out)
+    (write-string name out)
+    (write-char #\= out)
+    (when path
+      (write-string "; Path=" out)
+      (write-string path out))
+    (when domain
+      (write-string "; Domain=" out)
+      (write-string domain out))
+    (write-string "; Max-Age=0" out)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL percent-decoding (RFC 3986)
@@ -191,9 +364,21 @@
   "Match PATH against PATTERN with :param segment captures.
    Literal segments must match exactly; segments starting with : capture.
    Empty segments are not captured (e.g. /users/ does not match /users/:id).
-   Returns NIL if no match, T if match with no captures,
-   or an alist of (name . decoded-value) pairs if match with captures.
-   Captured values are percent-decoded."
+   Captured values are percent-decoded.
+
+   Return contract is a deliberate tri-state:
+     NIL      — PATH does not match PATTERN
+     T        — PATH matches and PATTERN has no captures
+     alist    — PATH matches and PATTERN has one or more captures
+
+   Callers that write (cdr (assoc \"id\" (match-path ...))) must only
+   do so for patterns they know carry a matching capture — the T
+   branch is not an alist and will raise. The alternative (return
+   () for capture-less match) would collapse 'matched without
+   captures' into 'did not match' because () is NIL in Common Lisp,
+   which is worse. Prefer a match-then-assoc idiom:
+     (let ((b (match-path p path)))
+       (when (and b (listp b)) (cdr (assoc \"id\" b))))"
   (let ((pat-segs  (split-path-segments pattern))
         (path-segs (split-path-segments path))
         (bindings nil))
@@ -267,7 +452,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun match-method-bytes (buf start end)
-  "Match BUF[START..END) against known HTTP methods. Returns keyword or NIL."
+  "Match BUF[START..END) against known HTTP methods. Returns keyword or NIL.
+   TRACE is intentionally unsupported: it echoes the request back in
+   the response body (RFC 7231 §4.3.8), which is the classic
+   cross-site-tracing (XST) sink for leaking cookies and auth headers
+   through a compromised client-side script. Rejecting it at the
+   parser layer means downstream handlers can never see it."
   (flet ((match-p (str)
            (let ((len (length str)))
              (and (= (- end start) len)
@@ -281,8 +471,41 @@
       ((match-p "DELETE")  :DELETE)
       ((match-p "HEAD")    :HEAD)
       ((match-p "OPTIONS") :OPTIONS)
-      ((match-p "PATCH")   :PATCH)
-      ((match-p "TRACE")   :TRACE))))
+      ((match-p "PATCH")   :PATCH))))
+
+;;; ---------------------------------------------------------------------------
+;;; RFC 7230 §3.2.6 tchar table
+;;;
+;;; One shared lookup used by both the inbound parser (header name
+;;; validation) and the outbound serializer (header name validation
+;;; before we copy bytes to the wire). Keeping the acceptance set
+;;; symmetric on both edges means an app can never build a response
+;;; header the framework would reject if it came back in as a request.
+;;;
+;;; tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "."
+;;;       / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+;;; ---------------------------------------------------------------------------
+
+(declaim (type (simple-array bit (256)) *tchar-table*))
+(defvar *tchar-table*
+  (let ((tbl (make-array 256 :element-type 'bit :initial-element 0)))
+    (loop for c from (char-code #\0) to (char-code #\9)
+          do (setf (aref tbl c) 1))
+    (loop for c from (char-code #\A) to (char-code #\Z)
+          do (setf (aref tbl c) 1))
+    (loop for c from (char-code #\a) to (char-code #\z)
+          do (setf (aref tbl c) 1))
+    (loop for ch across "!#$%&'*+-.^_`|~"
+          do (setf (aref tbl (char-code ch)) 1))
+    tbl)
+  "256-entry bit table: 1 iff the byte index is a valid RFC 7230
+   §3.2.6 token character. Used by parse-headers-bytes on ingress
+   and serialize-http-message on egress.")
+
+(declaim (inline tchar-byte-p))
+(defun tchar-byte-p (byte)
+  "T if BYTE is an RFC 7230 §3.2.6 tchar. BYTE must be in 0..255."
+  (= 1 (aref *tchar-table* byte)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Byte-level header parser (single-pass)
@@ -291,9 +514,14 @@
 (defun parse-headers-bytes (buf start end)
   "Parse headers from BUF[START..END) into an alist of (lowercase-name . value).
    Single-pass, handles obsolete line folding (RFC 7230 §3.2.4).
-   Stops at the first empty line (CRLFCRLF boundary)."
+   Stops at the first empty line (CRLFCRLF boundary). Enforces
+   *MAX-TOTAL-HEADER-BYTES* as a running-total guard — per-line and
+   per-count caps alone permit worst-case 800 KiB of header-string
+   allocation per request; the running total makes the actual bound
+   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB)."
   (let ((headers nil)
         (count 0)
+        (total 0)
         (pos start))
     (loop
       (let ((crlf (scan-crlf buf pos end)))
@@ -303,6 +531,10 @@
           (when (> line-len *max-header-line-length*)
             (http-parse-error "header line too long (~d bytes, max ~d)"
                               line-len *max-header-line-length*))
+          (incf total line-len)
+          (when (> total *max-total-header-bytes*)
+            (http-parse-error "total header bytes exceed ~d"
+                              *max-total-header-bytes*))
           (let ((first-byte (aref buf pos)))
             (if (and headers (or (= first-byte 32) (= first-byte 9)))
                 ;; RFC 7230 §3.2.4: reject obsolete line folding
@@ -313,20 +545,48 @@
                     (http-parse-error "malformed header (no colon)"))
                   (when (= colon pos)
                     (http-parse-error "empty header name"))
-                  ;; Reject whitespace in header name
+                  ;; RFC 7230 §3.2.6: header name must be a token,
+                  ;; i.e. each byte must be a tchar. The earlier
+                  ;; loose check (<=0x20 or =0x7F) rejected CTLs and
+                  ;; SP but let through separators like ':', '(',
+                  ;; ',', '/', etc. — any of which hidden in a name
+                  ;; is a smuggling primitive if it reaches assoc.
                   (loop for i from pos below colon
-                        when (let ((b (aref buf i))) (or (= b 32) (= b 9)))
-                        do (http-parse-error "whitespace in header name"))
+                        for b = (aref buf i)
+                        unless (tchar-byte-p b)
+                        do (http-parse-error "invalid byte in header name"))
                   (let ((name (bytes-to-lowercase-string buf pos colon)))
                     (multiple-value-bind (vs ve)
                         (trim-ows-bounds buf (1+ colon) crlf)
-                      (push (cons name (if (= vs ve) ""
-                                           (bytes-to-string buf vs ve)))
-                            headers)
+                      ;; RFC 7230 §3.2: field-value excludes CTLs
+                      ;; except HTAB. scan-crlf only terminates on
+                      ;; the CRLF pair, so a bare CR, bare LF, NUL,
+                      ;; or other CTL embedded in a value survives
+                      ;; into the alist — and from there into any
+                      ;; ~a-interpolated log line. Same log-injection
+                      ;; shape the request-target and method checks
+                      ;; already close in parse-request-bytes, and
+                      ;; symmetric with serialize-http-message's
+                      ;; value reject on egress. The asymmetry was
+                      ;; the bug — inbound accepted bytes the
+                      ;; outbound side would refuse to emit.
+                      (loop for i from vs below ve
+                            for b = (aref buf i)
+                            when (or (and (< b #x20) (/= b 9))
+                                     (= b #x7F))
+                            do (http-parse-error
+                                "invalid byte 0x~2,'0x in header value" b))
+                      ;; Check the count before pushing so the over-
+                      ;; budget header is not allocated into the alist
+                      ;; before we reject. Matches the pre-check
+                      ;; pattern used elsewhere (e.g. JSON depth).
                       (incf count)
                       (when (> count *max-header-count*)
                         (http-parse-error "too many headers (~d, max ~d)"
-                                          count *max-header-count*))))))))
+                                          count *max-header-count*))
+                      (push (cons name (if (= vs ve) ""
+                                           (bytes-to-string buf vs ve)))
+                            headers)))))))
         (setf pos (+ crlf 2))))
     (nreverse headers)))
 
@@ -356,6 +616,18 @@
           (http-parse-error "malformed request line"))
         (when (position 32 buf :start (1+ sp2) :end req-end)
           (http-parse-error "malformed request line (extra spaces)"))
+        ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the method region.
+        ;; Same discipline as the request-target check below: scan-crlf
+        ;; only matches the CRLF pair, so a bare CR or LF smuggled
+        ;; between start and the first space survives into
+        ;; bytes-to-string and lands in the 'unrecognized method: ~a'
+        ;; error text, which log-warn then splits across two lines —
+        ;; a log-injection primitive identical in shape to the
+        ;; request-target vector.
+        (loop for i from start below sp1
+              for b = (aref buf i)
+              when (or (< b #x20) (= b #x7F))
+              do (http-parse-error "control character in request method"))
         ;; Method
         (let ((method (match-method-bytes buf start sp1)))
           (unless method
@@ -386,6 +658,30 @@
                 (http-parse-error "empty request path"))
               (unless (= (aref buf uri-start) 47)  ; 47 = '/'
                 (http-parse-error "request path must start with /"))
+              ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the request-target
+              ;; region (RFC 7230 §3.2.6: request-target uses pchar, which
+              ;; excludes controls). Without this check a bare CR or LF
+              ;; smuggled into the URL survives scan-crlf (which only
+              ;; matches the CRLF pair) and ends up in the parsed PATH
+              ;; string, giving an attacker a log-injection primitive via
+              ;; any ~a-interpolated log call that names the path.
+              ;; Non-ASCII bytes (>= 0x80) rejected at parse time too.
+              ;; RFC 3986 §2.1 requires non-ASCII characters in URLs to
+              ;; be percent-encoded — raw UTF-8 bytes are non-compliant
+              ;; from a spec-adhering client. Without this check the
+              ;; bytes survive into the parsed PATH/QUERY strings; a
+              ;; later GET-QUERY-PARAM call trips URL-DECODE's
+              ;; :external-format :ascii conversion and the handler
+              ;; answers 400 at dispatch time with a misleading
+              ;; "parse error" log line. Rejecting at parse-time keeps
+              ;; the parser's contract honest and the error path
+              ;; consistent with the outbound PARSE-URL check.
+              (loop for i from uri-start below sp2
+                    for b = (aref buf i)
+                    when (or (< b #x20) (= b #x7F))
+                    do (http-parse-error "control character in request-target")
+                    when (>= b #x80)
+                    do (http-parse-error "non-ASCII byte in request-target"))
               (let ((path (bytes-to-string buf uri-start path-end))
                     (query (when qmark
                              (bytes-to-string buf (1+ qmark) sp2))))
@@ -439,6 +735,7 @@
     (409 . "Conflict")
     (413 . "Payload Too Large")
     (414 . "URI Too Long")
+    (417 . "Expectation Failed")
     (429 . "Too Many Requests")
     (431 . "Request Header Fields Too Large")
     (500 . "Internal Server Error")
@@ -470,39 +767,80 @@
    FIRST-LINE: status line or request line string (without CRLF).
    HEADERS: alist of (name . value) string pairs.
    BODY-BYTES: byte vector or NIL.
-   Single pre-sized buffer — no intermediate allocations."
-  (let* ((header-size (+ (length first-line) 2   ; first line + CRLF
-                         (loop for (name . value) in headers
-                               sum (+ (length name) 2 (length value) 2))
-                         2))                      ; final CRLF
+
+   All strings are UTF-8 encoded to bytes before validation and
+   write. A naive (char-code (char str i)) → (unsigned-byte 8)
+   write would truncate char codes > 255 and crash on codes > 127
+   whose UTF-8 form sets a high byte — an app that stuffs a UTF-8
+   status reason or accidental non-ASCII header value into a
+   response deserves a pointed content error, not a type-error
+   from SETF AREF deep inside the serializer. Encoding up front
+   means the per-byte checks below operate on the wire form, not
+   the source string form.
+
+   Header names are validated against the RFC 7230 §3.2.6 tchar
+   table — the same table parse-headers-bytes uses on ingress.
+   First-line and header-value bytes reject CTLs (0x00-0x1F, 0x7F)
+   except HTAB (0x09, permitted in field values per RFC 7230 §3.2.6).
+   Single pre-sized buffer — no intermediate allocations during write."
+  (let* ((first-line-bytes (sb-ext:string-to-octets
+                            first-line :external-format :utf-8))
+         ;; Encode each header once; reuse byte vectors for sizing
+         ;; and for the final copy. Consing one cons cell per header
+         ;; is cheaper than encoding twice.
+         (header-byte-specs
+          (loop for (name . value) in headers
+                collect (cons (sb-ext:string-to-octets
+                               name :external-format :utf-8)
+                              (sb-ext:string-to-octets
+                               value :external-format :utf-8))))
+         (header-size (+ (length first-line-bytes) 2   ; first line + CRLF
+                         (loop for (nb . vb) in header-byte-specs
+                               sum (+ (length nb) 2 (length vb) 2))
+                         2))                            ; final CRLF
          (body-len (if body-bytes (length body-bytes) 0))
          (buf (make-array (+ header-size body-len)
                           :element-type '(unsigned-byte 8)))
          (pos 0))
-    (flet ((put-ascii (str)
-             (loop for i from 0 below (length str)
-                   do (setf (aref buf pos) (char-code (char str i)))
-                      (incf pos)))
-           (put-crlf ()
-             (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
-             (incf pos 2)))
-      ;; Reject CRLF in request/status line (prevents request line injection)
-      (when (or (find #\Return first-line) (find #\Newline first-line))
-        (error "HTTP message line contains CRLF"))
-      (put-ascii first-line)
+    (labels ((reject-ctl-bytes (bytes where)
+               ;; Reject CTLs (<0x20, =0x7F) except HTAB. HTAB is
+               ;; legal inside field values (RFC 7230 §3.2.6); it
+               ;; is not meaningful in a first line but is also
+               ;; not a smuggling vector, and allowing it here
+               ;; keeps the same primitive usable for both callers.
+               (loop for i from 0 below (length bytes)
+                     for b = (aref bytes i)
+                     when (or (and (< b #x20) (/= b 9)) (= b #x7F))
+                     do (error "HTTP ~a contains control byte 0x~2,'0x"
+                               where b)))
+             (put-bytes (src)
+               (replace buf src :start1 pos)
+               (incf pos (length src)))
+             (put-crlf ()
+               (setf (aref buf pos) 13 (aref buf (1+ pos)) 10)
+               (incf pos 2)))
+      (reject-ctl-bytes first-line-bytes "first line")
+      (put-bytes first-line-bytes)
       (put-crlf)
-      (dolist (h headers)
-        (let ((name (car h))
-              (value (cdr h)))
-          ;; Reject CRLF in header names and values (prevents injection)
-          (when (or (find #\Return name) (find #\Newline name))
-            (error "HTTP header name contains CRLF: ~a" name))
-          (when (or (find #\Return value) (find #\Newline value))
-            (error "HTTP header value contains CRLF: ~a" name))
-          (put-ascii name)
-          (setf (aref buf pos) 58 (aref buf (1+ pos)) 32)
+      (dolist (spec header-byte-specs)
+        (let ((name-bytes (car spec))
+              (value-bytes (cdr spec)))
+          (when (zerop (length name-bytes))
+            (error "HTTP header has empty name"))
+          ;; tchar on every byte of the name. UTF-8 encoding a
+          ;; non-ASCII character produces bytes >= 0x80, all of
+          ;; which fail tchar-byte-p — so a header name like
+          ;; "X-Résumé" is rejected here cleanly instead of
+          ;; emitting broken bytes on the wire.
+          (loop for i from 0 below (length name-bytes)
+                for b = (aref name-bytes i)
+                unless (tchar-byte-p b)
+                do (error "HTTP header name has invalid byte 0x~2,'0x" b))
+          (reject-ctl-bytes value-bytes "header value")
+          (put-bytes name-bytes)
+          (setf (aref buf pos) 58 (aref buf (1+ pos)) 32)  ; ": "
           (incf pos 2)
-          (put-ascii value)
+          (put-bytes value-bytes)
           (put-crlf)))
       (put-crlf)
       (when body-bytes
@@ -514,12 +852,26 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun set-response-header (response name value)
-  "Set a header on RESPONSE. Replaces any existing header with the same name."
+  "Set a header on RESPONSE. Replaces any existing header with the
+   same name, compared case-insensitively per RFC 7230 §3.2. Apps
+   that build responses with mixed-case header literals
+   ('Content-Type') still get clean replacement instead of
+   duplication — duplicate Content-Length or Content-Type is a
+   response-smuggling primitive when a caching proxy is in front."
   (let ((key (string-downcase name)))
     (setf (http-response-headers response)
           (cons (cons key value)
                 (remove key (http-response-headers response)
-                        :key #'car :test #'string=))))
+                        :key #'car :test #'string-equal))))
+  response)
+
+(defun add-response-header (response name value)
+  "Add a header to RESPONSE without removing existing headers with the
+   same name. Required for multi-instance headers like Set-Cookie —
+   RFC 6265 §4.1 forbids comma-folding Set-Cookie, so each cookie
+   must be a separate header. SET-RESPONSE-HEADER replaces; this appends."
+  (push (cons (string-downcase name) value)
+        (http-response-headers response))
   response)
 
 (defun http-date (&optional (universal-time (get-universal-time)))
@@ -534,26 +886,90 @@
                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
             year hour min sec)))
 
-(defun format-response (response)
-  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket."
-  (let* ((status (http-response-status response))
-         (body   (http-response-body response))
+(defun format-response (response &key connection-hint head-only-p)
+  "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
+
+   CONNECTION-HINT stamps a Connection header at serialize time:
+     :CLOSE      — stamps 'Connection: close' when the server has
+                   decided to close the socket after this response.
+                   RFC 7230 §6.1 says a sender that wishes to close
+                   SHOULD send the close option in the final message.
+     :KEEP-ALIVE — stamps 'Connection: keep-alive' for an HTTP/1.0
+                   client that negotiated keep-alive (HTTP/1.1's
+                   default is keep-alive, so the header would be
+                   redundant there).
+     NIL         — do not stamp; caller didn't care or the default
+                   framing is sufficient.
+   The stamping happens in the emitted bytes only — never on the
+   RESPONSE struct — so a cached struct reused across requests does
+   not accumulate state. A caller-set Connection header always
+   takes precedence; the hint is ignored when one is present.
+
+   HEAD-ONLY-P skips the body in the emitted bytes while preserving
+   the Content-Length header computed from the body's byte length
+   (RFC 7231 §4.3.2). Without this, a HEAD response to a handler
+   that returned a 10 MiB body would allocate the body into the
+   serialization buffer only for STRIP-BODY-FOR-HEAD to truncate it
+   back out — two large allocations for the cold HEAD path.
+   Passing :HEAD-ONLY-P T encodes the body once for length, then
+   skips emission. The byte-vector path (static files) still goes
+   through STRIP-BODY-FOR-HEAD post-serialize."
+  (let ((status (http-response-status response)))
+    ;; Validate status up front so an out-of-range value short-
+    ;; circuits before the body encode + header build below.
+    (unless (<= 100 status 599)
+      (error "HTTP status ~d out of range (must be 100-599)" status))
+  (let* ((body   (http-response-body response))
          (body-bytes (when body
                        (sb-ext:string-to-octets body :external-format :utf-8)))
          (headers (http-response-headers response))
-         (headers (if (and body-bytes
-                           (not (assoc "content-length" headers :test #'string=)))
-                      (cons (cons "content-length"
-                                  (write-to-string (length body-bytes)))
+         (headers (cond
+                   ;; Body present — add CL if not already set
+                   ((and body-bytes
+                         (not (assoc "content-length" headers
+                                     :test #'string-equal)))
+                    (cons (cons "content-length"
+                                (write-to-string (length body-bytes)))
+                          headers))
+                   ;; No body, status requires CL:0 to prevent
+                   ;; keep-alive clients from waiting forever
+                   ((and (null body-bytes)
+                         (not (or (<= 100 status 199)
+                                  (= status 204) (= status 304)))
+                         (not (assoc "content-length" headers
+                                     :test #'string-equal)))
+                    (cons (cons "content-length" "0") headers))
+                   (t headers)))
+         ;; Stamp the Connection header from the hint without touching
+         ;; the caller's struct. App-set Connection header wins — if
+         ;; the handler already put one in the alist, the hint is
+         ;; ignored. :CLOSE maps to 'close' (RFC 7230 §6.1 SHOULD on
+         ;; server-initiated close); :KEEP-ALIVE maps to 'keep-alive'
+         ;; (only meaningful for HTTP/1.0 — 1.1 defaults to keep-alive
+         ;; so the header would be redundant); NIL leaves framing to
+         ;; the default for the request's HTTP version.
+         (headers (if (and connection-hint
+                           (not (assoc "connection" headers
+                                       :test #'string-equal)))
+                      (cons (cons "connection"
+                                  (ecase connection-hint
+                                    (:close      "close")
+                                    (:keep-alive "keep-alive")))
                             headers)
                       headers))
          ;; RFC 7231 §7.1.1.2: origin server MUST send Date
-         (headers (if (assoc "date" headers :test #'string=)
+         (headers (if (assoc "date" headers :test #'string-equal)
                       headers
                       (cons (cons "date" (http-date)) headers))))
     (serialize-http-message
      (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-     headers body-bytes)))
+     headers
+     ;; HEAD short-circuit: keep the computed Content-Length in the
+     ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
+     ;; response's CL) but omit the body bytes from the emitted
+     ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
+     ;; without the large subseq allocation.
+     (if head-only-p nil body-bytes)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors

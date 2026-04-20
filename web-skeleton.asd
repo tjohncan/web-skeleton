@@ -7,6 +7,7 @@
   :components ((:file "src/package")
                (:file "src/log" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
+               (:file "src/address" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
                (:file "src/algorithms/word32" :depends-on ("src/package"))
                (:file "src/algorithms/sha1"  :depends-on ("src/package"
@@ -19,6 +20,8 @@
                                                            "src/algorithms/sha256"))
                (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
+               (:file "src/random" :depends-on ("src/package"
+                                                 "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/package"
                                                        "src/algorithms/hex"))
                (:file "src/server/connection" :depends-on ("src/package"
@@ -45,7 +48,14 @@
                                                         "src/log"
                                                         "src/epoll"
                                                         "src/server/http"
-                                                        "src/server/connection"))
+                                                        "src/server/connection"
+                                                        "src/server/websocket"))
+               (:file "src/server/dns" :depends-on ("src/package"
+                                                      "src/log"
+                                                      "src/epoll"
+                                                      "src/server/http"
+                                                      "src/server/connection"
+                                                      "src/server/fetch"))
                (:file "src/server/main"  :depends-on ("src/package"
                                                        "src/log"
                                                        "src/epoll"
@@ -53,4 +63,8 @@
                                                        "src/server/connection"
                                                        "src/server/websocket"
                                                        "src/server/static"
-                                                       "src/server/fetch"))))
+                                                       "src/server/fetch"
+                                                       "src/server/dns"))
+               (:file "src/store" :depends-on ("src/package"
+                                                "src/log"
+                                                "src/server/main"))))

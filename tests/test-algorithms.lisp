@@ -191,20 +191,13 @@
          ;; Public key from RFC 7515 A.3
          (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
          (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
-         ;; Signature from RFC 7515 A.3, normalized to low-S
-         ;; (original has high-S which we reject to prevent malleability)
-         (sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmU69fgrc8OPGycO0lD3tat_FoFp57SETepkeks4eL_QfA"))
-         ;; Original high-S signature from the RFC
-         (high-s-sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")))
-    ;; Low-S signature verifies
-    (check "rfc7515 A.3 low-S signature"
+         ;; Signature from RFC 7515 A.3 as published — high-S, since
+         ;; RFC 7515 / 7518 do not mandate low-S normalization and
+         ;; mainstream ES256 issuers emit either form.
+         (sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")))
+    (check "rfc7515 A.3 signature"
            (ecdsa-verify-p256 hash sig x y)
            t)
-
-    ;; High-S (malleable twin) is rejected
-    (check "rfc7515 A.3 high-S rejected"
-           (ecdsa-verify-p256 hash high-s-sig x y)
-           nil)
 
     ;; Tampered hash should fail
     (let ((bad-hash (copy-seq hash)))
@@ -218,7 +211,40 @@
       (setf (aref bad-sig 10) (logxor (aref bad-sig 10) #xFF))
       (check "tampered signature rejects"
              (ecdsa-verify-p256 hash bad-sig x y)
+             nil))
+
+    ;; Wrong-length signature rejects. ES256 is fixed-width r||s
+    ;; (64 bytes) — a 65-byte or 63-byte input is malformed, not
+    ;; 'contains the right bytes plus/minus some', and both shapes
+    ;; must return NIL rather than truncating or crashing deep in
+    ;; a subseq call.
+    (let ((too-long (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  sig #(0))))
+      (check "oversized signature rejects"
+             (ecdsa-verify-p256 hash too-long x y)
+             nil))
+    (let ((too-short (subseq sig 0 63)))
+      (check "undersized signature rejects"
+             (ecdsa-verify-p256 hash too-short x y)
+             nil))
+    (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+      (check "empty signature rejects"
+             (ecdsa-verify-p256 hash empty x y)
              nil)))
+
+  ;; DER encoding strips leading zeros per X.690 8.3.2.
+  ;; der-encode-ecdsa-signature lives in the optional TLS system —
+  ;; skip when libssl is not loaded.
+  (when (fboundp 'web-skeleton::der-encode-ecdsa-signature)
+    (let* ((sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x42))
+           (dummy (progn (setf (aref sig 0) #x00 (aref sig 1) #x4A) nil))
+           (der (funcall 'web-skeleton::der-encode-ecdsa-signature sig)))
+      (declare (ignore dummy))
+      ;; The r INTEGER should be 31 bytes (stripped zero) not 32
+      ;; Tag=0x02, then length byte
+      (check "der minimal: r length stripped"
+             (aref der 3)
+             31)))
 
   ;; Generator point self-test: n*G should be the point at infinity
   (check "n*G = infinity"
@@ -226,6 +252,14 @@
                                (cons web-skeleton::+p256-gx+
                                      web-skeleton::+p256-gy+))
          nil)
+
+  ;; Short pubkey coordinate rejected
+  (let ((short-x (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+        (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+        (sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1)))
+    (check "short pubkey-x rejected"
+           (ecdsa-verify-p256 hash sig short-x y) nil))
 
   ;; Invalid-curve point rejected (FIPS 186-4 §5.6.2.3.3)
   ;; Use the valid RFC 7515 key but flip one byte in y — point no longer
@@ -237,7 +271,42 @@
     (setf (aref bad-y 0) (logxor (aref bad-y 0) #xFF))
     (check "invalid-curve point rejected"
            (ecdsa-verify-p256 hash sig x bad-y)
+           nil))
+
+  ;; FIPS 186-4 §5.6.2.3.3: public-key coordinates must be < p.
+  ;; The 32-byte input range exceeds +p256-p+, so unreduced coords
+  ;; slip past the curve-equation check (which uses MOD-MUL). Pass
+  ;; all-0xFF coords which integer-wise exceed p; verify rejected
+  ;; without raising. Exercised via the pure-Lisp path directly so
+  ;; the libssl swap's own range check doesn't shadow this test.
+  (let* ((hash (sha256 (sb-ext:string-to-octets "test")))
+         (sig  (make-array 64 :element-type '(unsigned-byte 8) :initial-element 1))
+         (huge (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xFF)))
+    (check "unreduced pubkey-x (>= p) rejected"
+           (web-skeleton::ecdsa-verify-p256-lisp hash sig huge huge)
            nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; mod-inv raises on non-invertible input (pure-Lisp primitive)
+;;;
+;;; Exercised separately because the bug only surfaces when a caller
+;;; skips coordinate range validation — the ECDSA verifier above does
+;;; check, but the primitive's contract should raise for 0 / any input
+;;; whose gcd with p isn't 1 rather than silently return 0.
+;;; ---------------------------------------------------------------------------
+
+(defun test-mod-inv-raise ()
+  (format t "~%mod-inv primitive~%")
+  (flet ((raises-p (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error () t))))
+    (check "mod-inv: 0 mod 13 raises"
+           (raises-p (lambda () (web-skeleton::mod-inv 0 13))) t)
+    (check "mod-inv: 13 mod 13 raises (reduces to 0)"
+           (raises-p (lambda () (web-skeleton::mod-inv 13 13))) t)
+    ;; Normal-case: inverse of 3 mod 11 is 4 (3 * 4 = 12 ≡ 1 mod 11)
+    (check "mod-inv: 3 mod 11 = 4"
+           (web-skeleton::mod-inv 3 11) 4)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HMAC-SHA256 test vectors (RFC 4231)
@@ -349,12 +418,58 @@
            (signals-error-p (lambda () (hex-decode "zz"))) t)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Crypto random tests
+;;; ---------------------------------------------------------------------------
+
+(defun test-random ()
+  (format t "~%Random~%")
+  ;; Length
+  (check "random-bytes: 32" (length (random-bytes 32)) 32)
+  (check "random-bytes: 16" (length (random-bytes 16)) 16)
+  (check "random-bytes: 1"  (length (random-bytes 1))  1)
+  ;; Element type
+  (check "random-bytes: element-type"
+         (array-element-type (random-bytes 16))
+         '(unsigned-byte 8))
+  ;; Distinctness — successive 32-byte calls must not match. A collision
+  ;; is 2^-256, effectively impossible; a match here means /dev/urandom
+  ;; is broken or we're reading the wrong thing.
+  (let ((a (random-bytes 32))
+        (b (random-bytes 32)))
+    (check "random-bytes: successive calls differ"
+           (equalp a b) nil))
+  ;; random-token: expected base64url length (unpadded)
+  ;; 32 bytes -> ceil(32*4/3) = 43 chars
+  ;; 16 bytes -> ceil(16*4/3) = 22 chars
+  (check "random-token: default length 43"
+         (length (random-token)) 43)
+  (check "random-token: :bytes 16 length 22"
+         (length (random-token :bytes 16)) 22)
+  ;; random-token output is pure base64url charset
+  (let ((token (random-token :bytes 64)))
+    (check "random-token: base64url charset"
+           (every (lambda (c)
+                    (or (char<= #\A c #\Z)
+                        (char<= #\a c #\z)
+                        (char<= #\0 c #\9)
+                        (char= c #\-)
+                        (char= c #\_)))
+                  token)
+           t))
+  ;; Distinctness
+  (let ((a (random-token))
+        (b (random-token)))
+    (check "random-token: successive calls differ"
+           (string= a b) nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
 (defun test-algorithms ()
   (setf *tests-passed* 0
-        *tests-failed* 0)
+        *tests-failed* 0
+        *failed-names* nil)
   (format t "~%=== Algorithm Tests ===~%")
   (test-sha1)
   (test-sha256)
@@ -362,8 +477,58 @@
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)
+  (test-mod-inv-raise)
   (test-hmac-sha256)
   (test-constant-time-equal)
   (test-hex)
-  (format t "~%~d passed, ~d failed~%~%" *tests-passed* *tests-failed*)
+  (test-random)
+  (report-suite "Algorithms")
+  (zerop *tests-failed*))
+
+;;; ---------------------------------------------------------------------------
+;;; Pure-Lisp crypto re-verification (framework-dev entry point)
+;;;
+;;; NOT wired into the default (test) runner. Intended for humans editing
+;;; src/algorithms/sha1.lisp, sha256.lisp, or ecdsa.lisp who want to verify
+;;; their changes to the pure-Lisp implementations on a machine that has
+;;; web-skeleton-tls loaded (and therefore sees the libssl-backed versions
+;;; as the active sha1/sha256/ecdsa-verify-p256 by default).
+;;;
+;;; Mechanism: temporarily swap SYMBOL-FUNCTION for the three public
+;;; crypto names back to their *-LISP originals, run the existing
+;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-ECDSA functions
+;;; unchanged (so the FIPS / RFC vectors live in exactly one place),
+;;; then restore via UNWIND-PROTECT. Safe only in a serial test runner.
+;;; If libssl isn't loaded, the swap still works — it just replaces
+;;; the thin SHA1/SHA256/ECDSA-VERIFY-P256 wrappers with their direct
+;;; *-LISP targets, which is effectively a no-op.
+;;; ---------------------------------------------------------------------------
+
+(defun test-pure-lisp-crypto ()
+  "Framework-dev entry point: re-run the existing crypto tests against
+   the pure-Lisp implementations by temporarily swapping SYMBOL-FUNCTION
+   for SHA1 / SHA256 / ECDSA-VERIFY-P256. HMAC-SHA256 is exercised for
+   free because it calls SHA256 through the function cell. Not part of
+   the default TEST runner — invoke manually when editing pure-Lisp
+   algorithm sources."
+  (setf *tests-passed* 0
+        *tests-failed* 0
+        *failed-names* nil)
+  (format t "~%=== Pure-Lisp crypto re-verification ===~%")
+  (let ((saved-sha1   (symbol-function 'sha1))
+        (saved-sha256 (symbol-function 'sha256))
+        (saved-ecdsa  (symbol-function 'ecdsa-verify-p256)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'sha1)              #'web-skeleton::sha1-lisp
+                 (symbol-function 'sha256)            #'web-skeleton::sha256-lisp
+                 (symbol-function 'ecdsa-verify-p256) #'web-skeleton::ecdsa-verify-p256-lisp)
+           (test-sha1)
+           (test-sha256)
+           (test-hmac-sha256)
+           (test-ecdsa))
+      (setf (symbol-function 'sha1)              saved-sha1
+            (symbol-function 'sha256)            saved-sha256
+            (symbol-function 'ecdsa-verify-p256) saved-ecdsa)))
+  (report-suite "Pure-Lisp Crypto" "(pure-Lisp)")
   (zerop *tests-failed*))

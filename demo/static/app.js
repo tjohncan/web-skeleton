@@ -2,6 +2,8 @@ const log = document.getElementById('log');
 const form = document.getElementById('form');
 const msg = document.getElementById('msg');
 let ws = null;
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 3;
 
 function appendLog(text, cls) {
   const line = document.createElement('div');
@@ -17,6 +19,7 @@ function connect(onOpen) {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   ws = new WebSocket(proto + location.host + '/ws');
   ws.onopen = function() {
+    reconnectAttempts = 0;
     appendLog('[status] connected', 'status');
     if (onOpen) onOpen();
   };
@@ -24,7 +27,13 @@ function connect(onOpen) {
     appendLog('[recv] ' + e.data, 'recv');
   };
   ws.onclose = function() {
-    appendLog('[status] disconnected', 'status');
+    if (reconnectAttempts < maxReconnectAttempts) {
+      reconnectAttempts++;
+      appendLog('[status] disconnected — reconnecting (' + reconnectAttempts + '/' + maxReconnectAttempts + ')...', 'status');
+      setTimeout(connect, 2000);
+    } else {
+      appendLog('[status] disconnected', 'status');
+    }
   };
   ws.onerror = function(e) {
     appendLog('[error] connection error', 'err');

@@ -34,37 +34,27 @@
          (digest (sha1 (sb-ext:string-to-octets combined :external-format :ascii))))
     (base64-encode digest)))
 
-(defun connection-header-has-token-p (header-value token)
-  "Check if TOKEN appears in a comma-separated header value (RFC 7230 §3.2.6).
-   Comparison is case-insensitive, tokens are trimmed of whitespace.
-   Zero intermediate string allocation."
-  (let ((len (length header-value))
-        (token-len (length token)))
-    (loop with pos = 0
-          while (< pos len)
-          do ;; Skip leading whitespace
-             (loop while (and (< pos len)
-                              (let ((ch (char header-value pos)))
-                                (or (char= ch #\Space) (char= ch #\Tab))))
-                   do (incf pos))
-             ;; Find end of token (comma or end of string)
-             (let ((end (or (position #\, header-value :start pos) len)))
-               ;; Trim trailing whitespace
-               (let ((trimmed-end end))
-                 (loop while (and (> trimmed-end pos)
-                                  (let ((ch (char header-value (1- trimmed-end))))
-                                    (or (char= ch #\Space) (char= ch #\Tab))))
-                       do (decf trimmed-end))
-                 ;; Compare bounded region case-insensitively
-                 (when (and (= (- trimmed-end pos) token-len)
-                            (string-equal header-value token
-                                         :start1 pos :end1 trimmed-end))
-                   (return t))
-                 ;; Move past comma
-                 (setf pos (1+ end)))))))
+(defun clamp-close-code (raw-code)
+  "Map a client-supplied WebSocket close code to the code we echo
+   back (RFC 6455 §7.4.1 / §7.4.2). Allowed ranges: 1000-1003,
+   1007-1014, 3000-4999. Everything else (< 1000, reserved
+   1004/1005/1006/1015, unassigned 1016-2999, undefined >= 5000)
+   is clamped to 1000. Lifted out of WEBSOCKET-ON-READ so the
+   reserved-code logic has a single definition."
+  (if (or (< raw-code 1000)
+          (member raw-code '(1004 1005 1006 1015))
+          (and (>= raw-code 1016) (<= raw-code 2999))
+          (> raw-code 4999))
+      1000
+      raw-code))
 
 (defun websocket-upgrade-p (request)
-  "Check if REQUEST is a valid WebSocket upgrade request."
+  "Check if REQUEST is a valid WebSocket upgrade request.
+   Sec-WebSocket-Key validation includes a base64 charset check —
+   the length test alone accepts any 24-character string, including
+   strings containing non-ASCII bytes that would later trip
+   WEBSOCKET-ACCEPT-KEY's :external-format :ascii conversion and
+   surface as 500 instead of the 400 a malformed key deserves."
   (and (eq (http-request-method request) :GET)
        (string= (http-request-version request) "1.1")
        (let ((upgrade    (get-header request "upgrade"))
@@ -77,6 +67,17 @@
               (connection-header-has-token-p connection "upgrade")
               key
               (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
+              ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
+              ;; with '=' padding. Sec-WebSocket-Key is a fixed-size base64
+              ;; over 16 random bytes so padding is always two '=' — the
+              ;; charset check is strict on the 22 data chars and the
+              ;; trailing '=' pair.
+              (loop for c across key
+                    always (or (char<= #\A c #\Z)
+                               (char<= #\a c #\z)
+                               (char<= #\0 c #\9)
+                               (char= c #\+) (char= c #\/)
+                               (char= c #\=)))
               version
               (string= version "13")))))
 
@@ -142,14 +143,25 @@
            (return-from try-parse-ws-frame (values nil 0)))
          (setf payload-length (logior (ash (aref buf (+ start 2)) 8)
                                       (aref buf (+ start 3)))
-               header-size 4))
+               header-size 4)
+         ;; RFC 6455 §5.2: "the minimal number of bytes MUST be used
+         ;; to encode the length." A 16-bit extended length < 126 is
+         ;; non-canonical — the peer should have used the 7-bit form.
+         ;; Accepting it opens a length-parser disagreement vector
+         ;; against strict downstreams.
+         (when (< payload-length 126)
+           (error "WebSocket: non-canonical 2-byte length")))
         ((= len7 127)
          (when (< available 10)
            (return-from try-parse-ws-frame (values nil 0)))
          (setf payload-length
                (loop for i from 0 below 8
                      sum (ash (aref buf (+ start 2 i)) (* 8 (- 7 i))))
-               header-size 10)))
+               header-size 10)
+         ;; RFC 6455 §5.2 minimal-encoding rule: a 64-bit extended
+         ;; length < 65536 is non-canonical.
+         (when (< payload-length 65536)
+           (error "WebSocket: non-canonical 8-byte length"))))
       ;; RFC 6455 §5.2: 64-bit length MSB must be 0
       (when (logbitp 63 payload-length)
         (error "WebSocket: invalid payload length (MSB set)"))
@@ -226,7 +238,20 @@
                   (sb-ext:string-to-octets text :external-format :utf-8)))
 
 (defun build-ws-close (&optional (code 1000))
-  "Build a close frame with a status code."
+  "Build a close frame with a status code. CODE must be in the
+   server-sendable set per RFC 6455 §7.4.1: 1000-1003, 1007-1014,
+   or 3000-4999. Codes < 1000, the reserved 1004/1005/1006/1015,
+   the unassigned 1016-2999, and 5000+ are rejected here — the
+   stricter counterpart to CLAMP-CLOSE-CODE on the receive path,
+   which accepts any out-of-range peer code by clamping it to
+   1000. A silent u16 truncation on out-of-range input (the old
+   behavior for values > 65535) would put bytes on the wire the
+   application never asked for."
+  (unless (or (<= 1000 code 1003)
+              (<= 1007 code 1014)
+              (<= 3000 code 4999))
+    (error "build-ws-close: code ~a not allowed to be sent per RFC 6455 §7.4.1 ~
+            (use 1000-1003, 1007-1014, or 3000-4999)" code))
   (let ((payload (make-array 2 :element-type '(unsigned-byte 8))))
     (setf (aref payload 0) (logand #xFF (ash code -8))
           (aref payload 1) (logand #xFF code))
@@ -264,14 +289,27 @@
         (pos 0)
         (end (length frame-bytes))
         (deadline (when (> *ws-send-timeout* 0)
-                    (+ (get-universal-time) *ws-send-timeout*))))
-    (loop while (< pos end)
-          do (when (and deadline (> (get-universal-time) deadline))
-               (error "ws-send: write timeout"))
-             (let ((result (nb-write fd frame-bytes pos (- end pos))))
-               (if (eq result :again)
-                   (poll-writable fd 1000)
-                   (incf pos result))))))
+                    (+ (get-internal-real-time)
+                       (* *ws-send-timeout* internal-time-units-per-second)))))
+    (flet ((remaining-ms ()
+             ;; Milliseconds to deadline, clamped non-negative. No
+             ;; deadline configured → use 1000 ms so the poll still
+             ;; drains as before.
+             (if deadline
+                 (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
+                               internal-time-units-per-second))
+                 1000)))
+      (loop while (< pos end)
+            do (when (and deadline (>= (get-internal-real-time) deadline))
+                 (error "ws-send: timed out after ~ds" *ws-send-timeout*))
+               (let ((result (nb-write fd frame-bytes pos (- end pos))))
+                 (if (eq result :again)
+                     ;; Clamp the poll wait to the remaining deadline so a
+                     ;; peer stalled with a partial flush in flight cannot
+                     ;; push the effective timeout past *ws-send-timeout* by
+                     ;; up to 1000 ms on each :again.
+                     (poll-writable fd (min 1000 (remaining-ms)))
+                     (incf pos result)))))))
 
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."
@@ -295,6 +333,27 @@
         (pos 0)
         (end (connection-read-pos conn))
         (responses nil))
+    (labels ((close-with (code)
+               ;; Tear-down helper for every error-close site. A
+               ;; bare (values :close (build-ws-close NNNN)) would
+               ;; drop the RESPONSES list populated by earlier frames
+               ;; in the same batch — a reply from frame N-1 would be
+               ;; lost if frame N had an RSV bit set. Funneling every
+               ;; site through one helper keeps the concat-then-close
+               ;; shape consistent with the normal close branch.
+               (ws-shift-buffer conn buf pos end)
+               (let ((close-frame (build-ws-close code)))
+                 (if responses
+                     (let* ((all (nreverse (cons close-frame responses)))
+                            (total (reduce #'+ all :key #'length))
+                            (out (make-array total
+                                              :element-type '(unsigned-byte 8)))
+                            (offset 0))
+                       (dolist (r all)
+                         (replace out r :start1 offset)
+                         (incf offset (length r)))
+                       (values :close out))
+                     (values :close close-frame)))))
     (loop
       (multiple-value-bind (frame consumed)
           (handler-case
@@ -303,9 +362,7 @@
               ;; Protocol errors (RSV bits, oversized, unmasked, etc.)
               ;; → close with 1002 per RFC 6455 §7.1.7
               (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
-              (ws-shift-buffer conn buf pos end)
-              (return-from websocket-on-read
-                (values :close (build-ws-close 1002)))))
+              (return-from websocket-on-read (close-with 1002))))
         (unless frame
           ;; No complete frame — shift unconsumed bytes to start of buffer
           (when (> pos 0)
@@ -325,9 +382,7 @@
                          (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1002))))
+               (return-from websocket-on-read (close-with 1002)))
              (if (ws-frame-fin frame)
                  ;; Complete single-frame message
                  (progn
@@ -339,9 +394,7 @@
                        (error ()
                          (log-warn "ws invalid UTF-8 in text frame fd ~d"
                                    (connection-fd conn))
-                         (ws-shift-buffer conn buf pos end)
-                         (return-from websocket-on-read
-                           (values :close (build-ws-close 1007))))))
+                         (return-from websocket-on-read (close-with 1007)))))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
@@ -349,34 +402,41 @@
                    (when ws-handler
                      (let ((response (funcall ws-handler conn frame)))
                        (when response (push response responses)))))
-                 ;; First fragment — start accumulating
-                 (progn
-                   (setf (connection-ws-frag-opcode conn) opcode
-                         (connection-ws-frag-buf conn)
-                         (list (ws-frame-payload frame))
-                         (connection-ws-frag-total conn)
-                         (length (ws-frame-payload frame)))
-                   (log-debug "ws frag start opcode ~d fd ~d"
-                              opcode (connection-fd conn)))))
+                 ;; First fragment — start accumulating. Enforce the
+                 ;; message-size cap on the starting size too, not
+                 ;; only on continuation accumulation, so apps that
+                 ;; configure *max-ws-payload-size* higher than
+                 ;; *max-ws-message-size* cannot slip a giant first
+                 ;; fragment past the running-total check.
+                 (let ((len (length (ws-frame-payload frame))))
+                   (if (> len *max-ws-message-size*)
+                       (progn
+                         (log-warn "ws fragmented message too large ~
+                                    on first fragment (~d bytes) fd ~d"
+                                   len (connection-fd conn))
+                         (return-from websocket-on-read (close-with 1009)))
+                       (progn
+                         (setf (connection-ws-frag-opcode conn) opcode
+                               (connection-ws-frag-buf conn)
+                               (list (ws-frame-payload frame))
+                               (connection-ws-frag-total conn) len)
+                         (log-debug "ws frag start opcode ~d fd ~d"
+                                    opcode (connection-fd conn)))))))
             ;; Continuation frame
             ((= opcode +ws-op-continuation+)
              (unless (connection-ws-frag-buf conn)
                (log-warn "ws continuation without start fd ~d"
                          (connection-fd conn))
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1002))))
+               (return-from websocket-on-read (close-with 1002)))
              ;; Accumulate fragment — O(1) running total instead of re-scanning
              (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
              (incf (connection-ws-frag-total conn) (length (ws-frame-payload frame)))
-             (when (> (connection-ws-frag-total conn) *max-ws-payload-size*)
+             (when (> (connection-ws-frag-total conn) *max-ws-message-size*)
                (log-warn "ws fragmented message too large (~d bytes) fd ~d"
                          (connection-ws-frag-total conn) (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
-               (ws-shift-buffer conn buf pos end)
-               (return-from websocket-on-read
-                 (values :close (build-ws-close 1009))))
+               (return-from websocket-on-read (close-with 1009)))
              (when (ws-frame-fin frame)
                ;; Final fragment — reassemble and deliver
                (let* ((chunks (nreverse (connection-ws-frag-buf conn)))
@@ -398,9 +458,7 @@
                      (error ()
                        (log-warn "ws invalid UTF-8 in reassembled text fd ~d"
                                  (connection-fd conn))
-                       (ws-shift-buffer conn buf pos end)
-                       (return-from websocket-on-read
-                         (values :close (build-ws-close 1007))))))
+                       (return-from websocket-on-read (close-with 1007)))))
                  (setf (connection-last-active conn) (get-universal-time))
                  (let ((complete (make-ws-frame
                                   :fin t
@@ -427,17 +485,11 @@
                                 ((= (length payload) 1)
                                  (log-warn "ws close with 1-byte body fd ~d"
                                            (connection-fd conn))
-                                 (ws-shift-buffer conn buf pos end)
                                  (return-from websocket-on-read
-                                   (values :close (build-ws-close 1002))))
+                                   (close-with 1002)))
                                 (t (logior (ash (aref payload 0) 8)
                                            (aref payload 1)))))
-                    ;; RFC 6455 §7.4.1: must not echo reserved codes
-                    (code (if (or (< raw-code 1000)
-                                  (member raw-code '(1004 1005 1006 1015))
-                                  (and (>= raw-code 1016) (<= raw-code 2999)))
-                              1000
-                              raw-code)))
+                    (code (clamp-close-code raw-code)))
                ;; RFC 6455 §5.5.1: close reason text must be valid UTF-8
                (when (> (length payload) 2)
                  (handler-case
@@ -446,38 +498,24 @@
                    (error ()
                      (log-warn "ws invalid UTF-8 in close reason fd ~d"
                                (connection-fd conn))
-                     (ws-shift-buffer conn buf pos end)
-                     (return-from websocket-on-read
-                       (values :close (build-ws-close 1007))))))
-               (ws-shift-buffer conn buf pos end)
-               ;; Flush any responses from earlier frames before the close
-               (let ((close-frame (build-ws-close code)))
-                 (if responses
-                     (let* ((all (nreverse (cons close-frame responses)))
-                            (total (reduce #'+ all :key #'length))
-                            (out (make-array total :element-type '(unsigned-byte 8)))
-                            (offset 0))
-                       (dolist (r all)
-                         (replace out r :start1 offset)
-                         (incf offset (length r)))
-                       (return-from websocket-on-read (values :close out)))
-                     (return-from websocket-on-read
-                       (values :close close-frame))))))
+                     (return-from websocket-on-read (close-with 1007)))))
+               ;; Normal client-initiated close: CLOSE-WITH concatenates
+               ;; any pending responses from earlier frames in this batch
+               ;; with the close frame and shifts the buffer.
+               (return-from websocket-on-read (close-with code))))
             (t
              ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
              (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
-             (ws-shift-buffer conn buf pos end)
-             (return-from websocket-on-read
-               (values :close (build-ws-close 1002))))))))
-    ;; Concatenate response frames into a single write buffer
-    (when responses
-      (setf responses (nreverse responses))
-      (if (= (length responses) 1)
-          (first responses)
-          (let* ((total (reduce #'+ responses :key #'length))
-                 (out (make-array total :element-type '(unsigned-byte 8)))
-                 (offset 0))
-            (dolist (r responses)
-              (replace out r :start1 offset)
-              (incf offset (length r)))
-            out)))))
+             (return-from websocket-on-read (close-with 1002)))))))
+      ;; Concatenate response frames into a single write buffer
+      (when responses
+        (setf responses (nreverse responses))
+        (if (= (length responses) 1)
+            (first responses)
+            (let* ((total (reduce #'+ responses :key #'length))
+                   (out (make-array total :element-type '(unsigned-byte 8)))
+                   (offset 0))
+              (dolist (r responses)
+                (replace out r :start1 offset)
+                (incf offset (length r)))
+              out))))))

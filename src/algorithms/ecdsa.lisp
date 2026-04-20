@@ -51,13 +51,21 @@
   (mod (* a b) p))
 
 (defun mod-inv (a p)
-  "Modular multiplicative inverse of A mod P via extended Euclidean algorithm."
+  "Modular multiplicative inverse of A mod P via extended Euclidean
+   algorithm. Raises when A has no inverse mod P (input reduces to 0,
+   or gcd(A, P) != 1). Silently returning 0 for non-invertible input
+   is a primitive-level footgun — a caller that skips pre-validation
+   of public-key coordinates could otherwise route garbage through
+   EC-ADD and get a verifier that never errors but never verifies
+   either."
   (let ((old-r p) (r (mod a p))
         (old-s 0) (s 1))
     (loop until (zerop r)
           do (let ((q (floor old-r r)))
                (psetf old-r r  r (- old-r (* q r)))
                (psetf old-s s  s (- old-s (* q s)))))
+    (unless (= old-r 1)
+      (error "mod-inv: ~d has no inverse mod ~d" a p))
     (mod old-s p)))
 
 ;;; ---------------------------------------------------------------------------
@@ -139,33 +147,65 @@
 ;;; Public interface
 ;;; ---------------------------------------------------------------------------
 
-(defun ecdsa-verify-p256 (hash sig-bytes pubkey-x pubkey-y)
-  "Verify an ECDSA P-256 signature.
+(defun ecdsa-verify-p256-lisp (hash sig-bytes pubkey-x pubkey-y)
+  "Pure-Lisp ECDSA P-256 signature verification (FIPS 186-4).
    HASH: 32-byte SHA-256 digest of the signed message.
    SIG-BYTES: 64-byte signature (r || s, each 32 bytes big-endian).
    PUBKEY-X, PUBKEY-Y: 32-byte x and y coordinates of the public key.
-   Returns T if valid, NIL otherwise."
+   Returns T if valid, NIL otherwise.
+
+   Always reachable under this name regardless of whether
+   web-skeleton-tls has been loaded — the TLS system swaps the public
+   ECDSA-VERIFY-P256 symbol to a libssl-backed version at load time via
+   SETF SYMBOL-FUNCTION, but this function stays accessible directly
+   so the framework-dev entry point TEST-PURE-LISP-CRYPTO can re-verify
+   the pure-Lisp path on a libssl-enabled machine.
+
+   DO NOT declaim ECDSA-VERIFY-P256 inline: the libssl swap works
+   through the function cell, and an inlined caller would bypass the
+   cell and keep calling whichever implementation was visible at
+   compile time."
+  ;; Length-gate the signature before indexing into it. ES256 is
+  ;; fixed-width r||s = 64 bytes; anything else is malformed, not
+  ;; merely 'contains the bytes we wanted plus some'. Without this
+  ;; gate the (subseq sig-bytes 0 32) / (subseq sig-bytes 32 64)
+  ;; below would silently accept a 65-byte signature by ignoring
+  ;; the trailing byte, and a shorter input would crash with a
+  ;; subseq error instead of returning NIL.
+  (unless (= (length sig-bytes) 64)
+    (return-from ecdsa-verify-p256-lisp nil))
+  (unless (and (= (length pubkey-x) 32) (= (length pubkey-y) 32))
+    (return-from ecdsa-verify-p256-lisp nil))
   (let ((r (bytes-to-integer (subseq sig-bytes 0 32)))
         (s (bytes-to-integer (subseq sig-bytes 32 64)))
         (qx (bytes-to-integer pubkey-x))
         (qy (bytes-to-integer pubkey-y))
         (z (bytes-to-integer hash)))
+    ;; FIPS 186-4 §5.6.2.3.3: public-key coordinates must lie in
+    ;; [0, p-1]. The 32-byte input range is [0, 2^256 - 1] which
+    ;; exceeds +p256-p+ (= 2^256 - 2^224 + 2^192 + 2^96 - 1), so
+    ;; unreduced coords slip past the curve-equation check below
+    ;; (it uses MOD-MUL / MOD-ADD throughout) and then break
+    ;; EC-ADD's (= x1 x2) equality test, routing into MOD-INV on
+    ;; a value that reduces to 0. Reject unreduced coords loud.
+    (unless (and (< qx +p256-p+) (< qy +p256-p+))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; Check r, s in [1, n-1]
+    ;; Both (r, s) and (r, n-s) are valid ES256 signatures per
+    ;; RFC 7515 / 7518 — JOSE does not mandate low-S normalization
+    ;; and mainstream issuers emit high-S roughly half the time.
+    ;; A Bitcoin-style malleability wrapper can layer on top at a
+    ;; call site that needs it; JWT verification does not.
     (unless (and (<= 1 r (1- +p256-n+))
                  (<= 1 s (1- +p256-n+)))
-      (return-from ecdsa-verify-p256 nil))
-    ;; Enforce low-S to prevent signature malleability.
-    ;; For any valid (r, s), (r, n-s) also verifies — reject high-S
-    ;; so each message maps to exactly one accepted signature.
-    (when (> s (ash +p256-n+ -1))
-      (return-from ecdsa-verify-p256 nil))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; Point-on-curve check (FIPS 186-4 §5.6.2.3.3):
     ;; reject invalid-curve points to prevent small-subgroup attacks
     (unless (= (mod-mul qy qy +p256-p+)
                (mod-add (mod-add (mod-mul qx (mod-mul qx qx +p256-p+) +p256-p+)
                                  (mod-mul +p256-a+ qx +p256-p+) +p256-p+)
                          +p256-b+ +p256-p+))
-      (return-from ecdsa-verify-p256 nil))
+      (return-from ecdsa-verify-p256-lisp nil))
     ;; w = s^-1 mod n
     (let* ((w (mod-inv s +p256-n+))
            ;; u1 = z*w mod n, u2 = r*w mod n
@@ -176,6 +216,13 @@
            (q (cons qx qy))
            (r-point (ec-add (ec-mul u1 g) (ec-mul u2 q))))
       (unless r-point
-        (return-from ecdsa-verify-p256 nil))
+        (return-from ecdsa-verify-p256-lisp nil))
       ;; Valid if R.x mod n == r
       (= (mod (car r-point) +p256-n+) r))))
+
+(defun ecdsa-verify-p256 (hash sig-bytes pubkey-x pubkey-y)
+  "Verify an ECDSA P-256 signature. Delegates to ECDSA-VERIFY-P256-LISP
+   by default; web-skeleton-tls replaces this function with a libssl-
+   backed version at load time. JWT-VERIFY and any other caller picks
+   up the swap transparently by routing through the function cell."
+  (ecdsa-verify-p256-lisp hash sig-bytes pubkey-x pubkey-y))
