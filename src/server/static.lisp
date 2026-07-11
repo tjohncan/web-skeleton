@@ -40,6 +40,7 @@
             ((string= e "txt")  "text/plain; charset=utf-8")
             ((string= e "xml")  "application/xml; charset=utf-8")
             ((string= e "webmanifest") "application/manifest+json; charset=utf-8")
+            ((string= e "map")  "application/json; charset=utf-8") ; source maps
             ;; Images
             ((string= e "png")  "image/png")
             ((or (string= e "jpg") (string= e "jpeg")) "image/jpeg")
@@ -47,11 +48,20 @@
             ((string= e "svg")  "image/svg+xml")
             ((string= e "ico")  "image/x-icon")
             ((string= e "webp") "image/webp")
+            ((string= e "avif") "image/avif")
             ;; Fonts
             ((string= e "woff")  "font/woff")
             ((string= e "woff2") "font/woff2")
             ((string= e "ttf")   "font/ttf")
             ((string= e "otf")   "font/otf")
+            ;; Media / documents
+            ((string= e "mp4")  "video/mp4")
+            ((string= e "webm") "video/webm")
+            ((string= e "pdf")  "application/pdf")
+            ;; WebAssembly — must be exactly application/wasm: browsers
+            ;; refuse WebAssembly.instantiateStreaming() /
+            ;; compileStreaming() on any other Content-Type.
+            ((string= e "wasm") "application/wasm")
             ;; Default
             (t "application/octet-stream"))))))
 
@@ -231,12 +241,35 @@
 ;;; Directory scanning and cache loading
 ;;; ---------------------------------------------------------------------------
 
+(defun hidden-path-component-p (relative)
+  "T when any /-separated component of RELATIVE starts with a dot —
+   except the exact component .well-known. RFC 8615 reserves
+   /.well-known/ as a public namespace that a web server must be able
+   to serve (ACME HTTP-01 challenges, security.txt, assetlinks.json,
+   apple-app-site-association), so the hide-dot-paths rule exempts
+   that one name. Dot-FILES keep answering T through their own
+   component — .well-known/.hidden stays hidden."
+  (let ((start 0)
+        (len (length relative)))
+    (loop
+      (let* ((slash (position #\/ relative :start start))
+             (end (or slash len)))
+        (when (and (< start end)
+                   (char= (char relative start) #\.)
+                   (not (string= relative ".well-known"
+                                 :start1 start :end1 end)))
+          (return t))
+        (unless slash (return nil))
+        (setf start (1+ slash))))))
+
 (defun load-static-files (directory &key (cache-control "public, max-age=3600")
                                          substitutions)
   "Load all files under DIRECTORY into the static file cache.
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
    Additive — can be called multiple times. Collisions: last wins.
+   Dotfiles and dot-directories are skipped (.git/, .env) — except
+   the RFC 8615 /.well-known/ namespace, which is served.
 
    CACHE-CONTROL is either a string (used for every file) or a
    function of one argument (the URL path) that returns a string.
@@ -308,9 +341,10 @@
                  (log-warn "static: skipping out-of-tree path ~a" fs-path))
                 (t
                  (let ((relative (subseq fs-path (length base))))
-                   ;; Skip files inside dot-directories (.git/, .secret/, etc.)
-                   ;; Search url-path (not relative) to catch root-level dot-dirs
-                   (unless (search "/." (concatenate 'string "/" relative))
+                   ;; Skip files inside dot-directories (.git/, .secret/, etc.).
+                   ;; The RFC 8615 /.well-known/ namespace is exempt — see
+                   ;; HIDDEN-PATH-COMPONENT-P.
+                   (unless (hidden-path-component-p relative)
                      (let* ((url-path (concatenate 'string "/" relative))
                             (raw-content (read-file-bytes fs-path))
                             (rules (and subs-table (gethash url-path subs-table)))

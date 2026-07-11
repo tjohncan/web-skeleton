@@ -2890,6 +2890,8 @@
                                     (truename ".")))
          (cc-seen nil))
     (ensure-directories-exist (merge-pathnames "sub/" scratch))
+    (ensure-directories-exist (merge-pathnames ".well-known/" scratch))
+    (ensure-directories-exist (merge-pathnames ".git/" scratch))
     (flet ((write-file (rel text)
              (with-open-file (s (merge-pathnames rel scratch)
                                 :direction :output
@@ -2901,7 +2903,12 @@
                                s))))
       (write-file "index.html"    "<!doctype html><title>root</title>")
       (write-file "page.html"     "<!doctype html><title>page</title>")
-      (write-file "sub/index.html" "<!doctype html><title>sub</title>"))
+      (write-file "sub/index.html" "<!doctype html><title>sub</title>")
+      ;; Dot-path discrimination: .well-known is the RFC 8615 exemption,
+      ;; .git is the stays-hidden control (its file has a dotless name,
+      ;; so only the directory-component filter can refuse it).
+      (write-file ".well-known/security.txt" "Contact: mailto:sec@example")
+      (write-file ".git/config" "[core]"))
     (let ((saved-cache web-skeleton::*static-cache*))
       (unwind-protect
            (progn
@@ -2935,17 +2942,25 @@
                              web-skeleton::*static-cache*) nil)
              (check "cache-control fn: saw /sub/index.html url"
                     (not (null (member "/sub/index.html" cc-seen
-                                       :test #'string=))) t))
+                                       :test #'string=))) t)
+             (check "dot-path: /.well-known/security.txt served"
+                    (not (null (gethash "/.well-known/security.txt"
+                                        web-skeleton::*static-cache*))) t)
+             (check "dot-path: /.git/config stays hidden"
+                    (gethash "/.git/config"
+                             web-skeleton::*static-cache*) nil))
         (setf web-skeleton::*static-cache* saved-cache)
         ;; Cleanup scratch tree. Files first, then nested dir, then
         ;; scratch root. IGNORE-ERRORS wraps each so a missing file
         ;; from a previous partial run does not mask a real test
         ;; failure.
-        (dolist (rel '("index.html" "page.html" "sub/index.html"))
+        (dolist (rel '("index.html" "page.html" "sub/index.html"
+                       ".well-known/security.txt" ".git/config"))
           (ignore-errors
            (delete-file (merge-pathnames rel scratch))))
-        (ignore-errors
-         (sb-ext:delete-directory (merge-pathnames "sub/" scratch)))
+        (dolist (dir '("sub/" ".well-known/" ".git/"))
+          (ignore-errors
+           (sb-ext:delete-directory (merge-pathnames dir scratch))))
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
@@ -2966,6 +2981,18 @@
          "image/svg+xml")
   (check "mime woff2" (web-skeleton::mime-type-for-path "/font.woff2")
          "font/woff2")
+  (check "mime wasm"  (web-skeleton::mime-type-for-path "/app.wasm")
+         "application/wasm")
+  (check "mime avif"  (web-skeleton::mime-type-for-path "/pic.avif")
+         "image/avif")
+  (check "mime mp4"   (web-skeleton::mime-type-for-path "/clip.mp4")
+         "video/mp4")
+  (check "mime webm"  (web-skeleton::mime-type-for-path "/clip.webm")
+         "video/webm")
+  (check "mime pdf"   (web-skeleton::mime-type-for-path "/doc.pdf")
+         "application/pdf")
+  (check "mime map"   (web-skeleton::mime-type-for-path "/app.js.map")
+         "application/json; charset=utf-8")
   (check "mime unknown" (web-skeleton::mime-type-for-path "/data.xyz")
          "application/octet-stream")
   (check "mime no ext" (web-skeleton::mime-type-for-path "/LICENSE")
@@ -2977,7 +3004,24 @@
   (check "ext dotfile in subdir"
          (web-skeleton::file-extension "/foo/.hidden") nil)
   (check "ext regular in subdir"
-         (web-skeleton::file-extension "/foo/bar.txt") "txt"))
+         (web-skeleton::file-extension "/foo/bar.txt") "txt")
+
+  ;; hidden-path-component-p — the dot-path filter with the RFC 8615
+  ;; .well-known exemption. Exact-component match only.
+  (check "hidden: dot dir"
+         (web-skeleton::hidden-path-component-p ".git/config") t)
+  (check "hidden: nested dot dir"
+         (web-skeleton::hidden-path-component-p "a/.secret/b.txt") t)
+  (check "hidden: dotfile in subdir"
+         (web-skeleton::hidden-path-component-p "sub/.env") t)
+  (check "hidden: .well-known exempt"
+         (web-skeleton::hidden-path-component-p ".well-known/acme/token") nil)
+  (check "hidden: dotfile inside .well-known"
+         (web-skeleton::hidden-path-component-p ".well-known/.hidden") t)
+  (check "hidden: .well-known-evil not exempt"
+         (web-skeleton::hidden-path-component-p ".well-known-evil/x") t)
+  (check "hidden: plain path"
+         (web-skeleton::hidden-path-component-p "a/b.txt") nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWT tests
