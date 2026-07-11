@@ -69,44 +69,55 @@
 ;;; Block processing
 ;;; ---------------------------------------------------------------------------
 
-(defun sha1-process-block (block h0 h1 h2 h3 h4)
-  "Process a single 512-bit (64-byte) BLOCK. Returns updated hash values
-   as (values h0 h1 h2 h3 h4)."
-  ;; Prepare message schedule — 80 words from the 16-word block
-  (let ((w (make-array 80 :element-type '(unsigned-byte 32) :initial-element 0)))
-    ;; First 16 words: read from block as big-endian 32-bit integers
-    (loop for i from 0 below 16
-          for offset = (* i 4)
-          do (setf (aref w i)
-                   (logior (ash (aref block offset)       24)
-                           (ash (aref block (+ offset 1)) 16)
-                           (ash (aref block (+ offset 2))  8)
-                                (aref block (+ offset 3)))))
-    ;; Words 16-79: XOR and rotate
-    (loop for i from 16 below 80
-          do (setf (aref w i)
-                   (u32-rotate-left
-                    (logxor (aref w (- i 3))
-                            (aref w (- i 8))
-                            (aref w (- i 14))
-                            (aref w (- i 16)))
-                    1)))
-    ;; Initialize working variables
-    (let ((a h0) (b h1) (c h2) (d h3) (e h4))
-      ;; 80 rounds
-      (loop for i from 0 below 80
-            do (let ((temp (u32+ (u32-rotate-left a 5)
-                                 (sha1-f i b c d)
-                                 e
-                                 (sha1-k i)
-                                 (aref w i))))
-                 (setf e d
-                       d c
-                       c (u32-rotate-left b 30)
-                       b a
-                       a temp)))
-      (values (u32+ h0 a) (u32+ h1 b) (u32+ h2 c)
-              (u32+ h3 d) (u32+ h4 e)))))
+(defun sha1-process-block (data start w h0 h1 h2 h3 h4)
+  "Process the 512-bit (64-byte) block at DATA[START..START+64).
+   Returns updated hash values as (values h0 h1 h2 h3 h4).
+
+   DATA is the whole padded message and START the block's offset within
+   it — not a freshly copied 64-byte block — and W is a caller-owned
+   80-word scratch schedule reused across every block of one digest.
+   Both exist to keep the hot loop allocation-free: a per-block SUBSEQ
+   plus a per-block schedule cost ~350 bytes of garbage for every 64
+   bytes of input, which dominated the pure-Lisp digest's cost. Every W
+   slot is written before it is read (0-15 from the block, 16-79 derived
+   from those), so reuse needs no clearing. SHA1-LISP allocates W per
+   call, so concurrent digests never share one."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (type (simple-array (unsigned-byte 32) (*)) w)
+           (type fixnum start))
+  ;; First 16 words: read from the block as big-endian 32-bit integers
+  (loop for i of-type fixnum from 0 below 16
+        for offset of-type fixnum = (+ start (* i 4))
+        do (setf (aref w i)
+                 (logior (ash (aref data offset)       24)
+                         (ash (aref data (+ offset 1)) 16)
+                         (ash (aref data (+ offset 2))  8)
+                              (aref data (+ offset 3)))))
+  ;; Words 16-79: XOR and rotate
+  (loop for i of-type fixnum from 16 below 80
+        do (setf (aref w i)
+                 (u32-rotate-left
+                  (logxor (aref w (- i 3))
+                          (aref w (- i 8))
+                          (aref w (- i 14))
+                          (aref w (- i 16)))
+                  1)))
+  ;; Initialize working variables
+  (let ((a h0) (b h1) (c h2) (d h3) (e h4))
+    ;; 80 rounds
+    (loop for i of-type fixnum from 0 below 80
+          do (let ((temp (u32+ (u32-rotate-left a 5)
+                               (sha1-f i b c d)
+                               e
+                               (sha1-k i)
+                               (aref w i))))
+               (setf e d
+                     d c
+                     c (u32-rotate-left b 30)
+                     b a
+                     a temp)))
+    (values (u32+ h0 a) (u32+ h1 b) (u32+ h2 c)
+            (u32+ h3 d) (u32+ h4 e))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public interface
@@ -124,18 +135,22 @@
    DO NOT declaim SHA1 inline: the libssl swap works through the
    function cell, and an inlined caller would bypass the cell and keep
    calling whichever implementation was visible at compile time."
-  (let ((padded (sha1-pad data)))
+  (let ((padded (sha1-pad data))
+        ;; One scratch schedule for the whole digest — see
+        ;; SHA1-PROCESS-BLOCK. Allocated per call, so concurrent
+        ;; digests stay independent.
+        (w (make-array 80 :element-type '(unsigned-byte 32)
+                          :initial-element 0)))
     ;; Initial hash values (FIPS 180-4 §5.3.1)
     (let ((h0 #x67452301)
           (h1 #xEFCDAB89)
           (h2 #x98BADCFE)
           (h3 #x10325476)
           (h4 #xC3D2E1F0))
-      ;; Process each 64-byte block
+      ;; Process each 64-byte block in place — no per-block copy.
       (loop for offset from 0 below (length padded) by 64
-            do (let ((block (subseq padded offset (+ offset 64))))
-                 (multiple-value-setq (h0 h1 h2 h3 h4)
-                   (sha1-process-block block h0 h1 h2 h3 h4))))
+            do (multiple-value-setq (h0 h1 h2 h3 h4)
+                 (sha1-process-block padded offset w h0 h1 h2 h3 h4)))
       ;; Produce the 20-byte digest
       (let ((digest (make-array 20 :element-type '(unsigned-byte 8))))
         (flet ((pack-u32 (val offset)
