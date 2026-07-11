@@ -31,6 +31,7 @@
            #:format-response
            #:make-text-response
            #:make-html-response
+           #:make-bytes-response
            #:make-error-response
            #:status-reason
            ;; Logging

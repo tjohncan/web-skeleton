@@ -571,6 +571,60 @@
     (check "error status" (http-response-status resp) 404)
     (check "error body" (http-response-body resp) "404 Not Found"))
 
+  ;; ---- Byte-vector bodies ----
+  ;; A string body is UTF-8 encoded at serialize time, so arbitrary
+  ;; bytes routed through MAKE-TEXT-RESPONSE come out re-encoded. The
+  ;; payload below is deliberately not valid UTF-8 (0x00 0xFF 0x80 0xFE):
+  ;; it must survive byte-for-byte.
+  (let* ((payload (make-array 6 :element-type '(unsigned-byte 8)
+                                :initial-contents '(#x00 #xFF #x80 #xFE #x01 #x7F)))
+         (resp (make-bytes-response 200 payload :content-type "image/png"))
+         (bytes (format-response resp))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes)))
+         (emitted (subseq bytes (+ header-end 4)))
+         (head-text (sb-ext:octets-to-string
+                     (subseq bytes 0 header-end) :external-format :latin-1)))
+    (check "bytes body: emitted verbatim" (equalp emitted payload) t)
+    (check "bytes body: content-length matches byte count"
+           (not (null (search "content-length: 6" head-text :test #'char-equal)))
+           t)
+    (check "bytes body: content-type honored"
+           (not (null (search "image/png" head-text))) t)
+    ;; HEAD keeps the Content-Length of the GET body but emits no body
+    ;; (RFC 7231 §4.3.2) — same contract as a string body.
+    (let* ((head-bytes (format-response resp :head-only-p t))
+           (hend (web-skeleton::scan-crlf-crlf head-bytes 0 (length head-bytes)))
+           (htext (sb-ext:octets-to-string
+                   (subseq head-bytes 0 hend) :external-format :latin-1)))
+      (check "bytes body: HEAD emits no body"
+             (= (length head-bytes) (+ hend 4)) t)
+      (check "bytes body: HEAD keeps content-length"
+             (not (null (search "content-length: 6" htext :test #'char-equal)))
+             t)))
+  ;; Empty byte vector is a present-but-empty body → Content-Length: 0,
+  ;; matching the empty-string case rather than falling into the no-body
+  ;; branch.
+  (let* ((resp (make-bytes-response
+                200 (make-array 0 :element-type '(unsigned-byte 8))))
+         (text (sb-ext:octets-to-string (format-response resp)
+                                        :external-format :latin-1)))
+    (check "bytes body: empty vector yields content-length 0"
+           (not (null (search "content-length: 0" text :test #'char-equal)))
+           t))
+  ;; Default content-type, and a fill-pointered accumulator (the shape an
+  ;; app building bytes incrementally ends up with) is accepted.
+  (let* ((acc (make-array 0 :element-type '(unsigned-byte 8)
+                            :fill-pointer 0 :adjustable t)))
+    (vector-push-extend 65 acc)
+    (vector-push-extend 66 acc)
+    (let* ((resp (make-bytes-response 201 acc))
+           (text (sb-ext:octets-to-string (format-response resp)
+                                          :external-format :latin-1)))
+      (check "bytes body: adjustable vector accepted"
+             (not (null (search "AB" text))) t)
+      (check "bytes body: default content-type"
+             (not (null (search "application/octet-stream" text))) t)))
+
   ;; HTTP header field names are case-insensitive (RFC 7230 §3.2).
   ;; Framework helpers route through set-response-header with lowercase
   ;; literals, but apps that build responses with mixed-case :headers
