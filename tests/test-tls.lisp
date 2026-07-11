@@ -27,6 +27,19 @@
   (check "https-stream-fn set"
          (not (null web-skeleton:*https-stream-fn*)) t))
 
+(defun tls-sym (name)
+  "Resolve a WEB-SKELETON symbol that exists only once web-skeleton-tls
+   is loaded. This test system does not depend on the TLS system — it is
+   optional, loaded at runtime by run-tests.lisp — so writing
+   WEB-SKELETON::%SSL-CTX-CTRL literally would intern the symbol at read
+   time and emit undefined-function / undefined-variable warnings on
+   every compile of a tree where TLS is not in the image. Looking the
+   name up at run time keeps the compile clean. Only ever called from
+   inside the libssl-is-loaded branch, so a miss is a real error."
+  (or (find-symbol name :web-skeleton)
+      (error "web-skeleton::~a not found — is web-skeleton-tls loaded?"
+             name)))
+
 (defun test-ssl-ctx-init ()
   ;; Smoke the shared-context init path for real. Registration checks
   ;; alone can't catch an FFI-level mistake — a binding that names the
@@ -47,14 +60,15 @@
   ;; correct init from a lucky one.
   (format t "~%SSL context init~%")
   (check "ensure-ssl-ctx initializes shared context"
-         (handler-case (and (web-skeleton::ensure-ssl-ctx) t)
+         (handler-case (and (funcall (tls-sym "ENSURE-SSL-CTX")) t)
            (error (e) (format nil "error: ~a" e)))
          t)
   (check "TLS 1.2 floor reads back off the context"
          (handler-case
-             (web-skeleton::%ssl-ctx-ctrl
-              (web-skeleton::ensure-ssl-ctx)
-              web-skeleton::+ssl-ctrl-get-min-proto-version+
-              0 (sb-sys:int-sap 0))
+             (funcall (tls-sym "%SSL-CTX-CTRL")
+                      (funcall (tls-sym "ENSURE-SSL-CTX"))
+                      (symbol-value
+                       (tls-sym "+SSL-CTRL-GET-MIN-PROTO-VERSION+"))
+                      0 (sb-sys:int-sap 0))
            (error (e) (format nil "error: ~a" e)))
-         web-skeleton::+tls1-2-version+))
+         (symbol-value (tls-sym "+TLS1-2-VERSION+"))))
