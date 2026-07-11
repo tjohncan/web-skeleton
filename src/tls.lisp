@@ -125,6 +125,19 @@
   (larg sb-alien:long)
   (parg (* t)))
 
+;;; Context-level ctrl. SSL_CTX_ctrl and SSL_ctrl are separate libssl
+;;; entry points over different struct types — the header macro
+;;; SSL_CTX_set_min_proto_version(ctx, v) expands to SSL_CTX_ctrl, and
+;;; passing an SSL_CTX* to SSL_ctrl instead reads and writes ssl_st
+;;; field offsets inside the smaller ssl_ctx_st allocation: undefined
+;;; behavior that can silently pass, hard-fail, or corrupt the context
+;;; depending on libssl version and heap layout. Never mix the two.
+(sb-alien:define-alien-routine ("SSL_CTX_ctrl" %ssl-ctx-ctrl) sb-alien:long
+  (ctx (* t))
+  (cmd sb-alien:int)
+  (larg sb-alien:long)
+  (parg (* t)))
+
 ;;; Hostname verification (OpenSSL 1.1.0+)
 (sb-alien:define-alien-routine ("SSL_set1_host" %ssl-set1-host) sb-alien:int
   (ssl (* t))
@@ -134,6 +147,11 @@
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
 (defconstant +ssl-ctrl-set-min-proto-version+ 123)
+(defconstant +ssl-ctrl-get-min-proto-version+ 130
+  "GET twin of the SET ctrl above. Used by the test suite to read the
+   floor back off the context — a wrong-entry-point SET (the SSL_ctrl /
+   SSL_CTX_ctrl mixup) can return 1 while writing to a garbage offset,
+   and only the read-back exposes that the floor never landed.")
 (defconstant +tls1-2-version+ #x0303)
 (defconstant +ssl-error-syscall+ 5)
 (defconstant +ssl-error-zero-return+ 6)
@@ -172,8 +190,8 @@
         ;; the client willing to negotiate 1.0 against a misconfigured
         ;; peer; OpenSSL 3.0's default security level already forbids
         ;; 1.0/1.1 so this check is redundant there but free to keep.
-        (unless (= 1 (%ssl-ctrl ctx +ssl-ctrl-set-min-proto-version+
-                                +tls1-2-version+ (sb-sys:int-sap 0)))
+        (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                                    +tls1-2-version+ (sb-sys:int-sap 0)))
           (error "SSL_CTX set min proto version failed"))
         ;; Load system CA certificates
         (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
