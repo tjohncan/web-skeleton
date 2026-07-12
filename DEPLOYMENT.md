@@ -361,37 +361,53 @@ Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 code path underneath. Apps that depend on exotic name sources
 continue to work without change.
 
-**Caching is opt-in at the app layer.** `getent` is reinvoked on
-every outbound fetch, which is fine for apps making a handful of calls
-per inbound request. Apps that pound a small set of upstream hosts many times
-can cache DNS themselves using the `store` primitive in about fifteen lines,
-then bypass the framework's DNS path by passing the resolved IP literal
-at the call site:
+**Caching is opt-in, and off by default.** With `*dns-cache-ttl*` at its
+default of `0`, `getent` is reinvoked on every outbound fetch to a hostname
+— fine for apps making a handful of calls per inbound request, and the only
+behavior that is correct without knowing your tolerance for stale addresses.
+
+Apps that pound a small set of upstreams turn the cache on by naming a TTL:
 
 ```lisp
-(defvar *dns-cache*
-  (make-store :expiry-fn (lambda (host entry)
-                           (declare (ignore host))
-                           (> (get-universal-time) (cdr entry)))
-              :reap-interval 60))
-
-(defun cached-ip-for (host)
-  (car (store-get *dns-cache* host)))
-
-(defun remember-ip (host ip &key (ttl 60))
-  (store-set *dns-cache* host (cons ip (+ (get-universal-time) ttl))))
+(setf web-skeleton:*dns-cache-ttl* 60)   ; trust a resolution for 60s
 ```
 
-At the call site, check `cached-ip-for` first and build the URL
-with the IP literal when there's a hit —
-the framework's numeric fast path skips `getent` entirely.
-On a miss, fall through to a hostname URL (paying the `getent` cost once)
-and populate the cache when the response arrives.
+Each worker then keeps its own hostname → address table (workers share
+nothing in the hot path, so there is no lock and no contention). A worker's
+first fetch to a host pays the subprocess; the rest of that window does not.
 
-The framework deliberately does not ship a DNS cache of its own.
-`getent` output does not surface TTL information, so any built-in cache
-would have to invent its own expiry policy — a choice that belongs to the app,
-not the framework.
+The framework cannot pick this number for you, which is exactly why it does
+not try. `getent` surfaces no TTL, so the value is a judgment about your
+upstream: how long may the server keep dialing a remembered address after
+DNS has changed? Small values (30–60s) suit an upstream behind a load
+balancer that can fail over; larger values suit a pinned host. Leaving it
+at `0` is a legitimate answer — it means "always ask".
+
+Details worth knowing:
+
+- **Successes only.** A failed lookup is not cached. Nameserver blips and
+  services still coming up are transient; caching the failure would stretch
+  an outage well past its cause.
+- **Bounded.** `*dns-cache-max-entries*` (default 256) caps each worker's
+  table; on overflow, expired entries are swept and the table cleared if
+  that is not enough. The cache is a latency optimization, not a source of
+  truth — dropping it costs one `getent` per host. Without a bound, a
+  handler fetching attacker-chosen hostnames could grow a worker's memory
+  without limit.
+- **`*fetch-address-filter*` is re-consulted on every cache hit.** A cached
+  address is never a way around the filter: if policy changes, or an entry
+  was admitted before a filter was installed, the hit is refused and the
+  entry evicted. Without this, caching would be a DNS-rebinding accelerator.
+- **A worker restart drops its cache.** Harmless — the next fetch to each
+  host pays one `getent` again.
+
+The cache is also the *only* way to avoid the subprocess on an HTTPS fetch.
+For plain HTTP, an app can resolve a host itself and pass the IP literal at
+the call site, hitting the numeric fast path. That does not work for HTTPS:
+`parse-url` refuses `https://` with an IP-literal host, because peer
+verification is wired to a DNS name and matching an IP SAN is not
+implemented. So an HTTPS upstream has no app-side way to skip `getent` —
+`*dns-cache-ttl*` is it.
 
 ### ws-send and worker blocking
 

@@ -127,6 +127,9 @@
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
            #:*fetch-timeout*
+           ;; DNS cache (opt-in — 0 disables)
+           #:*dns-cache-ttl*
+           #:*dns-cache-max-entries*
            ;; Shutdown
            #:*drain-timeout*
            #:*shutdown-poll-interval*

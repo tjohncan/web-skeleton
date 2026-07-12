@@ -135,6 +135,121 @@
         (setf line-start (1+ lf))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Optional per-worker resolution cache
+;;;
+;;; Every hostname fetch otherwise costs a fork+exec of getent (~ms). For
+;;; an app that pounds one upstream, that is a subprocess per request for
+;;; an answer that did not change.
+;;;
+;;; The framework supplies the mechanism and the app supplies the policy:
+;;; getent reports no TTL, so *there is no honest expiry the framework
+;;; could pick on the app's behalf*. Hence *DNS-CACHE-TTL* defaults to 0
+;;; (caching off, historical behavior, every fetch re-resolves) and an app
+;;; that wants caching names the number of seconds it is willing to trust
+;;; a resolution for. That number is a real trade — how fast an upstream's
+;;; failover must be noticed — and it belongs to whoever owns the upstream.
+;;;
+;;; The cache is per-worker: workers share nothing in the hot path, so
+;;; each keeps its own table and no lock is needed. A worker's first fetch
+;;; to a host pays the subprocess; the rest of that TTL window does not.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *dns-cache-ttl* 0
+  "Seconds a successful hostname → address resolution is cached per
+   worker. 0 (the default) disables caching entirely: every fetch to a
+   hostname re-runs getent, which is the framework's historical behavior
+   and the only one that is correct without knowing the app's tolerance
+   for stale addresses.
+
+   Set it to the number of seconds you are willing to keep dialing a
+   remembered address after DNS has changed. Small values (30-60) suit an
+   upstream behind a load balancer that can fail over; larger values suit
+   a pinned host. getent surfaces no TTL, so the framework cannot infer
+   this — that is exactly why the default is off rather than some invented
+   number.
+
+   The cache holds successes only, and never outlives a policy change:
+   *FETCH-ADDRESS-FILTER* is re-consulted on every cache hit, so a cached
+   address cannot become a way around the filter.")
+
+(defparameter *dns-cache-max-entries* 256
+  "Maximum hostnames cached per worker. On overflow, expired entries are
+   swept and the table is cleared if that is not enough. The cache is a
+   latency optimization, not a source of truth — dropping it costs one
+   getent per host — and an unbounded table would let a handler that
+   fetches attacker-chosen hostnames grow a worker's memory without
+   limit.")
+
+(defvar *dns-cache* nil
+  "Per-worker hostname → DNS-CACHE-ENTRY table, bound by RUN-WORKER
+   alongside *CONNECTIONS*. NIL outside a worker thread (a REPL, a test),
+   which simply means no caching happens there — every cache operation
+   no-ops on a NIL table rather than reaching for a global.")
+
+(defstruct (dns-cache-entry
+            (:constructor make-dns-cache-entry (ip family expires-at)))
+  (ip     nil)
+  (family :inet :type keyword)
+  (expires-at 0 :type integer))
+
+(defun dns-cache-lookup (host)
+  "Return (values IP FAMILY) for HOST from the per-worker cache, or NIL on
+   a miss, an expired entry, a disabled cache, or a thread with no cache
+   bound.
+
+   A hit is re-gated on *FETCH-ADDRESS-FILTER* before it is handed back.
+   This is the load-bearing part: without it, caching would be a DNS-
+   rebinding accelerator — an address admitted while no filter was
+   installed, or under a policy that has since changed, would keep being
+   dialed from memory with nothing left to refuse it. Re-running a cheap
+   predicate costs nothing next to the connect that follows. A now-refused
+   entry is dropped rather than merely skipped, so the filter does not get
+   re-invoked on it for the rest of its TTL."
+  (when (and *dns-cache* (> *dns-cache-ttl* 0))
+    (let ((entry (gethash host *dns-cache*)))
+      (when entry
+        (cond
+          ((>= (get-universal-time) (dns-cache-entry-expires-at entry))
+           (remhash host *dns-cache*)
+           nil)
+          ((not (fetch-address-allowed-p (dns-cache-entry-ip entry)
+                                         (dns-cache-entry-family entry)
+                                         host))
+           (remhash host *dns-cache*)
+           nil)
+          (t
+           (log-debug "dns: cache hit ~a -> ~a" host
+                      (format-ip (dns-cache-entry-ip entry)))
+           (values (dns-cache-entry-ip entry)
+                   (dns-cache-entry-family entry))))))))
+
+(defun dns-cache-store (host ip family)
+  "Record HOST → IP/FAMILY for *DNS-CACHE-TTL* seconds. No-op when
+   caching is disabled or no cache is bound.
+
+   Successful resolutions only. A failed lookup is usually transient — a
+   nameserver blip, a service still coming up — and caching the failure
+   would stretch an outage well past its cause."
+  (when (and *dns-cache* (> *dns-cache-ttl* 0))
+    (when (>= (hash-table-count *dns-cache*) *dns-cache-max-entries*)
+      (let ((now (get-universal-time))
+            (dead nil))
+        (maphash (lambda (k v)
+                   (when (>= now (dns-cache-entry-expires-at v))
+                     (push k dead)))
+                 *dns-cache*)
+        (dolist (k dead) (remhash k *dns-cache*))
+        (when (>= (hash-table-count *dns-cache*) *dns-cache-max-entries*)
+          (log-debug "dns: cache full (~d), clearing"
+                     (hash-table-count *dns-cache*))
+          (clrhash *dns-cache*))))
+    (setf (gethash host *dns-cache*)
+          (make-dns-cache-entry ip family
+                                (+ (get-universal-time) *dns-cache-ttl*)))
+    (log-debug "dns: cached ~a -> ~a for ~ds"
+               host (format-ip ip) *dns-cache-ttl*)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Kick off a lookup
 ;;;
 ;;; The process-reaping helper MAYBE-REAP-DNS-PROCESS lives in
@@ -148,7 +263,19 @@
    CONN behind a new outbound :out-dns connection carrying the DNS-THEN
    closure. When the pipe becomes readable, HANDLE-DNS-READY parses the
    output and fires DNS-THEN, which opens the TCP socket and transitions
-   to :out-connecting — the existing outbound flow takes over from there."
+   to :out-connecting — the existing outbound flow takes over from there.
+
+   A per-worker cache hit (opt-in, see *DNS-CACHE-TTL*) skips all of that:
+   no subprocess, no :out-dns connection, no epoll registration — straight
+   to the TCP phase on the remembered address, exactly as a numeric literal
+   would. The hit has already been re-gated on *FETCH-ADDRESS-FILTER* by
+   DNS-CACHE-LOOKUP."
+  (multiple-value-bind (cached-ip cached-family) (dns-cache-lookup host)
+    (when cached-ip
+      (return-from initiate-dns-lookup
+        (initiate-http-fetch-to-address conn epoll-fd fetch-req
+                                        host port path
+                                        cached-ip cached-family))))
   ;; -- terminates getent's option parsing so a hostname that begins
   ;; with '-' cannot be misread as a flag. Numeric IP literals never
   ;; reach this path (parse-ipv4-literal / parse-ipv6-literal catch
@@ -252,6 +379,12 @@
             (let ((dns-then (connection-dns-then dns-conn)))
               (handler-case
                   (destructuring-bind (ip . family) parsed
+                    ;; Remember the resolution before chaining to TCP: the
+                    ;; name resolved, which is true regardless of whether
+                    ;; the connect that follows succeeds. PARSE-GETENT-
+                    ;; OUTPUT already ran this address past the address
+                    ;; filter, so nothing refused ever enters the cache.
+                    (dns-cache-store (connection-dns-host dns-conn) ip family)
                     (funcall dns-then ip family)
                     ;; dns-then succeeded — the new outbound now carries the
                     ;; callback. Clear it on dns-conn so close-outbound
@@ -321,6 +454,14 @@
       (return-from resolve-host-blocking
         (when (fetch-address-allowed-p v6 :inet6 host)
           (values v6 :inet6)))))
+  ;; Per-worker cache (opt-in — see *DNS-CACHE-TTL*). A hit skips the
+  ;; subprocess and its deadline poll entirely. This is the only way an
+  ;; HTTPS fetch can avoid the fork+exec: PARSE-URL refuses https:// with
+  ;; an IP-literal host, so an app cannot hand us a pre-resolved address
+  ;; the way it can for plain HTTP.
+  (multiple-value-bind (cached-ip cached-family) (dns-cache-lookup host)
+    (when cached-ip
+      (return-from resolve-host-blocking (values cached-ip cached-family))))
   (handler-case
       (let ((process (sb-ext:run-program "getent"
                                           (list "ahosts" "--" host)
@@ -359,6 +500,7 @@
                              (vector-push-extend byte buf))
                     (let ((parsed (parse-getent-output buf (length buf) host)))
                       (when parsed
+                        (dns-cache-store host (car parsed) (cdr parsed))
                         (values (car parsed) (cdr parsed))))))))
           (ignore-errors (sb-ext:process-close process))))
     (error () nil)))

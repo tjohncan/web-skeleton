@@ -219,7 +219,14 @@ tests/
   subprocess whose stdout pipe is registered with the worker's epoll;
   the parked inbound resumes when the address lands.
   Numeric IPv4 and IPv6 literals (including `http://[::1]:8080/`) skip DNS entirely
-  via a fast path. Both families supported
+  via a fast path. Both families supported.
+  Optional per-worker resolution cache (`*dns-cache-ttl*`, off by default) —
+  a hit skips the subprocess entirely, and is re-gated on the address filter
+- **Outbound address policy (SSRF)** — `*fetch-address-filter*` is consulted for
+  every address a fetch is about to dial, including the IP-literal fast paths.
+  Because the framework resolves hostnames itself, this is the only place a
+  DNS-rebinding race can be closed — an app that resolves, approves, then hands
+  over the *name* is racing a second lookup. Pair it with `is-public-address-p`
 - **Streaming fetch** — `http-fetch-stream` reads a response body line by line,
   calling a callback per line. Designed for NDJSON/SSE streaming APIs.
   Blocking — call from within a handler
@@ -270,6 +277,9 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*fetch-timeout*`              | `30`      | Blocking fetch I/O timeout and :awaiting connection reap deadline                                                                                                                                                                                  |
+| `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
+| `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
+| `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
 | `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*shutdown-poll-interval*`     | `1`       | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout)                                                                                                                                                                  |

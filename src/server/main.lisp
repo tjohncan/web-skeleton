@@ -850,6 +850,12 @@
   (loop
     (handler-case
         (let ((*connections* (make-hash-table :test #'eql))
+              ;; Per-worker DNS cache. Workers share nothing in the hot
+              ;; path, so each keeps its own table and no lock is needed.
+              ;; Inert unless the app opts in via *DNS-CACHE-TTL*; a
+              ;; worker restart drops its cache, which is harmless — the
+              ;; next fetch to each host pays one getent again.
+              (*dns-cache* (make-hash-table :test #'equal))
               (*epoll-ctl-buf* (make-array +epoll-event-size+
                                            :element-type '(unsigned-byte 8)))
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))

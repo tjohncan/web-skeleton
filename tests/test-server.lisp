@@ -3335,6 +3335,92 @@
            '(127 0 0 1))))
 
 ;;; ---------------------------------------------------------------------------
+;;; DNS cache (opt-in)
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-cache ()
+  (format t "~%DNS cache~%")
+  (let ((v4 (make-array 4 :element-type '(unsigned-byte 8)
+                          :initial-contents '(93 184 216 34))))
+    ;; Default: TTL 0 → caching disabled. A store is a no-op and a lookup
+    ;; always misses, so every fetch re-resolves exactly as before. This is
+    ;; the property that makes the feature safe to ship: nothing changes
+    ;; until an app opts in.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 0))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (check "ttl 0: store is a no-op"
+             (hash-table-count web-skeleton::*dns-cache*) 0)
+      (check "ttl 0: lookup misses"
+             (web-skeleton::dns-cache-lookup "example.com") nil))
+
+    ;; No cache bound (a REPL, a test thread, any non-worker context) —
+    ;; operations no-op instead of reaching for a global.
+    (let ((web-skeleton::*dns-cache* nil)
+          (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (check "no cache bound: lookup misses, no error"
+             (web-skeleton::dns-cache-lookup "example.com") nil))
+
+    ;; Opted in: store then hit.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (multiple-value-bind (ip family)
+          (web-skeleton::dns-cache-lookup "example.com")
+        (check "ttl 60: cache hit returns address"
+               (coerce ip 'list) '(93 184 216 34))
+        (check "ttl 60: cache hit returns family" family :inet))
+      (check "unknown host still misses"
+             (web-skeleton::dns-cache-lookup "other.example") nil))
+
+    ;; Expiry: an entry past its deadline is dropped, not served.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60))
+      (setf (gethash "stale.example" web-skeleton::*dns-cache*)
+            (web-skeleton::make-dns-cache-entry
+             v4 :inet (- (get-universal-time) 1)))   ; expired one second ago
+      (check "expired entry misses"
+             (web-skeleton::dns-cache-lookup "stale.example") nil)
+      (check "expired entry is evicted on lookup"
+             (hash-table-count web-skeleton::*dns-cache*) 0))
+
+    ;; The load-bearing one: a cache hit is re-gated on the address filter,
+    ;; so the cache can never become a DNS-rebinding accelerator. Seed an
+    ;; entry with no filter installed (as an app might, before tightening
+    ;; policy), then install a public-only filter — the cached private
+    ;; address must stop being served AND be evicted.
+    (let* ((loopback (make-array 4 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(127 0 0 1)))
+           (web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+           (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "rebind.example" loopback :inet)
+      (check "seeded entry hits with no filter"
+             (coerce (web-skeleton::dns-cache-lookup "rebind.example") 'list)
+             '(127 0 0 1))
+      (let ((web-skeleton::*fetch-address-filter*
+              (lambda (ip family host)
+                (declare (ignore host))
+                (is-public-address-p ip family))))
+        (check "cached address re-gated on filter: refused hit misses"
+               (web-skeleton::dns-cache-lookup "rebind.example") nil)
+        (check "refused entry is evicted"
+               (hash-table-count web-skeleton::*dns-cache*) 0)))
+
+    ;; Bounded: the table never grows past the cap, so a handler fetching
+    ;; attacker-chosen hostnames cannot grow a worker without limit.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60)
+          (web-skeleton::*dns-cache-max-entries* 8))
+      (loop for i from 0 below 50
+            do (web-skeleton::dns-cache-store
+                (format nil "host~d.example" i) v4 :inet))
+      (check "cache stays bounded at max-entries"
+             (<= (hash-table-count web-skeleton::*dns-cache*)
+                 web-skeleton::*dns-cache-max-entries*)
+             t))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -3353,6 +3439,7 @@
   (test-dns)
   (test-is-public-address)
   (test-fetch-address-filter)
+  (test-dns-cache)
   (test-format-peer-addr)
   (test-url-decode)
   (test-query-string)
