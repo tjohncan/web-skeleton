@@ -74,12 +74,24 @@
    the 200 GET (headers + body), the 200 HEAD (same headers, body
    suppressed), and the 304 Not Modified (etag + cache-control only,
    no body). ETAG is the content's SHA-256 hex wrapped in a quoted
-   string — a strong entity tag per RFC 7232 §2.3."
+   string — a strong entity tag per RFC 7232 §2.3.
+
+   HEADERS, BODY-OFFSET and CONTENT-LENGTH exist for Range requests
+   (RFC 7233). A 206 needs a fresh header set — a different
+   Content-Length plus a Content-Range — so the 200's header alist is
+   kept to build from. BODY-OFFSET is where the body starts inside
+   GET-RESPONSE, which lets a range be sliced straight out of the
+   pre-built 200: the file is stored once, not twice. It is exactly the
+   length of HEAD-RESPONSE, since that is the same headers with the body
+   suppressed."
   (get-response          nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (head-response         nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (not-modified-response nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (etag                  nil :type (or null string))
-  (last-modified         ""  :type string))
+  (last-modified         ""  :type string)
+  (headers               nil :type list)
+  (body-offset             0 :type fixnum)
+  (content-length          0 :type fixnum))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
   "Maps URL path (string) to STATIC-ENTRY struct.
@@ -108,6 +120,11 @@
                 (cons "etag" etag)
                 (cons "cache-control" cache-control)
                 (cons "x-content-type-options" "nosniff")
+                ;; Advertise Range support (RFC 7233 §2.3). Without this
+                ;; a client has no way to know a byte range is worth
+                ;; asking for — media players in particular check it
+                ;; before attempting to seek.
+                (cons "accept-ranges" "bytes")
                 ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
                 ;; Pre-built responses cannot carry a per-request timestamp,
                 ;; and a stale Date would defeat max-age for caching proxies.
@@ -119,15 +136,24 @@
          (not-modified-headers
           (list (cons "etag" etag)
                 (cons "cache-control" cache-control)
-                (cons "last-modified" (http-date file-mtime)))))
+                (cons "last-modified" (http-date file-mtime))))
+         ;; The HEAD response is the same headers with no body, so its
+         ;; length is precisely where the body begins inside the GET
+         ;; response. That identity is what lets RANGE-RESPONSE slice a
+         ;; byte range out of the pre-built 200 instead of keeping a
+         ;; second copy of the file.
+         (head-bytes (serialize-http-message "HTTP/1.1 200 OK"
+                                             full-headers nil)))
     (make-static-entry
      :get-response  (serialize-http-message "HTTP/1.1 200 OK"
                                             full-headers content)
-     :head-response (serialize-http-message "HTTP/1.1 200 OK"
-                                            full-headers nil)
+     :head-response head-bytes
      :not-modified-response (serialize-http-message
                              "HTTP/1.1 304 Not Modified"
                              not-modified-headers nil)
+     :headers full-headers
+     :body-offset (length head-bytes)
+     :content-length (length content)
      :etag etag
      :last-modified (http-date file-mtime))))
 
@@ -475,6 +501,138 @@
         (setf pos (1+ end))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Range requests (RFC 7233)
+;;;
+;;; A client asking for part of a resource instead of the whole thing.
+;;; Two things depend on it in practice: seeking in <video> / <audio>
+;;; (dragging the scrubber issues a Range request for the bytes at that
+;;; timestamp — without it the browser must pull the file from byte 0 to
+;;; reach the middle), and resuming an interrupted download.
+;;;
+;;; The body is sliced out of the pre-built 200 response, so serving a
+;;; range costs one header build and one subseq — no second copy of the
+;;; file is kept, and a full GET still takes the pre-built zero-work path
+;;; untouched.
+;;; ---------------------------------------------------------------------------
+
+(defun parse-byte-range (header-value total)
+  "Parse a Range header value against a resource of TOTAL bytes. Returns
+     (values FIRST LAST) — an inclusive byte range — for a single
+                           satisfiable range,
+     :UNSATISFIABLE       — well-formed but outside the resource (→ 416),
+     NIL                  — ignore the header and serve the full 200.
+
+   Handles the three single-range forms of RFC 7233 §2.1:
+     bytes=0-499   explicit first-last (LAST is clamped to the end)
+     bytes=500-    first byte through the end of the resource
+     bytes=-500    the *final* 500 bytes (suffix form)
+
+   Multi-range (bytes=0-99,200-299) returns NIL. RFC 7233 §3.1 permits a
+   server to ignore a Range it does not wish to satisfy, and answering
+   with multipart/byteranges is a large amount of machinery for a form
+   that media players and download managers do not use. Anything
+   unparseable also returns NIL: ignoring a Range is always a safe
+   answer, where guessing at one is not."
+  (when (or (null header-value) (zerop total))
+    (return-from parse-byte-range nil))
+  (let ((v (string-trim '(#\Space #\Tab) header-value)))
+    (unless (and (> (length v) 6) (string-equal v "bytes=" :end1 6))
+      (return-from parse-byte-range nil))
+    (let ((spec (string-trim '(#\Space #\Tab) (subseq v 6))))
+      ;; Multi-range → ignore (see above).
+      (when (find #\, spec)
+        (return-from parse-byte-range nil))
+      (let ((dash (position #\- spec)))
+        (unless dash
+          (return-from parse-byte-range nil))
+        (let ((first-str (subseq spec 0 dash))
+              (last-str  (subseq spec (1+ dash))))
+          (flet ((digits-p (s)
+                   ;; Bounded length as well as charset: an unbounded run
+                   ;; of digits would hand PARSE-INTEGER a bignum built
+                   ;; from attacker-supplied bytes for no reason.
+                   (and (plusp (length s))
+                        (<= (length s) 19)
+                        (every (lambda (c) (char<= #\0 c #\9)) s))))
+            (cond
+              ;; Suffix form: bytes=-N — the last N bytes.
+              ((and (zerop (length first-str)) (digits-p last-str))
+               (let ((n (parse-integer last-str)))
+                 (cond
+                   ;; bytes=-0 asks for the last zero bytes: RFC 7233
+                   ;; §2.1 says a suffix length of 0 is unsatisfiable.
+                   ((zerop n) :unsatisfiable)
+                   ((>= n total) (values 0 (1- total)))   ; whole resource
+                   (t (values (- total n) (1- total))))))
+              ;; bytes=N-  or  bytes=N-M
+              ((digits-p first-str)
+               (let ((start (parse-integer first-str)))
+                 (cond
+                   ((>= start total) :unsatisfiable)
+                   ((zerop (length last-str)) (values start (1- total)))
+                   ((digits-p last-str)
+                    (let ((end (min (parse-integer last-str) (1- total))))
+                      ;; last < first is malformed, not unsatisfiable —
+                      ;; ignore it and serve the whole resource.
+                      (when (>= end start)
+                        (values start end))))
+                   (t nil))))
+              (t nil))))))))
+
+(defun if-range-matches-p (request entry)
+  "T when a Range request may be honored given its If-Range header
+   (RFC 7233 §3.2). No If-Range → T. An If-Range carrying our exact ETag
+   → T. Anything else → NIL, and the caller serves the full 200 instead.
+
+   This is what keeps a resumed download honest: the client says 'send me
+   bytes 5000000- *if* the file is still the one I started downloading'.
+   If the file changed, splicing new bytes onto an old prefix produces a
+   corrupt file that no error surfaces. Serving the whole resource is the
+   defined and safe answer.
+
+   Our ETags are strong, so a weak (W/-prefixed) validator never matches —
+   RFC 7233 §3.2 requires a strong comparison here, unlike If-None-Match."
+  (let ((if-range (get-header request "if-range")))
+    (or (null if-range)
+        (let ((v (string-trim '(#\Space #\Tab) if-range))
+              (etag (static-entry-etag entry)))
+          (and etag (string= v etag))))))
+
+(defun range-response (entry first last)
+  "Build a 206 Partial Content response covering the inclusive byte range
+   FIRST..LAST of ENTRY. The body is sliced straight out of the pre-built
+   200 response — the file lives in memory once."
+  (let* ((total (static-entry-content-length entry))
+         (len (1+ (- last first)))
+         (start (+ (static-entry-body-offset entry) first))
+         (body (subseq (static-entry-get-response entry) start (+ start len)))
+         (headers (append
+                   ;; Content-Length must describe the range, not the file.
+                   (remove "content-length" (static-entry-headers entry)
+                           :key #'car :test #'string-equal)
+                   (list (cons "content-length" (write-to-string len))
+                         (cons "content-range"
+                               (format nil "bytes ~d-~d/~d" first last total))))))
+    (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)))
+
+(defun range-not-satisfiable-response (entry)
+  "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4). The
+   Content-Range header reports the resource's true length with '*' as the
+   range, which is how a client learns what it should have asked for.
+
+   Built per request rather than cached on the entry: 416 answers
+   malformed client input, so it is a rare path and not worth a slot on
+   every static file in memory."
+  (serialize-http-message
+   "HTTP/1.1 416 Range Not Satisfiable"
+   (list (cons "content-range"
+               (format nil "bytes */~d" (static-entry-content-length entry)))
+         (cons "content-length" "0")
+         (cons "accept-ranges" "bytes")
+         (cons "etag" (or (static-entry-etag entry) "")))
+   nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; Request serving
 ;;; ---------------------------------------------------------------------------
 
@@ -517,6 +675,28 @@
                           (and ims
                                (string= ims (static-entry-last-modified entry)))))
                    (static-entry-not-modified-response entry))
+                  ;; Range (RFC 7233) — GET only, and evaluated after the
+                  ;; conditional checks above per RFC 7232 §6: a client
+                  ;; that already holds the current bytes gets its 304
+                  ;; rather than a slice it did not need. HEAD carries no
+                  ;; body, so a Range on it is meaningless and the normal
+                  ;; HEAD response answers it.
+                  ((and (eq method :GET)
+                        (get-header request "range"))
+                   (multiple-value-bind (first last)
+                       (parse-byte-range (get-header request "range")
+                                         (static-entry-content-length entry))
+                     (cond
+                       ;; If-Range says "only if unchanged", and it changed.
+                       ((not (if-range-matches-p request entry))
+                        (static-entry-get-response entry))
+                       ((eq first :unsatisfiable)
+                        (range-not-satisfiable-response entry))
+                       (first
+                        (range-response entry first last))
+                       ;; Unparseable / multi-range → ignore, serve it whole.
+                       (t
+                        (static-entry-get-response entry)))))
                   ((eq method :GET)
                    (static-entry-get-response entry))
                   (t

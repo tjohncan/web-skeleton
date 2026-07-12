@@ -3018,6 +3018,151 @@
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
+(defun test-static-range ()
+  (format t "~%Static Range (RFC 7233)~%")
+
+  ;; ---- parse-byte-range ----
+  ;; TOTAL = 100, so valid offsets are 0..99.
+  (flet ((r (spec)
+           (multiple-value-bind (first last)
+               (web-skeleton::parse-byte-range spec 100)
+             (cond ((eq first :unsatisfiable) :unsatisfiable)
+                   (first (list first last))
+                   (t :ignore)))))
+    (check "range: bytes=0-49"      (r "bytes=0-49")   '(0 49))
+    (check "range: bytes=50-"       (r "bytes=50-")    '(50 99))
+    (check "range: bytes=-10 suffix" (r "bytes=-10")   '(90 99))
+    (check "range: single byte"     (r "bytes=0-0")    '(0 0))
+    (check "range: last byte"       (r "bytes=99-99")  '(99 99))
+    ;; LAST beyond the end is clamped, not an error (RFC 7233 §2.1).
+    (check "range: end clamped to resource"
+           (r "bytes=90-999") '(90 99))
+    ;; A suffix longer than the resource yields the whole resource.
+    (check "range: oversized suffix yields whole resource"
+           (r "bytes=-500") '(0 99))
+    ;; Start past the end is unsatisfiable → 416.
+    (check "range: start past end unsatisfiable"
+           (r "bytes=100-") :unsatisfiable)
+    (check "range: bytes=-0 unsatisfiable"
+           (r "bytes=-0") :unsatisfiable)
+    ;; Malformed / unsupported shapes are ignored (serve the full 200) —
+    ;; ignoring a Range is always safe; guessing at one is not.
+    (check "range: multi-range ignored"  (r "bytes=0-9,20-29") :ignore)
+    (check "range: last < first ignored" (r "bytes=50-10") :ignore)
+    (check "range: non-numeric ignored"  (r "bytes=abc-def") :ignore)
+    (check "range: wrong unit ignored"   (r "items=0-9") :ignore)
+    (check "range: garbage ignored"      (r "bytes=") :ignore)
+    (check "range: nil header ignored"   (r nil) :ignore)
+    ;; An empty resource has no satisfiable range at all.
+    (check "range: empty resource ignored"
+           (multiple-value-bind (f l)
+               (web-skeleton::parse-byte-range "bytes=0-0" 0)
+             (declare (ignore l))
+             f)
+           nil))
+
+  ;; ---- end-to-end through serve-static ----
+  (let* ((content (sb-ext:string-to-octets
+                   "0123456789abcdefghijklmnopqrstuvwxyz"
+                   :external-format :ascii))   ; 36 bytes
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (flet ((fetch (&rest headers)
+                    (let ((bytes (serve-static
+                                  (make-test-request :method :GET
+                                                     :path "/data.txt"
+                                                     :headers headers))))
+                      (and bytes
+                           (sb-ext:octets-to-string
+                            bytes :external-format :latin-1))))
+                  (body-of (text)
+                    (let ((i (search (format nil "~a~a~a~a"
+                                             #\Return #\Newline
+                                             #\Return #\Newline)
+                                     text)))
+                      (and i (subseq text (+ i 4))))))
+             ;; A plain GET still takes the pre-built path and is unchanged,
+             ;; but now advertises Range support.
+             (let ((full (fetch)))
+               (check "range: plain GET still 200"
+                      (not (null (search "200 OK" full))) t)
+               (check "range: plain GET advertises accept-ranges"
+                      (not (null (search "accept-ranges: bytes" full))) t)
+               (check "range: plain GET body intact"
+                      (body-of full)
+                      "0123456789abcdefghijklmnopqrstuvwxyz"))
+             ;; A byte range comes back 206 with the right slice, the right
+             ;; Content-Length, and a Content-Range naming the whole size.
+             (let ((part (fetch (cons "range" "bytes=10-19"))))
+               (check "range: 206 status"
+                      (not (null (search "206 Partial Content" part))) t)
+               (check "range: content-range header"
+                      (not (null (search "content-range: bytes 10-19/36" part)))
+                      t)
+               (check "range: content-length is the slice"
+                      (not (null (search "content-length: 10" part))) t)
+               (check "range: body is exactly the slice"
+                      (body-of part) "abcdefghij"))
+             ;; Suffix form — the last 6 bytes.
+             (check "range: suffix form body"
+                    (body-of (fetch (cons "range" "bytes=-6"))) "uvwxyz")
+             ;; Open-ended form — from an offset to the end.
+             (check "range: open-ended body"
+                    (body-of (fetch (cons "range" "bytes=30-"))) "uvwxyz")
+             ;; Out of bounds → 416, and the client is told the real length.
+             (let ((oob (fetch (cons "range" "bytes=100-200"))))
+               (check "range: out-of-bounds is 416"
+                      (not (null (search "416 Range Not Satisfiable" oob))) t)
+               (check "range: 416 reports the resource length"
+                      (not (null (search "content-range: bytes */36" oob))) t))
+             ;; Unsupported shapes fall back to the whole file, not an error.
+             (check "range: multi-range serves full 200"
+                    (not (null (search "200 OK"
+                                       (fetch (cons "range" "bytes=0-9,20-29")))))
+                    t)
+             ;; If-Range: matching ETag honors the range...
+             (check "range: if-range with matching etag honors range"
+                    (body-of (fetch (cons "range" "bytes=0-3")
+                                    (cons "if-range"
+                                          (web-skeleton::static-entry-etag entry))))
+                    "0123")
+             ;; ...and a stale validator serves the whole file instead, so a
+             ;; resumed download can't splice bytes from two versions.
+             (let ((stale (fetch (cons "range" "bytes=0-3")
+                                 (cons "if-range" "\"stale-etag\""))))
+               (check "range: if-range with stale etag serves full 200"
+                      (not (null (search "200 OK" stale))) t)
+               (check "range: if-range stale body is the whole file"
+                      (body-of stale)
+                      "0123456789abcdefghijklmnopqrstuvwxyz"))
+             ;; RFC 7232 §6: a conditional that yields 304 wins over Range —
+             ;; the client already has these bytes.
+             (check "range: if-none-match hit still wins over range"
+                    (not (null (search "304 Not Modified"
+                                       (fetch (cons "range" "bytes=0-3")
+                                              (cons "if-none-match"
+                                                    (web-skeleton::static-entry-etag
+                                                     entry))))))
+                    t)
+             ;; HEAD has no body, so a Range on it is meaningless.
+             (let ((head (let ((bytes (serve-static
+                                       (make-test-request
+                                        :method :HEAD :path "/data.txt"
+                                        :headers (list (cons "range"
+                                                             "bytes=0-3"))))))
+                           (sb-ext:octets-to-string bytes
+                                                    :external-format :latin-1))))
+               (check "range: HEAD ignores range, stays 200"
+                      (not (null (search "200 OK" head))) t)
+               (check "range: HEAD emits no body"
+                      (body-of head) ""))))
+      (setf web-skeleton::*static-cache* saved))))
+
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
 
