@@ -3335,6 +3335,105 @@
            '(127 0 0 1))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Chunked completion detection (async outbound read path)
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunked-body-complete-p ()
+  (format t "~%Chunked completion~%")
+  (flet ((complete-p (s)
+           (let ((buf (sb-ext:string-to-octets s :external-format :latin-1)))
+             (not (null (web-skeleton::chunked-body-complete-p
+                         buf 0 (length buf)))))))
+    ;; The terminator is what completes a chunked body — not EOF.
+    (check "complete: single chunk + terminator"
+           (complete-p (format nil "5~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    (check "complete: multiple chunks"
+           (complete-p (format nil "3~a~aabc~a~a2~a~ade~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    ;; Terminator not yet arrived → keep reading.
+    (check "incomplete: chunk data but no terminator"
+           (complete-p (format nil "5~a~ahello~a~a"
+                               #\Return #\Newline #\Return #\Newline))
+           nil)
+    (check "incomplete: chunk data short of its declared size"
+           (complete-p (format nil "10~a~ahello" #\Return #\Newline))
+           nil)
+    (check "incomplete: size line without its LF"
+           (complete-p (format nil "5~a" #\Return))
+           nil)
+    (check "incomplete: empty buffer"
+           (complete-p "")
+           nil)
+    ;; Chunk-extensions on the size line are skipped, per RFC 7230 §4.1.1.
+    (check "complete: chunk-extension tolerated"
+           (complete-p (format nil "5;foo=bar~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    ;; Stops at the zero-size header, exactly where decode-chunked-body
+    ;; stops — so a body with trailers is complete without them.
+    (check "complete: zero chunk with trailers still pending"
+           (complete-p (format nil "5~a~ahello~a~a0~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline))
+           t)
+    ;; The one that matters: chunk DATA containing the terminator's exact
+    ;; bytes must not be mistaken for the terminator. A naive suffix check
+    ;; (or a scan for "0\r\n\r\n") truncates the response here; walking the
+    ;; framing and skipping over data does not.
+    (let ((data-that-looks-like-a-terminator
+            (format nil "5~a~a0~a~a~a~a" #\Return #\Newline
+                    #\Return #\Newline #\Return #\Newline)))
+      ;; chunk-size 5, data = "0\r\n\r\n" (5 bytes), then CRLF — and no
+      ;; terminator yet. Must read as INCOMPLETE.
+      (check "incomplete: data whose bytes look like the terminator"
+             (complete-p (concatenate 'string
+                                      data-that-looks-like-a-terminator
+                                      (format nil "~a~a" #\Return #\Newline)))
+             nil)
+      ;; Same body, now with the real terminator appended → complete, and
+      ;; decode-chunked-body agrees on the payload.
+      (let* ((s (concatenate 'string
+                             data-that-looks-like-a-terminator
+                             (format nil "~a~a0~a~a~a~a"
+                                     #\Return #\Newline #\Return #\Newline
+                                     #\Return #\Newline)))
+             (buf (sb-ext:string-to-octets s :external-format :latin-1)))
+        (check "complete: same body once the real terminator lands"
+               (not (null (web-skeleton::chunked-body-complete-p
+                           buf 0 (length buf))))
+               t)
+        (check "decoder agrees: payload is the 5 terminator-looking bytes"
+               (sb-ext:octets-to-string
+                (web-skeleton::decode-chunked-body buf 0 (length buf))
+                :external-format :latin-1)
+               (format nil "0~a~a~a~a" #\Return #\Newline
+                       #\Return #\Newline))))
+    ;; Byte-at-a-time arrival: incomplete at every prefix, complete only
+    ;; once the terminator's final byte lands. This is the property the
+    ;; async read path relies on — it re-checks on every epoll wake-up.
+    (let* ((s (format nil "5~a~ahello~a~a0~a~a~a~a"
+                      #\Return #\Newline #\Return #\Newline
+                      #\Return #\Newline #\Return #\Newline))
+           (buf (sb-ext:string-to-octets s :external-format :latin-1))
+           (full (length buf))
+           ;; complete-at = the shortest prefix that reads as complete
+           (complete-at
+             (loop for n from 0 to full
+                   when (web-skeleton::chunked-body-complete-p buf 0 n)
+                   return n)))
+      ;; "5\r\nhello\r\n0\r\n" is 13 bytes — the zero-size header's LF is
+      ;; the byte that completes it; the trailing CRLF is not needed.
+      (check "streaming: completes exactly when the zero-size line lands"
+             complete-at 13))))
+
+;;; ---------------------------------------------------------------------------
 ;;; DNS cache (opt-in)
 ;;; ---------------------------------------------------------------------------
 
@@ -3446,10 +3545,12 @@
   (test-match-path)
   (test-streaming-fetch)
   (test-decode-chunked-body)
+  (test-chunked-body-complete-p)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
   (test-static-etag)
+  (test-static-range)
   (test-jwt)
   (test-shutdown-hooks)
   (report-suite "Server")

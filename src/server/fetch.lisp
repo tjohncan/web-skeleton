@@ -1403,7 +1403,33 @@
                (content-length
                 (when (>= (- pos body-start) content-length)
                   (complete-fetch conn epoll-fd)))
-               ;; Chunked or no CL — wait for EOF (Connection: close)
+               ;; Chunked — complete on the zero-size chunk terminator.
+               ;; Waiting for EOF here worked only because outbound
+               ;; requests default to Connection: close, and it cost a
+               ;; round trip even then: the whole response sits in our
+               ;; buffer while we wait for the upstream's FIN. Worse, an
+               ;; app that overrides the Connection header to keep-alive
+               ;; gets an upstream that never closes, so the fetch hung
+               ;; until the :awaiting reaper dropped the inbound with no
+               ;; response at all. Completion now follows the framing
+               ;; rather than the socket's lifetime.
+               ;;
+               ;; Order matters: CHUNKED-BODY-COMPLETE-P is a cheap scan
+               ;; over chunk headers, so it runs first and the header
+               ;; parse only happens on the read that actually completes.
+               ;; The parse confirms the encoding really is chunked (a
+               ;; Transfer-Encoding that is not chunked is framed by EOF,
+               ;; and completing early there would truncate).
+               ((and te-present
+                     (chunked-body-complete-p buf body-start pos)
+                     (let ((first-crlf (scan-crlf buf 0 header-end)))
+                       (and first-crlf
+                            (response-chunked-p
+                             (parse-headers-bytes buf (+ first-crlf 2)
+                                                  (+ header-end 4))))))
+                (complete-fetch conn epoll-fd))
+               ;; Close-delimited (no CL, no TE) — EOF genuinely is the
+               ;; framing signal, so there is nothing to recognize early.
                ))))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1420,6 +1446,57 @@
   (loop for (name . value) in headers
         thereis (and (string-equal name "transfer-encoding")
                      (connection-header-has-token-p value "chunked"))))
+
+(defun chunked-body-complete-p (buf start end)
+  "T when BUF[START..END) already holds a complete chunked body — that
+   is, the zero-size chunk header has arrived. Walks the chunk framing,
+   skipping over chunk data rather than copying it, so the cost is
+   proportional to the number of chunks received and not to the bytes.
+
+   This is a 'do we have it all yet?' predicate, not a validator, and it
+   is deliberately permissive about malformed framing: DECODE-CHUNKED-BODY
+   is the authority and rejects bad framing loudly when COMPLETE-FETCH
+   runs (which becomes a 502). Returning NIL here only ever means 'keep
+   reading', so the failure mode of a too-strict predicate would be a hang
+   while the failure mode of a too-lax one is a loud decode error — the
+   latter is the safer direction to lean.
+
+   It stops at the zero-size chunk header rather than at the trailing
+   CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
+   are not consumed), so the two agree on the completion point."
+  (let ((pos start))
+    (loop
+      ;; chunk-size — at least one hex digit, capped like the decoder's.
+      (let ((size 0)
+            (digits 0)
+            (found nil))
+        (loop
+          (when (>= pos end) (return))
+          (let ((digit (hex-digit-value (aref buf pos))))
+            (unless digit (return))
+            (incf digits)
+            (when (> digits 16)
+              (return-from chunked-body-complete-p nil))
+            (setf size (+ (ash size 4) digit)
+                  found t)
+            (incf pos)))
+        (unless found
+          (return nil))
+        ;; Skip any chunk-extensions; the size line's LF must have landed.
+        (let ((lf (position 10 buf :start pos :end end)))
+          (unless lf (return nil))
+          (setf pos (1+ lf)))
+        ;; Zero-size chunk header = end of body.
+        (when (zerop size)
+          (return t))
+        ;; Skip the chunk data and its trailing CRLF. Note this jumps the
+        ;; data rather than scanning it, which is what keeps a body whose
+        ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
+        ;; for a terminator — a naive suffix check would truncate there.
+        (incf pos size)
+        (incf pos 2)
+        (when (> pos end)
+          (return nil))))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).
