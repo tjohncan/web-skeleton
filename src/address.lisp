@@ -25,6 +25,20 @@
 ;;; DNS path) and then call this on each resolved address.
 ;;; ===========================================================================
 
+(defun format-ip (bytes)
+  "Format an address byte vector for logs. 4 bytes → dotted quad,
+   16 bytes → colon-separated lowercase hex groups (no :: compression —
+   a log line wants unambiguous identity, not canonical form). Anything
+   else → \"<addr>\". Bracketless: a caller needing the RFC 3986
+   authority form adds its own brackets."
+  (case (length bytes)
+    (4  (format nil "~{~d~^.~}" (coerce bytes 'list)))
+    (16 (format nil "~(~{~x~^:~}~)"
+                (loop for i from 0 below 16 by 2
+                      collect (logior (ash (aref bytes i) 8)
+                                      (aref bytes (1+ i))))))
+    (t  "<addr>")))
+
 (defun ipv4-public-p (bytes)
   "Return T if the 4-byte vector BYTES is a publicly routable IPv4."
   (let ((a (aref bytes 0))

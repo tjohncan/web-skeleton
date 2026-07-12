@@ -68,12 +68,12 @@
    spending a connect syscall on it is wasted work."
   (every #'zerop bytes))
 
-(defun parse-getent-output (buf end)
+(defun parse-getent-output (buf end &optional host)
   "Scan BUF[0..END) for the first `<address> STREAM ...` line with a
-   parseable IPv4 or IPv6 address. Returns (IP . FAMILY) where FAMILY
-   is :INET or :INET6, or NIL if no complete parseable line yet.
-   Safe to call on partial buffers — returns NIL until at least one
-   line with a newline terminator has been received.
+   parseable IPv4 or IPv6 address that policy accepts. Returns
+   (IP . FAMILY) where FAMILY is :INET or :INET6, or NIL if no complete
+   parseable line yet. Safe to call on partial buffers — returns NIL
+   until at least one line with a newline terminator has been received.
 
    Token boundary: STREAM must appear as the token immediately after
    the address, not as a substring anywhere in the line. A substring
@@ -82,7 +82,17 @@
    my.STREAM.example') as a STREAM match.
 
    Rejects the unspecified addresses (0.0.0.0, ::) — dialing them is
-   meaningless and some systems quietly route 0.0.0.0 to loopback."
+   meaningless and some systems quietly route 0.0.0.0 to loopback.
+
+   HOST is the name being resolved; it is used only by the address
+   filter and its log line. Every candidate address is gated on
+   *FETCH-ADDRESS-FILTER* before selection. This is the point at which
+   an address gets *chosen*, so a refusal here means a multi-homed name
+   whose first address is refused simply falls through to the next one,
+   and a name with no acceptable address returns NIL — indistinguishable
+   to every caller from a name that did not resolve. Gating here rather
+   than at the connect syscall introduces no new failure mode and keeps
+   the fallback behavior for free."
   (let ((line-start 0))
     (loop while (< line-start end) do
       (let ((lf (position 10 buf :start line-start :end end)))
@@ -113,10 +123,14 @@
                                    (char= after #\Tab)))))))
               (when (and stream-token-p addr-str)
                 (let ((v4 (parse-ipv4-literal addr-str)))
-                  (when (and v4 (not (%unspecified-address-p v4)))
+                  (when (and v4 (not (%unspecified-address-p v4))
+                             (fetch-address-allowed-p
+                              v4 :inet (or host addr-str)))
                     (return (cons v4 :inet))))
                 (let ((v6 (parse-ipv6-literal addr-str)))
-                  (when (and v6 (not (%unspecified-address-p v6)))
+                  (when (and v6 (not (%unspecified-address-p v6))
+                             (fetch-address-allowed-p
+                              v6 :inet6 (or host addr-str)))
                     (return (cons v6 :inet6))))))))
         (setf line-start (1+ lf))))))
 
@@ -167,6 +181,9 @@
                     ;; creates a fresh outbound with the same
                     ;; callback attached.
                     :fetch-callback (http-fetch-continuation-callback fetch-req)
+                    ;; Carried so HANDLE-DNS-READY can name the host when
+                    ;; it runs the getent output past the address filter.
+                    :dns-host host
                     :dns-then (lambda (ip family)
                                 (initiate-http-fetch-to-address
                                  conn epoll-fd fetch-req
@@ -228,7 +245,8 @@
       ((:ok :eof)
        (let ((parsed (parse-getent-output
                       (connection-read-buf dns-conn)
-                      (connection-read-pos dns-conn))))
+                      (connection-read-pos dns-conn)
+                      (connection-dns-host dns-conn))))
          (cond
            (parsed
             (let ((dns-then (connection-dns-then dns-conn)))
@@ -246,7 +264,11 @@
                   (log-warn "dns: chain to TCP failed: ~a" e)
                   (deliver-dns-error dns-conn epoll-fd)))))
            ((eq result :eof)
-            (log-warn "dns: no usable address in getent output")
+            ;; No parseable STREAM row, or every address the name
+            ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
+            ;; are "no address we are willing to dial" — same 502.
+            (log-warn "dns: no usable address for ~a in getent output"
+                      (or (connection-dns-host dns-conn) "<host>"))
             (deliver-dns-error dns-conn epoll-fd))
            ;; :OK and incomplete — next epoll wake will bring more.
            )))
@@ -284,10 +306,21 @@
    mDNS responder) no longer pins the worker thread indefinitely —
    the promise that *FETCH-TIMEOUT* covers each of DNS, connect, and
    I/O on the blocking path is now actually kept."
+  ;; Literal fast paths are gated on *FETCH-ADDRESS-FILTER* for the same
+  ;; reason INITIATE-HTTP-FETCH's are: they skip DNS, so a resolver-only
+  ;; check would let https://169.254.169.254/ straight through. A refused
+  ;; literal returns NIL — the same "did not resolve" answer every caller
+  ;; already handles (raise → 502 + cleanup sentinel).
   (let ((v4 (parse-ipv4-literal host)))
-    (when v4 (return-from resolve-host-blocking (values v4 :inet))))
+    (when v4
+      (return-from resolve-host-blocking
+        (when (fetch-address-allowed-p v4 :inet host)
+          (values v4 :inet)))))
   (let ((v6 (parse-ipv6-literal host)))
-    (when v6 (return-from resolve-host-blocking (values v6 :inet6))))
+    (when v6
+      (return-from resolve-host-blocking
+        (when (fetch-address-allowed-p v6 :inet6 host)
+          (values v6 :inet6)))))
   (handler-case
       (let ((process (sb-ext:run-program "getent"
                                           (list "ahosts" "--" host)
@@ -324,7 +357,7 @@
                           do (when (>= (fill-pointer buf) 8192)
                                (error "dns: getent output exceeds 8KB"))
                              (vector-push-extend byte buf))
-                    (let ((parsed (parse-getent-output buf (length buf))))
+                    (let ((parsed (parse-getent-output buf (length buf) host)))
                       (when parsed
                         (values (car parsed) (cdr parsed))))))))
           (ignore-errors (sb-ext:process-close process))))

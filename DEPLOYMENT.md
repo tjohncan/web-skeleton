@@ -276,56 +276,65 @@ Don't rely on cleanup-path exceptions propagating back to the caller — they do
 
 ### Fetch URL safety (SSRF)
 
-If your handler constructs fetch URLs from user input,
-validate the destination before dialing.
-The framework does not filter resolved IP addresses — a user-supplied hostname
-resolving to `169.254.169.254` (cloud metadata), `127.0.0.1`,
-or any private RFC 1918 address will be connected to directly unless the app refuses.
+If your handler constructs fetch URLs from user input, the user is choosing
+who your server dials — and your server sits inside the trust boundary.
+It can reach `169.254.169.254` (cloud metadata, which hands out IAM credentials),
+`127.0.0.1` (your own admin endpoints), and RFC 1918 private ranges
+(everything else in the VPC). That is server-side request forgery.
 
-`is-public-address-p` is the primitive for doing this refusal correctly.
-It takes a byte vector and a family keyword
-and returns T only for publicly routable addresses,
-rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
-RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
-and cloud metadata IPs. It unwraps IPv4-mapped IPv6 and NAT64
-so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+**`*fetch-address-filter*` is the enforcement point.**
+It is a special holding a function `(ip family host) -> boolean`,
+consulted for every address the fetch machinery is about to dial.
+Returning NIL refuses the address. The default is NIL — no filter,
+every address allowed — which is the right setting when fetch URLs come
+from config rather than from users.
 
-The framework exports `parse-url`, `parse-ipv4-literal`, and `parse-ipv6-literal`
-specifically so a handler writing this check doesn't have to reinvent them.
-They are the same parsers the outbound fetch path uses internally,
-so a policy decision on the inbound side and the actual dial on the outbound side
-agree on what "host" means:
+Set it once at startup, before `start-server`:
 
 ```lisp
-(defun handle-proxy (req)
-  (let ((url (get-query-param req "url")))
-    (unless url
-      (return-from handle-proxy (make-error-response 400)))
-    (multiple-value-bind (scheme host port path)
-        (handler-case (parse-url url) (error () (values nil nil nil nil)))
-      (declare (ignore port path))
-      (unless scheme
-        (return-from handle-proxy (make-error-response 400)))
-      ;; parse-url + parse-ipv*-literal + is-public-address-p together.
-      ;; Only IP-literal hosts are accepted, and only if the address
-      ;; classifies as publicly routable. Hostnames are rejected —
-      ;; a permissive app would allowlist specific ones up front,
-      ;; or resolve via its own DNS path before calling
-      ;; is-public-address-p on each resolved address.
-      (let* ((v4 (parse-ipv4-literal host))
-             (v6 (and (not v4) (parse-ipv6-literal host))))
-        (cond
-          ((and v4 (is-public-address-p v4 :inet))
-           (defer-to-fetch :get url :then my-callback))
-          ((and v6 (is-public-address-p v6 :inet6))
-           (defer-to-fetch :get url :then my-callback))
-          (t
-           (make-error-response 403)))))))
+(setf web-skeleton:*fetch-address-filter*
+      (lambda (ip family host)
+        (declare (ignore host))
+        (is-public-address-p ip family)))
 ```
 
-The helper deliberately does not resolve hostnames —
-apps that accept hostnames must resolve first and then call `is-public-address-p`
-on each resolved address before dialing.
+`is-public-address-p` returns T only for publicly routable addresses,
+rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
+RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
+and cloud metadata IPs. It unwraps IPv4-mapped IPv6, NAT64, and 6to4,
+so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+
+**Why the framework has to do this and an app cannot.**
+The framework resolves hostnames itself. An app that resolves a name,
+approves the address, and then hands the *name* to `defer-to-fetch`
+is racing a second, independent resolution: the attacker's nameserver
+answers with a public address on the first lookup and `169.254.169.254`
+on the second. That is DNS rebinding, and no amount of app-side checking
+closes it, because the app does not control the dial. The filter runs on
+the resolution that is actually dialed. It also gates the IP-literal
+fast paths — `http://169.254.169.254/` skips DNS entirely, so a
+resolver-only check would miss the most direct form of the attack.
+
+**What a refusal does.** The address is skipped, not fatal. A hostname
+with several addresses falls through to the next one. A lookup where no
+address survives fails the fetch exactly as an unresolvable name does:
+502 to the inbound caller, with the fetch callback firing its
+`(nil nil nil)` cleanup sentinel exactly once. Refusals log at WARN with
+the address and host. A filter that *raises* refuses the address
+(fail closed) and logs at ERROR — an app-policy bug must not open the gate.
+
+The filter is mechanism, not policy: it does not know what your app should
+be allowed to reach. `is-public-address-p` is the common policy, but a
+stricter one is usually better where it is possible — an explicit allowlist
+of upstream hosts, checked in the handler before `defer-to-fetch` is ever
+called, cannot be defeated by rebinding at all because nothing else is
+dialable. Use both: allowlist what you can name, and set the filter as the
+backstop for everything else.
+
+`parse-url`, `parse-ipv4-literal`, and `parse-ipv6-literal` are exported
+so a handler doing its own up-front URL validation uses the same parsers
+the fetch path uses internally — the inbound policy decision and the
+outbound dial then agree on what "host" means.
 
 ### DNS resolution and caching
 

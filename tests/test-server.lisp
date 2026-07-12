@@ -3229,6 +3229,112 @@
              (eq (web-skeleton:register-cleanup fn) fn) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Outbound address filter (SSRF policy hook)
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-address-filter ()
+  (format t "~%Fetch address filter~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii)))
+    ;; Default: no filter installed → every address allowed. This is the
+    ;; property the demo's self-fetch to 127.0.0.1 depends on.
+    (check "no filter: loopback allowed"
+           (web-skeleton::fetch-address-allowed-p #(127 0 0 1) :inet "localhost")
+           t)
+    ;; A filter that refuses.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              nil)))
+      (check "filter refuses: gate returns nil"
+             (web-skeleton::fetch-address-allowed-p #(1 1 1 1) :inet "example.com")
+             nil))
+    ;; A raising filter must fail CLOSED — a bug in app policy must not
+    ;; open the gate, and must not take the worker down either.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              (error "boom"))))
+      (check "filter raises: fails closed"
+             (web-skeleton::fetch-address-allowed-p #(1 1 1 1) :inet "example.com")
+             nil))
+    ;; The intended composition with IS-PUBLIC-ADDRESS-P.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore host))
+              (is-public-address-p ip family))))
+      (check "is-public-address-p filter: public allowed"
+             (web-skeleton::fetch-address-allowed-p #(8 8 8 8) :inet "dns.google")
+             t)
+      (check "is-public-address-p filter: cloud metadata refused"
+             (web-skeleton::fetch-address-allowed-p
+              #(169 254 169 254) :inet "metadata.evil")
+             nil)
+      (check "is-public-address-p filter: loopback refused"
+             (web-skeleton::fetch-address-allowed-p #(127 0 0 1) :inet "localhost")
+             nil))
+
+    ;; ---- Filter applied inside the getent parser ----
+    ;; A refused address falls through to the name's next address rather
+    ;; than failing the lookup outright.
+    (let* ((text (format nil "169.254.169.254 STREAM evil~%~
+                              93.184.216.34   STREAM evil~%"))
+           (buf (bytes text)))
+      (let ((web-skeleton::*fetch-address-filter*
+              (lambda (ip family host)
+                (declare (ignore host))
+                (is-public-address-p ip family))))
+        (check "getent + filter: refused address falls through to next"
+               (coerce (car (web-skeleton::parse-getent-output
+                             buf (length buf) "evil"))
+                       'list)
+               '(93 184 216 34)))
+      ;; Same buffer, no filter → the metadata address wins, proving the
+      ;; fall-through above was the filter's doing and not line ordering.
+      (check "getent, no filter: first STREAM row wins as before"
+             (coerce (car (web-skeleton::parse-getent-output
+                           buf (length buf) "evil"))
+                     'list)
+             '(169 254 169 254)))
+    ;; Every address refused → NIL, which every caller already treats as
+    ;; "did not resolve" (→ 502 + cleanup sentinel). No new failure mode.
+    (let* ((text (format nil "10.0.0.5   STREAM internal~%~
+                              127.0.0.1  STREAM internal~%"))
+           (buf (bytes text))
+           (web-skeleton::*fetch-address-filter*
+             (lambda (ip family host)
+               (declare (ignore host))
+               (is-public-address-p ip family))))
+      (check "getent + filter: all addresses refused yields nil"
+             (web-skeleton::parse-getent-output buf (length buf) "internal")
+             nil))
+
+    ;; ---- Filter applied to the IP-literal fast path ----
+    ;; RESOLVE-HOST-BLOCKING short-circuits on a literal before getent
+    ;; ever runs, so the gate has to be there too or http://169.254.169.254/
+    ;; walks straight past the policy.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore host))
+              (is-public-address-p ip family))))
+      (check "literal fast path: metadata IP refused"
+             (web-skeleton::resolve-host-blocking "169.254.169.254")
+             nil)
+      (check "literal fast path: private IP refused"
+             (web-skeleton::resolve-host-blocking "10.1.2.3")
+             nil)
+      (check "literal fast path: v6 loopback refused"
+             (web-skeleton::resolve-host-blocking "::1")
+             nil)
+      (check "literal fast path: public IP allowed"
+             (coerce (web-skeleton::resolve-host-blocking "93.184.216.34") 'list)
+             '(93 184 216 34)))
+    ;; Default (no filter): literals resolve as before — the demo relies
+    ;; on 127.0.0.1 working here.
+    (check "literal fast path, no filter: loopback still resolves"
+           (coerce (web-skeleton::resolve-host-blocking "127.0.0.1") 'list)
+           '(127 0 0 1))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -3246,6 +3352,7 @@
   (test-fetch)
   (test-dns)
   (test-is-public-address)
+  (test-fetch-address-filter)
   (test-format-peer-addr)
   (test-url-decode)
   (test-query-string)

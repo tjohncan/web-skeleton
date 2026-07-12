@@ -74,7 +74,11 @@
   (ws-frag-total  0  :type fixnum)            ; running total bytes in frag-buf
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
-  (dns-then    nil :type (or null function))) ; (IP FAMILY) -> kick off TCP phase
+  (dns-then    nil :type (or null function))  ; (IP FAMILY) -> kick off TCP phase
+  (dns-host    nil :type (or null string)))   ; hostname being resolved — carried
+                                              ; so the address filter and the log
+                                              ; lines can name it when the getent
+                                              ; output lands
 
 ;;; ---------------------------------------------------------------------------
 ;;; Constructor

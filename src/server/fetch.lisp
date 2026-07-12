@@ -29,6 +29,72 @@
 (defparameter *fetch-timeout* 30
   "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
 
+;;; ---------------------------------------------------------------------------
+;;; Outbound address policy (SSRF)
+;;; ---------------------------------------------------------------------------
+
+(defvar *fetch-address-filter* nil
+  "Optional policy hook consulted for every address the outbound fetch
+   machinery is about to dial. A function (IP FAMILY HOST) returning a
+   generalized boolean: IP is the 4- or 16-byte address vector, FAMILY is
+   :INET or :INET6, HOST is the hostname or IP literal from the URL.
+   Returning NIL refuses the address.
+
+   NIL — the default — allows every address. That is the historical
+   behavior and the right one when fetch URLs come from config rather
+   than from users (a fixed upstream, a self-fetch to 127.0.0.1).
+
+   Set it when an app builds fetch URLs from user input. The framework
+   resolves hostnames itself, so an app that resolves a name, approves
+   the address, and then hands the *name* to DEFER-TO-FETCH is racing a
+   second, independent resolution: an attacker's nameserver answers with
+   a public address on the first lookup and 169.254.169.254 on the
+   second (DNS rebinding). This hook runs on the resolution that is
+   actually dialed, which is the only place that race can be closed. It
+   also gates the IP-literal fast paths, so http://169.254.169.254/ is
+   refused by the same policy — those skip DNS entirely and would
+   otherwise walk straight past a resolver-only check.
+
+   IS-PUBLIC-ADDRESS-P is the intended companion:
+
+     (setf *fetch-address-filter*
+           (lambda (ip family host)
+             (declare (ignore host))
+             (is-public-address-p ip family)))
+
+   A refused address is skipped, not fatal: a hostname with several
+   addresses falls through to the next one, and a lookup where none
+   survive fails the fetch exactly as an unresolvable name does — 502 to
+   the inbound caller, with the fetch callback firing its (NIL NIL NIL)
+   cleanup sentinel exactly once. The filter runs on the worker thread
+   inside the resolve path, so keep it cheap and non-blocking.")
+
+(defun fetch-address-allowed-p (ip family host)
+  "Gate IP (byte vector) / FAMILY (:INET or :INET6) / HOST (the name or
+   literal from the URL) through *FETCH-ADDRESS-FILTER*. Returns T when
+   no filter is installed or the filter accepts, NIL when it refuses.
+   Refusals log at WARN — a blocked fetch is a policy event an operator
+   wants to see, and a silent NIL would surface only as a puzzling 502.
+
+   A raising filter refuses the address rather than propagating: a bug in
+   app-supplied policy must fail closed (no dial) rather than fail open,
+   and must not take the worker down either. The raise is logged at ERROR
+   so the bug is not silently absorbed."
+  (let ((filter *fetch-address-filter*))
+    (cond
+      ((null filter) t)
+      ((handler-case (funcall filter ip family host)
+         (error (e)
+           (log-error "fetch: address filter raised on ~a (host ~a): ~a ~
+                       — refusing address"
+                      (format-ip ip) host e)
+           nil))
+       t)
+      (t
+       (log-warn "fetch: address ~a refused by *fetch-address-filter* (host ~a)"
+                 (format-ip ip) host)
+       nil))))
+
 (defparameter *max-outbound-response-size* (* 8 1024 1024)
   "Maximum total bytes (headers + body together) for a buffered
    outbound HTTPS response read by TLS-READ-ALL. Default 8 MiB.
@@ -1167,13 +1233,24 @@
    numeric IPv4 or IPv6 literal, skip DNS entirely and connect direct.
    Slow path: dispatch to *DNS-LOOKUP-FN* (provided by dns.lisp) which
    runs getent in a subprocess and resumes via
-   INITIATE-HTTP-FETCH-TO-ADDRESS when the address is in hand."
+   INITIATE-HTTP-FETCH-TO-ADDRESS when the address is in hand.
+
+   Both fast paths are gated on *FETCH-ADDRESS-FILTER*. They skip DNS,
+   so a resolver-only check would let http://169.254.169.254/ — the most
+   direct form of the attack the filter exists to stop — walk straight
+   through. A refused literal raises, and INITIATE-FETCH's handler-case
+   turns that into the same 502 + cleanup-sentinel path as any other
+   pre-connection failure."
   (let* ((v4 (parse-ipv4-literal host))
          (v6 (unless v4 (parse-ipv6-literal host))))
     (cond
-      (v4 (initiate-http-fetch-to-address
+      (v4 (unless (fetch-address-allowed-p v4 :inet host)
+            (error "fetch: address refused by policy: ~a" host))
+          (initiate-http-fetch-to-address
            conn epoll-fd fetch-req host port path v4 :inet))
-      (v6 (initiate-http-fetch-to-address
+      (v6 (unless (fetch-address-allowed-p v6 :inet6 host)
+            (error "fetch: address refused by policy: ~a" host))
+          (initiate-http-fetch-to-address
            conn epoll-fd fetch-req host port path v6 :inet6))
       (*dns-lookup-fn*
        (funcall *dns-lookup-fn* conn epoll-fd fetch-req host port path))

@@ -64,6 +64,7 @@
            #:ecdsa-verify-p256
            ;; Address classification
            #:is-public-address-p
+           #:*fetch-address-filter*
            ;; JWT
            #:jwt-key
            #:make-jwt-key
