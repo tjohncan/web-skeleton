@@ -3219,6 +3219,11 @@
          (web-skeleton::hidden-path-component-p ".well-known/.hidden") t)
   (check "hidden: .well-known-evil not exempt"
          (web-skeleton::hidden-path-component-p ".well-known-evil/x") t)
+  ;; RFC 8615 defines /.well-known/ at the root of the origin and nowhere
+  ;; else, so the exemption is root-only — a nested one means nothing to a
+  ;; client and stays hidden.
+  (check "hidden: nested .well-known not exempt"
+         (web-skeleton::hidden-path-component-p "sub/.well-known/x") t)
   (check "hidden: plain path"
          (web-skeleton::hidden-path-component-p "a/b.txt") nil))
 
@@ -3576,7 +3581,49 @@
       ;; "5\r\nhello\r\n0\r\n" is 13 bytes — the zero-size header's LF is
       ;; the byte that completes it; the trailing CRLF is not needed.
       (check "streaming: completes exactly when the zero-size line lands"
-             complete-at 13))))
+             complete-at 13))
+
+    ;; ---- Resume offset ----
+    ;; The walk hands back a chunk-header boundary so a caller polling a
+    ;; growing buffer resumes there instead of rescanning from the top —
+    ;; the difference between O(chunks) and O(chunks^2) over a transfer.
+    ;; The invariant under test: threading the resume offset back in must
+    ;; produce exactly the same answers as a from-scratch scan at every
+    ;; prefix. If it ever disagreed, a chunked response would be declared
+    ;; complete early (truncation) or never (hang).
+    (let* ((s (with-output-to-string (o)
+                ;; 40 one-byte chunks, then the terminator.
+                (dotimes (i 40)
+                  (format o "1~a~a~a~a~a" #\Return #\Newline
+                          (code-char (+ 97 (mod i 26))) #\Return #\Newline))
+                (format o "0~a~a~a~a" #\Return #\Newline #\Return #\Newline)))
+           (buf (sb-ext:string-to-octets s :external-format :latin-1))
+           (full (length buf))
+           (mismatches 0)
+           (resume 0)
+           (resume-complete-at nil)
+           (scratch-complete-at nil))
+      ;; Feed the buffer one byte at a time, exactly as reads would arrive.
+      (loop for n from 0 to full
+            do (multiple-value-bind (complete next)
+                   (web-skeleton::chunked-body-complete-p buf 0 n resume)
+                 (let ((scratch (web-skeleton::chunked-body-complete-p buf 0 n)))
+                   (unless (eq (not complete) (not scratch))
+                     (incf mismatches))
+                   (when (and complete (null resume-complete-at))
+                     (setf resume-complete-at n))
+                   (when (and scratch (null scratch-complete-at))
+                     (setf scratch-complete-at n)))
+                 ;; The resume offset must never move backwards, or the
+                 ;; walk would redo validated framing (or skip past it).
+                 (when (< next resume) (incf mismatches))
+                 (setf resume next)))
+      (check "resume: agrees with a from-scratch scan at every prefix"
+             mismatches 0)
+      (check "resume: completes at the same byte as a from-scratch scan"
+             resume-complete-at scratch-complete-at)
+      (check "resume: advanced past the first chunk (walk is incremental)"
+             (> resume 0) t))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; DNS cache (opt-in)

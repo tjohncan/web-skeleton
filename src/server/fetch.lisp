@@ -1380,57 +1380,30 @@
                 *max-outbound-response-size*)))
       (:again nil)  ; wait for more data
       (:ok
-       ;; Got data — check if we have a complete response
-       (let* ((buf (connection-read-buf conn))
-              (pos (connection-read-pos conn))
-              (header-end (scan-crlf-crlf buf 0 pos)))
-         (when header-end
-           ;; Have complete headers — check if body is complete.
-           ;; RFC 7230 §3.3.3: Transfer-Encoding takes precedence over CL.
-           (let* ((body-start (+ header-end 4))
-                  (te-present (scan-transfer-encoding buf header-end))
-                  (content-length (unless te-present
-                                    (scan-content-length buf header-end))))
-             (cond
-               ;; HEAD response body is empty by RFC 7231 §4.3.2, even
-               ;; when the upstream echoes the GET-body Content-Length.
-               ;; Complete on headers-done — waiting for CL body bytes
-               ;; would hang until EPOLLHUP lands as peer FIN, which
-               ;; is extra round-trip latency for no payload delivery.
-               ((eq (connection-fetch-method conn) :HEAD)
-                (complete-fetch conn epoll-fd))
-               ;; Have Content-Length (no TE) — complete when body received
-               (content-length
-                (when (>= (- pos body-start) content-length)
-                  (complete-fetch conn epoll-fd)))
-               ;; Chunked — complete on the zero-size chunk terminator.
-               ;; Waiting for EOF here worked only because outbound
-               ;; requests default to Connection: close, and it cost a
-               ;; round trip even then: the whole response sits in our
-               ;; buffer while we wait for the upstream's FIN. Worse, an
-               ;; app that overrides the Connection header to keep-alive
-               ;; gets an upstream that never closes, so the fetch hung
-               ;; until the :awaiting reaper dropped the inbound with no
-               ;; response at all. Completion now follows the framing
-               ;; rather than the socket's lifetime.
-               ;;
-               ;; Order matters: CHUNKED-BODY-COMPLETE-P is a cheap scan
-               ;; over chunk headers, so it runs first and the header
-               ;; parse only happens on the read that actually completes.
-               ;; The parse confirms the encoding really is chunked (a
-               ;; Transfer-Encoding that is not chunked is framed by EOF,
-               ;; and completing early there would truncate).
-               ((and te-present
-                     (chunked-body-complete-p buf body-start pos)
-                     (let ((first-crlf (scan-crlf buf 0 header-end)))
-                       (and first-crlf
-                            (response-chunked-p
-                             (parse-headers-bytes buf (+ first-crlf 2)
-                                                  (+ header-end 4))))))
-                (complete-fetch conn epoll-fd))
-               ;; Close-delimited (no CL, no TE) — EOF genuinely is the
-               ;; framing signal, so there is nothing to recognize early.
-               ))))))))
+       ;; Got data — is the response framed-complete yet? OUTBOUND-
+       ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
+       ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
+       ;; offset across reads so a dribbling upstream is walked once, not
+       ;; rescanned from the top on every wake-up.
+       ;;
+       ;; Completion follows the framing, not the socket's lifetime.
+       ;; Waiting for EOF worked only because outbound requests default to
+       ;; Connection: close, and even then it cost a round trip — the
+       ;; whole response sits in our buffer while we wait for the
+       ;; upstream's FIN. An app that overrides Connection to keep-alive
+       ;; got an upstream that never closes, and the fetch hung until the
+       ;; :awaiting reaper dropped the inbound with no response at all.
+       ;;
+       ;; Close-delimited responses (no CL, no TE) still complete via the
+       ;; :eof branch above: for those, EOF genuinely is the framing.
+       (multiple-value-bind (complete next-scan)
+           (outbound-response-complete-p (connection-read-buf conn)
+                                         (connection-read-pos conn)
+                                         (connection-fetch-method conn)
+                                         (connection-chunk-scan-pos conn))
+         (setf (connection-chunk-scan-pos conn) next-scan)
+         (when complete
+           (complete-fetch conn epoll-fd)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
@@ -1447,48 +1420,62 @@
         thereis (and (string-equal name "transfer-encoding")
                      (connection-header-has-token-p value "chunked"))))
 
-(defun chunked-body-complete-p (buf start end)
-  "T when BUF[START..END) already holds a complete chunked body — that
-   is, the zero-size chunk header has arrived. Walks the chunk framing,
-   skipping over chunk data rather than copying it, so the cost is
-   proportional to the number of chunks received and not to the bytes.
+(defun chunked-body-complete-p (buf start end &optional (resume start))
+  "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in
+   BUF[START..END). COMPLETE-P is T once the zero-size chunk header has
+   arrived. Walks the chunk framing, skipping *over* chunk data rather
+   than scanning it, so the cost is proportional to the number of chunks
+   and not to the bytes.
+
+   RESUME is a NEXT-RESUME returned by an earlier call — an offset that
+   is known to sit on a chunk-header boundary with everything before it
+   already validated. A caller polling a growing buffer threads it back
+   in, so each chunk is walked exactly once over the life of a transfer
+   instead of the whole body being rescanned on every read. Without it,
+   an upstream that dribbles N chunks costs O(N^2) header steps, which an
+   adversarial (if reachable) upstream could turn into real CPU burn
+   inside the response-size cap. Default RESUME = START scans from
+   scratch, which is what a one-shot caller wants.
 
    This is a 'do we have it all yet?' predicate, not a validator, and it
    is deliberately permissive about malformed framing: DECODE-CHUNKED-BODY
-   is the authority and rejects bad framing loudly when COMPLETE-FETCH
-   runs (which becomes a 502). Returning NIL here only ever means 'keep
-   reading', so the failure mode of a too-strict predicate would be a hang
-   while the failure mode of a too-lax one is a loud decode error — the
-   latter is the safer direction to lean.
+   is the authority and rejects bad framing loudly when the response is
+   delivered (which becomes a 502). NIL here only ever means 'keep
+   reading' — so a too-strict predicate would hang, while a too-lax one
+   merely reaches a loud decode error. Lean lax.
 
    It stops at the zero-size chunk header rather than at the trailing
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
    are not consumed), so the two agree on the completion point."
-  (let ((pos start))
+  (let ((pos (max start resume)))
     (loop
-      ;; chunk-size — at least one hex digit, capped like the decoder's.
-      (let ((size 0)
+      ;; BOUNDARY is the start of the chunk header about to be parsed:
+      ;; everything before it is validated framing, so it is the offset
+      ;; handed back for the next call to resume from.
+      (let ((boundary pos)
+            (size 0)
             (digits 0)
             (found nil))
+        ;; chunk-size — at least one hex digit, capped like the decoder's.
         (loop
           (when (>= pos end) (return))
           (let ((digit (hex-digit-value (aref buf pos))))
             (unless digit (return))
             (incf digits)
             (when (> digits 16)
-              (return-from chunked-body-complete-p nil))
+              (return-from chunked-body-complete-p (values nil boundary)))
             (setf size (+ (ash size 4) digit)
                   found t)
             (incf pos)))
         (unless found
-          (return nil))
+          (return (values nil boundary)))
         ;; Skip any chunk-extensions; the size line's LF must have landed.
         (let ((lf (position 10 buf :start pos :end end)))
-          (unless lf (return nil))
+          (unless lf (return (values nil boundary)))
           (setf pos (1+ lf)))
         ;; Zero-size chunk header = end of body.
         (when (zerop size)
-          (return t))
+          (return (values t boundary)))
         ;; Skip the chunk data and its trailing CRLF. Note this jumps the
         ;; data rather than scanning it, which is what keeps a body whose
         ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
@@ -1496,7 +1483,61 @@
         (incf pos size)
         (incf pos 2)
         (when (> pos end)
-          (return nil))))))
+          (return (values nil boundary)))))))
+
+(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0))
+  "Return (values COMPLETE-P NEXT-CHUNK-SCAN) for the outbound HTTP
+   response accumulated in BUF[0..END), given the request METHOD. Thread
+   NEXT-CHUNK-SCAN back in on the following call so a chunked body is
+   walked once across a growing buffer (see CHUNKED-BODY-COMPLETE-P).
+
+   One definition of 'the response is done', shared by the non-blocking
+   plain-HTTP read path (HANDLE-OUTBOUND-READ) and the blocking TLS one
+   (TLS-READ-ALL). They used to disagree: plain HTTP recognized the
+   chunked terminator while TLS read to EOF, so the same upstream could
+   be handled cleanly over http:// and stall over https://. A single
+   predicate is the only way that divergence stays fixed.
+
+   Framing, in RFC 7230 §3.3.3 order:
+     HEAD           — no body ever (§4.3.2), even when the upstream
+                      echoes the GET body's Content-Length. Done at
+                      headers.
+     Transfer-Encoding present — TE wins over Content-Length. Done at the
+                      zero-size chunk header, but only once the encoding
+                      is confirmed to actually be chunked: a TE that is
+                      not chunked is framed by EOF, and completing early
+                      there would truncate.
+     Content-Length — done when that many body bytes have landed.
+     Neither        — close-delimited. NIL forever: EOF *is* the framing,
+                      and the caller's EOF branch completes it."
+  (let ((header-end (scan-crlf-crlf buf 0 end)))
+    (unless header-end
+      (return-from outbound-response-complete-p (values nil chunk-scan)))
+    (let* ((body-start (+ header-end 4))
+           (te-present (scan-transfer-encoding buf header-end))
+           (content-length (unless te-present
+                             (scan-content-length buf header-end))))
+      (cond
+        ((eq method :HEAD)
+         (values t chunk-scan))
+        (te-present
+         (multiple-value-bind (complete next)
+             (chunked-body-complete-p buf body-start end
+                                      (max body-start chunk-scan))
+           ;; The header parse only runs on the read that actually
+           ;; completes — the cheap framing walk gates it.
+           (values (and complete
+                        (let ((first-crlf (scan-crlf buf 0 header-end)))
+                          (and first-crlf
+                               (response-chunked-p
+                                (parse-headers-bytes buf (+ first-crlf 2)
+                                                     (+ header-end 4)))
+                               t)))
+                   next)))
+        (content-length
+         (values (>= (- end body-start) content-length) chunk-scan))
+        (t
+         (values nil chunk-scan))))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).

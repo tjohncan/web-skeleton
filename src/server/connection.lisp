@@ -66,6 +66,13 @@
                                               ; HEAD responses carry CL but no body)
   ;; Awaiting (when this inbound connection is waiting for a fetch)
   (awaiting-fd    -1  :type fixnum)           ; fd of the outbound connection
+  ;; Resume offset for the chunked-completion walk on an outbound read
+  ;; (see CHUNKED-BODY-COMPLETE-P). Everything before it is validated
+  ;; chunk framing, so each chunk is walked once across the whole
+  ;; transfer instead of the body being rescanned on every read. Fresh
+  ;; per outbound connection — outbound connections are never reused —
+  ;; so it needs no reset.
+  (chunk-scan-pos  0  :type fixnum)
   ;; Keep-alive
   (close-after-p  nil :type boolean)          ; T = close after response sent
   ;; WebSocket fragment reassembly

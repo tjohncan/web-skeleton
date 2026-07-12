@@ -341,39 +341,71 @@
             (error "SSL_read: transport error ~a" (errno-string errno))))))
       (t (error "SSL_read failed: error ~d" err)))))
 
-(defun tls-read-all (ssl)
-  "Read the complete HTTP response through the SSL connection.
-   Returns the raw response as a byte vector. Bounded by
-   *MAX-OUTBOUND-RESPONSE-SIZE* (headers + body together) — the
-   inbound *MAX-BODY-SIZE* cap was the wrong knob here, since a
-   legitimate 1 MB HTTPS response with a few hundred bytes of
-   headers exceeds the inbound-request budget on principle."
-  (let ((chunks nil)
-        (total 0)
-        (buf (make-array 8192 :element-type '(unsigned-byte 8))))
+(defun tls-read-all (ssl &key (method :GET))
+  "Read the HTTP response through the SSL connection and return it as a
+   byte vector. Bounded by *MAX-OUTBOUND-RESPONSE-SIZE* (headers + body
+   together) — the inbound *MAX-BODY-SIZE* cap is the wrong knob here,
+   since a legitimate 1 MB HTTPS response with a few hundred bytes of
+   headers exceeds the inbound-request budget on principle.
+
+   Stops as soon as the response is framed-complete, via the same
+   OUTBOUND-RESPONSE-COMPLETE-P the non-blocking plain-HTTP path uses:
+   Content-Length satisfied, chunked terminator seen, or (for HEAD)
+   headers done. METHOD is the request method, needed for that last case.
+
+   Reading to EOF unconditionally — which this did — worked only because
+   BUILD-OUTBOUND-REQUEST sends Connection: close by default, and it was
+   never free:
+
+     * It cost a round trip on *every* HTTPS fetch. The complete response
+       is already in hand; we were waiting for the peer's close_notify to
+       tell us something the framing had already said.
+     * An upstream that keeps the connection open — because the caller
+       passed its own Connection header — pinned this worker thread until
+       SO_RCVTIMEO fired (*FETCH-TIMEOUT*, 30s by default). HTTPS fetch is
+       blocking, so that is a worker, not merely a parked connection.
+     * It left the two transports disagreeing about when a response ends:
+       plain HTTP recognized the chunked terminator, TLS did not. The same
+       upstream behaved differently over http:// and https://.
+
+   Close-delimited responses (no Content-Length, no Transfer-Encoding)
+   still read to EOF, because for those EOF genuinely is the framing."
+  (let* ((cap 8192)
+         (out (make-array cap :element-type '(unsigned-byte 8)))
+         (len 0)
+         (chunk-scan 0)
+         (buf (make-array 8192 :element-type '(unsigned-byte 8))))
     (loop
+      ;; Framed-complete? Ask before reading again, so a response whose
+      ;; last byte arrived on the previous pass does not wait on a read
+      ;; that has nothing left to deliver.
+      (multiple-value-bind (complete next-scan)
+          (outbound-response-complete-p out len method chunk-scan)
+        (setf chunk-scan next-scan)
+        (when complete (return)))
       (sb-sys:with-pinned-objects (buf)
         (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
           (cond
             ((> n 0)
-             (when (> (+ total n) *max-outbound-response-size*)
+             (when (> (+ len n) *max-outbound-response-size*)
                (error "HTTPS response too large (~d bytes, max ~d)"
-                      (+ total n) *max-outbound-response-size*))
-             (incf total n)
-             (push (subseq buf 0 n) chunks))
-            ((zerop n)
-             (ssl-read-eof-or-raise ssl n)
-             (return))
+                      (+ len n) *max-outbound-response-size*))
+             ;; Grow geometrically and copy in one REPLACE — a
+             ;; VECTOR-PUSH-EXTEND per byte would dominate the read.
+             (when (> (+ len n) cap)
+               (loop while (< cap (+ len n)) do (setf cap (* cap 2)))
+               (let ((bigger (make-array cap :element-type '(unsigned-byte 8))))
+                 (replace bigger out :end2 len)
+                 (setf out bigger)))
+             (replace out buf :start1 len :end2 n)
+             (incf len n))
             (t
+             ;; :EOF (benign close) or a raise — SSL-READ-EOF-OR-RAISE
+             ;; decides which, and a benign EOF is what completes a
+             ;; close-delimited response.
              (ssl-read-eof-or-raise ssl n)
              (return))))))
-    ;; Concatenate chunks
-    (let ((result (make-array total :element-type '(unsigned-byte 8)))
-          (offset 0))
-      (dolist (chunk (nreverse chunks))
-        (replace result chunk :start1 offset)
-        (incf offset (length chunk)))
-      result)))
+    (subseq out 0 len)))
 
 (defun tls-close (ssl socket)
   "Shut down a TLS connection and close the socket."
@@ -422,7 +454,7 @@
                 ;; apps pattern-matching on (if status ...) treat the
                 ;; integer 0 as truthy and blow up interpreting it as
                 ;; an HTTP status.
-                (let* ((response-buf (tls-read-all ssl))
+                (let* ((response-buf (tls-read-all ssl :method method))
                        (buf-len (length response-buf))
                        (header-end (scan-crlf-crlf response-buf 0 buf-len)))
                   (unless header-end
