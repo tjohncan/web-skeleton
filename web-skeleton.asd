@@ -44,15 +44,22 @@
                                                        "src/algorithms/sha256"
                                                        "src/algorithms/base64"
                                                        "src/algorithms/ecdsa"))
+               ;; src/address supplies FORMAT-IP (address → log string) and
+               ;; the IS-PUBLIC-ADDRESS-P classifier the address filter is
+               ;; meant to be paired with. Both fetch and dns call it, so
+               ;; the dependency is declared rather than left to rely on
+               ;; the order of this list.
                (:file "src/server/fetch" :depends-on ("src/package"
                                                         "src/log"
                                                         "src/epoll"
+                                                        "src/address"
                                                         "src/server/http"
                                                         "src/server/connection"
                                                         "src/server/websocket"))
                (:file "src/server/dns" :depends-on ("src/package"
                                                       "src/log"
                                                       "src/epoll"
+                                                      "src/address"
                                                       "src/server/http"
                                                       "src/server/connection"
                                                       "src/server/fetch"))

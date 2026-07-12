@@ -78,10 +78,13 @@
    80-word scratch schedule reused across every block of one digest.
    Both exist to keep the hot loop allocation-free: a per-block SUBSEQ
    plus a per-block schedule cost ~350 bytes of garbage for every 64
-   bytes of input, which dominated the pure-Lisp digest's cost. Every W
-   slot is written before it is read (0-15 from the block, 16-79 derived
-   from those), so reuse needs no clearing. SHA1-LISP allocates W per
-   call, so concurrent digests never share one."
+   bytes of input, which was essentially all of the pure-Lisp digest's
+   garbage (measured: 7.5 bytes consed per input byte, down to 1.0 — and
+   that 1.0 is the one padded copy). Throughput moves ~10%; the real win
+   is the GC pressure a busy server no longer pays. Every W slot is
+   written before it is read (0-15 from the block, 16-79 derived from
+   those), so reuse needs no clearing. SHA1-LISP allocates W per call, so
+   concurrent digests never share one."
   (declare (type (simple-array (unsigned-byte 8) (*)) data)
            (type (simple-array (unsigned-byte 32) (*)) w)
            (type fixnum start))

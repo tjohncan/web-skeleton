@@ -268,13 +268,20 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun hidden-path-component-p (relative)
-  "T when any /-separated component of RELATIVE starts with a dot —
-   except the exact component .well-known. RFC 8615 reserves
-   /.well-known/ as a public namespace that a web server must be able
-   to serve (ACME HTTP-01 challenges, security.txt, assetlinks.json,
-   apple-app-site-association), so the hide-dot-paths rule exempts
-   that one name. Dot-FILES keep answering T through their own
-   component — .well-known/.hidden stays hidden."
+  "T when any /-separated component of RELATIVE starts with a dot — with
+   one exemption: a LEADING component named exactly .well-known.
+
+   RFC 8615 reserves /.well-known/ as a public namespace a web server has
+   to be able to serve (ACME HTTP-01 challenges, security.txt,
+   assetlinks.json, apple-app-site-association), so the hide-dot-paths
+   rule has to let that one through. It is defined at the root of the
+   origin and nowhere else, so the exemption is root-only: a nested
+   /sub/.well-known/ means nothing to any client and stays hidden. The
+   narrowest exemption that does the job is the right one for a filter
+   whose whole purpose is refusing to serve things.
+
+   Dot-FILES still answer T through their own component, so
+   .well-known/.hidden stays hidden."
   (let ((start 0)
         (len (length relative)))
     (loop
@@ -282,8 +289,9 @@
              (end (or slash len)))
         (when (and (< start end)
                    (char= (char relative start) #\.)
-                   (not (string= relative ".well-known"
-                                 :start1 start :end1 end)))
+                   (not (and (zerop start)
+                             (string= relative ".well-known"
+                                      :start1 start :end1 end))))
           (return t))
         (unless slash (return nil))
         (setf start (1+ slash))))))
@@ -623,14 +631,20 @@
    Built per request rather than cached on the entry: 416 answers
    malformed client input, so it is a rare path and not worth a slot on
    every static file in memory."
-  (serialize-http-message
-   "HTTP/1.1 416 Range Not Satisfiable"
-   (list (cons "content-range"
-               (format nil "bytes */~d" (static-entry-content-length entry)))
-         (cons "content-length" "0")
-         (cons "accept-ranges" "bytes")
-         (cons "etag" (or (static-entry-etag entry) "")))
-   nil))
+  (let ((etag (static-entry-etag entry)))
+    (serialize-http-message
+     "HTTP/1.1 416 Range Not Satisfiable"
+     (append
+      (list (cons "content-range"
+                  (format nil "bytes */~d" (static-entry-content-length entry)))
+            (cons "content-length" "0")
+            (cons "accept-ranges" "bytes"))
+      ;; Omit the validator rather than emit an empty one: ETag's grammar
+      ;; has no empty form, so `etag: ""` would be malformed. Unreachable
+      ;; today (every entry is built with one) but a header that can only
+      ;; ever be well-formed is better than one that depends on that.
+      (when etag (list (cons "etag" etag))))
+     nil)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request serving
