@@ -1,0 +1,44 @@
+name: tests
+
+# Pull requests only, plus a manual button.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cold-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Ubuntu runners already carry libssl3 and glibc's getent, so the
+      # optional web-skeleton-tls system loads: the suite exercises the
+      # libssl crypto swap AND re-verifies the pure-Lisp originals against it.
+      - name: Install SBCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl
+          sbcl --version
+
+      # One step, one run, and it must be a COLD build.
+      #
+      # ASDF compiles to ~/.cache/common-lisp and reuses the fasls on any later run.
+      # A warm run loads without compiling, so it emits no "caught WARNING" lines at all.
+      #
+      # A fresh runner starts with no cache, so this is already cold.
+      # The rm makes that a stated invariant rather than a lucky one.
+      #
+      # set -o pipefail so sbcl's exit code survives the pipe through tee —
+      # the default shell here is `bash -e`, which would otherwise report
+      # tee's success and swallow a failing suite.
+      # run-tests.lisp exits 1 on any failure.
+      - name: Run test suite (cold build, fail on compile warnings)
+        run: |
+          set -o pipefail
+          rm -rf ~/.cache/common-lisp
+          sbcl --non-interactive --load run-tests.lisp 2>&1 | tee /tmp/build.log
+          if grep -qiE 'caught (warning|style-warning)' /tmp/build.log; then
+            echo "::error::compile emitted warnings"
+            grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/build.log
+            exit 1
+          fi
