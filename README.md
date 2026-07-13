@@ -163,7 +163,11 @@ tests/
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
-- **HTTP response builder** — status codes, headers, body serialization
+- **HTTP response builder** — status codes, headers, body serialization.
+  Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
+  verbatim, for content a string cannot carry (a generated image, a zip, a
+  protobuf payload) — a string body would be UTF-8 encoded on the way out and
+  arbitrary bytes would come back corrupt
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
 - **Expect: 100-continue** — interim `100 Continue` sent before reading the
@@ -199,14 +203,25 @@ tests/
   without returning from the handler until the work is done
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
-  MIME detection, extensionless HTML aliases (`/login.html` → `/login`),
+  MIME detection (including `application/wasm`, without which browsers refuse
+  `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),
   directory traversal protection, ETag-based revalidation
   (`If-None-Match` → `304 Not Modified` using a SHA-256 strong entity tag
   computed at load time),
   per-path `:cache-control` override (string or function of URL path),
   optional per-file `:substitutions` for injecting deploy-time values
-  (titles, API bases, build ids) via literal-string rewrites
+  (titles, API bases, build ids) via literal-string rewrites.
+  Dotfiles and dot-directories are skipped (`.git/`, `.env`) — except a
+  root-level `/.well-known/` (RFC 8615), which is served (ACME challenges,
+  `security.txt`)
+- **Range requests** — `Range: bytes=…` on static files returns `206 Partial Content`
+  with `Content-Range` (RFC 7233), so `<video>` seeking and resumable downloads work
+  instead of re-fetching from byte 0. Honors `If-Range` (a stale validator serves the
+  whole file, so a resumed download can't splice two versions together), answers `416`
+  with the true length when the range is out of bounds, and advertises
+  `Accept-Ranges: bytes`. The slice is taken from the pre-built response, so no file
+  is held in memory twice and a full GET still takes the zero-work path
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
   Optional background reaper sweeps entries on an app-supplied predicate

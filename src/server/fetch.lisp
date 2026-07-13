@@ -1509,7 +1509,16 @@
                       there would truncate.
      Content-Length — done when that many body bytes have landed.
      Neither        — close-delimited. NIL forever: EOF *is* the framing,
-                      and the caller's EOF branch completes it."
+                      and the caller's EOF branch completes it.
+
+   Known corner, deliberately not optimized: if an upstream sends a
+   Transfer-Encoding that is *not* chunked (already malformed — RFC 7230
+   §3.3.1 requires chunked to be the final encoding) and its body bytes
+   happen to walk as complete chunk framing, the confirming header parse
+   re-runs on every subsequent read until EOF, because nothing remembers
+   that the answer was already 'not chunked'. The cost is one header parse
+   per read on a response that is broken anyway, and remembering the
+   answer would mean a connection slot to carry it. Not worth the state."
   (let ((header-end (scan-crlf-crlf buf 0 end)))
     (unless header-end
       (return-from outbound-response-complete-p (values nil chunk-scan)))

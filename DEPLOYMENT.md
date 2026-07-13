@@ -376,6 +376,12 @@ Each worker then keeps its own hostname → address table (workers share
 nothing in the hot path, so there is no lock and no contention). A worker's
 first fetch to a host pays the subprocess; the rest of that window does not.
 
+Note the corollary when picking a TTL: **the miss rate is per-worker.** The kernel
+spreads accepts across workers, so with `N` workers a hot host costs up to `N` `getent`
+calls per TTL window, not one — each worker has to learn the address for itself. That is
+inherent to the share-nothing design (a shared table would need a lock on the hot path),
+and it means a very short TTL buys less than it looks like it should on a many-core box.
+
 The framework cannot pick this number for you, which is exactly why it does
 not try. `getent` surfaces no TTL, so the value is a judgment about your
 upstream: how long may the server keep dialing a remembered address after
@@ -448,6 +454,21 @@ If you place web-skeleton behind a CDN or reverse proxy,
 the proxy will stamp its own `Date` on the way out —
 operators should not be surprised to see `Date` missing on `/static/*`
 when watching the upstream directly with `curl -v`.
+
+**Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
+with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work
+rather than re-fetching from byte 0. `If-Range` is honored — a client whose validator
+no longer matches gets the whole file, so a resumed download cannot splice bytes from
+two versions of a file into a corrupt one. An out-of-bounds range gets `416` carrying
+the resource's true length. Multi-range (`bytes=0-9,20-29`) is deliberately ignored and
+the full file served, which RFC 7233 §3.1 permits; no media player or download manager
+asks for it. The byte range is sliced out of the pre-built response, so enabling this
+costs no extra memory and a full GET still takes the pre-built path.
+
+**Dotfiles are not served** — `.git/`, `.env` and anything else with a leading-dot path
+component is skipped at load time. The one exception is a root-level `/.well-known/`
+(RFC 8615), which *is* served, so ACME HTTP-01 challenges and `security.txt` work
+without an app-level route.
 
 `load-static-files` accepts an optional `:substitutions` argument
 for injecting deploy-time values into static files without a template engine:
