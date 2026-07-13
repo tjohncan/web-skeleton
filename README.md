@@ -163,7 +163,11 @@ tests/
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits
-- **HTTP response builder** — status codes, headers, body serialization
+- **HTTP response builder** — status codes, headers, body serialization.
+  Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
+  verbatim, for content a string cannot carry (a generated image, a zip, a
+  protobuf payload) — a string body would be UTF-8 encoded on the way out and
+  arbitrary bytes would come back corrupt
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
 - **Expect: 100-continue** — interim `100 Continue` sent before reading the
@@ -199,14 +203,25 @@ tests/
   without returning from the handler until the work is done
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
-  MIME detection, extensionless HTML aliases (`/login.html` → `/login`),
+  MIME detection (including `application/wasm`, without which browsers refuse
+  `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),
   directory traversal protection, ETag-based revalidation
   (`If-None-Match` → `304 Not Modified` using a SHA-256 strong entity tag
   computed at load time),
   per-path `:cache-control` override (string or function of URL path),
   optional per-file `:substitutions` for injecting deploy-time values
-  (titles, API bases, build ids) via literal-string rewrites
+  (titles, API bases, build ids) via literal-string rewrites.
+  Dotfiles and dot-directories are skipped (`.git/`, `.env`) — except a
+  root-level `/.well-known/` (RFC 8615), which is served (ACME challenges,
+  `security.txt`)
+- **Range requests** — `Range: bytes=…` on static files returns `206 Partial Content`
+  with `Content-Range` (RFC 7233), so `<video>` seeking and resumable downloads work
+  instead of re-fetching from byte 0. Honors `If-Range` (a stale validator serves the
+  whole file, so a resumed download can't splice two versions together), answers `416`
+  with the true length when the range is out of bounds, and advertises
+  `Accept-Ranges: bytes`. The slice is taken from the pre-built response, so no file
+  is held in memory twice and a full GET still takes the zero-work path
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
   Optional background reaper sweeps entries on an app-supplied predicate
@@ -219,7 +234,14 @@ tests/
   subprocess whose stdout pipe is registered with the worker's epoll;
   the parked inbound resumes when the address lands.
   Numeric IPv4 and IPv6 literals (including `http://[::1]:8080/`) skip DNS entirely
-  via a fast path. Both families supported
+  via a fast path. Both families supported.
+  Optional per-worker resolution cache (`*dns-cache-ttl*`, off by default) —
+  a hit skips the subprocess entirely, and is re-gated on the address filter
+- **Outbound address policy (SSRF)** — `*fetch-address-filter*` is consulted for
+  every address a fetch is about to dial, including the IP-literal fast paths.
+  Because the framework resolves hostnames itself, this is the only place a
+  DNS-rebinding race can be closed — an app that resolves, approves, then hands
+  over the *name* is racing a second lookup. Pair it with `is-public-address-p`
 - **Streaming fetch** — `http-fetch-stream` reads a response body line by line,
   calling a callback per line. Designed for NDJSON/SSE streaming APIs.
   Blocking — call from within a handler
@@ -270,6 +292,9 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*fetch-timeout*`              | `30`      | Blocking fetch I/O timeout and :awaiting connection reap deadline                                                                                                                                                                                  |
+| `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
+| `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
+| `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
 | `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*shutdown-poll-interval*`     | `1`       | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout)                                                                                                                                                                  |

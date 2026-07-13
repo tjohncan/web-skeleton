@@ -29,6 +29,72 @@
 (defparameter *fetch-timeout* 30
   "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
 
+;;; ---------------------------------------------------------------------------
+;;; Outbound address policy (SSRF)
+;;; ---------------------------------------------------------------------------
+
+(defvar *fetch-address-filter* nil
+  "Optional policy hook consulted for every address the outbound fetch
+   machinery is about to dial. A function (IP FAMILY HOST) returning a
+   generalized boolean: IP is the 4- or 16-byte address vector, FAMILY is
+   :INET or :INET6, HOST is the hostname or IP literal from the URL.
+   Returning NIL refuses the address.
+
+   NIL — the default — allows every address. That is the historical
+   behavior and the right one when fetch URLs come from config rather
+   than from users (a fixed upstream, a self-fetch to 127.0.0.1).
+
+   Set it when an app builds fetch URLs from user input. The framework
+   resolves hostnames itself, so an app that resolves a name, approves
+   the address, and then hands the *name* to DEFER-TO-FETCH is racing a
+   second, independent resolution: an attacker's nameserver answers with
+   a public address on the first lookup and 169.254.169.254 on the
+   second (DNS rebinding). This hook runs on the resolution that is
+   actually dialed, which is the only place that race can be closed. It
+   also gates the IP-literal fast paths, so http://169.254.169.254/ is
+   refused by the same policy — those skip DNS entirely and would
+   otherwise walk straight past a resolver-only check.
+
+   IS-PUBLIC-ADDRESS-P is the intended companion:
+
+     (setf *fetch-address-filter*
+           (lambda (ip family host)
+             (declare (ignore host))
+             (is-public-address-p ip family)))
+
+   A refused address is skipped, not fatal: a hostname with several
+   addresses falls through to the next one, and a lookup where none
+   survive fails the fetch exactly as an unresolvable name does — 502 to
+   the inbound caller, with the fetch callback firing its (NIL NIL NIL)
+   cleanup sentinel exactly once. The filter runs on the worker thread
+   inside the resolve path, so keep it cheap and non-blocking.")
+
+(defun fetch-address-allowed-p (ip family host)
+  "Gate IP (byte vector) / FAMILY (:INET or :INET6) / HOST (the name or
+   literal from the URL) through *FETCH-ADDRESS-FILTER*. Returns T when
+   no filter is installed or the filter accepts, NIL when it refuses.
+   Refusals log at WARN — a blocked fetch is a policy event an operator
+   wants to see, and a silent NIL would surface only as a puzzling 502.
+
+   A raising filter refuses the address rather than propagating: a bug in
+   app-supplied policy must fail closed (no dial) rather than fail open,
+   and must not take the worker down either. The raise is logged at ERROR
+   so the bug is not silently absorbed."
+  (let ((filter *fetch-address-filter*))
+    (cond
+      ((null filter) t)
+      ((handler-case (funcall filter ip family host)
+         (error (e)
+           (log-error "fetch: address filter raised on ~a (host ~a): ~a ~
+                       — refusing address"
+                      (format-ip ip) host e)
+           nil))
+       t)
+      (t
+       (log-warn "fetch: address ~a refused by *fetch-address-filter* (host ~a)"
+                 (format-ip ip) host)
+       nil))))
+
 (defparameter *max-outbound-response-size* (* 8 1024 1024)
   "Maximum total bytes (headers + body together) for a buffered
    outbound HTTPS response read by TLS-READ-ALL. Default 8 MiB.
@@ -1167,13 +1233,24 @@
    numeric IPv4 or IPv6 literal, skip DNS entirely and connect direct.
    Slow path: dispatch to *DNS-LOOKUP-FN* (provided by dns.lisp) which
    runs getent in a subprocess and resumes via
-   INITIATE-HTTP-FETCH-TO-ADDRESS when the address is in hand."
+   INITIATE-HTTP-FETCH-TO-ADDRESS when the address is in hand.
+
+   Both fast paths are gated on *FETCH-ADDRESS-FILTER*. They skip DNS,
+   so a resolver-only check would let http://169.254.169.254/ — the most
+   direct form of the attack the filter exists to stop — walk straight
+   through. A refused literal raises, and INITIATE-FETCH's handler-case
+   turns that into the same 502 + cleanup-sentinel path as any other
+   pre-connection failure."
   (let* ((v4 (parse-ipv4-literal host))
          (v6 (unless v4 (parse-ipv6-literal host))))
     (cond
-      (v4 (initiate-http-fetch-to-address
+      (v4 (unless (fetch-address-allowed-p v4 :inet host)
+            (error "fetch: address refused by policy: ~a" host))
+          (initiate-http-fetch-to-address
            conn epoll-fd fetch-req host port path v4 :inet))
-      (v6 (initiate-http-fetch-to-address
+      (v6 (unless (fetch-address-allowed-p v6 :inet6 host)
+            (error "fetch: address refused by policy: ~a" host))
+          (initiate-http-fetch-to-address
            conn epoll-fd fetch-req host port path v6 :inet6))
       (*dns-lookup-fn*
        (funcall *dns-lookup-fn* conn epoll-fd fetch-req host port path))
@@ -1303,31 +1380,30 @@
                 *max-outbound-response-size*)))
       (:again nil)  ; wait for more data
       (:ok
-       ;; Got data — check if we have a complete response
-       (let* ((buf (connection-read-buf conn))
-              (pos (connection-read-pos conn))
-              (header-end (scan-crlf-crlf buf 0 pos)))
-         (when header-end
-           ;; Have complete headers — check if body is complete.
-           ;; RFC 7230 §3.3.3: Transfer-Encoding takes precedence over CL.
-           (let* ((body-start (+ header-end 4))
-                  (te-present (scan-transfer-encoding buf header-end))
-                  (content-length (unless te-present
-                                    (scan-content-length buf header-end))))
-             (cond
-               ;; HEAD response body is empty by RFC 7231 §4.3.2, even
-               ;; when the upstream echoes the GET-body Content-Length.
-               ;; Complete on headers-done — waiting for CL body bytes
-               ;; would hang until EPOLLHUP lands as peer FIN, which
-               ;; is extra round-trip latency for no payload delivery.
-               ((eq (connection-fetch-method conn) :HEAD)
-                (complete-fetch conn epoll-fd))
-               ;; Have Content-Length (no TE) — complete when body received
-               (content-length
-                (when (>= (- pos body-start) content-length)
-                  (complete-fetch conn epoll-fd)))
-               ;; Chunked or no CL — wait for EOF (Connection: close)
-               ))))))))
+       ;; Got data — is the response framed-complete yet? OUTBOUND-
+       ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
+       ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
+       ;; offset across reads so a dribbling upstream is walked once, not
+       ;; rescanned from the top on every wake-up.
+       ;;
+       ;; Completion follows the framing, not the socket's lifetime.
+       ;; Waiting for EOF worked only because outbound requests default to
+       ;; Connection: close, and even then it cost a round trip — the
+       ;; whole response sits in our buffer while we wait for the
+       ;; upstream's FIN. An app that overrides Connection to keep-alive
+       ;; got an upstream that never closes, and the fetch hung until the
+       ;; :awaiting reaper dropped the inbound with no response at all.
+       ;;
+       ;; Close-delimited responses (no CL, no TE) still complete via the
+       ;; :eof branch above: for those, EOF genuinely is the framing.
+       (multiple-value-bind (complete next-scan)
+           (outbound-response-complete-p (connection-read-buf conn)
+                                         (connection-read-pos conn)
+                                         (connection-fetch-method conn)
+                                         (connection-chunk-scan-pos conn))
+         (setf (connection-chunk-scan-pos conn) next-scan)
+         (when complete
+           (complete-fetch conn epoll-fd)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
@@ -1343,6 +1419,134 @@
   (loop for (name . value) in headers
         thereis (and (string-equal name "transfer-encoding")
                      (connection-header-has-token-p value "chunked"))))
+
+(defun chunked-body-complete-p (buf start end &optional (resume start))
+  "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in
+   BUF[START..END). COMPLETE-P is T once the zero-size chunk header has
+   arrived. Walks the chunk framing, skipping *over* chunk data rather
+   than scanning it, so the cost is proportional to the number of chunks
+   and not to the bytes.
+
+   RESUME is a NEXT-RESUME returned by an earlier call — an offset that
+   is known to sit on a chunk-header boundary with everything before it
+   already validated. A caller polling a growing buffer threads it back
+   in, so each chunk is walked exactly once over the life of a transfer
+   instead of the whole body being rescanned on every read. Without it,
+   an upstream that dribbles N chunks costs O(N^2) header steps, which an
+   adversarial (if reachable) upstream could turn into real CPU burn
+   inside the response-size cap. Default RESUME = START scans from
+   scratch, which is what a one-shot caller wants.
+
+   This is a 'do we have it all yet?' predicate, not a validator, and it
+   is deliberately permissive about malformed framing: DECODE-CHUNKED-BODY
+   is the authority and rejects bad framing loudly when the response is
+   delivered (which becomes a 502). NIL here only ever means 'keep
+   reading' — so a too-strict predicate would hang, while a too-lax one
+   merely reaches a loud decode error. Lean lax.
+
+   It stops at the zero-size chunk header rather than at the trailing
+   CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
+   are not consumed), so the two agree on the completion point."
+  (let ((pos (max start resume)))
+    (loop
+      ;; BOUNDARY is the start of the chunk header about to be parsed:
+      ;; everything before it is validated framing, so it is the offset
+      ;; handed back for the next call to resume from.
+      (let ((boundary pos)
+            (size 0)
+            (digits 0)
+            (found nil))
+        ;; chunk-size — at least one hex digit, capped like the decoder's.
+        (loop
+          (when (>= pos end) (return))
+          (let ((digit (hex-digit-value (aref buf pos))))
+            (unless digit (return))
+            (incf digits)
+            (when (> digits 16)
+              (return-from chunked-body-complete-p (values nil boundary)))
+            (setf size (+ (ash size 4) digit)
+                  found t)
+            (incf pos)))
+        (unless found
+          (return (values nil boundary)))
+        ;; Skip any chunk-extensions; the size line's LF must have landed.
+        (let ((lf (position 10 buf :start pos :end end)))
+          (unless lf (return (values nil boundary)))
+          (setf pos (1+ lf)))
+        ;; Zero-size chunk header = end of body.
+        (when (zerop size)
+          (return (values t boundary)))
+        ;; Skip the chunk data and its trailing CRLF. Note this jumps the
+        ;; data rather than scanning it, which is what keeps a body whose
+        ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
+        ;; for a terminator — a naive suffix check would truncate there.
+        (incf pos size)
+        (incf pos 2)
+        (when (> pos end)
+          (return (values nil boundary)))))))
+
+(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0))
+  "Return (values COMPLETE-P NEXT-CHUNK-SCAN) for the outbound HTTP
+   response accumulated in BUF[0..END), given the request METHOD. Thread
+   NEXT-CHUNK-SCAN back in on the following call so a chunked body is
+   walked once across a growing buffer (see CHUNKED-BODY-COMPLETE-P).
+
+   One definition of 'the response is done', shared by the non-blocking
+   plain-HTTP read path (HANDLE-OUTBOUND-READ) and the blocking TLS one
+   (TLS-READ-ALL). They used to disagree: plain HTTP recognized the
+   chunked terminator while TLS read to EOF, so the same upstream could
+   be handled cleanly over http:// and stall over https://. A single
+   predicate is the only way that divergence stays fixed.
+
+   Framing, in RFC 7230 §3.3.3 order:
+     HEAD           — no body ever (§4.3.2), even when the upstream
+                      echoes the GET body's Content-Length. Done at
+                      headers.
+     Transfer-Encoding present — TE wins over Content-Length. Done at the
+                      zero-size chunk header, but only once the encoding
+                      is confirmed to actually be chunked: a TE that is
+                      not chunked is framed by EOF, and completing early
+                      there would truncate.
+     Content-Length — done when that many body bytes have landed.
+     Neither        — close-delimited. NIL forever: EOF *is* the framing,
+                      and the caller's EOF branch completes it.
+
+   Known corner, deliberately not optimized: if an upstream sends a
+   Transfer-Encoding that is *not* chunked (already malformed — RFC 7230
+   §3.3.1 requires chunked to be the final encoding) and its body bytes
+   happen to walk as complete chunk framing, the confirming header parse
+   re-runs on every subsequent read until EOF, because nothing remembers
+   that the answer was already 'not chunked'. The cost is one header parse
+   per read on a response that is broken anyway, and remembering the
+   answer would mean a connection slot to carry it. Not worth the state."
+  (let ((header-end (scan-crlf-crlf buf 0 end)))
+    (unless header-end
+      (return-from outbound-response-complete-p (values nil chunk-scan)))
+    (let* ((body-start (+ header-end 4))
+           (te-present (scan-transfer-encoding buf header-end))
+           (content-length (unless te-present
+                             (scan-content-length buf header-end))))
+      (cond
+        ((eq method :HEAD)
+         (values t chunk-scan))
+        (te-present
+         (multiple-value-bind (complete next)
+             (chunked-body-complete-p buf body-start end
+                                      (max body-start chunk-scan))
+           ;; The header parse only runs on the read that actually
+           ;; completes — the cheap framing walk gates it.
+           (values (and complete
+                        (let ((first-crlf (scan-crlf buf 0 header-end)))
+                          (and first-crlf
+                               (response-chunked-p
+                                (parse-headers-bytes buf (+ first-crlf 2)
+                                                     (+ header-end 4)))
+                               t)))
+                   next)))
+        (content-length
+         (values (>= (- end body-start) content-length) chunk-scan))
+        (t
+         (values nil chunk-scan))))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).

@@ -276,56 +276,65 @@ Don't rely on cleanup-path exceptions propagating back to the caller — they do
 
 ### Fetch URL safety (SSRF)
 
-If your handler constructs fetch URLs from user input,
-validate the destination before dialing.
-The framework does not filter resolved IP addresses — a user-supplied hostname
-resolving to `169.254.169.254` (cloud metadata), `127.0.0.1`,
-or any private RFC 1918 address will be connected to directly unless the app refuses.
+If your handler constructs fetch URLs from user input, the user is choosing
+who your server dials — and your server sits inside the trust boundary.
+It can reach `169.254.169.254` (cloud metadata, which hands out IAM credentials),
+`127.0.0.1` (your own admin endpoints), and RFC 1918 private ranges
+(everything else in the VPC). That is server-side request forgery.
 
-`is-public-address-p` is the primitive for doing this refusal correctly.
-It takes a byte vector and a family keyword
-and returns T only for publicly routable addresses,
-rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
-RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
-and cloud metadata IPs. It unwraps IPv4-mapped IPv6 and NAT64
-so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+**`*fetch-address-filter*` is the enforcement point.**
+It is a special holding a function `(ip family host) -> boolean`,
+consulted for every address the fetch machinery is about to dial.
+Returning NIL refuses the address. The default is NIL — no filter,
+every address allowed — which is the right setting when fetch URLs come
+from config rather than from users.
 
-The framework exports `parse-url`, `parse-ipv4-literal`, and `parse-ipv6-literal`
-specifically so a handler writing this check doesn't have to reinvent them.
-They are the same parsers the outbound fetch path uses internally,
-so a policy decision on the inbound side and the actual dial on the outbound side
-agree on what "host" means:
+Set it once at startup, before `start-server`:
 
 ```lisp
-(defun handle-proxy (req)
-  (let ((url (get-query-param req "url")))
-    (unless url
-      (return-from handle-proxy (make-error-response 400)))
-    (multiple-value-bind (scheme host port path)
-        (handler-case (parse-url url) (error () (values nil nil nil nil)))
-      (declare (ignore port path))
-      (unless scheme
-        (return-from handle-proxy (make-error-response 400)))
-      ;; parse-url + parse-ipv*-literal + is-public-address-p together.
-      ;; Only IP-literal hosts are accepted, and only if the address
-      ;; classifies as publicly routable. Hostnames are rejected —
-      ;; a permissive app would allowlist specific ones up front,
-      ;; or resolve via its own DNS path before calling
-      ;; is-public-address-p on each resolved address.
-      (let* ((v4 (parse-ipv4-literal host))
-             (v6 (and (not v4) (parse-ipv6-literal host))))
-        (cond
-          ((and v4 (is-public-address-p v4 :inet))
-           (defer-to-fetch :get url :then my-callback))
-          ((and v6 (is-public-address-p v6 :inet6))
-           (defer-to-fetch :get url :then my-callback))
-          (t
-           (make-error-response 403)))))))
+(setf web-skeleton:*fetch-address-filter*
+      (lambda (ip family host)
+        (declare (ignore host))
+        (is-public-address-p ip family)))
 ```
 
-The helper deliberately does not resolve hostnames —
-apps that accept hostnames must resolve first and then call `is-public-address-p`
-on each resolved address before dialing.
+`is-public-address-p` returns T only for publicly routable addresses,
+rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
+RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
+and cloud metadata IPs. It unwraps IPv4-mapped IPv6, NAT64, and 6to4,
+so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+
+**Why the framework has to do this and an app cannot.**
+The framework resolves hostnames itself. An app that resolves a name,
+approves the address, and then hands the *name* to `defer-to-fetch`
+is racing a second, independent resolution: the attacker's nameserver
+answers with a public address on the first lookup and `169.254.169.254`
+on the second. That is DNS rebinding, and no amount of app-side checking
+closes it, because the app does not control the dial. The filter runs on
+the resolution that is actually dialed. It also gates the IP-literal
+fast paths — `http://169.254.169.254/` skips DNS entirely, so a
+resolver-only check would miss the most direct form of the attack.
+
+**What a refusal does.** The address is skipped, not fatal. A hostname
+with several addresses falls through to the next one. A lookup where no
+address survives fails the fetch exactly as an unresolvable name does:
+502 to the inbound caller, with the fetch callback firing its
+`(nil nil nil)` cleanup sentinel exactly once. Refusals log at WARN with
+the address and host. A filter that *raises* refuses the address
+(fail closed) and logs at ERROR — an app-policy bug must not open the gate.
+
+The filter is mechanism, not policy: it does not know what your app should
+be allowed to reach. `is-public-address-p` is the common policy, but a
+stricter one is usually better where it is possible — an explicit allowlist
+of upstream hosts, checked in the handler before `defer-to-fetch` is ever
+called, cannot be defeated by rebinding at all because nothing else is
+dialable. Use both: allowlist what you can name, and set the filter as the
+backstop for everything else.
+
+`parse-url`, `parse-ipv4-literal`, and `parse-ipv6-literal` are exported
+so a handler doing its own up-front URL validation uses the same parsers
+the fetch path uses internally — the inbound policy decision and the
+outbound dial then agree on what "host" means.
 
 ### DNS resolution and caching
 
@@ -352,37 +361,59 @@ Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 code path underneath. Apps that depend on exotic name sources
 continue to work without change.
 
-**Caching is opt-in at the app layer.** `getent` is reinvoked on
-every outbound fetch, which is fine for apps making a handful of calls
-per inbound request. Apps that pound a small set of upstream hosts many times
-can cache DNS themselves using the `store` primitive in about fifteen lines,
-then bypass the framework's DNS path by passing the resolved IP literal
-at the call site:
+**Caching is opt-in, and off by default.** With `*dns-cache-ttl*` at its
+default of `0`, `getent` is reinvoked on every outbound fetch to a hostname
+— fine for apps making a handful of calls per inbound request, and the only
+behavior that is correct without knowing your tolerance for stale addresses.
+
+Apps that pound a small set of upstreams turn the cache on by naming a TTL:
 
 ```lisp
-(defvar *dns-cache*
-  (make-store :expiry-fn (lambda (host entry)
-                           (declare (ignore host))
-                           (> (get-universal-time) (cdr entry)))
-              :reap-interval 60))
-
-(defun cached-ip-for (host)
-  (car (store-get *dns-cache* host)))
-
-(defun remember-ip (host ip &key (ttl 60))
-  (store-set *dns-cache* host (cons ip (+ (get-universal-time) ttl))))
+(setf web-skeleton:*dns-cache-ttl* 60)   ; trust a resolution for 60s
 ```
 
-At the call site, check `cached-ip-for` first and build the URL
-with the IP literal when there's a hit —
-the framework's numeric fast path skips `getent` entirely.
-On a miss, fall through to a hostname URL (paying the `getent` cost once)
-and populate the cache when the response arrives.
+Each worker then keeps its own hostname → address table (workers share
+nothing in the hot path, so there is no lock and no contention). A worker's
+first fetch to a host pays the subprocess; the rest of that window does not.
 
-The framework deliberately does not ship a DNS cache of its own.
-`getent` output does not surface TTL information, so any built-in cache
-would have to invent its own expiry policy — a choice that belongs to the app,
-not the framework.
+Note the corollary when picking a TTL: **the miss rate is per-worker.** The kernel
+spreads accepts across workers, so with `N` workers a hot host costs up to `N` `getent`
+calls per TTL window, not one — each worker has to learn the address for itself. That is
+inherent to the share-nothing design (a shared table would need a lock on the hot path),
+and it means a very short TTL buys less than it looks like it should on a many-core box.
+
+The framework cannot pick this number for you, which is exactly why it does
+not try. `getent` surfaces no TTL, so the value is a judgment about your
+upstream: how long may the server keep dialing a remembered address after
+DNS has changed? Small values (30–60s) suit an upstream behind a load
+balancer that can fail over; larger values suit a pinned host. Leaving it
+at `0` is a legitimate answer — it means "always ask".
+
+Details worth knowing:
+
+- **Successes only.** A failed lookup is not cached. Nameserver blips and
+  services still coming up are transient; caching the failure would stretch
+  an outage well past its cause.
+- **Bounded.** `*dns-cache-max-entries*` (default 256) caps each worker's
+  table; on overflow, expired entries are swept and the table cleared if
+  that is not enough. The cache is a latency optimization, not a source of
+  truth — dropping it costs one `getent` per host. Without a bound, a
+  handler fetching attacker-chosen hostnames could grow a worker's memory
+  without limit.
+- **`*fetch-address-filter*` is re-consulted on every cache hit.** A cached
+  address is never a way around the filter: if policy changes, or an entry
+  was admitted before a filter was installed, the hit is refused and the
+  entry evicted. Without this, caching would be a DNS-rebinding accelerator.
+- **A worker restart drops its cache.** Harmless — the next fetch to each
+  host pays one `getent` again.
+
+The cache is also the *only* way to avoid the subprocess on an HTTPS fetch.
+For plain HTTP, an app can resolve a host itself and pass the IP literal at
+the call site, hitting the numeric fast path. That does not work for HTTPS:
+`parse-url` refuses `https://` with an IP-literal host, because peer
+verification is wired to a DNS name and matching an IP SAN is not
+implemented. So an HTTPS upstream has no app-side way to skip `getent` —
+`*dns-cache-ttl*` is it.
 
 ### ws-send and worker blocking
 
@@ -423,6 +454,21 @@ If you place web-skeleton behind a CDN or reverse proxy,
 the proxy will stamp its own `Date` on the way out —
 operators should not be surprised to see `Date` missing on `/static/*`
 when watching the upstream directly with `curl -v`.
+
+**Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
+with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work
+rather than re-fetching from byte 0. `If-Range` is honored — a client whose validator
+no longer matches gets the whole file, so a resumed download cannot splice bytes from
+two versions of a file into a corrupt one. An out-of-bounds range gets `416` carrying
+the resource's true length. Multi-range (`bytes=0-9,20-29`) is deliberately ignored and
+the full file served, which RFC 7233 §3.1 permits; no media player or download manager
+asks for it. The byte range is sliced out of the pre-built response, so enabling this
+costs no extra memory and a full GET still takes the pre-built path.
+
+**Dotfiles are not served** — `.git/`, `.env` and anything else with a leading-dot path
+component is skipped at load time. The one exception is a root-level `/.well-known/`
+(RFC 8615), which *is* served, so ACME HTTP-01 challenges and `security.txt` work
+without an app-level route.
 
 `load-static-files` accepts an optional `:substitutions` argument
 for injecting deploy-time values into static files without a template engine:

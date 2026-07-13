@@ -31,6 +31,7 @@
            #:format-response
            #:make-text-response
            #:make-html-response
+           #:make-bytes-response
            #:make-error-response
            #:status-reason
            ;; Logging
@@ -63,6 +64,7 @@
            #:ecdsa-verify-p256
            ;; Address classification
            #:is-public-address-p
+           #:*fetch-address-filter*
            ;; JWT
            #:jwt-key
            #:make-jwt-key
@@ -125,6 +127,9 @@
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
            #:*fetch-timeout*
+           ;; DNS cache (opt-in — 0 disables)
+           #:*dns-cache-ttl*
+           #:*dns-cache-max-entries*
            ;; Shutdown
            #:*drain-timeout*
            #:*shutdown-poll-interval*

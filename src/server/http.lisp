@@ -735,6 +735,7 @@
     (409 . "Conflict")
     (413 . "Payload Too Large")
     (414 . "URI Too Long")
+    (416 . "Range Not Satisfiable")
     (417 . "Expectation Failed")
     (429 . "Too Many Requests")
     (431 . "Request Header Fields Too Large")
@@ -756,7 +757,14 @@
 (defstruct http-response
   (status  200   :type integer)
   (headers nil   :type list)      ; alist — ((name . value) ...)
-  (body    nil   :type (or null string)))
+  ;; BODY is a string (UTF-8 encoded at serialize time) or a raw byte
+  ;; vector (emitted verbatim). Bytes exist for content that is not text
+  ;; — a generated PNG, a zip, a protobuf payload — where routing
+  ;; through a string would re-encode the bytes and corrupt them. Same
+  ;; element type as HTTP-REQUEST-BODY and BUILD-OUTBOUND-REQUEST's body
+  ;; argument, so a byte buffer flows through the framework unchanged in
+  ;; either direction. MAKE-BYTES-RESPONSE is the constructor.
+  (body    nil   :type (or null string (simple-array (unsigned-byte 8) (*)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP message serialization (shared by response builder, static, and fetch)
@@ -920,8 +928,17 @@
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
   (let* ((body   (http-response-body response))
-         (body-bytes (when body
-                       (sb-ext:string-to-octets body :external-format :utf-8)))
+         ;; String bodies encode to UTF-8; byte bodies pass through
+         ;; untouched. Everything downstream (Content-Length, the
+         ;; HEAD-ONLY-P short-circuit, the serializer) already works on
+         ;; BODY-BYTES, so this is the only place that has to know the
+         ;; difference. An empty body of either kind still lands in the
+         ;; "body present" branch below and gets Content-Length: 0.
+         (body-bytes (etypecase body
+                       (null nil)
+                       (string (sb-ext:string-to-octets
+                                body :external-format :utf-8))
+                       ((simple-array (unsigned-byte 8) (*)) body)))
          (headers (http-response-headers response))
          (headers (cond
                    ;; Body present — add CL if not already set
@@ -984,6 +1001,35 @@
 (defun make-html-response (status body)
   "Build a response with an HTML body."
   (make-text-response status body :content-type "text/html; charset=utf-8"))
+
+(defun make-bytes-response (status bytes
+                            &key (content-type "application/octet-stream"))
+  "Build a response whose body is raw BYTES, emitted verbatim.
+
+   For content a string cannot carry: a generated image, a zip, a PDF,
+   a protobuf payload. MAKE-TEXT-RESPONSE would UTF-8 encode the value
+   at serialize time, so arbitrary bytes handed to it come out
+   re-encoded and corrupt.
+
+   BYTES is coerced to a simple byte vector, so an accumulator built
+   with :FILL-POINTER / :ADJUSTABLE is accepted (and copied); an already
+   simple vector passes through without a copy. CONTENT-TYPE defaults to
+   application/octet-stream — pass the real type when you know it, since
+   browsers will not sniff their way out of a wrong one.
+
+   Content-Length is computed from the byte count, and HEAD requests
+   emit the headers without the body, exactly as for a string body.
+
+   This is distinct from the pre-serialized byte vector a handler may
+   return directly (what SERVE-STATIC produces): that is a whole HTTP
+   message, status line and headers included. This is an HTTP-RESPONSE
+   whose *body* happens to be bytes, and the framework still builds the
+   status line and headers for it."
+  (let ((resp (make-http-response
+               :status status
+               :body (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+    (set-response-header resp "content-type" content-type)
+    resp))
 
 (defun make-error-response (status &optional message)
   "Build a plain-text error response."

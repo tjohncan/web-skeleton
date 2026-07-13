@@ -571,6 +571,60 @@
     (check "error status" (http-response-status resp) 404)
     (check "error body" (http-response-body resp) "404 Not Found"))
 
+  ;; ---- Byte-vector bodies ----
+  ;; A string body is UTF-8 encoded at serialize time, so arbitrary
+  ;; bytes routed through MAKE-TEXT-RESPONSE come out re-encoded. The
+  ;; payload below is deliberately not valid UTF-8 (0x00 0xFF 0x80 0xFE):
+  ;; it must survive byte-for-byte.
+  (let* ((payload (make-array 6 :element-type '(unsigned-byte 8)
+                                :initial-contents '(#x00 #xFF #x80 #xFE #x01 #x7F)))
+         (resp (make-bytes-response 200 payload :content-type "image/png"))
+         (bytes (format-response resp))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes)))
+         (emitted (subseq bytes (+ header-end 4)))
+         (head-text (sb-ext:octets-to-string
+                     (subseq bytes 0 header-end) :external-format :latin-1)))
+    (check "bytes body: emitted verbatim" (equalp emitted payload) t)
+    (check "bytes body: content-length matches byte count"
+           (not (null (search "content-length: 6" head-text :test #'char-equal)))
+           t)
+    (check "bytes body: content-type honored"
+           (not (null (search "image/png" head-text))) t)
+    ;; HEAD keeps the Content-Length of the GET body but emits no body
+    ;; (RFC 7231 §4.3.2) — same contract as a string body.
+    (let* ((head-bytes (format-response resp :head-only-p t))
+           (hend (web-skeleton::scan-crlf-crlf head-bytes 0 (length head-bytes)))
+           (htext (sb-ext:octets-to-string
+                   (subseq head-bytes 0 hend) :external-format :latin-1)))
+      (check "bytes body: HEAD emits no body"
+             (= (length head-bytes) (+ hend 4)) t)
+      (check "bytes body: HEAD keeps content-length"
+             (not (null (search "content-length: 6" htext :test #'char-equal)))
+             t)))
+  ;; Empty byte vector is a present-but-empty body → Content-Length: 0,
+  ;; matching the empty-string case rather than falling into the no-body
+  ;; branch.
+  (let* ((resp (make-bytes-response
+                200 (make-array 0 :element-type '(unsigned-byte 8))))
+         (text (sb-ext:octets-to-string (format-response resp)
+                                        :external-format :latin-1)))
+    (check "bytes body: empty vector yields content-length 0"
+           (not (null (search "content-length: 0" text :test #'char-equal)))
+           t))
+  ;; Default content-type, and a fill-pointered accumulator (the shape an
+  ;; app building bytes incrementally ends up with) is accepted.
+  (let* ((acc (make-array 0 :element-type '(unsigned-byte 8)
+                            :fill-pointer 0 :adjustable t)))
+    (vector-push-extend 65 acc)
+    (vector-push-extend 66 acc)
+    (let* ((resp (make-bytes-response 201 acc))
+           (text (sb-ext:octets-to-string (format-response resp)
+                                          :external-format :latin-1)))
+      (check "bytes body: adjustable vector accepted"
+             (not (null (search "AB" text))) t)
+      (check "bytes body: default content-type"
+             (not (null (search "application/octet-stream" text))) t)))
+
   ;; HTTP header field names are case-insensitive (RFC 7230 §3.2).
   ;; Framework helpers route through set-response-header with lowercase
   ;; literals, but apps that build responses with mixed-case :headers
@@ -2890,6 +2944,8 @@
                                     (truename ".")))
          (cc-seen nil))
     (ensure-directories-exist (merge-pathnames "sub/" scratch))
+    (ensure-directories-exist (merge-pathnames ".well-known/" scratch))
+    (ensure-directories-exist (merge-pathnames ".git/" scratch))
     (flet ((write-file (rel text)
              (with-open-file (s (merge-pathnames rel scratch)
                                 :direction :output
@@ -2901,7 +2957,12 @@
                                s))))
       (write-file "index.html"    "<!doctype html><title>root</title>")
       (write-file "page.html"     "<!doctype html><title>page</title>")
-      (write-file "sub/index.html" "<!doctype html><title>sub</title>"))
+      (write-file "sub/index.html" "<!doctype html><title>sub</title>")
+      ;; Dot-path discrimination: .well-known is the RFC 8615 exemption,
+      ;; .git is the stays-hidden control (its file has a dotless name,
+      ;; so only the directory-component filter can refuse it).
+      (write-file ".well-known/security.txt" "Contact: mailto:sec@example")
+      (write-file ".git/config" "[core]"))
     (let ((saved-cache web-skeleton::*static-cache*))
       (unwind-protect
            (progn
@@ -2935,19 +2996,172 @@
                              web-skeleton::*static-cache*) nil)
              (check "cache-control fn: saw /sub/index.html url"
                     (not (null (member "/sub/index.html" cc-seen
-                                       :test #'string=))) t))
+                                       :test #'string=))) t)
+             (check "dot-path: /.well-known/security.txt served"
+                    (not (null (gethash "/.well-known/security.txt"
+                                        web-skeleton::*static-cache*))) t)
+             (check "dot-path: /.git/config stays hidden"
+                    (gethash "/.git/config"
+                             web-skeleton::*static-cache*) nil))
         (setf web-skeleton::*static-cache* saved-cache)
         ;; Cleanup scratch tree. Files first, then nested dir, then
         ;; scratch root. IGNORE-ERRORS wraps each so a missing file
         ;; from a previous partial run does not mask a real test
         ;; failure.
-        (dolist (rel '("index.html" "page.html" "sub/index.html"))
+        (dolist (rel '("index.html" "page.html" "sub/index.html"
+                       ".well-known/security.txt" ".git/config"))
           (ignore-errors
            (delete-file (merge-pathnames rel scratch))))
-        (ignore-errors
-         (sb-ext:delete-directory (merge-pathnames "sub/" scratch)))
+        (dolist (dir '("sub/" ".well-known/" ".git/"))
+          (ignore-errors
+           (sb-ext:delete-directory (merge-pathnames dir scratch))))
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
+
+(defun test-static-range ()
+  (format t "~%Static Range (RFC 7233)~%")
+
+  ;; ---- parse-byte-range ----
+  ;; TOTAL = 100, so valid offsets are 0..99.
+  (flet ((r (spec)
+           (multiple-value-bind (first last)
+               (web-skeleton::parse-byte-range spec 100)
+             (cond ((eq first :unsatisfiable) :unsatisfiable)
+                   (first (list first last))
+                   (t :ignore)))))
+    (check "range: bytes=0-49"      (r "bytes=0-49")   '(0 49))
+    (check "range: bytes=50-"       (r "bytes=50-")    '(50 99))
+    (check "range: bytes=-10 suffix" (r "bytes=-10")   '(90 99))
+    (check "range: single byte"     (r "bytes=0-0")    '(0 0))
+    (check "range: last byte"       (r "bytes=99-99")  '(99 99))
+    ;; LAST beyond the end is clamped, not an error (RFC 7233 §2.1).
+    (check "range: end clamped to resource"
+           (r "bytes=90-999") '(90 99))
+    ;; A suffix longer than the resource yields the whole resource.
+    (check "range: oversized suffix yields whole resource"
+           (r "bytes=-500") '(0 99))
+    ;; Start past the end is unsatisfiable → 416.
+    (check "range: start past end unsatisfiable"
+           (r "bytes=100-") :unsatisfiable)
+    (check "range: bytes=-0 unsatisfiable"
+           (r "bytes=-0") :unsatisfiable)
+    ;; Malformed / unsupported shapes are ignored (serve the full 200) —
+    ;; ignoring a Range is always safe; guessing at one is not.
+    (check "range: multi-range ignored"  (r "bytes=0-9,20-29") :ignore)
+    (check "range: last < first ignored" (r "bytes=50-10") :ignore)
+    (check "range: non-numeric ignored"  (r "bytes=abc-def") :ignore)
+    (check "range: wrong unit ignored"   (r "items=0-9") :ignore)
+    (check "range: garbage ignored"      (r "bytes=") :ignore)
+    (check "range: nil header ignored"   (r nil) :ignore)
+    ;; An empty resource has no satisfiable range at all.
+    (check "range: empty resource ignored"
+           (multiple-value-bind (f l)
+               (web-skeleton::parse-byte-range "bytes=0-0" 0)
+             (declare (ignore l))
+             f)
+           nil))
+
+  ;; ---- end-to-end through serve-static ----
+  (let* ((content (sb-ext:string-to-octets
+                   "0123456789abcdefghijklmnopqrstuvwxyz"
+                   :external-format :ascii))   ; 36 bytes
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (flet ((fetch (&rest headers)
+                    (let ((bytes (serve-static
+                                  (make-test-request :method :GET
+                                                     :path "/data.txt"
+                                                     :headers headers))))
+                      (and bytes
+                           (sb-ext:octets-to-string
+                            bytes :external-format :latin-1))))
+                  (body-of (text)
+                    (let ((i (search (format nil "~a~a~a~a"
+                                             #\Return #\Newline
+                                             #\Return #\Newline)
+                                     text)))
+                      (and i (subseq text (+ i 4))))))
+             ;; A plain GET still takes the pre-built path and is unchanged,
+             ;; but now advertises Range support.
+             (let ((full (fetch)))
+               (check "range: plain GET still 200"
+                      (not (null (search "200 OK" full))) t)
+               (check "range: plain GET advertises accept-ranges"
+                      (not (null (search "accept-ranges: bytes" full))) t)
+               (check "range: plain GET body intact"
+                      (body-of full)
+                      "0123456789abcdefghijklmnopqrstuvwxyz"))
+             ;; A byte range comes back 206 with the right slice, the right
+             ;; Content-Length, and a Content-Range naming the whole size.
+             (let ((part (fetch (cons "range" "bytes=10-19"))))
+               (check "range: 206 status"
+                      (not (null (search "206 Partial Content" part))) t)
+               (check "range: content-range header"
+                      (not (null (search "content-range: bytes 10-19/36" part)))
+                      t)
+               (check "range: content-length is the slice"
+                      (not (null (search "content-length: 10" part))) t)
+               (check "range: body is exactly the slice"
+                      (body-of part) "abcdefghij"))
+             ;; Suffix form — the last 6 bytes.
+             (check "range: suffix form body"
+                    (body-of (fetch (cons "range" "bytes=-6"))) "uvwxyz")
+             ;; Open-ended form — from an offset to the end.
+             (check "range: open-ended body"
+                    (body-of (fetch (cons "range" "bytes=30-"))) "uvwxyz")
+             ;; Out of bounds → 416, and the client is told the real length.
+             (let ((oob (fetch (cons "range" "bytes=100-200"))))
+               (check "range: out-of-bounds is 416"
+                      (not (null (search "416 Range Not Satisfiable" oob))) t)
+               (check "range: 416 reports the resource length"
+                      (not (null (search "content-range: bytes */36" oob))) t))
+             ;; Unsupported shapes fall back to the whole file, not an error.
+             (check "range: multi-range serves full 200"
+                    (not (null (search "200 OK"
+                                       (fetch (cons "range" "bytes=0-9,20-29")))))
+                    t)
+             ;; If-Range: matching ETag honors the range...
+             (check "range: if-range with matching etag honors range"
+                    (body-of (fetch (cons "range" "bytes=0-3")
+                                    (cons "if-range"
+                                          (web-skeleton::static-entry-etag entry))))
+                    "0123")
+             ;; ...and a stale validator serves the whole file instead, so a
+             ;; resumed download can't splice bytes from two versions.
+             (let ((stale (fetch (cons "range" "bytes=0-3")
+                                 (cons "if-range" "\"stale-etag\""))))
+               (check "range: if-range with stale etag serves full 200"
+                      (not (null (search "200 OK" stale))) t)
+               (check "range: if-range stale body is the whole file"
+                      (body-of stale)
+                      "0123456789abcdefghijklmnopqrstuvwxyz"))
+             ;; RFC 7232 §6: a conditional that yields 304 wins over Range —
+             ;; the client already has these bytes.
+             (check "range: if-none-match hit still wins over range"
+                    (not (null (search "304 Not Modified"
+                                       (fetch (cons "range" "bytes=0-3")
+                                              (cons "if-none-match"
+                                                    (web-skeleton::static-entry-etag
+                                                     entry))))))
+                    t)
+             ;; HEAD has no body, so a Range on it is meaningless.
+             (let ((head (let ((bytes (serve-static
+                                       (make-test-request
+                                        :method :HEAD :path "/data.txt"
+                                        :headers (list (cons "range"
+                                                             "bytes=0-3"))))))
+                           (sb-ext:octets-to-string bytes
+                                                    :external-format :latin-1))))
+               (check "range: HEAD ignores range, stays 200"
+                      (not (null (search "200 OK" head))) t)
+               (check "range: HEAD emits no body"
+                      (body-of head) ""))))
+      (setf web-skeleton::*static-cache* saved))))
 
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
@@ -2966,6 +3180,18 @@
          "image/svg+xml")
   (check "mime woff2" (web-skeleton::mime-type-for-path "/font.woff2")
          "font/woff2")
+  (check "mime wasm"  (web-skeleton::mime-type-for-path "/app.wasm")
+         "application/wasm")
+  (check "mime avif"  (web-skeleton::mime-type-for-path "/pic.avif")
+         "image/avif")
+  (check "mime mp4"   (web-skeleton::mime-type-for-path "/clip.mp4")
+         "video/mp4")
+  (check "mime webm"  (web-skeleton::mime-type-for-path "/clip.webm")
+         "video/webm")
+  (check "mime pdf"   (web-skeleton::mime-type-for-path "/doc.pdf")
+         "application/pdf")
+  (check "mime map"   (web-skeleton::mime-type-for-path "/app.js.map")
+         "application/json; charset=utf-8")
   (check "mime unknown" (web-skeleton::mime-type-for-path "/data.xyz")
          "application/octet-stream")
   (check "mime no ext" (web-skeleton::mime-type-for-path "/LICENSE")
@@ -2977,7 +3203,29 @@
   (check "ext dotfile in subdir"
          (web-skeleton::file-extension "/foo/.hidden") nil)
   (check "ext regular in subdir"
-         (web-skeleton::file-extension "/foo/bar.txt") "txt"))
+         (web-skeleton::file-extension "/foo/bar.txt") "txt")
+
+  ;; hidden-path-component-p — the dot-path filter with the RFC 8615
+  ;; .well-known exemption. Exact-component match only.
+  (check "hidden: dot dir"
+         (web-skeleton::hidden-path-component-p ".git/config") t)
+  (check "hidden: nested dot dir"
+         (web-skeleton::hidden-path-component-p "a/.secret/b.txt") t)
+  (check "hidden: dotfile in subdir"
+         (web-skeleton::hidden-path-component-p "sub/.env") t)
+  (check "hidden: .well-known exempt"
+         (web-skeleton::hidden-path-component-p ".well-known/acme/token") nil)
+  (check "hidden: dotfile inside .well-known"
+         (web-skeleton::hidden-path-component-p ".well-known/.hidden") t)
+  (check "hidden: .well-known-evil not exempt"
+         (web-skeleton::hidden-path-component-p ".well-known-evil/x") t)
+  ;; RFC 8615 defines /.well-known/ at the root of the origin and nowhere
+  ;; else, so the exemption is root-only — a nested one means nothing to a
+  ;; client and stays hidden.
+  (check "hidden: nested .well-known not exempt"
+         (web-skeleton::hidden-path-component-p "sub/.well-known/x") t)
+  (check "hidden: plain path"
+         (web-skeleton::hidden-path-component-p "a/b.txt") nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWT tests
@@ -3131,6 +3379,339 @@
              (eq (web-skeleton:register-cleanup fn) fn) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Outbound address filter (SSRF policy hook)
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-address-filter ()
+  (format t "~%Fetch address filter~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii)))
+    ;; Default: no filter installed → every address allowed. This is the
+    ;; property the demo's self-fetch to 127.0.0.1 depends on.
+    (check "no filter: loopback allowed"
+           (web-skeleton::fetch-address-allowed-p #(127 0 0 1) :inet "localhost")
+           t)
+    ;; A filter that refuses.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              nil)))
+      (check "filter refuses: gate returns nil"
+             (web-skeleton::fetch-address-allowed-p #(1 1 1 1) :inet "example.com")
+             nil))
+    ;; A raising filter must fail CLOSED — a bug in app policy must not
+    ;; open the gate, and must not take the worker down either.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              (error "boom"))))
+      (check "filter raises: fails closed"
+             (web-skeleton::fetch-address-allowed-p #(1 1 1 1) :inet "example.com")
+             nil))
+    ;; The intended composition with IS-PUBLIC-ADDRESS-P.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore host))
+              (is-public-address-p ip family))))
+      (check "is-public-address-p filter: public allowed"
+             (web-skeleton::fetch-address-allowed-p #(8 8 8 8) :inet "dns.google")
+             t)
+      (check "is-public-address-p filter: cloud metadata refused"
+             (web-skeleton::fetch-address-allowed-p
+              #(169 254 169 254) :inet "metadata.evil")
+             nil)
+      (check "is-public-address-p filter: loopback refused"
+             (web-skeleton::fetch-address-allowed-p #(127 0 0 1) :inet "localhost")
+             nil))
+
+    ;; ---- Filter applied inside the getent parser ----
+    ;; A refused address falls through to the name's next address rather
+    ;; than failing the lookup outright.
+    (let* ((text (format nil "169.254.169.254 STREAM evil~%~
+                              93.184.216.34   STREAM evil~%"))
+           (buf (bytes text)))
+      (let ((web-skeleton::*fetch-address-filter*
+              (lambda (ip family host)
+                (declare (ignore host))
+                (is-public-address-p ip family))))
+        (check "getent + filter: refused address falls through to next"
+               (coerce (car (web-skeleton::parse-getent-output
+                             buf (length buf) "evil"))
+                       'list)
+               '(93 184 216 34)))
+      ;; Same buffer, no filter → the metadata address wins, proving the
+      ;; fall-through above was the filter's doing and not line ordering.
+      (check "getent, no filter: first STREAM row wins as before"
+             (coerce (car (web-skeleton::parse-getent-output
+                           buf (length buf) "evil"))
+                     'list)
+             '(169 254 169 254)))
+    ;; Every address refused → NIL, which every caller already treats as
+    ;; "did not resolve" (→ 502 + cleanup sentinel). No new failure mode.
+    (let* ((text (format nil "10.0.0.5   STREAM internal~%~
+                              127.0.0.1  STREAM internal~%"))
+           (buf (bytes text))
+           (web-skeleton::*fetch-address-filter*
+             (lambda (ip family host)
+               (declare (ignore host))
+               (is-public-address-p ip family))))
+      (check "getent + filter: all addresses refused yields nil"
+             (web-skeleton::parse-getent-output buf (length buf) "internal")
+             nil))
+
+    ;; ---- Filter applied to the IP-literal fast path ----
+    ;; RESOLVE-HOST-BLOCKING short-circuits on a literal before getent
+    ;; ever runs, so the gate has to be there too or http://169.254.169.254/
+    ;; walks straight past the policy.
+    (let ((web-skeleton::*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore host))
+              (is-public-address-p ip family))))
+      (check "literal fast path: metadata IP refused"
+             (web-skeleton::resolve-host-blocking "169.254.169.254")
+             nil)
+      (check "literal fast path: private IP refused"
+             (web-skeleton::resolve-host-blocking "10.1.2.3")
+             nil)
+      (check "literal fast path: v6 loopback refused"
+             (web-skeleton::resolve-host-blocking "::1")
+             nil)
+      (check "literal fast path: public IP allowed"
+             (coerce (web-skeleton::resolve-host-blocking "93.184.216.34") 'list)
+             '(93 184 216 34)))
+    ;; Default (no filter): literals resolve as before — the demo relies
+    ;; on 127.0.0.1 working here.
+    (check "literal fast path, no filter: loopback still resolves"
+           (coerce (web-skeleton::resolve-host-blocking "127.0.0.1") 'list)
+           '(127 0 0 1))))
+
+;;; ---------------------------------------------------------------------------
+;;; Chunked completion detection (async outbound read path)
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunked-body-complete-p ()
+  (format t "~%Chunked completion~%")
+  (flet ((complete-p (s)
+           (let ((buf (sb-ext:string-to-octets s :external-format :latin-1)))
+             (not (null (web-skeleton::chunked-body-complete-p
+                         buf 0 (length buf)))))))
+    ;; The terminator is what completes a chunked body — not EOF.
+    (check "complete: single chunk + terminator"
+           (complete-p (format nil "5~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    (check "complete: multiple chunks"
+           (complete-p (format nil "3~a~aabc~a~a2~a~ade~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    ;; Terminator not yet arrived → keep reading.
+    (check "incomplete: chunk data but no terminator"
+           (complete-p (format nil "5~a~ahello~a~a"
+                               #\Return #\Newline #\Return #\Newline))
+           nil)
+    (check "incomplete: chunk data short of its declared size"
+           (complete-p (format nil "10~a~ahello" #\Return #\Newline))
+           nil)
+    (check "incomplete: size line without its LF"
+           (complete-p (format nil "5~a" #\Return))
+           nil)
+    (check "incomplete: empty buffer"
+           (complete-p "")
+           nil)
+    ;; Chunk-extensions on the size line are skipped, per RFC 7230 §4.1.1.
+    (check "complete: chunk-extension tolerated"
+           (complete-p (format nil "5;foo=bar~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+           t)
+    ;; Stops at the zero-size header, exactly where decode-chunked-body
+    ;; stops — so a body with trailers is complete without them.
+    (check "complete: zero chunk with trailers still pending"
+           (complete-p (format nil "5~a~ahello~a~a0~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline))
+           t)
+    ;; The one that matters: chunk DATA containing the terminator's exact
+    ;; bytes must not be mistaken for the terminator. A naive suffix check
+    ;; (or a scan for "0\r\n\r\n") truncates the response here; walking the
+    ;; framing and skipping over data does not.
+    (let ((data-that-looks-like-a-terminator
+            (format nil "5~a~a0~a~a~a~a" #\Return #\Newline
+                    #\Return #\Newline #\Return #\Newline)))
+      ;; chunk-size 5, data = "0\r\n\r\n" (5 bytes), then CRLF — and no
+      ;; terminator yet. Must read as INCOMPLETE.
+      (check "incomplete: data whose bytes look like the terminator"
+             (complete-p (concatenate 'string
+                                      data-that-looks-like-a-terminator
+                                      (format nil "~a~a" #\Return #\Newline)))
+             nil)
+      ;; Same body, now with the real terminator appended → complete, and
+      ;; decode-chunked-body agrees on the payload.
+      (let* ((s (concatenate 'string
+                             data-that-looks-like-a-terminator
+                             (format nil "~a~a0~a~a~a~a"
+                                     #\Return #\Newline #\Return #\Newline
+                                     #\Return #\Newline)))
+             (buf (sb-ext:string-to-octets s :external-format :latin-1)))
+        (check "complete: same body once the real terminator lands"
+               (not (null (web-skeleton::chunked-body-complete-p
+                           buf 0 (length buf))))
+               t)
+        (check "decoder agrees: payload is the 5 terminator-looking bytes"
+               (sb-ext:octets-to-string
+                (web-skeleton::decode-chunked-body buf 0 (length buf))
+                :external-format :latin-1)
+               (format nil "0~a~a~a~a" #\Return #\Newline
+                       #\Return #\Newline))))
+    ;; Byte-at-a-time arrival: incomplete at every prefix, complete only
+    ;; once the terminator's final byte lands. This is the property the
+    ;; async read path relies on — it re-checks on every epoll wake-up.
+    (let* ((s (format nil "5~a~ahello~a~a0~a~a~a~a"
+                      #\Return #\Newline #\Return #\Newline
+                      #\Return #\Newline #\Return #\Newline))
+           (buf (sb-ext:string-to-octets s :external-format :latin-1))
+           (full (length buf))
+           ;; complete-at = the shortest prefix that reads as complete
+           (complete-at
+             (loop for n from 0 to full
+                   when (web-skeleton::chunked-body-complete-p buf 0 n)
+                   return n)))
+      ;; "5\r\nhello\r\n0\r\n" is 13 bytes — the zero-size header's LF is
+      ;; the byte that completes it; the trailing CRLF is not needed.
+      (check "streaming: completes exactly when the zero-size line lands"
+             complete-at 13))
+
+    ;; ---- Resume offset ----
+    ;; The walk hands back a chunk-header boundary so a caller polling a
+    ;; growing buffer resumes there instead of rescanning from the top —
+    ;; the difference between O(chunks) and O(chunks^2) over a transfer.
+    ;; The invariant under test: threading the resume offset back in must
+    ;; produce exactly the same answers as a from-scratch scan at every
+    ;; prefix. If it ever disagreed, a chunked response would be declared
+    ;; complete early (truncation) or never (hang).
+    (let* ((s (with-output-to-string (o)
+                ;; 40 one-byte chunks, then the terminator.
+                (dotimes (i 40)
+                  (format o "1~a~a~a~a~a" #\Return #\Newline
+                          (code-char (+ 97 (mod i 26))) #\Return #\Newline))
+                (format o "0~a~a~a~a" #\Return #\Newline #\Return #\Newline)))
+           (buf (sb-ext:string-to-octets s :external-format :latin-1))
+           (full (length buf))
+           (mismatches 0)
+           (resume 0)
+           (resume-complete-at nil)
+           (scratch-complete-at nil))
+      ;; Feed the buffer one byte at a time, exactly as reads would arrive.
+      (loop for n from 0 to full
+            do (multiple-value-bind (complete next)
+                   (web-skeleton::chunked-body-complete-p buf 0 n resume)
+                 (let ((scratch (web-skeleton::chunked-body-complete-p buf 0 n)))
+                   (unless (eq (not complete) (not scratch))
+                     (incf mismatches))
+                   (when (and complete (null resume-complete-at))
+                     (setf resume-complete-at n))
+                   (when (and scratch (null scratch-complete-at))
+                     (setf scratch-complete-at n)))
+                 ;; The resume offset must never move backwards, or the
+                 ;; walk would redo validated framing (or skip past it).
+                 (when (< next resume) (incf mismatches))
+                 (setf resume next)))
+      (check "resume: agrees with a from-scratch scan at every prefix"
+             mismatches 0)
+      (check "resume: completes at the same byte as a from-scratch scan"
+             resume-complete-at scratch-complete-at)
+      (check "resume: advanced past the first chunk (walk is incremental)"
+             (> resume 0) t))))
+
+;;; ---------------------------------------------------------------------------
+;;; DNS cache (opt-in)
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-cache ()
+  (format t "~%DNS cache~%")
+  (let ((v4 (make-array 4 :element-type '(unsigned-byte 8)
+                          :initial-contents '(93 184 216 34))))
+    ;; Default: TTL 0 → caching disabled. A store is a no-op and a lookup
+    ;; always misses, so every fetch re-resolves exactly as before. This is
+    ;; the property that makes the feature safe to ship: nothing changes
+    ;; until an app opts in.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 0))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (check "ttl 0: store is a no-op"
+             (hash-table-count web-skeleton::*dns-cache*) 0)
+      (check "ttl 0: lookup misses"
+             (web-skeleton::dns-cache-lookup "example.com") nil))
+
+    ;; No cache bound (a REPL, a test thread, any non-worker context) —
+    ;; operations no-op instead of reaching for a global.
+    (let ((web-skeleton::*dns-cache* nil)
+          (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (check "no cache bound: lookup misses, no error"
+             (web-skeleton::dns-cache-lookup "example.com") nil))
+
+    ;; Opted in: store then hit.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "example.com" v4 :inet)
+      (multiple-value-bind (ip family)
+          (web-skeleton::dns-cache-lookup "example.com")
+        (check "ttl 60: cache hit returns address"
+               (coerce ip 'list) '(93 184 216 34))
+        (check "ttl 60: cache hit returns family" family :inet))
+      (check "unknown host still misses"
+             (web-skeleton::dns-cache-lookup "other.example") nil))
+
+    ;; Expiry: an entry past its deadline is dropped, not served.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60))
+      (setf (gethash "stale.example" web-skeleton::*dns-cache*)
+            (web-skeleton::make-dns-cache-entry
+             v4 :inet (- (get-universal-time) 1)))   ; expired one second ago
+      (check "expired entry misses"
+             (web-skeleton::dns-cache-lookup "stale.example") nil)
+      (check "expired entry is evicted on lookup"
+             (hash-table-count web-skeleton::*dns-cache*) 0))
+
+    ;; The load-bearing one: a cache hit is re-gated on the address filter,
+    ;; so the cache can never become a DNS-rebinding accelerator. Seed an
+    ;; entry with no filter installed (as an app might, before tightening
+    ;; policy), then install a public-only filter — the cached private
+    ;; address must stop being served AND be evicted.
+    (let* ((loopback (make-array 4 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(127 0 0 1)))
+           (web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+           (web-skeleton::*dns-cache-ttl* 60))
+      (web-skeleton::dns-cache-store "rebind.example" loopback :inet)
+      (check "seeded entry hits with no filter"
+             (coerce (web-skeleton::dns-cache-lookup "rebind.example") 'list)
+             '(127 0 0 1))
+      (let ((web-skeleton::*fetch-address-filter*
+              (lambda (ip family host)
+                (declare (ignore host))
+                (is-public-address-p ip family))))
+        (check "cached address re-gated on filter: refused hit misses"
+               (web-skeleton::dns-cache-lookup "rebind.example") nil)
+        (check "refused entry is evicted"
+               (hash-table-count web-skeleton::*dns-cache*) 0)))
+
+    ;; Bounded: the table never grows past the cap, so a handler fetching
+    ;; attacker-chosen hostnames cannot grow a worker without limit.
+    (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+          (web-skeleton::*dns-cache-ttl* 60)
+          (web-skeleton::*dns-cache-max-entries* 8))
+      (loop for i from 0 below 50
+            do (web-skeleton::dns-cache-store
+                (format nil "host~d.example" i) v4 :inet))
+      (check "cache stays bounded at max-entries"
+             (<= (hash-table-count web-skeleton::*dns-cache*)
+                 web-skeleton::*dns-cache-max-entries*)
+             t))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -3148,16 +3729,20 @@
   (test-fetch)
   (test-dns)
   (test-is-public-address)
+  (test-fetch-address-filter)
+  (test-dns-cache)
   (test-format-peer-addr)
   (test-url-decode)
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
   (test-decode-chunked-body)
+  (test-chunked-body-complete-p)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
   (test-static-etag)
+  (test-static-range)
   (test-jwt)
   (test-shutdown-hooks)
   (report-suite "Server")

@@ -425,12 +425,34 @@
           (unless (or (= errno +einprogress+)
                       (= errno +eagain+))
             (error "connect: ~a" (errno-string errno))))))
-    ;; ROUND here: POLL-WRITABLE takes an int (SB-ALIEN declaration in
-    ;; %POLL). A fractional *FETCH-TIMEOUT* (e.g., 2.5) would flow
-    ;; through as 2500.0 and either trap on the alien boundary or
-    ;; silently truncate depending on compile safety.
-    (unless (poll-writable fd (round (* timeout-seconds 1000)))
-      (error "connect: timed out after ~a seconds" timeout-seconds))
+    ;; poll(2) is not covered by SA_RESTART — a signal delivered to this
+    ;; thread mid-wait returns early with EINTR, which POLL-WRITABLE maps
+    ;; to NIL. NIL therefore means "not writable yet" and conflates a
+    ;; genuine timeout with a mere interruption (SIGTERM during drain,
+    ;; SIGCHLD from a getent child reaped on a busy worker). A single
+    ;; poll + (unless ... error) reported those interruptions as
+    ;; "connect: timed out after 30 seconds" a few milliseconds into the
+    ;; budget — an operator chasing that message looks at the network,
+    ;; not at signal delivery. Loop against a wall-clock deadline and
+    ;; re-poll for the time that is actually left: an interrupted wait
+    ;; resumes, and a real timeout still lands on the error because the
+    ;; remaining budget reaches zero.
+    ;;
+    ;; ROUND on the remaining milliseconds: POLL-WRITABLE takes an int
+    ;; (SB-ALIEN declaration in %POLL), so a fractional *FETCH-TIMEOUT*
+    ;; (e.g. 2.5) must not flow through as a float — it would trap or
+    ;; truncate at the alien boundary depending on compile safety.
+    (let ((deadline (+ (get-internal-real-time)
+                       (round (* timeout-seconds
+                                 internal-time-units-per-second)))))
+      (loop
+        (let ((remaining-ms
+                (round (* 1000 (- deadline (get-internal-real-time)))
+                       internal-time-units-per-second)))
+          (when (<= remaining-ms 0)
+            (error "connect: timed out after ~a seconds" timeout-seconds))
+          (when (poll-writable fd remaining-ms)
+            (return)))))
     (let ((err (get-socket-option-int fd +sol-socket+ +so-error+)))
       (unless (zerop err)
         (error "connect: ~a" (errno-string err))))
