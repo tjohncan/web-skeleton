@@ -2009,22 +2009,27 @@
                t)
       (close stream)))
 
-  ;; Bodiless responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1, RFC
-  ;; 7231 §4.3.2. 1xx / 204 / 304 / HEAD terminate at the header-end
+  ;; Bodiless FINAL responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1,
+  ;; RFC 7231 §4.3.2. 204 / 304 / HEAD terminate at the header-end
   ;; empty line regardless of CL / TE. Before the exempt was ported
   ;; to streaming, a 204 with a leftover CL raised "short body" and a
   ;; 304 with chunked framing blocked waiting for chunk-size bytes
   ;; that would never arrive. Symmetric with complete-fetch's
   ;; exempt set on the buffered path.
+  ;;
+  ;; 1xx deliberately does NOT appear here. It used to: 100 and 199
+  ;; were listed as "bodiless" and the reader returned them as the
+  ;; final status. That was the A1 defect — RFC 7231 §6.2 makes a 1xx
+  ;; interim by definition, so an upstream that sends one and then
+  ;; closes has not delivered a response at all, and reporting 103 as
+  ;; the result silently discards the real one. Interim handling is
+  ;; covered by TEST-INTERIM-RESPONSES, which asserts both that a 1xx
+  ;; is stepped over and that a lone 1xx followed by EOF raises.
   (dolist (spec '((204 "Content-Length: 500")
                   (304 "Content-Length: 500")
-                  (304 "Transfer-Encoding: chunked")
-                  (100 "Content-Length: 500")
-                  (199 "Content-Length: 500")))
+                  (304 "Transfer-Encoding: chunked")))
     (destructuring-bind (status-code framing-line) spec
       (let* ((reason (case status-code
-                       (100 "Continue")
-                       (199 "Experimental")
                        (204 "No Content")
                        (304 "Not Modified")))
              (raw (ascii-bytes
@@ -2256,6 +2261,201 @@
           (check "HEAD stream: status" status 200)
           (check "HEAD stream: zero body lines" (length lines) 0))
       (close stream))))
+
+;;; ---------------------------------------------------------------------------
+;;; Upstream 1xx interim responses (RFC 7231 §6.2)
+;;;
+;;; A 1xx block is terminated by its own empty line and carries no body, so
+;;; the final response begins immediately after it. Every buffered reader
+;;; anchors on a CRLFCRLF to find where headers end, so without a skip that
+;;; first boundary is the *interim's* terminator: the interim's status and
+;;; headers become the fetch's, the body is forced empty by the bodiless
+;;; exempt set, and the real response is discarded with no error.
+;;;
+;;; This is not a shape an app can avoid by configuration — `103 Early
+;;; Hints` (RFC 8297) is sent unsolicited by Cloudflare and Fastly, and
+;;; Apache emits it under H2EarlyHints.
+;;;
+;;; The framing predicate has to skip too. An interim carries no
+;;; Content-Length, so anchoring on it makes a CL-framed 200 look
+;;; close-delimited — which is how the fetch used to hang for the full
+;;; *FETCH-TIMEOUT* against any upstream that keeps the connection alive.
+;;; The regression cases below (plain 200, 204, partial interim) matter as
+;;; much as the fix cases.
+;;; ---------------------------------------------------------------------------
+
+(defun test-interim-responses ()
+  (format t "~%Interim 1xx responses~%")
+  (flet ((skip (s)
+           (let ((buf (ascii-bytes s)))
+             (web-skeleton::skip-interim-responses buf 0 (length buf))))
+         (status-after-skip (s)
+           (let* ((buf (ascii-bytes s)) (end (length buf))
+                  (sk (web-skeleton::skip-interim-responses buf 0 end)))
+             (web-skeleton::parse-response-status buf sk end)))
+         (complete-p (s method)
+           (let ((buf (ascii-bytes s)))
+             (not (null (web-skeleton::outbound-response-complete-p
+                         buf (length buf) method 0))))))
+
+    ;; ---- skip offsets ----
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints"
+                                "Link: </s.css>; rel=preload")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: 103 skipped"            (skip s) 57)
+      (check "interim: 103 then status is 200" (status-after-skip s) 200)
+      (check "interim: 103 then CL-framed completes" (complete-p s :GET) t))
+
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 100 Continue")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: 100 then status is 200" (status-after-skip s) 200)
+      (check "interim: 100 then CL-framed completes" (complete-p s :GET) t))
+
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 100 Continue")
+                          (crlf "HTTP/1.1 103 Early Hints" "Link: <a>")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: two blocks then status is 200"
+             (status-after-skip s) 200)
+      (check "interim: two blocks then completes" (complete-p s :GET) t))
+
+    ;; Chunked after an interim — the framing predicate must read TE from
+    ;; the FINAL block's headers, not the interim's (which has none).
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints")
+                          (crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked")
+                          "5" *crlf* "hello" *crlf* "0" *crlf* *crlf*)))
+      (check "interim: chunked after interim completes on terminator"
+             (complete-p s :GET) t))
+
+    ;; ---- regressions: nothing without an interim may move ----
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim regression: plain 200 skip is 0"  (skip s) 0)
+      (check "interim regression: plain 200 status"     (status-after-skip s) 200)
+      (check "interim regression: plain 200 completes"  (complete-p s :GET) t))
+
+    ;; 204 is a final status, not an interim — it must never be skipped.
+    (let ((s (crlf "HTTP/1.1 204 No Content")))
+      (check "interim regression: 204 not skipped" (skip s) 0)
+      (check "interim regression: 204 status"      (status-after-skip s) 204))
+
+    ;; ---- partial reads: skip must not mis-anchor ----
+    ;; A half-buffered interim yields START unchanged, so the read loop
+    ;; simply waits for more bytes.
+    (let ((s "HTTP/1.1 103 Early Hints\r\nLink: <a>\r\n"))
+      (check "interim: partial interim yields start" (skip s) 0)
+      (check "interim: partial interim is incomplete" (complete-p s :GET) nil))
+    ;; Complete interim, partial final — skip advances past the interim and
+    ;; the predicate still says "keep reading".
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints")
+                          "HTTP/1.1 200 OK\r\nContent-Len")))
+      (check "interim: complete interim + partial final skips interim"
+             (skip s) 28)
+      (check "interim: complete interim + partial final is incomplete"
+             (complete-p s :GET) nil))
+
+    ;; ---- cap: exactly at the limit must pass, one over must raise ----
+    ;; The boundary is the whole point. A test that only feeds a wildly
+    ;; over-cap count passes whether the loop allows N or N-1, which is
+    ;; how an off-by-one here survived: the buffered walk consumes one
+    ;; block per iteration, so it needs N+1 iterations to accept N
+    ;; interims and still recognise the final response. Iterating only N
+    ;; times rejected the Nth while the streaming paths — which count with
+    ;; a separate (> count cap) test — accepted it, and the two transports
+    ;; disagreed about their own documented limit.
+    (flet ((n-interims (n)
+             (with-output-to-string (o)
+               (dotimes (i n)
+                 (declare (ignorable i))
+                 (write-string (crlf "HTTP/1.1 103 Early Hints") o))
+               (write-string (crlf "HTTP/1.1 200 OK" "Content-Length: 0") o))))
+      (check "interim cap: exactly *max-interim-responses* is accepted"
+             (status-after-skip (n-interims web-skeleton:*max-interim-responses*))
+             200)
+      (check-error "interim cap: one over raises"
+                   (skip (n-interims (1+ web-skeleton:*max-interim-responses*))))
+      ;; And the streaming path must agree on the same boundary — the
+      ;; two implementations count differently, so only a paired test
+      ;; keeps them honest.
+      (check "interim cap: streaming accepts exactly the cap"
+             (let ((stream (make-mock-stream
+                            (ascii-bytes
+                             (n-interims web-skeleton:*max-interim-responses*)))))
+               (unwind-protect
+                    (web-skeleton::stream-response-lines stream nil)
+                 (close stream)))
+             200)
+      (check-error "interim cap: streaming raises one over"
+                   (let ((stream (make-mock-stream
+                                  (ascii-bytes
+                                   (n-interims
+                                    (1+ web-skeleton:*max-interim-responses*))))))
+                     (unwind-protect
+                          (web-skeleton::stream-response-lines stream nil)
+                       (close stream))))
+      ;; The knob is exported like every other limit, so an app behind a
+      ;; chatty CDN can raise it.
+      (check "*max-interim-responses* exported from :web-skeleton"
+             (nth-value 1 (find-symbol "*MAX-INTERIM-RESPONSES*" :web-skeleton))
+             :external)))
+
+  ;; ---- streaming path: must re-enter the header phase, not report 103 ----
+  (flet ((stream-lines (raw &key (method :GET))
+           (let ((lines nil)
+                 (stream (make-mock-stream (ascii-bytes raw))))
+             (unwind-protect
+                  (let ((status (web-skeleton::stream-response-lines
+                                 stream (lambda (l) (push l lines))
+                                 :method method)))
+                    (list status (nreverse lines)))
+               (close stream)))))
+
+    (check "interim streaming: 103 then CL body"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 103 Early Hints" "Link: </s.css>")
+                         (crlf "HTTP/1.1 200 OK" "Content-Length: 14")
+                         "line-a" (string #\Newline)
+                         "line-b" (string #\Newline)))
+           '(200 ("line-a" "line-b")))
+
+    (check "interim streaming: 103 then chunked body"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 103 Early Hints")
+                         (crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked")
+                         "7" *crlf* "{\"n\":1}" *crlf* "0" *crlf* *crlf*))
+           '(200 ("{\"n\":1}")))
+
+    (check "interim streaming regression: plain 200 unchanged"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 200 OK" "Content-Length: 14")
+                         "line-a" (string #\Newline)
+                         "line-b" (string #\Newline)))
+           '(200 ("line-a" "line-b")))
+
+    (check "interim streaming regression: 204 still bodiless"
+           (stream-lines (crlf "HTTP/1.1 204 No Content" "Content-Length: 500"))
+           '(204 ()))
+
+    (check "interim streaming regression: HEAD still bodiless"
+           (stream-lines (crlf "HTTP/1.1 200 OK" "Content-Length: 42")
+                         :method :HEAD)
+           '(200 ()))
+
+    ;; An upstream that sends only an interim and then closes has not sent
+    ;; a response at all — that must be loud, not a silent 103.
+    (check-error "interim streaming: interim then EOF raises"
+                 (stream-lines (crlf "HTTP/1.1 103 Early Hints")))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Buffered chunked body decoding tests
@@ -3736,6 +3936,7 @@
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
   (test-websocket)

@@ -116,6 +116,7 @@
            #:*max-body-size*
            #:*max-outbound-response-size*
            #:*max-streaming-line-size*
+           #:*max-interim-responses*
            #:*json-max-depth*
            #:*json-max-string-length*
            #:*max-ws-payload-size*

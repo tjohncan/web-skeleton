@@ -456,12 +456,20 @@
                 ;; an HTTP status.
                 (let* ((response-buf (tls-read-all ssl :method method))
                        (buf-len (length response-buf))
-                       (header-end (scan-crlf-crlf response-buf 0 buf-len)))
+                       ;; Step over any 1xx interim blocks (RFC 7231 §6.2)
+                       ;; before locating the header boundary — a CDN's
+                       ;; unsolicited 103 Early Hints would otherwise supply
+                       ;; the status and headers this fetch reports, and the
+                       ;; real response would be dropped without a word.
+                       ;; Same helper the plain-HTTP path uses, so the two
+                       ;; transports cannot drift on where a response starts.
+                       (start (skip-interim-responses response-buf 0 buf-len))
+                       (header-end (scan-crlf-crlf response-buf start buf-len)))
                   (unless header-end
                     (error "https: upstream response has no parseable headers"))
-                  (let* ((status (parse-response-status response-buf 0 buf-len))
+                  (let* ((status (parse-response-status response-buf start buf-len))
                          (headers
-                          (let ((first-crlf (scan-crlf response-buf 0 header-end)))
+                          (let ((first-crlf (scan-crlf response-buf start header-end)))
                             (when first-crlf
                               (parse-headers-bytes response-buf
                                                    (+ first-crlf 2)
@@ -472,10 +480,10 @@
                          ;; RFC 7230 §3.3.3 rule 3: any TE present means
                          ;; CL is ignored — read-until-close, not CL-framed.
                          (te-present (scan-transfer-encoding response-buf
-                                                             header-end))
+                                                             header-end start))
                          (content-length (unless te-present
                                            (scan-content-length response-buf
-                                                                header-end))))
+                                                                header-end start))))
                     (unless status
                       (error "https: upstream status line unparseable"))
                     ;; Truncation guard: an upstream that declares a
@@ -487,14 +495,17 @@
                     ;; handler-case converts it into a 502 and fires
                     ;; the cleanup sentinel.
                     ;;
-                    ;; Skipped for 1xx/204/304 (carry CL but MUST NOT
+                    ;; Skipped for 204/304 (carry CL but MUST NOT
                     ;; have a body per RFC 7230 §3.3.3 rule 1 / RFC 7232
                     ;; §4.1) and for HEAD (RFC 7231 §4.3.2 — upstream
                     ;; echoes the GET-body CL but MUST NOT send a body).
                     ;; Twin of the exemption in fetch.lisp COMPLETE-FETCH
-                    ;; on the plain-HTTP path.
+                    ;; on the plain-HTTP path, 1xx included: the skip
+                    ;; above has consumed every complete interim, so
+                    ;; STATUS is >= 200 here and testing for 1xx would be
+                    ;; dead code implying an interim could be final.
                     (when (and content-length
-                               (not (or (<= 100 status 199) (= status 204) (= status 304)))
+                               (not (or (= status 204) (= status 304)))
                                (not (eq method :HEAD))
                                (< (- buf-len body-start) content-length))
                       (error "https: short body (~d of ~d bytes)"
@@ -502,10 +513,11 @@
                     (let* ((body-end (if content-length
                                          (min buf-len (+ body-start content-length))
                                          buf-len))
-                           ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
+                           ;; 204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
                            ;; HEAD MUST NOT include a body (RFC 7231 §4.3.2).
                            ;; Force empty regardless of what the upstream sent.
-                           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304)
+                           ;; 1xx cannot reach here — see the guard above.
+                           (body-end (if (or (= status 204) (= status 304)
                                              (eq method :HEAD))
                                          body-start
                                          body-end))
@@ -627,6 +639,10 @@
         (in-headers t)
         (header-count 0)
         (total-header-bytes 0)
+        ;; Count of 1xx interim blocks stepped over so far (RFC 7231
+        ;; §6.2). Bounded by *MAX-INTERIM-RESPONSES* so an upstream
+        ;; cannot feed well-formed interim blocks forever.
+        (interims 0)
         ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
         ;; line terminators. PREV-CR carries across SSL-read
         ;; iterations so a CRLF pair split at a TLS record boundary
@@ -698,27 +714,51 @@
                              ((= byte 10)
                               (let ((line (emit-line)))
                                 (if (zerop (length line))
-                                    (progn
-                                      (setf in-headers nil)
-                                      (when chunked (setf in-chunk-size t))
-                                      ;; Bodiless responses — 1xx / 204
-                                      ;; / 304 / HEAD. RFC 7230 §3.3.3
-                                      ;; rule 1, RFC 7232 §4.1, RFC 7231
-                                      ;; §4.3.2: empty-line header
-                                      ;; boundary terminates regardless
-                                      ;; of CL / TE. Skip body phase and
-                                      ;; its truncation checks.
-                                      ;; Symmetric with the exempt set
-                                      ;; in complete-fetch's buffered
-                                      ;; path.
-                                      (when (or (eq method :HEAD)
-                                                (and status
-                                                     (or (<= 100 status 199)
-                                                         (= status 204)
-                                                         (= status 304))))
-                                        (return-from tls-stream-response
-                                          (or status
-                                              (error "https streaming: no parseable status line")))))
+                                    (cond
+                                      ;; 1xx interim block (RFC 7231 §6.2).
+                                      ;; It is terminated by this empty line,
+                                      ;; carries no body, and is never the
+                                      ;; final response — so the next status
+                                      ;; line follows immediately. Reset the
+                                      ;; per-block state and stay in the
+                                      ;; header phase rather than reporting
+                                      ;; 103 as the result and streaming
+                                      ;; nothing. Checked before the HEAD arm
+                                      ;; because a HEAD request can receive an
+                                      ;; interim too.
+                                      ((and status (<= 100 status 199))
+                                       (incf interims)
+                                       (when (> interims *max-interim-responses*)
+                                         (error "https streaming: more than ~d ~
+                                                 interim responses"
+                                                *max-interim-responses*))
+                                       (setf status             nil
+                                             chunked            nil
+                                             te-present         nil
+                                             content-length     nil
+                                             first-line         t
+                                             header-count       0
+                                             total-header-bytes 0))
+                                      (t
+                                       (setf in-headers nil)
+                                       (when chunked (setf in-chunk-size t))
+                                       ;; Bodiless FINAL responses — 204 /
+                                       ;; 304 / HEAD. RFC 7230 §3.3.3 rule 1,
+                                       ;; RFC 7232 §4.1, RFC 7231 §4.3.2:
+                                       ;; the empty-line header boundary
+                                       ;; terminates regardless of CL / TE.
+                                       ;; Skip body phase and its truncation
+                                       ;; checks. Symmetric with the exempt
+                                       ;; set in complete-fetch's buffered
+                                       ;; path. 1xx is handled by the arm
+                                       ;; above and never reaches here.
+                                       (when (or (eq method :HEAD)
+                                                 (and status
+                                                      (or (= status 204)
+                                                          (= status 304))))
+                                         (return-from tls-stream-response
+                                           (or status
+                                               (error "https streaming: no parseable status line"))))))
                                     (progn
                                       (incf header-count)
                                       (when (> header-count *max-header-count*)
