@@ -34,6 +34,14 @@
    on STRING= against NIL)."
   (let* ((jwks (json-parse json-string))
          (keys-array (json-get jwks "keys"))
+         ;; "keys" must be an array. A JWKS with "keys": {} or a scalar is
+         ;; malformed per RFC 7517 §5, and LOOP FOR ... IN on a non-list
+         ;; raises a raw SBCL type error out of a function with no
+         ;; handler-case. Reject with the same shape as every other JWKS
+         ;; complaint so an issuer bug reads as an issuer bug.
+         (keys-array (cond ((null keys-array) nil)
+                           ((listp keys-array) keys-array)
+                           (t (error "JWKS: \"keys\" must be an array"))))
          (keys
           (loop for key-obj in keys-array
                 for kty = (json-get key-obj "kty")
@@ -82,8 +90,14 @@
 
 (defun jwt-verify (token keys)
   "Verify a JWT token string against a list of JWT-KEY structs.
-   Returns the claims as an alist if valid, NIL if invalid.
-   Checks: algorithm is ES256, signature is valid, token is not expired."
+   Returns the claims as a JSON-OBJECT if valid, NIL if invalid — read
+   them with JWT-CLAIM (or JSON-GET, which JWT-CLAIM is a thin alias for).
+   Checks: algorithm is ES256, signature is valid, token is not expired.
+
+   The claims value is always non-NIL on success, including for a token
+   whose payload is {}. It used to be a bare alist, so an empty-but-valid
+   claim set came back as NIL and was indistinguishable from a rejected
+   token at the call site."
   (handler-case
       (let ((parts (jwt-split token)))
         (unless (= (length parts) 3)
@@ -148,7 +162,7 @@
     (error () nil)))
 
 (defun jwt-claim (claims key)
-  "Extract a claim value from a JWT claims alist."
+  "Extract a claim value from the JSON-OBJECT returned by JWT-VERIFY."
   (json-get claims key))
 
 ;;; ---------------------------------------------------------------------------

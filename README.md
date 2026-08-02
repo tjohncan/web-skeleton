@@ -182,7 +182,15 @@ tests/
 - **Path matching** — `match-path` matches URL paths against patterns
   with `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
 - **JSON** — full parser and serializer (RFC 8259).
-  Objects become alists, arrays become lists.
+  Objects become `json-object` structs (read with `json-get`, which also
+  accepts a bare alist); arrays become lists. `{}`, `[]`, and `null` are
+  three distinct values that each round-trip to themselves.
+  Objects are a distinct type rather than a bare alist because the two are
+  otherwise the same Lisp object — an array of `[string, value]` pairs and
+  an alist are indistinguishable, so a serializer that guessed re-emitted
+  `[["a",1],["b",2]]` as `{"a":[1],"b":[2]}`: well-formed and silently wrong.
+  To emit an object from data you built yourself, wrap it:
+  `(json-serialize (make-json-object '(("a" . 1))))`.
   Handles all escape sequences including `\uXXXX` and surrogate pairs
 - **SHA-1** & **SHA-256** — complete implementations per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication

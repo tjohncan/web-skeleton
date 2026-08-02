@@ -79,6 +79,10 @@
            #:json-parse
            #:json-serialize
            #:json-get
+           #:json-object
+           #:make-json-object
+           #:json-object-p
+           #:json-object-alist
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd

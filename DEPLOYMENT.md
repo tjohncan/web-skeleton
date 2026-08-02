@@ -146,8 +146,11 @@ Check Origin in your handler before returning `:upgrade`:
 
 ### JWT issuer and audience
 
-`jwt-verify` checks the signature, expiration, and not-before claims.
-It does **not** check `iss` (issuer) or `aud` (audience).
+`jwt-verify` checks the signature, and checks `exp` / `nbf` **when those claims
+are present**. Both are OPTIONAL per RFC 7519 §4.1, so a token that simply omits
+`exp` verifies and never expires — "signature valid" is not the same as "safe to
+act on." If your issuer can mint tokens without `exp`, check for it yourself.
+`jwt-verify` also does **not** check `iss` (issuer) or `aud` (audience).
 If your JWKS key set is shared across services, always verify these:
 
 ```lisp
@@ -629,14 +632,56 @@ since browsers match Set-Cookie to stored cookies on those two fields:
 (add-response-header resp "set-cookie" (delete-cookie "session"))
 ```
 
-### JSON empty containers
+### JSON objects are a distinct type
 
-`json-parse` returns NIL for both `{}` and `[]`.
-`json-serialize` on NIL produces `"null"`.
-This means empty objects and arrays do not round-trip — they collapse to null.
-This is a deliberate design choice (CL's NIL is the natural empty representation).
-If the distinction matters for your use case, check the raw JSON string
-or use `:NULL` for explicit null.
+`json-parse` returns a `json-object` struct for a JSON object, and a plain list
+for a JSON array:
+
+| JSON | Lisp |
+|---|---|
+| `{"a":1}` | `json-object` wrapping `(("a" . 1))` |
+| `[1,2]` | `(1 2)` |
+| `{}` | empty `json-object` |
+| `[]` | `NIL` |
+| `null` | `:NULL` |
+
+All three empty forms round-trip to themselves.
+
+**Reading is unchanged.** `json-get` accepts a `json-object` *or* a bare alist,
+so handler code written against either representation works:
+
+```lisp
+(json-get (json-parse body) "user_id")
+```
+
+`json-object-alist` gets the underlying alist when you need to walk it, and
+`json-object-p` is the shape test — **not** `listp`, which a struct fails.
+
+**Writing needs a wrapper.** A bare alist serializes as an array of pairs:
+
+```lisp
+(json-serialize (make-json-object '(("ok" . t) ("count" . 3))))  ; => {"ok":true,"count":3}
+(json-serialize '(("ok" . t)))                                    ; => raises
+```
+
+The raise is deliberate and names the fix — a dotted pair is not a valid array
+element, so the mistake surfaces at the call site rather than as a
+well-formed-but-wrong document.
+
+**Why objects are typed rather than guessed.** An alist and an array of
+`[string, value]` pairs are the same Lisp object:
+
+```lisp
+(json-parse "[[\"a\",1]]")   ; => (("a" 1))   =  (("a" . (1)))
+'(("options" . (("temp" . 0.8))))              ;  (("options" ("temp" . 0.8)))
+```
+
+Both are `(string . cons)`. A serializer handed a bare list cannot tell an array
+of pairs from an alist with a structured value, so any rule that emits `{…}` for
+the second emits it for the first — which is how `[["a",1],["b",2]]` used to come
+back out as `{"a":[1],"b":[2]}`. Well-formed, silently wrong, no error anywhere.
+The information is destroyed at parse time, so no heuristic downstream can
+recover it; typing objects is the only fix that works in both directions.
 
 ### Query parameter parsing
 

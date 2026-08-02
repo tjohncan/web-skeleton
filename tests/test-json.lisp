@@ -38,26 +38,44 @@
   (check "mixed array" (json-parse "[1,\"two\",true]") '(1 "two" t))
   (check "nested array" (json-parse "[[1],[2]]") '((1) (2)))
 
-  ;; Objects
-  (check "empty object" (json-parse "{}") nil)
+  ;; Objects — a JSON-OBJECT struct, read via json-get or the alist slot.
+  ;; An empty object is an EMPTY object, not NIL: that is what keeps {}
+  ;; distinguishable from [] and from null.
+  (check "empty object is an empty json-object"
+         (json-object-alist (json-parse "{}")) nil)
+  (check "empty object is not NIL"
+         (null (json-parse "{}")) nil)
+  (check "empty object is a json-object"
+         (json-object-p (json-parse "{}")) t)
   (check "simple object"
-         (json-parse "{\"name\":\"ankle\",\"size\":4444}")
+         (json-object-alist (json-parse "{\"name\":\"ankle\",\"size\":4444}"))
          '(("name" . "ankle") ("size" . 4444)))
   (check "nested object"
-         (json-get (json-parse "{\"outer\":{\"inner\":\"deep\"}}") "outer")
+         (json-object-alist
+          (json-get (json-parse "{\"outer\":{\"inner\":\"deep\"}}") "outer"))
          '(("inner" . "deep")))
+  (check "json-get reads a json-object"
+         (json-get (json-parse "{\"a\":1}") "a") 1)
+  ;; json-get still accepts a bare alist so handler code written against
+  ;; the old representation keeps working.
+  (check "json-get still accepts a bare alist"
+         (json-get '(("a" . 1)) "a") 1)
+  (check "json-get on a non-object returns nil, does not raise"
+         (json-get "not-an-object" "a") nil)
 
   ;; Whitespace tolerance
   (check "whitespace"
-         (json-parse "  { \"a\" : 1 , \"b\" : 2 }  ")
+         (json-object-alist (json-parse "  { \"a\" : 1 , \"b\" : 2 }  "))
          '(("a" . 1) ("b" . 2)))
 
   ;; Real-world: JWT header
   (check "jwt header"
-         (json-parse "{\"alg\":\"ES256\",\"typ\":\"JWT\"}")
+         (json-object-alist (json-parse "{\"alg\":\"ES256\",\"typ\":\"JWT\"}"))
          '(("alg" . "ES256") ("typ" . "JWT")))
 
-  ;; Real-world: JWKS fragment
+  ;; Real-world: JWKS fragment. The "keys" value is an ARRAY of objects,
+  ;; so it stays a list whose elements are JSON-OBJECTs — exactly the walk
+  ;; PARSE-JWKS performs.
   (let ((jwks (json-parse "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"key-1\",\"x\":\"abc\",\"y\":\"def\"}]}")))
     (check "jwks keys array"
            (length (json-get jwks "keys")) 1)
@@ -130,7 +148,12 @@
   (check "ser true" (json-serialize t) "true")
   (check "ser false" (json-serialize :false) "false")
   (check "ser null" (json-serialize :null) "null")
-  (check "ser nil" (json-serialize nil) "null")
+  ;; NIL is the empty list, so it emits []. Explicit null is :NULL and an
+  ;; empty object is an empty JSON-OBJECT — the three used to collapse
+  ;; onto "null" and now each round-trips to itself.
+  (check "ser nil is []" (json-serialize nil) "[]")
+  (check "ser empty json-object is {}"
+         (json-serialize (make-json-object nil)) "{}")
   (check "ser float" (json-serialize 3.14d0) "3.14")
   (check "ser float large" (json-serialize 1.0d7) "1.0e7")
   (check "ser float small" (json-serialize 1.0d-4) "1.0e-4")
@@ -168,22 +191,59 @@
            (signals-error-p
             (lambda () (json-serialize '(("a" . 1) ("b" . 2) . 3)))) t))
 
-  ;; Objects (alists with string keys)
+  ;; Objects — MAKE-JSON-OBJECT is what emits {...}. A bare alist is an
+  ;; array of pairs now; see the A2 block below for why.
   (check "ser object"
-         (json-serialize '(("name" . "ankle") ("size" . 4444)))
+         (json-serialize
+          (make-json-object '(("name" . "ankle") ("size" . 4444))))
          "{\"name\":\"ankle\",\"size\":4444}")
 
-  ;; Nested
+  ;; Nested — an object whose value is an array.
   (check "ser nested"
-         (json-serialize '(("items" . (1 2 3)) ("count" . 3)))
+         (json-serialize
+          (make-json-object (list (cons "items" '(1 2 3))
+                                  (cons "count" 3))))
          "{\"items\":[1,2,3],\"count\":3}")
 
-  ;; Round-trip
-  (let ((data '(("users" . ((("id" . 1) ("name" . "heel"))
-                             (("id" . 2) ("name" . "ankle")))))))
-    (check "round-trip"
-           (json-parse (json-serialize data))
-           data))
+  ;; Round-trip through parse: whatever json-parse produces must
+  ;; re-serialize to the identical document.
+  (let ((doc "{\"users\":[{\"id\":1,\"name\":\"heel\"},{\"id\":2,\"name\":\"ankle\"}]}"))
+    (check "round-trip nested objects in an array"
+           (json-serialize (json-parse doc)) doc))
+
+  ;; ---- A2: arrays of pairs must stay arrays ----
+  ;; The serializer used to decide "object vs array" by testing whether
+  ;; every element was a cons with a string car. An array whose elements
+  ;; are two-element arrays beginning with a string satisfies that test,
+  ;; so [["a",1],["b",2]] came back out as {"a":[1],"b":[2]} — well-formed,
+  ;; silently wrong, no error anywhere. That shape is not exotic: it is how
+  ;; Object.entries(), tabular payloads, and header lists serialize.
+  ;; Objects are a distinct type now, so no guessing happens.
+  (dolist (doc '("[[\"a\",1],[\"b\",2]]"
+                 "[[\"a\",1]]"
+                 "[[\"k\",\"v\"],[\"k2\",\"v2\"],[\"k3\",\"v3\"]]"
+                 "{\"a\":{},\"b\":[]}"
+                 "{\"a\":null,\"b\":[]}"
+                 "[[],{},null]"
+                 "{}"
+                 "[]"
+                 "null"
+                 "[{\"a\":1},{\"a\":2}]"
+                 "{\"outer\":{\"inner\":[[\"x\",1]]}}"))
+    (check (format nil "A2 round-trip ~a" doc)
+           (json-serialize (json-parse doc)) doc))
+
+  ;; A hand-built alist is an array of pairs, and a dotted pair is not a
+  ;; valid array element — so the mistake surfaces as a loud error naming
+  ;; the fix, never as a well-formed-but-wrong document.
+  (flet ((error-text (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error (e) (princ-to-string e)))))
+    (let ((msg (error-text (lambda () (json-serialize '(("a" . 1)))))))
+      (check "ser bare alist raises"
+             (not (null msg)) t)
+      (check "ser bare alist error names MAKE-JSON-OBJECT"
+             (not (null (search "MAKE-JSON-OBJECT" msg))) t)))
 
   ;; Float error cases
   (flet ((signals-error-p (thunk)
@@ -201,7 +261,8 @@
   ;; Leading UTF-8 BOM (U+FEFF) silently skipped per RFC 8259 §8.1.
   ;; Windows text editors and some encoders prepend one.
   (check "BOM stripped from JSON input"
-         (json-parse (format nil "~a{\"x\":1}" (string (code-char #xFEFF))))
+         (json-object-alist
+          (json-parse (format nil "~a{\"x\":1}" (string (code-char #xFEFF)))))
          '(("x" . 1)))
   (check "BOM-only input still errors cleanly"
          (handler-case

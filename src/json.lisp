@@ -4,7 +4,7 @@
 ;;; JSON Parser and Serializer (RFC 8259)
 ;;;
 ;;; Parse: JSON string -> Lisp data
-;;;   Objects  -> alists  ((key . value) ...)
+;;;   Objects  -> JSON-OBJECT struct wrapping an alist ((key . value) ...)
 ;;;   Arrays   -> lists   (value ...)
 ;;;   Strings  -> strings
 ;;;   Numbers  -> integers or floats
@@ -13,15 +13,42 @@
 ;;;   null     -> :NULL
 ;;;
 ;;; Serialize: Lisp data -> JSON string
-;;;   alists   -> objects (when car of first element is a string)
-;;;   lists    -> arrays
-;;;   strings  -> strings
-;;;   integers -> numbers
-;;;   floats   -> numbers
-;;;   T        -> true
-;;;   :FALSE   -> false
-;;;   :NULL    -> null
-;;;   NIL      -> null
+;;;   JSON-OBJECT -> object
+;;;   lists       -> arrays
+;;;   strings     -> strings
+;;;   integers    -> numbers
+;;;   floats      -> numbers
+;;;   T           -> true
+;;;   :FALSE      -> false
+;;;   :NULL       -> null
+;;;   NIL         -> [] (NIL is the empty list in Common Lisp)
+;;;
+;;; Why objects are a distinct type rather than a bare alist
+;;; -------------------------------------------------------
+;;; They used to be bare alists, and the serializer guessed which of the
+;;; two a list was by testing whether every element was a cons with a
+;;; string car. That test cannot be made correct, because the two shapes
+;;; are the same Lisp object:
+;;;
+;;;   [["a",1],["b",2]]  parses to  (("a" 1) ("b" 2))
+;;;   {"a":1,"b":2}      parses to  (("a" . 1) ("b" . 2))
+;;;
+;;; ...and an alist whose values happen to be lists — (("items" . (1 2 3)))
+;;; — is indistinguishable from an array of arrays. So an ordinary array of
+;;; key/value pairs (Object.entries output, CSV-ish rows, header lists) came
+;;; back out as an object: [["a",1],["b",2]] re-serialized to {"a":[1],"b":[2]}.
+;;; Well-formed, silently wrong, no error anywhere. The information was
+;;; destroyed at parse time, so no heuristic downstream could recover it.
+;;;
+;;; Typing objects fixes the round trip in both directions and lets {} and
+;;; [] stop colliding: {} is an empty JSON-OBJECT, [] is NIL, and null is
+;;; :NULL — three distinct values that each serialize back to themselves.
+;;;
+;;; Consequence for hand-built data: a bare alist is now an ARRAY of pairs.
+;;; Wrap it in MAKE-JSON-OBJECT to emit an object. This fails loudly rather
+;;; than silently — a dotted pair is not a valid array element, so
+;;; (json-serialize '(("a" . 1))) raises the improper-list error below
+;;; instead of quietly emitting the wrong shape.
 ;;;
 ;;; false and null are keywords to avoid ambiguity with NIL (empty list).
 ;;; ===========================================================================
@@ -37,6 +64,19 @@
    response boundary (bodies up to *MAX-OUTBOUND-RESPONSE-SIZE* =
    8 MiB) cannot force an 8 MiB per-string allocation. Raise for apps
    that need larger strings; do not disable.")
+
+;;; ---------------------------------------------------------------------------
+;;; Object representation
+;;; ---------------------------------------------------------------------------
+
+(defstruct (json-object (:constructor make-json-object (&optional alist))
+                        (:copier nil))
+  "A JSON object: an ordered alist of (key . value) with string keys,
+   wrapped so it is distinguishable from a JSON array at serialize time.
+   ALIST preserves document order and may be read directly, but JSON-GET
+   is the supported accessor — it also accepts a bare alist, so handler
+   code written against the old representation keeps working."
+  (alist nil :type list))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parser internals
@@ -255,8 +295,10 @@
       (t (error "json: unexpected character '~a' at ~d" ch pos)))))
 
 (defun json-parse-object (str pos &optional (depth 0))
-  "Parse a JSON object at POS. Returns (values alist new-pos).
+  "Parse a JSON object at POS. Returns (values JSON-OBJECT new-pos).
    Caller (json-parse-value) has already dispatched on the opening '{'.
+   An empty object is an empty JSON-OBJECT, not NIL — that is what keeps
+   {} distinguishable from [] and from null.
 
    Duplicate keys raise. RFC 8259 §4 says names within an object
    SHOULD be unique and permits 'undefined' or 'implementation-
@@ -270,7 +312,7 @@
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
   (when (char= (char str pos) #\})
-    (return-from json-parse-object (values nil (1+ pos))))
+    (return-from json-parse-object (values (make-json-object nil) (1+ pos))))
   (let ((pairs nil)
         (seen (make-hash-table :test #'equal)))
     (loop
@@ -301,7 +343,7 @@
             (cond
               ((char= (char str pos) #\,) (incf pos))
               ((char= (char str pos) #\})
-               (return (values (nreverse pairs) (1+ pos))))
+               (return (values (make-json-object (nreverse pairs)) (1+ pos))))
               (t (error "json: expected ',' or '}' at ~d" pos)))))))))
 
 (defun json-parse-array (str pos &optional (depth 0))
@@ -330,8 +372,10 @@
 
 (defun json-parse (str)
   "Parse a JSON string into Lisp data.
-   Objects become alists, arrays become lists.
-   false -> :FALSE, null -> :NULL (to distinguish from NIL/empty list).
+   Objects become JSON-OBJECT structs (read them with JSON-GET), arrays
+   become lists. false -> :FALSE, null -> :NULL. {} is an empty
+   JSON-OBJECT, [] is NIL, and null is :NULL — three distinct values,
+   each of which serializes back to itself.
 
    A leading U+FEFF (UTF-8 BOM when decoded via UTF-8) is silently
    skipped per RFC 8259 §8.1. Windows text editors, older .NET
@@ -348,8 +392,20 @@
       val)))
 
 (defun json-get (obj key)
-  "Look up KEY (string) in a JSON object (alist). Returns value or NIL."
-  (cdr (assoc key obj :test #'string=)))
+  "Look up KEY (string) in OBJ. Returns the value, or NIL if absent.
+
+   OBJ may be a JSON-OBJECT (what JSON-PARSE now produces) or a bare
+   alist. Accepting both is deliberate: handler code written against the
+   old alist representation keeps working unchanged, and so do the
+   framework's own callers (PARSE-JWKS, JWT-VERIFY), which only ever read
+   through this function. Anything else — a string, a number, an array —
+   returns NIL rather than raising, so walking a document whose shape
+   differs from what the caller expected degrades to a miss instead of a
+   type error deep inside ASSOC."
+  (let ((alist (cond ((json-object-p obj) (json-object-alist obj))
+                     ((listp obj) obj)
+                     (t nil))))
+    (cdr (assoc key alist :test #'string=))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Serializer
@@ -373,7 +429,9 @@
 
 (defun json-serialize (value)
   "Serialize a Lisp value to a JSON string.
-   Alists with string keys serialize as objects; other lists as arrays."
+   A JSON-OBJECT serializes as an object; every other list serializes as
+   an array. To emit an object from data you built yourself, wrap the
+   alist: (json-serialize (make-json-object '((\"a\" . 1))))."
   (with-output-to-string (out)
     (json-write-value value out)))
 
@@ -383,9 +441,10 @@
     ((eq value t)      (write-string "true" stream))
     ((eq value :false) (write-string "false" stream))
     ((eq value :null)  (write-string "null" stream))
-    ;; NIL serializes as null. Empty {} and [] both parse to NIL,
-    ;; so they round-trip to null. Use :NULL for explicit null if needed.
-    ((null value)      (write-string "null" stream))
+    ;; NIL is the empty list, so it emits []. An empty object is an empty
+    ;; JSON-OBJECT and explicit null is :NULL — the three used to collapse
+    ;; onto "null" and now each round-trips to itself.
+    ((null value)      (write-string "[]" stream))
     ((stringp value)   (json-write-string value stream))
     ((integerp value)  (format stream "~d" value))
     ((floatp value)
@@ -402,22 +461,25 @@
      (let* ((*read-default-float-format* 'double-float)
             (s (write-to-string (coerce value 'double-float))))
        (write-string s stream)))
+    ;; Object — the only thing that emits {...}. No guessing.
+    ((json-object-p value)
+     (json-write-object (json-object-alist value) stream))
     ;; Improper lists reject up front — a dotted tail would emit a
-    ;; trailing comma through json-write-array, producing invalid
-    ;; JSON. Must come before the cons branches so EVERY on an
-    ;; improper alist shape doesn't run with undefined behavior
-    ;; (CLHS — EVERY requires proper lists).
+    ;; trailing comma through json-write-array, producing invalid JSON.
+    ;; This is also where a hand-built alist lands now that objects are
+    ;; typed: ("a" . 1) is not a valid array element, so the mistake is
+    ;; caught here with a message naming the fix rather than emitting a
+    ;; well-formed-but-wrong document.
     ((and (consp value) (not (proper-list-p value)))
-     (error "json: cannot serialize improper list ~s" value))
-    ;; Alist (object) — every element must be a cons with a string car.
-    ;; Checking only the first element was a footgun: a mixed list like
-    ;; '(("foo" . 1) "bar") would route to json-write-object and crash
-    ;; mid-serialize. Checking every element falls back to the array
-    ;; branch on mixed input, producing well-formed (if surprising) JSON.
-    ((and (consp value)
-          (every (lambda (el) (and (consp el) (stringp (car el)))) value))
-     (json-write-object value stream))
-    ;; List (array)
+     (if (and (stringp (car value)) (not (consp (cdr value))))
+         (error "json: cannot serialize the dotted pair ~s. Objects are a ~
+                 distinct type — wrap the alist in MAKE-JSON-OBJECT to emit ~
+                 an object."
+                value)
+         (error "json: cannot serialize improper list ~s" value)))
+    ;; Everything else that is a cons is an array. A bare alist is an
+    ;; array of pairs; see the file header for why this cannot be
+    ;; decided by inspection.
     ((consp value)
      (json-write-array value stream))
     (t (error "json-serialize: unsupported type ~a" (type-of value)))))
