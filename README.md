@@ -194,7 +194,11 @@ tests/
   Handles all escape sequences including `\uXXXX` and surrogate pairs
 - **SHA-1** & **SHA-256** — complete implementations per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
-- **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648)
+- **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648).
+  Decoding rejects non-zero trailing bits and padding that does not exactly
+  complete the last group. Padding itself stays optional because base64url
+  omits it, so `"Zg"` and `"Zg=="` both decode — one spelling per padding
+  convention, not one outright
 - **Crypto random** — `random-bytes` reads N bytes from `/dev/urandom`;
   `random-token` returns a base64url-encoded token (default 32 bytes / ~256 bits).
   For session IDs, CSRF tokens, nonces, PKCE verifiers

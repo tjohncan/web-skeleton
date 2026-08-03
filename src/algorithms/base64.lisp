@@ -1,9 +1,21 @@
 (in-package :web-skeleton)
 
 ;;; ===========================================================================
-;;; Base64 Encoder (RFC 4648)
+;;; Base64 (RFC 4648)
 ;;;
-;;; Encodes a byte vector into a base64 string.
+;;; Encodes a byte vector into a base64 string, and back.
+;;;
+;;; The decoder is canonical-only within a padding convention: it rejects
+;;; a final group whose unused low bits are set, and padding that does not
+;;; exactly complete the last group. Padding itself stays optional, since
+;;; base64url omits it, so "Zg" and "Zg==" both decode to #(102) — one
+;;; spelling per convention, not one outright. Callers that need a single
+;;; spelling have to say which convention they mean; JWT does, and
+;;; JWT-SPLIT enforces it there rather than here.
+;;;
+;;; RFC 4648 §3.5 leaves the trailing-bit check optional. It is not
+;;; optional here: this decoder feeds JWT verification, where every extra
+;;; spelling of a token defeats anything keyed on the token text.
 ;;; ===========================================================================
 
 (defparameter *base64-alphabet*
@@ -67,12 +79,27 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun %base64-decode (string decode-table)
-  "Internal decoder. DECODE-TABLE maps char-code -> 0-63 or NIL."
+  "Internal decoder. DECODE-TABLE maps char-code -> 0-63 or NIL.
+   Rejects non-canonical input: stray or short padding, and a final group
+   whose unused low bits are not zero."
   (let* ((len (length string))
-         ;; Strip padding for length calculation
-         (data-len (loop for i downfrom (1- len) above 0
+         ;; Strip padding for length calculation. The scan runs DOWNTO 0
+         ;; rather than stopping ABOVE it so that an all-padding input like
+         ;; "====" reports PAD-LEN 4 instead of 3; the padding check below
+         ;; rejects it either way, but only one of those counts is true.
+         (data-len (loop for i downfrom (1- len) downto 0
                          while (char= (char string i) #\=)
-                         finally (return (1+ i)))))
+                         finally (return (1+ i))))
+         (pad-len (- len data-len)))
+    ;; Padding is optional because base64url omits it, but when present it
+    ;; must complete the final group to exactly four characters and stop.
+    ;; Otherwise the scan above quietly eats a stray '=' and decodes the
+    ;; rest as though it had never been written, so "AAAA=" and "AAAA"
+    ;; return the same three bytes. Checked before the length test so that
+    ;; "Zg=" is diagnosed as the padding mistake it is.
+    (unless (or (zerop pad-len)
+                (and (<= pad-len 2) (zerop (mod len 4))))
+      (error "base64: invalid padding (~d '=' in ~d characters)" pad-len len))
     (when (= (mod data-len 4) 1)
       (error "base64: invalid input length ~d" len))
     (let ((out (make-array (* 3 (ceiling data-len 4))
@@ -93,6 +120,21 @@
                                         (ash (third vals) 6)
                                         (fourth vals)))
                        (chars-present (min (- data-len i) 4)))
+                   ;; RFC 4648 §3.5: the bits of the final group that fall
+                   ;; past the last whole octet carry nothing and MUST be
+                   ;; zero. Only the final group can be short, so only it
+                   ;; can trip this. Ignoring them instead — the obvious
+                   ;; cheaper reading of "SHOULD reject" — costs uniqueness:
+                   ;; "QQ" and "QR" both decode to #(65), so a JWT signature
+                   ;; segment gets a second spelling that still verifies, and
+                   ;; every check keyed on the token text (revocation list,
+                   ;; replay cache, rate-limit bucket, audit line) sees two
+                   ;; different tokens where the crypto sees one.
+                   (case chars-present
+                     (2 (unless (zerop (logand (second vals) #x0F))
+                          (error "base64: non-canonical trailing bits")))
+                     (3 (unless (zerop (logand (third vals) #x03))
+                          (error "base64: non-canonical trailing bits"))))
                    (vector-push (logand #xFF (ash triplet -16)) out)
                    (when (> chars-present 2)
                      (vector-push (logand #xFF (ash triplet -8)) out))

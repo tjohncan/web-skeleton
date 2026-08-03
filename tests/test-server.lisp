@@ -3466,6 +3466,34 @@
     (check "jwt split: three dots returns nil (early bail)"
            (web-skeleton::jwt-split "a.b.c.d") nil)
 
+    ;; RFC 7515 §2: JWS segments carry no padding. The signature segment
+    ;; is the one that matters — it sits outside the signed input, so
+    ;; "sig" and "sig==" decode to the same 64 bytes and both verify.
+    ;; The other two are checked by the same rule rather than a separate
+    ;; argument about which segment deserves it.
+    (check "jwt split: padded signature segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a.~a.~a==" header-b64 payload-b64 sig-b64))
+           nil)
+    (check "jwt split: padded payload segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a.~a==.~a" header-b64 payload-b64 sig-b64))
+           nil)
+    (check "jwt split: padded header segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a==.~a.~a" header-b64 payload-b64 sig-b64))
+           nil)
+    ;; The hole that closes, asserted at the codec rather than end to end
+    ;; because there is no unexpired positive JWT-VERIFY fixture: the RFC
+    ;; 7515 A.3 token is expired, so a JWT-VERIFY assertion would return
+    ;; NIL for the wrong reason and pass whether or not the guard exists.
+    ;; The codec accepts both spellings on purpose — padding is legal
+    ;; base64url, and it is JWS that forbids it.
+    (check "padded signature segment decodes to the same bytes"
+           (equalp (base64url-decode sig-b64)
+                   (base64url-decode (concatenate 'string sig-b64 "==")))
+           t)
+
     ;; Verify signature is valid by calling ecdsa-verify-p256 directly
     (let* ((signing-input (format nil "~a.~a" header-b64 payload-b64))
            (hash (sha256 (sb-ext:string-to-octets signing-input

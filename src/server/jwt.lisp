@@ -24,6 +24,21 @@
   (y   (make-array 0 :element-type '(unsigned-byte 8))
        :type (simple-array (unsigned-byte 8) (*))))
 
+(defun %jwks-decode-coordinate (b64 name)
+  "Decode a JWKS EC coordinate, restating a codec error as a JWKS error.
+   BASE64URL-DECODE rejects non-canonical input, and a 32-byte
+   coordinate encodes to 43 characters — a three-character final group,
+   so the trailing-bit check applies to every JWKS this server loads.
+   Unwrapped, a bad coordinate surfaces mid-rotation as a bare
+   \"base64: ...\" from a function with no handler-case, which reads as
+   a framework bug to whoever is holding the log. Same reasoning as the
+   missing-coordinate guard below, and the same stakes as it: this path
+   raises rather than returning NIL, so it fails all verification, not
+   one request."
+  (handler-case (base64url-decode b64)
+    (error (e)
+      (error "JWKS: EC P-256 key ~a is not valid base64url (~a)" name e))))
+
 (defun parse-jwks (json-string)
   "Parse a JWKS JSON string into a list of JWT-KEY structs.
    Extracts ES256 keys only (kty=EC, crv=P-256). Rejects JWKS sets
@@ -61,8 +76,8 @@
                           ;; the log.
                           (unless (and x-b64 y-b64)
                             (error "JWKS: EC P-256 key missing x or y"))
-                          (let ((x (base64url-decode x-b64))
-                                (y (base64url-decode y-b64)))
+                          (let ((x (%jwks-decode-coordinate x-b64 "x"))
+                                (y (%jwks-decode-coordinate y-b64 "y")))
                             (unless (and (= (length x) 32) (= (length y) 32))
                               (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
                             (make-jwt-key
@@ -172,19 +187,40 @@
 (defun jwt-split (token)
   "Split a JWT token on dots. Returns a list of 3 strings for a
    well-formed JWS Compact Serialization, or NIL for any token with
-   more or fewer dots. Bails out as soon as a fourth dot appears so
-   a malformed token with many dots does not allocate O(dots)
-   substrings before rejection."
+   more or fewer dots, or any token carrying base64 padding. Bails out
+   as soon as a fourth dot appears so a malformed token with many dots
+   does not allocate O(dots) substrings before rejection."
   (let ((parts nil)
         (start 0)
         (dots 0))
     (loop for i from 0 below (length token)
-          when (char= (char token i) #\.)
-          do (incf dots)
-             (when (> dots 2)
-               (return-from jwt-split nil))
-             (push (subseq token start i) parts)
-             (setf start (1+ i)))
+          for c = (char token i)
+          do (cond
+               ;; RFC 7515 §2: every JWS segment is base64url with all
+               ;; trailing '=' omitted. '=' is the only illegal character
+               ;; worth naming here — '+', '/' and whitespace are absent
+               ;; from the base64url table, so they raise out of
+               ;; BASE64URL-DECODE into JWT-VERIFY's handler and turn
+               ;; themselves away. '=' decodes successfully, and that is
+               ;; the whole reason this case exists.
+               ;;
+               ;; It matters for the signature segment, the one part of
+               ;; a token outside the signed input — "sig" and "sig=="
+               ;; decode to the same 64 bytes,
+               ;; so both verify and one signature gets two token
+               ;; strings. Padding the header or payload changes the
+               ;; bytes the signature is checked against, so those two
+               ;; defend themselves; the rule is applied to all three
+               ;; anyway because it is one rule, and this is already
+               ;; where a malformed token is turned away.
+               ((char= c #\=)
+                (return-from jwt-split nil))
+               ((char= c #\.)
+                (incf dots)
+                (when (> dots 2)
+                  (return-from jwt-split nil))
+                (push (subseq token start i) parts)
+                (setf start (1+ i)))))
     (unless (= dots 2)
       (return-from jwt-split nil))
     (push (subseq token start) parts)

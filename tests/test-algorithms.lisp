@@ -110,7 +110,44 @@
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
     (check "single char rejected"
-           (signals-error-p (lambda () (base64-decode "A"))) t)))
+           (signals-error-p (lambda () (base64-decode "A"))) t)
+
+    ;; RFC 4648 §3.5 canonical form. The final group's unused low bits
+    ;; must be zero or one byte string has sixteen spellings: "QQ" and
+    ;; "QR" differ only in bits the decoder never emits.
+    (check "2-char group: canonical trailing bits accepted"
+           (bytes-to-hex (base64-decode "QQ")) "41")
+    (check "2-char group: non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64-decode "QR"))) t)
+    (check "3-char group: canonical trailing bits accepted"
+           (bytes-to-hex (base64-decode "QUE")) "4141")
+    (check "3-char group: non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64-decode "QUF"))) t)
+    ;; Padded spellings of those same two groups. Padding and the bit
+    ;; check are separate guards, so each verdict has to survive both.
+    (check "padded 2-char group accepted"
+           (bytes-to-hex (base64-decode "QQ==")) "41")
+    (check "padded non-canonical 2-char group rejected"
+           (signals-error-p (lambda () (base64-decode "QR=="))) t)
+
+    ;; Padding must complete the final group and then stop. The
+    ;; trailing-'=' scan used to swallow a stray pad, so "AAAA=" decoded
+    ;; as "AAAA" — a second spelling of three zero bytes.
+    (check "stray pad after a complete group rejected"
+           (signals-error-p (lambda () (base64-decode "AAAA="))) t)
+    (check "short pad rejected"
+           (signals-error-p (lambda () (base64-decode "Zg="))) t)
+    (check "over-padded group rejected"
+           (signals-error-p (lambda () (base64-decode "AAAA===="))) t)
+    (check "all-padding input rejected"
+           (signals-error-p (lambda () (base64-decode "===="))) t)
+    (check "lone pad rejected"
+           (signals-error-p (lambda () (base64-decode "="))) t)
+    ;; Interior padding was already rejected by the charset check; keep
+    ;; it asserted so the new padding guard can't accidentally take over
+    ;; and start allowing it.
+    (check "interior pad rejected"
+           (signals-error-p (lambda () (base64-decode "Zg==Zg=="))) t)))
 
 (defun test-base64url ()
   (format t "~%Base64url~%")
@@ -146,7 +183,34 @@
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
     (check "url single char rejected"
-           (signals-error-p (lambda () (base64url-decode "A"))) t)))
+           (signals-error-p (lambda () (base64url-decode "A"))) t)
+
+    ;; Token malleability, the reason the canonical check exists. A
+    ;; P-256 signature is 64 bytes, so its base64url is 86 characters —
+    ;; a final group of two, whose last character carries four bits that
+    ;; are never emitted. Rewriting the trailing 'Q' as 'R' left the 64
+    ;; decoded bytes untouched, so the mutated token verified against
+    ;; the same key: one signature, two token strings, and any check
+    ;; keyed on the text (revocation, replay, audit) fooled.
+    (let* ((sig "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+           (twin (concatenate 'string (subseq sig 0 (1- (length sig))) "R")))
+      (check "signature segment is 86 chars (2-char final group)"
+             (mod (length sig) 4) 2)
+      (check "signature segment decodes to 64 bytes"
+             (length (base64url-decode sig)) 64)
+      ;; Canonical input has exactly one spelling, and it is the one the
+      ;; encoder produces — so decode is injective over what it accepts.
+      (check "signature segment round-trips to its own spelling"
+             (base64url-encode (base64url-decode sig)) sig)
+      (check "non-canonical twin of a signature segment rejected"
+             (signals-error-p (lambda () (base64url-decode twin))) t))
+
+    ;; base64url omits padding, so unpadded input stays legal — the new
+    ;; padding guard must not have quietly made it mandatory.
+    (check "url unpadded 2-char group still accepted"
+           (bytes-to-hex (base64url-decode "QQ")) "41")
+    (check "url non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64url-decode "QR"))) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SHA-256 test vectors (FIPS 180-4)

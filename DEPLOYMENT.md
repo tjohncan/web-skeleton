@@ -162,6 +162,41 @@ If your JWKS key set is shared across services, always verify these:
     ...))
 ```
 
+### Keying on the token string
+
+**Do not key a revocation list, replay-dedup cache, rate-limit bucket, or audit
+line on the raw token text.** A verified token does not have exactly one
+spelling, and it cannot be made to.
+
+If `(r, s)` verifies then so does `(r, n-s)`. Anyone holding the token can
+compute that — no key needed, `n` is a public curve constant. JOSE does not
+mandate low-S normalization and mainstream issuers emit high-S roughly half the
+time, so rejecting it would reject real tokens; `src/algorithms/ecdsa.lisp` says
+so at the point where it declines to enforce it. Two token strings, one
+signature, both valid.
+
+Key on something canonical under a valid signature instead:
+
+- the `jti` claim (RFC 7519 §4.1.7), if your issuer sets one
+- the `header.payload` prefix — the exact bytes the signature is checked
+  against, so any mutation invalidates the token
+
+None of this is a forgery risk. The signed input is `header.payload`, so
+altering either changes the bytes the signature is checked against.
+
+### JWKS coordinate encoding
+
+`parse-jwks` raises rather than returning NIL, so a key set it rejects takes down
+all verification, not one request.
+
+Base64url decoding is strict: it rejects a final group whose unused low bits are
+set, and padding that does not exactly complete the last group. A 32-byte EC
+coordinate encodes to 43 characters — a three-character final group — so that
+check applies to every key set you load. Only a non-conforming issuer is
+affected: RFC 4648 §3.5 makes zeroed pad bits a MUST for encoders, and RFC 7515
+§2 makes unpadded segments a MUST for JWS. The error names the key and the
+coordinate, so a rotation that trips it reads as the issuer bug it is.
+
 ### HMAC signature comparison
 
 When verifying webhook signatures or other HMAC-authenticated messages,
