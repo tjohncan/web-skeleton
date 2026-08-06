@@ -3505,6 +3505,35 @@
                                 (jwt-key-y (first keys)))
              t))
 
+    ;; The positive case. Every other JWT-VERIFY assertion here is a
+    ;; rejection, so without this one (defun jwt-verify (token keys) nil)
+    ;; passes the whole suite — the framework's security-critical entry
+    ;; point asserted to fail three ways and to succeed at nothing.
+    ;;
+    ;; The A.3 token expired in 2011 and there is no signer in this
+    ;; framework (verification only), so the only route to a positive
+    ;; result is to widen the clock window past the token's age. Derived
+    ;; from the token's own exp rather than a literal date: the NOW terms
+    ;; cancel, (- now *jwt-clock-skew*) reduces to exp - 3600, and the
+    ;; expiry branch cannot start firing on some future run.
+    (let ((*jwt-clock-skew* (+ 3600 (- (web-skeleton::jwt-current-time)
+                                       1300819380))))
+      (check "jwt verify: A.3 token verifies with the clock window widened"
+             (jwt-claim (jwt-verify token keys) "iss")
+             "joe")
+      ;; First end-to-end proof that the JSON-OBJECT survives out of
+      ;; JWT-VERIFY into JWT-CLAIM — the claims used to be a bare alist,
+      ;; and the type change had no test that crossed this boundary.
+      (check "jwt verify: claims come back as a json-object"
+             (json-object-p (jwt-verify token keys))
+             t)
+      ;; Discriminating both ways: without JWT-SPLIT's padding guard this
+      ;; token splits into three parts, the signature segment decodes to
+      ;; the same 64 bytes, and the claims come back instead of NIL.
+      (check "jwt verify: padded signature segment does not verify"
+             (jwt-verify (concatenate 'string token "==") keys)
+             nil))
+
     ;; jwt-verify rejects expired token
     (check "jwt expired token"
            (jwt-verify token keys)
