@@ -1282,7 +1282,89 @@
                         "localhost" "/"))) t)
     (check "method charset: HEAD accepted"
            (not (null (web-skeleton::build-outbound-request
-                       :HEAD "localhost" "/"))) t))
+                       :HEAD "localhost" "/"))) t)
+
+    ;; Framing headers belong to the builder, not the caller. The merge
+    ;; adds Content-Length only when the caller did not supply one, which
+    ;; decides both cases below: Transfer-Encoding does not suppress it,
+    ;; so a caller who sends TE with a body gets both framing headers at
+    ;; once; Content-Length does suppress it, so a caller who sends a
+    ;; wrong one gets their number in front of our bytes. Ingress already
+    ;; refuses Transfer-Encoding; egress refusing to emit what ingress
+    ;; refuses to accept is the symmetry.
+    (check "outbound: caller Transfer-Encoding rejected with a body"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("transfer-encoding" . "chunked"))
+                        :body "hello"))) t)
+    ;; Bodiless too: the header is still a claim about framing we do not
+    ;; implement, and rejecting only the both-headers case would leave
+    ;; the lie legal whenever it happened to be harmless.
+    (check "outbound: caller Transfer-Encoding rejected without a body"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :GET "localhost" "/"
+                        :headers '(("transfer-encoding" . "chunked"))))) t)
+    ;; Header names are case-insensitive on the wire, so the guard has to
+    ;; be too — STRING-EQUAL, not STRING=.
+    (check "outbound: Transfer-Encoding rejected case-insensitively"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("Transfer-Encoding" . "chunked"))
+                        :body "hello"))) t)
+    ;; Content-Length is the half of RFC 7230 §3.3.3 that a caller reaches
+    ;; by accident rather than on purpose — a stale content-length copied
+    ;; along with the rest of a header alist. Short declaration: the
+    ;; upstream reads five bytes and treats "56789" as the head of the
+    ;; next request. Long declaration: it blocks until its read timeout.
+    (check "outbound: caller Content-Length under-declaring rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("content-length" . "5"))
+                        :body "0123456789"))) t)
+    (check "outbound: caller Content-Length over-declaring rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("content-length" . "100"))
+                        :body "hello"))) t)
+    ;; Rejected even when it happens to agree with the body: a guard that
+    ;; compared numbers instead of refusing the header would leave the
+    ;; caller believing framing is theirs to declare, and the next value
+    ;; they pass is the stale one.
+    (check "outbound: caller Content-Length rejected even when correct"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("Content-Length" . "5"))
+                        :body "hello"))) t)
+    ;; The escape hatch has to keep working: a deliberate Content-Length: 0
+    ;; on a bodiless POST is expressed as :body "", which is a zero-length
+    ;; vector rather than NIL and so still emits the header.
+    (let ((text (sb-ext:octets-to-string
+                 (web-skeleton::build-outbound-request
+                  :POST "localhost" "/" :body "")
+                 :external-format :utf-8)))
+      (check "outbound: :body \"\" still declares Content-Length: 0"
+             (not (null (search "content-length: 0" text))) t))
+    ;; And the computed header is still emitted for an ordinary body, so
+    ;; the guards did not cost the normal path its framing.
+    (let ((text (sb-ext:octets-to-string
+                 (web-skeleton::build-outbound-request
+                  :POST "localhost" "/" :body "hello")
+                 :external-format :utf-8)))
+      (check "outbound: computed Content-Length still emitted"
+             (not (null (search "content-length: 5" text))) t))
+    ;; And an ordinary header still passes, so the guard is not just
+    ;; rejecting every :headers list handed to it.
+    (check "outbound: unrelated header still accepted"
+           (not (null (web-skeleton::build-outbound-request
+                       :POST "localhost" "/"
+                       :headers '(("x-trace" . "abc"))
+                       :body "hello"))) t))
 
   ;; Config knobs that DEPLOYMENT.md tells users to setf from their
   ;; own packages must be exported from :WEB-SKELETON. An unqualified

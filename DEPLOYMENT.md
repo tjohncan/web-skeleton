@@ -270,6 +270,25 @@ and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_not
 is still accepted silently — that's the framing signal for HTTP/1.0-style servers
 that never send `close_notify` at all.
 
+**Framing headers are the framework's, not yours.** Passing either
+`Transfer-Encoding` or `Content-Length` in `:headers` signals an error
+rather than going on the wire. Both are ways for a request's declared
+framing to disagree with the bytes that follow (RFC 7230 §3.3.3), and
+either one aimed at an upstream is a request-smuggling primitive:
+
+- `Transfer-Encoding` — the framework never chunk-encodes, so the claim
+  is false whatever the body is, and it does not suppress the computed
+  `Content-Length`, so the request would have carried both framing
+  headers at once.
+- `Content-Length` — a caller-supplied one *does* suppress the computed
+  one, so `"5"` in front of a ten-byte body would have left `56789` in
+  the upstream's buffer as the head of the next request. This is the one
+  reached by accident: a stale `content-length` copied along with the
+  rest of a header alist.
+
+For a deliberate `Content-Length: 0` on a bodiless POST, pass `:body ""`
+— an empty body is still a body, and the header is computed from it.
+
 ### Fetch callback contract
 
 The `:then` closure supplied to `http-fetch` / `defer-to-fetch`

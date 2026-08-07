@@ -421,6 +421,43 @@
                  (every (lambda (c) (char<= #\A c #\Z)) method-str))
       (error "build-outbound-request: method must be uppercase ASCII ~
               letters, got ~s" method-str))
+    ;; Framing headers are ours, not the caller's. RFC 7230 §3.3.3 gives
+    ;; two ways for a request's declared framing to disagree with the
+    ;; bytes that follow, and :headers can reach both.
+    ;;
+    ;; Transfer-Encoding: this function never chunk-encodes, so the claim
+    ;; is false whatever the body is. The merge below adds Content-Length
+    ;; only when the caller did not supply one — and Transfer-Encoding is
+    ;; not Content-Length, so it does not suppress it. A caller passing
+    ;; ("transfer-encoding" . "chunked") with a body therefore emits both
+    ;; framing headers at once, which is the canonical smuggling shape,
+    ;; pointed at the upstream.
+    ;;
+    ;; Content-Length: the same merge rule is what opens this one. A
+    ;; caller-supplied Content-Length *does* suppress the computed one,
+    ;; so ("content-length" . "5") alongside a ten-byte body puts a
+    ;; five-byte promise in front of ten bytes and leaves "56789" sitting
+    ;; in the upstream's buffer as the start of the next request. The
+    ;; inverse just hangs the upstream until its read timeout. This is
+    ;; the easier of the two to reach by accident, because it needs no
+    ;; exotic header — only a stale content-length carried along with the
+    ;; rest of a copied header alist.
+    ;;
+    ;; Ingress already refuses Transfer-Encoding on principle. Refusing
+    ;; to emit what we refuse to accept is the same symmetry the tchar
+    ;; table keeps between PARSE-HEADERS-BYTES and SERIALIZE-HTTP-MESSAGE,
+    ;; and it is the same threat model the method-charset check above
+    ;; already accepts — attacker-influenced data reaching :headers is
+    ;; likelier than attacker-influenced data reaching :method.
+    (when (assoc "transfer-encoding" headers :test #'string-equal)
+      (error "build-outbound-request: Transfer-Encoding is not supported on ~
+              outbound requests — the framework frames bodies with ~
+              Content-Length"))
+    (when (assoc "content-length" headers :test #'string-equal)
+      (error "build-outbound-request: Content-Length is computed from :body. ~
+              A caller-supplied one that disagrees with the body is a framing ~
+              lie aimed at the upstream. Pass :body \"\" for a deliberate ~
+              Content-Length: 0."))
   (let* ((default-port-p (or (and (eq scheme :http) (= port 80))
                              (and (eq scheme :https) (= port 443))))
          ;; Re-bracket IPv6 literals. An IPv6 address always contains
@@ -448,8 +485,18 @@
                         (unless (has-header-p "user-agent")
                           (list (cons "user-agent" "web-skeleton")))
                         headers
-                        (when (and body-bytes
-                                   (not (has-header-p "content-length")))
+                        ;; Unconditional. The guard above refuses a
+                        ;; caller-supplied Content-Length outright, so
+                        ;; there is no case left where theirs wins and
+                        ;; the test could only ever be true. Leaving it
+                        ;; in would leave the shape of the old contract —
+                        ;; "the caller may override framing" — sitting
+                        ;; thirty lines below a comment saying framing
+                        ;; headers are ours, and a reader who meets the
+                        ;; merge first would re-derive the wrong rule.
+                        ;; HOST / CONNECTION / USER-AGENT above stay
+                        ;; conditional: those are real caller overrides.
+                        (when body-bytes
                           (list (cons "content-length"
                                       (write-to-string
                                        (length body-bytes)))))))))
