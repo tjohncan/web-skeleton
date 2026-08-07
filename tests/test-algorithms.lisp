@@ -502,6 +502,67 @@
         (b (random-bytes 32)))
     (check "random-bytes: successive calls differ"
            (equalp a b) nil))
+  ;; The worker path. RANDOM-BYTES used to open, read and close
+  ;; /dev/urandom on every call, which a session-per-request app pays
+  ;; per request; a worker now holds one stream open for its lifetime.
+  ;; Outside a worker the binding is NIL and the per-call open remains,
+  ;; which is the state every check above runs in.
+  (check "random-bytes: no cached stream outside a worker"
+         web-skeleton::*urandom-stream* nil)
+  (web-skeleton::with-worker-urandom
+    (check "with-worker-urandom: binds a stream"
+           (and (streamp web-skeleton::*urandom-stream*)
+                (open-stream-p web-skeleton::*urandom-stream*))
+           t)
+    (check "random-bytes: correct length from the cached stream"
+           (length (random-bytes 32)) 32)
+    (check "random-bytes: cached stream still yields distinct reads"
+           (equalp (random-bytes 32) (random-bytes 32)) nil)
+    (check "random-token: works through the cached stream"
+           (length (random-token)) 43))
+  ;; And the binding is unwound, so nothing leaks the stream past the
+  ;; worker that opened it.
+  (check "with-worker-urandom: unbinds on exit"
+         web-skeleton::*urandom-stream* nil)
+  ;; The checks above prove the plumbing exists; this one proves
+  ;; RANDOM-BYTES is connected to it. Bound to a stream of known bytes,
+  ;; it must return those bytes — a RANDOM-BYTES that ignored the
+  ;; binding would return four bytes from /dev/urandom instead, and
+  ;; every check above would still pass.
+  (let ((path (merge-pathnames "tests/tmp-urandom.bin" (truename "."))))
+    (unwind-protect
+         (progn
+           (with-open-file (s path :direction :output
+                                   :element-type '(unsigned-byte 8)
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)
+             (write-sequence (coerce #(1 2 3 4 5 6 7 8)
+                                     '(vector (unsigned-byte 8)))
+                             s))
+           (with-open-file (s path :direction :input
+                                   :element-type '(unsigned-byte 8))
+             (let ((web-skeleton::*urandom-stream* s))
+               (check "random-bytes: reads from the bound stream"
+                      (coerce (random-bytes 4) 'list) '(1 2 3 4))
+               ;; Sequential, not re-read from the top — a cached stream
+               ;; carries a position, which is the whole reason it is
+               ;; per-worker rather than shared.
+               (check "random-bytes: advances the bound stream"
+                      (coerce (random-bytes 4) 'list) '(5 6 7 8))
+               ;; Exhausted. The cached stream is an optimisation, not a
+               ;; requirement, so a read that comes up short falls back
+               ;; to a per-call open rather than raising — otherwise one
+               ;; bad read poisons the binding for the worker's whole
+               ;; life, and RANDOM-TOKEN feeds session IDs and CSRF
+               ;; tokens. Matches how the open already degrades.
+               (let ((bytes (random-bytes 8)))
+                 (check "random-bytes: exhausted stream falls back"
+                        (length bytes) 8)
+                 ;; And the fallback really produced random bytes rather
+                 ;; than the zeros a silently-unfilled buffer would hold.
+                 (check "random-bytes: fallback bytes are not the empty buffer"
+                        (every #'zerop bytes) nil)))))
+      (ignore-errors (delete-file path))))
   ;; random-token: expected base64url length (unpadded)
   ;; 32 bytes -> ceil(32*4/3) = 43 chars
   ;; 16 bytes -> ceil(16*4/3) = 22 chars

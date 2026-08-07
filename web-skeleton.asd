@@ -67,6 +67,13 @@
                (:file "src/server/main"  :depends-on ("src/package"
                                                        "src/log"
                                                        "src/epoll"
+                                                       ;; WITH-WORKER-URANDOM is a macro, so this
+                                                       ;; edge has to hold at compile time: without
+                                                       ;; it, main.lisp would compile the form as a
+                                                       ;; function call, the worker body would
+                                                       ;; become an argument, and the binding would
+                                                       ;; silently never happen.
+                                                       "src/random"
                                                        "src/server/http"
                                                        "src/server/connection"
                                                        "src/server/websocket"

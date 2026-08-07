@@ -853,6 +853,7 @@
    Automatically restarts on unhandled errors (with backoff)."
   (loop
     (handler-case
+        (with-worker-urandom
         (let ((*connections* (make-hash-table :test #'eql))
               ;; Per-worker DNS cache. Workers share nothing in the hot
               ;; path, so each keeps its own table and no lock is needed.
@@ -905,7 +906,7 @@
               (sb-bsd-sockets:socket-close listener)))
           ;; Normal exit (shutdown requested)
           (log-info "worker ~d stopped" worker-id)
-          (return))
+          (return)))
       (error (e)
         (log-error "worker ~d crashed: ~a — restarting" worker-id e)
         ;; 1-second backoff, sliced into *shutdown-poll-interval*
