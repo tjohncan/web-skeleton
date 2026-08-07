@@ -849,6 +849,39 @@
          (sync (conn response)
            (web-skeleton::sync-close-after-p-from-response conn response)
            (web-skeleton::connection-close-after-p conn)))
+    ;; The inbound read cap used to be *max-body-size* verbatim, so one
+    ;; knob silently moved two budgets: an app tightening the body cap to
+    ;; 32 KiB also capped total request bytes at 32 KiB, and a request
+    ;; with large-but-legal headers died on the buffer with a 400 that
+    ;; blamed the body. Asserted as a strict inequality against the body
+    ;; cap rather than a literal, so the check survives retuned defaults.
+    (let ((c (make-conn)))
+      (check "read cap: inbound leaves room for headers beyond the body"
+             (> (web-skeleton::connection-read-cap c)
+                (+ web-skeleton::*max-body-size*
+                   web-skeleton::*max-total-header-bytes*))
+             t)
+      ;; The tightened-body-cap case the aliasing broke, stated directly:
+      ;; a 32 KiB body budget must still admit a full 64 KiB of headers.
+      (let ((web-skeleton::*max-body-size* (* 32 1024)))
+        (check "read cap: tight body cap still admits full headers"
+               (> (web-skeleton::connection-read-cap c)
+                  web-skeleton::*max-total-header-bytes*)
+               t))
+      ;; The other three arms are unchanged and stay that way.
+      (setf (web-skeleton::connection-state c) :websocket)
+      (check "read cap: websocket is payload plus masked header"
+             (web-skeleton::connection-read-cap c)
+             (+ web-skeleton::*max-ws-payload-size* 14))
+      (setf (web-skeleton::connection-state c) :out-dns)
+      (check "read cap: out-dns is 8 KiB"
+             (web-skeleton::connection-read-cap c) 8192))
+    (let ((c (make-conn)))
+      (setf (web-skeleton::connection-outbound-p c) t)
+      (check "read cap: outbound uses the response budget"
+             (web-skeleton::connection-read-cap c)
+             web-skeleton::*max-outbound-response-size*))
+
     (let ((c (make-conn)))
       (check "sync-close: no Connection header — no-op"
              (sync c (make-text-response 200 "x")) nil))

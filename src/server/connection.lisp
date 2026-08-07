@@ -158,41 +158,59 @@
 ;;; Read buffer helpers
 ;;; ---------------------------------------------------------------------------
 
-(defun connection-read-available (conn)
-  "Drain all available bytes from fd into read buffer (edge-triggered).
-   Grows the buffer as needed, up to the state-appropriate limit.
-   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN.
-
-   The size cap is state- and direction-dependent:
+(defun connection-read-cap (conn)
+  "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
+     :out-dns           → 8 KiB
      outbound response  → *max-outbound-response-size* (8 MiB default)
-     inbound request    → *max-body-size*             (1 MiB default)
+     inbound request    → every inbound budget summed (~1.07 MiB default)
+
    Keeping the inbound and outbound caps separate means a 1 MiB+ HTTPS
    response (which a real upstream will routinely send) doesn't get
-   truncated by the inbound request-body budget."
-  ;; Known coupling: the :read-http phase cap is *max-body-size*
-  ;; which must also accommodate headers. At default 1 MiB this
-  ;; is generous; an operator setting *max-body-size* very low
-  ;; (e.g. 64 KB) while allowing large headers will hit the cap
-  ;; before headers are fully buffered.
+   truncated by the inbound request-body budget.
+
+   Split out of CONNECTION-READ-AVAILABLE so the arithmetic can be
+   asserted without an fd to read from."
+  (cond
+    ((eq (connection-state conn) :websocket)
+     (+ *max-ws-payload-size* 14))
+    ;; DNS pipe output is 'getent ahosts <host>' stdout — a handful of
+    ;; STREAM / DGRAM / RAW lines per address family, typically well
+    ;; under 1 KiB. Cap at 8 KiB to match RESOLVE-HOST-BLOCKING's
+    ;; explicit 8192-byte cap on the synchronous path; reusing
+    ;; *MAX-OUTBOUND-RESPONSE-SIZE* here would let a pathological NSS
+    ;; module produce an 8 MiB buffer for what is definitionally a few
+    ;; lines.
+    ((eq (connection-state conn) :out-dns)
+     8192)
+    ((connection-outbound-p conn)
+     *max-outbound-response-size*)
+    ;; The inbound cap is the sum of the budgets that actually apply, not
+    ;; *max-body-size* alone. Aliasing them made one knob quietly move
+    ;; two: a JSON API tightening the body cap to 32 KiB also capped
+    ;; total request bytes at 32 KiB, so a request with large-but-legal
+    ;; headers — a fat cookie jar, a long Authorization, a proxy's
+    ;; X-Forwarded-* chain — died on the buffer with a 400 that blamed
+    ;; the body.
+    ;;
+    ;; Summed exactly rather than padded with slack, the same way the
+    ;; :websocket arm spells out its 14-byte masked header. The last two
+    ;; terms are why this is not simply the sum of two variables:
+    ;; *max-total-header-bytes* counts header line bytes only, so the
+    ;; request line and every CRLF fall outside it.
+    (t
+     (+ *max-body-size*
+        *max-total-header-bytes*
+        *max-request-line-length*
+        (* 2 *max-header-count*)  ; CRLF ending each header
+        4))))                     ; request-line and blank-line CRLFs
+
+(defun connection-read-available (conn)
+  "Drain all available bytes from fd into read buffer (edge-triggered).
+   Grows the buffer as needed, up to CONNECTION-READ-CAP.
+   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
   (let ((any-read nil)
-        (max-size (cond
-                    ((eq (connection-state conn) :websocket)
-                     (+ *max-ws-payload-size* 14))
-                    ;; DNS pipe output is 'getent ahosts <host>' stdout —
-                    ;; a handful of STREAM / DGRAM / RAW lines per
-                    ;; address family, typically well under 1 KiB. Cap
-                    ;; at 8 KiB to match RESOLVE-HOST-BLOCKING's
-                    ;; explicit 8192-byte cap on the synchronous path;
-                    ;; reusing *MAX-OUTBOUND-RESPONSE-SIZE* here would
-                    ;; let a pathological NSS module produce an 8 MiB
-                    ;; buffer for what is definitionally a few lines.
-                    ((eq (connection-state conn) :out-dns)
-                     8192)
-                    ((connection-outbound-p conn)
-                     *max-outbound-response-size*)
-                    (t
-                     *max-body-size*))))
+        (max-size (connection-read-cap conn)))
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))
