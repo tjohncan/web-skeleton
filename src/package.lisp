@@ -131,6 +131,7 @@
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
+           #:*ws-send-timeout*
            #:*fetch-timeout*
            ;; DNS cache (opt-in — 0 disables)
            #:*dns-cache-ttl*

@@ -1295,7 +1295,12 @@
                   "*MAX-OUTBOUND-RESPONSE-SIZE*"
                   "*MAX-STREAMING-LINE-SIZE*"
                   "*MAX-WS-PAYLOAD-SIZE*"
-                  "*MAX-WS-MESSAGE-SIZE*"))
+                  "*MAX-WS-MESSAGE-SIZE*"
+                  ;; WS-SEND is exported; its only tuning knob was not, so
+                  ;; the deadline that decides how long one slow peer may
+                  ;; hold a whole worker was unreachable through the
+                  ;; public API. A limit nobody can set is not a limit.
+                  "*WS-SEND-TIMEOUT*"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -2738,6 +2743,33 @@
            (web-skeleton::websocket-upgrade-p
             (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
+
+  ;; *ws-send-timeout* used to document 0 as "disable", which set no
+  ;; deadline and left the write loop with no exit — a peer that stopped
+  ;; draining its receive window pinned the worker permanently, and the
+  ;; worker is every other connection on it, not just this one. An empty
+  ;; frame is used so the loop body never runs and no fd is touched:
+  ;; before the guard, 0 with nothing to write returned normally.
+  (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (check "ws-send: zero timeout refused"
+           (let ((*ws-send-timeout* 0))
+             (handler-case (progn (web-skeleton::ws-send conn empty) nil)
+               (error (e) (not (null (search "*ws-send-timeout*"
+                                             (princ-to-string e)))))))
+           t)
+    (check "ws-send: negative timeout refused"
+           (let ((*ws-send-timeout* -1))
+             (handler-case (progn (web-skeleton::ws-send conn empty) nil)
+               (error () t)))
+           t)
+    ;; A positive value still passes the guard, or the two checks above
+    ;; would be satisfied by a function that refused everything.
+    (check "ws-send: positive timeout passes the guard"
+           (let ((*ws-send-timeout* 10))
+             (handler-case (progn (web-skeleton::ws-send conn empty) :sent)
+               (error () :error)))
+           :sent))
 
   ;; build-ws-close only accepts the send-allowed set per RFC 6455
   ;; §7.4.1: 1000-1003, 1007-1014, 3000-4999. Clamp-on-receive is

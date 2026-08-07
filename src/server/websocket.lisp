@@ -277,7 +277,13 @@
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
 (defparameter *ws-send-timeout* 10
-  "Seconds before ws-send gives up writing a frame. 0 to disable.")
+  "Seconds before WS-SEND gives up writing a frame. Must be positive.
+
+   There is no setting that disables the deadline. This used to accept 0
+   for no deadline at all, which meant a peer that stopped draining its
+   receive window pinned a worker permanently — see the blast radius
+   note below, and note that the thing being pinned is not one
+   connection.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Synchronous frame send
@@ -286,30 +292,42 @@
 ;;; all bytes are flushed.  Intended for use inside ws-handler — the
 ;;; event loop is paused while the handler runs, so there is no
 ;;; contention with pings or other writes.
+;;;
+;;; Blast radius: "blocking" means the worker, not the connection. The
+;;; event loop being paused is the one serving every other connection on
+;;; this worker, so one peer that stops reading freezes all of them for
+;;; up to *WS-SEND-TIMEOUT*. With (CPU-COUNT) workers that is 1/N of the
+;;; server's capacity held for ten seconds by a single slow client, and
+;;; N slow clients arriving together is a full stall. This is a property
+;;; of the synchronous design rather than a bug in it — an app that
+;;; broadcasts to many peers, or serves any peer it does not control,
+;;; wants to know the number before it picks this over its own queue.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
   "Send FRAME-BYTES to CONN synchronously, blocking until fully written.
    FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
    Safe to call from within ws-handler — the event loop is paused while the
-   handler runs, so there is no write contention.
+   handler runs, so there is no write contention. That pause covers every
+   other connection on this worker, not just this one; see the blast
+   radius note above.
    Signals an error if the write exceeds *ws-send-timeout*."
+  (unless (plusp *ws-send-timeout*)
+    (error "ws-send: *ws-send-timeout* is ~s; it must be positive. There is ~
+            no unbounded setting, because this write holds the worker and a ~
+            peer that never drains would hold it forever."
+           *ws-send-timeout*))
   (let ((fd (connection-fd conn))
         (pos 0)
         (end (length frame-bytes))
-        (deadline (when (> *ws-send-timeout* 0)
-                    (+ (get-internal-real-time)
-                       (* *ws-send-timeout* internal-time-units-per-second)))))
+        (deadline (+ (get-internal-real-time)
+                     (* *ws-send-timeout* internal-time-units-per-second))))
     (flet ((remaining-ms ()
-             ;; Milliseconds to deadline, clamped non-negative. No
-             ;; deadline configured → use 1000 ms so the poll still
-             ;; drains as before.
-             (if deadline
-                 (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
-                               internal-time-units-per-second))
-                 1000)))
+             ;; Milliseconds to deadline, clamped non-negative.
+             (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
+                           internal-time-units-per-second))))
       (loop while (< pos end)
-            do (when (and deadline (>= (get-internal-real-time) deadline))
+            do (when (>= (get-internal-real-time) deadline)
                  (error "ws-send: timed out after ~ds" *ws-send-timeout*))
                (let ((result (nb-write fd frame-bytes pos (- end pos))))
                  (if (eq result :again)

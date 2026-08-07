@@ -456,7 +456,8 @@ implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed (fixed 10-second timeout).
+blocking until all bytes are flushed or `*ws-send-timeout*` expires
+(default 10 seconds).
 Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
@@ -474,6 +475,22 @@ The worker thread is blocked for the duration of the handler call.
 With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking —
 a slow client holds the worker hostage.
+
+**"Blocking" means the worker, not the connection**, and the number is
+worth stating plainly. The event loop being paused is the one serving
+*every other connection on that worker*, so one peer that stops reading
+freezes all of them for up to `*ws-send-timeout*`. With `(cpu-count)`
+workers that is 1/N of the server's capacity held by a single slow
+client, and N slow clients arriving together is a full stall.
+
+That is a property of the synchronous design rather than a defect in it.
+But an app that broadcasts to many peers, or serves any peer it does not
+control, wants the number before it picks `ws-send` over its own queue —
+in a fan-out broadcast, one unresponsive subscriber is enough.
+
+`*ws-send-timeout*` must be positive. There is no setting that disables
+the deadline: it used to accept `0` for no deadline at all, which meant a
+peer that never drained its receive window pinned the worker permanently.
 
 ### Static files
 
