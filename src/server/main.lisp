@@ -473,11 +473,11 @@
                   (setf (connection-close-after-p conn)
                         (cond
                           ((some (lambda (v)
-                                   (connection-header-has-token-p v "close"))
+                                   (header-has-token-p v "close"))
                                  conn-values)
                            t)
                           ((some (lambda (v)
-                                   (connection-header-has-token-p v "keep-alive"))
+                                   (header-has-token-p v "keep-alive"))
                                  conn-values)
                            nil)
                           ((string= (http-request-version request) "1.0") t)

@@ -1022,7 +1022,7 @@
                                         :end1 18))
                  (setf te-present t)
                  (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
-                   (when (connection-header-has-token-p value "chunked")
+                   (when (header-has-token-p value "chunked")
                      (setf chunked t))))
                (when (and (>= (length line) 15)
                           (string-equal line "content-length:"
@@ -1231,7 +1231,7 @@
   (when (and inbound (typep response 'http-response))
     (let ((values (loop for (k . v) in (http-response-headers response)
                         when (string-equal k "connection") collect v)))
-      (when (some (lambda (v) (connection-header-has-token-p v "close"))
+      (when (some (lambda (v) (header-has-token-p v "close"))
                   values)
         (setf (connection-close-after-p inbound) t)))))
 
@@ -1568,7 +1568,7 @@
    false-match on substring 'chunked'."
   (loop for (name . value) in headers
         thereis (and (string-equal name "transfer-encoding")
-                     (connection-header-has-token-p value "chunked"))))
+                     (header-has-token-p value "chunked"))))
 
 (defun chunked-body-complete-p (buf start end &optional (resume start))
   "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in

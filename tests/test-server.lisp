@@ -3054,15 +3054,15 @@
     (check "build-ws-close: 4000 app-range accepted"
            (not (null (build-ws-close 4000))) t))
 
-  ;; connection-header-has-token-p
+  ;; header-has-token-p
   (check "token single"
-         (web-skeleton::connection-header-has-token-p "upgrade" "upgrade") t)
+         (web-skeleton::header-has-token-p "upgrade" "upgrade") t)
   (check "token in list"
-         (web-skeleton::connection-header-has-token-p "keep-alive, Upgrade" "upgrade") t)
+         (web-skeleton::header-has-token-p "keep-alive, Upgrade" "upgrade") t)
   (check "token with whitespace"
-         (web-skeleton::connection-header-has-token-p "  Upgrade  ,  keep-alive  " "upgrade") t)
+         (web-skeleton::header-has-token-p "  Upgrade  ,  keep-alive  " "upgrade") t)
   (check "token absent"
-         (web-skeleton::connection-header-has-token-p "keep-alive" "upgrade") nil)
+         (web-skeleton::header-has-token-p "keep-alive" "upgrade") nil)
 
   ;; Frame building — text frame
   (let ((frame (build-ws-text "hello")))

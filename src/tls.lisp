@@ -815,7 +815,7 @@
                                         (setf te-present t)
                                         (let ((value (string-trim '(#\Space #\Tab)
                                                                    (subseq line 18))))
-                                          (when (connection-header-has-token-p value "chunked")
+                                          (when (header-has-token-p value "chunked")
                                             (setf chunked t))))
                                       ;; Capture Content-Length for
                                       ;; the non-chunked truncation

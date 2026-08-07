@@ -111,15 +111,18 @@
   (loop for (n . v) in (http-request-headers request)
         when (string-equal n name) collect v))
 
-(defun connection-header-has-token-p (header-value token)
+(defun header-has-token-p (header-value token)
   "Check if TOKEN appears in a comma-separated header value (RFC 7230 §3.2.6).
    Comparison is case-insensitive, tokens are trimmed of whitespace.
    Zero intermediate string allocation.
 
    Used for Transfer-Encoding: chunked, Connection: close/keep-alive,
-   and Upgrade: websocket detection. The historical name survives
-   from when this was websocket-specific; it is now a general HTTP
-   token-list primitive, callable from any header-parsing site."
+   and Upgrade: websocket detection — a general HTTP token-list
+   primitive, callable from any header-parsing site. It was
+   CONNECTION-HEADER-HAS-TOKEN-P while it only served the Connection
+   header, and the docstring spent two lines apologising for the name
+   afterwards; eight call sites across four files now read as what they
+   are rather than as something borrowed."
   (let ((len (length header-value))
         (token-len (length token)))
     (loop with pos = 0

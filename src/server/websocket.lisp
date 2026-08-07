@@ -62,9 +62,9 @@
              (key        (get-header request "sec-websocket-key"))
              (version    (get-header request "sec-websocket-version")))
          (and upgrade
-              (connection-header-has-token-p upgrade "websocket")
+              (header-has-token-p upgrade "websocket")
               connection
-              (connection-header-has-token-p connection "upgrade")
+              (header-has-token-p connection "upgrade")
               key
               (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
               ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
