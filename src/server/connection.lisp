@@ -661,7 +661,25 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-queue-write (conn bytes)
-  "Queue BYTES for writing. Caller is responsible for setting state."
+  "Replace the write buffer with BYTES. Caller is responsible for
+   setting state, and for the buffer having drained first — this
+   queues nothing behind an in-flight write, it overwrites it.
+
+   Calling with bytes still un-flushed signals rather than truncating.
+   Every one of the current call sites is reached from a read state,
+   a freshly-created outbound connection, or an inbound parked in
+   :awaiting with its buffer already drained, so the invariant holds
+   by construction — but by construction is a property of today's
+   nineteen callers, not of the function. DRAIN-CONNECTIONS and
+   PING-WS-CONNECTIONS both test (< write-pos write-end) before
+   calling, which is the same invariant enforced two levels out; the
+   next caller to skip that test would otherwise ship the peer a
+   truncated frame followed by a whole one, and the corruption would
+   surface as a protocol error somewhere else entirely."
+  (let ((pending (- (connection-write-end conn) (connection-write-pos conn))))
+    (when (plusp pending)
+      (error "connection-queue-write would clobber ~d un-flushed byte~:p on fd ~d"
+             pending (connection-fd conn))))
   (setf (connection-write-buf conn) bytes
         (connection-write-pos conn) 0
         (connection-write-end conn) (length bytes)))

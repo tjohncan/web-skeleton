@@ -852,6 +852,33 @@
     (let ((c (make-conn)))
       (check "sync-close: no Connection header — no-op"
              (sync c (make-text-response 200 "x")) nil))
+
+    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every
+    ;; current call site reaches it with a drained buffer, so the
+    ;; invariant holds by construction — but by construction is a fact
+    ;; about today's callers, not about the function, and the caller who
+    ;; gets it wrong would ship a truncated frame followed by a whole
+    ;; one, surfacing as a protocol error somewhere unrelated.
+    (let ((c (make-conn))
+          (bytes (make-array 4 :element-type '(unsigned-byte 8)
+                               :initial-element 65)))
+      (web-skeleton::connection-queue-write c bytes)
+      (check "queue-write: drained buffer accepts a new one"
+             (web-skeleton::connection-write-end c) 4)
+      ;; Simulate a partial flush, then try to queue over it.
+      (setf (web-skeleton::connection-write-pos c) 1)
+      (check "queue-write: clobbering un-flushed bytes signals"
+             (handler-case (progn (web-skeleton::connection-queue-write c bytes)
+                                  nil)
+               (error () t))
+             t)
+      ;; Fully flushed is not "un-flushed": pos = end must still pass, or
+      ;; the guard would reject the ordinary keep-alive path.
+      (setf (web-skeleton::connection-write-pos c) 4)
+      (check "queue-write: fully flushed buffer accepts a new one"
+             (progn (web-skeleton::connection-queue-write c bytes)
+                    (web-skeleton::connection-write-pos c))
+             0))
     (let ((c (make-conn))
           (r (make-text-response 200 "x")))
       (set-response-header r "connection" "upgrade")
@@ -2656,6 +2683,27 @@
            nil)
     (check "ws-upgrade: short key (length) rejected"
            (web-skeleton::websocket-upgrade-p (ws-req "dGhlIHNhbXBsZQ=="))
+           nil)
+    ;; The key is base64 over 16 fixed bytes, so its shape is fully
+    ;; determined: 22 data characters then exactly "==". A flat alphabet
+    ;; sweep across all 24 admits '=' at any position, which accepted 24
+    ;; of them — while the comment above the loop claimed the positional
+    ;; strictness the loop did not have.
+    (check "ws-upgrade: all-padding key rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "========================"))
+           nil)
+    (check "ws-upgrade: pad inside the data chars rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub=5jZQ=="))
+           nil)
+    (check "ws-upgrade: missing trailing pad rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub25jZQAA"))
+           nil)
+    (check "ws-upgrade: single trailing pad rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
 
   ;; build-ws-close only accepts the send-allowed set per RFC 6455
@@ -2768,6 +2816,28 @@
               (lambda ()
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
              t))
+    ;; RFC 6455 §5.1: client frames are masked. The mask bit is in byte 1,
+    ;; so the rejection needs nothing but the two header bytes — it used
+    ;; to sit below the availability test, which meant a peer could make
+    ;; us buffer a whole payload before we refused a frame we had already
+    ;; decided against. Header-only input proves the check no longer waits:
+    ;; before the hoist this returned (values NIL 0) asking for more bytes.
+    (let ((header-only (make-array 2 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x81 100))))
+      (check "reject unmasked frame from header alone"
+             (signals-error-p
+              (lambda ()
+                (web-skeleton::try-parse-ws-frame header-only 0 2)))
+             t))
+    ;; And a masked frame with the same shortfall still asks for more,
+    ;; so the hoist did not turn incompleteness into an error.
+    (let ((masked-short (make-array 2 :element-type '(unsigned-byte 8)
+                                      :initial-contents '(#x81 #xE4))))
+      (check "masked but incomplete frame still waits for bytes"
+             (multiple-value-bind (frame consumed)
+                 (web-skeleton::try-parse-ws-frame masked-short 0 2)
+               (list frame consumed))
+             '(nil 0)))
     ;; Canonical: len7=126, value=126 — accepted (boundary).
     (let* ((payload (make-array 126 :element-type '(unsigned-byte 8)
                                     :initial-element 97))  ; all 'a'

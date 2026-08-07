@@ -69,15 +69,19 @@
               (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
               ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
               ;; with '=' padding. Sec-WebSocket-Key is a fixed-size base64
-              ;; over 16 random bytes so padding is always two '=' — the
-              ;; charset check is strict on the 22 data chars and the
-              ;; trailing '=' pair.
-              (loop for c across key
+              ;; over 16 random bytes, so the shape is fully determined —
+              ;; 22 data characters and then exactly "==". Checked
+              ;; positionally: a flat alphabet sweep across all 24 admits
+              ;; '=' anywhere, which accepted a key of 24 '=' characters
+              ;; while this comment claimed the positional strictness the
+              ;; loop did not have.
+              (string= key "==" :start1 22)
+              (loop for i from 0 below 22
+                    for c = (char key i)
                     always (or (char<= #\A c #\Z)
                                (char<= #\a c #\z)
                                (char<= #\0 c #\9)
-                               (char= c #\+) (char= c #\/)
-                               (char= c #\=)))
+                               (char= c #\+) (char= c #\/)))
               version
               (string= version "13")))))
 
@@ -134,6 +138,14 @@
       ;; RSV1/2/3 must be zero unless an extension negotiated them (RFC 6455 §5.2)
       (when (logtest b0 #x70)
         (error "WebSocket: non-zero RSV bits"))
+      ;; RFC 6455 §5.1: every client-to-server frame is masked. The mask
+      ;; bit is byte 1, so this is decidable from the two bytes already
+      ;; in hand — no reason to wait. Checked below the availability test
+      ;; it meant an unmasked frame was buffered to completion before
+      ;; being refused, which is a peer choosing how much of our memory
+      ;; to occupy with something we had already decided to reject.
+      (unless masked
+        (error "WebSocket: received unmasked client frame"))
       ;; Determine payload length and header size
       (cond
         ((<= len7 125)
@@ -183,9 +195,6 @@
       (let ((frame-size (+ header-size payload-length)))
         (when (< available frame-size)
           (return-from try-parse-ws-frame (values nil 0)))
-        ;; Client frames must be masked
-        (unless masked
-          (error "WebSocket: received unmasked client frame"))
         ;; Unmask payload — read mask key directly from buffer, no allocation
         (let* ((mask-start (+ start (- header-size 4)))
                (payload-start (+ start header-size))
