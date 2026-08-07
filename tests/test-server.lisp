@@ -1694,6 +1694,15 @@
   (check "v4 172.16/12 low"  (is-public-address-p #(172 16 0 1) :inet)      nil)
   (check "v4 172.16/12 high" (is-public-address-p #(172 31 255 255) :inet)  nil)
   (check "v4 192.168/16"  (is-public-address-p #(192 168 1 1) :inet)        nil)
+  ;; 6to4 relay anycast, deprecated by RFC 7526. The relays are gone, so
+  ;; the prefix is still routed but reaches whoever picked it up.
+  (check "v4 6to4 anycast low"  (is-public-address-p #(192 88 99 0) :inet)   nil)
+  (check "v4 6to4 anycast high" (is-public-address-p #(192 88 99 255) :inet) nil)
+  ;; Neighbours on either side of the /24 stay public, so the new clause
+  ;; is a /24 and not a /16 sitting on top of 192.88 or all of 192.
+  (check "v4 192.88.98 is public"  (is-public-address-p #(192 88 98 1) :inet)  t)
+  (check "v4 192.88.100 is public" (is-public-address-p #(192 88 100 1) :inet) t)
+  (check "v4 192.89 is public"     (is-public-address-p #(192 89 99 1) :inet)  t)
   (check "v4 test-net-1"  (is-public-address-p #(192 0 2 1) :inet)          nil)
   (check "v4 test-net-2"  (is-public-address-p #(198 51 100 1) :inet)       nil)
   (check "v4 test-net-3"  (is-public-address-p #(203 0 113 1) :inet)        nil)

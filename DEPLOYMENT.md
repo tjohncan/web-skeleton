@@ -400,8 +400,15 @@ Set it once at startup, before `start-server`:
 `is-public-address-p` returns T only for publicly routable addresses,
 rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
 RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
-and cloud metadata IPs. It unwraps IPv4-mapped IPv6, NAT64, and 6to4,
-so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+6to4 relay anycast (`192.88.99.0/24`), and cloud metadata IPs. It unwraps
+IPv4-mapped IPv6, NAT64, and 6to4, so an attacker cannot launder
+`127.0.0.1` as `::ffff:127.0.0.1`.
+
+The 6to4 relay prefix is refused *because* RFC 7526 deprecated it. The
+relays are gone, so the prefix is still globally routed but no longer
+goes anywhere in particular — whoever announces it today receives the
+traffic. "Deprecated" reads like a reason to stop worrying about a range;
+here it is the reason to refuse it.
 
 **Why the framework has to do this and an app cannot.**
 The framework resolves hostnames itself. An app that resolves a name,

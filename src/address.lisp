@@ -61,6 +61,12 @@
       ((and (= a 192) (= b 0) (= c 0)) nil)
       ;; 192.0.2.0/24 — TEST-NET-1 (documentation)
       ((and (= a 192) (= b 0) (= c 2)) nil)
+      ;; 192.88.99.0/24 — 6to4 relay anycast. Deprecated by RFC 7526,
+      ;; which is the reason to refuse it rather than to skip it: the
+      ;; relays are gone, so a packet sent here reaches whatever picked
+      ;; up the anycast prefix afterwards. Still routed, still not a
+      ;; destination an app meant to reach.
+      ((and (= a 192) (= b 88) (= c 99)) nil)
       ;; 192.168.0.0/16 — RFC 1918 private
       ((and (= a 192) (= b 168)) nil)
       ;; 198.18.0.0/15 — benchmarking (RFC 2544)
