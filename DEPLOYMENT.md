@@ -539,6 +539,14 @@ the full file served, which RFC 7233 §3.1 permits; no media player or download 
 asks for it. The byte range is sliced out of the pre-built response, so enabling this
 costs no extra memory and a full GET still takes the pre-built path.
 
+A `Range` against a **zero-length** file is `416`, not an empty `200`.
+RFC 7233 §2.1 puts every `first-byte-pos` at or past a length of zero, so
+no range overlaps and §4.4 answers with 416. Worth knowing if you serve
+media: a few players treat 416 as fatal where they would retry an empty
+200. Files are read once at startup, so a file would have to be empty at
+load time — a segment caught mid-write by a restart, not one being
+written while the server runs.
+
 **Dotfiles are not served** — `.git/`, `.env` and anything else with a leading-dot path
 component is skipped at load time. The one exception is a root-level `/.well-known/`
 (RFC 8615), which *is* served, so ACME HTTP-01 challenges and `security.txt` work

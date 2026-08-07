@@ -541,7 +541,17 @@
    that media players and download managers do not use. Anything
    unparseable also returns NIL: ignoring a Range is always a safe
    answer, where guessing at one is not."
-  (when (or (null header-value) (zerop total))
+  ;; A zero-length resource used to short-circuit to NIL and serve a 200.
+  ;; RFC 7233 §2.1 makes a byte-range-spec unsatisfiable once its
+  ;; first-byte-pos is at or past the current length, which for an empty
+  ;; representation is true of every range there is — so the answer is the
+  ;; 416 this function already knows how to ask for. Both explicit forms
+  ;; reach it unaided below, since every first-byte-pos is >= 0; only the
+  ;; suffix form needs telling, and it is told there rather than here so
+  ;; that a malformed Range on an empty file still returns NIL and serves
+  ;; the (empty) 200 instead of inventing a 416 for a header nobody wrote
+  ;; correctly.
+  (when (null header-value)
     (return-from parse-byte-range nil))
   (let ((v (string-trim '(#\Space #\Tab) header-value)))
     (unless (and (> (length v) 6) (string-equal v "bytes=" :end1 6))
@@ -570,6 +580,11 @@
                    ;; bytes=-0 asks for the last zero bytes: RFC 7233
                    ;; §2.1 says a suffix length of 0 is unsatisfiable.
                    ((zerop n) :unsatisfiable)
+                   ;; No bytes to take the last N of. Left to the
+                   ;; whole-resource branch it computes (values 0 -1),
+                   ;; which is a range the rest of the code has no
+                   ;; meaning for.
+                   ((zerop total) :unsatisfiable)
                    ((>= n total) (values 0 (1- total)))   ; whole resource
                    (t (values (- total n) (1- total))))))
               ;; bytes=N-  or  bytes=N-M

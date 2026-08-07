@@ -3470,13 +3470,32 @@
     (check "range: wrong unit ignored"   (r "items=0-9") :ignore)
     (check "range: garbage ignored"      (r "bytes=") :ignore)
     (check "range: nil header ignored"   (r nil) :ignore)
-    ;; An empty resource has no satisfiable range at all.
-    (check "range: empty resource ignored"
-           (multiple-value-bind (f l)
-               (web-skeleton::parse-byte-range "bytes=0-0" 0)
-             (declare (ignore l))
-             f)
-           nil))
+    ;; An empty resource has no satisfiable range at all, which is the
+    ;; definition of 416 rather than a reason to serve 200. RFC 7233 §2.1
+    ;; puts every first-byte-pos at or past a zero length, and §4.4
+    ;; answers that with 416; this used to short-circuit to NIL and serve
+    ;; the full (empty) 200 instead. All three forms are checked because
+    ;; only the suffix form needed telling — the other two reach
+    ;; :unsatisfiable through the ordinary out-of-range branch, and a
+    ;; later edit could break one without touching the others.
+    (flet ((r0 (spec)
+             (multiple-value-bind (first last)
+                 (web-skeleton::parse-byte-range spec 0)
+               (cond ((eq first :unsatisfiable) :unsatisfiable)
+                     (first (list first last))
+                     (t :ignore)))))
+      (check "range: empty resource, explicit range unsatisfiable"
+             (r0 "bytes=0-0") :unsatisfiable)
+      (check "range: empty resource, open-ended range unsatisfiable"
+             (r0 "bytes=0-") :unsatisfiable)
+      (check "range: empty resource, suffix range unsatisfiable"
+             (r0 "bytes=-500") :unsatisfiable)
+      ;; Still NIL for a Range nobody wrote correctly: an empty resource
+      ;; does not turn a malformed header into a satisfiability question.
+      (check "range: empty resource, garbage still ignored"
+             (r0 "bytes=abc-def") :ignore)
+      (check "range: empty resource, nil header still ignored"
+             (r0 nil) :ignore)))
 
   ;; ---- end-to-end through serve-static ----
   (let* ((content (sb-ext:string-to-octets
