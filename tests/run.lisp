@@ -2,6 +2,104 @@
 
 ;;; ===========================================================================
 ;;; Test utilities and runner
+;;;
+;;; This file holds the two assertion macros every test in the suite goes
+;;; through (CHECK, CHECK-ERROR), the per-suite reporting, and TEST, which
+;;; runs everything and is what run-tests.lisp calls.
+;;;
+;;; ---------------------------------------------------------------------------
+;;; The suites
+;;;
+;;;   test-algorithms  SHA-1, SHA-256, HMAC, hex, base64, ECDSA, random
+;;;   test-json        JSON parser and serializer
+;;;   test-server      HTTP parsing and response building, URL and query,
+;;;                    routing, connection state, WebSocket, static files,
+;;;                    outbound fetch, JWT
+;;;   test-store       concurrent keyed store and its reaper
+;;;   test-harness     the live-server harness's own round-trips
+;;;   test-tls         TLS registration; skips when libssl is absent
+;;;
+;;; TEST runs all six, then re-runs the crypto suite as
+;;; TEST-PURE-LISP-CRYPTO if libssl is loaded. That second pass is not
+;;; redundant: when libssl is present it has swapped its own
+;;; implementations into the sha1 / sha256 / ecdsa symbol cells, so the
+;;; first pass never touched the pure-Lisp originals in
+;;; src/algorithms/. The re-run swaps them back so an edit there is
+;;; caught on a machine that has libssl too.
+;;;
+;;; ---------------------------------------------------------------------------
+;;; Running
+;;;
+;;;   sbcl --non-interactive --load run-tests.lisp     ; everything, exit 1 on fail
+;;;   (web-skeleton-tests:test-server)                 ; one suite, from a REPL
+;;;
+;;; CI runs the same entry point with the fasl cache deleted first, and
+;;; fails the build on any "caught WARNING" or "caught STYLE-WARNING" in
+;;; the output as well as on a failing test. A warning-free cold build is
+;;; therefore part of the contract, not a nicety — an undefined function
+;;; or an unused binding fails CI exactly as a bad assertion does. Run it
+;;; the same way locally before believing a change is finished.
+;;;
+;;; ---------------------------------------------------------------------------
+;;; Writing a test
+;;;
+;;; CHECK compares with EQUAL and prints both values on failure, so
+;;; prefer expressions that reduce to something legible — a list, a
+;;; length, a status code — over a struct whose printed form fills the
+;;; screen. CHECK-ERROR asserts that a form signals, and notes the
+;;; condition type when it is not an HTTP-PARSE-ERROR.
+;;;
+;;; Test names are printed verbatim and are the only thing a reader of a
+;;; failing CI log gets, so name the behaviour and not the function:
+;;; "range: empty resource, suffix range unsatisfiable" survives a
+;;; rename; "test parse-byte-range 7" does not.
+;;;
+;;; Two styles are available, both from web-skeleton-test-harness:
+;;; WITH-TEST-SERVER for a real round-trip against a live single-worker
+;;; server on an ephemeral port, and MAKE-TEST-REQUEST for building a
+;;; request struct and calling a handler directly. Prefer the second
+;;; unless the thing under test is the network path itself — it is
+;;; faster and it cannot hang.
+;;;
+;;; Dynamic bindings do not cross SB-THREAD:MAKE-THREAD. A LET around a
+;;; special will not be seen by a worker the harness starts, so a test
+;;; that needs the server to observe a changed parameter has to SETF it
+;;; globally and restore it afterwards.
+;;;
+;;; ---------------------------------------------------------------------------
+;;; Checking that a check tests something
+;;;
+;;; A test that passes against the pre-fix code is not coverage. It is
+;;; possible to write an assertion that names the right behaviour, reads
+;;; correctly, passes, and would pass just as well with the fix removed —
+;;; because it fails an earlier guard, or asserts a value both versions
+;;; produce, or proves a binding exists without proving anything reads
+;;; it. Rereading it will not reveal this. Removing the fix will.
+;;;
+;;; So for anything security-relevant: revert the fix and confirm the
+;;; check fails. Two ways, neither touching the working tree:
+;;;
+;;;   - reimplement the pre-fix function inside a probe and show
+;;;     old-accepts / new-rejects on the same input
+;;;   - redefine it in a loaded image and re-run the suite:
+;;;     (in-package :web-skeleton), defun, then (web-skeleton-tests:test)
+;;;
+;;; Four things that make the second one lie:
+;;;
+;;;   - One process per revert. Running TEST twice in one image deadlocks
+;;;     on the listeners the harness binds.
+;;;   - (SYMBOL-FUNCTION 'F), never #'F, when capturing an original to
+;;;     call from its replacement. #'F resolves through the fdefn and so
+;;;     follows the redefinition — the wrapper calls itself forever.
+;;;   - Macros are already expanded into their compiled callers, so
+;;;     redefining one in the image changes nothing. Revert a function it
+;;;     expands into instead.
+;;;   - If the revert breaks shared infrastructure, assert against the
+;;;     affected function directly rather than through TEST. A revert
+;;;     that takes the harness down produces a hang, not a result.
+;;;
+;;; The same rule holds outside testing: do not enter a multi-step state
+;;; change without first confirming every intermediate step passes.
 ;;; ===========================================================================
 
 (defvar *crlf* (coerce '(#\Return #\Newline) 'string)
