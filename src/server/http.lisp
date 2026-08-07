@@ -719,10 +719,12 @@
     (101 . "Switching Protocols")
     (200 . "OK")
     (201 . "Created")
+    (202 . "Accepted")
     (204 . "No Content")
     (206 . "Partial Content")
     (301 . "Moved Permanently")
     (302 . "Found")
+    (303 . "See Other")
     (304 . "Not Modified")
     (307 . "Temporary Redirect")
     (308 . "Permanent Redirect")
@@ -733,18 +735,34 @@
     (405 . "Method Not Allowed")
     (408 . "Request Timeout")
     (409 . "Conflict")
+    (410 . "Gone")
+    (411 . "Length Required")
+    (412 . "Precondition Failed")
     (413 . "Payload Too Large")
     (414 . "URI Too Long")
+    (415 . "Unsupported Media Type")
     (416 . "Range Not Satisfiable")
     (417 . "Expectation Failed")
+    (422 . "Unprocessable Content")
+    (428 . "Precondition Required")
     (429 . "Too Many Requests")
     (431 . "Request Header Fields Too Large")
     (500 . "Internal Server Error")
     (501 . "Not Implemented")
     (502 . "Bad Gateway")
     (503 . "Service Unavailable")
-    (504 . "Gateway Timeout"))
-  "Map of HTTP status codes to reason phrases.")
+    (504 . "Gateway Timeout")
+    (505 . "HTTP Version Not Supported"))
+  "Map of HTTP status codes to reason phrases.
+
+   Codes the framework itself emits, plus the ones an app most often
+   needs from a handler. 422 carries RFC 9110's phrasing (\"Unprocessable
+   Content\"), not RFC 4918's older \"Unprocessable Entity\".
+
+   Not exhaustive on purpose: the situational codes (402, 406, 426, 451)
+   and 418 are absent because an app that wants one can set the status
+   itself, and STATUS-REASON answering \"Unknown\" for a code nobody in
+   this codebase sends is better than a table nobody trusts is complete.")
 
 (defun status-reason (code)
   "Return the reason phrase for a status CODE, or \"Unknown\"."

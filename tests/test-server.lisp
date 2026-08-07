@@ -549,6 +549,29 @@
   (check "200 reason" (status-reason 200) "OK")
   (check "404 reason" (status-reason 404) "Not Found")
   (check "unknown reason" (status-reason 999) "Unknown")
+  ;; Codes added for handler use. Phrases are asserted rather than just
+  ;; presence, because a wrong phrase reaches the wire on every response
+  ;; that uses the code and nothing else in the system would notice.
+  (dolist (spec '((202 . "Accepted")
+                  (303 . "See Other")
+                  (410 . "Gone")
+                  (411 . "Length Required")
+                  (412 . "Precondition Failed")
+                  (415 . "Unsupported Media Type")
+                  (422 . "Unprocessable Content")
+                  (428 . "Precondition Required")
+                  (505 . "HTTP Version Not Supported")))
+    (check (format nil "~d reason" (car spec))
+           (status-reason (car spec)) (cdr spec)))
+  ;; RFC 9110 §15.5.21 renamed 422 from RFC 4918's "Unprocessable
+  ;; Entity". Pinned so a future editor does not "correct" it back to
+  ;; the phrasing every other framework still ships.
+  (check "422 uses RFC 9110 phrasing, not RFC 4918's"
+         (search "Entity" (status-reason 422)) nil)
+  ;; Deliberately absent — see the *status-reasons* docstring.
+  (dolist (code '(418 402 406 426 451))
+    (check (format nil "~d deliberately absent" code)
+           (status-reason code) "Unknown"))
 
   ;; Text response
   (let ((resp (make-text-response 200 "hello")))
