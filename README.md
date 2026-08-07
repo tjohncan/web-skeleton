@@ -162,7 +162,11 @@ tests/
   configurable idle timeout for inactive WebSocket connections
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
-  validates against configurable size limits
+  validates against configurable size limits. A rejection carries the
+  status that describes it — 413 over a size cap, 414 for the request
+  line, 431 for headers, 501 for an unimplemented method or transfer
+  coding, 505 for a version that isn't 1.0 or 1.1 — rather than answering
+  everything with 400
 - **HTTP response builder** — status codes, headers, body serialization.
   Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
   verbatim, for content a string cannot carry (a generated image, a zip, a

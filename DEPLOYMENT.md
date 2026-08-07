@@ -124,6 +124,34 @@ nginx, caddy, or a similar reverse proxy for HTTPS termination.
 The default bind address is localhost (`#(127 0 0 1)`), correct for this setup.
 Use `:host #(0 0 0 0)` only if the server must accept connections directly.
 
+### Status codes the framework itself sends
+
+A request the framework rejects before your handler sees it gets a
+specific status, not a blanket 400:
+
+| Code | Sent when |
+|------|-----------|
+| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host` |
+| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request |
+| `414 URI Too Long` | Request line over `*max-request-line-length*` |
+| `417 Expectation Failed` | An `Expect` the framework does not implement |
+| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
+| `501 Not Implemented` | A method not in the accepted set, or any `Transfer-Encoding` (RFC 7230 §3.3.1) |
+| `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
+| `500 Internal Server Error` | Your handler raised |
+
+**If you alert on 400s, this changes what you see.** All of the above
+were 400 previously, so a dashboard counting "client errors" will start
+splitting them out — and a spike that used to look like malformed
+requests may resolve into something more specific, such as a client
+retrying with an oversized body or a scanner speaking HTTP/2 at a 1.1
+port. That is the point of the change, but it does move the numbers.
+
+`status-reason` covers the codes above plus the ones handlers commonly
+need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx
+set. It is deliberately not exhaustive: for anything else, set the status
+and supply your own reason phrase.
+
 ### WebSocket origin validation
 
 The framework validates WebSocket protocol headers

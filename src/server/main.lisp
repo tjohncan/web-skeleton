@@ -605,14 +605,18 @@
     (http-parse-error (e)
       (log-warn "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
-      ;; Send 400 before closing so the client gets a proper HTTP response.
+      ;; Answer before closing so the client gets a proper HTTP response.
+      ;; The status comes from the condition: 400 unless the raise site
+      ;; knew better (413 for a body over the cap, 414 for a request line
+      ;; over its cap, 431 for headers, 501 for a method or transfer
+      ;; coding we do not implement, 505 for a version we do not speak).
       ;; Runs through STRIP-BODY-FOR-HEAD for symmetry with the 500 path
       ;; below — typically a no-op here because CONNECTION-REQUEST isn't
       ;; set until PARSE-REQUEST-BYTES fully succeeds, but harmless and
       ;; correct on any future path that raises HTTP-PARSE-ERROR after
       ;; the request is parsed.
       (handler-case
-          (let ((resp (make-error-response 400)))
+          (let ((resp (make-error-response (http-parse-error-status e))))
             (set-response-header resp "connection" "close")
             (let ((err-bytes (strip-body-for-head
                               (format-response resp) conn)))

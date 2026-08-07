@@ -53,14 +53,34 @@
 ;;; ---------------------------------------------------------------------------
 
 (define-condition http-parse-error (error)
-  ((message :initarg :message :reader http-parse-error-message))
+  ((message :initarg :message :reader http-parse-error-message)
+   ;; The status the client should receive. 400 is the right answer for
+   ;; a request whose syntax we could not make sense of, and it is the
+   ;; default because most raise sites are exactly that. It is not the
+   ;; right answer for a request we understood perfectly and refused on
+   ;; its merits — a 12 MiB body, an HTTP/2 preface, a method we do not
+   ;; implement. Those told the client "you wrote this wrong" when the
+   ;; truth was "this is too big", "wrong protocol", "not supported",
+   ;; and 413 / 414 / 431 already sat in *STATUS-REASONS* unreachable
+   ;; because every path through here answered 400.
+   (status  :initarg :status  :reader http-parse-error-status
+            :initform 400))
   (:report (lambda (condition stream)
              (format stream "HTTP parse error: ~a"
                      (http-parse-error-message condition)))))
 
 (defun http-parse-error (format-string &rest args)
-  "Signal an HTTP-PARSE-ERROR with a formatted message."
+  "Signal an HTTP-PARSE-ERROR with a formatted message. Answers 400."
   (error 'http-parse-error
+         :message (apply #'format nil format-string args)))
+
+(defun http-reject (status format-string &rest args)
+  "Signal an HTTP-PARSE-ERROR carrying a specific STATUS.
+   Separate from HTTP-PARSE-ERROR rather than an optional argument to
+   it, because that function's lambda list is (format-string &rest args)
+   — a status keyword could not be told apart from a format argument."
+  (error 'http-parse-error
+         :status status
          :message (apply #'format nil format-string args)))
 
 ;;; ---------------------------------------------------------------------------
@@ -528,12 +548,15 @@
         (unless crlf (return))          ; no more complete lines
         (when (= crlf pos) (return))    ; empty line = end of headers
         (let ((line-len (- crlf pos)))
+          ;; RFC 6585 §5: 431 is for headers, individually or in total.
+          ;; A client sending an 9 KiB cookie has not malformed anything;
+          ;; it is over a budget, and 400 gave it no way to know which.
           (when (> line-len *max-header-line-length*)
-            (http-parse-error "header line too long (~d bytes, max ~d)"
+            (http-reject 431 "header line too long (~d bytes, max ~d)"
                               line-len *max-header-line-length*))
           (incf total line-len)
           (when (> total *max-total-header-bytes*)
-            (http-parse-error "total header bytes exceed ~d"
+            (http-reject 431 "total header bytes exceed ~d"
                               *max-total-header-bytes*))
           (let ((first-byte (aref buf pos)))
             (if (and headers (or (= first-byte 32) (= first-byte 9)))
@@ -582,7 +605,7 @@
                       ;; pattern used elsewhere (e.g. JSON depth).
                       (incf count)
                       (when (> count *max-header-count*)
-                        (http-parse-error "too many headers (~d, max ~d)"
+                        (http-reject 431 "too many headers (~d, max ~d)"
                                           count *max-header-count*))
                       (push (cons name (if (= vs ve) ""
                                            (bytes-to-string buf vs ve)))
@@ -604,8 +627,11 @@
     (let ((req-line-len (- req-end start)))
       (when (zerop req-line-len)
         (http-parse-error "empty request line"))
+      ;; The request line is METHOD SP URI SP VERSION, and the only part
+      ;; a client can make arbitrarily long is the URI — so over-length
+      ;; here is 414, not 400. RFC 7231 §6.5.12.
       (when (> req-line-len *max-request-line-length*)
-        (http-parse-error "request line too long (~d bytes, max ~d)"
+        (http-reject 414 "request line too long (~d bytes, max ~d)"
                           req-line-len *max-request-line-length*)))
     ;; Parse: METHOD SP URI SP VERSION
     (let ((sp1 (position 32 buf :start start :end req-end)))  ; 32 = space
@@ -628,70 +654,93 @@
               for b = (aref buf i)
               when (or (< b #x20) (= b #x7F))
               do (http-parse-error "control character in request method"))
-        ;; Method
-        (let ((method (match-method-bytes buf start sp1)))
+        ;; Method and version are both resolved before either is judged,
+        ;; because the order of the two rejections is itself a decision.
+        ;; RFC 7230 §2.6: a server SHOULD answer 505 when it cannot
+        ;; respond using the request's major version — which outranks any
+        ;; question about the method, since a version we do not speak
+        ;; makes the method unanswerable rather than merely unsupported.
+        ;;
+        ;; The only requests this ordering moves are the ones that fail
+        ;; both checks, and in practice that set has one member: the
+        ;; HTTP/2 prior-knowledge preface, "PRI * HTTP/2.0". Its method
+        ;; is PRI, so a method-first parser answers 501 and never looks
+        ;; at the version — which is how this read 501 while three
+        ;; comments and a table row claimed 505.
+        (let ((method (match-method-bytes buf start sp1))
+              ;; Version — match "HTTP/1.0" or "HTTP/1.1" byte-by-byte
+              (version
+                (let* ((ver-start (1+ sp2))
+                       (ver-len (- req-end ver-start)))
+                  (when (and (= ver-len 8)
+                             (= (aref buf ver-start)       72)  ; H
+                             (= (aref buf (+ ver-start 1)) 84)  ; T
+                             (= (aref buf (+ ver-start 2)) 84)  ; T
+                             (= (aref buf (+ ver-start 3)) 80)  ; P
+                             (= (aref buf (+ ver-start 4)) 47)  ; /
+                             (= (aref buf (+ ver-start 5)) 49)  ; 1
+                             (= (aref buf (+ ver-start 6)) 46)) ; .
+                    (case (aref buf (+ ver-start 7))
+                      (49 "1.1")     ; '1'
+                      (48 "1.0")))))) ; '0'
+          ;; RFC 7231 §6.6.6. Anything whose version token is not exactly
+          ;; HTTP/1.0 or HTTP/1.1: the h2 preface, a typo'd "HTTP/1.2", a
+          ;; literal "HTTP/0.9". (A genuine HTTP/0.9 request line is
+          ;; "GET /path" with no version token at all — one space, so it
+          ;; is caught as a malformed request line well before here.)
+          (unless version
+            (http-reject 505 "unsupported HTTP version"))
+          ;; RFC 7231 §6.6.2: a method the origin server does not support
+          ;; is 501, not 400 — the request line is well-formed, we simply
+          ;; do not implement PROPFIND. 405 is the neighbouring code and
+          ;; the wrong one: that is a method we know, refused for this
+          ;; resource, and it carries a mandatory Allow header naming the
+          ;; alternatives. We have no resource-level view here.
           (unless method
-            (http-parse-error "unrecognized method: ~a"
-                              (bytes-to-string buf start sp1)))
-          ;; Version — match "HTTP/1.0" or "HTTP/1.1" byte-by-byte
-          (let* ((ver-start (1+ sp2))
-                 (ver-len (- req-end ver-start))
-                 (version
-                   (when (and (= ver-len 8)
-                              (= (aref buf ver-start)       72)  ; H
-                              (= (aref buf (+ ver-start 1)) 84)  ; T
-                              (= (aref buf (+ ver-start 2)) 84)  ; T
-                              (= (aref buf (+ ver-start 3)) 80)  ; P
-                              (= (aref buf (+ ver-start 4)) 47)  ; /
-                              (= (aref buf (+ ver-start 5)) 49)  ; 1
-                              (= (aref buf (+ ver-start 6)) 46)) ; .
-                     (case (aref buf (+ ver-start 7))
-                       (49 "1.1")    ; '1'
-                       (48 "1.0"))))) ; '0'
-            (unless version
-              (http-parse-error "unsupported HTTP version"))
-            ;; URI → path + query
-            (let* ((uri-start (1+ sp1))
-                   (qmark (position 63 buf :start uri-start :end sp2))  ; 63 = '?'
-                   (path-end (or qmark sp2)))
-              (when (= uri-start path-end)
-                (http-parse-error "empty request path"))
-              (unless (= (aref buf uri-start) 47)  ; 47 = '/'
-                (http-parse-error "request path must start with /"))
-              ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the request-target
-              ;; region (RFC 7230 §3.2.6: request-target uses pchar, which
-              ;; excludes controls). Without this check a bare CR or LF
-              ;; smuggled into the URL survives scan-crlf (which only
-              ;; matches the CRLF pair) and ends up in the parsed PATH
-              ;; string, giving an attacker a log-injection primitive via
-              ;; any ~a-interpolated log call that names the path.
-              ;; Non-ASCII bytes (>= 0x80) rejected at parse time too.
-              ;; RFC 3986 §2.1 requires non-ASCII characters in URLs to
-              ;; be percent-encoded — raw UTF-8 bytes are non-compliant
-              ;; from a spec-adhering client. Without this check the
-              ;; bytes survive into the parsed PATH/QUERY strings; a
-              ;; later GET-QUERY-PARAM call trips URL-DECODE's
-              ;; :external-format :ascii conversion and the handler
-              ;; answers 400 at dispatch time with a misleading
-              ;; "parse error" log line. Rejecting at parse-time keeps
-              ;; the parser's contract honest and the error path
-              ;; consistent with the outbound PARSE-URL check.
-              (loop for i from uri-start below sp2
-                    for b = (aref buf i)
-                    when (or (< b #x20) (= b #x7F))
-                    do (http-parse-error "control character in request-target")
-                    when (>= b #x80)
-                    do (http-parse-error "non-ASCII byte in request-target"))
-              (let ((path (bytes-to-string buf uri-start path-end))
-                    (query (when qmark
-                             (bytes-to-string buf (1+ qmark) sp2))))
-                (let ((headers (parse-headers-bytes buf (+ req-end 2) end)))
-                  (make-http-request
-                   :method method
-                   :path path
-                   :query query
-                   :version version
-                   :headers headers))))))))))
+            (http-reject 501 "unrecognized method: ~a"
+                         (bytes-to-string buf start sp1)))
+          ;; URI → path + query
+          (let* ((uri-start (1+ sp1))
+                 (qmark (position 63 buf :start uri-start :end sp2))  ; 63 = '?'
+                 (path-end (or qmark sp2)))
+            (when (= uri-start path-end)
+              (http-parse-error "empty request path"))
+            (unless (= (aref buf uri-start) 47)  ; 47 = '/'
+              (http-parse-error "request path must start with /"))
+            ;; Reject CTL bytes (0x00-0x1F, 0x7F) in the request-target
+            ;; region (RFC 7230 §3.2.6: request-target uses pchar, which
+            ;; excludes controls). Without this check a bare CR or LF
+            ;; smuggled into the URL survives scan-crlf (which only
+            ;; matches the CRLF pair) and ends up in the parsed PATH
+            ;; string, giving an attacker a log-injection primitive via
+            ;; any ~a-interpolated log call that names the path.
+            ;; Non-ASCII bytes (>= 0x80) rejected at parse time too.
+            ;; RFC 3986 §2.1 requires non-ASCII characters in URLs to
+            ;; be percent-encoded — raw UTF-8 bytes are non-compliant
+            ;; from a spec-adhering client. Without this check the
+            ;; bytes survive into the parsed PATH/QUERY strings; a
+            ;; later GET-QUERY-PARAM call trips URL-DECODE's
+            ;; :external-format :ascii conversion and the handler
+            ;; answers 400 at dispatch time with a misleading
+            ;; "parse error" log line. Rejecting at parse-time keeps
+            ;; the parser's contract honest and the error path
+            ;; consistent with the outbound PARSE-URL check.
+            (loop for i from uri-start below sp2
+                  for b = (aref buf i)
+                  when (or (< b #x20) (= b #x7F))
+                  do (http-parse-error "control character in request-target")
+                  when (>= b #x80)
+                  do (http-parse-error "non-ASCII byte in request-target"))
+            (let ((path (bytes-to-string buf uri-start path-end))
+                  (query (when qmark
+                           (bytes-to-string buf (1+ qmark) sp2))))
+              (let ((headers (parse-headers-bytes buf (+ req-end 2) end)))
+                (make-http-request
+                 :method method
+                 :path path
+                 :query query
+                 :version version
+                 :headers headers)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; String-level convenience interface

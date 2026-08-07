@@ -284,7 +284,12 @@
                          ;; makes the per-digit cap do real work.
                          do (incf digits)
                             (when (> digits 10)
-                              (http-parse-error "Content-Length too large"))
+                              ;; An 11-digit length is >= 10 GB, which is
+                              ;; over any *max-body-size* worth setting —
+                              ;; 413 rather than 400, same as the body
+                              ;; check that would have caught it if we
+                              ;; had let the number finish parsing.
+                              (http-reject 413 "Content-Length too large"))
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
                             (incf pos))
@@ -479,7 +484,10 @@
                    (connection-body-expected conn)))
           nil)
          (t
-          (http-parse-error "request too large (buffer full)"))))
+          ;; The buffer is at CONNECTION-READ-CAP with no complete
+          ;; request in it. Whatever the client is sending, there is
+          ;; more of it than we will hold — 413, not 400.
+          (http-reject 413 "request too large (buffer full)"))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
     ;; Activity timestamp is NOT updated here on partial reads.
@@ -530,8 +538,14 @@
                  (let ((minor-version-byte (aref buf (+ sp 8)))
                        (hdr-start (+ req-line-end 2)))
                  ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
+                 ;; RFC 7230 §3.3.1 names the code for this exactly: a
+                 ;; server that receives a transfer coding it does not
+                 ;; understand SHOULD answer 501. Not 411 — that is for
+                 ;; refusing a request until it carries a Content-Length,
+                 ;; and it would misdescribe a client whose framing is
+                 ;; legal and simply unimplemented here.
                  (when (scan-transfer-encoding buf header-end hdr-start)
-                   (http-parse-error "Transfer-Encoding not supported"))
+                   (http-reject 501 "Transfer-Encoding not supported"))
                  ;; Classify Expect once — disposition gates dispatch
                  ;; before the body-presence split so a no-body GET with
                  ;; Expect: x-foo 417s the same as a bodied POST does.
@@ -575,8 +589,8 @@
                    ((and content-length (> content-length 0))
                     ;; Reject oversized bodies before allocating.
                     (when (> content-length *max-body-size*)
-                      (http-parse-error "body too large (~d bytes, max ~d)"
-                                        content-length *max-body-size*))
+                      (http-reject 413 "body too large (~d bytes, max ~d)"
+                                   content-length *max-body-size*))
                     ;; Grow read buffer if needed.
                     (let ((total-needed (+ body-start content-length)))
                       (when (> total-needed (length (connection-read-buf conn)))

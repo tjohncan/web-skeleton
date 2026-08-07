@@ -549,6 +549,7 @@
   (check "200 reason" (status-reason 200) "OK")
   (check "404 reason" (status-reason 404) "Not Found")
   (check "unknown reason" (status-reason 999) "Unknown")
+
   ;; Codes added for handler use. Phrases are asserted rather than just
   ;; presence, because a wrong phrase reaches the wire on every response
   ;; that uses the code and nothing else in the system would notice.
@@ -1830,6 +1831,116 @@
          (web-skeleton::format-peer-addr
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
          "[2001:db8:0:0:0:0:0:1]:80"))
+;;; ---------------------------------------------------------------------------
+;;; Parse errors carry the status the client should receive
+;;; ---------------------------------------------------------------------------
+
+(defun test-parse-error-status ()
+  (format t "~%Parse error status codes~%")
+  ;; Every parse failure used to answer 400, including ones the framework
+  ;; understood perfectly and refused on their merits. 413 / 414 / 431
+  ;; were already in *status-reasons* and unreachable for exactly that
+  ;; reason. These assert the status the condition carries, which is what
+  ;; HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE.
+  (flet ((status-of (thunk)
+           (handler-case (progn (funcall thunk) :no-error)
+             (web-skeleton:http-parse-error (e)
+               (web-skeleton::http-parse-error-status e))))
+         (req (line)
+           (sb-ext:string-to-octets (concatenate 'string line *crlf* *crlf*)
+                                    :external-format :ascii)))
+    ;; 400 is still the default for genuine syntax trouble.
+    (check "malformed request line stays 400"
+           (status-of (lambda ()
+                        (let ((b (req "GARBAGE")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           400)
+    ;; 505 — the version is the problem, and 400 named the wrong thing.
+    (check "unsupported version is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/2.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    ;; The real HTTP/2 prior-knowledge preface, which is the case the
+    ;; version-before-method ordering exists for. Its method is PRI, so a
+    ;; method-first parser answers 501 and never reaches the version —
+    ;; and "GET / HTTP/2.0" above cannot catch that, because a known
+    ;; method reaches the version check either way. RFC 7230 §2.6 puts
+    ;; the version first.
+    (check "h2 prior-knowledge preface is 505, not 501"
+           (status-of (lambda ()
+                        (let ((b (req "PRI * HTTP/2.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    (check "typo'd version is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/1.2")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    ;; A genuine HTTP/0.9 request line carries no version token at all,
+    ;; so it has one space and dies as a malformed request line long
+    ;; before the version check. A literal "HTTP/0.9" token does reach
+    ;; 505. Both pinned because the distinction is easy to state wrongly.
+    (check "literal HTTP/0.9 token is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/0.9")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    (check "versionless 0.9 request line is 400"
+           (status-of (lambda ()
+                        (let ((b (req "GET /path")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           400)
+    (check "HTTP/1.0 still accepted"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/1.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           :no-error)
+    ;; 501 — a method we do not implement, not a malformed one. 405 would
+    ;; be wrong: that means "known method, not allowed here" and carries a
+    ;; mandatory Allow header we have no resource-level view to fill in.
+    (check "unrecognized method is 501"
+           (status-of (lambda ()
+                        (let ((b (req "PROPFIND / HTTP/1.1")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           501)
+    ;; 414 — the only part of a request line a client can grow at will is
+    ;; the URI.
+    (check "over-long request line is 414"
+           (status-of
+            (lambda ()
+              (let ((b (req (format nil "GET /~a HTTP/1.1"
+                                    (make-string
+                                     (1+ web-skeleton:*max-request-line-length*)
+                                     :initial-element #\a)))))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           414)
+    ;; 431 — RFC 6585 §5, for headers individually or in total.
+    (check "too many headers is 431"
+           (status-of
+            (lambda ()
+              (let* ((hdrs (with-output-to-string (s)
+                             (dotimes (i (+ 2 web-skeleton:*max-header-count*))
+                               (format s "x-~d: v~a" i *crlf*))))
+                     (b (sb-ext:string-to-octets
+                         (concatenate 'string "GET / HTTP/1.1" *crlf*
+                                      "host: x" *crlf* hdrs *crlf*)
+                         :external-format :ascii)))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           431)
+    (check "over-long header line is 431"
+           (status-of
+            (lambda ()
+              (let ((b (sb-ext:string-to-octets
+                        (concatenate 'string "GET / HTTP/1.1" *crlf*
+                                     "x-big: "
+                                     (make-string
+                                      (1+ web-skeleton:*max-header-line-length*)
+                                      :initial-element #\a)
+                                     *crlf* *crlf*)
+                        :external-format :ascii)))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           431)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL decode tests
@@ -4283,6 +4394,7 @@
   (test-fetch-address-filter)
   (test-dns-cache)
   (test-format-peer-addr)
+  (test-parse-error-status)
   (test-url-decode)
   (test-query-string)
   (test-match-path)
