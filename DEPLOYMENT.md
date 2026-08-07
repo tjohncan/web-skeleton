@@ -517,6 +517,26 @@ peer that never drained its receive window pinned the worker permanently.
 Call it **before** `start-server`.
 It is not thread-safe and must not be called while the server is running.
 
+**The whole tree is capped at 256 MiB** (`:max-total-bytes`), and crossing
+it signals with the offending path and the running total. The cache is
+resident for the life of the process, so without a cap a directory
+holding one large video buys a resident set to match — discovered on the
+box at deploy time rather than at the call. Range support makes that
+likelier rather than less: serving large media is what Range is *for*, so
+the invitation to keep large media next to the CSS now comes with a
+number attached.
+
+There is no serve-from-disk path — every served file lives in this cache.
+If the cap fires, either raise it deliberately:
+
+```lisp
+(load-static-files "static/" :max-total-bytes (* 2 1024 1024 1024))
+```
+
+or leave large media to the reverse proxy, which is already in front of
+this server for TLS termination and is better at it. The cap is per-call,
+not global, so additive calls each bring their own budget.
+
 Static responses **omit the `Date` header** — the pre-built bytes
 are frozen at startup time and the framework will not patch each served
 response with a per-request date. This violates the RFC 7231 §7.1.1.2 `MUST`,

@@ -3419,7 +3419,42 @@
                                         web-skeleton::*static-cache*))) t)
              (check "dot-path: /.git/config stays hidden"
                     (gethash "/.git/config"
-                             web-skeleton::*static-cache*) nil))
+                             web-skeleton::*static-cache*) nil)
+             ;; :MAX-TOTAL-BYTES. The cache is resident for the life of
+             ;; the process, so an oversized tree is a resident-set
+             ;; surprise discovered on the box at deploy time unless it
+             ;; is refused here. Range support makes large media likelier
+             ;; to be sitting in the directory, not less.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: tree over :max-total-bytes signals"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch) :max-total-bytes 10)
+                               nil)
+                      (error () t))
+                    t)
+             ;; A cap the tree fits under must not fire — otherwise the
+             ;; check above would pass for a guard that rejects always.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: tree under :max-total-bytes loads"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch)
+                                :max-total-bytes (* 1024 1024))
+                               (not (null (gethash "/index.html"
+                                                   web-skeleton::*static-cache*))))
+                      (error () nil))
+                    t)
+             ;; And the default is generous enough that an ordinary tree
+             ;; never trips it, so existing callers are untouched.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: default cap does not fire on a small tree"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch))
+                               t)
+                      (error () nil))
+                    t))
         (setf web-skeleton::*static-cache* saved-cache)
         ;; Cleanup scratch tree. Files first, then nested dir, then
         ;; scratch root. IGNORE-ERRORS wraps each so a missing file
