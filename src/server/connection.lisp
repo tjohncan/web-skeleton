@@ -93,18 +93,19 @@
 
 (defun format-peer-addr (host port)
   "Format a (HOST PORT) pair as a peer-address string for log output.
-   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the v6 form
-   uses the bracketed 8-group lowercase hex representation (RFC 5952).
-   No :: compression — a log line doesn't need canonical form, just
-   unambiguous identity."
-  (case (length host)
-    (4  (format nil "~{~d~^.~}:~d" (coerce host 'list) port))
-    (16 (format nil "[~(~{~x~^:~}~)]:~d"
-                (loop for i from 0 below 16 by 2
-                      collect (logior (ash (aref host i) 8)
-                                      (aref host (1+ i))))
-                port))
-    (t  (format nil "<addr>:~d" port))))
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector. The v6 form is
+   bracketed per RFC 3986 §3.2.2 so the port cannot be read as another
+   hex group; the v4 form needs no brackets.
+
+   The address itself is FORMAT-IP's job. This used to walk the sixteen
+   bytes itself, which meant two implementations of one hex format — and
+   a log line that disagreed with a filter decision about what an address
+   even looked like would be a miserable thing to debug. Brackets and a
+   port are the whole difference, so that is all this adds."
+  (let ((addr (format-ip host)))
+    (if (= (length host) 16)
+        (format nil "[~a]:~d" addr port)
+        (format nil "~a:~d" addr port))))
 
 (defun make-client-connection (client-socket)
   "Wrap a newly accepted socket into a connection object.

@@ -27,6 +27,7 @@
                (:file "src/server/connection" :depends-on ("src/package"
                                                             "src/log"
                                                             "src/epoll"
+                                                            "src/address"
                                                             "src/server/http"))
                (:file "src/server/websocket" :depends-on ("src/package"
                                                            "src/log"

@@ -1839,7 +1839,27 @@
   (check "v6 documentation"
          (web-skeleton::format-peer-addr
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
-         "[2001:db8:0:0:0:0:0:1]:80"))
+         "[2001:db8:0:0:0:0:0:1]:80")
+  ;; Neither length — the fallback both functions share.
+  (check "unknown length"
+         (web-skeleton::format-peer-addr #(1 2 3) 80)
+         "<addr>:80")
+  ;; FORMAT-PEER-ADDR is now FORMAT-IP plus brackets and a port, rather
+  ;; than a second implementation of the same sixteen-byte walk. Asserted
+  ;; as a relationship so the two cannot drift back apart: a log line
+  ;; disagreeing with an address-filter decision about what an address
+  ;; even looks like is a miserable thing to debug.
+  (dolist (addr (list #(127 0 0 1)
+                      #(8 8 8 8)
+                      #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1)
+                      #(1 2 3)))
+    (let ((v6-p (= (length addr) 16)))
+      (check (format nil "peer-addr embeds format-ip (~d bytes)" (length addr))
+             (web-skeleton::format-peer-addr addr 80)
+             (if v6-p
+                 (format nil "[~a]:80" (web-skeleton::format-ip addr))
+                 (format nil "~a:80" (web-skeleton::format-ip addr)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parse errors carry the status the client should receive
 ;;; ---------------------------------------------------------------------------
