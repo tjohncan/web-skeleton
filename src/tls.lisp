@@ -180,26 +180,51 @@
       (unless (= 1 (%openssl-init-ssl 0 (sb-sys:int-sap 0)))
         (error "OPENSSL_init_ssl failed"))
       ;; Create context with modern TLS client method
-      (let ((ctx (%ssl-ctx-new (%tls-client-method))))
+      (let ((ctx (%ssl-ctx-new (%tls-client-method)))
+            (ready nil))
         (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
           (error "SSL_CTX_new failed"))
-        ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
-        ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION.
-        ;; A silent failure on OpenSSL 1.1.1 (still shipped by long-tail
-        ;; LTS distros, where the default floor is TLS 1.0) would leave
-        ;; the client willing to negotiate 1.0 against a misconfigured
-        ;; peer; OpenSSL 3.0's default security level already forbids
-        ;; 1.0/1.1 so this check is redundant there but free to keep.
-        (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
-                                    +tls1-2-version+ (sb-sys:int-sap 0)))
-          (error "SSL_CTX set min proto version failed"))
-        ;; Load system CA certificates
-        (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
-          (log-warn "tls: could not load system CA certificates"))
-        ;; Enable peer certificate verification
-        (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
-        (setf *ssl-ctx* ctx)
-        (log-info "tls: SSL context initialized")))
+        ;; Free the context on any failure below. Nothing cached it yet —
+        ;; *SSL-CTX* is only set on the success path — so without this
+        ;; every retry of a failing init leaks another SSL_CTX, and the
+        ;; CA check is a failure an app retries on every single fetch.
+        (unwind-protect
+             (progn
+               ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
+               ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION.
+               ;; A silent failure on OpenSSL 1.1.1 (still shipped by long-tail
+               ;; LTS distros, where the default floor is TLS 1.0) would leave
+               ;; the client willing to negotiate 1.0 against a misconfigured
+               ;; peer; OpenSSL 3.0's default security level already forbids
+               ;; 1.0/1.1 so this check is redundant there but free to keep.
+               (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                                           +tls1-2-version+ (sb-sys:int-sap 0)))
+                 (error "SSL_CTX set min proto version failed"))
+               ;; Load system CA certificates. Raising rather than warning:
+               ;; SSL_VERIFY_PEER is set two lines down, so with no trust
+               ;; anchors every handshake fails anyway — the old warning was
+               ;; already fail-closed, it just made the operator derive that
+               ;; from one startup line and an unrelated-looking stream of
+               ;; handshake errors afterwards. This is init refusing to hand
+               ;; back a context that cannot do the one thing it is for,
+               ;; which is what the two checks above it already do.
+               ;;
+               ;; Safe to raise here because ENSURE-SSL-CTX is called from
+               ;; TLS-CONNECT, not at startup: a plain-HTTP server on a
+               ;; distroless image still boots, and only an actual HTTPS
+               ;; fetch — which was going to fail regardless — now says why.
+               (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
+                 (error "tls: no system CA certificates found, so every HTTPS ~
+                         fetch would fail certificate verification. Install a ~
+                         CA bundle (ca-certificates), or point SSL_CERT_FILE / ~
+                         SSL_CERT_DIR at one."))
+               ;; Enable peer certificate verification
+               (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
+               (setf *ssl-ctx* ctx
+                     ready t)
+               (log-info "tls: SSL context initialized"))
+          (unless ready
+            (%ssl-ctx-free ctx)))))
     *ssl-ctx*))
 
 ;;; ---------------------------------------------------------------------------

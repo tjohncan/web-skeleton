@@ -331,6 +331,20 @@ A raising cleanup closure is logged at WARN and swallowed by
 `close-outbound`'s handler-case, so it never blocks the framework's own teardown.
 Don't rely on cleanup-path exceptions propagating back to the caller — they don't.
 
+### TLS trust anchors
+
+**A missing CA store raises rather than warning.** `SSL_VERIFY_PEER` is
+set, so a process with no trust anchors fails every handshake regardless
+— the old warning was already fail-closed, it just left you to connect
+one startup line to an unrelated-looking stream of handshake errors
+afterwards. The first HTTPS fetch now says so directly.
+
+This bites on distroless and scratch images. Install a CA bundle
+(`ca-certificates`), or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at one. A
+plain-HTTP server on such an image still boots: the check runs when a TLS
+connection is opened, not at startup, so nothing that never fetches over
+HTTPS is affected.
+
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, the user is choosing
