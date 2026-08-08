@@ -278,14 +278,22 @@ it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper hands back a 502.
 
 **Chunked completion on the async path.** The non-blocking `http-fetch` path
-detects response completion by Content-Length (immediate) or by EOF (Connection: close).
-For chunked responses where the upstream keeps the TCP connection alive
-after sending the `0\r\n\r\n` terminator, completion is detected only
-when the upstream eventually closes or `*fetch-timeout*` expires —
-up to 30 seconds of unnecessary delay. The framework sends `Connection: close`
-on all outbound requests, so well-behaved upstreams close promptly;
-the stall appears only against upstreams that ignore the header.
-A future optimization could scan for the zero-size chunk terminator in-buffer.
+detects response completion three ways: by `Content-Length`, by the
+zero-size chunk terminator when the response is chunked, and by EOF for a
+close-delimited one. A chunked upstream that holds the connection open
+after `0\r\n\r\n` therefore completes as soon as the terminator lands,
+rather than stalling until the peer closes or `*fetch-timeout*` expires.
+`chunked-body-complete-p` walks the framing in the read buffer and resumes
+from where the previous read stopped, so each chunk is walked once across
+the transfer instead of the body being rescanned on every read.
+
+That is the **response** side — decoding a chunked body an upstream sent
+to us. Inbound requests are the opposite direction and get the opposite
+answer: a client sending `Transfer-Encoding` is refused with 501, because
+the framework frames request bodies with `Content-Length` alone. Reading
+chunked responses does not imply accepting chunked requests, and the
+ingress refusal is deliberate — it is what makes a CL-TE disagreement
+unrepresentable.
 
 **`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL`
 for four distinct conditions — unexpected peer close without `close_notify`
@@ -597,6 +605,20 @@ If you place web-skeleton behind a CDN or reverse proxy,
 the proxy will stamp its own `Date` on the way out —
 operators should not be surprised to see `Date` missing on `/static/*`
 when watching the upstream directly with `curl -v`.
+
+**Dynamic responses do carry it.** `format-response` stamps `Date` on
+anything it builds, unless the handler set one itself. So compliance with
+that `MUST` depends on which path answered: `/api/thing` carries a `Date`
+and `/static/app.css` does not, from the same server, in the same second.
+Both behaviours are defensible on their own and the pair is worth knowing
+about before you write a cache rule, a conformance test, or a monitoring
+check that assumes the header is always present.
+
+Closing the gap is possible without giving up the pre-built path — `Date`
+has one-second granularity, so a per-worker cached header refreshed on
+the existing maintenance tick would cost nothing per request. It would
+mean moving the header out of the frozen block into a small prefix write.
+Not done; noted so the choice is visible rather than inherited.
 
 **Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
 with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work
