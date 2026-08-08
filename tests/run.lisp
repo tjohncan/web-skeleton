@@ -16,10 +16,12 @@
 ;;;                    routing, connection state, WebSocket, static files,
 ;;;                    outbound fetch, JWT
 ;;;   test-store       concurrent keyed store and its reaper
+;;;   test-properties  generated-input invariants, and agreement between
+;;;                    implementations that are meant to be equivalent
 ;;;   test-harness     the live-server harness's own round-trips
 ;;;   test-tls         TLS registration; skips when libssl is absent
 ;;;
-;;; TEST runs all six, then re-runs the crypto suite as
+;;; TEST runs all seven, then re-runs the crypto suite as
 ;;; TEST-PURE-LISP-CRYPTO if libssl is loaded. That second pass is not
 ;;; redundant: when libssl is present it has swapped its own
 ;;; implementations into the sha1 / sha256 / ecdsa symbol cells, so the
@@ -84,8 +86,17 @@
 ;;;   - redefine it in a loaded image and re-run the suite:
 ;;;     (in-package :web-skeleton), defun, then (web-skeleton-tests:test)
 ;;;
-;;; Four things that make the second one lie:
+;;; Five things that make the second one lie:
 ;;;
+;;;   - IN-PACKAGE only works at top level. It acts when the reader reads
+;;;     it, so an IN-PACKAGE nested inside a HANDLER-BIND or a LET has
+;;;     already been read — along with everything after it — in the old
+;;;     package. A DEFUN meant for an internal web-skeleton function then
+;;;     silently defines a same-named symbol in the test package and the
+;;;     original runs untouched. Exported names hide this, because :USE
+;;;     inherits the symbol and the redefinition lands correctly; internal
+;;;     ones do not. Write WEB-SKELETON::NAME explicitly and the question
+;;;     does not arise.
 ;;;   - One process per revert. Running TEST twice in one image deadlocks
 ;;;     on the listeners the harness binds.
 ;;;   - (SYMBOL-FUNCTION 'F), never #'F, when capturing an original to
@@ -176,7 +187,7 @@
         (total-passed 0)
         (total-failed 0))
     (setf *all-failed-names* nil)
-    (dolist (suite '(test-algorithms test-json test-server test-store
+    (dolist (suite '(test-algorithms test-json test-server test-store test-properties
                      test-harness test-tls))
       (unless (funcall suite)
         (setf all-passed nil))

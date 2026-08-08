@@ -7,5 +7,6 @@
            #:test-store
            #:test-harness
            #:test-tls
+           #:test-properties
            ;; Framework-dev re-verification — not part of (test)
            #:test-pure-lisp-crypto))
