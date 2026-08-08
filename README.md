@@ -286,6 +286,54 @@ tests/
   without pulling in the framework's own test suite
 - **Demo application** — separate ASDF system with static demo page and echo server
 
+## Limitations
+
+The boundaries of the list above. Each is a deliberate choice rather than
+an oversight, but a boundary you meet in production is worse than one you
+read about here.
+
+- **No inbound TLS.** The server cannot serve HTTPS. A reverse proxy
+  (nginx, caddy) terminates TLS in front of it. Outbound TLS *is*
+  supported — `web-skeleton-tls` gives `https://` fetches — so the
+  feature list above can read as if the inbound case were covered too. It
+  isn't.
+- **No chunked request bodies.** A request carrying `Transfer-Encoding`
+  is refused with 501. Request bodies are framed by `Content-Length`
+  only, which is what closes the CL-TE smuggling shape, but it also
+  refuses any client streaming a body of unknown length — `curl -T -`,
+  Go's `http.Client` with a non-seekable body. Chunked *responses* from
+  an upstream are read normally; the two directions are unrelated.
+- **No response compression.** No gzip, no `Content-Encoding`
+  negotiation. Compressing static assets is the proxy's job today.
+- **No HTTP/2, no multipart.** A request whose version token is not
+  HTTP/1.0 or HTTP/1.1 gets 505. Form bodies are
+  `application/x-www-form-urlencoded` only — `multipart/form-data`, and
+  therefore file upload, is unimplemented.
+- **Static files are served from memory only.** `load-static-files` reads
+  the tree into the heap at startup and pre-builds each response; there
+  is no serve-from-disk path, so every file you serve is resident for the
+  life of the process. The tree is capped at 256 MiB
+  (`:max-total-bytes`). Large media belongs behind the reverse proxy.
+- **JWT is verification only.** `jwt-verify`, `parse-jwks` and
+  `jwt-claim` check tokens someone else issued. There is no signer — no
+  key generation, no token minting — so an app that issues its own
+  tokens needs another component for that half.
+- **Multi-range requests are ignored.** `Range: bytes=0-99,200-299`
+  serves the whole file rather than a `multipart/byteranges` response.
+  RFC 7233 §3.1 permits this, and no media player or download manager
+  asks for it; single ranges are fully supported.
+- **`https://` to an IP-literal host is refused.** Certificate hostname
+  verification uses `SSL_set1_host`, which does not match IP SANs — that
+  needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
+  is the honest answer; silently skipping verification would not be.
+  Plain `http://` to an IP literal works.
+- **`ws-send` blocks the worker, not just the connection.** One peer that
+  stops reading freezes every other connection on that worker for up to
+  `*ws-send-timeout*`. See DEPLOYMENT.md for the arithmetic before
+  building a broadcast on it.
+- **Static responses omit `Date`.** Dynamic responses carry it. See
+  DEPLOYMENT.md — it matters if you put a caching CDN in front.
+
 ## Configuration
 
 All configurable via `setf` before calling `start-server`.
