@@ -72,11 +72,11 @@
    ordinary failed check holding whatever bytes did arrive.
 
    This is not yet universal, and a reader should not assume the file is
-   hang-proof. The pipelined drain comes through here. The other
-   end-to-end reads in this file do not, nor does PARSE-TEST-RESPONSE in
-   the harness, which every TEST-HTTP-REQUEST routes through — any of
-   those can still block until CI gives up. New reads should use this,
-   and converting the rest is worth doing.
+   hang-proof. The pipelined drain and the connection-refusal reads come
+   through here. The older end-to-end reads in this file do not, nor does
+   PARSE-TEST-RESPONSE in the harness, which every TEST-HTTP-REQUEST
+   routes through — any of those can still block until CI gives up. New
+   reads should use this, and converting the rest is worth doing.
 
    SECONDS is a diagnostic backstop, not a latency assertion: a healthy
    response lands in milliseconds, so any value a working server cannot
@@ -101,8 +101,9 @@
    is NIL when the deadline passed with the stream still open. CLEAN-P is
    NIL when the read ended in an error rather than an ordinary end of
    stream — a reset, in practice — which is a different outcome from a
-   graceful close, and one a caller may be asserting about. Collapsing
-   them would make this unusable for such a caller."
+   graceful close and precisely the one REFUSE-CONNECTION's drain
+   decides. Collapsing them would make this unusable for the test that
+   cares."
   (multiple-value-bind (clean completed)
       (call-with-read-deadline
        seconds
@@ -866,6 +867,259 @@
                           (not (null (search "path=/b" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun read-response-status-head (stream)
+  "Read through the CRLFCRLF ending a response's header block and return
+   the status. NIL if the peer closed before a complete block arrived.
+
+   PARSE-TEST-RESPONSE reads to EOF, which is right for a
+   Connection: close request and wrong here — the point of the holder
+   connection below is that it stays open and keeps its slot."
+  (let ((buf (make-array 4096 :element-type '(unsigned-byte 8)
+                              :fill-pointer 0 :adjustable t)))
+    (values
+     (call-with-read-deadline
+      10
+      (lambda ()
+        (loop for byte = (handler-case (read-byte stream nil nil)
+                           (error () nil))
+              while byte
+              do (vector-push-extend byte buf)
+              until (web-skeleton::scan-crlf-crlf buf 0 (fill-pointer buf)))
+        (let ((end (fill-pointer buf)))
+          (when (web-skeleton::scan-crlf-crlf buf 0 end)
+            (web-skeleton::parse-response-status buf 0 end))))))))
+
+(defun claim-connection-slot (&key (attempts 40))
+  "Open a keep-alive connection and return its socket once the server has
+   accepted it, or NIL if it never does.
+
+   Retrying is not defensive padding. WAIT-FOR-PORT establishes the
+   server is up by connecting and closing immediately, and that probe
+   stays registered in the worker's connection table until the worker
+   processes its EOF — so a test running against a limit of 1 can find
+   the slot already taken and be refused. Retrying until a connection is
+   accepted means the slot under test is provably this function's, rather
+   than assumed free at a moment when it demonstrably may not be."
+  (let ((crlf (coerce '(#\Return #\Linefeed) 'string)))
+    (dotimes (i attempts)
+      (declare (ignorable i))
+      (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp))
+            (kept nil))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+               (let ((stream (sb-bsd-sockets:socket-make-stream
+                              socket :input t :output t
+                              :element-type '(unsigned-byte 8))))
+                 (write-sequence
+                  (sb-ext:string-to-octets
+                   (concatenate 'string
+                                "GET / HTTP/1.1" crlf
+                                "Host: localhost" crlf
+                                "Connection: keep-alive" crlf crlf)
+                   :external-format :ascii)
+                  stream)
+                 (force-output stream)
+                 ;; A 200 read to the end of its headers proves the handler
+                 ;; ran, which proves the connection is accepted and
+                 ;; registered. Anything else means the worker was full.
+                 (when (eql (read-response-status-head stream) 200)
+                   (setf kept t)
+                   (return-from claim-connection-slot socket))))
+          (unless kept
+            (ignore-errors (sb-bsd-sockets:socket-close socket))
+            (sleep 0.02)))))))
+
+(defun request-expecting-refusal ()
+  "Send a request the server is expected to refuse and return what came
+   back: (values STATUS HEADERS BODY-STRING).
+
+   Hand-rolled rather than routed through TEST-HTTP-REQUEST because a
+   refusal that answers nothing leaves PARSE-TEST-RESPONSE with no header
+   block to parse, and it signals. That silence is a regression worth
+   reporting as a failed check rather than a backtrace that takes the
+   rest of the suite down with it, so this returns NILs instead."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp))
+        (crlf (coerce '(#\Return #\Linefeed) 'string)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+           (let ((stream (sb-bsd-sockets:socket-make-stream
+                          socket :input t :output t
+                          :element-type '(unsigned-byte 8)))
+                 (buf (make-array 4096 :element-type '(unsigned-byte 8)
+                                       :fill-pointer 0 :adjustable t)))
+             (write-sequence
+              (sb-ext:string-to-octets
+               (concatenate 'string
+                            "GET / HTTP/1.1" crlf
+                            "Host: localhost" crlf
+                            "Connection: close" crlf crlf)
+               :external-format :ascii)
+              stream)
+             (force-output stream)
+             ;; A refused connection can end in a reset rather than an
+             ;; ordinary close, which READ-TO-EOF-BOUNDED reports as
+             ;; unclean. Only the bytes matter here — whether the close
+             ;; was graceful is the accept-time race, asserted where it
+             ;; is decidable rather than here.
+             (read-to-eof-bounded stream buf :seconds 10)
+             (let* ((end (fill-pointer buf))
+                    (header-end (web-skeleton::scan-crlf-crlf buf 0 end)))
+               (if (null header-end)
+                   (values nil nil nil)
+                   (let* ((status (web-skeleton::parse-response-status
+                                   buf 0 end))
+                          (first-crlf (web-skeleton::scan-crlf buf 0 header-end))
+                          (headers (when first-crlf
+                                     (web-skeleton::parse-headers-bytes
+                                      buf (+ first-crlf 2) (+ header-end 4))))
+                          (body-start (+ header-end 4))
+                          (body (when (> end body-start)
+                                  (handler-case
+                                      (sb-ext:octets-to-string
+                                       (subseq buf body-start end)
+                                       :external-format :utf-8)
+                                    (error () nil)))))
+                     (values status headers body))))))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun wait-until-readable (socket &key (attempts 400))
+  "Wait until SOCKET has bytes queued, without consuming them.
+   Returns T once data is present, NIL if it never arrives."
+  (let ((buf (make-array 1 :element-type '(unsigned-byte 8))))
+    (web-skeleton::set-nonblocking (web-skeleton::socket-fd socket))
+    (dotimes (i attempts nil)
+      (declare (ignorable i))
+      (let ((n (handler-case
+                   (nth-value 1 (sb-bsd-sockets:socket-receive
+                                 socket buf 1 :peek t))
+                 (error () nil))))
+        (when (and n (plusp n))
+          (return t))
+        (sleep 0.005)))))
+
+(defun test-refuse-connection-drains ()
+  "REFUSE-CONNECTION answers and then closes without resetting, once the
+   peer's request has actually arrived.
+
+   Driven directly instead of through a server, because that precondition
+   is the whole property and the accept path cannot supply it: the
+   refusal happens at accept time and may precede the request entirely,
+   leaving the drain nothing to clear and the close to reset. Asserting a
+   graceful close through ACCEPT-CONNECTION would therefore be asserting
+   the outcome of a race — it failed about one cold run in four when this
+   test tried it that way. Here the request is confirmed queued before
+   REFUSE-CONNECTION is called, so the drain has work to do and the
+   result is a fact rather than a coin."
+  (format t "~%Harness: refuse-connection drains, then closes cleanly~%")
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (let ((client (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+               (unwind-protect
+                    (progn
+                      (sb-bsd-sockets:socket-connect client #(127 0 0 1) port)
+                      (let ((accepted (sb-bsd-sockets:socket-accept listener))
+                            (stream (sb-bsd-sockets:socket-make-stream
+                                     client :input t :output t
+                                     :element-type '(unsigned-byte 8))))
+                        (write-sequence
+                         (sb-ext:string-to-octets
+                          (concatenate 'string
+                                       "GET / HTTP/1.1" *crlf*
+                                       "Host: localhost" *crlf* *crlf*)
+                          :external-format :ascii)
+                         stream)
+                        (force-output stream)
+                        (check "request is queued before the refusal"
+                               (wait-until-readable accepted) t)
+                        (web-skeleton::refuse-connection accepted)
+                        (let ((buf (make-array 1024
+                                               :element-type '(unsigned-byte 8)
+                                               :fill-pointer 0 :adjustable t)))
+                          (multiple-value-bind (ended clean)
+                              (read-to-eof-bounded stream buf :seconds 5)
+                            ;; Bounded even though REFUSE-CONNECTION closes
+                            ;; unconditionally today: this test's subject
+                            ;; is whether it closes, and the day that
+                            ;; SOCKET-CLOSE moves inside a conditional, the
+                            ;; test written to catch it should fail rather
+                            ;; than hang the suite it belongs to.
+                            (check "refused connection is closed" ended t)
+                            (let ((text (sb-ext:octets-to-string
+                                         (subseq buf 0 (fill-pointer buf))
+                                         :external-format :latin-1)))
+                              (check "direct refusal sends the 503"
+                                     (and (search "503" text) t) t))
+                            ;; The assertion the drain exists for. Without
+                            ;; it the queued request is still unread at
+                            ;; close, Linux sends RST instead of FIN, and
+                            ;; this read ends in a reset rather than an
+                            ;; ordinary end of stream.
+                            (check "drained refusal closes without a reset"
+                                   clean t)))))
+                 (ignore-errors (sb-bsd-sockets:socket-close client))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-harness-connection-limit-e2e ()
+  "A worker at *MAX-CONNECTIONS* answers 503 instead of closing mute."
+  (format t "~%Harness: connection limit answers 503~%")
+  (let ((saved web-skeleton::*max-connections*))
+    ;; Global SETF rather than a LET binding, for the reason
+    ;; CALL-WITH-TEST-SERVER gives for the shutdown specials: the worker
+    ;; runs in a thread START-SERVER spawns, and it reads the global
+    ;; value. A binding established here would not reach it, and the
+    ;; test would quietly assert nothing against a limit of 10000.
+    (setf web-skeleton::*max-connections* 1)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "")))
+           (let ((holder (claim-connection-slot)))
+             (unwind-protect
+                  (progn
+                    (check "a connection is accepted below the limit"
+                           (not (null holder)) t)
+                    (when holder
+                      ;; Delivery only, and on loopback rather than by
+                      ;; guarantee: the refusal happens at accept time and
+                      ;; may precede the request arriving at all, which
+                      ;; costs the graceful close and can cost the
+                      ;; response itself. Here the client's write always
+                      ;; beats the server's accept, so this is stable —
+                      ;; but it is stable because of the transport, not
+                      ;; because the accept path promises anything. The
+                      ;; drain's own property is asserted in
+                      ;; TEST-REFUSE-CONNECTION-DRAINS, which establishes
+                      ;; the precondition this path cannot.
+                      (multiple-value-bind (status headers body)
+                          (request-expecting-refusal)
+                        (check "refused connection gets 503" status 503)
+                        (check "refusal carries Retry-After"
+                               (cdr (assoc "retry-after" headers
+                                           :test #'string-equal))
+                               "2")
+                        (check "refusal explains itself"
+                               (and body
+                                    (search "connection limit" body)
+                                    t)
+                               t))))
+               (when holder
+                 (ignore-errors (sb-bsd-sockets:socket-close holder))))))
+      (setf web-skeleton::*max-connections* saved))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -896,6 +1150,8 @@
   (test-harness-handler-connection-close-honored-e2e)
   (test-harness-fetch-callback-connection-close-honored-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
+  (test-refuse-connection-drains)
+  (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (report-suite "Harness")
   (zerop *tests-failed*))

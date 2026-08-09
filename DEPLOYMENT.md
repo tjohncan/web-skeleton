@@ -137,15 +137,53 @@ specific status, not a blanket 400:
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
 | `501 Not Implemented` | A method not in the accepted set, or any `Transfer-Encoding` (RFC 7230 §3.3.1) |
+| `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised |
 
-**If you alert on 400s, this changes what you see.** All of the above
-were 400 previously, so a dashboard counting "client errors" will start
-splitting them out — and a spike that used to look like malformed
-requests may resolve into something more specific, such as a client
-retrying with an oversized body or a scanner speaking HTTP/2 at a 1.1
-port. That is the point of the change, but it does move the numbers.
+**If you alert on 400s, this changes what you see.** Every 4xx and 5xx
+above except the 503 was a 400 previously, so a dashboard counting
+"client errors" will start splitting them out — and a spike that used to
+look like malformed requests may resolve into something more specific,
+such as a client retrying with an oversized body or a scanner speaking
+HTTP/2 at a 1.1 port. That is the point of the change, but it does move
+the numbers.
+
+**The 503 is new traffic, not re-labelled traffic.** A worker at
+`*max-connections*` used to accept the socket and close it without a
+word, so an overloaded instance and a crashed one were indistinguishable
+from the client side and there was nothing to back off against. It now
+answers before closing. Two consequences worth knowing before you build
+an alert on it:
+
+- **The 503 is always written; whether it is seen is not guaranteed.**
+  The refusal is one non-blocking write followed by a bounded drain of
+  what the client already sent, capped at 8 KiB. The drain is there
+  because `close(2)` on a socket holding unread data makes Linux send RST
+  rather than FIN, and a client that surfaces a reset in place of the 503
+  learns nothing from it.
+
+  Both the drain and the delivery turn on the same race, and neither is
+  settled by it. The refusal happens at accept time, which may precede
+  the client's request arriving at all. If it does, the request lands on
+  a socket that no longer exists, the kernel answers RST, and that reset
+  discards whatever the client had not yet read — including the 503. On
+  loopback the request always wins that race, which is why the test suite
+  sees the response every time; across a real network under real
+  overload, which is the only condition any of this fires in, it is a
+  race like any other. A client refused mid-upload, or simply slower than
+  the accept, can end up with a reset and nothing else.
+
+  This is still strictly better than the bare close it replaces, which
+  conveyed nothing by construction. It is not a delivery guarantee, and
+  an alert built on counting 503s at the client will undercount.
+- **It is not in your access path**, so it will not appear in handler
+  metrics or anything else counted after dispatch. If you want to see
+  refusals, watch the `connection limit reached` warning, which is
+  logged once per refusal.
+
+Like static responses, the refusal carries no `Date` — see the header's
+own section below for why pre-built bytes omit it.
 
 `status-reason` covers the codes above plus the ones handlers commonly
 need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx

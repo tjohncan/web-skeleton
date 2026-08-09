@@ -65,7 +65,36 @@
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *max-connections* 10000
-  "Maximum connections per worker. New accepts are dropped when full.")
+  "Maximum connections per worker. New accepts are refused when full.")
+
+(defparameter *connection-limit-response*
+  (let* ((body (sb-ext:string-to-octets
+                (format nil "Service Unavailable: connection limit reached~%")
+                :external-format :ascii))
+         (crlf (coerce '(#\Return #\Linefeed) 'string)))
+    (concatenate
+     '(simple-array (unsigned-byte 8) (*))
+     (sb-ext:string-to-octets
+      (concatenate 'string
+                   "HTTP/1.1 503 Service Unavailable" crlf
+                   ;; Two seconds: long enough that the retry is not part
+                   ;; of the same burst that caused the refusal, short
+                   ;; enough that a momentary spike does not turn into a
+                   ;; visible stall for a client that did nothing wrong.
+                   "Retry-After: 2" crlf
+                   "Content-Type: text/plain; charset=utf-8" crlf
+                   (format nil "Content-Length: ~d" (length body)) crlf
+                   "Connection: close" crlf
+                   crlf)
+      :external-format :ascii)
+     body))
+  "The refusal sent when a worker is at *MAX-CONNECTIONS*, built once.
+
+   No Date header, for the reason BUILD-STATIC-RESPONSE omits one: bytes
+   frozen at load time cannot carry a per-request timestamp, and a stale
+   Date is worse than none. Building it per refusal would put header
+   construction on the one path that exists because the worker is already
+   out of room.")
 
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
@@ -265,10 +294,58 @@
 ;;; Accept a new connection
 ;;; ---------------------------------------------------------------------------
 
+(defun refuse-connection (client-socket)
+  "Answer 503 on a connection the worker has no room for, then close.
+
+   A bare close leaves the client unable to tell \"server full\" from
+   \"server broken\" — both are a socket that opens and immediately shuts —
+   and gives it nothing to back off against. One pre-built write makes
+   the condition name itself.
+
+   Delivery is best effort, and both limits are structural.
+
+   The write is a single non-blocking attempt. Blocking here would stall
+   the accept loop, which is the thing the connection limit exists to
+   protect. The response is under 200 bytes and an empty send buffer
+   takes it whole, so a short write means the peer is already gone.
+
+   The drain is bounded, and what it buys is a graceful close rather
+   than delivery. close(2) on a socket still holding unread data makes
+   Linux send RST instead of FIN. The response has already gone out by
+   then, so the bytes do arrive; what the peer loses is the ordinary
+   end-of-stream, getting a reset on the read that should have returned
+   it — and a client that reports a connection error in place of the 503
+   has learned nothing, which is the state this function exists to get
+   out of.
+
+   It shortens the odds rather than settling the matter, and cannot do
+   better. The refusal happens at accept time, which may precede the
+   peer's request arriving at all, so the drain clears only what is
+   already queued. Waiting for the rest would mean blocking in the
+   accept loop, and draining to EOF would mean parking a peer there is
+   by definition no room for. Four buffers clears a request already in
+   hand, which is the ordinary case; bytes still in flight, or a client
+   midway through a large upload, still earn a reset — and are still no
+   worse off than the bare close they used to get."
+  (let ((fd (ignore-errors (socket-fd client-socket))))
+    (when (and fd (>= fd 0))
+      (ignore-errors (set-nonblocking fd))
+      (ignore-errors
+       (nb-write fd *connection-limit-response* 0
+                 (length *connection-limit-response*)))
+      (let ((sink (make-array 2048 :element-type '(unsigned-byte 8))))
+        (dotimes (i 4)
+          (declare (ignorable i))
+          ;; NB-READ returns :AGAIN once the queue is empty and :EOF once
+          ;; the peer is done; either way there is nothing left to clear.
+          (unless (integerp (ignore-errors (nb-read fd sink 0 (length sink))))
+            (return))))))
+  (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
+
 (defun accept-connection (listener-socket epoll-fd)
   "Accept a pending connection and register it with epoll.
    Returns T if a connection was accepted, NIL if none pending (EAGAIN).
-   Drops the connection if the per-worker limit is reached."
+   Refuses the connection with a 503 if the per-worker limit is reached."
   (let ((client-socket (handler-case
                           (sb-bsd-sockets:socket-accept listener-socket)
                         (error (e)
@@ -280,9 +357,9 @@
     ;; Enforce per-worker connection limit
     (when (and (> *max-connections* 0)
                (>= (hash-table-count *connections*) *max-connections*))
-      (log-warn "connection limit reached (~d), dropping new accept"
+      (log-warn "connection limit reached (~d), refusing new accept"
                 *max-connections*)
-      (ignore-errors (sb-bsd-sockets:socket-close client-socket))
+      (refuse-connection client-socket)
       (return-from accept-connection t))
     (handler-case
         (let ((conn (make-client-connection client-socket))
