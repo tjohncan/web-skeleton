@@ -60,6 +60,62 @@
 ;;; End-to-end server tests
 ;;; ---------------------------------------------------------------------------
 
+(defun call-with-read-deadline (seconds thunk)
+  "Run THUNK on its own thread and abandon it after SECONDS.
+   Returns (values RESULT COMPLETED-P).
+
+   READ-BYTE on a socket stream has no deadline, so a server that answers
+   late, answers partially, or never answers does not fail the test — it
+   stops the suite, and CI kills the job ten minutes later with a log
+   ending at the name of the test that started and nothing said about
+   what it was waiting for. A thread and a deadline turn that into an
+   ordinary failed check holding whatever bytes did arrive.
+
+   This is not yet universal, and a reader should not assume the file is
+   hang-proof. The pipelined drain comes through here. The other
+   end-to-end reads in this file do not, nor does PARSE-TEST-RESPONSE in
+   the harness, which every TEST-HTTP-REQUEST routes through — any of
+   those can still block until CI gives up. New reads should use this,
+   and converting the rest is worth doing.
+
+   SECONDS is a diagnostic backstop, not a latency assertion: a healthy
+   response lands in milliseconds, so any value a working server cannot
+   reach will do."
+  (let* ((completed nil)
+         (result nil)
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (setf result (funcall thunk)
+                          completed t))
+                  :name "bounded-reader")))
+    (sb-thread:join-thread thread :timeout seconds :default nil)
+    (unless completed
+      (ignore-errors (sb-thread:terminate-thread thread)))
+    (values result completed)))
+
+(defun read-to-eof-bounded (stream buf &key (seconds 10))
+  "Drain STREAM into BUF until it ends, giving up after SECONDS.
+   Returns (values ENDED-P CLEAN-P).
+
+   The two are separate answers and the separation is the point. ENDED-P
+   is NIL when the deadline passed with the stream still open. CLEAN-P is
+   NIL when the read ended in an error rather than an ordinary end of
+   stream — a reset, in practice — which is a different outcome from a
+   graceful close, and one a caller may be asserting about. Collapsing
+   them would make this unusable for such a caller."
+  (multiple-value-bind (clean completed)
+      (call-with-read-deadline
+       seconds
+       (lambda ()
+         (handler-case
+             (progn
+               (loop for byte = (read-byte stream nil nil)
+                     while byte
+                     do (vector-push-extend byte buf))
+               t)
+           (error () nil))))
+    (values completed (and completed clean))))
+
 (defun test-harness-basic-get ()
   (format t "~%Harness: basic GET~%")
   (with-test-server
@@ -791,10 +847,8 @@
                 (sb-bsd-sockets:socket-shutdown socket :direction :output))
                (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
                                             :fill-pointer 0 :adjustable t)))
-                 (loop for byte = (handler-case (read-byte stream nil nil)
-                                    (error () nil))
-                       while byte
-                       do (vector-push-extend byte buf))
+                 (check "pipelined: server closed the connection"
+                        (read-to-eof-bounded stream buf) t)
                  (let* ((text (sb-ext:octets-to-string
                                (subseq buf 0 (fill-pointer buf))
                                :external-format :utf-8))
