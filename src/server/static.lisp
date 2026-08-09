@@ -297,13 +297,24 @@
         (setf start (1+ slash))))))
 
 (defun load-static-files (directory &key (cache-control "public, max-age=3600")
-                                         substitutions)
+                                         substitutions
+                                         (max-total-bytes (* 256 1024 1024)))
   "Load all files under DIRECTORY into the static file cache.
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
    Additive — can be called multiple times. Collisions: last wins.
    Dotfiles and dot-directories are skipped (.git/, .env) — except
    the RFC 8615 /.well-known/ namespace, which is served.
+
+   MAX-TOTAL-BYTES caps the whole tree, default 256 MiB, and signals with
+   the offending path and the running total when crossed. The cache is
+   resident for the life of the process, so pointing this at a directory
+   holding a 4 GB video buys a 4 GB resident set — discovered at deploy
+   time, on the box, rather than here. Range support makes that likelier
+   rather than less: serving large media is what Range is for, so the
+   invitation to keep large media next to the CSS is now in the box.
+   Per-call, not global, because the limit belongs to the tree being
+   loaded and additive calls each bring their own.
 
    CACHE-CONTROL is either a string (used for every file) or a
    function of one argument (the URL path) that returns a string.
@@ -396,6 +407,18 @@
                        (setf (gethash url-path *static-cache*) response)
                        (incf count)
                        (incf total-bytes (length content))
+                       ;; Checked after the increment so the reported
+                       ;; total includes the file that crossed the line —
+                       ;; the operator wants to know what it costs, not
+                       ;; what it cost before.
+                       (when (> total-bytes max-total-bytes)
+                         (error "load-static-files: ~a brings the tree to ~
+                                 ~d bytes, over the ~d-byte cap. Raise ~
+                                 :max-total-bytes, or serve large media from ~
+                                 the reverse proxy directly — this cache holds ~
+                                 every file in the process for its whole life, ~
+                                 and there is no serve-from-disk path."
+                                url-path total-bytes max-total-bytes))
                        (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content))))))))))
         ;; Validate every :substitutions file key matched a file we
         ;; actually loaded. Runs before alias generation so aliases
@@ -541,7 +564,17 @@
    that media players and download managers do not use. Anything
    unparseable also returns NIL: ignoring a Range is always a safe
    answer, where guessing at one is not."
-  (when (or (null header-value) (zerop total))
+  ;; A zero-length resource used to short-circuit to NIL and serve a 200.
+  ;; RFC 7233 §2.1 makes a byte-range-spec unsatisfiable once its
+  ;; first-byte-pos is at or past the current length, which for an empty
+  ;; representation is true of every range there is — so the answer is the
+  ;; 416 this function already knows how to ask for. Both explicit forms
+  ;; reach it unaided below, since every first-byte-pos is >= 0; only the
+  ;; suffix form needs telling, and it is told there rather than here so
+  ;; that a malformed Range on an empty file still returns NIL and serves
+  ;; the (empty) 200 instead of inventing a 416 for a header nobody wrote
+  ;; correctly.
+  (when (null header-value)
     (return-from parse-byte-range nil))
   (let ((v (string-trim '(#\Space #\Tab) header-value)))
     (unless (and (> (length v) 6) (string-equal v "bytes=" :end1 6))
@@ -570,6 +603,11 @@
                    ;; bytes=-0 asks for the last zero bytes: RFC 7233
                    ;; §2.1 says a suffix length of 0 is unsatisfiable.
                    ((zerop n) :unsatisfiable)
+                   ;; No bytes to take the last N of. Left to the
+                   ;; whole-resource branch it computes (values 0 -1),
+                   ;; which is a range the rest of the code has no
+                   ;; meaning for.
+                   ((zerop total) :unsatisfiable)
                    ((>= n total) (values 0 (1- total)))   ; whole resource
                    (t (values (- total n) (1- total))))))
               ;; bytes=N-  or  bytes=N-M

@@ -5,9 +5,19 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A new push to the same PR cancels the in-flight run.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only token: this job builds and tests, it never writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   cold-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -21,16 +31,13 @@ jobs:
           sbcl --version
 
       # One step, one run, and it must be a COLD build.
-      #
       # ASDF compiles to ~/.cache/common-lisp and reuses the fasls on any later run.
       # A warm run loads without compiling, so it emits no "caught WARNING" lines at all.
-      #
       # A fresh runner starts with no cache, so this is already cold.
-      # The rm makes that a stated invariant rather than a lucky one.
+      # The rm makes that a stated invariant.
       #
       # set -o pipefail so sbcl's exit code survives the pipe through tee —
-      # the default shell here is `bash -e`, which would otherwise report
-      # tee's success and swallow a failing suite.
+      # the default shell here is `bash -e`, which otherwise only reports tee's success.
       # run-tests.lisp exits 1 on any failure.
       - name: Run test suite (cold build, fail on compile warnings)
         run: |

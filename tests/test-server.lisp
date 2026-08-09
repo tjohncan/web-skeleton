@@ -550,6 +550,30 @@
   (check "404 reason" (status-reason 404) "Not Found")
   (check "unknown reason" (status-reason 999) "Unknown")
 
+  ;; Codes added for handler use. Phrases are asserted rather than just
+  ;; presence, because a wrong phrase reaches the wire on every response
+  ;; that uses the code and nothing else in the system would notice.
+  (dolist (spec '((202 . "Accepted")
+                  (303 . "See Other")
+                  (410 . "Gone")
+                  (411 . "Length Required")
+                  (412 . "Precondition Failed")
+                  (415 . "Unsupported Media Type")
+                  (422 . "Unprocessable Content")
+                  (428 . "Precondition Required")
+                  (505 . "HTTP Version Not Supported")))
+    (check (format nil "~d reason" (car spec))
+           (status-reason (car spec)) (cdr spec)))
+  ;; RFC 9110 §15.5.21 renamed 422 from RFC 4918's "Unprocessable
+  ;; Entity". Pinned so a future editor does not "correct" it back to
+  ;; the phrasing every other framework still ships.
+  (check "422 uses RFC 9110 phrasing, not RFC 4918's"
+         (search "Entity" (status-reason 422)) nil)
+  ;; Deliberately absent — see the *status-reasons* docstring.
+  (dolist (code '(418 402 406 426 451))
+    (check (format nil "~d deliberately absent" code)
+           (status-reason code) "Unknown"))
+
   ;; Text response
   (let ((resp (make-text-response 200 "hello")))
     (check "text response status" (http-response-status resp) 200)
@@ -849,9 +873,69 @@
          (sync (conn response)
            (web-skeleton::sync-close-after-p-from-response conn response)
            (web-skeleton::connection-close-after-p conn)))
+    ;; The inbound read cap used to be *max-body-size* verbatim, so one
+    ;; knob silently moved two budgets: an app tightening the body cap to
+    ;; 32 KiB also capped total request bytes at 32 KiB, and a request
+    ;; with large-but-legal headers died on the buffer with a 400 that
+    ;; blamed the body. Asserted as a strict inequality against the body
+    ;; cap rather than a literal, so the check survives retuned defaults.
+    (let ((c (make-conn)))
+      (check "read cap: inbound leaves room for headers beyond the body"
+             (> (web-skeleton::connection-read-cap c)
+                (+ web-skeleton::*max-body-size*
+                   web-skeleton::*max-total-header-bytes*))
+             t)
+      ;; The tightened-body-cap case the aliasing broke, stated directly:
+      ;; a 32 KiB body budget must still admit a full 64 KiB of headers.
+      (let ((web-skeleton::*max-body-size* (* 32 1024)))
+        (check "read cap: tight body cap still admits full headers"
+               (> (web-skeleton::connection-read-cap c)
+                  web-skeleton::*max-total-header-bytes*)
+               t))
+      ;; The other three arms are unchanged and stay that way.
+      (setf (web-skeleton::connection-state c) :websocket)
+      (check "read cap: websocket is payload plus masked header"
+             (web-skeleton::connection-read-cap c)
+             (+ web-skeleton::*max-ws-payload-size* 14))
+      (setf (web-skeleton::connection-state c) :out-dns)
+      (check "read cap: out-dns is 8 KiB"
+             (web-skeleton::connection-read-cap c) 8192))
+    (let ((c (make-conn)))
+      (setf (web-skeleton::connection-outbound-p c) t)
+      (check "read cap: outbound uses the response budget"
+             (web-skeleton::connection-read-cap c)
+             web-skeleton::*max-outbound-response-size*))
+
     (let ((c (make-conn)))
       (check "sync-close: no Connection header — no-op"
              (sync c (make-text-response 200 "x")) nil))
+
+    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every
+    ;; current call site reaches it with a drained buffer, so the
+    ;; invariant holds by construction — but by construction is a fact
+    ;; about today's callers, not about the function, and the caller who
+    ;; gets it wrong would ship a truncated frame followed by a whole
+    ;; one, surfacing as a protocol error somewhere unrelated.
+    (let ((c (make-conn))
+          (bytes (make-array 4 :element-type '(unsigned-byte 8)
+                               :initial-element 65)))
+      (web-skeleton::connection-queue-write c bytes)
+      (check "queue-write: drained buffer accepts a new one"
+             (web-skeleton::connection-write-end c) 4)
+      ;; Simulate a partial flush, then try to queue over it.
+      (setf (web-skeleton::connection-write-pos c) 1)
+      (check "queue-write: clobbering un-flushed bytes signals"
+             (handler-case (progn (web-skeleton::connection-queue-write c bytes)
+                                  nil)
+               (error () t))
+             t)
+      ;; Fully flushed is not "un-flushed": pos = end must still pass, or
+      ;; the guard would reject the ordinary keep-alive path.
+      (setf (web-skeleton::connection-write-pos c) 4)
+      (check "queue-write: fully flushed buffer accepts a new one"
+             (progn (web-skeleton::connection-queue-write c bytes)
+                    (web-skeleton::connection-write-pos c))
+             0))
     (let ((c (make-conn))
           (r (make-text-response 200 "x")))
       (set-response-header r "connection" "upgrade")
@@ -1222,7 +1306,89 @@
                         "localhost" "/"))) t)
     (check "method charset: HEAD accepted"
            (not (null (web-skeleton::build-outbound-request
-                       :HEAD "localhost" "/"))) t))
+                       :HEAD "localhost" "/"))) t)
+
+    ;; Framing headers belong to the builder, not the caller. The merge
+    ;; adds Content-Length only when the caller did not supply one, which
+    ;; decides both cases below: Transfer-Encoding does not suppress it,
+    ;; so a caller who sends TE with a body gets both framing headers at
+    ;; once; Content-Length does suppress it, so a caller who sends a
+    ;; wrong one gets their number in front of our bytes. Ingress already
+    ;; refuses Transfer-Encoding; egress refusing to emit what ingress
+    ;; refuses to accept is the symmetry.
+    (check "outbound: caller Transfer-Encoding rejected with a body"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("transfer-encoding" . "chunked"))
+                        :body "hello"))) t)
+    ;; Bodiless too: the header is still a claim about framing we do not
+    ;; implement, and rejecting only the both-headers case would leave
+    ;; the lie legal whenever it happened to be harmless.
+    (check "outbound: caller Transfer-Encoding rejected without a body"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :GET "localhost" "/"
+                        :headers '(("transfer-encoding" . "chunked"))))) t)
+    ;; Header names are case-insensitive on the wire, so the guard has to
+    ;; be too — STRING-EQUAL, not STRING=.
+    (check "outbound: Transfer-Encoding rejected case-insensitively"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("Transfer-Encoding" . "chunked"))
+                        :body "hello"))) t)
+    ;; Content-Length is the half of RFC 7230 §3.3.3 that a caller reaches
+    ;; by accident rather than on purpose — a stale content-length copied
+    ;; along with the rest of a header alist. Short declaration: the
+    ;; upstream reads five bytes and treats "56789" as the head of the
+    ;; next request. Long declaration: it blocks until its read timeout.
+    (check "outbound: caller Content-Length under-declaring rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("content-length" . "5"))
+                        :body "0123456789"))) t)
+    (check "outbound: caller Content-Length over-declaring rejected"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("content-length" . "100"))
+                        :body "hello"))) t)
+    ;; Rejected even when it happens to agree with the body: a guard that
+    ;; compared numbers instead of refusing the header would leave the
+    ;; caller believing framing is theirs to declare, and the next value
+    ;; they pass is the stale one.
+    (check "outbound: caller Content-Length rejected even when correct"
+           (raises-p (lambda ()
+                       (web-skeleton::build-outbound-request
+                        :POST "localhost" "/"
+                        :headers '(("Content-Length" . "5"))
+                        :body "hello"))) t)
+    ;; The escape hatch has to keep working: a deliberate Content-Length: 0
+    ;; on a bodiless POST is expressed as :body "", which is a zero-length
+    ;; vector rather than NIL and so still emits the header.
+    (let ((text (sb-ext:octets-to-string
+                 (web-skeleton::build-outbound-request
+                  :POST "localhost" "/" :body "")
+                 :external-format :utf-8)))
+      (check "outbound: :body \"\" still declares Content-Length: 0"
+             (not (null (search "content-length: 0" text))) t))
+    ;; And the computed header is still emitted for an ordinary body, so
+    ;; the guards did not cost the normal path its framing.
+    (let ((text (sb-ext:octets-to-string
+                 (web-skeleton::build-outbound-request
+                  :POST "localhost" "/" :body "hello")
+                 :external-format :utf-8)))
+      (check "outbound: computed Content-Length still emitted"
+             (not (null (search "content-length: 5" text))) t))
+    ;; And an ordinary header still passes, so the guard is not just
+    ;; rejecting every :headers list handed to it.
+    (check "outbound: unrelated header still accepted"
+           (not (null (web-skeleton::build-outbound-request
+                       :POST "localhost" "/"
+                       :headers '(("x-trace" . "abc"))
+                       :body "hello"))) t))
 
   ;; Config knobs that DEPLOYMENT.md tells users to setf from their
   ;; own packages must be exported from :WEB-SKELETON. An unqualified
@@ -1235,7 +1401,12 @@
                   "*MAX-OUTBOUND-RESPONSE-SIZE*"
                   "*MAX-STREAMING-LINE-SIZE*"
                   "*MAX-WS-PAYLOAD-SIZE*"
-                  "*MAX-WS-MESSAGE-SIZE*"))
+                  "*MAX-WS-MESSAGE-SIZE*"
+                  ;; WS-SEND is exported; its only tuning knob was not, so
+                  ;; the deadline that decides how long one slow peer may
+                  ;; hold a whole worker was unreachable through the
+                  ;; public API. A limit nobody can set is not a limit.
+                  "*WS-SEND-TIMEOUT*"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -1523,6 +1694,15 @@
   (check "v4 172.16/12 low"  (is-public-address-p #(172 16 0 1) :inet)      nil)
   (check "v4 172.16/12 high" (is-public-address-p #(172 31 255 255) :inet)  nil)
   (check "v4 192.168/16"  (is-public-address-p #(192 168 1 1) :inet)        nil)
+  ;; 6to4 relay anycast, deprecated by RFC 7526. The relays are gone, so
+  ;; the prefix is still routed but reaches whoever picked it up.
+  (check "v4 6to4 anycast low"  (is-public-address-p #(192 88 99 0) :inet)   nil)
+  (check "v4 6to4 anycast high" (is-public-address-p #(192 88 99 255) :inet) nil)
+  ;; Neighbours on either side of the /24 stay public, so the new clause
+  ;; is a /24 and not a /16 sitting on top of 192.88 or all of 192.
+  (check "v4 192.88.98 is public"  (is-public-address-p #(192 88 98 1) :inet)  t)
+  (check "v4 192.88.100 is public" (is-public-address-p #(192 88 100 1) :inet) t)
+  (check "v4 192.89 is public"     (is-public-address-p #(192 89 99 1) :inet)  t)
   (check "v4 test-net-1"  (is-public-address-p #(192 0 2 1) :inet)          nil)
   (check "v4 test-net-2"  (is-public-address-p #(198 51 100 1) :inet)       nil)
   (check "v4 test-net-3"  (is-public-address-p #(203 0 113 1) :inet)        nil)
@@ -1659,7 +1839,137 @@
   (check "v6 documentation"
          (web-skeleton::format-peer-addr
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
-         "[2001:db8:0:0:0:0:0:1]:80"))
+         "[2001:db8:0:0:0:0:0:1]:80")
+  ;; Neither length — the fallback both functions share.
+  (check "unknown length"
+         (web-skeleton::format-peer-addr #(1 2 3) 80)
+         "<addr>:80")
+  ;; FORMAT-PEER-ADDR is now FORMAT-IP plus brackets and a port, rather
+  ;; than a second implementation of the same sixteen-byte walk. Asserted
+  ;; as a relationship so the two cannot drift back apart: a log line
+  ;; disagreeing with an address-filter decision about what an address
+  ;; even looks like is a miserable thing to debug.
+  (dolist (addr (list #(127 0 0 1)
+                      #(8 8 8 8)
+                      #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1)
+                      #(1 2 3)))
+    (let ((v6-p (= (length addr) 16)))
+      (check (format nil "peer-addr embeds format-ip (~d bytes)" (length addr))
+             (web-skeleton::format-peer-addr addr 80)
+             (if v6-p
+                 (format nil "[~a]:80" (web-skeleton::format-ip addr))
+                 (format nil "~a:80" (web-skeleton::format-ip addr)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Parse errors carry the status the client should receive
+;;; ---------------------------------------------------------------------------
+
+(defun test-parse-error-status ()
+  (format t "~%Parse error status codes~%")
+  ;; Every parse failure used to answer 400, including ones the framework
+  ;; understood perfectly and refused on their merits. 413 / 414 / 431
+  ;; were already in *status-reasons* and unreachable for exactly that
+  ;; reason. These assert the status the condition carries, which is what
+  ;; HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE.
+  (flet ((status-of (thunk)
+           (handler-case (progn (funcall thunk) :no-error)
+             (web-skeleton:http-parse-error (e)
+               (web-skeleton::http-parse-error-status e))))
+         (req (line)
+           (sb-ext:string-to-octets (concatenate 'string line *crlf* *crlf*)
+                                    :external-format :ascii)))
+    ;; 400 is still the default for genuine syntax trouble.
+    (check "malformed request line stays 400"
+           (status-of (lambda ()
+                        (let ((b (req "GARBAGE")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           400)
+    ;; 505 — the version is the problem, and 400 named the wrong thing.
+    (check "unsupported version is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/2.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    ;; The real HTTP/2 prior-knowledge preface, which is the case the
+    ;; version-before-method ordering exists for. Its method is PRI, so a
+    ;; method-first parser answers 501 and never reaches the version —
+    ;; and "GET / HTTP/2.0" above cannot catch that, because a known
+    ;; method reaches the version check either way. RFC 7230 §2.6 puts
+    ;; the version first.
+    (check "h2 prior-knowledge preface is 505, not 501"
+           (status-of (lambda ()
+                        (let ((b (req "PRI * HTTP/2.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    (check "typo'd version is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/1.2")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    ;; A genuine HTTP/0.9 request line carries no version token at all,
+    ;; so it has one space and dies as a malformed request line long
+    ;; before the version check. A literal "HTTP/0.9" token does reach
+    ;; 505. Both pinned because the distinction is easy to state wrongly.
+    (check "literal HTTP/0.9 token is 505"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/0.9")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           505)
+    (check "versionless 0.9 request line is 400"
+           (status-of (lambda ()
+                        (let ((b (req "GET /path")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           400)
+    (check "HTTP/1.0 still accepted"
+           (status-of (lambda ()
+                        (let ((b (req "GET / HTTP/1.0")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           :no-error)
+    ;; 501 — a method we do not implement, not a malformed one. 405 would
+    ;; be wrong: that means "known method, not allowed here" and carries a
+    ;; mandatory Allow header we have no resource-level view to fill in.
+    (check "unrecognized method is 501"
+           (status-of (lambda ()
+                        (let ((b (req "PROPFIND / HTTP/1.1")))
+                          (web-skeleton::parse-request-bytes b 0 (length b)))))
+           501)
+    ;; 414 — the only part of a request line a client can grow at will is
+    ;; the URI.
+    (check "over-long request line is 414"
+           (status-of
+            (lambda ()
+              (let ((b (req (format nil "GET /~a HTTP/1.1"
+                                    (make-string
+                                     (1+ web-skeleton:*max-request-line-length*)
+                                     :initial-element #\a)))))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           414)
+    ;; 431 — RFC 6585 §5, for headers individually or in total.
+    (check "too many headers is 431"
+           (status-of
+            (lambda ()
+              (let* ((hdrs (with-output-to-string (s)
+                             (dotimes (i (+ 2 web-skeleton:*max-header-count*))
+                               (format s "x-~d: v~a" i *crlf*))))
+                     (b (sb-ext:string-to-octets
+                         (concatenate 'string "GET / HTTP/1.1" *crlf*
+                                      "host: x" *crlf* hdrs *crlf*)
+                         :external-format :ascii)))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           431)
+    (check "over-long header line is 431"
+           (status-of
+            (lambda ()
+              (let ((b (sb-ext:string-to-octets
+                        (concatenate 'string "GET / HTTP/1.1" *crlf*
+                                     "x-big: "
+                                     (make-string
+                                      (1+ web-skeleton:*max-header-line-length*)
+                                      :initial-element #\a)
+                                     *crlf* *crlf*)
+                        :external-format :ascii)))
+                (web-skeleton::parse-request-bytes b 0 (length b)))))
+           431)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL decode tests
@@ -2009,22 +2319,27 @@
                t)
       (close stream)))
 
-  ;; Bodiless responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1, RFC
-  ;; 7231 §4.3.2. 1xx / 204 / 304 / HEAD terminate at the header-end
+  ;; Bodiless FINAL responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1,
+  ;; RFC 7231 §4.3.2. 204 / 304 / HEAD terminate at the header-end
   ;; empty line regardless of CL / TE. Before the exempt was ported
   ;; to streaming, a 204 with a leftover CL raised "short body" and a
   ;; 304 with chunked framing blocked waiting for chunk-size bytes
   ;; that would never arrive. Symmetric with complete-fetch's
   ;; exempt set on the buffered path.
+  ;;
+  ;; 1xx deliberately does NOT appear here. It used to: 100 and 199
+  ;; were listed as "bodiless" and the reader returned them as the
+  ;; final status. That was the A1 defect — RFC 7231 §6.2 makes a 1xx
+  ;; interim by definition, so an upstream that sends one and then
+  ;; closes has not delivered a response at all, and reporting 103 as
+  ;; the result silently discards the real one. Interim handling is
+  ;; covered by TEST-INTERIM-RESPONSES, which asserts both that a 1xx
+  ;; is stepped over and that a lone 1xx followed by EOF raises.
   (dolist (spec '((204 "Content-Length: 500")
                   (304 "Content-Length: 500")
-                  (304 "Transfer-Encoding: chunked")
-                  (100 "Content-Length: 500")
-                  (199 "Content-Length: 500")))
+                  (304 "Transfer-Encoding: chunked")))
     (destructuring-bind (status-code framing-line) spec
       (let* ((reason (case status-code
-                       (100 "Continue")
-                       (199 "Experimental")
                        (204 "No Content")
                        (304 "Not Modified")))
              (raw (ascii-bytes
@@ -2258,6 +2573,201 @@
       (close stream))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Upstream 1xx interim responses (RFC 7231 §6.2)
+;;;
+;;; A 1xx block is terminated by its own empty line and carries no body, so
+;;; the final response begins immediately after it. Every buffered reader
+;;; anchors on a CRLFCRLF to find where headers end, so without a skip that
+;;; first boundary is the *interim's* terminator: the interim's status and
+;;; headers become the fetch's, the body is forced empty by the bodiless
+;;; exempt set, and the real response is discarded with no error.
+;;;
+;;; This is not a shape an app can avoid by configuration — `103 Early
+;;; Hints` (RFC 8297) is sent unsolicited by Cloudflare and Fastly, and
+;;; Apache emits it under H2EarlyHints.
+;;;
+;;; The framing predicate has to skip too. An interim carries no
+;;; Content-Length, so anchoring on it makes a CL-framed 200 look
+;;; close-delimited — which is how the fetch used to hang for the full
+;;; *FETCH-TIMEOUT* against any upstream that keeps the connection alive.
+;;; The regression cases below (plain 200, 204, partial interim) matter as
+;;; much as the fix cases.
+;;; ---------------------------------------------------------------------------
+
+(defun test-interim-responses ()
+  (format t "~%Interim 1xx responses~%")
+  (flet ((skip (s)
+           (let ((buf (ascii-bytes s)))
+             (web-skeleton::skip-interim-responses buf 0 (length buf))))
+         (status-after-skip (s)
+           (let* ((buf (ascii-bytes s)) (end (length buf))
+                  (sk (web-skeleton::skip-interim-responses buf 0 end)))
+             (web-skeleton::parse-response-status buf sk end)))
+         (complete-p (s method)
+           (let ((buf (ascii-bytes s)))
+             (not (null (web-skeleton::outbound-response-complete-p
+                         buf (length buf) method 0))))))
+
+    ;; ---- skip offsets ----
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints"
+                                "Link: </s.css>; rel=preload")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: 103 skipped"            (skip s) 57)
+      (check "interim: 103 then status is 200" (status-after-skip s) 200)
+      (check "interim: 103 then CL-framed completes" (complete-p s :GET) t))
+
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 100 Continue")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: 100 then status is 200" (status-after-skip s) 200)
+      (check "interim: 100 then CL-framed completes" (complete-p s :GET) t))
+
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 100 Continue")
+                          (crlf "HTTP/1.1 103 Early Hints" "Link: <a>")
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim: two blocks then status is 200"
+             (status-after-skip s) 200)
+      (check "interim: two blocks then completes" (complete-p s :GET) t))
+
+    ;; Chunked after an interim — the framing predicate must read TE from
+    ;; the FINAL block's headers, not the interim's (which has none).
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints")
+                          (crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked")
+                          "5" *crlf* "hello" *crlf* "0" *crlf* *crlf*)))
+      (check "interim: chunked after interim completes on terminator"
+             (complete-p s :GET) t))
+
+    ;; ---- regressions: nothing without an interim may move ----
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 200 OK" "Content-Length: 5")
+                          "hello")))
+      (check "interim regression: plain 200 skip is 0"  (skip s) 0)
+      (check "interim regression: plain 200 status"     (status-after-skip s) 200)
+      (check "interim regression: plain 200 completes"  (complete-p s :GET) t))
+
+    ;; 204 is a final status, not an interim — it must never be skipped.
+    (let ((s (crlf "HTTP/1.1 204 No Content")))
+      (check "interim regression: 204 not skipped" (skip s) 0)
+      (check "interim regression: 204 status"      (status-after-skip s) 204))
+
+    ;; ---- partial reads: skip must not mis-anchor ----
+    ;; A half-buffered interim yields START unchanged, so the read loop
+    ;; simply waits for more bytes.
+    (let ((s "HTTP/1.1 103 Early Hints\r\nLink: <a>\r\n"))
+      (check "interim: partial interim yields start" (skip s) 0)
+      (check "interim: partial interim is incomplete" (complete-p s :GET) nil))
+    ;; Complete interim, partial final — skip advances past the interim and
+    ;; the predicate still says "keep reading".
+    (let ((s (concatenate 'string
+                          (crlf "HTTP/1.1 103 Early Hints")
+                          "HTTP/1.1 200 OK\r\nContent-Len")))
+      (check "interim: complete interim + partial final skips interim"
+             (skip s) 28)
+      (check "interim: complete interim + partial final is incomplete"
+             (complete-p s :GET) nil))
+
+    ;; ---- cap: exactly at the limit must pass, one over must raise ----
+    ;; The boundary is the whole point. A test that only feeds a wildly
+    ;; over-cap count passes whether the loop allows N or N-1, which is
+    ;; how an off-by-one here survived: the buffered walk consumes one
+    ;; block per iteration, so it needs N+1 iterations to accept N
+    ;; interims and still recognise the final response. Iterating only N
+    ;; times rejected the Nth while the streaming paths — which count with
+    ;; a separate (> count cap) test — accepted it, and the two transports
+    ;; disagreed about their own documented limit.
+    (flet ((n-interims (n)
+             (with-output-to-string (o)
+               (dotimes (i n)
+                 (declare (ignorable i))
+                 (write-string (crlf "HTTP/1.1 103 Early Hints") o))
+               (write-string (crlf "HTTP/1.1 200 OK" "Content-Length: 0") o))))
+      (check "interim cap: exactly *max-interim-responses* is accepted"
+             (status-after-skip (n-interims web-skeleton:*max-interim-responses*))
+             200)
+      (check-error "interim cap: one over raises"
+                   (skip (n-interims (1+ web-skeleton:*max-interim-responses*))))
+      ;; And the streaming path must agree on the same boundary — the
+      ;; two implementations count differently, so only a paired test
+      ;; keeps them honest.
+      (check "interim cap: streaming accepts exactly the cap"
+             (let ((stream (make-mock-stream
+                            (ascii-bytes
+                             (n-interims web-skeleton:*max-interim-responses*)))))
+               (unwind-protect
+                    (web-skeleton::stream-response-lines stream nil)
+                 (close stream)))
+             200)
+      (check-error "interim cap: streaming raises one over"
+                   (let ((stream (make-mock-stream
+                                  (ascii-bytes
+                                   (n-interims
+                                    (1+ web-skeleton:*max-interim-responses*))))))
+                     (unwind-protect
+                          (web-skeleton::stream-response-lines stream nil)
+                       (close stream))))
+      ;; The knob is exported like every other limit, so an app behind a
+      ;; chatty CDN can raise it.
+      (check "*max-interim-responses* exported from :web-skeleton"
+             (nth-value 1 (find-symbol "*MAX-INTERIM-RESPONSES*" :web-skeleton))
+             :external)))
+
+  ;; ---- streaming path: must re-enter the header phase, not report 103 ----
+  (flet ((stream-lines (raw &key (method :GET))
+           (let ((lines nil)
+                 (stream (make-mock-stream (ascii-bytes raw))))
+             (unwind-protect
+                  (let ((status (web-skeleton::stream-response-lines
+                                 stream (lambda (l) (push l lines))
+                                 :method method)))
+                    (list status (nreverse lines)))
+               (close stream)))))
+
+    (check "interim streaming: 103 then CL body"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 103 Early Hints" "Link: </s.css>")
+                         (crlf "HTTP/1.1 200 OK" "Content-Length: 14")
+                         "line-a" (string #\Newline)
+                         "line-b" (string #\Newline)))
+           '(200 ("line-a" "line-b")))
+
+    (check "interim streaming: 103 then chunked body"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 103 Early Hints")
+                         (crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked")
+                         "7" *crlf* "{\"n\":1}" *crlf* "0" *crlf* *crlf*))
+           '(200 ("{\"n\":1}")))
+
+    (check "interim streaming regression: plain 200 unchanged"
+           (stream-lines
+            (concatenate 'string
+                         (crlf "HTTP/1.1 200 OK" "Content-Length: 14")
+                         "line-a" (string #\Newline)
+                         "line-b" (string #\Newline)))
+           '(200 ("line-a" "line-b")))
+
+    (check "interim streaming regression: 204 still bodiless"
+           (stream-lines (crlf "HTTP/1.1 204 No Content" "Content-Length: 500"))
+           '(204 ()))
+
+    (check "interim streaming regression: HEAD still bodiless"
+           (stream-lines (crlf "HTTP/1.1 200 OK" "Content-Length: 42")
+                         :method :HEAD)
+           '(200 ()))
+
+    ;; An upstream that sends only an interim and then closes has not sent
+    ;; a response at all — that must be loud, not a silent 103.
+    (check-error "interim streaming: interim then EOF raises"
+                 (stream-lines (crlf "HTTP/1.1 103 Early Hints")))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Buffered chunked body decoding tests
 ;;; ---------------------------------------------------------------------------
 
@@ -2456,7 +2966,55 @@
            nil)
     (check "ws-upgrade: short key (length) rejected"
            (web-skeleton::websocket-upgrade-p (ws-req "dGhlIHNhbXBsZQ=="))
+           nil)
+    ;; The key is base64 over 16 fixed bytes, so its shape is fully
+    ;; determined: 22 data characters then exactly "==". A flat alphabet
+    ;; sweep across all 24 admits '=' at any position, which accepted 24
+    ;; of them — while the comment above the loop claimed the positional
+    ;; strictness the loop did not have.
+    (check "ws-upgrade: all-padding key rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "========================"))
+           nil)
+    (check "ws-upgrade: pad inside the data chars rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub=5jZQ=="))
+           nil)
+    (check "ws-upgrade: missing trailing pad rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub25jZQAA"))
+           nil)
+    (check "ws-upgrade: single trailing pad rejected"
+           (web-skeleton::websocket-upgrade-p
+            (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
+
+  ;; *ws-send-timeout* used to document 0 as "disable", which set no
+  ;; deadline and left the write loop with no exit — a peer that stopped
+  ;; draining its receive window pinned the worker permanently, and the
+  ;; worker is every other connection on it, not just this one. An empty
+  ;; frame is used so the loop body never runs and no fd is touched:
+  ;; before the guard, 0 with nothing to write returned normally.
+  (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (check "ws-send: zero timeout refused"
+           (let ((*ws-send-timeout* 0))
+             (handler-case (progn (web-skeleton::ws-send conn empty) nil)
+               (error (e) (not (null (search "*ws-send-timeout*"
+                                             (princ-to-string e)))))))
+           t)
+    (check "ws-send: negative timeout refused"
+           (let ((*ws-send-timeout* -1))
+             (handler-case (progn (web-skeleton::ws-send conn empty) nil)
+               (error () t)))
+           t)
+    ;; A positive value still passes the guard, or the two checks above
+    ;; would be satisfied by a function that refused everything.
+    (check "ws-send: positive timeout passes the guard"
+           (let ((*ws-send-timeout* 10))
+             (handler-case (progn (web-skeleton::ws-send conn empty) :sent)
+               (error () :error)))
+           :sent))
 
   ;; build-ws-close only accepts the send-allowed set per RFC 6455
   ;; §7.4.1: 1000-1003, 1007-1014, 3000-4999. Clamp-on-receive is
@@ -2496,15 +3054,15 @@
     (check "build-ws-close: 4000 app-range accepted"
            (not (null (build-ws-close 4000))) t))
 
-  ;; connection-header-has-token-p
+  ;; header-has-token-p
   (check "token single"
-         (web-skeleton::connection-header-has-token-p "upgrade" "upgrade") t)
+         (web-skeleton::header-has-token-p "upgrade" "upgrade") t)
   (check "token in list"
-         (web-skeleton::connection-header-has-token-p "keep-alive, Upgrade" "upgrade") t)
+         (web-skeleton::header-has-token-p "keep-alive, Upgrade" "upgrade") t)
   (check "token with whitespace"
-         (web-skeleton::connection-header-has-token-p "  Upgrade  ,  keep-alive  " "upgrade") t)
+         (web-skeleton::header-has-token-p "  Upgrade  ,  keep-alive  " "upgrade") t)
   (check "token absent"
-         (web-skeleton::connection-header-has-token-p "keep-alive" "upgrade") nil)
+         (web-skeleton::header-has-token-p "keep-alive" "upgrade") nil)
 
   ;; Frame building — text frame
   (let ((frame (build-ws-text "hello")))
@@ -2568,6 +3126,28 @@
               (lambda ()
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
              t))
+    ;; RFC 6455 §5.1: client frames are masked. The mask bit is in byte 1,
+    ;; so the rejection needs nothing but the two header bytes — it used
+    ;; to sit below the availability test, which meant a peer could make
+    ;; us buffer a whole payload before we refused a frame we had already
+    ;; decided against. Header-only input proves the check no longer waits:
+    ;; before the hoist this returned (values NIL 0) asking for more bytes.
+    (let ((header-only (make-array 2 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x81 100))))
+      (check "reject unmasked frame from header alone"
+             (signals-error-p
+              (lambda ()
+                (web-skeleton::try-parse-ws-frame header-only 0 2)))
+             t))
+    ;; And a masked frame with the same shortfall still asks for more,
+    ;; so the hoist did not turn incompleteness into an error.
+    (let ((masked-short (make-array 2 :element-type '(unsigned-byte 8)
+                                      :initial-contents '(#x81 #xE4))))
+      (check "masked but incomplete frame still waits for bytes"
+             (multiple-value-bind (frame consumed)
+                 (web-skeleton::try-parse-ws-frame masked-short 0 2)
+               (list frame consumed))
+             '(nil 0)))
     ;; Canonical: len7=126, value=126 — accepted (boundary).
     (let* ((payload (make-array 126 :element-type '(unsigned-byte 8)
                                     :initial-element 97))  ; all 'a'
@@ -3002,7 +3582,42 @@
                                         web-skeleton::*static-cache*))) t)
              (check "dot-path: /.git/config stays hidden"
                     (gethash "/.git/config"
-                             web-skeleton::*static-cache*) nil))
+                             web-skeleton::*static-cache*) nil)
+             ;; :MAX-TOTAL-BYTES. The cache is resident for the life of
+             ;; the process, so an oversized tree is a resident-set
+             ;; surprise discovered on the box at deploy time unless it
+             ;; is refused here. Range support makes large media likelier
+             ;; to be sitting in the directory, not less.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: tree over :max-total-bytes signals"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch) :max-total-bytes 10)
+                               nil)
+                      (error () t))
+                    t)
+             ;; A cap the tree fits under must not fire — otherwise the
+             ;; check above would pass for a guard that rejects always.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: tree under :max-total-bytes loads"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch)
+                                :max-total-bytes (* 1024 1024))
+                               (not (null (gethash "/index.html"
+                                                   web-skeleton::*static-cache*))))
+                      (error () nil))
+                    t)
+             ;; And the default is generous enough that an ordinary tree
+             ;; never trips it, so existing callers are untouched.
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (check "static: default cap does not fire on a small tree"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                (namestring scratch))
+                               t)
+                      (error () nil))
+                    t))
         (setf web-skeleton::*static-cache* saved-cache)
         ;; Cleanup scratch tree. Files first, then nested dir, then
         ;; scratch root. IGNORE-ERRORS wraps each so a missing file
@@ -3053,13 +3668,32 @@
     (check "range: wrong unit ignored"   (r "items=0-9") :ignore)
     (check "range: garbage ignored"      (r "bytes=") :ignore)
     (check "range: nil header ignored"   (r nil) :ignore)
-    ;; An empty resource has no satisfiable range at all.
-    (check "range: empty resource ignored"
-           (multiple-value-bind (f l)
-               (web-skeleton::parse-byte-range "bytes=0-0" 0)
-             (declare (ignore l))
-             f)
-           nil))
+    ;; An empty resource has no satisfiable range at all, which is the
+    ;; definition of 416 rather than a reason to serve 200. RFC 7233 §2.1
+    ;; puts every first-byte-pos at or past a zero length, and §4.4
+    ;; answers that with 416; this used to short-circuit to NIL and serve
+    ;; the full (empty) 200 instead. All three forms are checked because
+    ;; only the suffix form needed telling — the other two reach
+    ;; :unsatisfiable through the ordinary out-of-range branch, and a
+    ;; later edit could break one without touching the others.
+    (flet ((r0 (spec)
+             (multiple-value-bind (first last)
+                 (web-skeleton::parse-byte-range spec 0)
+               (cond ((eq first :unsatisfiable) :unsatisfiable)
+                     (first (list first last))
+                     (t :ignore)))))
+      (check "range: empty resource, explicit range unsatisfiable"
+             (r0 "bytes=0-0") :unsatisfiable)
+      (check "range: empty resource, open-ended range unsatisfiable"
+             (r0 "bytes=0-") :unsatisfiable)
+      (check "range: empty resource, suffix range unsatisfiable"
+             (r0 "bytes=-500") :unsatisfiable)
+      ;; Still NIL for a Range nobody wrote correctly: an empty resource
+      ;; does not turn a malformed header into a satisfiability question.
+      (check "range: empty resource, garbage still ignored"
+             (r0 "bytes=abc-def") :ignore)
+      (check "range: empty resource, nil header still ignored"
+             (r0 nil) :ignore)))
 
   ;; ---- end-to-end through serve-static ----
   (let* ((content (sb-ext:string-to-octets
@@ -3266,6 +3900,34 @@
     (check "jwt split: three dots returns nil (early bail)"
            (web-skeleton::jwt-split "a.b.c.d") nil)
 
+    ;; RFC 7515 §2: JWS segments carry no padding. The signature segment
+    ;; is the one that matters — it sits outside the signed input, so
+    ;; "sig" and "sig==" decode to the same 64 bytes and both verify.
+    ;; The other two are checked by the same rule rather than a separate
+    ;; argument about which segment deserves it.
+    (check "jwt split: padded signature segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a.~a.~a==" header-b64 payload-b64 sig-b64))
+           nil)
+    (check "jwt split: padded payload segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a.~a==.~a" header-b64 payload-b64 sig-b64))
+           nil)
+    (check "jwt split: padded header segment returns nil"
+           (web-skeleton::jwt-split
+            (format nil "~a==.~a.~a" header-b64 payload-b64 sig-b64))
+           nil)
+    ;; The hole that closes, asserted at the codec rather than end to end
+    ;; because there is no unexpired positive JWT-VERIFY fixture: the RFC
+    ;; 7515 A.3 token is expired, so a JWT-VERIFY assertion would return
+    ;; NIL for the wrong reason and pass whether or not the guard exists.
+    ;; The codec accepts both spellings on purpose — padding is legal
+    ;; base64url, and it is JWS that forbids it.
+    (check "padded signature segment decodes to the same bytes"
+           (equalp (base64url-decode sig-b64)
+                   (base64url-decode (concatenate 'string sig-b64 "==")))
+           t)
+
     ;; Verify signature is valid by calling ecdsa-verify-p256 directly
     (let* ((signing-input (format nil "~a.~a" header-b64 payload-b64))
            (hash (sha256 (sb-ext:string-to-octets signing-input
@@ -3276,6 +3938,35 @@
                                 (jwt-key-x (first keys))
                                 (jwt-key-y (first keys)))
              t))
+
+    ;; The positive case. Every other JWT-VERIFY assertion here is a
+    ;; rejection, so without this one (defun jwt-verify (token keys) nil)
+    ;; passes the whole suite — the framework's security-critical entry
+    ;; point asserted to fail three ways and to succeed at nothing.
+    ;;
+    ;; The A.3 token expired in 2011 and there is no signer in this
+    ;; framework (verification only), so the only route to a positive
+    ;; result is to widen the clock window past the token's age. Derived
+    ;; from the token's own exp rather than a literal date: the NOW terms
+    ;; cancel, (- now *jwt-clock-skew*) reduces to exp - 3600, and the
+    ;; expiry branch cannot start firing on some future run.
+    (let ((*jwt-clock-skew* (+ 3600 (- (web-skeleton::jwt-current-time)
+                                       1300819380))))
+      (check "jwt verify: A.3 token verifies with the clock window widened"
+             (jwt-claim (jwt-verify token keys) "iss")
+             "joe")
+      ;; First end-to-end proof that the JSON-OBJECT survives out of
+      ;; JWT-VERIFY into JWT-CLAIM — the claims used to be a bare alist,
+      ;; and the type change had no test that crossed this boundary.
+      (check "jwt verify: claims come back as a json-object"
+             (json-object-p (jwt-verify token keys))
+             t)
+      ;; Discriminating both ways: without JWT-SPLIT's padding guard this
+      ;; token splits into three parts, the signature segment decodes to
+      ;; the same 64 bytes, and the claims come back instead of NIL.
+      (check "jwt verify: padded signature segment does not verify"
+             (jwt-verify (concatenate 'string token "==") keys)
+             nil))
 
     ;; jwt-verify rejects expired token
     (check "jwt expired token"
@@ -3732,10 +4423,12 @@
   (test-fetch-address-filter)
   (test-dns-cache)
   (test-format-peer-addr)
+  (test-parse-error-status)
   (test-url-decode)
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
   (test-websocket)

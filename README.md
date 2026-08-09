@@ -162,7 +162,11 @@ tests/
   configurable idle timeout for inactive WebSocket connections
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
-  validates against configurable size limits
+  validates against configurable size limits. A rejection carries the
+  status that describes it — 413 over a size cap, 414 for the request
+  line, 431 for headers, 501 for an unimplemented method or transfer
+  coding, 505 for a version that isn't 1.0 or 1.1 — rather than answering
+  everything with 400
 - **HTTP response builder** — status codes, headers, body serialization.
   Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
   verbatim, for content a string cannot carry (a generated image, a zip, a
@@ -182,11 +186,23 @@ tests/
 - **Path matching** — `match-path` matches URL paths against patterns
   with `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
 - **JSON** — full parser and serializer (RFC 8259).
-  Objects become alists, arrays become lists.
+  Objects become `json-object` structs (read with `json-get`, which also
+  accepts a bare alist); arrays become lists. `{}`, `[]`, and `null` are
+  three distinct values that each round-trip to themselves.
+  Objects are a distinct type rather than a bare alist because the two are
+  otherwise the same Lisp object — an array of `[string, value]` pairs and
+  an alist are indistinguishable, so a serializer that guessed re-emitted
+  `[["a",1],["b",2]]` as `{"a":[1],"b":[2]}`: well-formed and silently wrong.
+  To emit an object from data you built yourself, wrap it:
+  `(json-serialize (make-json-object '(("a" . 1))))`.
   Handles all escape sequences including `\uXXXX` and surrogate pairs
 - **SHA-1** & **SHA-256** — complete implementations per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
-- **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648)
+- **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648).
+  Decoding rejects non-zero trailing bits and padding that does not exactly
+  complete the last group. Padding itself stays optional because base64url
+  omits it, so `"Zg"` and `"Zg=="` both decode — one spelling per padding
+  convention, not one outright
 - **Crypto random** — `random-bytes` reads N bytes from `/dev/urandom`;
   `random-token` returns a base64url-encoded token (default 32 bytes / ~256 bits).
   For session IDs, CSRF tokens, nonces, PKCE verifiers
@@ -270,6 +286,54 @@ tests/
   without pulling in the framework's own test suite
 - **Demo application** — separate ASDF system with static demo page and echo server
 
+## Limitations
+
+The boundaries of the list above. Each is a deliberate choice rather than
+an oversight, but a boundary you meet in production is worse than one you
+read about here.
+
+- **No inbound TLS.** The server cannot serve HTTPS. A reverse proxy
+  (nginx, caddy) terminates TLS in front of it. Outbound TLS *is*
+  supported — `web-skeleton-tls` gives `https://` fetches — so the
+  feature list above can read as if the inbound case were covered too. It
+  isn't.
+- **No chunked request bodies.** A request carrying `Transfer-Encoding`
+  is refused with 501. Request bodies are framed by `Content-Length`
+  only, which is what closes the CL-TE smuggling shape, but it also
+  refuses any client streaming a body of unknown length — `curl -T -`,
+  Go's `http.Client` with a non-seekable body. Chunked *responses* from
+  an upstream are read normally; the two directions are unrelated.
+- **No response compression.** No gzip, no `Content-Encoding`
+  negotiation. Compressing static assets is the proxy's job today.
+- **No HTTP/2, no multipart.** A request whose version token is not
+  HTTP/1.0 or HTTP/1.1 gets 505. Form bodies are
+  `application/x-www-form-urlencoded` only — `multipart/form-data`, and
+  therefore file upload, is unimplemented.
+- **Static files are served from memory only.** `load-static-files` reads
+  the tree into the heap at startup and pre-builds each response; there
+  is no serve-from-disk path, so every file you serve is resident for the
+  life of the process. The tree is capped at 256 MiB
+  (`:max-total-bytes`). Large media belongs behind the reverse proxy.
+- **JWT is verification only.** `jwt-verify`, `parse-jwks` and
+  `jwt-claim` check tokens someone else issued. There is no signer — no
+  key generation, no token minting — so an app that issues its own
+  tokens needs another component for that half.
+- **Multi-range requests are ignored.** `Range: bytes=0-99,200-299`
+  serves the whole file rather than a `multipart/byteranges` response.
+  RFC 7233 §3.1 permits this, and no media player or download manager
+  asks for it; single ranges are fully supported.
+- **`https://` to an IP-literal host is refused.** Certificate hostname
+  verification uses `SSL_set1_host`, which does not match IP SANs — that
+  needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
+  is the honest answer; silently skipping verification would not be.
+  Plain `http://` to an IP literal works.
+- **`ws-send` blocks the worker, not just the connection.** One peer that
+  stops reading freezes every other connection on that worker for up to
+  `*ws-send-timeout*`. See DEPLOYMENT.md for the arithmetic before
+  building a broadcast on it.
+- **Static responses omit `Date`.** Dynamic responses carry it. See
+  DEPLOYMENT.md — it matters if you put a caching CDN in front.
+
 ## Configuration
 
 All configurable via `setf` before calling `start-server`.
@@ -284,6 +348,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB)                                                                                                                                                                                                              |
 | `*max-outbound-response-size*` | `8388608` | Max buffered outbound HTTPS response total (headers + body, bytes, default 8MB). Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected                                                                          |
 | `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound)                 |
+| `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value                                    |
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
 | `*max-connections*`            | `10000`   | Max connections per worker (new accepts dropped when full)                                                                                                                                                                                         |
@@ -291,6 +356,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
+| `*ws-send-timeout*`            | `10`      | Seconds before `ws-send` gives up writing a frame. Must be positive — there is no unbounded setting. `ws-send` blocks the **worker**, not just its connection, so this is how long one peer that stops reading may freeze every other connection on that worker |
 | `*fetch-timeout*`              | `30`      | Blocking fetch I/O timeout and :awaiting connection reap deadline                                                                                                                                                                                  |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |

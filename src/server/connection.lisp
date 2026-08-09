@@ -93,18 +93,19 @@
 
 (defun format-peer-addr (host port)
   "Format a (HOST PORT) pair as a peer-address string for log output.
-   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the v6 form
-   uses the bracketed 8-group lowercase hex representation (RFC 5952).
-   No :: compression — a log line doesn't need canonical form, just
-   unambiguous identity."
-  (case (length host)
-    (4  (format nil "~{~d~^.~}:~d" (coerce host 'list) port))
-    (16 (format nil "[~(~{~x~^:~}~)]:~d"
-                (loop for i from 0 below 16 by 2
-                      collect (logior (ash (aref host i) 8)
-                                      (aref host (1+ i))))
-                port))
-    (t  (format nil "<addr>:~d" port))))
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector. The v6 form is
+   bracketed per RFC 3986 §3.2.2 so the port cannot be read as another
+   hex group; the v4 form needs no brackets.
+
+   The address itself is FORMAT-IP's job. This used to walk the sixteen
+   bytes itself, which meant two implementations of one hex format — and
+   a log line that disagreed with a filter decision about what an address
+   even looked like would be a miserable thing to debug. Brackets and a
+   port are the whole difference, so that is all this adds."
+  (let ((addr (format-ip host)))
+    (if (= (length host) 16)
+        (format nil "[~a]:~d" addr port)
+        (format nil "~a:~d" addr port))))
 
 (defun make-client-connection (client-socket)
   "Wrap a newly accepted socket into a connection object.
@@ -158,41 +159,59 @@
 ;;; Read buffer helpers
 ;;; ---------------------------------------------------------------------------
 
-(defun connection-read-available (conn)
-  "Drain all available bytes from fd into read buffer (edge-triggered).
-   Grows the buffer as needed, up to the state-appropriate limit.
-   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN.
-
-   The size cap is state- and direction-dependent:
+(defun connection-read-cap (conn)
+  "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
+     :out-dns           → 8 KiB
      outbound response  → *max-outbound-response-size* (8 MiB default)
-     inbound request    → *max-body-size*             (1 MiB default)
+     inbound request    → every inbound budget summed (~1.07 MiB default)
+
    Keeping the inbound and outbound caps separate means a 1 MiB+ HTTPS
    response (which a real upstream will routinely send) doesn't get
-   truncated by the inbound request-body budget."
-  ;; Known coupling: the :read-http phase cap is *max-body-size*
-  ;; which must also accommodate headers. At default 1 MiB this
-  ;; is generous; an operator setting *max-body-size* very low
-  ;; (e.g. 64 KB) while allowing large headers will hit the cap
-  ;; before headers are fully buffered.
+   truncated by the inbound request-body budget.
+
+   Split out of CONNECTION-READ-AVAILABLE so the arithmetic can be
+   asserted without an fd to read from."
+  (cond
+    ((eq (connection-state conn) :websocket)
+     (+ *max-ws-payload-size* 14))
+    ;; DNS pipe output is 'getent ahosts <host>' stdout — a handful of
+    ;; STREAM / DGRAM / RAW lines per address family, typically well
+    ;; under 1 KiB. Cap at 8 KiB to match RESOLVE-HOST-BLOCKING's
+    ;; explicit 8192-byte cap on the synchronous path; reusing
+    ;; *MAX-OUTBOUND-RESPONSE-SIZE* here would let a pathological NSS
+    ;; module produce an 8 MiB buffer for what is definitionally a few
+    ;; lines.
+    ((eq (connection-state conn) :out-dns)
+     8192)
+    ((connection-outbound-p conn)
+     *max-outbound-response-size*)
+    ;; The inbound cap is the sum of the budgets that actually apply, not
+    ;; *max-body-size* alone. Aliasing them made one knob quietly move
+    ;; two: a JSON API tightening the body cap to 32 KiB also capped
+    ;; total request bytes at 32 KiB, so a request with large-but-legal
+    ;; headers — a fat cookie jar, a long Authorization, a proxy's
+    ;; X-Forwarded-* chain — died on the buffer with a 400 that blamed
+    ;; the body.
+    ;;
+    ;; Summed exactly rather than padded with slack, the same way the
+    ;; :websocket arm spells out its 14-byte masked header. The last two
+    ;; terms are why this is not simply the sum of two variables:
+    ;; *max-total-header-bytes* counts header line bytes only, so the
+    ;; request line and every CRLF fall outside it.
+    (t
+     (+ *max-body-size*
+        *max-total-header-bytes*
+        *max-request-line-length*
+        (* 2 *max-header-count*)  ; CRLF ending each header
+        4))))                     ; request-line and blank-line CRLFs
+
+(defun connection-read-available (conn)
+  "Drain all available bytes from fd into read buffer (edge-triggered).
+   Grows the buffer as needed, up to CONNECTION-READ-CAP.
+   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
   (let ((any-read nil)
-        (max-size (cond
-                    ((eq (connection-state conn) :websocket)
-                     (+ *max-ws-payload-size* 14))
-                    ;; DNS pipe output is 'getent ahosts <host>' stdout —
-                    ;; a handful of STREAM / DGRAM / RAW lines per
-                    ;; address family, typically well under 1 KiB. Cap
-                    ;; at 8 KiB to match RESOLVE-HOST-BLOCKING's
-                    ;; explicit 8192-byte cap on the synchronous path;
-                    ;; reusing *MAX-OUTBOUND-RESPONSE-SIZE* here would
-                    ;; let a pathological NSS module produce an 8 MiB
-                    ;; buffer for what is definitionally a few lines.
-                    ((eq (connection-state conn) :out-dns)
-                     8192)
-                    ((connection-outbound-p conn)
-                     *max-outbound-response-size*)
-                    (t
-                     *max-body-size*))))
+        (max-size (connection-read-cap conn)))
     (loop
       (let* ((buf (connection-read-buf conn))
              (pos (connection-read-pos conn))
@@ -266,7 +285,12 @@
                          ;; makes the per-digit cap do real work.
                          do (incf digits)
                             (when (> digits 10)
-                              (http-parse-error "Content-Length too large"))
+                              ;; An 11-digit length is >= 10 GB, which is
+                              ;; over any *max-body-size* worth setting —
+                              ;; 413 rather than 400, same as the body
+                              ;; check that would have caught it if we
+                              ;; had let the number finish parsing.
+                              (http-reject 413 "Content-Length too large"))
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
                             (incf pos))
@@ -461,7 +485,10 @@
                    (connection-body-expected conn)))
           nil)
          (t
-          (http-parse-error "request too large (buffer full)"))))
+          ;; The buffer is at CONNECTION-READ-CAP with no complete
+          ;; request in it. Whatever the client is sending, there is
+          ;; more of it than we will hold — 413, not 400.
+          (http-reject 413 "request too large (buffer full)"))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
     ;; Activity timestamp is NOT updated here on partial reads.
@@ -512,8 +539,14 @@
                  (let ((minor-version-byte (aref buf (+ sp 8)))
                        (hdr-start (+ req-line-end 2)))
                  ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
+                 ;; RFC 7230 §3.3.1 names the code for this exactly: a
+                 ;; server that receives a transfer coding it does not
+                 ;; understand SHOULD answer 501. Not 411 — that is for
+                 ;; refusing a request until it carries a Content-Length,
+                 ;; and it would misdescribe a client whose framing is
+                 ;; legal and simply unimplemented here.
                  (when (scan-transfer-encoding buf header-end hdr-start)
-                   (http-parse-error "Transfer-Encoding not supported"))
+                   (http-reject 501 "Transfer-Encoding not supported"))
                  ;; Classify Expect once — disposition gates dispatch
                  ;; before the body-presence split so a no-body GET with
                  ;; Expect: x-foo 417s the same as a bodied POST does.
@@ -557,8 +590,8 @@
                    ((and content-length (> content-length 0))
                     ;; Reject oversized bodies before allocating.
                     (when (> content-length *max-body-size*)
-                      (http-parse-error "body too large (~d bytes, max ~d)"
-                                        content-length *max-body-size*))
+                      (http-reject 413 "body too large (~d bytes, max ~d)"
+                                   content-length *max-body-size*))
                     ;; Grow read buffer if needed.
                     (let ((total-needed (+ body-start content-length)))
                       (when (> total-needed (length (connection-read-buf conn)))
@@ -661,7 +694,25 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-queue-write (conn bytes)
-  "Queue BYTES for writing. Caller is responsible for setting state."
+  "Replace the write buffer with BYTES. Caller is responsible for
+   setting state, and for the buffer having drained first — this
+   queues nothing behind an in-flight write, it overwrites it.
+
+   Calling with bytes still un-flushed signals rather than truncating.
+   Every one of the current call sites is reached from a read state,
+   a freshly-created outbound connection, or an inbound parked in
+   :awaiting with its buffer already drained, so the invariant holds
+   by construction — but by construction is a property of today's
+   nineteen callers, not of the function. DRAIN-CONNECTIONS and
+   PING-WS-CONNECTIONS both test (< write-pos write-end) before
+   calling, which is the same invariant enforced two levels out; the
+   next caller to skip that test would otherwise ship the peer a
+   truncated frame followed by a whole one, and the corruption would
+   surface as a protocol error somewhere else entirely."
+  (let ((pending (- (connection-write-end conn) (connection-write-pos conn))))
+    (when (plusp pending)
+      (error "connection-queue-write would clobber ~d un-flushed byte~:p on fd ~d"
+             pending (connection-fd conn))))
   (setf (connection-write-buf conn) bytes
         (connection-write-pos conn) 0
         (connection-write-end conn) (length bytes)))

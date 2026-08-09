@@ -124,6 +124,72 @@ nginx, caddy, or a similar reverse proxy for HTTPS termination.
 The default bind address is localhost (`#(127 0 0 1)`), correct for this setup.
 Use `:host #(0 0 0 0)` only if the server must accept connections directly.
 
+### Status codes the framework itself sends
+
+A request the framework rejects before your handler sees it gets a
+specific status, not a blanket 400:
+
+| Code | Sent when |
+|------|-----------|
+| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host` |
+| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request |
+| `414 URI Too Long` | Request line over `*max-request-line-length*` |
+| `417 Expectation Failed` | An `Expect` the framework does not implement |
+| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
+| `501 Not Implemented` | A method not in the accepted set, or any `Transfer-Encoding` (RFC 7230 §3.3.1) |
+| `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
+| `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
+| `500 Internal Server Error` | Your handler raised |
+
+**If you alert on 400s, this changes what you see.** Every 4xx and 5xx
+above except the 503 was a 400 previously, so a dashboard counting
+"client errors" will start splitting them out — and a spike that used to
+look like malformed requests may resolve into something more specific,
+such as a client retrying with an oversized body or a scanner speaking
+HTTP/2 at a 1.1 port. That is the point of the change, but it does move
+the numbers.
+
+**The 503 is new traffic, not re-labelled traffic.** A worker at
+`*max-connections*` used to accept the socket and close it without a
+word, so an overloaded instance and a crashed one were indistinguishable
+from the client side and there was nothing to back off against. It now
+answers before closing. Two consequences worth knowing before you build
+an alert on it:
+
+- **The 503 is always written; whether it is seen is not guaranteed.**
+  The refusal is one non-blocking write followed by a bounded drain of
+  what the client already sent, capped at 8 KiB. The drain is there
+  because `close(2)` on a socket holding unread data makes Linux send RST
+  rather than FIN, and a client that surfaces a reset in place of the 503
+  learns nothing from it.
+
+  Both the drain and the delivery turn on the same race, and neither is
+  settled by it. The refusal happens at accept time, which may precede
+  the client's request arriving at all. If it does, the request lands on
+  a socket that no longer exists, the kernel answers RST, and that reset
+  discards whatever the client had not yet read — including the 503. On
+  loopback the request always wins that race, which is why the test suite
+  sees the response every time; across a real network under real
+  overload, which is the only condition any of this fires in, it is a
+  race like any other. A client refused mid-upload, or simply slower than
+  the accept, can end up with a reset and nothing else.
+
+  This is still strictly better than the bare close it replaces, which
+  conveyed nothing by construction. It is not a delivery guarantee, and
+  an alert built on counting 503s at the client will undercount.
+- **It is not in your access path**, so it will not appear in handler
+  metrics or anything else counted after dispatch. If you want to see
+  refusals, watch the `connection limit reached` warning, which is
+  logged once per refusal.
+
+Like static responses, the refusal carries no `Date` — see the header's
+own section below for why pre-built bytes omit it.
+
+`status-reason` covers the codes above plus the ones handlers commonly
+need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx
+set. It is deliberately not exhaustive: for anything else, set the status
+and supply your own reason phrase.
+
 ### WebSocket origin validation
 
 The framework validates WebSocket protocol headers
@@ -146,8 +212,11 @@ Check Origin in your handler before returning `:upgrade`:
 
 ### JWT issuer and audience
 
-`jwt-verify` checks the signature, expiration, and not-before claims.
-It does **not** check `iss` (issuer) or `aud` (audience).
+`jwt-verify` checks the signature, and checks `exp` / `nbf` **when those claims
+are present**. Both are OPTIONAL per RFC 7519 §4.1, so a token that simply omits
+`exp` verifies and never expires — "signature valid" is not the same as "safe to
+act on." If your issuer can mint tokens without `exp`, check for it yourself.
+`jwt-verify` also does **not** check `iss` (issuer) or `aud` (audience).
 If your JWKS key set is shared across services, always verify these:
 
 ```lisp
@@ -158,6 +227,41 @@ If your JWKS key set is shared across services, always verify these:
     ;; token is valid and intended for this service
     ...))
 ```
+
+### Keying on the token string
+
+**Do not key a revocation list, replay-dedup cache, rate-limit bucket, or audit
+line on the raw token text.** A verified token does not have exactly one
+spelling, and it cannot be made to.
+
+If `(r, s)` verifies then so does `(r, n-s)`. Anyone holding the token can
+compute that — no key needed, `n` is a public curve constant. JOSE does not
+mandate low-S normalization and mainstream issuers emit high-S roughly half the
+time, so rejecting it would reject real tokens; `src/algorithms/ecdsa.lisp` says
+so at the point where it declines to enforce it. Two token strings, one
+signature, both valid.
+
+Key on something canonical under a valid signature instead:
+
+- the `jti` claim (RFC 7519 §4.1.7), if your issuer sets one
+- the `header.payload` prefix — the exact bytes the signature is checked
+  against, so any mutation invalidates the token
+
+None of this is a forgery risk. The signed input is `header.payload`, so
+altering either changes the bytes the signature is checked against.
+
+### JWKS coordinate encoding
+
+`parse-jwks` raises rather than returning NIL, so a key set it rejects takes down
+all verification, not one request.
+
+Base64url decoding is strict: it rejects a final group whose unused low bits are
+set, and padding that does not exactly complete the last group. A 32-byte EC
+coordinate encodes to 43 characters — a three-character final group — so that
+check applies to every key set you load. Only a non-conforming issuer is
+affected: RFC 4648 §3.5 makes zeroed pad bits a MUST for encoders, and RFC 7515
+§2 makes unpadded segments a MUST for JWS. The error names the key and the
+coordinate, so a rotation that trips it reads as the issuer bug it is.
 
 ### HMAC signature comparison
 
@@ -212,14 +316,22 @@ it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper hands back a 502.
 
 **Chunked completion on the async path.** The non-blocking `http-fetch` path
-detects response completion by Content-Length (immediate) or by EOF (Connection: close).
-For chunked responses where the upstream keeps the TCP connection alive
-after sending the `0\r\n\r\n` terminator, completion is detected only
-when the upstream eventually closes or `*fetch-timeout*` expires —
-up to 30 seconds of unnecessary delay. The framework sends `Connection: close`
-on all outbound requests, so well-behaved upstreams close promptly;
-the stall appears only against upstreams that ignore the header.
-A future optimization could scan for the zero-size chunk terminator in-buffer.
+detects response completion three ways: by `Content-Length`, by the
+zero-size chunk terminator when the response is chunked, and by EOF for a
+close-delimited one. A chunked upstream that holds the connection open
+after `0\r\n\r\n` therefore completes as soon as the terminator lands,
+rather than stalling until the peer closes or `*fetch-timeout*` expires.
+`chunked-body-complete-p` walks the framing in the read buffer and resumes
+from where the previous read stopped, so each chunk is walked once across
+the transfer instead of the body being rescanned on every read.
+
+That is the **response** side — decoding a chunked body an upstream sent
+to us. Inbound requests are the opposite direction and get the opposite
+answer: a client sending `Transfer-Encoding` is refused with 501, because
+the framework frames request bodies with `Content-Length` alone. Reading
+chunked responses does not imply accepting chunked requests, and the
+ingress refusal is deliberate — it is what makes a CL-TE disagreement
+unrepresentable.
 
 **`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL`
 for four distinct conditions — unexpected peer close without `close_notify`
@@ -231,6 +343,25 @@ so `*fetch-timeout*` actually bounds the HTTPS read path for close-delimited res
 and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_notify`
 is still accepted silently — that's the framing signal for HTTP/1.0-style servers
 that never send `close_notify` at all.
+
+**Framing headers are the framework's, not yours.** Passing either
+`Transfer-Encoding` or `Content-Length` in `:headers` signals an error
+rather than going on the wire. Both are ways for a request's declared
+framing to disagree with the bytes that follow (RFC 7230 §3.3.3), and
+either one aimed at an upstream is a request-smuggling primitive:
+
+- `Transfer-Encoding` — the framework never chunk-encodes, so the claim
+  is false whatever the body is, and it does not suppress the computed
+  `Content-Length`, so the request would have carried both framing
+  headers at once.
+- `Content-Length` — a caller-supplied one *does* suppress the computed
+  one, so `"5"` in front of a ten-byte body would have left `56789` in
+  the upstream's buffer as the head of the next request. This is the one
+  reached by accident: a stale `content-length` copied along with the
+  rest of a header alist.
+
+For a deliberate `Content-Length: 0` on a bodiless POST, pass `:body ""`
+— an empty body is still a body, and the header is computed from it.
 
 ### Fetch callback contract
 
@@ -274,6 +405,20 @@ A raising cleanup closure is logged at WARN and swallowed by
 `close-outbound`'s handler-case, so it never blocks the framework's own teardown.
 Don't rely on cleanup-path exceptions propagating back to the caller — they don't.
 
+### TLS trust anchors
+
+**A missing CA store raises rather than warning.** `SSL_VERIFY_PEER` is
+set, so a process with no trust anchors fails every handshake regardless
+— the old warning was already fail-closed, it just left you to connect
+one startup line to an unrelated-looking stream of handshake errors
+afterwards. The first HTTPS fetch now says so directly.
+
+This bites on distroless and scratch images. Install a CA bundle
+(`ca-certificates`), or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at one. A
+plain-HTTP server on such an image still boots: the check runs when a TLS
+connection is opened, not at startup, so nothing that never fetches over
+HTTPS is affected.
+
 ### Fetch URL safety (SSRF)
 
 If your handler constructs fetch URLs from user input, the user is choosing
@@ -301,8 +446,15 @@ Set it once at startup, before `start-server`:
 `is-public-address-p` returns T only for publicly routable addresses,
 rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
 RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
-and cloud metadata IPs. It unwraps IPv4-mapped IPv6, NAT64, and 6to4,
-so an attacker cannot launder `127.0.0.1` as `::ffff:127.0.0.1`.
+6to4 relay anycast (`192.88.99.0/24`), and cloud metadata IPs. It unwraps
+IPv4-mapped IPv6, NAT64, and 6to4, so an attacker cannot launder
+`127.0.0.1` as `::ffff:127.0.0.1`.
+
+The 6to4 relay prefix is refused *because* RFC 7526 deprecated it. The
+relays are gone, so the prefix is still globally routed but no longer
+goes anywhere in particular — whoever announces it today receives the
+traffic. "Deprecated" reads like a reason to stop worrying about a range;
+here it is the reason to refuse it.
 
 **Why the framework has to do this and an app cannot.**
 The framework resolves hostnames itself. An app that resolves a name,
@@ -418,7 +570,8 @@ implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed (fixed 10-second timeout).
+blocking until all bytes are flushed or `*ws-send-timeout*` expires
+(default 10 seconds).
 Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
@@ -437,11 +590,47 @@ With multiple workers this is fine for bounded work (e.g. streaming
 an LLM response for a few seconds), but avoid unbounded blocking —
 a slow client holds the worker hostage.
 
+**"Blocking" means the worker, not the connection**, and the number is
+worth stating plainly. The event loop being paused is the one serving
+*every other connection on that worker*, so one peer that stops reading
+freezes all of them for up to `*ws-send-timeout*`. With `(cpu-count)`
+workers that is 1/N of the server's capacity held by a single slow
+client, and N slow clients arriving together is a full stall.
+
+That is a property of the synchronous design rather than a defect in it.
+But an app that broadcasts to many peers, or serves any peer it does not
+control, wants the number before it picks `ws-send` over its own queue —
+in a fan-out broadcast, one unresponsive subscriber is enough.
+
+`*ws-send-timeout*` must be positive. There is no setting that disables
+the deadline: it used to accept `0` for no deadline at all, which meant a
+peer that never drained its receive window pinned the worker permanently.
+
 ### Static files
 
 `load-static-files` reads files into memory at startup and pre-builds HTTP responses.
 Call it **before** `start-server`.
 It is not thread-safe and must not be called while the server is running.
+
+**The whole tree is capped at 256 MiB** (`:max-total-bytes`), and crossing
+it signals with the offending path and the running total. The cache is
+resident for the life of the process, so without a cap a directory
+holding one large video buys a resident set to match — discovered on the
+box at deploy time rather than at the call. Range support makes that
+likelier rather than less: serving large media is what Range is *for*, so
+the invitation to keep large media next to the CSS now comes with a
+number attached.
+
+There is no serve-from-disk path — every served file lives in this cache.
+If the cap fires, either raise it deliberately:
+
+```lisp
+(load-static-files "static/" :max-total-bytes (* 2 1024 1024 1024))
+```
+
+or leave large media to the reverse proxy, which is already in front of
+this server for TLS termination and is better at it. The cap is per-call,
+not global, so additive calls each bring their own budget.
 
 Static responses **omit the `Date` header** — the pre-built bytes
 are frozen at startup time and the framework will not patch each served
@@ -455,6 +644,20 @@ the proxy will stamp its own `Date` on the way out —
 operators should not be surprised to see `Date` missing on `/static/*`
 when watching the upstream directly with `curl -v`.
 
+**Dynamic responses do carry it.** `format-response` stamps `Date` on
+anything it builds, unless the handler set one itself. So compliance with
+that `MUST` depends on which path answered: `/api/thing` carries a `Date`
+and `/static/app.css` does not, from the same server, in the same second.
+Both behaviours are defensible on their own and the pair is worth knowing
+about before you write a cache rule, a conformance test, or a monitoring
+check that assumes the header is always present.
+
+Closing the gap is possible without giving up the pre-built path — `Date`
+has one-second granularity, so a per-worker cached header refreshed on
+the existing maintenance tick would cost nothing per request. It would
+mean moving the header out of the frozen block into a small prefix write.
+Not done; noted so the choice is visible rather than inherited.
+
 **Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
 with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work
 rather than re-fetching from byte 0. `If-Range` is honored — a client whose validator
@@ -464,6 +667,14 @@ the resource's true length. Multi-range (`bytes=0-9,20-29`) is deliberately igno
 the full file served, which RFC 7233 §3.1 permits; no media player or download manager
 asks for it. The byte range is sliced out of the pre-built response, so enabling this
 costs no extra memory and a full GET still takes the pre-built path.
+
+A `Range` against a **zero-length** file is `416`, not an empty `200`.
+RFC 7233 §2.1 puts every `first-byte-pos` at or past a length of zero, so
+no range overlaps and §4.4 answers with 416. Worth knowing if you serve
+media: a few players treat 416 as fatal where they would retry an empty
+200. Files are read once at startup, so a file would have to be empty at
+load time — a segment caught mid-write by a restart, not one being
+written while the server runs.
 
 **Dotfiles are not served** — `.git/`, `.env` and anything else with a leading-dot path
 component is skipped at load time. The one exception is a root-level `/.well-known/`
@@ -629,14 +840,56 @@ since browsers match Set-Cookie to stored cookies on those two fields:
 (add-response-header resp "set-cookie" (delete-cookie "session"))
 ```
 
-### JSON empty containers
+### JSON objects are a distinct type
 
-`json-parse` returns NIL for both `{}` and `[]`.
-`json-serialize` on NIL produces `"null"`.
-This means empty objects and arrays do not round-trip — they collapse to null.
-This is a deliberate design choice (CL's NIL is the natural empty representation).
-If the distinction matters for your use case, check the raw JSON string
-or use `:NULL` for explicit null.
+`json-parse` returns a `json-object` struct for a JSON object, and a plain list
+for a JSON array:
+
+| JSON | Lisp |
+|---|---|
+| `{"a":1}` | `json-object` wrapping `(("a" . 1))` |
+| `[1,2]` | `(1 2)` |
+| `{}` | empty `json-object` |
+| `[]` | `NIL` |
+| `null` | `:NULL` |
+
+All three empty forms round-trip to themselves.
+
+**Reading is unchanged.** `json-get` accepts a `json-object` *or* a bare alist,
+so handler code written against either representation works:
+
+```lisp
+(json-get (json-parse body) "user_id")
+```
+
+`json-object-alist` gets the underlying alist when you need to walk it, and
+`json-object-p` is the shape test — **not** `listp`, which a struct fails.
+
+**Writing needs a wrapper.** A bare alist serializes as an array of pairs:
+
+```lisp
+(json-serialize (make-json-object '(("ok" . t) ("count" . 3))))  ; => {"ok":true,"count":3}
+(json-serialize '(("ok" . t)))                                    ; => raises
+```
+
+The raise is deliberate and names the fix — a dotted pair is not a valid array
+element, so the mistake surfaces at the call site rather than as a
+well-formed-but-wrong document.
+
+**Why objects are typed rather than guessed.** An alist and an array of
+`[string, value]` pairs are the same Lisp object:
+
+```lisp
+(json-parse "[[\"a\",1]]")   ; => (("a" 1))   =  (("a" . (1)))
+'(("options" . (("temp" . 0.8))))              ;  (("options" ("temp" . 0.8)))
+```
+
+Both are `(string . cons)`. A serializer handed a bare list cannot tell an array
+of pairs from an alist with a structured value, so any rule that emits `{…}` for
+the second emits it for the first — which is how `[["a",1],["b",2]]` used to come
+back out as `{"a":[1],"b":[2]}`. Well-formed, silently wrong, no error anywhere.
+The information is destroyed at parse time, so no heuristic downstream can
+recover it; typing objects is the only fix that works in both directions.
 
 ### Query parameter parsing
 

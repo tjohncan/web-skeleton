@@ -79,6 +79,10 @@
            #:json-parse
            #:json-serialize
            #:json-get
+           #:json-object
+           #:make-json-object
+           #:json-object-p
+           #:json-object-alist
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd
@@ -116,6 +120,7 @@
            #:*max-body-size*
            #:*max-outbound-response-size*
            #:*max-streaming-line-size*
+           #:*max-interim-responses*
            #:*json-max-depth*
            #:*json-max-string-length*
            #:*max-ws-payload-size*
@@ -126,6 +131,7 @@
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
+           #:*ws-send-timeout*
            #:*fetch-timeout*
            ;; DNS cache (opt-in — 0 disables)
            #:*dns-cache-ttl*

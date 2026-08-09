@@ -180,26 +180,51 @@
       (unless (= 1 (%openssl-init-ssl 0 (sb-sys:int-sap 0)))
         (error "OPENSSL_init_ssl failed"))
       ;; Create context with modern TLS client method
-      (let ((ctx (%ssl-ctx-new (%tls-client-method))))
+      (let ((ctx (%ssl-ctx-new (%tls-client-method)))
+            (ready nil))
         (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
           (error "SSL_CTX_new failed"))
-        ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
-        ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION.
-        ;; A silent failure on OpenSSL 1.1.1 (still shipped by long-tail
-        ;; LTS distros, where the default floor is TLS 1.0) would leave
-        ;; the client willing to negotiate 1.0 against a misconfigured
-        ;; peer; OpenSSL 3.0's default security level already forbids
-        ;; 1.0/1.1 so this check is redundant there but free to keep.
-        (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
-                                    +tls1-2-version+ (sb-sys:int-sap 0)))
-          (error "SSL_CTX set min proto version failed"))
-        ;; Load system CA certificates
-        (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
-          (log-warn "tls: could not load system CA certificates"))
-        ;; Enable peer certificate verification
-        (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
-        (setf *ssl-ctx* ctx)
-        (log-info "tls: SSL context initialized")))
+        ;; Free the context on any failure below. Nothing cached it yet —
+        ;; *SSL-CTX* is only set on the success path — so without this
+        ;; every retry of a failing init leaks another SSL_CTX, and the
+        ;; CA check is a failure an app retries on every single fetch.
+        (unwind-protect
+             (progn
+               ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
+               ;; returns 1 on success, 0 on failure for SET_MIN_PROTO_VERSION.
+               ;; A silent failure on OpenSSL 1.1.1 (still shipped by long-tail
+               ;; LTS distros, where the default floor is TLS 1.0) would leave
+               ;; the client willing to negotiate 1.0 against a misconfigured
+               ;; peer; OpenSSL 3.0's default security level already forbids
+               ;; 1.0/1.1 so this check is redundant there but free to keep.
+               (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
+                                           +tls1-2-version+ (sb-sys:int-sap 0)))
+                 (error "SSL_CTX set min proto version failed"))
+               ;; Load system CA certificates. Raising rather than warning:
+               ;; SSL_VERIFY_PEER is set two lines down, so with no trust
+               ;; anchors every handshake fails anyway — the old warning was
+               ;; already fail-closed, it just made the operator derive that
+               ;; from one startup line and an unrelated-looking stream of
+               ;; handshake errors afterwards. This is init refusing to hand
+               ;; back a context that cannot do the one thing it is for,
+               ;; which is what the two checks above it already do.
+               ;;
+               ;; Safe to raise here because ENSURE-SSL-CTX is called from
+               ;; TLS-CONNECT, not at startup: a plain-HTTP server on a
+               ;; distroless image still boots, and only an actual HTTPS
+               ;; fetch — which was going to fail regardless — now says why.
+               (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
+                 (error "tls: no system CA certificates found, so every HTTPS ~
+                         fetch would fail certificate verification. Install a ~
+                         CA bundle (ca-certificates), or point SSL_CERT_FILE / ~
+                         SSL_CERT_DIR at one."))
+               ;; Enable peer certificate verification
+               (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
+               (setf *ssl-ctx* ctx
+                     ready t)
+               (log-info "tls: SSL context initialized"))
+          (unless ready
+            (%ssl-ctx-free ctx)))))
     *ssl-ctx*))
 
 ;;; ---------------------------------------------------------------------------
@@ -456,12 +481,20 @@
                 ;; an HTTP status.
                 (let* ((response-buf (tls-read-all ssl :method method))
                        (buf-len (length response-buf))
-                       (header-end (scan-crlf-crlf response-buf 0 buf-len)))
+                       ;; Step over any 1xx interim blocks (RFC 7231 §6.2)
+                       ;; before locating the header boundary — a CDN's
+                       ;; unsolicited 103 Early Hints would otherwise supply
+                       ;; the status and headers this fetch reports, and the
+                       ;; real response would be dropped without a word.
+                       ;; Same helper the plain-HTTP path uses, so the two
+                       ;; transports cannot drift on where a response starts.
+                       (start (skip-interim-responses response-buf 0 buf-len))
+                       (header-end (scan-crlf-crlf response-buf start buf-len)))
                   (unless header-end
                     (error "https: upstream response has no parseable headers"))
-                  (let* ((status (parse-response-status response-buf 0 buf-len))
+                  (let* ((status (parse-response-status response-buf start buf-len))
                          (headers
-                          (let ((first-crlf (scan-crlf response-buf 0 header-end)))
+                          (let ((first-crlf (scan-crlf response-buf start header-end)))
                             (when first-crlf
                               (parse-headers-bytes response-buf
                                                    (+ first-crlf 2)
@@ -472,10 +505,10 @@
                          ;; RFC 7230 §3.3.3 rule 3: any TE present means
                          ;; CL is ignored — read-until-close, not CL-framed.
                          (te-present (scan-transfer-encoding response-buf
-                                                             header-end))
+                                                             header-end start))
                          (content-length (unless te-present
                                            (scan-content-length response-buf
-                                                                header-end))))
+                                                                header-end start))))
                     (unless status
                       (error "https: upstream status line unparseable"))
                     ;; Truncation guard: an upstream that declares a
@@ -487,14 +520,17 @@
                     ;; handler-case converts it into a 502 and fires
                     ;; the cleanup sentinel.
                     ;;
-                    ;; Skipped for 1xx/204/304 (carry CL but MUST NOT
+                    ;; Skipped for 204/304 (carry CL but MUST NOT
                     ;; have a body per RFC 7230 §3.3.3 rule 1 / RFC 7232
                     ;; §4.1) and for HEAD (RFC 7231 §4.3.2 — upstream
                     ;; echoes the GET-body CL but MUST NOT send a body).
                     ;; Twin of the exemption in fetch.lisp COMPLETE-FETCH
-                    ;; on the plain-HTTP path.
+                    ;; on the plain-HTTP path, 1xx included: the skip
+                    ;; above has consumed every complete interim, so
+                    ;; STATUS is >= 200 here and testing for 1xx would be
+                    ;; dead code implying an interim could be final.
                     (when (and content-length
-                               (not (or (<= 100 status 199) (= status 204) (= status 304)))
+                               (not (or (= status 204) (= status 304)))
                                (not (eq method :HEAD))
                                (< (- buf-len body-start) content-length))
                       (error "https: short body (~d of ~d bytes)"
@@ -502,10 +538,11 @@
                     (let* ((body-end (if content-length
                                          (min buf-len (+ body-start content-length))
                                          buf-len))
-                           ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
+                           ;; 204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
                            ;; HEAD MUST NOT include a body (RFC 7231 §4.3.2).
                            ;; Force empty regardless of what the upstream sent.
-                           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304)
+                           ;; 1xx cannot reach here — see the guard above.
+                           (body-end (if (or (= status 204) (= status 304)
                                              (eq method :HEAD))
                                          body-start
                                          body-end))
@@ -627,6 +664,10 @@
         (in-headers t)
         (header-count 0)
         (total-header-bytes 0)
+        ;; Count of 1xx interim blocks stepped over so far (RFC 7231
+        ;; §6.2). Bounded by *MAX-INTERIM-RESPONSES* so an upstream
+        ;; cannot feed well-formed interim blocks forever.
+        (interims 0)
         ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
         ;; line terminators. PREV-CR carries across SSL-read
         ;; iterations so a CRLF pair split at a TLS record boundary
@@ -698,27 +739,51 @@
                              ((= byte 10)
                               (let ((line (emit-line)))
                                 (if (zerop (length line))
-                                    (progn
-                                      (setf in-headers nil)
-                                      (when chunked (setf in-chunk-size t))
-                                      ;; Bodiless responses — 1xx / 204
-                                      ;; / 304 / HEAD. RFC 7230 §3.3.3
-                                      ;; rule 1, RFC 7232 §4.1, RFC 7231
-                                      ;; §4.3.2: empty-line header
-                                      ;; boundary terminates regardless
-                                      ;; of CL / TE. Skip body phase and
-                                      ;; its truncation checks.
-                                      ;; Symmetric with the exempt set
-                                      ;; in complete-fetch's buffered
-                                      ;; path.
-                                      (when (or (eq method :HEAD)
-                                                (and status
-                                                     (or (<= 100 status 199)
-                                                         (= status 204)
-                                                         (= status 304))))
-                                        (return-from tls-stream-response
-                                          (or status
-                                              (error "https streaming: no parseable status line")))))
+                                    (cond
+                                      ;; 1xx interim block (RFC 7231 §6.2).
+                                      ;; It is terminated by this empty line,
+                                      ;; carries no body, and is never the
+                                      ;; final response — so the next status
+                                      ;; line follows immediately. Reset the
+                                      ;; per-block state and stay in the
+                                      ;; header phase rather than reporting
+                                      ;; 103 as the result and streaming
+                                      ;; nothing. Checked before the HEAD arm
+                                      ;; because a HEAD request can receive an
+                                      ;; interim too.
+                                      ((and status (<= 100 status 199))
+                                       (incf interims)
+                                       (when (> interims *max-interim-responses*)
+                                         (error "https streaming: more than ~d ~
+                                                 interim responses"
+                                                *max-interim-responses*))
+                                       (setf status             nil
+                                             chunked            nil
+                                             te-present         nil
+                                             content-length     nil
+                                             first-line         t
+                                             header-count       0
+                                             total-header-bytes 0))
+                                      (t
+                                       (setf in-headers nil)
+                                       (when chunked (setf in-chunk-size t))
+                                       ;; Bodiless FINAL responses — 204 /
+                                       ;; 304 / HEAD. RFC 7230 §3.3.3 rule 1,
+                                       ;; RFC 7232 §4.1, RFC 7231 §4.3.2:
+                                       ;; the empty-line header boundary
+                                       ;; terminates regardless of CL / TE.
+                                       ;; Skip body phase and its truncation
+                                       ;; checks. Symmetric with the exempt
+                                       ;; set in complete-fetch's buffered
+                                       ;; path. 1xx is handled by the arm
+                                       ;; above and never reaches here.
+                                       (when (or (eq method :HEAD)
+                                                 (and status
+                                                      (or (= status 204)
+                                                          (= status 304))))
+                                         (return-from tls-stream-response
+                                           (or status
+                                               (error "https streaming: no parseable status line"))))))
                                     (progn
                                       (incf header-count)
                                       (when (> header-count *max-header-count*)
@@ -750,7 +815,7 @@
                                         (setf te-present t)
                                         (let ((value (string-trim '(#\Space #\Tab)
                                                                    (subseq line 18))))
-                                          (when (connection-header-has-token-p value "chunked")
+                                          (when (header-has-token-p value "chunked")
                                             (setf chunked t))))
                                       ;; Capture Content-Length for
                                       ;; the non-chunked truncation

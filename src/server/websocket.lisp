@@ -62,22 +62,26 @@
              (key        (get-header request "sec-websocket-key"))
              (version    (get-header request "sec-websocket-version")))
          (and upgrade
-              (connection-header-has-token-p upgrade "websocket")
+              (header-has-token-p upgrade "websocket")
               connection
-              (connection-header-has-token-p connection "upgrade")
+              (header-has-token-p connection "upgrade")
               key
               (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
               ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
               ;; with '=' padding. Sec-WebSocket-Key is a fixed-size base64
-              ;; over 16 random bytes so padding is always two '=' — the
-              ;; charset check is strict on the 22 data chars and the
-              ;; trailing '=' pair.
-              (loop for c across key
+              ;; over 16 random bytes, so the shape is fully determined —
+              ;; 22 data characters and then exactly "==". Checked
+              ;; positionally: a flat alphabet sweep across all 24 admits
+              ;; '=' anywhere, which accepted a key of 24 '=' characters
+              ;; while this comment claimed the positional strictness the
+              ;; loop did not have.
+              (string= key "==" :start1 22)
+              (loop for i from 0 below 22
+                    for c = (char key i)
                     always (or (char<= #\A c #\Z)
                                (char<= #\a c #\z)
                                (char<= #\0 c #\9)
-                               (char= c #\+) (char= c #\/)
-                               (char= c #\=)))
+                               (char= c #\+) (char= c #\/)))
               version
               (string= version "13")))))
 
@@ -134,6 +138,14 @@
       ;; RSV1/2/3 must be zero unless an extension negotiated them (RFC 6455 §5.2)
       (when (logtest b0 #x70)
         (error "WebSocket: non-zero RSV bits"))
+      ;; RFC 6455 §5.1: every client-to-server frame is masked. The mask
+      ;; bit is byte 1, so this is decidable from the two bytes already
+      ;; in hand — no reason to wait. Checked below the availability test
+      ;; it meant an unmasked frame was buffered to completion before
+      ;; being refused, which is a peer choosing how much of our memory
+      ;; to occupy with something we had already decided to reject.
+      (unless masked
+        (error "WebSocket: received unmasked client frame"))
       ;; Determine payload length and header size
       (cond
         ((<= len7 125)
@@ -183,9 +195,6 @@
       (let ((frame-size (+ header-size payload-length)))
         (when (< available frame-size)
           (return-from try-parse-ws-frame (values nil 0)))
-        ;; Client frames must be masked
-        (unless masked
-          (error "WebSocket: received unmasked client frame"))
         ;; Unmask payload — read mask key directly from buffer, no allocation
         (let* ((mask-start (+ start (- header-size 4)))
                (payload-start (+ start header-size))
@@ -268,7 +277,13 @@
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
 (defparameter *ws-send-timeout* 10
-  "Seconds before ws-send gives up writing a frame. 0 to disable.")
+  "Seconds before WS-SEND gives up writing a frame. Must be positive.
+
+   There is no setting that disables the deadline. This used to accept 0
+   for no deadline at all, which meant a peer that stopped draining its
+   receive window pinned a worker permanently — see the blast radius
+   note below, and note that the thing being pinned is not one
+   connection.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Synchronous frame send
@@ -277,30 +292,42 @@
 ;;; all bytes are flushed.  Intended for use inside ws-handler — the
 ;;; event loop is paused while the handler runs, so there is no
 ;;; contention with pings or other writes.
+;;;
+;;; Blast radius: "blocking" means the worker, not the connection. The
+;;; event loop being paused is the one serving every other connection on
+;;; this worker, so one peer that stops reading freezes all of them for
+;;; up to *WS-SEND-TIMEOUT*. With (CPU-COUNT) workers that is 1/N of the
+;;; server's capacity held for ten seconds by a single slow client, and
+;;; N slow clients arriving together is a full stall. This is a property
+;;; of the synchronous design rather than a bug in it — an app that
+;;; broadcasts to many peers, or serves any peer it does not control,
+;;; wants to know the number before it picks this over its own queue.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
   "Send FRAME-BYTES to CONN synchronously, blocking until fully written.
    FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
    Safe to call from within ws-handler — the event loop is paused while the
-   handler runs, so there is no write contention.
+   handler runs, so there is no write contention. That pause covers every
+   other connection on this worker, not just this one; see the blast
+   radius note above.
    Signals an error if the write exceeds *ws-send-timeout*."
+  (unless (plusp *ws-send-timeout*)
+    (error "ws-send: *ws-send-timeout* is ~s; it must be positive. There is ~
+            no unbounded setting, because this write holds the worker and a ~
+            peer that never drains would hold it forever."
+           *ws-send-timeout*))
   (let ((fd (connection-fd conn))
         (pos 0)
         (end (length frame-bytes))
-        (deadline (when (> *ws-send-timeout* 0)
-                    (+ (get-internal-real-time)
-                       (* *ws-send-timeout* internal-time-units-per-second)))))
+        (deadline (+ (get-internal-real-time)
+                     (* *ws-send-timeout* internal-time-units-per-second))))
     (flet ((remaining-ms ()
-             ;; Milliseconds to deadline, clamped non-negative. No
-             ;; deadline configured → use 1000 ms so the poll still
-             ;; drains as before.
-             (if deadline
-                 (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
-                               internal-time-units-per-second))
-                 1000)))
+             ;; Milliseconds to deadline, clamped non-negative.
+             (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
+                           internal-time-units-per-second))))
       (loop while (< pos end)
-            do (when (and deadline (>= (get-internal-real-time) deadline))
+            do (when (>= (get-internal-real-time) deadline)
                  (error "ws-send: timed out after ~ds" *ws-send-timeout*))
                (let ((result (nb-write fd frame-bytes pos (- end pos))))
                  (if (eq result :again)

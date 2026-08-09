@@ -421,6 +421,43 @@
                  (every (lambda (c) (char<= #\A c #\Z)) method-str))
       (error "build-outbound-request: method must be uppercase ASCII ~
               letters, got ~s" method-str))
+    ;; Framing headers are ours, not the caller's. RFC 7230 §3.3.3 gives
+    ;; two ways for a request's declared framing to disagree with the
+    ;; bytes that follow, and :headers can reach both.
+    ;;
+    ;; Transfer-Encoding: this function never chunk-encodes, so the claim
+    ;; is false whatever the body is. The merge below adds Content-Length
+    ;; only when the caller did not supply one — and Transfer-Encoding is
+    ;; not Content-Length, so it does not suppress it. A caller passing
+    ;; ("transfer-encoding" . "chunked") with a body therefore emits both
+    ;; framing headers at once, which is the canonical smuggling shape,
+    ;; pointed at the upstream.
+    ;;
+    ;; Content-Length: the same merge rule is what opens this one. A
+    ;; caller-supplied Content-Length *does* suppress the computed one,
+    ;; so ("content-length" . "5") alongside a ten-byte body puts a
+    ;; five-byte promise in front of ten bytes and leaves "56789" sitting
+    ;; in the upstream's buffer as the start of the next request. The
+    ;; inverse just hangs the upstream until its read timeout. This is
+    ;; the easier of the two to reach by accident, because it needs no
+    ;; exotic header — only a stale content-length carried along with the
+    ;; rest of a copied header alist.
+    ;;
+    ;; Ingress already refuses Transfer-Encoding on principle. Refusing
+    ;; to emit what we refuse to accept is the same symmetry the tchar
+    ;; table keeps between PARSE-HEADERS-BYTES and SERIALIZE-HTTP-MESSAGE,
+    ;; and it is the same threat model the method-charset check above
+    ;; already accepts — attacker-influenced data reaching :headers is
+    ;; likelier than attacker-influenced data reaching :method.
+    (when (assoc "transfer-encoding" headers :test #'string-equal)
+      (error "build-outbound-request: Transfer-Encoding is not supported on ~
+              outbound requests — the framework frames bodies with ~
+              Content-Length"))
+    (when (assoc "content-length" headers :test #'string-equal)
+      (error "build-outbound-request: Content-Length is computed from :body. ~
+              A caller-supplied one that disagrees with the body is a framing ~
+              lie aimed at the upstream. Pass :body \"\" for a deliberate ~
+              Content-Length: 0."))
   (let* ((default-port-p (or (and (eq scheme :http) (= port 80))
                              (and (eq scheme :https) (= port 443))))
          ;; Re-bracket IPv6 literals. An IPv6 address always contains
@@ -448,8 +485,18 @@
                         (unless (has-header-p "user-agent")
                           (list (cons "user-agent" "web-skeleton")))
                         headers
-                        (when (and body-bytes
-                                   (not (has-header-p "content-length")))
+                        ;; Unconditional. The guard above refuses a
+                        ;; caller-supplied Content-Length outright, so
+                        ;; there is no case left where theirs wins and
+                        ;; the test could only ever be true. Leaving it
+                        ;; in would leave the shape of the old contract —
+                        ;; "the caller may override framing" — sitting
+                        ;; thirty lines below a comment saying framing
+                        ;; headers are ours, and a reader who meets the
+                        ;; merge first would re-derive the wrong rule.
+                        ;; HOST / CONNECTION / USER-AGENT above stay
+                        ;; conditional: those are real caller overrides.
+                        (when body-bytes
                           (list (cons "content-length"
                                       (write-to-string
                                        (length body-bytes)))))))))
@@ -533,6 +580,81 @@
             (let ((status (+ (* d1 100) (* d2 10) d3)))
               (when (<= 100 status 599)
                 status))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Interim (1xx) responses
+;;;
+;;; RFC 7231 §6.2: "A client MUST be able to parse one or more 1xx responses
+;;; received prior to a final response, even if the client does not expect
+;;; one." A 1xx block is terminated by its own empty line and carries no
+;;; body, so the *final* response begins immediately after it.
+;;;
+;;; Every buffered reader here anchors on a CRLFCRLF to find where headers
+;;; end. Without a skip, that first boundary is the *interim's* terminator:
+;;; the interim's status becomes the fetch's status, its headers become the
+;;; fetch's headers, and — because 1xx is in the bodiless exempt set — the
+;;; body is forced empty. The real response is discarded with no error and
+;;; no log line.
+;;;
+;;; This is not a hypothetical shape an app can avoid by configuration.
+;;; `103 Early Hints` (RFC 8297) is sent UNSOLICITED by CDNs — Cloudflare
+;;; and Fastly both do it. Nothing the application does invites it, and
+;;; the old caveat in this file ("Apps must not add Expect: 100-continue
+;;; to outbound fetch headers") pushed a protocol obligation onto the
+;;; application that it had no way to discharge.
+;;;
+;;; A 1xx must never be reported as a final status either: it is by
+;;; definition interim, so "keep reading" is the only correct response to
+;;; one. The framing predicate has to skip as well — otherwise the
+;;; interim's (absent) Content-Length decides framing for the whole
+;;; exchange, which is how a CL-framed 200 gets mistaken for a
+;;; close-delimited response and hangs until *FETCH-TIMEOUT*.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *max-interim-responses* 8
+  "Maximum number of 1xx blocks accepted before the final response. Eight
+   are allowed; the ninth signals. Bounded so an upstream cannot stream
+   interim responses forever inside the response size cap — each block is
+   cheap on its own, and without a cap a malicious or broken peer could
+   hold a connection open indefinitely feeding blocks that are
+   individually well-formed.
+
+   Raise it for an app behind a chatty CDN. All three transports read this
+   one variable, so they cannot drift on what the limit is.")
+
+(defun skip-interim-responses (buf start end)
+  "Return the offset of the final response's first byte in BUF[START..END),
+   stepping over any 1xx interim blocks (RFC 7231 §6.2).
+
+   Returns START unchanged when no complete block is buffered yet, so a
+   partially-read interim is simply retried on the next wake-up rather than
+   mis-anchoring. Signals when a *MAX-INTERIM-RESPONSES*+1'th interim block
+   arrives; every caller already runs inside a handler-case that turns that
+   into a 502 plus the fetch cleanup sentinel.
+
+   The loop runs one more time than the cap on purpose: each pass consumes
+   at most one interim, so N+1 passes are needed to consume N interims and
+   still have a pass left to recognise the final response. Iterating only
+   *MAX-INTERIM-RESPONSES* times would reject the Nth interim while the
+   streaming paths — which count with a separate (> count cap) test —
+   accepted it, and the two transports would disagree about the limit.
+
+   Shared by the buffered plain-HTTP path, the framing predicate, and the
+   TLS path so all three agree on where a response starts."
+  (let ((pos start))
+    (dotimes (i (1+ *max-interim-responses*)
+                (error "upstream sent more than ~d interim responses"
+                       *max-interim-responses*))
+      (declare (ignorable i))
+      (let ((header-end (scan-crlf-crlf buf pos end)))
+        ;; No complete block from POS — caller keeps reading.
+        (unless header-end (return pos))
+        (let ((status (parse-response-status buf pos end)))
+          ;; A status we cannot parse is not an interim; hand POS back and
+          ;; let the caller's own "status line unparseable" path report it.
+          (if (and status (<= 100 status 199))
+              (setf pos (+ header-end 4))
+              (return pos)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
@@ -854,13 +976,25 @@
         (status nil)
         (chunked nil)
         (te-present nil)
-        (content-length nil))
+        (content-length nil)
+        (interims 0))
     ;; Read status line + headers. Tighter MAX-SIZE for header lines
     ;; matches the buffered parse-headers-bytes budget so a 1 MiB
     ;; attacker-framed "header" can't coast on the body-line cap.
     ;; TOTAL-HEADER-BYTES enforces the aggregate cap symmetrically
     ;; with parse-headers-bytes' running-total guard.
-    (let ((header-count 0)
+    ;;
+    ;; The whole header phase repeats over any 1xx interim block
+    ;; (RFC 7231 §6.2): an interim is terminated by its own empty line
+    ;; and carries no body, so the final response's status line is the
+    ;; very next line. Without this the header loop stopped at the
+    ;; interim's blank line, reported 103 as the status, took the
+    ;; bodiless branch, and never called ON-LINE at all. Per-block
+    ;; state is reset each pass so an interim's headers cannot leak
+    ;; into the final response's framing decision.
+    (loop
+      (setf status nil chunked nil te-present nil content-length nil)
+      (let ((header-count 0)
           (total-header-bytes 0))
       (loop for line = (reader-read-line r :max-size *max-header-line-length*)
             for first = t then nil
@@ -888,7 +1022,7 @@
                                         :end1 18))
                  (setf te-present t)
                  (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
-                   (when (connection-header-has-token-p value "chunked")
+                   (when (header-has-token-p value "chunked")
                      (setf chunked t))))
                (when (and (>= (length line) 15)
                           (string-equal line "content-length:"
@@ -910,10 +1044,21 @@
                                ~d vs ~d"
                               content-length n))
                      (setf content-length n))))))
+      ;; Interim block — its empty line just ended, so go around and read
+      ;; the next status line. A NIL status (unparseable, or EOF before
+      ;; any line) is not an interim: fall through and let the post-loop
+      ;; "no parseable status line" check report it.
+      (if (and status (<= 100 status 199))
+          (progn
+            (incf interims)
+            (when (> interims *max-interim-responses*)
+              (error "streaming response: more than ~d interim responses"
+                     *max-interim-responses*)))
+          (return)))
     ;; Stream body lines
     (cond
-      ;; Bodiless responses — RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1,
-      ;; RFC 7231 §4.3.2. 1xx / 204 / 304 are always terminated by
+      ;; Bodiless FINAL responses — RFC 7230 §3.3.3 rule 1, RFC 7232
+      ;; §4.1, RFC 7231 §4.3.2. 204 / 304 are always terminated by
       ;; the empty-line header boundary regardless of CL / TE, and
       ;; HEAD responses carry no body even when the upstream echoes
       ;; the GET Content-Length. Skip body phase and its truncation
@@ -921,9 +1066,14 @@
       ;; buffered path — without this, a 204 with a leftover CL or
       ;; a 304 with chunked framing would either raise "short body"
       ;; or block forever waiting for framing that will never arrive.
+      ;;
+      ;; 1xx is deliberately absent: the header loop above only exits
+      ;; on a NIL status or a status >= 200, so an interim can never
+      ;; reach here. Testing for it would be dead code that reads as
+      ;; though a 1xx were a legitimate final status — which is the
+      ;; belief that produced the interim-response defect.
       ((or (eq method :HEAD)
-           (and status
-                (or (<= 100 status 199) (= status 204) (= status 304))))
+           (and status (or (= status 204) (= status 304))))
        nil)
       (chunked
        (stream-chunked-lines r on-line))
@@ -1081,7 +1231,7 @@
   (when (and inbound (typep response 'http-response))
     (let ((values (loop for (k . v) in (http-response-headers response)
                         when (string-equal k "connection") collect v)))
-      (when (some (lambda (v) (connection-header-has-token-p v "close"))
+      (when (some (lambda (v) (header-has-token-p v "close"))
                   values)
         (setf (connection-close-after-p inbound) t)))))
 
@@ -1418,7 +1568,7 @@
    false-match on substring 'chunked'."
   (loop for (name . value) in headers
         thereis (and (string-equal name "transfer-encoding")
-                     (connection-header-has-token-p value "chunked"))))
+                     (header-has-token-p value "chunked"))))
 
 (defun chunked-body-complete-p (buf start end &optional (resume start))
   "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in
@@ -1519,13 +1669,21 @@
    that the answer was already 'not chunked'. The cost is one header parse
    per read on a response that is broken anyway, and remembering the
    answer would mean a connection slot to carry it. Not worth the state."
-  (let ((header-end (scan-crlf-crlf buf 0 end)))
+  ;; Step over any 1xx interim blocks first. This has to happen HERE and
+  ;; not only in COMPLETE-FETCH: the framing decision below reads
+  ;; Transfer-Encoding / Content-Length out of the header region, and an
+  ;; interim block carries neither. Anchoring on the interim would make a
+  ;; CL-framed 200 look close-delimited, so the predicate would answer NIL
+  ;; forever and the fetch would hang until *FETCH-TIMEOUT* on any upstream
+  ;; that keeps the connection alive.
+  (let* ((start (skip-interim-responses buf 0 end))
+         (header-end (scan-crlf-crlf buf start end)))
     (unless header-end
       (return-from outbound-response-complete-p (values nil chunk-scan)))
     (let* ((body-start (+ header-end 4))
-           (te-present (scan-transfer-encoding buf header-end))
+           (te-present (scan-transfer-encoding buf header-end start))
            (content-length (unless te-present
-                             (scan-content-length buf header-end))))
+                             (scan-content-length buf header-end start))))
       (cond
         ((eq method :HEAD)
          (values t chunk-scan))
@@ -1536,7 +1694,7 @@
            ;; The header parse only runs on the read that actually
            ;; completes — the cheap framing walk gates it.
            (values (and complete
-                        (let ((first-crlf (scan-crlf buf 0 header-end)))
+                        (let ((first-crlf (scan-crlf buf start header-end)))
                           (and first-crlf
                                (response-chunked-p
                                 (parse-headers-bytes buf (+ first-crlf 2)
@@ -1653,7 +1811,13 @@
   "Parse the outbound response and deliver it to the parked inbound connection."
   (let* ((buf (connection-read-buf out-conn))
          (pos (connection-read-pos out-conn))
-         (header-end (scan-crlf-crlf buf 0 pos)))
+         ;; Step over any 1xx interim blocks (RFC 7231 §6.2) before
+         ;; locating the header boundary. A CDN's unsolicited 103 Early
+         ;; Hints would otherwise become the fetch's status and headers,
+         ;; and the real response would be dropped silently — see
+         ;; SKIP-INTERIM-RESPONSES.
+         (start (skip-interim-responses buf 0 pos))
+         (header-end (scan-crlf-crlf buf start pos)))
     ;; Gate on complete headers. DEPLOYMENT.md's fetch callback
     ;; contract promises the happy path fires with an integer
     ;; status and the cleanup sentinel is (NIL NIL NIL) — never
@@ -1666,23 +1830,18 @@
       (deliver-fetch-error out-conn epoll-fd
                            "upstream response has no parseable headers")
       (return-from complete-fetch))
-    ;; Known limitation: 1xx interim responses (e.g. 100 Continue
-    ;; from an upstream) are not stripped — scan-crlf-crlf anchors
-    ;; on the first CRLFCRLF, which is the interim response's
-    ;; terminator. Apps must not add Expect: 100-continue to
-    ;; outbound fetch headers.
-    (let* ((status (parse-response-status buf 0 pos))
+    (let* ((status (parse-response-status buf start pos))
            (body-start (+ header-end 4))
-           (headers (let ((first-crlf (scan-crlf buf 0 header-end)))
+           (headers (let ((first-crlf (scan-crlf buf start header-end)))
                       (when first-crlf
                         (parse-headers-bytes buf (+ first-crlf 2)
                                              (+ header-end 4)))))
            (chunked-p (response-chunked-p headers))
            ;; RFC 7230 §3.3.3 rule 3: any TE present means CL is
            ;; ignored — read-until-close, not CL-framed.
-           (te-present (scan-transfer-encoding buf header-end))
+           (te-present (scan-transfer-encoding buf header-end start))
            (content-length (unless te-present
-                             (scan-content-length buf header-end))))
+                             (scan-content-length buf header-end start))))
     ;; Status line must parse too. PARSE-RESPONSE-STATUS returns
     ;; NIL on a malformed status line ('HTTP/1.1 ABC OK', status
     ;; digits out of range, missing version, etc.) — same 'never
@@ -1700,14 +1859,21 @@
     ;; deliver-fetch-error so the callback fires its cleanup path
     ;; and the inbound gets a 502 instead of a short body.
     ;;
-    ;; Skipped for 1xx/204/304 — these carry CL but have no body
+    ;; Skipped for 204/304 — these carry CL but have no body
     ;; (RFC 7230 §3.3.3 rule 1, RFC 7232 §4.1). Also skipped for
     ;; HEAD — RFC 7231 §4.3.2: upstream echoes the CL of the GET
     ;; body but MUST NOT send a body. The request method lives on
     ;; out-conn's fetch-method slot (set from the continuation in
     ;; initiate-http-fetch-to-address).
+    ;;
+    ;; 1xx is absent from this set, and from the body-end forcing
+    ;; below, because SKIP-INTERIM-RESPONSES has already consumed every
+    ;; complete interim: STATUS here is either >= 200 or NIL, and NIL
+    ;; was rejected by the gate above. Testing for 1xx would be dead
+    ;; code that reads as though an interim could be a final status —
+    ;; the belief that produced the defect the skip exists to fix.
     (when (and content-length
-               (not (or (<= 100 status 199) (= status 204) (= status 304)))
+               (not (or (= status 204) (= status 304)))
                (not (eq (connection-fetch-method out-conn) :HEAD))
                (< (- pos body-start) content-length))
       (deliver-fetch-error out-conn epoll-fd
@@ -1721,10 +1887,11 @@
     (let* ((body-end (if content-length
                          (min pos (+ body-start content-length))
                          pos))
-           ;; 1xx/204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
+           ;; 204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
            ;; HEAD responses MUST NOT include a body (RFC 7231 §4.3.2)
-           ;; regardless of what the upstream sent. Force empty on all.
-           (body-end (if (or (<= 100 status 199) (= status 204) (= status 304)
+           ;; regardless of what the upstream sent. Force empty on both.
+           ;; 1xx cannot reach here — see the note on the guard above.
+           (body-end (if (or (= status 204) (= status 304)
                              (eq (connection-fetch-method out-conn) :HEAD))
                          body-start
                          body-end))

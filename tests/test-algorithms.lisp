@@ -110,7 +110,44 @@
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
     (check "single char rejected"
-           (signals-error-p (lambda () (base64-decode "A"))) t)))
+           (signals-error-p (lambda () (base64-decode "A"))) t)
+
+    ;; RFC 4648 §3.5 canonical form. The final group's unused low bits
+    ;; must be zero or one byte string has sixteen spellings: "QQ" and
+    ;; "QR" differ only in bits the decoder never emits.
+    (check "2-char group: canonical trailing bits accepted"
+           (bytes-to-hex (base64-decode "QQ")) "41")
+    (check "2-char group: non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64-decode "QR"))) t)
+    (check "3-char group: canonical trailing bits accepted"
+           (bytes-to-hex (base64-decode "QUE")) "4141")
+    (check "3-char group: non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64-decode "QUF"))) t)
+    ;; Padded spellings of those same two groups. Padding and the bit
+    ;; check are separate guards, so each verdict has to survive both.
+    (check "padded 2-char group accepted"
+           (bytes-to-hex (base64-decode "QQ==")) "41")
+    (check "padded non-canonical 2-char group rejected"
+           (signals-error-p (lambda () (base64-decode "QR=="))) t)
+
+    ;; Padding must complete the final group and then stop. The
+    ;; trailing-'=' scan used to swallow a stray pad, so "AAAA=" decoded
+    ;; as "AAAA" — a second spelling of three zero bytes.
+    (check "stray pad after a complete group rejected"
+           (signals-error-p (lambda () (base64-decode "AAAA="))) t)
+    (check "short pad rejected"
+           (signals-error-p (lambda () (base64-decode "Zg="))) t)
+    (check "over-padded group rejected"
+           (signals-error-p (lambda () (base64-decode "AAAA===="))) t)
+    (check "all-padding input rejected"
+           (signals-error-p (lambda () (base64-decode "===="))) t)
+    (check "lone pad rejected"
+           (signals-error-p (lambda () (base64-decode "="))) t)
+    ;; Interior padding was already rejected by the charset check; keep
+    ;; it asserted so the new padding guard can't accidentally take over
+    ;; and start allowing it.
+    (check "interior pad rejected"
+           (signals-error-p (lambda () (base64-decode "Zg==Zg=="))) t)))
 
 (defun test-base64url ()
   (format t "~%Base64url~%")
@@ -146,7 +183,34 @@
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
     (check "url single char rejected"
-           (signals-error-p (lambda () (base64url-decode "A"))) t)))
+           (signals-error-p (lambda () (base64url-decode "A"))) t)
+
+    ;; Token malleability, the reason the canonical check exists. A
+    ;; P-256 signature is 64 bytes, so its base64url is 86 characters —
+    ;; a final group of two, whose last character carries four bits that
+    ;; are never emitted. Rewriting the trailing 'Q' as 'R' left the 64
+    ;; decoded bytes untouched, so the mutated token verified against
+    ;; the same key: one signature, two token strings, and any check
+    ;; keyed on the text (revocation, replay, audit) fooled.
+    (let* ((sig "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+           (twin (concatenate 'string (subseq sig 0 (1- (length sig))) "R")))
+      (check "signature segment is 86 chars (2-char final group)"
+             (mod (length sig) 4) 2)
+      (check "signature segment decodes to 64 bytes"
+             (length (base64url-decode sig)) 64)
+      ;; Canonical input has exactly one spelling, and it is the one the
+      ;; encoder produces — so decode is injective over what it accepts.
+      (check "signature segment round-trips to its own spelling"
+             (base64url-encode (base64url-decode sig)) sig)
+      (check "non-canonical twin of a signature segment rejected"
+             (signals-error-p (lambda () (base64url-decode twin))) t))
+
+    ;; base64url omits padding, so unpadded input stays legal — the new
+    ;; padding guard must not have quietly made it mandatory.
+    (check "url unpadded 2-char group still accepted"
+           (bytes-to-hex (base64url-decode "QQ")) "41")
+    (check "url non-canonical trailing bits rejected"
+           (signals-error-p (lambda () (base64url-decode "QR"))) t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; SHA-256 test vectors (FIPS 180-4)
@@ -438,6 +502,67 @@
         (b (random-bytes 32)))
     (check "random-bytes: successive calls differ"
            (equalp a b) nil))
+  ;; The worker path. RANDOM-BYTES used to open, read and close
+  ;; /dev/urandom on every call, which a session-per-request app pays
+  ;; per request; a worker now holds one stream open for its lifetime.
+  ;; Outside a worker the binding is NIL and the per-call open remains,
+  ;; which is the state every check above runs in.
+  (check "random-bytes: no cached stream outside a worker"
+         web-skeleton::*urandom-stream* nil)
+  (web-skeleton::with-worker-urandom
+    (check "with-worker-urandom: binds a stream"
+           (and (streamp web-skeleton::*urandom-stream*)
+                (open-stream-p web-skeleton::*urandom-stream*))
+           t)
+    (check "random-bytes: correct length from the cached stream"
+           (length (random-bytes 32)) 32)
+    (check "random-bytes: cached stream still yields distinct reads"
+           (equalp (random-bytes 32) (random-bytes 32)) nil)
+    (check "random-token: works through the cached stream"
+           (length (random-token)) 43))
+  ;; And the binding is unwound, so nothing leaks the stream past the
+  ;; worker that opened it.
+  (check "with-worker-urandom: unbinds on exit"
+         web-skeleton::*urandom-stream* nil)
+  ;; The checks above prove the plumbing exists; this one proves
+  ;; RANDOM-BYTES is connected to it. Bound to a stream of known bytes,
+  ;; it must return those bytes — a RANDOM-BYTES that ignored the
+  ;; binding would return four bytes from /dev/urandom instead, and
+  ;; every check above would still pass.
+  (let ((path (merge-pathnames "tests/tmp-urandom.bin" (truename "."))))
+    (unwind-protect
+         (progn
+           (with-open-file (s path :direction :output
+                                   :element-type '(unsigned-byte 8)
+                                   :if-exists :supersede
+                                   :if-does-not-exist :create)
+             (write-sequence (coerce #(1 2 3 4 5 6 7 8)
+                                     '(vector (unsigned-byte 8)))
+                             s))
+           (with-open-file (s path :direction :input
+                                   :element-type '(unsigned-byte 8))
+             (let ((web-skeleton::*urandom-stream* s))
+               (check "random-bytes: reads from the bound stream"
+                      (coerce (random-bytes 4) 'list) '(1 2 3 4))
+               ;; Sequential, not re-read from the top — a cached stream
+               ;; carries a position, which is the whole reason it is
+               ;; per-worker rather than shared.
+               (check "random-bytes: advances the bound stream"
+                      (coerce (random-bytes 4) 'list) '(5 6 7 8))
+               ;; Exhausted. The cached stream is an optimisation, not a
+               ;; requirement, so a read that comes up short falls back
+               ;; to a per-call open rather than raising — otherwise one
+               ;; bad read poisons the binding for the worker's whole
+               ;; life, and RANDOM-TOKEN feeds session IDs and CSRF
+               ;; tokens. Matches how the open already degrades.
+               (let ((bytes (random-bytes 8)))
+                 (check "random-bytes: exhausted stream falls back"
+                        (length bytes) 8)
+                 ;; And the fallback really produced random bytes rather
+                 ;; than the zeros a silently-unfilled buffer would hold.
+                 (check "random-bytes: fallback bytes are not the empty buffer"
+                        (every #'zerop bytes) nil)))))
+      (ignore-errors (delete-file path))))
   ;; random-token: expected base64url length (unpadded)
   ;; 32 bytes -> ceil(32*4/3) = 43 chars
   ;; 16 bytes -> ceil(16*4/3) = 22 chars
