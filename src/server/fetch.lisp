@@ -27,7 +27,11 @@
   (callback nil    :type function))
 
 (defparameter *fetch-timeout* 30
-  "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
+  "Seconds, per phase — not a total, except on the async http:// path
+   where the :awaiting reap does bound the whole exchange. Elsewhere it
+   bounds DNS, connect, and each individual socket read separately, so a
+   trickling upstream never trips it. README Limitations has what that
+   costs.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound address policy (SSRF)

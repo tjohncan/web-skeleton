@@ -84,6 +84,7 @@ sbcl
 (web-skeleton-tests:test-json)              ; JSON parser and serializer
 (web-skeleton-tests:test-server)            ; HTTP, URL, query, routing, JWT
 (web-skeleton-tests:test-store)             ; concurrent store and reaper
+(web-skeleton-tests:test-properties)        ; generated-input properties, cross-path parity
 (web-skeleton-tests:test-harness)           ; live-server test harness round-trips
 (web-skeleton-tests:test-tls)               ; TLS registration (skips if libssl absent)
 (web-skeleton-tests:test-pure-lisp-crypto)  ; re-run crypto suites against the pure-Lisp originals
@@ -141,6 +142,7 @@ tests/
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
   test-store.lisp        Concurrent store and reaper tests
+  test-properties.lisp   Generated-input properties; buffered/streaming parity
   test-harness.lisp      Test harness self-tests (live-server round-trips)
   test-tls.lisp          TLS registration (skips if libssl absent)
 ```
@@ -277,7 +279,16 @@ tests/
   each wrapped in `handler-case` so a raising hook cannot block the rest
 - **Standalone binary** — `save-lisp-and-die` produces a single executable
 - **Test suite** — FIPS/RFC test vectors for all crypto primitives,
-  JSON round-trip tests, HTTP parser tests, JWT validation tests
+  JSON round-trip tests, HTTP parser tests, JWT validation tests.
+  Alongside those, generated-input properties over fixed seeds: the request
+  parser signals only `http-parse-error` and never leaks another condition
+  type, JSON and base64 round-trip, base64 accepts only the canonical
+  spelling of the bytes it yields, and byte ranges stay inside the resource.
+  Plus parity assertions between paths that must agree — the buffered and
+  streaming chunked decoders on the same framing, and the buffered and
+  streaming response readers on the same interim blocks. Seeds are fixed
+  rather than drawn from the clock, so a failure is reproducible and a
+  seed that once found a bug stays in the corpus
 - **Test harness** — optional `web-skeleton-test-harness` ASDF system.
   `with-test-server` spins an ephemeral-port live server,
   `test-http-request` makes real HTTP round-trips inside test bodies,
@@ -327,10 +338,39 @@ read about here.
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
   is the honest answer; silently skipping verification would not be.
   Plain `http://` to an IP literal works.
-- **`ws-send` blocks the worker, not just the connection.** One peer that
-  stops reading freezes every other connection on that worker for up to
-  `*ws-send-timeout*`. See DEPLOYMENT.md for the arithmetic before
-  building a broadcast on it.
+- **Exactly one network operation is non-blocking, and "blocking" means
+  the worker rather than the connection.** `http-fetch` over `http://`
+  runs on the event loop: the inbound parks, the outbound uses the same
+  epoll, and one `*fetch-timeout*` bounds the whole exchange. Every other
+  operation below holds the worker thread, which is every connection that
+  worker is serving and not only the one that asked. With `(cpu-count)`
+  workers, one held worker is 1/N of the server.
+
+  - **`http-fetch` over `https://`** blocks for the entire request
+    lifecycle. The API is identical to the `http://` form — the feature
+    list says "just use `https://` URLs" and means it — so one character
+    of scheme changes the concurrency model with nothing else to signal
+    it. The three setup phases (DNS, connect, request I/O) are each
+    bounded by `*fetch-timeout*`; the response read is not bounded in
+    time at all, only by `*max-outbound-response-size*`, so a trickling
+    upstream is stopped by 8 MiB rather than by a clock.
+  - **`http-fetch-stream`, both schemes**, blocks and has **no total
+    deadline of any kind**. `SO_RCVTIMEO` bounds each individual read, so
+    an upstream that emits one byte before every timeout expires holds a
+    worker indefinitely. `*fetch-timeout*`'s docstring ("Blocking fetch
+    I/O timeout") reads as though it were a total. It is not.
+  - **`ws-send`** blocks until flushed or `*ws-send-timeout*` (10 s)
+    expires. One peer that stops reading freezes every other connection
+    on that worker for that long, and N such peers arriving together is a
+    full stall. See DEPLOYMENT.md for the arithmetic before building a
+    broadcast on it.
+  - **Your handler, `ws-handler`, and any fetch `:then` callback** block
+    for as long as they run, with no bound. Inherent rather than a
+    shortcoming — that is your code on the worker thread — but it is the
+    same worker.
+  - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
+    keep `EMFILE` from spinning the log. Under fd exhaustion that is a
+    worker doing nothing else, 100 ms at a time.
 - **Static responses omit `Date`.** Dynamic responses carry it. See
   DEPLOYMENT.md — it matters if you put a caching CDN in front.
 
@@ -345,19 +385,22 @@ All configurable via `setf` before calling `start-server`.
 | `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes)                                                                                                                                                                                                                      |
 | `*max-header-count*`           | `100`     | Max number of headers per request                                                                                                                                                                                                                  |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes)                                                                                                                                                                                                                     |
+| `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431      |
 | `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB)                                                                                                                                                                                                              |
 | `*max-outbound-response-size*` | `8388608` | Max buffered outbound HTTPS response total (headers + body, bytes, default 8MB). Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected                                                                          |
 | `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound)                 |
 | `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value                                    |
+| `*json-max-depth*`             | `256`     | Max nesting depth for `json-parse`. Bounds the recursive descent so deeply nested input cannot overflow the stack                                                                                                                                   |
+| `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it |
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
-| `*max-connections*`            | `10000`   | Max connections per worker (new accepts dropped when full)                                                                                                                                                                                         |
+| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed |
 | `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed                                                                                                                                                                                                   |
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*ws-send-timeout*`            | `10`      | Seconds before `ws-send` gives up writing a frame. Must be positive — there is no unbounded setting. `ws-send` blocks the **worker**, not just its connection, so this is how long one peer that stops reading may freeze every other connection on that worker |
-| `*fetch-timeout*`              | `30`      | Blocking fetch I/O timeout and :awaiting connection reap deadline                                                                                                                                                                                  |
+| `*fetch-timeout*`              | `30`      | Per-phase bound, not a total. On the async `http://` path it *is* end-to-end (the `:awaiting` reap covers DNS + connect + read together). On the blocking paths it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
