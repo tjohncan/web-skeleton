@@ -719,6 +719,160 @@
       (setf web-skeleton:*fetch-timeout* saved)
       (ignore-errors (sb-bsd-sockets:socket-close silent)))))
 
+(defun %close-delimited-upstream (listener)
+  "Accept once, read the request head, answer with a response framed only
+   by the close, then close. Returns the thread.
+
+   No Content-Length and no Transfer-Encoding, so end-of-stream is the
+   only framing there is — which is what OUTBOUND-RESPONSE-COMPLETE-P
+   defers to the caller's EOF branch for. Written and closed back to
+   back so the body and the FIN reach the framework in one wake-up, which
+   is the ordinary shape on loopback and the one that produced :OK-EOF
+   instead of :EOF."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (loop for byte = (read-byte st nil nil)
+                 while byte
+                 do (vector-push-extend byte b)
+                 until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
+           (write-sequence
+            (sb-ext:string-to-octets
+             (format nil "HTTP/1.1 200 OK~c~cContent-Type: text/plain~c~c~c~c~a"
+                     #\Return #\Newline #\Return #\Newline
+                     #\Return #\Newline "close-framed-body")
+             :external-format :ascii)
+            st)
+           (force-output st)
+           (sb-bsd-sockets:socket-close s))
+       (error () nil)))
+   :name "close-delimited-upstream"))
+
+(defun test-harness-close-delimited-fetch-e2e ()
+  "A fetch of a close-delimited upstream completes when the close arrives,
+   not when *FETCH-TIMEOUT* expires.
+
+   CONNECTION-READ-AVAILABLE used to report \"read bytes, then EOF\" as
+   :OK, discarding the end of stream. For a response with no
+   Content-Length and no Transfer-Encoding that end of stream *is* the
+   framing — OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
+   deferring to the caller's EOF branch — so the branch never ran and the
+   fetch hung until the sweeper took it.
+
+   A TCP peer's close does not set EPOLLHUP, so HANDLE-OUTBOUND-EVENT's
+   error arm did not rescue it either. Nothing about this needs
+   configuring: our own outbound requests send Connection: close, which
+   invites an upstream to frame this way.
+
+   Uses an IP literal so the numeric fast path skips DNS — the framing is
+   what is under test here, not resolution."
+  (format t "~%Harness: close-delimited upstream fetch~%")
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread (%close-delimited-upstream listener))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (defer-to-fetch :GET
+                      (format nil "http://127.0.0.1:~d/framed" upstream-port)
+                      :then (lambda (status headers body)
+                              (declare (ignore headers))
+                              (make-text-response
+                               (or status 500)
+                               (format nil "~a|~a" status
+                                       (if body
+                                           (sb-ext:octets-to-string
+                                            body :external-format :utf-8)
+                                           "(none)")))))))
+               (let ((start (get-internal-real-time)))
+                 (multiple-value-bind (status headers body)
+                     (handler-case (test-http-request :get "/proxy")
+                       (error (e) (values nil nil (princ-to-string e))))
+                   (declare (ignore headers))
+                   (let ((secs (/ (float (- (get-internal-real-time) start))
+                                  internal-time-units-per-second)))
+                     (check "close-delimited: status delivered" status 200)
+                     (check "close-delimited: body survives the framing"
+                            (and body (search "200|close-framed-body" body) t) t)
+                     ;; The discriminating one. *FETCH-TIMEOUT* is 30 by
+                     ;; default and the harness read deadline is 10, so a
+                     ;; regression shows up here as a wait rather than as
+                     ;; a wrong answer.
+                     (check "close-delimited: completes on the close, promptly"
+                            (< secs 5.0) t)))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-dns-all-addresses-refused-e2e ()
+  "A hostname whose every resolved address the policy refuses fails the
+   fetch promptly, with a 502, rather than stranding until the sweeper.
+
+   This is the other half of the same defect and the reason it went
+   unnoticed. `getent`'s stdout is fully buffered, so its output and its
+   EOF always arrive in one read: reported as :OK, HANDLE-DNS-READY's
+   \"no usable address\" branch was reachable only when getent printed
+   nothing at all — a name that does not resolve. A name that resolves to
+   addresses *FETCH-ADDRESS-FILTER* refuses produces bytes, so it took the
+   keep-reading path and waited for a wake-up the closed pipe would never
+   send.
+
+   The one input that reaches this branch is therefore precisely the
+   SSRF-defense case, which is the worst possible place for it to have
+   been broken. DEPLOYMENT.md promised a prompt 502 with the cleanup
+   sentinel firing once; the sentinel did fire, thirty seconds late, and
+   the 502 never did.
+
+   The filter is set globally, not bound: the worker reads it on a thread
+   START-SERVER spawned."
+  (format t "~%Harness: DNS with every address refused~%")
+  (let ((saved web-skeleton:*fetch-address-filter*))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore ip family host))
+            nil))
+    (unwind-protect
+         (let ((sentinel nil))
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (declare (ignore req))
+                  ;; A name, not a literal — the literal fast paths skip
+                  ;; DNS and this is about what happens after getent runs.
+                  (defer-to-fetch :GET "http://localhost:9/refused"
+                    :then (lambda (status headers body)
+                            (declare (ignore headers body))
+                            (unless status (setf sentinel t))
+                            (make-text-response (or status 500) "unreached")))))
+             (let ((start (get-internal-real-time)))
+               (multiple-value-bind (status headers body)
+                   (handler-case (test-http-request :get "/proxy")
+                     (error (e) (values nil nil (princ-to-string e))))
+                 (declare (ignore headers body))
+                 (let ((secs (/ (float (- (get-internal-real-time) start))
+                                internal-time-units-per-second)))
+                   (check "dns all-refused: answers 502" status 502)
+                   (check "dns all-refused: promptly, not at the sweep"
+                          (< secs 5.0) t)))))
+           (check "dns all-refused: fetch cleanup sentinel fired" sentinel t))
+      (setf web-skeleton:*fetch-address-filter* saved))))
+
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
   "When an HTTP/1.1 client sends 'Connection: close', the server's
    response MUST carry 'Connection: close' (RFC 7230 §6.1: a sender
@@ -1147,6 +1301,8 @@
   (test-harness-handler-connection-close-honored-e2e)
   (test-harness-fetch-callback-connection-close-honored-e2e)
   (test-harness-awaiting-timeout-answers-504-e2e)
+  (test-harness-close-delimited-fetch-e2e)
+  (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)

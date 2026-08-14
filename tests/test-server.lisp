@@ -4070,6 +4070,50 @@
              (eq (web-skeleton:register-cleanup fn) fn) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; CONNECTION-READ-AVAILABLE tells "read data, then EOF" from "read data"
+;;;
+;;; This is the discriminating test for :OK-EOF. Both bugs it fixes are
+;;; end-to-end shapes whose reproduction depends on whether a peer's last
+;;; bytes and its end-of-stream land in the same read, and that is a race:
+;;; the e2e close-delimited test hits it reliably on loopback, the e2e DNS
+;;; test does not, because the framework usually reads getent's output
+;;; before getent has exited.
+;;;
+;;; The contract underneath both is not a race. A pipe from a process that
+;;; has already exited holds its bytes and its end of stream together,
+;;; every time — which is precisely the fully-buffered shape getent
+;;; produces, arrived at deterministically.
+;;; ---------------------------------------------------------------------------
+
+(defun test-read-available-eof ()
+  (format t "~%connection-read-available: EOF reporting~%")
+  (flet ((drain (sh-command)
+           (let* ((proc (sb-ext:run-program "/bin/sh" (list "-c" sh-command)
+                                            :output :stream :wait t))
+                  (fd (web-skeleton::%process-output-fd proc)))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd fd :state :out-dns :outbound-p t
+                               :last-active 0)))
+                    (web-skeleton::set-nonblocking fd)
+                    (list (web-skeleton::connection-read-available conn)
+                          (web-skeleton::connection-read-pos conn)))
+               (ignore-errors (sb-ext:process-close proc))))))
+    ;; Bytes and end-of-stream in one drain. Reported as :OK, the EOF is
+    ;; discarded, and every caller that treats it as terminal loses it.
+    (destructuring-bind (result pos)
+        (drain "printf '10.0.0.5 STREAM internal\\n'")
+      (check "read-available: bytes then EOF reports :ok-eof" result :ok-eof)
+      (check "read-available: :ok-eof still delivers the bytes"
+             (> pos 0) t))
+    ;; Nothing written before exit — no bytes to report, so plain :EOF.
+    ;; This is the only case the DNS error branch could reach before, and
+    ;; it corresponds to a name that does not resolve at all.
+    (destructuring-bind (result pos) (drain "exit 0")
+      (check "read-available: no bytes at EOF reports :eof" result :eof)
+      (check "read-available: :eof delivers nothing" pos 0))))
+
+;;; ---------------------------------------------------------------------------
 ;;; The :awaiting sweeper's 504, and its fallback
 ;;;
 ;;; The e2e test proves the 504 reaches a client. This proves the branch
@@ -4519,6 +4563,7 @@
   (test-static-range)
   (test-jwt)
   (test-shutdown-hooks)
+  (test-read-available-eof)
   (test-awaiting-sweep-504)
   (report-suite "Server")
   (zerop *tests-failed*))

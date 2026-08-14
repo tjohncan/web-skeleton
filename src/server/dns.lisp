@@ -346,9 +346,10 @@
    error. Reply to the parked inbound with a 502 and tear down the
    dns-conn through CLOSE-OUTBOUND, which fires the fetch callback
    with (NIL NIL NIL) so app-level cleanup runs."
-  (let ((inbound-fd (connection-inbound-fd dns-conn)))
+  (let ((inbound-fd (connection-inbound-fd dns-conn))
+        (out-fd (connection-fd dns-conn)))
     (close-outbound dns-conn epoll-fd)
-    (let ((inbound (lookup-connection inbound-fd)))
+    (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
       (when inbound
         (let ((err-bytes (strip-body-for-head
                          (format-response
@@ -369,7 +370,7 @@
    deliver a 502 on EOF-without-answer."
   (let ((result (connection-read-available dns-conn)))
     (case result
-      ((:ok :eof)
+      ((:ok :ok-eof :eof)
        (let ((parsed (parse-getent-output
                       (connection-read-buf dns-conn)
                       (connection-read-pos dns-conn)
@@ -396,10 +397,20 @@
                   ;; close-outbound fires the cleanup sentinel.
                   (log-warn "dns: chain to TCP failed: ~a" e)
                   (deliver-dns-error dns-conn epoll-fd)))))
-           ((eq result :eof)
+           ((member result '(:eof :ok-eof))
             ;; No parseable STREAM row, or every address the name
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
             ;; are "no address we are willing to dial" — same 502.
+            ;;
+            ;; :OK-EOF is the case that matters and used to be missing.
+            ;; getent's stdout is fully buffered, so it flushes at exit
+            ;; and the output and the EOF land in one read — which means
+            ;; this branch only ever sees :EOF when getent printed
+            ;; nothing at all. A name that resolved to addresses the
+            ;; filter refused produced bytes, so it arrived as :OK, fell
+            ;; past this branch to wait for a wake-up that the closed
+            ;; pipe would never deliver, and the parked inbound sat until
+            ;; the sweeper took it.
             (log-warn "dns: no usable address for ~a in getent output"
                       (or (connection-dns-host dns-conn) "<host>"))
             (deliver-dns-error dns-conn epoll-fd))
