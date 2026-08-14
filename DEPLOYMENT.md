@@ -606,6 +606,33 @@ in a fan-out broadcast, one unresponsive subscriber is enough.
 the deadline: it used to accept `0` for no deadline at all, which meant a
 peer that never drained its receive window pinned the worker permanently.
 
+### Logging holds the only shared lock
+
+`log-msg` takes a single global mutex and holds it across both the
+`format` and the `force-output`. It is the one lock every worker contends
+for — connections, the DNS cache, the scratch buffers and `/dev/urandom`
+are per-worker precisely so that the request path needs none.
+
+At the `:info` default this costs nothing measurable, because a request
+that parses and dispatches cleanly logs nothing at all. At `:debug` it is
+several acquisitions per request with every worker serialized behind
+them, which is worth knowing before turning `:debug` on under load rather
+than after.
+
+Two operational consequences:
+
+- **`*log-stream*` pointed at a slow consumer stalls the server, not one
+  connection.** A pipe to a log shipper that stops reading leaves the
+  blocked `force-output` holding the lock while every worker queues
+  behind it. A file or the terminal is fine; anything whose reader can
+  block deserves a moment's thought, and a bounded local buffer in front
+  of it is cheap insurance.
+- **An access log would put this on the hot path by construction** — one
+  line per request, every request, every worker, through one mutex. The
+  framework does not ship one. If you add one, per-worker buffers drained
+  on a timer are the shape that avoids the contention; routing it through
+  `log-msg` is the shape that does not.
+
 ### Static files
 
 `load-static-files` reads files into memory at startup and pre-builds HTTP responses.
