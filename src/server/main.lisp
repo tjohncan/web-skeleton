@@ -133,9 +133,50 @@
 (defparameter *ws-max-missed-pongs* 3
   "Close a WebSocket connection after this many consecutive unanswered pings.")
 
+(defun deliver-awaiting-timeout (conn epoll-fd)
+  "Answer 504 on an inbound parked in :AWAITING past *FETCH-TIMEOUT*, then
+   hand it to the write path to close.
+
+   504 rather than 502 because the condition is specifically that the
+   upstream did not answer in time. DELIVER-FETCH-ERROR's 502s are right
+   for their cases — connect refused, short body, unparseable status, all
+   genuinely a bad response from the gateway — and this is the other one.
+   Answering everything with a single code is what *STATUS-REASONS*
+   already declines to do.
+
+   The paired outbound goes first, through CLOSE-OUTBOUND, because that
+   is what fires the fetch callback's (NIL NIL NIL) sentinel. Skipping it
+   would leak the app's cleanup on exactly the path where the fetch never
+   returned.
+
+   The write buffer is drained by construction: a connection reaches
+   :AWAITING only from dispatch, after its request was fully read and
+   before any response was queued, and both the keep-alive reset and the
+   100-continue flush zero the buffer on the way. CONNECTION-QUEUE-WRITE
+   enforces that rather than trusting it, which is why the caller catches
+   — a signal here would take down a worker mid-sweep."
+  (let ((out-fd (connection-awaiting-fd conn)))
+    (when (>= out-fd 0)
+      (let ((out-conn (lookup-connection out-fd)))
+        (when out-conn
+          (close-outbound out-conn epoll-fd)))))
+  (setf (connection-close-after-p conn) t
+        (connection-awaiting-fd conn) -1)
+  (let ((bytes (strip-body-for-head
+                (format-response (make-error-response 504)
+                                 :connection-hint (connection-hint-for conn))
+                conn)))
+    (connection-queue-write conn bytes)
+    (setf (connection-state conn) :write-response
+          (connection-last-active conn) (get-universal-time))
+    (epoll-modify epoll-fd (connection-fd conn)
+                  (logior +epollout+ +epollet+))))
+
 (defun sweep-idle-connections (epoll-fd now)
   "Close connections that have been idle too long.
-   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*."
+   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*.
+   An :AWAITING connection is answered 504 first — see
+   DELIVER-AWAITING-TIMEOUT."
   (let ((idle nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
@@ -154,7 +195,22 @@
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
                  (connection-fd conn) (connection-state conn))
-      (close-connection conn epoll-fd))))
+      ;; Collect-then-act: nothing here queues a write inside the MAPHASH
+      ;; above, because DELIVER-AWAITING-TIMEOUT tears down the paired
+      ;; outbound and that mutates the table being walked.
+      (if (eq (connection-state conn) :awaiting)
+          ;; A failure to answer must not be worse than not trying. If
+          ;; anything in the 504 path signals — a write buffer that was
+          ;; not drained after all, a serializer refusing a header — fall
+          ;; back to the bare close this used to do unconditionally,
+          ;; rather than letting it escape into RUN-EVENT-LOOP, which has
+          ;; no handler and would restart the worker mid-sweep.
+          (handler-case (deliver-awaiting-timeout conn epoll-fd)
+            (error (e)
+              (log-warn "awaiting timeout: could not answer 504 on fd ~d: ~a"
+                        (connection-fd conn) e)
+              (close-connection conn epoll-fd)))
+          (close-connection conn epoll-fd)))))
 
 (defun ping-ws-connections (epoll-fd)
   "Send pings to WebSocket connections and close dead ones.

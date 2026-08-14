@@ -138,6 +138,7 @@ specific status, not a blanket 400:
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
 | `501 Not Implemented` | A method not in the accepted set, or any `Transfer-Encoding` (RFC 7230 §3.3.1) |
 | `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
+| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised |
 
@@ -313,7 +314,17 @@ together. A slow DNS phase shortens the budget remaining for connect and respons
 Blocking paths (`http-fetch-stream`, HTTPS) get the three per-phase bounds above;
 the async path gets one total. Tune `*fetch-timeout*` with this in mind —
 it is the worst-case wall time the parked inbound will sit in `:awaiting`
-before the idle sweeper hands back a 502.
+before the idle sweeper answers **`504 Gateway Timeout`** and closes.
+
+That 504 is the floor under every way a fetch can fail to come back,
+including ones with no specific handler: an upstream that accepts and then
+says nothing, a DNS lookup that produces no usable address, a response
+whose framing never completes. Wherever the fetch machinery has something
+more specific to say it says it — `deliver-fetch-error`'s 502 covers a
+refused connect, a short body, an unparseable status line — and everything
+else lands here. The fetch callback still fires its `(nil nil nil)` cleanup
+sentinel exactly once, because the paired outbound is torn down through the
+same `close-outbound` path either way.
 
 **Chunked completion on the async path.** The non-blocking `http-fetch` path
 detects response completion three ways: by `Content-Length`, by the

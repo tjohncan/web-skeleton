@@ -642,6 +642,83 @@
                           got-second nil))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
 
+(defun test-harness-awaiting-timeout-answers-504-e2e ()
+  "An inbound parked on a fetch that never comes back is answered 504,
+   not closed without a word.
+
+   DEPLOYMENT.md promised this and the code did not do it: the sweeper
+   collected the timed-out connection and called CLOSE-CONNECTION, which
+   removes it from epoll, unregisters it, and closes the fd. The client
+   got a bare TCP close after *FETCH-TIMEOUT* seconds and nothing to
+   distinguish it from the server dying.
+
+   The upstream is a listener that accepts and never writes, built inline
+   rather than added to the harness — the harness ships, and one internal
+   test is not a reason to widen what it promises. The TCP connect
+   succeeds because the kernel completes the handshake into the accept
+   queue without anyone calling accept, so the fetch gets all the way to
+   :out-read and waits there, which is the state under test.
+
+   *FETCH-TIMEOUT* is set globally rather than bound: the worker runs in a
+   thread START-SERVER spawned, and a LET here would not reach it."
+  (format t "~%Harness: :awaiting timeout answers 504~%")
+  (let ((saved web-skeleton:*fetch-timeout*)
+        (silent (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (setf web-skeleton:*fetch-timeout* 2)
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address silent) t)
+           (sb-bsd-sockets:socket-bind silent #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen silent 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name silent)
+             (declare (ignore host))
+             (let ((cleanup-fired nil))
+               (with-test-server
+                   (:handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (defer-to-fetch :GET
+                        (format nil "http://127.0.0.1:~d/never" upstream-port)
+                        :then (lambda (status headers body)
+                                (declare (ignore headers body))
+                                (unless status (setf cleanup-fired t))
+                                (make-text-response (or status 500)
+                                                    "unreached")))))
+                 (let ((start (get-internal-real-time)))
+                   ;; A regression here answers nothing at all, and
+                   ;; TEST-HTTP-REQUEST raises rather than returning on a
+                   ;; response it cannot parse. Caught so that becomes a
+                   ;; failed check with the diagnostic attached instead of
+                   ;; a backtrace that ends the whole suite run.
+                   (multiple-value-bind (status headers body)
+                       (handler-case (test-http-request :get "/proxy")
+                         (error (e) (values nil nil (princ-to-string e))))
+                     (declare (ignore headers))
+                     (let ((secs (/ (float (- (get-internal-real-time) start))
+                                    internal-time-units-per-second)))
+                       (check "awaiting timeout: answers 504, not a bare close"
+                              status 504)
+                       (check "awaiting timeout: body names the condition"
+                              (and body (search "Gateway Timeout" body) t) t)
+                       ;; Bounded on both sides. Too early would mean
+                       ;; something other than the sweeper answered; too
+                       ;; late would mean the sweeper is not the thing
+                       ;; that did. The sweep runs at 1 Hz against a
+                       ;; one-second clock, so a 2 s timeout lands in
+                       ;; [2, 4) plus scheduling.
+                       (check "awaiting timeout: at roughly *fetch-timeout*"
+                              (and (> secs 1.0) (< secs 10.0)) t)))))
+               ;; The fetch callback's cleanup sentinel must still fire
+               ;; exactly once — CLOSE-OUTBOUND is what fires it, and
+               ;; answering the inbound must not skip tearing the
+               ;; outbound down.
+               (check "awaiting timeout: fetch cleanup sentinel fired"
+                      cleanup-fired t))))
+      (setf web-skeleton:*fetch-timeout* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close silent)))))
+
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
   "When an HTTP/1.1 client sends 'Connection: close', the server's
    response MUST carry 'Connection: close' (RFC 7230 §6.1: a sender
@@ -1069,6 +1146,7 @@
   (test-harness-connection-header-split-e2e)
   (test-harness-handler-connection-close-honored-e2e)
   (test-harness-fetch-callback-connection-close-honored-e2e)
+  (test-harness-awaiting-timeout-answers-504-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
