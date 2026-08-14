@@ -4070,6 +4070,87 @@
              (eq (web-skeleton:register-cleanup fn) fn) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The :awaiting sweeper's 504, and its fallback
+;;;
+;;; The e2e test proves the 504 reaches a client. This proves the branch
+;;; underneath it: DELIVER-AWAITING-TIMEOUT runs inside SWEEP-IDLE-
+;;; CONNECTIONS, which runs inside RUN-EVENT-LOOP, which has no handler —
+;;; so a signal escaping the sweep restarts the worker mid-walk and costs
+;;; every other connection on it. The handler-case falls back to the bare
+;;; close instead.
+;;;
+;;; A fallback is the one thing that fails silently by succeeding: if it
+;;; fires when it shouldn't, the connection is closed without a word,
+;;; which is exactly the behavior the 504 exists to remove. So both
+;;; branches are asserted, and the clean case is the control that makes
+;;; the dirty one mean something.
+;;; ---------------------------------------------------------------------------
+
+(defun test-awaiting-sweep-504 ()
+  (format t "~%Awaiting sweep~%")
+  (flet ((sweep-one (&key dirty)
+           ;; Two epoll fds: one to sweep against, one standing in for a
+           ;; connection. An epoll fd is pollable, so EPOLL_CTL accepts
+           ;; it, and no socket or listener is needed.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (log (make-string-output-stream)))
+             (unwind-protect
+                  (let* ((conn (web-skeleton::make-connection
+                                :fd connfd
+                                :state :awaiting
+                                :last-active 0
+                                :request (web-skeleton::make-http-request
+                                          :method :GET :path "/")))
+                         (web-skeleton::*connections*
+                           (make-hash-table :test #'eql))
+                         (web-skeleton:*log-level* :warn)
+                         (web-skeleton:*log-stream* log))
+                    (web-skeleton::epoll-add
+                     epfd connfd (logior web-skeleton::+epollin+
+                                         web-skeleton::+epollet+))
+                    (when dirty
+                      ;; A write half-flushed. CONNECTION-QUEUE-WRITE
+                      ;; refuses to clobber it — that guard is what turns
+                      ;; a broken invariant into a signal here.
+                      (setf (web-skeleton::connection-write-buf conn)
+                            (make-array 2 :element-type '(unsigned-byte 8))
+                            (web-skeleton::connection-write-pos conn) 1
+                            (web-skeleton::connection-write-end conn) 2))
+                    (web-skeleton::register-connection conn)
+                    (let ((signalled
+                            (handler-case
+                                (progn (web-skeleton::sweep-idle-connections
+                                        epfd (get-universal-time))
+                                       nil)
+                              (error (e) (princ-to-string e)))))
+                      (list signalled
+                            (web-skeleton::connection-state conn)
+                            (get-output-stream-string log))))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Control: a drained buffer takes the 504 path.
+    (destructuring-bind (signalled state log) (sweep-one)
+      (check "awaiting sweep: clean case does not signal" signalled nil)
+      (check "awaiting sweep: clean case queues a response"
+             state :write-response)
+      (check "awaiting sweep: clean case does not take the fallback"
+             (search "could not answer 504" log) nil))
+
+    ;; A broken invariant must not escape into the event loop.
+    (destructuring-bind (signalled state log) (sweep-one :dirty t)
+      (check "awaiting sweep: dirty buffer does not signal out of the sweep"
+             signalled nil)
+      (check "awaiting sweep: dirty buffer takes the fallback"
+             (and (search "could not answer 504" log) t) t)
+      ;; CONNECTION-CLOSE is what the fallback ends in, and it leaves the
+      ;; state :closing — so the connection was torn down rather than left
+      ;; parked forever, which is the whole point of falling back.
+      (check "awaiting sweep: dirty buffer still gets closed"
+             state :closing))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Outbound address filter (SSRF policy hook)
 ;;; ---------------------------------------------------------------------------
 
@@ -4438,5 +4519,6 @@
   (test-static-range)
   (test-jwt)
   (test-shutdown-hooks)
+  (test-awaiting-sweep-504)
   (report-suite "Server")
   (zerop *tests-failed*))
