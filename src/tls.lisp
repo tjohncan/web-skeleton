@@ -628,9 +628,38 @@
           (tls-stream-response ssl on-line :method method))
       (tls-close ssl socket))))
 
-(defun tls-stream-response (ssl on-line &key (method :GET))
+(defun ssl-byte-reader (ssl)
+  "Default byte source for TLS-STREAM-RESPONSE: fill BUF, answer with the
+   count, :EOF on a benign close, or raise.
+
+   The classification lives here rather than at the call site because a
+   caller supplying its own source has no SSL pointer to hand
+   SSL-READ-EOF-OR-RAISE — and that function's four-way reading of
+   SSL_ERROR_SYSCALL is not something a second site should restate."
+  (lambda (buf len)
+    (sb-sys:with-pinned-objects (buf)
+      (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) len)))
+        (if (> n 0)
+            n
+            ;; Returns :EOF for a benign close, raises for everything
+            ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
+            ;; one of them is an ordinary end of stream.
+            (ssl-read-eof-or-raise ssl n))))))
+
+(defun tls-stream-response (ssl on-line &key (method :GET) read-fn)
   "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
    Handles chunked transfer encoding. Returns the status code.
+
+   READ-FN substitutes the byte source: (READ-FN BUF LEN) fills BUF and
+   answers with the count, :EOF at a clean end of stream, or raises.
+   Defaults to SSL-BYTE-READER over SSL, which is then untouched.
+
+   A parameter added for testability is the kind of thing this codebase
+   declines, so: this function is a second implementation of what
+   STREAM-RESPONSE-LINES does, %SSL-READ takes a raw pointer, and
+   TEST-PROPERTIES.LISP's header recorded the resulting coverage gap as
+   one it could not close. The seam closes it, and it is what will make
+   deleting this function checkable rather than hopeful.
 
    METHOD gates the body-framing discipline: for :HEAD, RFC 7231
    §4.3.2 guarantees an empty body even when the upstream echoes
@@ -652,7 +681,8 @@
        receiving a silently truncated response.
      - close-delimited (no TE, no CL): the connection close IS
        the framing signal; clean EOF is treated as complete."
-  (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)))
+  (let ((read (or read-fn (ssl-byte-reader ssl)))
+        (buf (make-array 8192 :element-type '(unsigned-byte 8)))
         (line-buf (make-array 4096 :element-type '(unsigned-byte 8)
                                    :fill-pointer 0 :adjustable t))
         (status nil)
@@ -702,23 +732,16 @@
         (when (and content-length (not te-present)
                    (>= body-consumed content-length))
           (return))
-        (sb-sys:with-pinned-objects (buf)
-          (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
-            (cond
-              ((zerop n)
-               (ssl-read-eof-or-raise ssl n)
-               (return))
-              ((< n 0)
-               ;; Non-positive return must NOT be treated as clean EOF
-               ;; unconditionally — SSL_ERROR_SYSCALL conflates timeout,
-               ;; transport error, and benign HTTP/1.0 connection-close.
-               ;; Same discipline as tls-read-all: the helper either
-               ;; returns :EOF (benign) or raises so the outer
-               ;; unwind-protect tears down and the caller sees the
-               ;; error instead of a silently-truncated NDJSON/SSE
-               ;; stream.
-               (ssl-read-eof-or-raise ssl n)
-               (return))
+        (let ((n (funcall read buf (length buf))))
+          (cond
+            ((eq n :eof)
+             ;; The reader has already classified. SSL_ERROR_SYSCALL
+             ;; conflates timeout, transport error, and a benign
+             ;; HTTP/1.0-style close, so only the last of those reaches
+             ;; here — the rest raised, and the caller's unwind-protect
+             ;; tears the session down rather than presenting a
+             ;; silently-truncated NDJSON/SSE stream as success.
+             (return))
               (t
                (loop for i from 0 below n
                      for byte = (aref buf i)
@@ -963,7 +986,7 @@
                              ;; and let the outer loop exit via its
                              ;; pre-read guard so any trailing bytes
                              ;; in the current buffer are discarded.
-                             (return)))))))))))
+                             (return))))))))))
     ;; Post-loop truncation checks. Raise loud on either framing
     ;; shape that came up short — the outer UNWIND-PROTECT in
     ;; HTTPS-FETCH-STREAM closes the TLS session and the error

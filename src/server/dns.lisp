@@ -402,15 +402,24 @@
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
             ;; are "no address we are willing to dial" — same 502.
             ;;
-            ;; :OK-EOF is the case that matters and used to be missing.
-            ;; getent's stdout is fully buffered, so it flushes at exit
-            ;; and the output and the EOF land in one read — which means
-            ;; this branch only ever sees :EOF when getent printed
-            ;; nothing at all. A name that resolved to addresses the
-            ;; filter refused produced bytes, so it arrived as :OK, fell
-            ;; past this branch to wait for a wake-up that the closed
-            ;; pipe would never deliver, and the parked inbound sat until
-            ;; the sweeper took it.
+            ;; :OK-EOF used to be missing here, and its absence was a
+            ;; race rather than a certainty — which is why the branch
+            ;; mostly worked and the bug was hard to see.
+            ;;
+            ;; getent writes its output in one go and the EOF appears
+            ;; when it exits. Usually it has not exited by the time we
+            ;; drain, so the bytes come back :OK, the exit arrives as a
+            ;; later event, and this branch fires on a clean :EOF — which
+            ;; is the common ordering and the reason the old code was
+            ;; right most of the time. When getent has already exited,
+            ;; both land in one read; reported as :OK, that fell straight
+            ;; past here to wait for a wake-up the closed pipe would
+            ;; never deliver, and the parked inbound sat until the
+            ;; sweeper took it.
+            ;;
+            ;; So neither arm is dead. :EOF is the common path and
+            ;; :OK-EOF is the coalesced one, and the branch has to accept
+            ;; both because which one arrives is not ours to decide.
             (log-warn "dns: no usable address for ~a in getent output"
                       (or (connection-dns-host dns-conn) "<host>"))
             (deliver-dns-error dns-conn epoll-fd))

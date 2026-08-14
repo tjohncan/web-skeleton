@@ -232,11 +232,16 @@
      forever, deferring to the caller's EOF branch. That branch was
      unreachable, so the fetch sat until *FETCH-TIMEOUT*.
 
-     A `getent` pipe is fully buffered, so its output and its EOF always
-     arrive together. HANDLE-DNS-READY's \"no usable address\" branch
-     therefore never fired, and the one input that reaches it is a name
-     whose every address *FETCH-ADDRESS-FILTER* refused — the SSRF-defense
-     path.
+     A `getent` pipe carries the same hazard, on a race rather than
+     reliably. getent writes its output in one go and the EOF appears when
+     it exits, so whether one drain sees both depends on whether it has
+     exited by the time we read. Usually it has not: the data comes back
+     :OK, the exit arrives as a later event, and HANDLE-DNS-READY's \"no
+     usable address\" branch fires on a clean :EOF. When it has — a cached
+     answer, a loaded box, any scheduling that lets it finish first — the
+     two coalesce and that branch was skipped. The name it strands is one
+     whose every address *FETCH-ADDRESS-FILTER* refused, so the failure
+     lands on the SSRF-defense path and only sometimes.
 
    Neither is rescued by epoll. A TCP peer calling close(2) does not set
    EPOLLHUP — that flag means both directions are down, and a FIN alone

@@ -4107,8 +4107,11 @@
       (check "read-available: :ok-eof still delivers the bytes"
              (> pos 0) t))
     ;; Nothing written before exit — no bytes to report, so plain :EOF.
-    ;; This is the only case the DNS error branch could reach before, and
-    ;; it corresponds to a name that does not resolve at all.
+    ;; Both arms are live in the DNS path: this one on the common
+    ;; ordering, where the bytes arrive as :OK and the exit follows as a
+    ;; separate event, and :OK-EOF above when getent has already finished.
+    ;; Which of the two shows up is not the caller's to decide, so the
+    ;; branch has to take both.
     (destructuring-bind (result pos) (drain "exit 0")
       (check "read-available: no bytes at EOF reports :eof" result :eof)
       (check "read-available: :eof delivers nothing" pos 0))))
