@@ -96,6 +96,30 @@
    construction on the one path that exists because the worker is already
    out of room.")
 
+(defconstant +refusal-drain-size+ 2048
+  "Bytes REFUSE-CONNECTION clears per read while draining a refused peer.
+   Sized to hold an ordinary request in one or two passes; the drain is
+   capped at four of them regardless.")
+
+(defvar *refusal-drain-buf* nil
+  "Scratch buffer REFUSE-CONNECTION drains into, bound per worker by
+   RUN-WORKER alongside *EPOLL-CTL-BUF* and *POLL-BUF*.
+
+   The bytes read into it are discarded — the drain exists so that
+   close(2) sends FIN rather than RST, not to look at what the peer
+   said — so one buffer per worker is enough and its contents never
+   need clearing between refusals.
+
+   Per-worker rather than global for the reason every other scratch
+   buffer here is: workers share nothing in the hot path, and a shared
+   sink would be two threads writing one array. Nothing reads it, so
+   that would in fact be harmless, which is exactly the kind of thing
+   that stops being true after an edit nobody connected to it.
+
+   NIL outside a worker — the REPL, the test suite driving
+   REFUSE-CONNECTION directly — where the per-call allocation this
+   replaces is still what happens.")
+
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
@@ -333,7 +357,9 @@
       (ignore-errors
        (nb-write fd *connection-limit-response* 0
                  (length *connection-limit-response*)))
-      (let ((sink (make-array 2048 :element-type '(unsigned-byte 8))))
+      (let ((sink (or *refusal-drain-buf*
+                      (make-array +refusal-drain-size+
+                                  :element-type '(unsigned-byte 8)))))
         (dotimes (i 4)
           (declare (ignorable i))
           ;; NB-READ returns :AGAIN once the queue is empty and :EOF once
@@ -940,7 +966,10 @@
               (*dns-cache* (make-hash-table :test #'equal))
               (*epoll-ctl-buf* (make-array +epoll-event-size+
                                            :element-type '(unsigned-byte 8)))
-              (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
+              (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8)))
+              (*refusal-drain-buf*
+                (make-array +refusal-drain-size+
+                            :element-type '(unsigned-byte 8))))
           ;; Split the listener and epoll-fd bindings so a failure of
           ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
           ;; listener socket — a shared let* would leak it because the
