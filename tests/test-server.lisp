@@ -110,6 +110,56 @@
     (check "http-date format"
            date "Thu, 09 Apr 2026 21:00:00 GMT")))
 
+(defun test-http-date-cache ()
+  (format t "~%HTTP Date cache~%")
+  ;; No cache bound is the state every existing test and every REPL call
+  ;; runs in, and it must keep formatting.
+  (let ((web-skeleton::*http-date-cache* nil))
+    (check "date: no cache bound still formats correctly"
+           (string= (web-skeleton::http-date)
+                    (web-skeleton::%format-http-date (get-universal-time)))
+           t))
+  (let ((web-skeleton::*http-date-cache* (cons 0 "")))
+    ;; A cold cache formats and fills.
+    (check "date: cold cache produces the right string"
+           (string= (web-skeleton::http-date)
+                    (web-skeleton::%format-http-date (get-universal-time)))
+           t)
+    (check "date: cold cache records the second it built for"
+           (eql (car web-skeleton::*http-date-cache*) (get-universal-time))
+           t)
+    ;; A hit is served without reformatting. Asserted through a sentinel
+    ;; that formatting could never produce, and tolerant of the second
+    ;; ticking between setup and call — rare, and a fresh format is the
+    ;; correct answer when it happens, so this is not a flake.
+    (let ((now (get-universal-time)))
+      (setf (car web-skeleton::*http-date-cache*) now
+            (cdr web-skeleton::*http-date-cache*) "SENTINEL")
+      (let ((got (web-skeleton::http-date)))
+        (check "date: a hit in the same second is served from the cache"
+               (or (string= got "SENTINEL")
+                   (string= got (web-skeleton::%format-http-date
+                                 (get-universal-time))))
+               t)))
+    ;; A stale second must not be served. Without this the cache would be
+    ;; a clock that stopped.
+    (setf (car web-skeleton::*http-date-cache*) 1
+          (cdr web-skeleton::*http-date-cache*) "STALE")
+    (check "date: a different second is not served from the cache"
+           (string= (web-skeleton::http-date) "STALE")
+           nil)
+    ;; The load-bearing one. BUILD-STATIC-RESPONSE passes file mtimes, and
+    ;; if an explicit time consulted the cache every static file's
+    ;; Last-Modified would read as the moment the server started.
+    (setf (car web-skeleton::*http-date-cache*) (get-universal-time)
+          (cdr web-skeleton::*http-date-cache*) "SENTINEL")
+    (check "date: an explicit time bypasses the cache"
+           (web-skeleton::http-date 0)
+           (web-skeleton::%format-http-date 0))
+    (check "date: an explicit time does not disturb the cache"
+           (cdr web-skeleton::*http-date-cache*)
+           "SENTINEL")))
+
 (defun test-http-parser-errors ()
   (format t "~%HTTP Parser — rejection~%")
 
@@ -4543,6 +4593,7 @@
   (test-http-parser-errors)
   (test-expect-100-continue)
   (test-http-date)
+  (test-http-date-cache)
   (test-http-response)
   (test-cookie-builder)
   (test-fetch)

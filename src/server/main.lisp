@@ -1031,7 +1031,12 @@
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8)))
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
-                            :element-type '(unsigned-byte 8))))
+                            :element-type '(unsigned-byte 8)))
+              ;; CAR is the second the string was built for. 0 can never
+              ;; be the current universal time, so the first response of
+              ;; the worker's life formats and the rest of that second
+              ;; read.
+              (*http-date-cache* (cons 0 "")))
           ;; Split the listener and epoll-fd bindings so a failure of
           ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
           ;; listener socket — a shared let* would leak it because the
