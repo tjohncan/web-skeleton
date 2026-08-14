@@ -824,20 +824,25 @@
   "A hostname whose every resolved address the policy refuses fails the
    fetch promptly, with a 502, rather than stranding until the sweeper.
 
-   This is the other half of the same defect and the reason it went
-   unnoticed. `getent`'s stdout is fully buffered, so its output and its
-   EOF always arrive in one read: reported as :OK, HANDLE-DNS-READY's
-   \"no usable address\" branch was reachable only when getent printed
-   nothing at all — a name that does not resolve. A name that resolves to
-   addresses *FETCH-ADDRESS-FILTER* refuses produces bytes, so it took the
-   keep-reading path and waited for a wake-up the closed pipe would never
-   send.
+   Read this before trusting it: **this test passes without the fix**, and
+   is here as an end-to-end assertion of the DEPLOYMENT.md promise rather
+   than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is the check with
+   teeth.
 
-   The one input that reaches this branch is therefore precisely the
-   SSRF-defense case, which is the worst possible place for it to have
-   been broken. DEPLOYMENT.md promised a prompt 502 with the cleanup
-   sentinel firing once; the sentinel did fire, thirty seconds late, and
-   the 502 never did.
+   The reason is the mechanism. getent writes its output in one go and the
+   EOF appears when it exits, so whether one drain sees both depends on
+   whether it has exited by the time we read — and usually it has not. The
+   bytes come back :OK, the exit arrives as a separate event, and the old
+   code handled it on a clean :EOF. Only when getent finishes first do the
+   two coalesce, and that is the ordering the bug needed. A race, not a
+   certainty, which is exactly why it survived a suite that covers the
+   parser it sits behind.
+
+   What the test does assert is the promise: a name whose every resolved
+   address *FETCH-ADDRESS-FILTER* refuses fails the fetch promptly with a
+   502 and fires the cleanup sentinel once. That is the SSRF-defense path,
+   which is where DEPLOYMENT.md made the promise and the worst place for
+   it to go unkept.
 
    The filter is set globally, not bound: the worker reads it on a thread
    START-SERVER spawned."
