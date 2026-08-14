@@ -195,12 +195,18 @@
 
 (defparameter *shutdown-poll-interval* 1
   "Seconds between shutdown-signal checks in the main thread's wait loop
-   and each worker's event-loop epoll timeout. Also governs the worker's
-   periodic-maintenance cadence (idle-connection sweep, WebSocket ping).
+   and each worker's event-loop epoll timeout.
    Default 1 second balances wake-up overhead against shutdown
    responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
    so teardown doesn't wait a full second per call. Float accepted —
-   the worker converts to ms for epoll_wait.")
+   the worker converts to ms for epoll_wait.
+
+   It does not set the periodic-maintenance cadence. RUN-EVENT-LOOP gates
+   the idle sweep on a hardcoded one second and the WebSocket ping on
+   *WS-PING-INTERVAL*; this only bounds how often the loop can wake to
+   check them. Lowering it makes shutdown prompt without making either
+   scan run more often — the harness sets it to 0.05 and the sweep still
+   runs at 1 Hz.")
 
 (defconstant +max-events+ 64
   "Maximum events to process per epoll_wait call. Internal — not a
