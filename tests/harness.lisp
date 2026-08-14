@@ -4,7 +4,10 @@
            #:*test-port*
            #:test-http-request
            #:make-test-request
-           #:make-test-ws-frame))
+           #:make-test-ws-frame
+           ;; Bounded reading — a test that reads a socket needs a deadline
+           #:read-until-bounded
+           #:*test-read-timeout*))
 
 (in-package :web-skeleton-test-harness)
 
@@ -135,6 +138,99 @@
             web-skeleton:*shutdown-poll-interval* saved-poll))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Bounded reads
+;;;
+;;; READ-BYTE on a socket stream has no deadline. A server that answers
+;;; late, answers partially, or never answers therefore does not fail a
+;;; test — it stops the suite, and CI kills the job ten minutes later with
+;;; a log ending at the name of the test that started and nothing said
+;;; about what it was waiting for.
+;;;
+;;; Every read this harness performs goes through a deadline, and
+;;; READ-UNTIL-BOUNDED is exported so that reads a downstream app performs
+;;; can too.
+;;; ---------------------------------------------------------------------------
+
+(defvar *test-read-timeout* 10
+  "Seconds any harness read waits before giving up and returning what
+   arrived.
+
+   A diagnostic backstop, not a latency assertion: a healthy response
+   lands in milliseconds, so any value a working server cannot reach will
+   do. Raise it around a deliberately slow handler with a LET — unlike the
+   server's own specials, this one is read on the calling thread, so a
+   binding is seen.")
+
+(defun call-with-read-deadline (seconds thunk)
+  "Run THUNK on its own thread and abandon it after SECONDS.
+   Returns (values RESULT COMPLETED-P).
+
+   A thread is the mechanism because there is no other one: READ-BYTE on
+   an fd-stream cannot be interrupted from outside, so the only way to
+   stop waiting is to stop looking at the thread that is waiting. The
+   abandoned thread may still be blocked in a read when this returns —
+   which is why anything it was filling has to be visible to the caller
+   rather than returned by the thunk."
+  (let* ((completed nil)
+         (result nil)
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (setf result (funcall thunk)
+                          completed t))
+                  :name "bounded-reader")))
+    (sb-thread:join-thread thread :timeout seconds :default nil)
+    (unless completed
+      (ignore-errors (sb-thread:terminate-thread thread)))
+    (values result completed)))
+
+(defun read-until-bounded (stream &key until into
+                                       (seconds *test-read-timeout*))
+  "Read bytes from STREAM until UNTIL is satisfied, the stream ends, or
+   SECONDS elapse. Returns (values BUFFER REASON).
+
+   BUFFER is a fill-pointered (UNSIGNED-BYTE 8) vector holding everything
+   that arrived — always, including on the deadline and on a reset. That
+   is the point: a test that times out should be able to assert against
+   the bytes it did get, and say what was missing.
+
+   REASON is one of:
+     :SATISFIED — UNTIL returned true
+     :EOF       — the peer closed cleanly
+     :ERROR     — the read failed, in practice a reset
+     :DEADLINE  — SECONDS elapsed with the stream still open
+
+   :EOF and :ERROR are kept apart because an ordinary end of stream and a
+   reset are different outcomes, and at least one test turns on which one
+   it got (a refused connection is supposed to close, not reset).
+
+   UNTIL is called as (UNTIL BUFFER FILL) after each byte, so it must be
+   cheap — a scan of the whole buffer per byte is quadratic, which for
+   test-sized payloads is fine and for a large stream is not. NIL means
+   read until the stream ends, which is the right choice whenever the
+   response is close-delimited and the wrong one whenever it is not:
+   a keep-alive response never reaches EOF, so it needs a predicate or it
+   will sit here until the deadline.
+
+   :INTO supplies the buffer instead of allocating one, for a caller
+   accumulating across several calls."
+  (let ((buf (or into
+                 (make-array 8192 :element-type '(unsigned-byte 8)
+                                  :fill-pointer 0 :adjustable t))))
+    (multiple-value-bind (reason completed)
+        (call-with-read-deadline
+         seconds
+         (lambda ()
+           (handler-case
+               (loop
+                 (when (and until (funcall until buf (fill-pointer buf)))
+                   (return :satisfied))
+                 (let ((byte (read-byte stream nil nil)))
+                   (unless byte (return :eof))
+                   (vector-push-extend byte buf)))
+             (error () :error))))
+      (values buf (if completed reason :deadline)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; HTTP client for end-to-end tests
 ;;; ---------------------------------------------------------------------------
 
@@ -185,17 +281,29 @@
 
 (defun parse-test-response (stream)
   "Drain a complete HTTP response from STREAM and return
-   (values STATUS HEADERS BODY-STRING). BODY-STRING is NIL when empty."
-  (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
-                              :fill-pointer 0 :adjustable t)))
-    (loop for byte = (handler-case (read-byte stream nil nil)
-                       (error () nil))
-          while byte
-          do (vector-push-extend byte buf))
+   (values STATUS HEADERS BODY-STRING). BODY-STRING is NIL when empty.
+
+   Reads to the end of the stream, bounded by *TEST-READ-TIMEOUT*.
+   End-of-stream is the right framing here because TEST-HTTP-REQUEST sends
+   Connection: close unless the caller overrides it — a caller who does
+   override it wants READ-UNTIL-BOUNDED with an :UNTIL predicate instead,
+   because a kept-alive response never reaches EOF and this will spend the
+   whole deadline discovering that."
+  (multiple-value-bind (buf reason) (read-until-bounded stream)
     (let* ((end (fill-pointer buf))
            (header-end (web-skeleton::scan-crlf-crlf buf 0 end)))
       (unless header-end
-        (error "test harness: incomplete response from test server"))
+        (error "test harness: ~a after ~d byte~:p~@[ — got: ~s~]"
+               (ecase reason
+                 (:deadline (format nil "no complete response within ~as"
+                                    *test-read-timeout*))
+                 (:eof      "peer closed before a complete response")
+                 (:error    "read failed before a complete response")
+                 (:satisfied "predicate satisfied before a complete response"))
+               end
+               (when (plusp end)
+                 (sb-ext:octets-to-string
+                  (subseq buf 0 (min end 200)) :external-format :latin-1))))
       (let* ((status (web-skeleton::parse-response-status buf 0 end))
              (first-crlf (web-skeleton::scan-crlf buf 0 header-end))
              (headers (when first-crlf

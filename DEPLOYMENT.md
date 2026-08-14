@@ -987,6 +987,41 @@ For unit-style tests that bypass the network entirely,
 `make-test-ws-frame` is the analogue for WebSocket handler unit tests —
 it builds a masked client frame that `ws-handler` code can parse and process.
 
+**Reads are bounded, and yours should be too.** `read-byte` on a socket
+stream has no deadline, so a server that answers late, answers partially,
+or never answers does not fail a test — it stops the run, and CI kills the
+job minutes later with a log ending at the name of the test that started
+and nothing said about what it was waiting for.
+
+Every read `test-http-request` performs goes through a deadline
+(`*test-read-timeout*`, 10 seconds, rebindable with a plain `let` since it
+is read on the calling thread). A test that times out raises immediately,
+naming the deadline, the byte count, and the first 200 bytes that did
+arrive.
+
+For reads of your own — anything that talks to a handler over a raw
+socket — `read-until-bounded` is exported:
+
+```lisp
+;; Read to the end of the stream, bounded. Right for a
+;; Connection: close response.
+(multiple-value-bind (buf reason) (read-until-bounded stream)
+  ;; reason is :eof, :error, or :deadline; buf holds whatever arrived
+  ...)
+
+;; Read until a predicate is satisfied. Necessary for anything the
+;; server keeps open — a kept-alive response or a stream never
+;; reaches EOF, so reading to the end means waiting out the deadline.
+(read-until-bounded stream
+                    :until (lambda (buf fill)
+                             (>= (count-events buf fill) 3))
+                    :seconds 5)
+```
+
+It always returns the buffer, including on the deadline, so a test that
+gives up can still assert against the bytes it did get and say what was
+missing. `:until` is called after each byte, so keep it cheap.
+
 End-to-end tests are slower than unit-style tests
 (~1-2 seconds per `with-test-server` call, mostly shutdown latency).
 Use unit-style tests for handler logic,
