@@ -1016,18 +1016,18 @@
                 with start = 0
                 with len = (length line)
                 while (< start len)
-                for comma = (or (position #\, line :start start) len)
-                for dash  = (position #\- line :start start :end comma)
-                do (if dash
-                       (let ((lo (parse-integer line :start start :end dash))
-                             (hi (parse-integer line :start (1+ dash)
-                                                     :end comma)))
-                         (incf total (1+ (- hi lo))))
-                       (progn
-                         ;; Single-CPU token — still parse to validate.
-                         (parse-integer line :start start :end comma)
-                         (incf total)))
-                   (setf start (1+ comma))
+                do (let* ((comma (or (position #\, line :start start) len))
+                          (dash  (position #\- line :start start :end comma)))
+                     (if dash
+                         (let ((lo (parse-integer line :start start :end dash))
+                               (hi (parse-integer line :start (1+ dash)
+                                                       :end comma)))
+                           (incf total (1+ (- hi lo))))
+                         (progn
+                           ;; Single-CPU token — still parse to validate.
+                           (parse-integer line :start start :end comma)
+                           (incf total)))
+                     (setf start (1+ comma)))
                 finally (return (max 1 total)))))
     (error ()
       (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")

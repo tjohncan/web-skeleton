@@ -1732,8 +1732,7 @@
             (found nil)
             (digits 0))
         (loop while (< pos end)
-              for byte = (aref buf pos)
-              do (let ((digit (hex-digit-value byte)))
+              do (let ((digit (hex-digit-value (aref buf pos))))
                    (if digit
                        (progn (incf digits)
                               (when (> digits 16)
