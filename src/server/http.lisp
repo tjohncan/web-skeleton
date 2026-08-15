@@ -1001,6 +1001,51 @@
                      (cdr cache) formatted)
                formatted))))))
 
+(defvar *http-date-line-cache* nil
+  "Per-worker cache of the serialized `date: ...CRLF` header line, as a
+   CONS of (SECOND . BYTES). Bound by RUN-WORKER beside *HTTP-DATE-CACHE*.
+
+   Separate from that one because the consumers differ. A dynamic
+   response gets its Date as a string, through the header alist and the
+   serializer. A pre-built static response gets it as a finished vector
+   appended to the write queue, and building that vector per request
+   would undo the point of pre-building anything.")
+
+(defconstant +header-terminator+
+  (if (boundp '+header-terminator+)
+      (symbol-value '+header-terminator+)
+      (sb-ext:string-to-octets (coerce (list #\Return #\Newline) 'string)
+                               :external-format :ascii))
+  "The blank line ending a header block, as its own vector.
+
+   Shared and never written into, like the pre-built ping frame — the
+   write queue holds vectors by reference and advances a per-connection
+   offset through them.")
+
+(defun http-date-line ()
+  "The current `date: <rfc1123>CRLF` header line as bytes, cached for the
+   second it belongs to.
+
+   The vector is shared by every response sent in that second and is
+   never mutated: a new one is built when the second turns, rather than
+   the old one being patched in place. Patching would be cheaper and
+   wrong — the queue can still be draining a vector into a slow peer
+   while the next request is served, and a Date rewritten underneath a
+   half-sent response is a torn header with nothing to catch it."
+  (let ((now (get-universal-time))
+        (cache *http-date-line-cache*))
+    (flet ((build ()
+             (sb-ext:string-to-octets
+              (format nil "date: ~a~c~c" (http-date) #\Return #\Newline)
+              :external-format :ascii)))
+      (cond
+        ((null cache) (build))
+        ((eql (car cache) now) (cdr cache))
+        (t (let ((bytes (build)))
+             (setf (car cache) now
+                   (cdr cache) bytes)
+             bytes))))))
+
 (defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
 

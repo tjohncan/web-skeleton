@@ -578,11 +578,251 @@ verification is wired to a DNS name and matching an IP SAN is not
 implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 `*dns-cache-ttl*` is it.
 
-### ws-send and worker blocking
+### The write backlog bound
 
-`ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed or `*ws-send-timeout*` expires
-(default 10 seconds).
+A connection holds one buffer being flushed and, on the paths that queue,
+a list of vectors waiting behind it. `*max-write-backlog*` caps the two
+together, 2 MiB by default.
+
+**It has to clear `*max-ws-message-size*` by at least 10 bytes**, the
+largest header `build-ws-frame` emits, or a maximal legal message cannot
+be sent even onto an empty queue. The receive path accepts a payload of
+exactly `*max-ws-message-size*`; framing it for the trip back costs the
+extended-length header, so setting the two equal hands an echo handler a
+message it is then refused permission to return. Both are exported and
+tunable apart, so this is a requirement to keep rather than an identity
+to lean on — the default leaves a full MiB of room, not the ten bytes
+that would technically satisfy it.
+
+The bound exists because a producer and its peer run at different speeds.
+An app pushing events faster than a phone on a train can read them has to
+be stopped somewhere, and the alternative to a bound is a per-connection
+list that grows until the worker dies.
+
+A send that would cross the bound is refused whole rather than truncated:
+a short frame is a protocol error on the peer's side, while a refused one
+leaves the stream well-formed and short. What the refusal *means* is the
+caller's to decide, and the two answers differ. An app-generated stream
+should close — a dropped event is invisible to the client, so its view
+diverges from the server's permanently with nothing raised anywhere. A
+relay should stop reading its upstream instead, because the client has
+not misbehaved, and letting the upstream's TCP window fill turns a killed
+download into a slow one.
+
+Per connection, so the ceiling is `*max-write-backlog*` × `*max-connections*`
+× workers — the same shape as the read-buffer arithmetic above, and it takes
+every connection on the box being simultaneously backed up to reach it.
+Lower it for many connections and a generous `ulimit`; raise it for few
+connections and bursty output.
+
+`ws-send` is the first surface to use it. The HTTP response path still
+sends one vector and waits for it, so a plain request/response connection
+never builds a queue.
+
+### Relaying an upstream incrementally
+
+`http-fetch` takes an `:on-body` callback, called `(conn bytes)` with each
+chunk of a chunked upstream response as it arrives on the async `http://`
+path. Pair it with a streaming response and a relay forwards as it reads
+rather than buffering the whole body first.
+
+```lisp
+(defun handle-relay (req)
+  (declare (ignore req))
+  (make-stream-response
+   :on-open
+   (lambda (client)
+     (http-fetch :get "http://upstream.internal/feed"
+                 :on-body (lambda (out chunk)
+                            (declare (ignore out))
+                            (stream-send client chunk))
+                 :then (lambda (status headers body)
+                         (declare (ignore status headers body))
+                         (stream-close client)
+                         nil)))))
+```
+
+**`:then` still fires exactly once, with a NIL body.** The bytes went out
+incrementally; handing them over again would double the memory the
+callback exists to avoid.
+
+**Chunked framing only, and it degrades rather than disappearing.** A
+`Content-Length` or close-delimited response has no chunk walk to hand
+bytes back from, so `:on-body` is never called and `:then` receives the
+whole body the ordinary way — not incremental, but not lost. You do not
+choose which framing an upstream uses: the same origin will switch by
+response size or by whatever proxy sits in front of it. Write the relay
+to take the bytes from `:on-body` when they arrive there and from
+`:then`'s body when they do not.
+
+**Chunk-granular, not line-granular, and deliberately.** Line splitting
+already exists once, on the blocking path, with CR/LF/CRLF handling and
+partial-line state carried across reads. A second implementation here
+would be two readers that could disagree about where a line ends, which
+is the disagreement this codebase treats as its threat model. Split what
+you are given if you want lines.
+
+**Backpressure is a return value.** Return `:pause` from `:on-body` to
+stop reading the upstream — its send window fills and the pressure
+propagates back without anything being dropped or buffered — and call
+`fetch-resume` on the outbound connection to start again. A value rather
+than a condition, for the same reason `connection-append-write` refuses
+by return: applying backpressure is ordinary control flow and should not
+unwind through the middle of a read loop.
+
+The re-arm works here for a reason worth knowing. Elsewhere the docs warn
+that an `EPOLL_CTL_MOD` will not re-fire for data already sitting in
+user space; the bytes a paused fetch has not read are still in the
+kernel, so the edge does fire.
+
+`*fetch-timeout*` stays a **total** on this path, not an inactivity
+bound. It is the only end-to-end network deadline the framework has, and
+it is what distinguishes the async path from every blocking one. A relay
+that legitimately runs long wants a larger number, not a different shape
+— converting it to idle would delete the guarantee and add one more
+entry to the trickling-upstream list.
+
+### Streaming responses
+
+A handler that returns `make-stream-response` gets the head serialized
+immediately — status, headers, no `Content-Length` — and is then handed
+the connection through `:on-open`. It produces the body with `stream-send`
+and ends it with `stream-close`.
+
+```lisp
+(defun handle-events (req)
+  (declare (ignore req))
+  (make-stream-response
+   :headers '(("content-type" . "text/plain"))
+   :on-close (lambda (conn reason)
+               (declare (ignore conn))
+               (unsubscribe-from-feed reason))
+   :on-open (lambda (conn)
+              (subscribe-to-feed
+               (lambda (event) (stream-send conn event))))))
+```
+
+**The handler returns while the response is still being delivered.** That
+is the whole point: `:on-open` queues what it has and returns, and the
+worker goes back to the event loop. A stream costs a connection slot, not
+a worker. Nothing here is synchronized, though — `stream-send` is safe
+from the worker that owns the connection and nowhere else, so an app
+doing fan-out holds its own registry and pushes from the owning worker.
+
+Framing follows the client. HTTP/1.1 gets `Transfer-Encoding: chunked`;
+HTTP/1.0 cannot read chunked at all, so it gets close-delimited framing
+with `Connection: close` and the socket goes when the stream ends. Both
+are handled for you — the app sends bytes and never sees a chunk header.
+
+**The framework owns the terminator.** `stream-close` writes it; there is
+no way for an app to write one and no way for it to forget. Any other way
+a stream ends — the peer disconnects, a deadline fires, the server drains
+— closes the socket instead, so an unterminated chunked body is never
+followed by a reused connection. That matters more than it sounds: the
+next response's status line landing where a downstream reader expects a
+chunk-size is a request-smuggling primitive, and it would be one we built
+ourselves.
+
+`:on-close` fires exactly once however the stream ends, with a reason —
+`:done`, `:disconnected`, `:idle`, `:stalled`, `:shutdown`, or `:closed`.
+Register teardown there rather than after `stream-close`, because most of
+those reasons never reach the app's own code path.
+
+Three deadlines apply, and they answer different questions:
+
+| Knob | Question |
+|---|---|
+| `*stream-idle-timeout*` | Is the app still producing? |
+| `*write-stall-timeout*` | Are bytes still leaving for the peer? |
+| `*max-write-backlog*`   | How much may pile up before we give up? |
+
+A stream can be perfectly healthy at the socket and dead at the source,
+which is why the first two are separate. `*stream-keepalive-interval*`
+refreshes the first — but only if the `make-stream-response` supplied
+keepalive bytes, because there is nothing generic to send. A chunked
+stream's only zero-content emission is the empty chunk, and that is the
+terminator; anything that keeps a stream warm is content at the layer
+above.
+
+A `HEAD` to a streaming endpoint gets the headers a `GET` would have got
+and no body, per RFC 7231 §4.3.2. No stream starts and `:on-open` is not
+called, so a handler that opens a resource there is not left holding one.
+
+Data arriving from the client mid-stream is discarded and the connection
+is marked not to be reused. A pipelined request behind a stream would
+have to wait for the stream to end, and the stream may never end — a
+clean close is retryable, a silently dropped request is not.
+
+### Server-Sent Events
+
+`make-sse-response` is a streaming response with the SSE framing on top.
+
+```lisp
+(defun handle-events (req)
+  (declare (ignore req))
+  (make-sse-response
+   :on-open (lambda (conn)
+              (subscribe (lambda (row)
+                           (sse-send conn :data (row-json row)
+                                          :event "update"
+                                          :id (row-id row)))))
+   :on-close (lambda (conn reason)
+               (declare (ignore conn))
+               (unsubscribe reason))))
+```
+
+Three headers are set for you and win over anything you pass:
+`content-type: text/event-stream` defines the protocol, `cache-control:
+no-cache` stops an intermediary serving a stale prefix of a response that
+never ends, and **`x-accel-buffering: no`** turns off nginx's buffering,
+which is on by default for this content type. Without that last one the
+events arrive in batches when a buffer fills, which is not a stream. The
+deployment story here assumes a proxy in front, so it is not decoration.
+An app that needs different proxy hints should build a
+`make-stream-response` directly rather than fight these.
+
+**Field values carrying a line break are refused, not escaped.** CR and
+LF both end a line for `EventSource`, so either one inside an `event` or
+`id` value ends that field early and hands the client whatever follows as
+a new field — or, on a blank line, dispatches an event the app never
+wrote, with a type it never chose. NUL is refused too, for a quieter
+reason: the spec has the client discard an `id` containing one, so the
+last-event-ID never updates and a reconnect replays from the wrong point
+with nothing raised anywhere.
+
+`data` is the exception and the only one: a line break in it is the
+protocol's own mechanism for multi-line payloads, and becomes one `data:`
+line per segment, which the client rejoins with LF. A **CR** in `data` is
+still refused, because the client's rejoin uses LF and passing one
+through would silently rewrite your bytes.
+
+The whole event is validated before a byte is queued, so a rejected field
+leaves the stream well-formed and short rather than half-written. Half an
+event on the wire is worse than none — the client splices it onto
+whatever comes next.
+
+**An event with no data is refused.** `EventSource` returns early on an
+empty data buffer, so such an event would look sent from the server and
+be dispatched to nobody. For a keepalive use `sse-comment`, which is the
+one emission that legitimately carries no data — that is also why it is a
+separate function rather than an empty event.
+
+`sse-comment` sends one by hand, for a producer that wants to nudge an
+intermediary on its own schedule rather than waiting for the sweep.
+
+By default the response installs a bare comment line as its keepalive,
+sent whenever the stream goes quiet for `*stream-keepalive-interval*`.
+That is what stops an intermediary reaping an idle stream, and it counts
+as production, so `*stream-idle-timeout*` never reaps a stream that is
+emitting them. Pass `:keepalive nil` to turn it off.
+
+### ws-send and the write queue
+
+`ws-send` queues a WebSocket frame and flushes whatever the socket will
+take right now. It does not block, and it may return with bytes still
+queued — that is what a slow peer looks like, not an error. The event
+loop finishes the remainder.
+
 Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
@@ -596,26 +836,63 @@ so there is no write contention.
     nil))  ; return nil — we already sent our responses
 ```
 
-The worker thread is blocked for the duration of the handler call.
-With multiple workers this is fine for bounded work (e.g. streaming
-an LLM response for a few seconds), but avoid unbounded blocking —
-a slow client holds the worker hostage.
+The worker thread is blocked for the duration of the handler call. With
+multiple workers this is fine for bounded work (e.g. streaming an LLM
+response for a few seconds), but avoid unbounded blocking — that is your
+code on the worker thread, and no framework change removes it.
 
-**"Blocking" means the worker, not the connection**, and the number is
-worth stating plainly. The event loop being paused is the one serving
-*every other connection on that worker*, so one peer that stops reading
-freezes all of them for up to `*ws-send-timeout*`. With `(cpu-count)`
-workers that is 1/N of the server's capacity held by a single slow
-client, and N slow clients arriving together is a full stall.
+**What `ws-send` contributes to that is now nothing.** It used to block
+until every byte was flushed or its send deadline expired, and because
+the event loop is paused while a handler runs, the thing being held was
+the worker: every other connection on it, frozen for up to ten seconds by
+one peer that stopped reading. With `(cpu-count)` workers that was 1/N of
+the server's capacity held by a single slow client, and N of them arriving
+together was a full stall.
 
-That is a property of the synchronous design rather than a defect in it.
-But an app that broadcasts to many peers, or serves any peer it does not
-control, wants the number before it picks `ws-send` over its own queue —
-in a fan-out broadcast, one unresponsive subscriber is enough.
+The frame now goes onto that connection's write queue and `ws-send`
+returns. A peer that is keeping up still gets incremental delivery,
+because the flush happens on the spot rather than waiting for the handler
+to finish; a peer that is not accumulates a backlog instead of freezing
+anything. **The blast radius is one connection.**
 
-`*ws-send-timeout*` must be positive. There is no setting that disables
-the deadline: it used to accept `0` for no deadline at all, which meant a
-peer that never drained its receive window pinned the worker permanently.
+Two limits bound what is left, and they answer different questions.
+`*max-write-backlog*` is how much may pile up; `*write-stall-timeout*` is
+how long it may sit **without moving**. Cross either and that one
+connection is closed. The deadline is measured from the last forward
+progress on the queue and not from the connection's last activity, so a
+peer that keeps sending while refusing to read cannot keep its own
+backlog alive.
+
+`*write-stall-timeout*` applies to every connection with a backlog,
+whatever state it is in — WebSocket frames, server-sent streams, ordinary
+responses to a client that stopped reading. It was called
+`*ws-send-timeout*` while it bounded a spin inside `ws-send`; that name
+would have sent anyone tuning a stalled SSE stream looking at a WebSocket
+setting, and scoping the check to WebSocket connections would have left
+long-lived streams — the state most likely to build a backlog — as the
+one state with no stall bound at all.
+
+It must be positive, and `start-server` refuses to start otherwise.
+`ws-send` checks it too, but only `ws-send` does — a handler that returns
+a frame rather than pushing one appends through a path that never sees
+it, so the startup check is what actually backs the promise.
+
+**It is an inactivity bound, not a total.** The old ten-second deadline
+was a total: one frame, ten seconds, trickle or not. This one restarts
+every time the peer accepts any bytes at all, so a client reading one
+byte per interval holds its connection open indefinitely. That is the
+deliberate trade for not holding the worker — the total bound was a total
+on the wrong thing — and the cost is capped at one connection slot plus
+`*max-write-backlog*` rather than 1/N of the server. If your deployment
+needs a hard ceiling on how long a single peer may occupy a slot, that is
+the proxy's job, not this one's.
+
+This changes the advice for fan-out. One unresponsive subscriber used to
+be enough to stall a broadcast, which was the reason to prefer your own
+queue over calling `ws-send` in a loop. It now costs that subscriber its
+own connection and nothing else. `ws-send` returns NIL when it leaves a
+remainder, so a broadcast loop that wants to know which subscribers are
+falling behind can see it without tracking anything itself.
 
 ### Logging holds the only shared lock
 
@@ -670,31 +947,32 @@ or leave large media to the reverse proxy, which is already in front of
 this server for TLS termination and is better at it. The cap is per-call,
 not global, so additive calls each bring their own budget.
 
-Static responses **omit the `Date` header** — the pre-built bytes
-are frozen at startup time and the framework will not patch each served
-response with a per-request date. This violates the RFC 7231 §7.1.1.2 `MUST`,
-but a stale `Date` from 14 hours ago would be strictly worse than none
-(CDN caches would use it as the freshness anchor).
-Downstream caches fall back to the time they received the response,
-which is correct.
-If you place web-skeleton behind a CDN or reverse proxy,
-the proxy will stamp its own `Date` on the way out —
-operators should not be surprised to see `Date` missing on `/static/*`
-when watching the upstream directly with `curl -v`.
+Static responses **carry a `Date`**, like every other response, and the
+pre-built path survives intact. RFC 7231 §7.1.1.2 makes it a `MUST` and
+this used to be the one place the server did not comply.
 
-**Dynamic responses do carry it.** `format-response` stamps `Date` on
-anything it builds, unless the handler set one itself. So compliance with
-that `MUST` depends on which path answered: `/api/thing` carries a `Date`
-and `/static/app.css` does not, from the same server, in the same second.
-Both behaviours are defensible on their own and the pair is worth knowing
-about before you write a cache rule, a conformance test, or a monitoring
-check that assumes the header is always present.
+The bytes are still built once at startup, but they are stored as pieces
+rather than as a finished response: a prefix holding the status line and
+headers, and the file's content. At request time the write queue takes
+the prefix, a date line, the blank line that ends the headers, and the
+body — four entries, no copying, no rebuild. The date line is cached per
+second per worker, so a busy second serializes one.
 
-Closing the gap is possible without giving up the pre-built path — `Date`
-has one-second granularity, so a per-worker cached header refreshed on
-the existing maintenance tick would cost nothing per request. It would
-mean moving the header out of the frozen block into a small prefix write.
-Not done; noted so the choice is visible rather than inherited.
+Nothing is patched in place. The pre-built vectors are shared by every
+worker and by every request for that file, and the write queue holds them
+by reference while it drains — a `Date` rewritten under a half-sent
+response would be a torn header with nothing to catch it. A new line is
+built when the second turns instead.
+
+Storing the body separately also retired an offset that used to matter: a
+range was sliced out of the pre-built 200 at a position derived from the
+header block's length. Anything added to the headers of one pre-built
+vector and not the other would have moved the body under the slice — a
+`206` with a correct status, a correct `Content-Length`, and content
+starting a few bytes early. No offset depends on header length now.
+
+`206` and `416` build their headers per request, so they get a `Date`
+from the ordinary serializer along with everything else.
 
 **Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
 with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work

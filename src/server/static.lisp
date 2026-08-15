@@ -79,18 +79,29 @@
    HEADERS, BODY-OFFSET and CONTENT-LENGTH exist for Range requests
    (RFC 7233). A 206 needs a fresh header set — a different
    Content-Length plus a Content-Range — so the 200's header alist is
-   kept to build from. BODY-OFFSET is where the body starts inside
-   GET-RESPONSE, which lets a range be sliced straight out of the
-   pre-built 200: the file is stored once, not twice. It is exactly the
-   length of HEAD-RESPONSE, since that is the same headers with the body
-   suppressed."
-  (get-response          nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (head-response         nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (not-modified-response nil :type (or null (simple-array (unsigned-byte 8) (*))))
+   kept to build from.
+
+   Stored in pieces rather than as finished responses, because a Date
+   has to be current and these vectors are built once at startup and
+   shared by every worker. A prefix is the status line and headers
+   *without* the blank line that ends them, so a per-request date line
+   and the terminator can be appended after it and the body after that —
+   the write queue takes them as separate vectors and copies nothing.
+
+   The pieces also retire an identity that used to be load-bearing:
+   BODY-OFFSET was where the body began inside the pre-built 200, and it
+   was exactly the length of the HEAD response because the two shared a
+   header block. Splicing anything into one and not the other would have
+   moved a body out from under a range slice — a 206 with a correct
+   status, a correct length, and content starting a few bytes early. The
+   body now lives in CONTENT on its own, so no offset depends on how long
+   the headers happen to be."
+  (head-prefix           nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (not-modified-prefix   nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (content               nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (etag                  nil :type (or null string))
   (last-modified         ""  :type string)
   (headers               nil :type list)
-  (body-offset             0 :type fixnum)
   (content-length          0 :type fixnum))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
@@ -125,11 +136,9 @@
                 ;; asking for — media players in particular check it
                 ;; before attempting to seek.
                 (cons "accept-ranges" "bytes")
-                ;; Date omitted (violates RFC 7231 §7.1.1.2 MUST).
-                ;; Pre-built responses cannot carry a per-request timestamp,
-                ;; and a stale Date would defeat max-age for caching proxies.
-                ;; Omission is the least-harmful option: caches fall back to
-                ;; received time (RFC 7234 §4.2.3), preserving correct freshness.
+                ;; Date is not here: it is appended per request, because a
+                ;; pre-built vector shared by every worker cannot carry a
+                ;; timestamp that has to be current. See HTTP-DATE-LINE.
                 (cons "last-modified" (http-date file-mtime))))
          ;; 304 responses carry validator and cache headers (ETag,
          ;; Cache-Control, Last-Modified). No Content-Type / Content-Length / body.
@@ -137,22 +146,24 @@
           (list (cons "etag" etag)
                 (cons "cache-control" cache-control)
                 (cons "last-modified" (http-date file-mtime))))
-         ;; The HEAD response is the same headers with no body, so its
-         ;; length is precisely where the body begins inside the GET
-         ;; response. That identity is what lets RANGE-RESPONSE slice a
-         ;; byte range out of the pre-built 200 instead of keeping a
-         ;; second copy of the file.
-         (head-bytes (serialize-http-message "HTTP/1.1 200 OK"
-                                             full-headers nil)))
+         ;; Serialize the whole message, then drop the two bytes of the
+         ;; blank line that ends the header block. What is left is a
+         ;; prefix a date line can be appended to. Going through
+         ;; SERIALIZE-HTTP-MESSAGE rather than building the bytes here
+         ;; keeps one implementation of header validation — the header
+         ;; names and values still get the same tchar and CTL checks
+         ;; every other response gets.
+         (head-prefix (let ((b (serialize-http-message "HTTP/1.1 200 OK"
+                                                       full-headers nil)))
+                        (subseq b 0 (- (length b) 2))))
+         (nm-prefix (let ((b (serialize-http-message "HTTP/1.1 304 Not Modified"
+                                                     not-modified-headers nil)))
+                      (subseq b 0 (- (length b) 2)))))
     (make-static-entry
-     :get-response  (serialize-http-message "HTTP/1.1 200 OK"
-                                            full-headers content)
-     :head-response head-bytes
-     :not-modified-response (serialize-http-message
-                             "HTTP/1.1 304 Not Modified"
-                             not-modified-headers nil)
+     :head-prefix head-prefix
+     :not-modified-prefix nm-prefix
+     :content content
      :headers full-headers
-     :body-offset (length head-bytes)
      :content-length (length content)
      :etag etag
      :last-modified (http-date file-mtime))))
@@ -644,15 +655,40 @@
               (etag (static-entry-etag entry)))
           (and etag (string= v etag))))))
 
+(defun static-segments (entry kind)
+  "The pieces of a static response, in wire order, for the write queue to
+   take one after another.
+
+   KIND is :GET, :HEAD, or :NOT-MODIFIED. Every one is the same shape —
+   a pre-built prefix, the current date line, the blank line that ends
+   the headers — and :GET adds the body. Nothing is copied and nothing is
+   mutated: the prefix and the body are the vectors built at startup, the
+   date line is shared by every response in its second, and the
+   terminator is a constant.
+
+   This is where the Date that a pre-built response could not carry comes
+   from, and appending it costs an entry on the queue rather than a
+   rebuild of anything."
+  (let ((prefix (ecase kind
+                  ((:get :head) (static-entry-head-prefix entry))
+                  (:not-modified (static-entry-not-modified-prefix entry)))))
+    (if (eq kind :get)
+        (list prefix (http-date-line) +header-terminator+
+              (static-entry-content entry))
+        (list prefix (http-date-line) +header-terminator+))))
+
 (defun range-response (entry first last)
   "Build a 206 Partial Content response covering the inclusive byte range
-   FIRST..LAST of ENTRY. The body is sliced straight out of the pre-built
-   200 response — the file lives in memory once."
+   FIRST..LAST of ENTRY. The body is sliced out of the stored content —
+   the file lives in memory once.
+
+   Built per request, so unlike the pre-built responses it gets its Date
+   through the ordinary header alist."
   (let* ((total (static-entry-content-length entry))
          (len (1+ (- last first)))
-         (start (+ (static-entry-body-offset entry) first))
-         (body (subseq (static-entry-get-response entry) start (+ start len)))
+         (body (subseq (static-entry-content entry) first (+ first len)))
          (headers (append
+                   (list (cons "date" (http-date)))
                    ;; Content-Length must describe the range, not the file.
                    (remove "content-length" (static-entry-headers entry)
                            :key #'car :test #'string-equal)
@@ -673,7 +709,8 @@
     (serialize-http-message
      "HTTP/1.1 416 Range Not Satisfiable"
      (append
-      (list (cons "content-range"
+      (list (cons "date" (http-date))
+            (cons "content-range"
                   (format nil "bytes */~d" (static-entry-content-length entry)))
             (cons "content-length" "0")
             (cons "accept-ranges" "bytes"))
@@ -718,7 +755,7 @@
                 (cond
                   ((if-none-match-hit-p (get-header request "if-none-match")
                                         (static-entry-etag entry))
-                   (static-entry-not-modified-response entry))
+                   (static-segments entry :not-modified))
                   ;; If-Modified-Since: exact string match against our
                   ;; stored Last-Modified value (no date arithmetic).
                   ;; RFC 7232 §3.3: MUST ignore IMS when INM is present.
@@ -726,7 +763,7 @@
                         (let ((ims (get-header request "if-modified-since")))
                           (and ims
                                (string= ims (static-entry-last-modified entry)))))
-                   (static-entry-not-modified-response entry))
+                   (static-segments entry :not-modified))
                   ;; Range (RFC 7233) — GET only, and evaluated after the
                   ;; conditional checks above per RFC 7232 §6: a client
                   ;; that already holds the current bytes gets its 304
@@ -741,15 +778,15 @@
                      (cond
                        ;; If-Range says "only if unchanged", and it changed.
                        ((not (if-range-matches-p request entry))
-                        (static-entry-get-response entry))
+                        (static-segments entry :get))
                        ((eq first :unsatisfiable)
                         (range-not-satisfiable-response entry))
                        (first
                         (range-response entry first last))
                        ;; Unparseable / multi-range → ignore, serve it whole.
                        (t
-                        (static-entry-get-response entry)))))
+                        (static-segments entry :get)))))
                   ((eq method :GET)
-                   (static-entry-get-response entry))
+                   (static-segments entry :get))
                   (t
-                   (static-entry-head-response entry)))))))))))
+                   (static-segments entry :head)))))))))))

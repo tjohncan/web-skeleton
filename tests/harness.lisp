@@ -41,11 +41,29 @@
 
 (defun find-free-port ()
   "Bind a temporary socket to port 0, let the kernel pick a free port,
-   then close and return it. There is a tiny race between close and the
-   caller's rebind — another process could theoretically grab the port
-   in the gap — but in practice this is reliable for localhost tests.
-   If it ever flakes in CI, the fix is to teach START-SERVER to accept
-   port 0 and propagate the assigned port back to the caller."
+   then close and return it.
+
+   There is a race between that close and the caller's rebind, and it is
+   not theoretical — it has cost two investigations. What this docstring
+   used to get wrong was the symptom. It assumed a collision would show
+   up as a bind failure; every listener sets SO_REUSEPORT, so the second
+   bind *succeeds* and the kernel load-balances between two servers on
+   one port. Measured, with two suites racing: 40 requests split 17/23,
+   no error, no warning, nothing in either log.
+
+   What that looks like from inside a test is a request answered by the
+   other suite's handler, or accepted into the backlog of a server that
+   is mid-teardown and never answers. Ten seconds later, a read deadline
+   expires in a test that has nothing to do with whatever was being
+   changed at the time.
+
+   The durable fix is the one this docstring already named: teach
+   START-SERVER to accept port 0 and report the bound port back, so the
+   listener exists before the number can be handed to anyone else. Until
+   then CALL-WITH-TEST-SERVER probes for a nonce, which does not close
+   the window but does turn a ten-minute mystery into a named failure.
+
+   Operationally: one suite at a time on a machine."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                :type :stream :protocol :tcp)))
     (unwind-protect
@@ -56,6 +74,39 @@
              (declare (ignore host))
              port))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun check-owns-port (nonce)
+  "Confirm the server answering *TEST-PORT* is the one this test started.
+
+   Cannot close FIND-FREE-PORT's window — the durable fix for that is a
+   START-SERVER that reports its own bound port. What it does is name the
+   failure. With SO_REUSEPORT two servers can hold one port and the
+   kernel splits traffic between them silently, so the symptom is a
+   request answered by someone else's handler, or a connection accepted
+   by a server that is shutting down and will never reply. Left alone
+   that surfaces ten seconds later as a read deadline in an unrelated
+   test, and costs an afternoon.
+
+   Probing once per server start catches roughly half of any given
+   collision, which across a suite of forty is plenty — and one clear
+   line beats one silent hang.
+
+   Raises only on positive evidence: a 200 whose body is somebody else's.
+   Anything else is inconclusive and passes, because some tests lower
+   *MAX-CONNECTIONS* far enough that this probe itself draws the
+   framework's own 503, and a check that breaks the tests it is meant to
+   protect is worse than the hang it replaces."
+  (multiple-value-bind (status headers body)
+      (handler-case (test-http-request :get "/__nonce")
+        (error () (values :error nil nil)))
+    (declare (ignore headers))
+    (when (and (eql status 200) (not (equal body nonce)))
+      (error "test server on port ~d is not ours: expected nonce ~s, got ~s. ~
+              Another process is bound to the same port — every listener ~
+              sets SO_REUSEPORT, so a collision shares the port instead of ~
+              failing the bind, and the kernel splits traffic between the ~
+              two. Run one suite at a time; see FIND-FREE-PORT."
+             *test-port* nonce body))))
 
 (defun wait-for-port (port &key (timeout 5))
   "Poll PORT every 50ms until it accepts a TCP connection, or TIMEOUT
@@ -108,19 +159,33 @@
           web-skeleton:*drain-timeout* 1
           web-skeleton:*shutdown-poll-interval* 0.05)
     (unwind-protect
-         (let ((server-thread
-                 (sb-thread:make-thread
-                  (lambda ()
-                    (start-server :host #(127 0 0 1)
-                                  :port port
-                                  :workers 1
-                                  :handler handler
-                                  :ws-handler ws-handler))
-                  :name "web-skeleton-test-server")))
+         (let* ((nonce (format nil "~36r~36r" (random (expt 36 8))
+                               (get-internal-real-time)))
+                (server-thread
+                  (sb-thread:make-thread
+                   (lambda ()
+                     (start-server :host #(127 0 0 1)
+                                   :port port
+                                   :workers 1
+                                   ;; Wrapped so every server answers one
+                                   ;; reserved path with its own nonce,
+                                   ;; whatever the test's handler does.
+                                   ;; The app handler never sees the probe.
+                                   :handler
+                                   (lambda (req)
+                                     (if (string= (http-request-path req)
+                                                  "/__nonce")
+                                         (make-text-response 200 nonce)
+                                         (if handler
+                                             (funcall handler req)
+                                             (make-error-response 501))))
+                                   :ws-handler ws-handler))
+                   :name "web-skeleton-test-server")))
            (unwind-protect
                 (progn
                   (wait-for-port port)
                   (let ((*test-port* port))
+                    (check-owns-port nonce)
                     (funcall thunk)))
              ;; Teardown: signal shutdown, join with a bounded timeout,
              ;; fall back to TERMINATE-THREAD if the graceful path

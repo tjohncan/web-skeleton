@@ -276,67 +276,58 @@
    (build-ws-frame +ws-op-ping+
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
-(defparameter *ws-send-timeout* 10
-  "Seconds before WS-SEND gives up writing a frame. Must be positive.
-
-   There is no setting that disables the deadline. This used to accept 0
-   for no deadline at all, which meant a peer that stopped draining its
-   receive window pinned a worker permanently — see the blast radius
-   note below, and note that the thing being pinned is not one
-   connection.")
-
 ;;; ---------------------------------------------------------------------------
-;;; Synchronous frame send
+;;; Frame send
 ;;;
-;;; Writes a complete WebSocket frame to a connection, blocking until
-;;; all bytes are flushed.  Intended for use inside ws-handler — the
-;;; event loop is paused while the handler runs, so there is no
-;;; contention with pings or other writes.
+;;; Queues a frame and flushes what the socket will accept right now.
+;;; Intended for use inside ws-handler — the event loop is paused while
+;;; the handler runs, so there is no contention with pings or other writes.
 ;;;
-;;; Blast radius: "blocking" means the worker, not the connection. The
-;;; event loop being paused is the one serving every other connection on
-;;; this worker, so one peer that stops reading freezes all of them for
-;;; up to *WS-SEND-TIMEOUT*. With (CPU-COUNT) workers that is 1/N of the
-;;; server's capacity held for ten seconds by a single slow client, and
-;;; N slow clients arriving together is a full stall. This is a property
-;;; of the synchronous design rather than a bug in it — an app that
-;;; broadcasts to many peers, or serves any peer it does not control,
-;;; wants to know the number before it picks this over its own queue.
+;;; The flush is opportunistic: one non-blocking pass, no spin and no
+;;; deadline. A pure append would have been simpler, and wrong — the
+;;; event loop does not turn while a handler runs, so nothing would reach
+;;; the peer until the handler returned, and a handler that streams for
+;;; thirty seconds is the documented use. The pass keeps incremental
+;;; delivery for a peer that is keeping up, and a peer that is not gets
+;;; its bytes queued instead of freezing the worker.
+;;;
+;;; Arming EPOLLOUT is deliberately not done here. WS-SEND has no epoll
+;;; fd, and threading one through an exported function to arm it once per
+;;; frame would re-register the same interest repeatedly for a handler
+;;; sending in a loop. HANDLE-CLIENT-READ arms once, after the handler
+;;; returns, only if anything is still pending.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
-  "Send FRAME-BYTES to CONN synchronously, blocking until fully written.
+  "Queue FRAME-BYTES for CONN and flush as much as the socket takes now.
    FRAME-BYTES should be a byte vector from BUILD-WS-TEXT, BUILD-WS-FRAME, etc.
-   Safe to call from within ws-handler — the event loop is paused while the
-   handler runs, so there is no write contention. That pause covers every
-   other connection on this worker, not just this one; see the blast
-   radius note above.
-   Signals an error if the write exceeds *ws-send-timeout*."
-  (unless (plusp *ws-send-timeout*)
-    (error "ws-send: *ws-send-timeout* is ~s; it must be positive. There is ~
-            no unbounded setting, because this write holds the worker and a ~
-            peer that never drains would hold it forever."
-           *ws-send-timeout*))
-  (let ((fd (connection-fd conn))
-        (pos 0)
-        (end (length frame-bytes))
-        (deadline (+ (get-internal-real-time)
-                     (* *ws-send-timeout* internal-time-units-per-second))))
-    (flet ((remaining-ms ()
-             ;; Milliseconds to deadline, clamped non-negative.
-             (max 0 (floor (* 1000 (- deadline (get-internal-real-time)))
-                           internal-time-units-per-second))))
-      (loop while (< pos end)
-            do (when (>= (get-internal-real-time) deadline)
-                 (error "ws-send: timed out after ~ds" *ws-send-timeout*))
-               (let ((result (nb-write fd frame-bytes pos (- end pos))))
-                 (if (eq result :again)
-                     ;; Clamp the poll wait to the remaining deadline so a
-                     ;; peer stalled with a partial flush in flight cannot
-                     ;; push the effective timeout past *ws-send-timeout* by
-                     ;; up to 1000 ms on each :again.
-                     (poll-writable fd (min 1000 (remaining-ms)))
-                     (incf pos result)))))))
+   Returns T if everything reached the kernel, NIL if a remainder is queued.
+
+   Does not block. Bytes may still be in the queue when this returns, and
+   the event loop flushes the rest — so a NIL return is the normal way a
+   slow peer looks, not an error. Failures of the flush itself do surface
+   here; failures of the deferred remainder surface on the event loop.
+
+   Call it from within ws-handler. The event loop is paused while the
+   handler runs, so there is no write contention, and this is the only
+   context that owns the connection.
+
+   Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
+   is not queued, not truncated, and the peer is far enough behind that
+   dropping it silently would leave the app's view and the peer's view of
+   the stream permanently different."
+  (unless (plusp *write-stall-timeout*)
+    (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
+            There is no unbounded setting, because it is the only ~
+            deadline on a queue this connection may never drain."
+           *write-stall-timeout*))
+  (unless (connection-append-write conn frame-bytes)
+    (error "ws-send: fd ~d is at *max-write-backlog* (~d bytes pending, ~
+            frame is ~d); the peer is not draining."
+           (connection-fd conn)
+           (connection-write-pending conn)
+           (length frame-bytes)))
+  (eq (connection-on-write conn) :done))
 
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."

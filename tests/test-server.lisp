@@ -1452,11 +1452,31 @@
                   "*MAX-STREAMING-LINE-SIZE*"
                   "*MAX-WS-PAYLOAD-SIZE*"
                   "*MAX-WS-MESSAGE-SIZE*"
-                  ;; WS-SEND is exported; its only tuning knob was not, so
-                  ;; the deadline that decides how long one slow peer may
-                  ;; hold a whole worker was unreachable through the
-                  ;; public API. A limit nobody can set is not a limit.
-                  "*WS-SEND-TIMEOUT*"))
+                  ;; The two limits on the write queue. They are a pair —
+                  ;; too much queued, and queued too long — and a
+                  ;; deployment that can set one but not the other can
+                  ;; only half-tune a slow peer. A limit nobody can set
+                  ;; is not a limit.
+                  "*MAX-WRITE-BACKLOG*"
+                  "*WRITE-STALL-TIMEOUT*"
+                  ;; The stream knobs, and the surface an app reaches
+                  ;; them through. A handler in another package that
+                  ;; cannot name MAKE-STREAM-RESPONSE cannot stream at
+                  ;; all, and one that cannot name the timeouts gets the
+                  ;; defaults whatever it writes in its config block.
+                  "*STREAM-IDLE-TIMEOUT*"
+                  "*STREAM-KEEPALIVE-INTERVAL*"
+                  "MAKE-STREAM-RESPONSE"
+                  "STREAM-SEND"
+                  "STREAM-CLOSE"
+                  "STREAM-FULL-P"
+                  "MAKE-SSE-RESPONSE"
+                  "SSE-SEND"
+                  "SSE-COMMENT"
+                  ;; The backpressure half of :on-body. An app that
+                  ;; pauses and cannot name the function that resumes has
+                  ;; a relay that stops mid-body.
+                  "FETCH-RESUME"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -3039,7 +3059,7 @@
             (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
 
-  ;; *ws-send-timeout* used to document 0 as "disable", which set no
+  ;; *write-stall-timeout* used to document 0 as "disable", which set no
   ;; deadline and left the write loop with no exit — a peer that stopped
   ;; draining its receive window pinned the worker permanently, and the
   ;; worker is every other connection on it, not just this one. An empty
@@ -3048,20 +3068,20 @@
   (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (check "ws-send: zero timeout refused"
-           (let ((*ws-send-timeout* 0))
+           (let ((*write-stall-timeout* 0))
              (handler-case (progn (web-skeleton::ws-send conn empty) nil)
-               (error (e) (not (null (search "*ws-send-timeout*"
+               (error (e) (not (null (search "*write-stall-timeout*"
                                              (princ-to-string e)))))))
            t)
     (check "ws-send: negative timeout refused"
-           (let ((*ws-send-timeout* -1))
+           (let ((*write-stall-timeout* -1))
              (handler-case (progn (web-skeleton::ws-send conn empty) nil)
                (error () t)))
            t)
     ;; A positive value still passes the guard, or the two checks above
     ;; would be satisfied by a function that refused everything.
     (check "ws-send: positive timeout passes the guard"
-           (let ((*ws-send-timeout* 10))
+           (let ((*write-stall-timeout* 10))
              (handler-case (progn (web-skeleton::ws-send conn empty) :sent)
                (error () :error)))
            :sent))
@@ -3475,8 +3495,8 @@
     (check "static-entry: etag is sha256 of content"
            (web-skeleton::static-entry-etag entry)
            (format nil "\"~a\"" (sha256-hex content)))
-    (check "static-entry: not-modified response pre-built"
-           (not (null (web-skeleton::static-entry-not-modified-response entry)))
+    (check "static-entry: not-modified prefix pre-built"
+           (not (null (web-skeleton::static-entry-not-modified-prefix entry)))
            t))
 
   ;; Same content → same etag (deterministic)
@@ -3546,19 +3566,19 @@
                            "public, max-age=31536000, immutable")))
       (check "cache-control: default present on GET"
              (header-present-p
-              (web-skeleton::static-entry-get-response default-entry)
+              (web-skeleton::static-entry-head-prefix default-entry)
               "cache-control: public, max-age=3600") t)
       (check "cache-control: default present on 304"
              (header-present-p
-              (web-skeleton::static-entry-not-modified-response default-entry)
+              (web-skeleton::static-entry-not-modified-prefix default-entry)
               "cache-control: public, max-age=3600") t)
       (check "cache-control: custom string present on GET"
              (header-present-p
-              (web-skeleton::static-entry-get-response custom-entry)
+              (web-skeleton::static-entry-head-prefix custom-entry)
               "cache-control: public, max-age=31536000, immutable") t)
       (check "cache-control: custom string present on 304"
              (header-present-p
-              (web-skeleton::static-entry-not-modified-response custom-entry)
+              (web-skeleton::static-entry-not-modified-prefix custom-entry)
               "cache-control: public, max-age=31536000, immutable") t)))
 
   ;; ---- LOAD-STATIC-FILES aliases ----
@@ -3756,14 +3776,23 @@
          (progn
            (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
            (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           ;; SERVE-STATIC answers either as one vector (the ranged and
+           ;; 416 paths, built per request) or as the segments a
+           ;; pre-built response is assembled from. What a client sees is
+           ;; the concatenation either way, and that is what these
+           ;; assertions are about.
            (flet ((fetch (&rest headers)
-                    (let ((bytes (serve-static
-                                  (make-test-request :method :GET
-                                                     :path "/data.txt"
-                                                     :headers headers))))
-                      (and bytes
+                    (let ((r (serve-static
+                              (make-test-request :method :GET
+                                                 :path "/data.txt"
+                                                 :headers headers))))
+                      (and r
                            (sb-ext:octets-to-string
-                            bytes :external-format :latin-1))))
+                            (if (consp r)
+                                (apply #'concatenate
+                                       '(vector (unsigned-byte 8)) r)
+                                r)
+                            :external-format :latin-1))))
                   (body-of (text)
                     (let ((i (search (format nil "~a~a~a~a"
                                              #\Return #\Newline
@@ -3834,13 +3863,17 @@
                                                      entry))))))
                     t)
              ;; HEAD has no body, so a Range on it is meaningless.
-             (let ((head (let ((bytes (serve-static
-                                       (make-test-request
-                                        :method :HEAD :path "/data.txt"
-                                        :headers (list (cons "range"
-                                                             "bytes=0-3"))))))
-                           (sb-ext:octets-to-string bytes
-                                                    :external-format :latin-1))))
+             (let ((head (let ((r (serve-static
+                                   (make-test-request
+                                    :method :HEAD :path "/data.txt"
+                                    :headers (list (cons "range"
+                                                         "bytes=0-3"))))))
+                           (sb-ext:octets-to-string
+                            (if (consp r)
+                                (apply #'concatenate
+                                       '(vector (unsigned-byte 8)) r)
+                                r)
+                            :external-format :latin-1))))
                (check "range: HEAD ignores range, stays 200"
                       (not (null (search "200 OK" head))) t)
                (check "range: HEAD emits no body"
@@ -4248,6 +4281,1538 @@
              state :closing))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Write queue
+;;;
+;;; CONNECTION-APPEND-WRITE queues behind whatever is pending instead of
+;;; replacing it. The bookkeeping is testable with no fd at all; the part
+;;; that needs one is CONNECTION-ON-WRITE promoting the next vector when
+;;; the head drains, which is what makes queueing mean anything.
+;;;
+;;; The drain test asserts file *contents*, not the return value. A
+;;; snapshotted ON-WRITE also returns :DONE — it just stops after the
+;;; first vector and waits for an EPOLLOUT that is not coming, so a
+;;; check on :DONE alone would pass against the bug it exists to catch.
+;;; ---------------------------------------------------------------------------
+
+(defun test-write-queue ()
+  (format t "~%Write queue~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
+         (str (v) (sb-ext:octets-to-string v :external-format :ascii)))
+    ;; --- Append onto an idle connection becomes the head, no cons ---
+    (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (check "append: accepted on idle connection"
+             (web-skeleton::connection-append-write conn (bytes "hello")) t)
+      (check "append: idle append becomes the head"
+             (str (web-skeleton::connection-write-buf conn)) "hello")
+      (check "append: idle append does not use the queue"
+             (web-skeleton::connection-write-queue conn) nil)
+      (check "append: pending counts the head"
+             (web-skeleton::connection-write-pending conn) 5)
+
+      ;; --- Second append goes behind, head untouched ---
+      (check "append: accepted behind a head"
+             (web-skeleton::connection-append-write conn (bytes "world!")) t)
+      (check "append: head is not replaced"
+             (str (web-skeleton::connection-write-buf conn)) "hello")
+      (check "append: pending spans head and queue"
+             (web-skeleton::connection-write-pending conn) 11)
+      (check "append: queued counts only the tail"
+             (web-skeleton::connection-write-queued conn) 6)
+
+      ;; --- Order is preserved across a third ---
+      (web-skeleton::connection-append-write conn (bytes "third"))
+      (check "append: queue holds tail vectors oldest first"
+             (mapcar #'str (web-skeleton::connection-write-queue conn))
+             '("world!" "third"))
+
+      ;; --- QUEUE-WRITE's guard counts the queue, not just the head ---
+      ;; Drain the head only; a queue remains. The old guard subtracted
+      ;; write-pos from write-end and would have seen zero here.
+      (setf (web-skeleton::connection-write-pos conn)
+            (web-skeleton::connection-write-end conn))
+      (check "queue-write: signals when only the append queue is pending"
+             (handler-case (progn (web-skeleton::connection-queue-write
+                                   conn (bytes "clobber"))
+                                  nil)
+               (error () t))
+             t)
+
+      ;; --- Promotion walks the queue in order and unwinds the counter ---
+      (check "promote: first promotion takes the oldest"
+             (progn (web-skeleton::connection-promote-write conn)
+                    (str (web-skeleton::connection-write-buf conn)))
+             "world!")
+      (check "promote: promotion resets the head offsets"
+             (list (web-skeleton::connection-write-pos conn)
+                   (web-skeleton::connection-write-end conn))
+             '(0 6))
+      (check "promote: second promotion takes the next"
+             (progn (setf (web-skeleton::connection-write-pos conn) 6)
+                    (web-skeleton::connection-promote-write conn)
+                    (str (web-skeleton::connection-write-buf conn)))
+             "third")
+      (check "promote: queued returns to zero when the tail empties"
+             (web-skeleton::connection-write-queued conn) 0)
+      (check "promote: tail pointer is released with the last cons"
+             (web-skeleton::connection-write-queue-tail conn) nil)
+      (check "promote: empty queue reports nothing to promote"
+             (progn (setf (web-skeleton::connection-write-pos conn) 5)
+                    (web-skeleton::connection-promote-write conn))
+             nil))
+
+    ;; --- RESET-WRITE clears the queue along with the head ---
+    ;; A queued vector surviving a keep-alive reset would be flushed as a
+    ;; prefix of the next response on the same socket.
+    (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (web-skeleton::connection-append-write conn (bytes "first"))
+      (web-skeleton::connection-append-write conn (bytes "second"))
+      (web-skeleton::connection-reset-write conn)
+      (check "reset: head cleared"
+             (web-skeleton::connection-write-buf conn) nil)
+      (check "reset: queue cleared"
+             (web-skeleton::connection-write-queue conn) nil)
+      (check "reset: tail pointer cleared"
+             (web-skeleton::connection-write-queue-tail conn) nil)
+      (check "reset: nothing reported pending"
+             (web-skeleton::connection-write-pending conn) 0))
+
+    ;; --- The backlog bound refuses whole rather than appending a prefix ---
+    ;; LET is safe for the limit here: these calls run on this thread, not
+    ;; through a worker, so the binding is in scope for every one of them.
+    (let ((web-skeleton:*max-write-backlog* 10)
+          (conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (check "backlog: empty connection is not full"
+             (web-skeleton::connection-write-full-p conn) nil)
+      (check "backlog: append within the bound accepted"
+             (web-skeleton::connection-append-write conn (bytes "12345678")) t)
+      (check "backlog: append past the bound refused"
+             (web-skeleton::connection-append-write conn (bytes "999")) nil)
+      (check "backlog: refused append queues nothing"
+             (web-skeleton::connection-write-pending conn) 8)
+      (check "backlog: an exact fit is still accepted"
+             (web-skeleton::connection-append-write conn (bytes "99")) t)
+      (check "backlog: reaching the bound reports full"
+             (web-skeleton::connection-write-full-p conn) t))
+
+    ;; --- The queue never holds the caller's own vector ---
+    ;; A producer reusing one buffer is the obvious way to write one, and
+    ;; the queue advances an offset through what it is given. Chunked
+    ;; framing copies because ENCODE-CHUNK builds a new vector; close
+    ;; framing has nothing to build, so it has to copy on purpose. An app
+    ;; cannot see which framing it got.
+    (let ((sink (open "/dev/null" :direction :output
+                                  :element-type '(unsigned-byte 8)
+                                  :if-exists :append)))
+      (unwind-protect
+           (let ((conn (web-skeleton::make-connection
+                        :fd (sb-sys:fd-stream-fd sink)
+                        :state :streaming :last-active 0))
+                 (buf (make-array 4 :element-type '(unsigned-byte 8)
+                                    :initial-element 65)))
+             (setf (web-skeleton::connection-stream-framing conn) :close)
+             (web-skeleton:stream-send conn buf)
+             (fill buf 90)
+             (check "stream-send: close framing copies the caller's vector"
+                    (sb-ext:octets-to-string
+                     (subseq (web-skeleton::connection-write-buf conn) 0 4)
+                     :external-format :ascii)
+                    "AAAA"))
+        (ignore-errors (close sink))))
+
+    ;; --- The bound must clear the inbound message cap by a frame header ---
+    ;; At default settings the receive path accepts a payload of exactly
+    ;; *MAX-WS-MESSAGE-SIZE* (websocket.lisp tests > , not >=). Sending that
+    ;; back means framing it, and BUILD-WS-FRAME spends 10 bytes on the
+    ;; extended-length header for any payload past 65535. A bound merely
+    ;; equal to the message cap therefore refuses a maximal legal echo onto
+    ;; a completely empty queue. The two limits are exported and tunable
+    ;; apart, so the relationship is a requirement to hold, not an identity
+    ;; to assume.
+    (let* ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+           (payload (make-array web-skeleton:*max-ws-message-size*
+                                :element-type '(unsigned-byte 8)
+                                :initial-element 65))
+           (frame (web-skeleton::build-ws-frame
+                   web-skeleton::+ws-op-binary+ payload)))
+      (check "backlog: headroom over the message cap covers a frame header"
+             (>= (- web-skeleton:*max-write-backlog*
+                    web-skeleton:*max-ws-message-size*)
+                 10)
+             t)
+      (check "backlog: a maximal legal ws message fits an empty queue"
+             (web-skeleton::connection-append-write conn frame) t))))
+
+(defun test-write-queue-drain ()
+  (format t "~%Write queue drain~%")
+  (let ((path "/tmp/web-skeleton-write-queue.bin"))
+    (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
+           (str (v) (sb-ext:octets-to-string v :external-format :ascii))
+           (slurp ()
+             (with-open-file (s path :element-type '(unsigned-byte 8))
+               (let ((buf (make-array (file-length s)
+                                      :element-type '(unsigned-byte 8))))
+                 (read-sequence buf s)
+                 (sb-ext:octets-to-string buf :external-format :ascii)))))
+      ;; A regular file fd never reports EAGAIN and never short-writes, so
+      ;; ON-WRITE runs to completion in one pass and the file is exactly
+      ;; the byte stream the peer would have seen.
+      (let* ((stream (open path :direction :output :element-type '(unsigned-byte 8)
+                               :if-exists :supersede :if-does-not-exist :create))
+             (fd (sb-sys:fd-stream-fd stream))
+             (shared (bytes "SHARED")))
+        (unwind-protect
+             (let ((conn (web-skeleton::make-connection :fd fd :last-active 0)))
+               (web-skeleton::connection-queue-write conn (bytes "AAA"))
+               (web-skeleton::connection-append-write conn (bytes "BB"))
+               (web-skeleton::connection-append-write conn shared)
+               ;; Same vector twice: the queue holds references, so this is
+               ;; the case that would break if the head were ever compacted
+               ;; in place. Static serving hands one vector to every request.
+               (web-skeleton::connection-append-write conn shared)
+               (check "drain: one pass reports done"
+                      (web-skeleton::connection-on-write conn) :done)
+               (check "drain: nothing left pending"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "drain: shared vector is not mutated"
+                      (str shared) "SHARED"))
+          (ignore-errors (close stream))))
+      ;; The whole queue reached the wire, in order. A snapshotted ON-WRITE
+      ;; stops after "AAA".
+      (check "drain: every queued vector is written, in order"
+             (slurp) "AAABBSHAREDSHARED")
+      (ignore-errors (delete-file path)))))
+
+;;; ---------------------------------------------------------------------------
+;;; ws-send queues instead of spinning
+;;;
+;;; Needs a fd that genuinely returns EAGAIN, which a regular file never
+;;; does. A pipe to a child that never reads its stdin is deterministic:
+;;; the buffer is 64 KiB, `sleep` does not drain it, so a payload past
+;;; that size is guaranteed to leave a remainder.
+;;;
+;;; The elapsed-time check is the point of the whole item. The old ws-send
+;;; sat in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT* expired,
+;;; holding the worker and every other connection on it. Against this
+;;; fixture — a peer that never reads at all — that is a full ten seconds.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-send-queues ()
+  (format t "~%ws-send queueing~%")
+  (let ((proc (sb-ext:run-program "/bin/sleep" '("30")
+                                  :input :stream :output nil :wait nil)))
+    (unwind-protect
+         (let* ((fd (sb-sys:fd-stream-fd (sb-ext:process-input proc)))
+                (conn (web-skeleton::make-connection
+                       :fd fd :state :websocket :last-active 0))
+                (big (web-skeleton::build-ws-frame
+                      web-skeleton::+ws-op-binary+
+                      (make-array (* 256 1024) :element-type '(unsigned-byte 8)
+                                               :initial-element 88)))
+                (small (web-skeleton::build-ws-frame
+                        web-skeleton::+ws-op-binary+
+                        (make-array 100 :element-type '(unsigned-byte 8)
+                                        :initial-element 89))))
+           (web-skeleton::set-nonblocking fd)
+           (let* ((start (get-internal-real-time))
+                  ;; Caught rather than allowed to propagate: a ws-send that
+                  ;; went back to blocking would raise its timeout here and
+                  ;; end the run with a backtrace instead of a failed check.
+                  (flushed (handler-case (web-skeleton::ws-send conn big)
+                             (error (e) (format nil "signalled: ~a" e))))
+                  (elapsed (/ (- (get-internal-real-time) start)
+                              internal-time-units-per-second)))
+             (check "ws-send: reports a remainder rather than full delivery"
+                    flushed nil)
+             (check "ws-send: the remainder is queued"
+                    (plusp (web-skeleton::connection-write-pending conn)) t)
+             (check "ws-send: returns without waiting for the peer"
+                    (< elapsed 1) t))
+           ;; Append, not substitute. The old ws-send never touched the
+           ;; connection's buffer at all; the new one must add to it.
+           (let ((before (web-skeleton::connection-write-pending conn)))
+             ;; Caught for the same reason as the first send: a blocking
+             ;; ws-send raises here, and an unhandled raise ends the run
+             ;; instead of reporting. The delta check below still tells
+             ;; the two apart — a send that raised queued nothing.
+             (handler-case (web-skeleton::ws-send conn small) (error () nil))
+             (check "ws-send: a second frame is appended behind the first"
+                    (- (web-skeleton::connection-write-pending conn) before)
+                    (length small)))
+           ;; The invariant the sweeps depend on: a drained head never sits
+           ;; in front of a non-empty queue, because ON-WRITE promotes
+           ;; before it returns and APPEND takes the head slot whenever
+           ;; nothing is pending. Asserted after a real partial write, not
+           ;; argued.
+           (flet ((head-drained-with-queue-p ()
+                    (and (zerop (- (web-skeleton::connection-write-end conn)
+                                   (web-skeleton::connection-write-pos conn)))
+                         (web-skeleton::connection-write-queue conn))))
+             (check "ws-send: no drained head in front of a queue"
+                    (head-drained-with-queue-p) nil)
+             (web-skeleton::connection-on-write conn)
+             (check "ws-send: still none after another write pass"
+                    (head-drained-with-queue-p) nil))
+           ;; At the bound ws-send signals. It must not truncate the frame
+           ;; and must not drop it quietly.
+           (let ((web-skeleton:*max-write-backlog*
+                   (web-skeleton::connection-write-pending conn))
+                 (pending-before (web-skeleton::connection-write-pending conn)))
+             (check "ws-send: signals at the backlog bound"
+                    (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                      (error () t))
+                    t)
+             (check "ws-send: the refused frame queued nothing"
+                    (web-skeleton::connection-write-pending conn)
+                    pending-before)))
+      (ignore-errors (sb-ext:process-kill proc 9))
+      (ignore-errors (sb-ext:process-wait proc))
+      ;; PROCESS-KILL and PROCESS-WAIT reap the child; neither closes the
+      ;; pipe SBCL opened for :INPUT :STREAM. Without this the fd stays
+      ;; open for the rest of the run — the Server suite's one leak.
+      (ignore-errors (sb-ext:process-close proc)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The write-stall deadline
+;;;
+;;; *write-stall-timeout* used to bound a spin inside ws-send. It now bounds
+;;; how long a connection may sit on a backlog that is not moving. The
+;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
+;;; a day, and a peer that has stopped reading may still be sending, which
+;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
+;;; current — that is precisely the case the idle timeout would miss.
+;;;
+;;; The sweep asks whether there is a backlog and whether it has moved,
+;;; not what state the connection is in. It used to name :WEBSOCKET, which
+;;; left every other state — including the long-lived ones most likely to
+;;; build a backlog — with no stall bound at all, so a second state is
+;;; swept here to hold the generalization in place.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-write-stall-sweep ()
+  (format t "~%Write stall sweep~%")
+  (flet ((sweep-one (&key stalled (state :websocket))
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (log (make-string-output-stream))
+                 (now (get-universal-time)))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd connfd :state state
+                               ;; Fresh, so the idle sweep has no interest.
+                               :last-active now))
+                        (web-skeleton::*connections* (make-hash-table :test #'eql))
+                        (web-skeleton:*log-level* :info)
+                        (web-skeleton:*log-stream* log))
+                    (web-skeleton::epoll-add
+                     epfd connfd (logior web-skeleton::+epollin+
+                                         web-skeleton::+epollet+))
+                    ;; A backlog that exists either way; only its age differs.
+                    (web-skeleton::connection-append-write
+                     conn (make-array 64 :element-type '(unsigned-byte 8)))
+                    (setf (web-skeleton::connection-write-progress-at conn)
+                          (if stalled
+                              (- now web-skeleton:*write-stall-timeout* 1)
+                              now))
+                    (web-skeleton::register-connection conn)
+                    (web-skeleton::sweep-idle-connections epfd now)
+                    (list (hash-table-count web-skeleton::*connections*)
+                          (get-output-stream-string log)))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Control: same backlog, progress just made. Must survive — and would
+    ;; also survive the old code, which is why the stalled case below is
+    ;; what carries the check.
+    (destructuring-bind (count log) (sweep-one)
+      (check "ws stall: a moving backlog is left alone" count 1)
+      (check "ws stall: control logs nothing about stalling"
+             (search "stalled" log) nil))
+
+    ;; Stalled past the deadline with LAST-ACTIVE fresh: the idle sweep
+    ;; would never touch this connection.
+    (destructuring-bind (count log) (sweep-one :stalled t)
+      (check "ws stall: a stalled backlog is closed" count 0)
+      (check "ws stall: the log names the reason"
+             (and (search "write stalled" log) t) t))
+
+    ;; A state that is not :WEBSOCKET. Gating the clause on one state left
+    ;; the long-lived ones — the ones that queue most — unbounded.
+    (destructuring-bind (count log) (sweep-one :stalled t :state :write-response)
+      (check "stall: a non-websocket state is swept too" count 0)
+      (check "stall: and the log names which state it was"
+             (and (search "WRITE-RESPONSE" log :test #'char-equal) t) t))
+    (destructuring-bind (count log) (sweep-one :state :write-response)
+      (declare (ignore log))
+      (check "stall: a moving non-websocket backlog is left alone" count 1))))
+
+;;; ---------------------------------------------------------------------------
+;;; Chunked encoder
+;;;
+;;; The generated property covers agreement with the three readers. These
+;;; are the cases worth naming rather than discovering: the byte-exact
+;;; wire shape, and the two ways a plausible encoder corrupts a stream
+;;; while emitting bytes every reader accepts.
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunked-encoder ()
+  (format t "~%Chunked encoder~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1)))
+
+    ;; --- The wire shape is the intersection, not any reader's tolerance ---
+    (check "encode-chunk: size line is bare lowercase hex plus CRLF"
+           (str (web-skeleton::encode-chunk (bytes "hello")))
+           (format nil "5~c~chello~c~c" #\Return #\Newline #\Return #\Newline))
+    (check "encode-chunk: multi-digit sizes stay lowercase hex"
+           (subseq (str (web-skeleton::encode-chunk
+                         (make-array 255 :element-type '(unsigned-byte 8)
+                                         :initial-element 65)))
+                   0 4)
+           (format nil "ff~c~c" #\Return #\Newline))
+    (check "chunked-terminator: last-chunk plus empty trailer section"
+           (str (web-skeleton::chunked-terminator))
+           (format nil "0~c~c~c~c" #\Return #\Newline #\Return #\Newline))
+    ;; Shared and reused, like the ping frame — the write queue holds it by
+    ;; reference, so a fresh vector per call would be waste and a mutated
+    ;; one would be a bug.
+    (check "chunked-terminator: the same vector every time"
+           (eq (web-skeleton::chunked-terminator)
+               (web-skeleton::chunked-terminator))
+           t)
+
+    ;; --- An empty payload must never become the terminator ---
+    ;; This is the failure that produces bytes every reader accepts: the
+    ;; message ends early, nothing raises anywhere, and the peer believes
+    ;; it received the whole thing.
+    (check "encode-chunk: an empty payload yields nothing at all"
+           (web-skeleton::encode-chunk
+            (make-array 0 :element-type '(unsigned-byte 8)))
+           nil)
+    (check "encode-chunk: an empty range of a non-empty vector yields nothing"
+           (web-skeleton::encode-chunk (bytes "hello") :start 2 :end 2)
+           nil)
+    ;; A reversed range must not borrow the empty range's quiet NIL. One
+    ;; of them means "nothing to send"; the other means the caller has its
+    ;; offsets backwards and is about to lose bytes.
+    (check "encode-chunk: a reversed range signals rather than answering nothing"
+           (handler-case (progn (web-skeleton::encode-chunk
+                                 (bytes "hello") :start 2 :end 1)
+                                nil)
+             (error () t))
+           t)
+    (check "encode-chunk: a range past the end signals"
+           (handler-case (progn (web-skeleton::encode-chunk
+                                 (bytes "hello") :start 0 :end 99)
+                                nil)
+             (error () t))
+           t)
+
+    ;; --- An empty chunk between two real ones truncates nothing ---
+    (let* ((framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk (bytes "AAA"))
+                                (or (web-skeleton::encode-chunk
+                                     (make-array 0 :element-type '(unsigned-byte 8)))
+                                    #())
+                                (web-skeleton::encode-chunk (bytes "BBB"))
+                                (web-skeleton::chunked-terminator))))
+      (check "encode-chunk: an empty chunk mid-stream does not end it"
+             (str (web-skeleton::decode-chunked-body framed 0 (length framed)))
+             "AAABBB"))
+
+    ;; --- Content that looks like framing survives it ---
+    ;; The decoders skip *over* chunk data rather than scanning it, which
+    ;; is what makes this safe; asserting it keeps a future encoder from
+    ;; deciding to be clever about escaping.
+    (let* ((payload (bytes (format nil "0~c~c~c~cmore"
+                                   #\Return #\Newline #\Return #\Newline)))
+           (framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk payload)
+                                (web-skeleton::chunked-terminator))))
+      (check "encode-chunk: a payload containing a terminator round-trips"
+             (str (web-skeleton::decode-chunked-body framed 0 (length framed)))
+             (str payload))
+      (check "encode-chunk: and the predicate is not fooled by it either"
+             (multiple-value-bind (complete resume)
+                 (web-skeleton::chunked-body-complete-p framed 0 (length framed))
+               (list complete
+                     (= resume (- (length framed)
+                                  (length (web-skeleton::chunked-terminator))))))
+             '(t t)))))
+
+;;; ---------------------------------------------------------------------------
+;;; connection-discard-available: the same EOF contract, on a scratch sink
+;;;
+;;; A :STREAMING connection notices its peer leaving through this, so it
+;;; needs the same discrimination CONNECTION-READ-AVAILABLE gained: a
+;;; peer whose last bytes and FIN arrive in one wake-up must not report
+;;; :OK and be mistaken for one that is still there. Two readers with the
+;;; same job disagreeing is the failure this codebase names as its threat
+;;; model, so the twin is pinned against the same deterministic fixture
+;;; rather than against an e2e race.
+;;; ---------------------------------------------------------------------------
+
+(defun test-discard-available-eof ()
+  (format t "~%connection-discard-available: EOF reporting~%")
+  (flet ((drain (sh-command)
+           (let* ((proc (sb-ext:run-program "/bin/sh" (list "-c" sh-command)
+                                            :output :stream :wait t))
+                  (fd (web-skeleton::%process-output-fd proc))
+                  (sink (make-array 64 :element-type '(unsigned-byte 8))))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd fd :state :streaming :last-active 0)))
+                    (web-skeleton::set-nonblocking fd)
+                    (list (web-skeleton::connection-discard-available conn sink)
+                          ;; The connection's own buffer must be untouched:
+                          ;; a stream's pipelined bytes still live at the
+                          ;; offsets the keep-alive reset works from.
+                          (web-skeleton::connection-read-pos conn)))
+               (ignore-errors (sb-ext:process-close proc))))))
+    (destructuring-bind (result pos) (drain "printf 'noise'")
+      (check "discard-available: bytes then EOF reports :ok-eof" result :ok-eof)
+      (check "discard-available: the connection buffer is not disturbed"
+             pos 0))
+    (destructuring-bind (result pos) (drain "exit 0")
+      (check "discard-available: no bytes at EOF reports :eof" result :eof)
+      (check "discard-available: still nothing in the connection buffer"
+             pos 0))
+    ;; More than one sink-full, so the loop is exercised rather than a
+    ;; single read that happens to see everything.
+    (destructuring-bind (result pos)
+        (drain "printf '%0.s-' $(seq 1 500)")
+      (check "discard-available: a payload past the sink still reports :ok-eof"
+             result :ok-eof)
+      (check "discard-available: and still leaves the buffer alone" pos 0))))
+
+;;; ---------------------------------------------------------------------------
+;;; Incremental delivery from the chunk walk
+;;;
+;;; CHUNKED-BODY-COMPLETE-P already visited every chunk exactly once, to
+;;; step over it. ON-DATA hands those bytes back from the same visit, so
+;;; the properties worth pinning are that it sees each chunk once, sees
+;;; exactly what DECODE-CHUNKED-BODY would have produced, and never sees
+;;; a chunk whose framing has not yet fully arrived.
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunk-walk-on-data ()
+  (format t "~%Chunk walk on-data~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1)))
+    (let* ((framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk (bytes "alpha"))
+                                (web-skeleton::encode-chunk (bytes "beta"))
+                                (web-skeleton::encode-chunk (bytes "gamma"))
+                                (web-skeleton::chunked-terminator)))
+           (n (length framed)))
+
+      ;; --- One pass over a whole body: every chunk, in order, once ---
+      (let ((seen nil))
+        (multiple-value-bind (complete resume)
+            (web-skeleton::chunked-body-complete-p
+             framed 0 n 0
+             (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+          (declare (ignore resume))
+          (check "on-data: the body is complete" complete t)
+          (check "on-data: every chunk, in order"
+                 (nreverse seen) '("alpha" "beta" "gamma"))))
+
+      ;; --- What it hands back is what the decoder would have produced ---
+      (let ((seen (make-string-output-stream)))
+        (web-skeleton::chunked-body-complete-p
+         framed 0 n 0
+         (lambda (buf s e) (write-string (str (subseq buf s e)) seen)))
+        (check "on-data: the concatenation is the decoded body"
+               (get-output-stream-string seen)
+               (str (web-skeleton::decode-chunked-body framed 0 n))))
+
+      ;; --- A dribbling upstream: each chunk delivered once, never twice ---
+      ;; This is what RESUME buys, and the reason ON-DATA can live in the
+      ;; walk at all — a caller threading the offset back never revisits
+      ;; a chunk, so it cannot re-deliver one.
+      (let ((seen nil)
+            (scan 0))
+        (loop for end from 0 to n
+              do (multiple-value-bind (complete next)
+                     (web-skeleton::chunked-body-complete-p
+                      framed 0 end scan
+                      (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+                   (declare (ignore complete))
+                   (setf scan next)))
+        (check "on-data: a byte-at-a-time upstream delivers each chunk once"
+               (nreverse seen) '("alpha" "beta" "gamma")))
+
+      ;; --- A partial chunk is never handed over ---
+      ;; The walk returns before ON-DATA when the data or its trailing
+      ;; CRLF has not landed, so an app is never given bytes whose
+      ;; framing has not been proved.
+      (let ((seen nil))
+        ;; "5\r\nalph" — one byte of payload short, and no CRLF.
+        (web-skeleton::chunked-body-complete-p
+         framed 0 8 0
+         (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+        (check "on-data: an incomplete chunk is withheld" seen nil)))))
+
+;;; ---------------------------------------------------------------------------
+;;; :on-body backpressure
+;;;
+;;; Over a real socket and a real epoll fd, because the whole mechanism
+;;; is an epoll interest change: :PAUSE drops EPOLLIN so the upstream's
+;;; send window fills, and FETCH-RESUME puts it back. Nothing about that
+;;; is observable from a struct.
+;;;
+;;; The property that makes the simple re-arm correct is that a pause
+;;; stops the *upstream*, not the current pass — everything already read
+;;; is still handed over, so no undelivered bytes are left in user space
+;;; where an EPOLL_CTL_MOD would not re-fire.
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-on-body-pause ()
+  (format t "~%Fetch :on-body backpressure~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (seen nil)
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-read
+                         :outbound-p t :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  ;; Three chunks in one write, so they all land in one
+                  ;; read and the walk sees them in a single pass.
+                  (body (concatenate
+                         '(vector (unsigned-byte 8))
+                         (sb-ext:string-to-octets
+                          (format nil "HTTP/1.1 200 OK~c~ctransfer-encoding: ~
+                                       chunked~c~c~c~c"
+                                  #\Return #\Newline #\Return #\Newline
+                                  #\Return #\Newline)
+                          :external-format :ascii)
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "aa" :external-format :ascii))
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "bb" :external-format :ascii))
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "cc" :external-format :ascii)))))
+             (web-skeleton::set-nonblocking out-fd)
+             (setf (web-skeleton::connection-fetch-on-body conn)
+                   (lambda (c chunk)
+                     (declare (ignore c))
+                     (push (sb-ext:octets-to-string
+                            chunk :external-format :ascii)
+                           seen)
+                     :pause))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (sb-bsd-sockets:socket-send client body nil)
+             ;; Give the bytes a moment to cross loopback, then let the
+             ;; read path drain them.
+             (sleep 0.1)
+             (web-skeleton::handle-outbound-read conn epfd)
+
+             (check "pause: the callback saw every chunk already read"
+                    (nreverse seen) '("aa" "bb" "cc"))
+             (check "pause: the connection is marked paused"
+                    (web-skeleton::connection-fetch-paused conn) t)
+             ;; The response is unterminated, so the fetch has not
+             ;; completed — the connection is still registered and no
+             ;; callback has fired.
+             (check "pause: the fetch has not completed"
+                    (hash-table-count web-skeleton::*connections*) 1)
+
+             ;; Resume clears the flag and re-arms. The re-arm is what
+             ;; makes the pause recoverable rather than a one-way door.
+             (web-skeleton::fetch-resume conn)
+             (check "resume: the paused flag is cleared"
+                    (web-skeleton::connection-fetch-paused conn) nil)
+             (check "resume: a second resume is a no-op, not an error"
+                    (progn (web-skeleton::fetch-resume conn)
+                           (web-skeleton::connection-fetch-paused conn))
+                    nil)
+
+             ;; The re-arm has to be asserted against epoll, not against a
+             ;; read. HANDLE-OUTBOUND-READ calls the socket directly, so
+             ;; it delivers bytes whatever the interest mask says — the
+             ;; mask only decides whether the event loop is ever woken to
+             ;; call it. Reverting the re-arm and re-running showed
+             ;; exactly that: a delivery check passed with the pause
+             ;; never lifted.
+             (let ((evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                      :element-type '(unsigned-byte 8))))
+               ;; Fresh bytes with the interest re-armed: the loop wakes.
+               (sb-bsd-sockets:socket-send
+                client
+                (web-skeleton::encode-chunk
+                 (sb-ext:string-to-octets "dd" :external-format :ascii))
+                nil)
+               (sleep 0.1)
+               (check "resume: epoll reports the fd once the interest is back"
+                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+               ;; And it really is our fd, not a stray wake-up.
+               (check "resume: and it is the outbound fd"
+                      (web-skeleton::epoll-event-fd evbuf 0) out-fd)
+               ;; Paused again, the same bytes produce no wake-up at all.
+               (web-skeleton::handle-outbound-read conn epfd)
+               (check "pause: a paused fd is not reported, with data waiting"
+                      (progn
+                        (sb-bsd-sockets:socket-send
+                         client
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "ee" :external-format :ascii))
+                         nil)
+                        (sleep 0.1)
+                        (web-skeleton::epoll-wait epfd evbuf 4 50))
+                      0)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Static responses carry a Date
+;;;
+;;; The interesting assertion is not that the header is present. It is
+;;; that the body is still exactly the file after a header was added to
+;;; the response — because the design this replaced derived the body's
+;;; offset from the header block's length, and anything spliced into one
+;;; pre-built vector and not the other would have moved a range slice
+;;; without moving its Content-Length. That failure has a correct status,
+;;; a correct length, and content starting a few bytes early, and it is
+;;; invisible to every test that does not ask for a byte range.
+;;; ---------------------------------------------------------------------------
+
+(defun test-static-date ()
+  (format t "~%Static Date~%")
+  (let ((saved web-skeleton::*static-cache*)
+        (content (sb-ext:string-to-octets
+                  "0123456789abcdefghijklmnopqrstuvwxyz"
+                  :external-format :latin-1)))
+    (unwind-protect
+         (let ((web-skeleton::*http-date-line-cache* (cons 0 #())))
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/d.txt" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response "text/plain" content 0))
+           (flet ((wire (method &rest headers)
+                    (let ((r (serve-static
+                              (make-test-request :method method :path "/d.txt"
+                                                 :headers headers))))
+                      (sb-ext:octets-to-string
+                       (if (consp r)
+                           (apply #'concatenate '(vector (unsigned-byte 8)) r)
+                           r)
+                       :external-format :latin-1)))
+                  (body (text)
+                    (let ((i (search (format nil "~c~c~c~c" #\Return #\Newline
+                                             #\Return #\Newline)
+                                     text)))
+                      (and i (subseq text (+ i 4))))))
+
+             ;; Every pre-built shape now carries one. RFC 7231 §7.1.1.2
+             ;; is a MUST, and 7232 §4.1 wants it on the 304 as well.
+             (check "static date: a GET carries a Date"
+                    (and (search "date: " (wire :GET)) t) t)
+             (check "static date: a HEAD carries a Date"
+                    (and (search "date: " (wire :HEAD)) t) t)
+             (check "static date: a 304 carries a Date"
+                    (and (search "date: "
+                                 (wire :GET (cons "if-none-match"
+                                                  (web-skeleton::static-entry-etag
+                                                   (gethash "/d.txt"
+                                                            web-skeleton::*static-cache*)))))
+                         t)
+                    t)
+             (check "static date: a 206 carries a Date"
+                    (and (search "date: "
+                                 (wire :GET (cons "range" "bytes=0-3")))
+                         t)
+                    t)
+             ;; A Date is exactly one header line, so it must appear once
+             ;; — a per-request line appended to a prefix that already
+             ;; had one would be two, and RFC 7230 §3.2.2 forbids that
+             ;; for a non-list-valued field.
+             (check "static date: exactly one Date on a GET"
+                    (let ((w (wire :GET)) (n 0) (i 0))
+                      (loop (let ((h (search "date: " w :start2 i)))
+                              (unless h (return n))
+                              (incf n)
+                              (setf i (1+ h)))))
+                    1)
+
+             ;; The assertions the retired offset used to be load-bearing
+             ;; for. The body of a whole GET is the file and nothing else,
+             ;; and a range is the matching slice of it — both true no
+             ;; matter how long the header block happens to be.
+             (check "static date: the GET body is exactly the file"
+                    (body (wire :GET))
+                    "0123456789abcdefghijklmnopqrstuvwxyz")
+             (check "static date: a range is the matching slice"
+                    (body (wire :GET (cons "range" "bytes=5-9")))
+                    "56789")
+             (check "static date: a suffix range is the matching slice"
+                    (body (wire :GET (cons "range" "bytes=-4")))
+                    "wxyz")
+             (check "static date: HEAD still has no body"
+                    (body (wire :HEAD)) ""))
+
+           ;; --- A file larger than the backlog bound goes out whole ---
+           ;; *max-write-backlog* is for a producer outrunning its peer.
+           ;; A static file is complete in memory at queue time: there is
+           ;; nothing to throttle and nobody to decide a disposition, so
+           ;; refusing a piece of it does not conserve anything — it
+           ;; sends headers promising a body the peer never gets, and on
+           ;; a keep-alive connection the next response lands where that
+           ;; body should have been. The suite had no file over the bound
+           ;; because the bound is 2 MiB; the number is tunable and
+           ;; someone will lower it.
+           ;; SETF and restore rather than LET. Every other test that
+           ;; touches a tuning knob a worker might read does it this way,
+           ;; and the reason generalizes past thread visibility: a LET
+           ;; here leaves the binding live for everything the body calls,
+           ;; and this body calls into the server's own queueing code.
+           (let ((saved-backlog web-skeleton:*max-write-backlog*))
+             (unwind-protect
+                  (let* ((big (make-array 600 :element-type '(unsigned-byte 8)
+                                              :initial-element 88))
+                         (entry (web-skeleton::build-static-response
+                                 "application/wasm" big 0))
+                         (segments (web-skeleton::static-segments entry :get))
+                         (conn (web-skeleton::make-connection
+                                :fd -1 :last-active 0))
+                         (total (reduce #'+ segments :key #'length)))
+                    (setf web-skeleton:*max-write-backlog* 512)
+                    (check "static backlog: the whole response is queued, bound or not"
+                           (progn (web-skeleton::connection-queue-segments
+                                   conn segments)
+                                  (web-skeleton::connection-write-pending conn))
+                           total)
+                    (check "static backlog: the body is all of it"
+                           (- (web-skeleton::connection-write-pending conn)
+                              (length (first segments))
+                              (length (second segments))
+                              (length (third segments)))
+                           600)
+                    ;; The bound still means what it says for the path it
+                    ;; was written for.
+                    (let ((c2 (web-skeleton::make-connection
+                               :fd -1 :last-active 0)))
+                      (check "static backlog: an ordinary append is still bounded"
+                             (web-skeleton::connection-append-write c2 big)
+                             nil)))
+               (setf web-skeleton:*max-write-backlog* saved-backlog))))
+      (setf web-skeleton::*static-cache* saved))))
+
+;;; ---------------------------------------------------------------------------
+;;; Server-Sent Events
+;;;
+;;; The validation follows VALIDATE-COOKIE-FIELD's register, but the
+;;; character set is re-derived rather than inherited: a cookie's
+;;; delimiters are ';' and CR/LF against header injection, an SSE field's
+;;; delimiter is a line break against *event* injection — a client
+;;; dispatching an event the app never sent. The tests below are written
+;;; against that consequence, not against the character list.
+;;; ---------------------------------------------------------------------------
+
+(defun test-sse ()
+  (format t "~%Server-Sent Events~%")
+  (flet ((str (v) (sb-ext:octets-to-string v :external-format :utf-8))
+         (refused (thunk)
+           (handler-case (progn (funcall thunk) nil) (error () t))))
+
+    ;; --- The ordinary shapes ---
+    (check "sse: a data-only event"
+           (str (web-skeleton::sse-event-bytes :data "hello"))
+           (format nil "data: hello~c~c" #\Newline #\Newline))
+    (check "sse: fields come before data, in spec order"
+           (str (web-skeleton::sse-event-bytes
+                 :data "x" :event "tick" :id "7" :retry 3000))
+           (format nil "event: tick~cid: 7~cretry: 3000~cdata: x~c~c"
+                   #\Newline #\Newline #\Newline #\Newline #\Newline))
+    ;; Multi-line data is the protocol's own mechanism, not an error: one
+    ;; data line per segment, rejoined with LF by the client.
+    (check "sse: multi-line data becomes one data line per segment"
+           (str (web-skeleton::sse-event-bytes :data
+                 (format nil "one~ctwo" #\Newline)))
+           (format nil "data: one~cdata: two~c~c"
+                   #\Newline #\Newline #\Newline))
+    (check "sse: a trailing newline round-trips as an empty segment"
+           (str (web-skeleton::sse-event-bytes :data
+                 (format nil "one~c" #\Newline)))
+           (format nil "data: one~cdata: ~c~c"
+                   #\Newline #\Newline #\Newline))
+
+    ;; --- Event injection: the consequence the validator exists for ---
+    ;; A blank line dispatches. An event value carrying one would end the
+    ;; app's event early and hand the client a second event it never
+    ;; wrote — including one that could carry a different event type.
+    (check "sse: LF in event is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :event
+                                (format nil "a~c~cdata: forged" #\Newline
+                                        #\Newline))))
+           t)
+    (check "sse: LF in id is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :id (format nil "1~cdata: forged"
+                                                      #\Newline))))
+           t)
+    ;; CR is a line terminator to EventSource too — the character a
+    ;; header-shaped validator would have caught for the wrong reason,
+    ;; and a body-shaped one that only knew about LF would have missed.
+    (check "sse: CR in event is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :event
+                                (format nil "a~cdata: forged" #\Return))))
+           t)
+    (check "sse: CR in data is refused, even though LF is allowed there"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data (format nil "a~cb" #\Return))))
+           t)
+    (check "sse: NUL in id is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :id (format nil "1~c2"
+                                                      (code-char 0)))))
+           t)
+    (check "sse: a non-integer retry is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :retry "soon")))
+           t)
+    ;; A named refusal, not FIND's type error. An integer id is the most
+    ;; natural thing an app passes — sequence numbers are what
+    ;; Last-Event-ID replay is for — and "the value 42 is not of type
+    ;; SEQUENCE" names neither the argument nor the fix.
+    (dolist (case '((:id 42) (:event :tick) (:data 7)))
+      (check (format nil "sse: a non-string ~a is refused by name"
+                     (string-downcase (symbol-name (first case))))
+             (handler-case
+                 (progn (apply #'web-skeleton::sse-event-bytes
+                               (if (eq (first case) :data)
+                                   case
+                                   (list* :data "x" case)))
+                        nil)
+               (error (e) (and (search "must be a string"
+                                       (princ-to-string e))
+                               t)))
+             t))
+
+    ;; --- An event with no data reaches nobody, so it is refused ---
+    ;; EventSource returns early on an empty data buffer. Emitting one
+    ;; would look sent from here and be dispatched nowhere.
+    (check "sse: an event without data is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes :event "tick")))
+           t)
+    (check "sse: an event with empty data is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes :data "")))
+           t)
+
+    ;; --- The keepalive is the one emission with no data ---
+    (check "sse: a bare comment is still two bytes, not zero"
+           (str (web-skeleton::sse-comment-bytes))
+           (format nil ":~c" #\Newline))
+    (check "sse: a comment carries its text"
+           (str (web-skeleton::sse-comment-bytes "ka"))
+           (format nil ":ka~c" #\Newline))
+    (check "sse: a comment cannot smuggle a line break either"
+           (refused (lambda () (web-skeleton::sse-comment-bytes
+                                (format nil "x~c~cdata: forged"
+                                        #\Newline #\Newline))))
+           t)
+
+    ;; --- The response carries what a proxy needs to leave it alone ---
+    (let* ((sresp (web-skeleton:make-sse-response))
+           (head (sb-ext:octets-to-string
+                  (web-skeleton::format-streaming-head
+                   (web-skeleton::stream-response-response sresp) :chunked)
+                  :external-format :latin-1)))
+      (check "sse: content type declares the protocol"
+             (and (search "content-type: text/event-stream" head) t) t)
+      (check "sse: no-cache, so nothing serves a prefix of an endless body"
+             (and (search "cache-control: no-cache" head) t) t)
+      ;; nginx buffers this content type by default, and the deployment
+      ;; story assumes a proxy in front — without this the stream arrives
+      ;; in batches, which is not a stream.
+      (check "sse: x-accel-buffering off for the proxy in front"
+             (and (search "x-accel-buffering: no" head) t) t)
+      (check "sse: a keepalive is installed by default"
+             (str (web-skeleton::stream-response-keepalive sresp))
+             (format nil ":~c" #\Newline)))
+    (check "sse: the keepalive can be declined"
+           (web-skeleton::stream-response-keepalive
+            (web-skeleton:make-sse-response :keepalive nil))
+           nil)
+    ;; The framework's headers win: an app cannot quietly turn an SSE
+    ;; response into something a client will not parse as one.
+    (let ((head (sb-ext:octets-to-string
+                 (web-skeleton::format-streaming-head
+                  (web-skeleton::stream-response-response
+                   (web-skeleton:make-sse-response
+                    :headers '(("content-type" . "text/plain"))))
+                  :chunked)
+                 :external-format :latin-1)))
+      (check "sse: the protocol's content type is not overridable"
+             (and (search "content-type: text/event-stream" head) t) t))))
+
+;;; ---------------------------------------------------------------------------
+;;; Stream lifecycle
+;;;
+;;; START-STREAM through STREAM-CLOSE over a real loopback pair, reading
+;;; back what the peer would have seen. The interesting assertions are
+;;; the ones about the terminator: that it is written on the way out,
+;;; and that the only route from :STREAMING back to :READ-HTTP is the one
+;;; that writes it.
+;;; ---------------------------------------------------------------------------
+
+(defun test-stream-lifecycle ()
+  (format t "~%Stream lifecycle~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (closed-with :never)
+          (sent-from-on-close :never))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :read-http
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (request (web-skeleton::make-http-request
+                            :method :GET :path "/s" :version "1.1"))
+                  (sresp (web-skeleton:make-stream-response
+                          :headers '(("content-type" . "text/plain"))
+                          :on-close
+                          (lambda (c reason)
+                            (setf closed-with reason)
+                            ;; A goodbye event from on-close is an
+                            ;; ordinary shape. It must be refused, and
+                            ;; refusing depends on the state having moved
+                            ;; before the callback ran — otherwise these
+                            ;; bytes land behind the terminator and, on a
+                            ;; keep-alive connection, prefix the next
+                            ;; response.
+                            (setf sent-from-on-close
+                                  (handler-case
+                                      (progn (web-skeleton:stream-send
+                                              c (sb-ext:string-to-octets
+                                                 "bye" :external-format :ascii))
+                                             :accepted)
+                                    (error () :refused))))
+                          :on-open
+                          (lambda (c)
+                            (web-skeleton:stream-send
+                             c (sb-ext:string-to-octets
+                                "hello " :external-format :ascii))
+                            (web-skeleton:stream-send
+                             c (sb-ext:string-to-octets
+                                "world" :external-format :ascii))))))
+             (web-skeleton::set-nonblocking server-fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::start-stream conn epfd request sresp)
+
+             (check "stream: the connection is streaming after the head"
+                    (web-skeleton::connection-state conn) :streaming)
+             (check "stream: framing came from the client's version"
+                    (web-skeleton::connection-stream-framing conn) :chunked)
+             (check "stream: on-close has not fired while the stream is open"
+                    closed-with :never)
+
+             ;; Closing writes the terminator and hands the socket back to
+             ;; the ordinary write path.
+             (web-skeleton:stream-close conn)
+             (check "stream: close fires on-close exactly once, with :done"
+                    closed-with :done)
+             (check "stream: close leaves the ordinary write path in charge"
+                    (web-skeleton::connection-state conn) :write-response)
+             (check "stream: nothing is left queued after close"
+                    (web-skeleton::connection-write-pending conn) 0)
+
+             ;; A second teardown must not deliver a second notification.
+             (setf closed-with :never)
+             (web-skeleton::notify-stream-closed conn :disconnected)
+             (check "stream: on-close does not fire twice" closed-with :never)
+             (check "stream: a send from inside on-close is refused"
+                    sent-from-on-close :refused)
+
+             ;; What the peer actually received: head, two chunks, the
+             ;; terminator — and the body decodes to what was sent.
+             (let ((buf (make-array 4096 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (b n)
+                   (sb-bsd-sockets:socket-receive client buf 4096)
+                 (declare (ignore b))
+                 (let* ((raw (subseq buf 0 n))
+                        (text (sb-ext:octets-to-string
+                               raw :external-format :latin-1))
+                        (hend (web-skeleton::scan-crlf-crlf raw 0 n)))
+                   (check "stream: the head declares chunked framing"
+                          (and (search "transfer-encoding: chunked" text) t) t)
+                   (check "stream: the head declares no length"
+                          (search "content-length" text) nil)
+                   ;; Caught: a stream that stopped writing its terminator
+                   ;; makes this raise, and an unhandled raise ends the
+                   ;; run with a backtrace instead of a failed check.
+                   (check "stream: the body decodes to everything sent"
+                          (handler-case
+                              (sb-ext:octets-to-string
+                               (web-skeleton::decode-chunked-body
+                                raw (+ hend 4) n)
+                               :external-format :ascii)
+                            (error (e) (princ-to-string e)))
+                          "hello world")
+                   ;; Checked on the wire rather than on the queue. A
+                   ;; send accepted from ON-CLOSE flushes straight out,
+                   ;; so an empty queue afterwards proves nothing — and
+                   ;; the decoder stops at the terminator, so the body
+                   ;; check would not see the extra bytes either. What
+                   ;; the peer received has to be the terminator last.
+                   (check "stream: the terminator is the last thing sent"
+                          (coerce (subseq raw (- n 5) n) 'list)
+                          (coerce (web-skeleton::chunked-terminator) 'list))))))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-stream-head-request ()
+  (format t "~%Stream HEAD request~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (opened nil))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :read-http
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (request (web-skeleton::make-http-request
+                            :method :HEAD :path "/s" :version "1.1"))
+                  (sresp (web-skeleton:make-stream-response
+                          :on-open (lambda (c) (declare (ignore c))
+                                     (setf opened t)))))
+             (web-skeleton::set-nonblocking server-fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::start-stream conn epfd request sresp)
+             ;; Headers a GET would have carried, and nothing after them.
+             (check "stream HEAD: no stream is started"
+                    (web-skeleton::connection-state conn) :write-response)
+             (check "stream HEAD: on-open is never called" opened nil)
+             (check "stream HEAD: no terminator is owed"
+                    (web-skeleton::connection-stream-framing conn) nil)
+             (web-skeleton::connection-on-write conn)
+             (let ((buf (make-array 4096 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (b n)
+                   (sb-bsd-sockets:socket-receive client buf 4096)
+                 (declare (ignore b))
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 n) :external-format :latin-1)))
+                   (check "stream HEAD: the head still declares the framing"
+                          (and (search "transfer-encoding: chunked" text) t) t)
+                   (check "stream HEAD: and nothing follows the headers"
+                          (- n (+ 4 (web-skeleton::scan-crlf-crlf
+                                     (subseq buf 0 n) 0 n)))
+                          0)))))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Stream keepalive and idle
+;;;
+;;; Two knobs answering two questions. *STREAM-IDLE-TIMEOUT* asks whether
+;;; the app is still producing; *WRITE-STALL-TIMEOUT* asks whether bytes
+;;; are still leaving. A stream can be healthy at the socket and dead at
+;;; the source, which is why reusing either of the existing idle knobs
+;;; would be wrong — ten seconds reaps live streams, a day holds dead
+;;; ones.
+;;; ---------------------------------------------------------------------------
+
+(defun test-stream-keepalive-and-idle ()
+  (format t "~%Stream keepalive and idle~%")
+  (flet ((streaming-conn (epfd connfd &key keepalive (age 0))
+           ;; LAST-ACTIVE is held *current* while the production clock is
+           ;; aged. That is the shape a draining backlog produces —
+           ;; EPOLLOUT keeps the connection looking busy while the app
+           ;; has stopped saying anything — and judging a stream on
+           ;; LAST-ACTIVE would miss every one of them.
+           (let ((conn (web-skeleton::make-connection
+                        :fd connfd :state :streaming
+                        :last-active (get-universal-time))))
+             (setf (web-skeleton::connection-stream-framing conn) :chunked
+                   (web-skeleton::connection-stream-produced-at conn)
+                   (- (get-universal-time) age)
+                   (web-skeleton::connection-stream-keepalive conn) keepalive)
+             (web-skeleton::epoll-add
+              epfd connfd (logior web-skeleton::+epollin+
+                                  web-skeleton::+epollet+))
+             (web-skeleton::register-connection conn)
+             conn)))
+
+    ;; --- Idle: a stream producing nothing for long enough is closed ---
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (reason :never)
+                 (now (get-universal-time)))
+             (let ((conn (streaming-conn epfd connfd
+                                         :age (+ web-skeleton:*stream-idle-timeout*
+                                                 1))))
+               (setf (web-skeleton::connection-stream-on-close conn)
+                     (lambda (c r) (declare (ignore c)) (setf reason r))))
+             (web-skeleton::sweep-idle-connections epfd now)
+             (check "stream idle: a quiet stream is reaped"
+                    (hash-table-count web-skeleton::*connections*) 0)
+             (check "stream idle: the app is told why" reason :idle))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))
+
+    ;; --- Control: within the deadline it survives ---
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (now (get-universal-time)))
+             (streaming-conn epfd connfd :age 1)
+             (web-skeleton::sweep-idle-connections epfd now)
+             (check "stream idle: a recent stream is left alone"
+                    (hash-table-count web-skeleton::*connections*) 1))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))
+
+    ;; --- Keepalive: framed, sent inline, and it refreshes the idle clock ---
+    ;; Over a real pair rather than /dev/null, because the only site that
+    ;; can tell a framed keepalive from a raw one is the wire. "Nothing
+    ;; left queued", "counts as production" and "survives without arming"
+    ;; are all true either way — they were, for a whole item.
+    (multiple-value-bind (server client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (now (get-universal-time))
+                    (ka (sb-ext:string-to-octets ":ka" :external-format :ascii))
+                    (conn (web-skeleton::make-connection
+                           :fd (web-skeleton::socket-fd server)
+                           :socket server :state :streaming
+                           :last-active now)))
+               (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
+               (setf (web-skeleton::connection-stream-framing conn) :chunked
+                     (web-skeleton::connection-stream-produced-at conn)
+                     (- now web-skeleton:*stream-keepalive-interval* 1)
+                     (web-skeleton::connection-stream-keepalive conn) ka)
+               (web-skeleton::register-connection conn)
+               (web-skeleton::keepalive-streams epfd now)
+               (check "stream keepalive: nothing is left queued"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "stream keepalive: it counts as production"
+                      (web-skeleton::connection-stream-produced-at conn) now)
+               (check "stream keepalive: the connection survives without arming"
+                      (hash-table-count web-skeleton::*connections*) 1)
+               ;; The assertion that needed a wire: these bytes share a
+               ;; body with the app's sends, so on a chunked stream they
+               ;; have to arrive as a chunk. Raw, they sit where the
+               ;; peer's decoder expects a chunk-size.
+               (let ((buf (make-array 64 :element-type '(unsigned-byte 8))))
+                 (multiple-value-bind (b n)
+                     (sb-bsd-sockets:socket-receive client buf 64)
+                   (declare (ignore b))
+                   (check "stream keepalive: it reaches the peer framed as a chunk"
+                          (sb-ext:octets-to-string (subseq buf 0 n)
+                                                   :external-format :latin-1)
+                          (format nil "3~c~c:ka~c~c"
+                                  #\Return #\Newline #\Return #\Newline)))))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close server))
+          (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+    ;; --- A stream with no keepalive bytes is left alone ---
+    ;; There is nothing generic to send: a chunked stream's only
+    ;; zero-content emission is the empty chunk, and that is the
+    ;; terminator. Inventing one here would end the message.
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (now (get-universal-time)))
+             (let ((conn (streaming-conn
+                          epfd connfd
+                          :age (+ web-skeleton:*stream-keepalive-interval* 1))))
+               (web-skeleton::keepalive-streams epfd now)
+               (check "stream keepalive: none configured means none sent"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "stream keepalive: and the idle clock is not touched"
+                      (< (web-skeleton::connection-stream-produced-at conn) now)
+                      t)))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Streaming response head
+;;;
+;;; The strongest check available is that the head we emit, followed by
+;;; the chunks we encode, is read back as a complete response by the
+;;; framework's own outbound reader. Producing and consuming are separate
+;;; code paths that must agree on framing, which is the disagreement this
+;;; codebase treats as the threat model.
+;;; ---------------------------------------------------------------------------
+
+(defun test-streaming-head ()
+  (format t "~%Streaming response head~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1))
+         (resp (&optional headers)
+           (let ((r (web-skeleton::make-http-response :status 200)))
+             (loop for (n . v) in headers
+                   do (web-skeleton::set-response-header r n v))
+             r)))
+
+    ;; --- Framing follows the client's version, not our preference ---
+    (check "streaming framing: HTTP/1.1 gets chunked"
+           (web-skeleton::stream-framing-for
+            (web-skeleton::make-http-request :method :GET :version "1.1"))
+           :chunked)
+    (check "streaming framing: HTTP/1.0 cannot read chunked, so close"
+           (web-skeleton::stream-framing-for
+            (web-skeleton::make-http-request :method :GET :version "1.0"))
+           :close)
+
+    ;; --- The chunked head declares the framing and no length ---
+    (let ((head (str (web-skeleton::format-streaming-head (resp) :chunked))))
+      (check "streaming head: declares chunked transfer-encoding"
+             (and (search "transfer-encoding: chunked" head) t) t)
+      (check "streaming head: carries no Content-Length at all"
+             (search "content-length" head) nil)
+      (check "streaming head: carries a Date"
+             (and (search "date: " head) t) t)
+      (check "streaming head: ends at the header boundary"
+             (and (search (format nil "~c~c~c~c" #\Return #\Newline
+                                  #\Return #\Newline)
+                          head)
+                  t)
+             t))
+
+    ;; --- The close-delimited head says so, and declares no encoding ---
+    (let ((head (str (web-skeleton::format-streaming-head (resp) :close))))
+      (check "streaming head: close framing stamps Connection: close"
+             (and (search "connection: close" head) t) t)
+      (check "streaming head: close framing declares no transfer-encoding"
+             (search "transfer-encoding" head) nil)
+      (check "streaming head: close framing carries no Content-Length"
+             (search "content-length" head) nil))
+
+    ;; --- Two opinions about framing are refused, not reconciled ---
+    (check "streaming head: a caller-set Content-Length is refused"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("content-length" . "5"))) :chunked)
+                                nil)
+             (error () t))
+           t)
+    (check "streaming head: a caller-set Transfer-Encoding is refused"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("transfer-encoding" . "chunked")))
+                                 :chunked)
+                                nil)
+             (error () t))
+           t)
+    ;; On :CLOSE framing the Connection header *is* the framing — nothing
+    ;; else says where the body ends — so a caller promising reuse would
+    ;; leave the client unable to tell the eventual close from truncation.
+    ;; Contradiction refused; agreement accepted.
+    (check "streaming head: Connection: keep-alive is refused on close framing"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("connection" . "keep-alive")))
+                                 :close)
+                                nil)
+             (error () t))
+           t)
+    (check "streaming head: a redundant Connection: close is accepted"
+           (let ((head (str (web-skeleton::format-streaming-head
+                             (resp '(("connection" . "close"))) :close))))
+             (and (search "connection: close" head) t))
+           t)
+    ;; The same header on chunked framing is only a hint, and stays one.
+    (check "streaming head: Connection: keep-alive is fine on chunked framing"
+           (let ((head (str (web-skeleton::format-streaming-head
+                             (resp '(("connection" . "keep-alive"))) :chunked))))
+             (and (search "transfer-encoding: chunked" head) t))
+           t)
+    (dolist (status '(204 304 100))
+      (check (format nil "streaming head: status ~d cannot stream" status)
+             (handler-case
+                 (progn (web-skeleton::format-streaming-head
+                         (web-skeleton::make-http-response :status status)
+                         :chunked)
+                        nil)
+               (error () t))
+             t))
+
+    ;; --- Round-trip: our head plus our chunks, read by our own reader ---
+    (let* ((head (web-skeleton::format-streaming-head (resp) :chunked))
+           (full (concatenate '(vector (unsigned-byte 8))
+                              head
+                              (web-skeleton::encode-chunk (bytes "hello "))
+                              (web-skeleton::encode-chunk (bytes "world"))
+                              (web-skeleton::chunked-terminator))))
+      (check "streaming head: the outbound reader sees a complete response"
+             (and (web-skeleton::outbound-response-complete-p
+                   full (length full) :GET)
+                  t)
+             t)
+      (let ((hend (web-skeleton::scan-crlf-crlf full 0 (length full))))
+        (check "streaming head: and the body decodes to what was streamed"
+               (str (web-skeleton::decode-chunked-body
+                     full (+ hend 4) (length full)))
+               "hello world"))
+      ;; Without the terminator the reader must keep waiting rather than
+      ;; declaring the response done — which is what makes an unterminated
+      ;; stream a hazard worth a lifecycle rule.
+      (let ((unterminated (concatenate '(vector (unsigned-byte 8))
+                                       head
+                                       (web-skeleton::encode-chunk
+                                        (bytes "hello ")))))
+        (check "streaming head: an unterminated body never reads as complete"
+               (web-skeleton::outbound-response-complete-p
+                unterminated (length unterminated) :GET)
+               nil)))))
+
+;;; ---------------------------------------------------------------------------
+;;; A handler that pushes and also returns
+;;;
+;;; DEPLOYMENT.md's own example calls ws-send from inside ws-handler. A
+;;; handler that does that *and* returns a frame is the natural next step,
+;;; and it is the case the read branch had to convert for: the returned
+;;; frame used to go through CONNECTION-QUEUE-WRITE, which either
+;;; overwrites what ws-send queued or — now that its guard counts the
+;;; queue — signals, taking the connection down through the handler-case.
+;;;
+;;; Needs a genuinely bidirectional fd, so this builds a connected
+;;; loopback pair rather than a pipe.
+;;; ---------------------------------------------------------------------------
+
+(defun %loopback-pair ()
+  "Two connected TCP sockets over loopback. Returns (values server client)."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (multiple-value-bind (addr port) (sb-bsd-sockets:socket-name listener)
+      (declare (ignore addr))
+      (let ((client (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp)))
+        (sb-bsd-sockets:socket-connect client #(127 0 0 1) port)
+        (let ((server (sb-bsd-sockets:socket-accept listener)))
+          (sb-bsd-sockets:socket-close listener)
+          (values server client))))))
+
+(defun test-ws-handler-push-and-return ()
+  (format t "~%ws handler push and return~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :websocket
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  ;; Half a megabyte, against a shrunk send buffer and a
+                  ;; client that never reads. The two paths are only
+                  ;; distinguishable when ws-send leaves a remainder: with
+                  ;; room to spare it flushes completely, the queue is
+                  ;; empty by the time the handler returns, and a write
+                  ;; that replaces the head looks exactly like one that
+                  ;; appends behind it.
+                  (pushed (web-skeleton::build-ws-frame
+                           web-skeleton::+ws-op-binary+
+                           (make-array (* 512 1024)
+                                       :element-type '(unsigned-byte 8)
+                                       :initial-element 80)))
+                  (returned (web-skeleton::build-ws-text "RETURNED"))
+                  (handler (lambda (c frame)
+                             (declare (ignore frame))
+                             ;; Push one frame, then hand back another.
+                             (web-skeleton::ws-send c pushed)
+                             returned)))
+             (web-skeleton::set-nonblocking server-fd)
+             ;; SO_SNDBUF is 7 on Linux. The kernel doubles the value and
+             ;; enforces its own floor, so this asks for "as small as you
+             ;; will give me" rather than an exact size.
+             (web-skeleton::set-socket-option-int
+              server-fd web-skeleton::+sol-socket+ 7 2048)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; The client sends one masked text frame to trigger the handler.
+             (let ((req (make-test-ws-frame "GO")))
+               (sb-bsd-sockets:socket-send client req nil))
+             (let ((signalled
+                     (handler-case
+                         (progn (web-skeleton::handle-client-read
+                                 conn epfd nil handler)
+                                nil)
+                       (error (e) (princ-to-string e)))))
+               (check "ws push+return: the read branch does not signal"
+                      signalled nil))
+             (check "ws push+return: the connection is still open"
+                    (hash-table-count web-skeleton::*connections*) 1)
+             ;; The pushed frame is still the head, partly written; the
+             ;; returned frame sits behind it rather than on top of it.
+             (check "ws push+return: the pushed frame is still the head"
+                    (web-skeleton::connection-write-end conn) (length pushed))
+             (check "ws push+return: the head is only partly written"
+                    (< (web-skeleton::connection-write-pos conn)
+                       (web-skeleton::connection-write-end conn))
+                    t)
+             (check "ws push+return: the returned frame is queued behind it"
+                    (coerce (first (web-skeleton::connection-write-queue conn))
+                            'list)
+                    (coerce returned 'list)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The ping sweep flushes inline
+;;;
+;;; A two-byte ping onto an empty queue fits in any socket with room, so
+;;; the sweep should hand it over on the spot and arm nothing. Under the
+;;; old shape the frame sat queued until EPOLLOUT came back — one
+;;; epoll_ctl per WebSocket connection per interval, in a burst, to
+;;; deliver two bytes that had already fit. PENDING = 0 on return is the
+;;; observable form of "no arming was needed".
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-ping-flush ()
+  (format t "~%ws ping flush~%")
+  (let ((epfd (web-skeleton::epoll-create))
+        (sink (open "/dev/null" :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :append)))
+    (unwind-protect
+         (let* ((conn (web-skeleton::make-connection
+                       :fd (sb-sys:fd-stream-fd sink)
+                       :state :websocket
+                       :last-active (get-universal-time)))
+                (web-skeleton::*connections* (make-hash-table :test #'eql)))
+           (web-skeleton::register-connection conn)
+           (web-skeleton::ping-ws-connections epfd)
+           (check "ws ping: nothing is left queued after the sweep"
+                  (web-skeleton::connection-write-pending conn) 0)
+           (check "ws ping: the ping was counted against the pong budget"
+                  (web-skeleton::connection-missed-pongs conn) 1)
+           ;; The fd was never registered with EPFD, so had the sweep tried
+           ;; to arm EPOLLOUT the epoll_ctl would have failed and the
+           ;; connection would have been collected as broken.
+           (check "ws ping: the connection survives without any arming"
+                  (hash-table-count web-skeleton::*connections*) 1))
+      (ignore-errors (close sink))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Outbound address filter (SSRF policy hook)
 ;;; ---------------------------------------------------------------------------
 
@@ -4610,14 +6175,30 @@
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
+  (test-chunked-encoder)
+  (test-chunk-walk-on-data)
+  (test-fetch-on-body-pause)
+  (test-streaming-head)
+  (test-discard-available-eof)
+  (test-stream-lifecycle)
+  (test-stream-head-request)
+  (test-stream-keepalive-and-idle)
+  (test-sse)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
   (test-static-etag)
   (test-static-range)
+  (test-static-date)
   (test-jwt)
   (test-shutdown-hooks)
   (test-read-available-eof)
   (test-awaiting-sweep-504)
+  (test-write-queue)
+  (test-write-queue-drain)
+  (test-ws-send-queues)
+  (test-ws-write-stall-sweep)
+  (test-ws-handler-push-and-return)
+  (test-ws-ping-flush)
   (report-suite "Server")
   (zerop *tests-failed*))

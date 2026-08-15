@@ -126,12 +126,25 @@
            #:*max-ws-payload-size*
            #:*max-ws-message-size*
            #:*max-connections*
+           #:*max-write-backlog*
+           ;; Streaming responses
+           #:make-stream-response
+           #:stream-send
+           #:stream-close
+           #:stream-full-p
+           ;; Server-Sent Events
+           #:make-sse-response
+           #:sse-send
+           #:sse-comment
+           #:fetch-resume
+           #:*stream-idle-timeout*
+           #:*stream-keepalive-interval*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
-           #:*ws-send-timeout*
+           #:*write-stall-timeout*
            #:*fetch-timeout*
            ;; DNS cache (opt-in — 0 disables)
            #:*dns-cache-ttl*

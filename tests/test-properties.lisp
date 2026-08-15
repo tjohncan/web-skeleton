@@ -300,6 +300,121 @@
                     buffered streamed)))))
     bad))
 
+(defun gen-chunk-payloads ()
+  "Payloads for the encoder: two to five byte vectors, at least one of
+   them guaranteed empty and placed wherever the generator likes rather
+   than only ever last. An empty chunk is the case that matters — a
+   terminator emitted for one truncates the message while producing bytes
+   every reader accepts — so it is forced rather than left to chance.
+
+   Bytes are printable ASCII: no CR, no LF. STREAM-CHUNKED-LINES treats
+   CR, LF and CRLF as line terminators, so keeping them out of the
+   payload makes chunk boundaries and line boundaries independent and
+   leaves the framing as the thing under test. Content that *looks* like
+   framing is covered deterministically in TEST-CHUNKED-ENCODER."
+  (let* ((n (+ 2 (random 4)))
+         (payloads (loop repeat n
+                         collect (let* ((len (random 20))
+                                        (v (make-array len :element-type
+                                                       '(unsigned-byte 8))))
+                                   (dotimes (j len v)
+                                     (setf (aref v j) (+ 32 (random 95))))))))
+    (setf (nth (random n) payloads)
+          (make-array 0 :element-type '(unsigned-byte 8)))
+    payloads))
+
+(defun encode-chunk-stream (payloads)
+  "Frame PAYLOADS and append the terminator, the way a producer would."
+  (apply #'concatenate '(vector (unsigned-byte 8))
+         (append (remove nil (mapcar #'web-skeleton::encode-chunk payloads))
+                 (list (web-skeleton::chunked-terminator)))))
+
+(defun prop-chunked-encoder-roundtrip (seed)
+  "ENCODE-CHUNK's output is read identically by all three readers.
+
+   The framework had three chunked readers and no writer, so nothing
+   could generate well-formed chunked streams and the agreement between
+   the readers could only be asserted in prose. CHUNKED-BODY-COMPLETE-P's
+   docstring makes exactly such a claim — that it and DECODE-CHUNKED-BODY
+   'agree on the completion point' — and until there was an encoder there
+   was no way to check it.
+
+   Three parts. The first two are acceptance; the third is the one worth
+   having. Note the third is not 'the same offset': the predicate returns
+   the *start* of the last-chunk header while the decoder stops *after*
+   it, so the checkable claim is that they agree on the verdict at every
+   prefix, and that the predicate's resume offset lands on the header."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((payloads (gen-chunk-payloads))
+             (original (apply #'concatenate '(vector (unsigned-byte 8)) payloads))
+             (framed (encode-chunk-stream payloads))
+             (term-len (length (web-skeleton::chunked-terminator))))
+        ;; 1. Buffered decode returns exactly what went in.
+        (let ((decoded (handler-case
+                           (web-skeleton::decode-chunked-body
+                            framed 0 (length framed))
+                         (error (e) (princ-to-string e)))))
+          (unless (equalp decoded original)
+            (unless bad
+              (setf bad :buffered)
+              (fuzz-report nil seed framed)
+              (format t "    in:  ~s~%    out: ~s~%" original decoded))))
+        ;; 2. The streaming reader sees the same content. With no CR or LF
+        ;;    in the payload it accumulates one line and flushes it at the
+        ;;    end — or none at all when every payload was empty.
+        (let* ((acc nil)
+               (streamed (handler-case
+                             (progn
+                               (web-skeleton::stream-chunked-lines
+                                (web-skeleton::make-stream-reader
+                                 (make-mock-stream framed))
+                                (lambda (line) (push line acc)))
+                               (nreverse acc))
+                           (error (e) (princ-to-string e))))
+               (expected (if (zerop (length original))
+                             nil
+                             (list (sb-ext:octets-to-string
+                                    original :external-format :utf-8)))))
+          (unless (equal streamed expected)
+            (unless bad
+              (setf bad :streamed)
+              (fuzz-report nil seed framed)
+              (format t "    expected: ~s~%    streamed: ~s~%"
+                      expected streamed))))
+        ;; 3. At every prefix, the predicate's verdict matches whether the
+        ;;    decoder can actually finish. Too eager and the decoder runs
+        ;;    on a truncated body; too reluctant and the read loop hangs.
+        (loop for k from 0 to (length framed)
+              do (let ((complete (and (web-skeleton::chunked-body-complete-p
+                                       framed 0 k)
+                                      t))
+                       (decodes (handler-case
+                                    (progn (web-skeleton::decode-chunked-body
+                                            framed 0 k)
+                                           t)
+                                  (error () nil))))
+                   (unless (eq complete decodes)
+                     (unless bad
+                       (setf bad :predicate)
+                       (fuzz-report nil seed framed)
+                       (format t "    prefix ~d: complete-p ~s, decodes ~s~%"
+                               k complete decodes)))))
+        ;; 3b. And the offset it hands back is the start of the last-chunk,
+        ;;     not the end of the trailing CRLF — the "trailers are not
+        ;;     consumed" half of the same docstring claim.
+        (multiple-value-bind (complete resume)
+            (web-skeleton::chunked-body-complete-p framed 0 (length framed))
+          (unless (and complete
+                       (= resume (- (length framed) term-len)))
+            (unless bad
+              (setf bad :resume)
+              (fuzz-report nil seed framed)
+              (format t "    complete ~s resume ~s want ~s~%"
+                      complete resume (- (length framed) term-len)))))))
+    bad))
+
 (defun prop-byte-range-in-bounds (seed)
   "PARSE-BYTE-RANGE never returns a range outside [0, TOTAL). A range
    that escapes its resource becomes a SUBSEQ on the pre-built response
@@ -562,6 +677,8 @@
   (dolist (spec (list (cons "request parser is total" #'prop-request-parser-total)
                       (cons "json round-trips" #'prop-json-roundtrip)
                       (cons "chunked decoders agree" #'prop-chunked-parity)
+                      (cons "chunked encoder round-trips"
+                            #'prop-chunked-encoder-roundtrip)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

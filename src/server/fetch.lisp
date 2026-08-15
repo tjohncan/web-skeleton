@@ -24,7 +24,10 @@
   (url      ""     :type string)
   (headers  nil    :type list)
   (body     nil)
-  (callback nil    :type function))
+  (callback nil    :type function)
+  ;; (BYTES) called per chunk as the response arrives, on the async
+  ;; http:// path. NIL buffers the whole body as before.
+  (on-body  nil    :type (or null function)))
 
 (defparameter *fetch-timeout* 30
   "Seconds, per phase — not a total, except on the async http:// path
@@ -119,16 +122,58 @@
    operate on one line at a time and never buffer the whole
    response.")
 
-(defun http-fetch (method url &key headers body then)
+(defun http-fetch (method url &key headers body then on-body)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
    THEN is called with (status headers body) when the response arrives;
-   it must return an HTTP response, byte vector, or another http-fetch-continuation."
+   it must return an HTTP response, byte vector, or another http-fetch-continuation.
+
+   ON-BODY, if given, is called as (CONN BYTES) with each chunk of a
+   chunked response as it arrives, on the async http:// path — CONN is
+   the outbound connection, for FETCH-RESUME. The framing walk already
+   proves each chunk whole, so this hands those bytes over instead of
+   only stepping past them. THEN still fires exactly once at the end,
+   with a NIL body: the bytes went out incrementally rather than being
+   accumulated, and handing them over twice would double the memory the
+   callback exists to avoid.
+
+   Chunked framing only, and it degrades rather than disappearing. A
+   Content-Length or close-delimited response has no chunk walk to hand
+   bytes back from, so ON-BODY is never called and THEN receives the
+   whole body the ordinary way — not incremental, but not lost. An app
+   cannot choose which framing an upstream uses: the same origin will
+   switch by response size or by whatever proxy is in front, so a relay
+   has to be written to accept the body either way. Read the bytes from
+   ON-BODY when they arrive there and from THEN's body when they do not.
+
+   Chunk-granular, not line-granular, and deliberately. Line splitting
+   already exists once, in READER-READ-BYTES on the blocking path, with
+   CR/LF/CRLF handling and partial-line state carried across reads. A
+   second implementation here would be two readers that could disagree
+   about where a line ends, which is the disagreement this codebase
+   treats as its threat model. An app that wants lines can split what it
+   is given.
+
+   Return :PAUSE from ON-BODY to stop reading the upstream — its send
+   window fills and the pressure propagates back without anything being
+   dropped. Resume with FETCH-RESUME. A value rather than a condition,
+   for the reason CONNECTION-APPEND-WRITE refuses by return: applying
+   backpressure is ordinary control flow and should not unwind through
+   the middle of a read loop.
+
+   :PAUSE stops the upstream, not the current pass. Whatever was already
+   read stays in the read buffer and every chunk of it is still handed
+   over before EPOLLIN is dropped — CONNECTION-READ-AVAILABLE drains to
+   EAGAIN, so that can be a lot. This is deliberate and load-bearing: if
+   the walk stopped early, the undelivered bytes would sit in user space
+   where an EPOLL_CTL_MOD does not re-fire, and FETCH-RESUME could not be
+   a simple re-arm. The last answer in a pass is the one that counts, so
+   a caller may pause on one chunk and continue on a later one."
   (unless then
     (error "http-fetch requires :then callback"))
   (make-http-fetch-continuation :method method :url url
                                 :headers headers :body body
-                                :callback then))
+                                :callback then :on-body on-body))
 
 (defun defer-to-fetch (method url &key headers body then)
   "Readability alias for HTTP-FETCH at the handler call site. Returns an
@@ -1377,6 +1422,7 @@
                                  :outbound-p t
                                  :inbound-fd (connection-fd conn)
                                  :fetch-callback (http-fetch-continuation-callback fetch-req)
+                                 :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :last-active (get-universal-time)))
                  (connection-queue-write out-conn request-bytes)
@@ -1534,6 +1580,24 @@
       ;; :continue — more bytes to write
       )))
 
+(defun fetch-resume (conn)
+  "Resume reading an outbound response that ON-BODY paused.
+
+   Re-arms EPOLLIN on the outbound connection. The bytes that arrived
+   while it was paused are in the kernel, not in user space, so the
+   edge-triggered re-arm does fire — which is exactly the case the
+   framework documents as *not* holding for buffered user-space data.
+
+   CONN is the outbound connection ON-BODY was called for. A no-op if it
+   was never paused, so a producer that calls this on every pass rather
+   than tracking state is not punished for it."
+  (when (connection-fetch-paused conn)
+    (setf (connection-fetch-paused conn) nil)
+    (when *epoll-fd*
+      (epoll-modify *epoll-fd* (connection-fd conn)
+                    (logior +epollin+ +epollet+))))
+  (values))
+
 (defun handle-outbound-read (conn epoll-fd)
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
   (let ((result (connection-read-available conn)))
@@ -1575,14 +1639,36 @@
        ;;
        ;; Close-delimited responses (no CL, no TE) still complete via the
        ;; :eof branch above: for those, EOF genuinely is the framing.
-       (multiple-value-bind (complete next-scan)
-           (outbound-response-complete-p (connection-read-buf conn)
-                                         (connection-read-pos conn)
-                                         (connection-fetch-method conn)
-                                         (connection-chunk-scan-pos conn))
-         (setf (connection-chunk-scan-pos conn) next-scan)
-         (when complete
-           (complete-fetch conn epoll-fd)))))))
+       (let ((pause nil))
+         (multiple-value-bind (complete next-scan)
+             (outbound-response-complete-p
+              (connection-read-buf conn)
+              (connection-read-pos conn)
+              (connection-fetch-method conn)
+              (connection-chunk-scan-pos conn)
+              (when (connection-fetch-on-body conn)
+                (lambda (buf start end)
+                  ;; SUBSEQ rather than the shared buffer: the app keeps
+                  ;; whatever it is handed, and the read buffer is reused
+                  ;; on the next wake-up.
+                  ;; Last answer in a pass wins. A caller that pauses on
+                  ;; one chunk and continues on the next ends the pass
+                  ;; reading, which is the useful reading of a producer
+                  ;; that drained its own backlog partway through.
+                  (setf pause
+                        (eq (funcall (connection-fetch-on-body conn)
+                                     conn (subseq buf start end))
+                            :pause)))))
+           (setf (connection-chunk-scan-pos conn) next-scan)
+           (cond
+             (complete (complete-fetch conn epoll-fd))
+             ;; Backpressure: leave the bytes in the kernel and let the
+             ;; upstream's window fill, which is the disposition a relay
+             ;; wants — the client has not misbehaved, it is on a slower
+             ;; link. FETCH-RESUME has why the re-arm works.
+             (pause
+              (setf (connection-fetch-paused conn) t)
+              (epoll-modify epoll-fd (connection-fd conn) +epollet+)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
@@ -1599,7 +1685,7 @@
         thereis (and (string-equal name "transfer-encoding")
                      (header-has-token-p value "chunked"))))
 
-(defun chunked-body-complete-p (buf start end &optional (resume start))
+(defun chunked-body-complete-p (buf start end &optional (resume start) on-data)
   "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in
    BUF[START..END). COMPLETE-P is T once the zero-size chunk header has
    arrived. Walks the chunk framing, skipping *over* chunk data rather
@@ -1625,7 +1711,12 @@
 
    It stops at the zero-size chunk header rather than at the trailing
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
-   are not consumed), so the two agree on the completion point."
+   are not consumed), so the two agree on the completion point.
+
+   ON-DATA, when supplied, is called (BUF START END) once per chunk whose
+   framing this walk has just proved whole — the same visit, handing the
+   bytes back instead of only stepping over them. Never called twice for
+   a chunk, because RESUME means the walk never revisits one."
   (let ((pos (max start resume)))
     (loop
       ;; BOUNDARY is the start of the chunk header about to be parsed:
@@ -1659,12 +1750,17 @@
         ;; data rather than scanning it, which is what keeps a body whose
         ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
         ;; for a terminator — a naive suffix check would truncate there.
-        (incf pos size)
-        (incf pos 2)
-        (when (> pos end)
-          (return (values nil boundary)))))))
+        (let ((data-start pos))
+          (incf pos size)
+          (incf pos 2)
+          (when (> pos end)
+            (return (values nil boundary)))
+          ;; The walk has already proved this chunk whole; ON-DATA is how
+          ;; the bytes leave without a second pass over them.
+          (when on-data
+            (funcall on-data buf data-start (+ data-start size))))))))
 
-(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0))
+(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0) on-data)
   "Return (values COMPLETE-P NEXT-CHUNK-SCAN) for the outbound HTTP
    response accumulated in BUF[0..END), given the request METHOD. Thread
    NEXT-CHUNK-SCAN back in on the following call so a chunked body is
@@ -1719,7 +1815,8 @@
         (te-present
          (multiple-value-bind (complete next)
              (chunked-body-complete-p buf body-start end
-                                      (max body-start chunk-scan))
+                                      (max body-start chunk-scan)
+                                      on-data)
            ;; The header parse only runs on the read that actually
            ;; completes — the cheap framing walk gates it.
            (values (and complete
@@ -1925,9 +2022,21 @@
                          body-end))
            (raw-body (when (> body-end body-start)
                        (subseq buf body-start body-end)))
-           (body (if (and raw-body chunked-p)
-                     (decode-chunked-body raw-body 0 (length raw-body))
-                     raw-body))
+           ;; NIL only when ON-BODY *actually* delivered the bytes, which
+           ;; is the chunked path and no other — ON-DATA is threaded into
+           ;; CHUNKED-BODY-COMPLETE-P's walk and nowhere else. Keying this
+           ;; on the callback merely being supplied dropped the body of
+           ;; every Content-Length and close-delimited response: no chunks
+           ;; delivered, NIL in :THEN, nothing raised. That is the majority
+           ;; of responses in the wild, and the caller does not choose the
+           ;; framing — the same origin switches by response size or by
+           ;; whatever proxy is in front, so a relay would work against one
+           ;; upstream and come back empty against the next.
+           (body (cond
+                   ((and (connection-fetch-on-body out-conn) chunked-p) nil)
+                   ((and raw-body chunked-p)
+                    (decode-chunked-body raw-body 0 (length raw-body)))
+                   (t raw-body)))
            ;; Call the user's callback.
            (callback (connection-fetch-callback out-conn))
            (inbound-fd (connection-inbound-fd out-conn))

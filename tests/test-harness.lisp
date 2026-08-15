@@ -964,6 +964,412 @@
     (check "start-server: :workers :auto signals error"
            (try-workers :auto) t)))
 
+(defun test-harness-write-stall-timeout-zero-rejected ()
+  "start-server must refuse a non-positive *write-stall-timeout*.
+
+   WS-SEND checks it too, but only callers of WS-SEND reach that check,
+   and a handler that returns a frame instead of pushing one appends
+   through a path that never sees it. With the deadline disabled, that
+   path — the primary documented shape — has no time bound on an
+   undrained queue at all: *ws-idle-timeout* defaults to a day and is
+   refreshed by reads a peer that stopped reading may still be sending.
+   Three documents promise no setting disables the deadline. This is
+   where that promise is kept.
+
+   The error message is asserted, not merely the fact of an error, so
+   this cannot pass on a rejection that happened for some other reason.
+   The positive case needs no check here: every other harness test starts
+   a server at the default of 10.
+
+   SETF rather than LET, and restored in an UNWIND-PROTECT — the probe
+   runs in a fresh thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: start-server *write-stall-timeout* 0 rejects~%")
+  (let ((saved *write-stall-timeout*))
+    (unwind-protect
+         (flet ((try-timeout (v)
+                  (setf *write-stall-timeout* v)
+                  (let ((msg nil))
+                    (let ((th (sb-thread:make-thread
+                               (lambda ()
+                                 (handler-case
+                                     (progn
+                                       (start-server
+                                        :workers 1
+                                        :handler (lambda (r) (declare (ignore r))))
+                                       nil)
+                                   (error (e) (setf msg (princ-to-string e)))))
+                               :name "write-stall-timeout-validation-probe")))
+                      (handler-case
+                          (sb-thread:join-thread th :timeout 2)
+                        (error ()
+                          (ignore-errors (sb-thread:terminate-thread th))
+                          (ignore-errors (sb-thread:join-thread th)))))
+                    msg)))
+           (check "start-server: *write-stall-timeout* 0 signals error"
+                  (let ((m (try-timeout 0)))
+                    (and m (not (null (search "*write-stall-timeout*" m))) t))
+                  t)
+           (check "start-server: *write-stall-timeout* -1 signals error"
+                  (let ((m (try-timeout -1)))
+                    (and m (not (null (search "*write-stall-timeout*" m))) t))
+                  t))
+      (setf *write-stall-timeout* saved))))
+
+(defun %raw-connect ()
+  "A raw socket to the live test server, plus its byte stream."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+    (values socket
+            (sb-bsd-sockets:socket-make-stream
+             socket :input t :output t :element-type '(unsigned-byte 8)))))
+
+(defun %send-raw-get (stream path &key (extra ""))
+  (write-sequence (sb-ext:string-to-octets
+                   (format nil "GET ~a HTTP/1.1~c~cHost: localhost~c~c~a~c~c"
+                           path #\Return #\Newline #\Return #\Newline
+                           extra #\Return #\Newline)
+                   :external-format :ascii)
+                  stream)
+  (force-output stream))
+
+(defun test-harness-streaming-e2e ()
+  "A streaming response, end to end: head, chunks, terminator, and the
+   framework's own decoder reading its own encoder's output back off a
+   real socket. The handler returns as soon as it has queued its content,
+   which is the shape the whole issue is about — the worker is free while
+   the response is still being delivered."
+  (format t "~%Harness: streaming response end-to-end~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-stream-response
+                   :headers '(("content-type" . "text/plain"))
+                   :on-open (lambda (conn)
+                              (stream-send conn (sb-ext:string-to-octets
+                                                 "alpha " :external-format :ascii))
+                              (stream-send conn (sb-ext:string-to-octets
+                                                 "beta" :external-format :ascii))
+                              (stream-close conn)))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (%send-raw-get stream "/stream" :extra
+                            (format nil "Connection: close~c~c"
+                                    #\Return #\Newline))
+             (let* ((buf (read-until-bounded stream))
+                    (raw (subseq buf 0 (fill-pointer buf)))
+                    (text (sb-ext:octets-to-string raw :external-format :latin-1))
+                    (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+               (check "streaming e2e: 200 with chunked framing"
+                      (and (search "200 OK" text)
+                           (search "transfer-encoding: chunked" text)
+                           t)
+                      t)
+               (check "streaming e2e: no Content-Length"
+                      (search "content-length" text) nil)
+               ;; Caught for the same reason as the unit-level decode: a
+               ;; missing terminator raises here, and a raise ends the
+               ;; run rather than reporting.
+               (check "streaming e2e: the body decodes to what was streamed"
+                      (handler-case
+                          (sb-ext:octets-to-string
+                           (web-skeleton::decode-chunked-body
+                            raw (+ hend 4) (length raw))
+                           :external-format :ascii)
+                        (error (e) (princ-to-string e)))
+                      "alpha beta")))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-sse-e2e ()
+  "An SSE endpoint end to end. The events go out framed as chunks and
+   come back through the framework's own chunked decoder, so what is
+   asserted is the event text a browser would actually parse — not the
+   bytes the serializer happened to produce."
+  (format t "~%Harness: server-sent events end-to-end~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-sse-response
+                   :on-open (lambda (conn)
+                              (sse-send conn :data "first" :event "tick")
+                              (sse-send conn :data "second" :id "2")
+                              (sse-comment conn "keep")
+                              (stream-close conn)))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (%send-raw-get stream "/events" :extra
+                            (format nil "Connection: close~c~c"
+                                    #\Return #\Newline))
+             (let* ((buf (read-until-bounded stream))
+                    (raw (subseq buf 0 (fill-pointer buf)))
+                    (text (sb-ext:octets-to-string raw :external-format :latin-1))
+                    (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+               (check "sse e2e: the content type reaches the client"
+                      (and (search "content-type: text/event-stream" text) t) t)
+               (check "sse e2e: and so does the proxy hint"
+                      (and (search "x-accel-buffering: no" text) t) t)
+               (check "sse e2e: the events decode to what was sent"
+                      (handler-case
+                          (sb-ext:octets-to-string
+                           (web-skeleton::decode-chunked-body
+                            raw (+ hend 4) (length raw))
+                           :external-format :utf-8)
+                        (error (e) (princ-to-string e)))
+                      (format nil "event: tick~cdata: first~c~c~
+                                   id: 2~cdata: second~c~c~
+                                   :keep~c"
+                              #\Newline #\Newline #\Newline
+                              #\Newline #\Newline #\Newline
+                              #\Newline))))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-sse-keepalive-framed-e2e ()
+  "A keepalive on a chunked stream has to be framed as a chunk.
+
+   Every check written for the keepalive before this one looked at the
+   response struct or the connection's queue — 'installed by default',
+   'nothing left queued', 'counts as production' — and all of those are
+   true of raw bytes and framed bytes alike. The only site that can tell
+   them apart is the wire, so this reads the bytes back and puts them
+   through the framework's own chunked decoder.
+
+   Unframed, the comment line sits where the peer's decoder expects a
+   chunk-size, and the keepalive whose job is to stop a quiet stream
+   being dropped is what drops it — in the default configuration, with
+   no app error required.
+
+   SETF rather than LET on the interval: the worker reads it from another
+   thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: sse keepalive is framed~%")
+  (let ((saved *stream-keepalive-interval*))
+    (unwind-protect
+         (progn
+           (setf *stream-keepalive-interval* 1)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-sse-response
+                            :on-open (lambda (conn)
+                                       ;; One real event, then silence —
+                                       ;; the sweep supplies the rest.
+                                       (sse-send conn :data "start")))))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (%send-raw-get stream "/events")
+                      ;; No predicate: the stream never ends, so the
+                      ;; deadline is the mechanism. Four seconds at a
+                      ;; one-second interval collects the event plus
+                      ;; several keepalives.
+                      (let ((buf (read-until-bounded stream :seconds 4)))
+                        (let* ((raw (subseq buf 0 (fill-pointer buf)))
+                               (hend (or (web-skeleton::scan-crlf-crlf
+                                          raw 0 (length raw))
+                                         (error "no header boundary in ~d bytes"
+                                                (length raw))))
+                               (body (subseq raw (+ hend 4)))
+                               ;; The stream is still open, so it has no
+                               ;; terminator. Append one and the decoder
+                               ;; can pass judgement on everything sent
+                               ;; so far.
+                               (terminated
+                                 (concatenate '(vector (unsigned-byte 8))
+                                              body
+                                              (web-skeleton::chunked-terminator))))
+                          (check "sse keepalive: the stream so far is valid chunked"
+                                 (handler-case
+                                     (progn (web-skeleton::decode-chunked-body
+                                             terminated 0 (length terminated))
+                                            :decoded)
+                                   (error (e) (princ-to-string e)))
+                                 :decoded)
+                          (check "sse keepalive: and a comment line reached the client"
+                                 (let ((decoded
+                                         (handler-case
+                                             (sb-ext:octets-to-string
+                                              (web-skeleton::decode-chunked-body
+                                               terminated 0 (length terminated))
+                                              :external-format :utf-8)
+                                           (error () ""))))
+                                   (and (search "data: start" decoded)
+                                        (search ":" decoded :start2
+                                                (+ 11 (or (search "data: start"
+                                                                  decoded)
+                                                          0)))
+                                        t))
+                                 t))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf *stream-keepalive-interval* saved))))
+
+(defun test-harness-fetch-on-body-e2e ()
+  "A chunked response relayed incrementally, end to end and on one
+   worker: the same server streams it and fetches it.
+
+   ON-BODY sees each chunk as its framing is proved, and THEN still fires
+   once at the end with a NIL body — the bytes went out incrementally
+   rather than being accumulated, and delivering them twice would double
+   the memory the callback exists to avoid.
+
+   The upstream is item 5's streaming surface, so this also checks that
+   what the encoder produces is what the walk hands back."
+  (format t "~%Harness: fetch :on-body incremental delivery~%")
+  (let ((collected nil)
+        (final :never)
+        (port-box (list nil)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (sb-ext:string-to-octets
+                                           "one" :external-format :ascii))
+                           (stream-send c (sb-ext:string-to-octets
+                                           "two" :external-format :ascii))
+                           (stream-close c)))
+               (http-fetch
+                :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                :on-body (lambda (conn chunk)
+                           (declare (ignore conn))
+                           (push (sb-ext:octets-to-string
+                                  chunk :external-format :ascii)
+                                 collected))
+                :then (lambda (status headers body)
+                        (declare (ignore headers))
+                        (setf final (list status (if body :present :nil)))
+                        (make-text-response 200 "relayed"))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (status headers body)
+          (test-http-request :get "/relay")
+        (declare (ignore headers))
+        (check "on-body e2e: the relay answered" status 200)
+        (check "on-body e2e: and its own body came through" body "relayed"))
+      (check "on-body e2e: every chunk arrived, in order"
+             (reverse collected) '("one" "two"))
+      ;; The final callback still fires exactly once, and its body is NIL
+      ;; because the bytes were already handed over.
+      (check "on-body e2e: :then saw the upstream status" (first final) 200)
+      (check "on-body e2e: :then got no body to re-deliver"
+             (second final) :nil))))
+
+(defun test-harness-fetch-on-body-content-length-e2e ()
+  "An :ON-BODY fetch against a Content-Length upstream must still deliver
+   the body — through :THEN, since there is no chunk walk to hand it back
+   from.
+
+   Suppressing the buffered body on the strength of ON-BODY merely being
+   *supplied* dropped it entirely on this framing: no chunks, NIL in
+   :THEN, nothing raised. An app cannot choose which framing an upstream
+   uses — the same origin switches by response size or by whatever proxy
+   is in front — so the two paths have to agree that the bytes arrive
+   somewhere."
+  (format t "~%Harness: fetch :on-body against a Content-Length upstream~%")
+  (let ((chunks nil)
+        (final :never)
+        (port-box (list nil)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               ;; An ordinary response: Content-Length, no chunking.
+               (make-text-response 200 "plain-body")
+               (http-fetch
+                :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                :on-body (lambda (conn chunk)
+                           (declare (ignore conn))
+                           (push (sb-ext:octets-to-string
+                                  chunk :external-format :ascii)
+                                 chunks))
+                :then (lambda (status headers body)
+                        (declare (ignore status headers))
+                        (setf final (if body
+                                        (sb-ext:octets-to-string
+                                         body :external-format :ascii)
+                                        :nil))
+                        (make-text-response 200 "relayed"))))))
+      (setf (first port-box) *test-port*)
+      (test-http-request :get "/relay")
+      (check "on-body/CL: no chunks, because there is no chunk walk"
+             chunks nil)
+      (check "on-body/CL: and the body still arrives, through :then"
+             final "plain-body"))))
+
+(defun test-harness-stream-does-not-hold-worker-e2e ()
+  "The acceptance criterion for the whole issue, at :WORKERS 1.
+
+   One client opens a stream and leaves it open. A second client then
+   makes an ordinary request on the same single worker and must be
+   answered while the first is still streaming. If holding a stream held
+   the worker, the second request could not complete at all.
+
+   The same fixture then covers disconnect detection: the streaming
+   client goes away without a word, and the server has to notice and run
+   the app's teardown rather than producing into a socket with nobody on
+   the far end."
+  (format t "~%Harness: a live stream does not hold the worker~%")
+  (let ((live-conn nil)
+        (closed-reason :never))
+    (with-test-server
+        (:handler (lambda (req)
+                    (if (search "/stream" (http-request-path req))
+                        (make-stream-response
+                         :on-close (lambda (c reason)
+                                     (declare (ignore c))
+                                     (setf closed-reason reason))
+                         :on-open (lambda (conn)
+                                    ;; Send something so the client can
+                                    ;; prove the stream is live, then
+                                    ;; return without closing it.
+                                    (setf live-conn conn)
+                                    (stream-send conn
+                                                 (sb-ext:string-to-octets
+                                                  "tick" :external-format :ascii))))
+                        (make-text-response 200 "fast"))))
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/stream")
+               ;; Read only as far as the first chunk. The response is
+               ;; keep-alive and open-ended, so it never reaches EOF —
+               ;; without a predicate this would sit here until the
+               ;; deadline and prove nothing.
+               (multiple-value-bind (got reason)
+                   (read-until-bounded
+                    stream :seconds 3
+                    :until (lambda (buf fill)
+                             (search "tick"
+                                     (sb-ext:octets-to-string
+                                      (subseq buf 0 fill)
+                                      :external-format :latin-1))))
+                 (declare (ignore got))
+                 (check "stream/worker: the stream delivered its first chunk"
+                        reason :satisfied))
+               (check "stream/worker: the stream is still open"
+                      (null live-conn) nil)
+               ;; The worker must still be able to serve someone else.
+               (multiple-value-bind (status headers body)
+                   (test-http-request :get "/fast")
+                 (declare (ignore headers))
+                 (check "stream/worker: a concurrent request is answered"
+                        status 200)
+                 (check "stream/worker: and answered correctly" body "fast")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; The streaming client is gone now. The server should notice and
+      ;; tell the app, rather than holding a connection to nobody.
+      (let ((deadline (+ (get-internal-real-time)
+                         (* 3 internal-time-units-per-second))))
+        (loop until (or (not (eq closed-reason :never))
+                        (> (get-internal-real-time) deadline))
+              do (sleep 0.05)))
+      (check "stream/worker: the app is told the peer disconnected"
+             closed-reason :disconnected))))
+
 (defun test-harness-pipelined-with-fin-e2e ()
   "Two HTTP/1.1 requests pipelined onto one connection, followed by
    a half-close from the client, both dispatch. After the keep-alive
@@ -1312,5 +1718,12 @@
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
+  (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-streaming-e2e)
+  (test-harness-sse-e2e)
+  (test-harness-sse-keepalive-framed-e2e)
+  (test-harness-fetch-on-body-e2e)
+  (test-harness-fetch-on-body-content-length-e2e)
+  (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))
