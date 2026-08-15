@@ -47,6 +47,13 @@
   (write-buf nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (write-pos 0   :type fixnum)               ; bytes sent so far
   (write-end 0   :type fixnum)               ; total bytes to send
+  ;; Vectors queued behind write-buf, oldest first. write-buf is the head
+  ;; of the queue and these follow it; CONNECTION-ON-WRITE promotes the
+  ;; next one each time the head drains. Held by reference and never
+  ;; written into — see CONNECTION-APPEND-WRITE for why that matters.
+  (write-queue      nil :type list)
+  (write-queue-tail nil :type list)          ; last cons of write-queue, for O(1) append
+  (write-queued     0   :type fixnum)        ; unsent bytes in write-queue, head excluded
   ;; Parsed request (set once headers + body are complete)
   (request   nil :type (or null http-request))
   ;; Content-Length tracking (during :read-body state)
@@ -747,7 +754,145 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: queue write
+;;;
+;;; WRITE-BUF is the head of a queue whose tail is WRITE-QUEUE. Two ways in:
+;;;
+;;;   CONNECTION-QUEUE-WRITE  — replaces the head, signals if anything is
+;;;                             pending. The original, unchanged. A response
+;;;                             is one vector and the caller owns the socket.
+;;;   CONNECTION-APPEND-WRITE — adds behind whatever is pending. For producers
+;;;                             that emit repeatedly without waiting for the
+;;;                             peer: WS-SEND, and the streaming surfaces.
+;;;
+;;; Keeping both is deliberate. QUEUE-WRITE's guard is a real one — it caught
+;;; the class of bug where a second response is built for a connection that
+;;; never finished sending the first, and turning every caller into an append
+;;; would convert that signal into a peer quietly receiving two responses
+;;; concatenated. Callers that legitimately queue say so by name.
 ;;; ---------------------------------------------------------------------------
+
+(defparameter *max-write-backlog* (* 2 1024 1024)
+  "Maximum unsent bytes a single connection may hold, default 2 MiB.
+   Counts the in-flight head plus everything queued behind it.
+
+   Reached when a producer outruns the peer — an app pushing events
+   faster than a phone on a train can read them. A send that would
+   exceed the bound is refused whole rather than truncated, and the
+   caller decides what that means (see CONNECTION-APPEND-WRITE).
+
+   Must clear *MAX-WS-MESSAGE-SIZE* by at least 10 bytes — the largest
+   header BUILD-WS-FRAME emits — or a maximal legal message cannot be
+   sent even onto an empty queue. The receive path accepts a payload of
+   exactly *MAX-WS-MESSAGE-SIZE*, and framing it for the trip back costs
+   the extended-length header, so an echo handler in the default
+   configuration would be handed a message it is then refused permission
+   to return. Both limits are exported and tunable apart, which makes
+   this a requirement to keep rather than an identity to lean on; the
+   default leaves a full MiB of room rather than the ten bytes that
+   would technically satisfy it.
+
+   Per connection, so the worst case is this times *MAX-CONNECTIONS*
+   times worker count — the same arithmetic as the read buffers, and
+   it needs every connection to be simultaneously backed up to get
+   there. Lower it if the deployment has many connections and a
+   generous ulimit; raise it for few connections and bursty output.")
+
+(defun connection-write-pending (conn)
+  "Unsent bytes on CONN: what is left of the head, plus the queue behind it."
+  (+ (- (connection-write-end conn) (connection-write-pos conn))
+     (connection-write-queued conn)))
+
+(defun connection-write-full-p (conn)
+  "True when CONN is at or over *MAX-WRITE-BACKLOG*.
+
+   A hint for a producer deciding whether to keep going at all, never a
+   pre-flight check for one send. This answers about the bytes already
+   queued; CONNECTION-APPEND-WRITE answers about the bytes being handed
+   over, and only its return value is authoritative. With a byte of room
+   left this reports NIL and the next 64 KiB append is still refused. A
+   caller that reads a NIL here as permission and drops the append's
+   return loses whatever it had read — the same invisible data loss that
+   the close-on-full disposition below exists to avoid, arriving by the
+   back door.
+
+   The two dispositions differ and neither belongs here: an
+   app-generated stream should close, because a dropped event is
+   invisible to the client and its view diverges permanently; a relay
+   should stop reading its upstream instead, because the client has not
+   misbehaved and letting the upstream's TCP window fill turns a killed
+   download into a slow one."
+  (>= (connection-write-pending conn) *max-write-backlog*))
+
+(defun connection-reset-write (conn)
+  "Drop all write state. Used where a connection is recycled for its
+   next request — keep-alive reset, ws-upgrade completion, 100-continue.
+
+   The queue has to go with the head. Those sites used to zero the three
+   buffer slots inline, which was the whole of the write state; leaving
+   a queued vector behind now would flush it into the *next* response on
+   the same socket, arriving as a prefix nobody sent."
+  (setf (connection-write-buf conn) nil
+        (connection-write-pos conn) 0
+        (connection-write-end conn) 0
+        (connection-write-queue conn) nil
+        (connection-write-queue-tail conn) nil
+        (connection-write-queued conn) 0))
+
+(defun connection-append-write (conn bytes)
+  "Queue BYTES behind whatever CONN has pending. Returns T if accepted,
+   NIL if it would pass *MAX-WRITE-BACKLOG* — in which case nothing is
+   queued and the caller must decide (CONNECTION-WRITE-FULL-P documents
+   the two dispositions).
+
+   Refusing whole rather than appending a prefix is the point: a
+   truncated frame is a protocol error on the peer's side, while a
+   refused one leaves the stream well-formed and short, which the
+   caller can act on.
+
+   BYTES is held by reference and never written into. Shared, reused
+   vectors reach this queue — the pre-built ping frame, the 100-Continue
+   bytes, the connection-limit refusal, and every static file's response,
+   which is one vector served to every request for that file. Advancing
+   through them is safe because only WRITE-POS moves and that lives on
+   the connection. In-place compaction of the head would corrupt static
+   serving for every subsequent request, permanently and invisibly, so
+   this queue does not compact: it promotes.
+
+   Does not write to the socket. The flush is a separate step so this
+   can also serve the relay path, where the event loop is already
+   turning and an opportunistic flush would be redundant work on a
+   socket that is about to report writable anyway."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (let ((len (length bytes)))
+    (cond
+      ((> (+ (connection-write-pending conn) len) *max-write-backlog*) nil)
+      ;; Nothing outstanding — become the head. Skips a cons, and keeps
+      ;; the common single-vector case identical in shape to QUEUE-WRITE.
+      ((zerop (connection-write-pending conn))
+       (setf (connection-write-buf conn) bytes
+             (connection-write-pos conn) 0
+             (connection-write-end conn) len)
+       t)
+      (t
+       (let ((cell (list bytes)))
+         (if (connection-write-queue-tail conn)
+             (setf (cdr (connection-write-queue-tail conn)) cell)
+             (setf (connection-write-queue conn) cell))
+         (setf (connection-write-queue-tail conn) cell))
+       (incf (connection-write-queued conn) len)
+       t))))
+
+(defun connection-promote-write (conn)
+  "Make the next queued vector the head. Returns NIL if the queue is empty."
+  (let ((next (pop (connection-write-queue conn))))
+    (when next
+      (unless (connection-write-queue conn)
+        (setf (connection-write-queue-tail conn) nil))
+      (decf (connection-write-queued conn) (length next))
+      (setf (connection-write-buf conn) next
+            (connection-write-pos conn) 0
+            (connection-write-end conn) (length next))
+      t)))
 
 (defun connection-queue-write (conn bytes)
   "Replace the write buffer with BYTES. Caller is responsible for
@@ -764,8 +909,13 @@
    calling, which is the same invariant enforced two levels out; the
    next caller to skip that test would otherwise ship the peer a
    truncated frame followed by a whole one, and the corruption would
-   surface as a protocol error somewhere else entirely."
-  (let ((pending (- (connection-write-end conn) (connection-write-pos conn))))
+   surface as a protocol error somewhere else entirely.
+
+   The guard counts the append queue too. A caller that means to queue
+   has CONNECTION-APPEND-WRITE and says so; reaching this function with
+   a queue behind the head means two producers believe they own the
+   socket, which is the same mistake the guard already exists to catch."
+  (let ((pending (connection-write-pending conn)))
     (when (plusp pending)
       (error "connection-queue-write would clobber ~d un-flushed byte~:p on fd ~d"
              pending (connection-fd conn))))
@@ -783,15 +933,26 @@
 
 (defun connection-on-write (conn)
   "Handle writable event. Loops until EAGAIN or all bytes sent.
-   Edge-triggered epoll requires draining writability in one pass."
-  (let ((buf (connection-write-buf conn))
-        (end (connection-write-end conn)))
-    (loop
-      (let* ((pos (connection-write-pos conn))
-             (remaining (- end pos)))
-        (when (zerop remaining)
-          (return :done))
-        (let ((result (nb-write (connection-fd conn) buf pos remaining)))
-          (cond
-            ((eq result :again) (return :continue))
-            (t (incf (connection-write-pos conn) result))))))))
+   Edge-triggered epoll requires draining writability in one pass.
+
+   Reads the head's slots each turn instead of hoisting them out of the
+   loop. The hoist was correct while a connection could hold one vector
+   and only one, but the head now moves underneath: it advances to the
+   next queued vector as each drains, and an append can land while this
+   loop is running. A stale END would stop the pass at the old vector's
+   length and wait for an EPOLLOUT that — the socket having never
+   reported unwritable — is not coming."
+  (loop
+    (let* ((pos (connection-write-pos conn))
+           (remaining (- (connection-write-end conn) pos)))
+      (cond
+        ((plusp remaining)
+         (let ((result (nb-write (connection-fd conn) (connection-write-buf conn)
+                                 pos remaining)))
+           (if (eq result :again)
+               (return :continue)
+               (incf (connection-write-pos conn) result))))
+        ;; Head drained; promote the next queued vector and keep writing.
+        ;; The socket is still writable and will not say so a second time.
+        ((connection-promote-write conn))
+        (t (return :done))))))

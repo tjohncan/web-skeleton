@@ -126,6 +126,7 @@
            #:*max-ws-payload-size*
            #:*max-ws-message-size*
            #:*max-connections*
+           #:*max-write-backlog*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*

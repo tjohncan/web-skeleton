@@ -4248,6 +4248,183 @@
              state :closing))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Write queue
+;;;
+;;; CONNECTION-APPEND-WRITE queues behind whatever is pending instead of
+;;; replacing it. The bookkeeping is testable with no fd at all; the part
+;;; that needs one is CONNECTION-ON-WRITE promoting the next vector when
+;;; the head drains, which is what makes queueing mean anything.
+;;;
+;;; The drain test asserts file *contents*, not the return value. A
+;;; snapshotted ON-WRITE also returns :DONE — it just stops after the
+;;; first vector and waits for an EPOLLOUT that is not coming, so a
+;;; check on :DONE alone would pass against the bug it exists to catch.
+;;; ---------------------------------------------------------------------------
+
+(defun test-write-queue ()
+  (format t "~%Write queue~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
+         (str (v) (sb-ext:octets-to-string v :external-format :ascii)))
+    ;; --- Append onto an idle connection becomes the head, no cons ---
+    (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (check "append: accepted on idle connection"
+             (web-skeleton::connection-append-write conn (bytes "hello")) t)
+      (check "append: idle append becomes the head"
+             (str (web-skeleton::connection-write-buf conn)) "hello")
+      (check "append: idle append does not use the queue"
+             (web-skeleton::connection-write-queue conn) nil)
+      (check "append: pending counts the head"
+             (web-skeleton::connection-write-pending conn) 5)
+
+      ;; --- Second append goes behind, head untouched ---
+      (check "append: accepted behind a head"
+             (web-skeleton::connection-append-write conn (bytes "world!")) t)
+      (check "append: head is not replaced"
+             (str (web-skeleton::connection-write-buf conn)) "hello")
+      (check "append: pending spans head and queue"
+             (web-skeleton::connection-write-pending conn) 11)
+      (check "append: queued counts only the tail"
+             (web-skeleton::connection-write-queued conn) 6)
+
+      ;; --- Order is preserved across a third ---
+      (web-skeleton::connection-append-write conn (bytes "third"))
+      (check "append: queue holds tail vectors oldest first"
+             (mapcar #'str (web-skeleton::connection-write-queue conn))
+             '("world!" "third"))
+
+      ;; --- QUEUE-WRITE's guard counts the queue, not just the head ---
+      ;; Drain the head only; a queue remains. The old guard subtracted
+      ;; write-pos from write-end and would have seen zero here.
+      (setf (web-skeleton::connection-write-pos conn)
+            (web-skeleton::connection-write-end conn))
+      (check "queue-write: signals when only the append queue is pending"
+             (handler-case (progn (web-skeleton::connection-queue-write
+                                   conn (bytes "clobber"))
+                                  nil)
+               (error () t))
+             t)
+
+      ;; --- Promotion walks the queue in order and unwinds the counter ---
+      (check "promote: first promotion takes the oldest"
+             (progn (web-skeleton::connection-promote-write conn)
+                    (str (web-skeleton::connection-write-buf conn)))
+             "world!")
+      (check "promote: promotion resets the head offsets"
+             (list (web-skeleton::connection-write-pos conn)
+                   (web-skeleton::connection-write-end conn))
+             '(0 6))
+      (check "promote: second promotion takes the next"
+             (progn (setf (web-skeleton::connection-write-pos conn) 6)
+                    (web-skeleton::connection-promote-write conn)
+                    (str (web-skeleton::connection-write-buf conn)))
+             "third")
+      (check "promote: queued returns to zero when the tail empties"
+             (web-skeleton::connection-write-queued conn) 0)
+      (check "promote: tail pointer is released with the last cons"
+             (web-skeleton::connection-write-queue-tail conn) nil)
+      (check "promote: empty queue reports nothing to promote"
+             (progn (setf (web-skeleton::connection-write-pos conn) 5)
+                    (web-skeleton::connection-promote-write conn))
+             nil))
+
+    ;; --- RESET-WRITE clears the queue along with the head ---
+    ;; A queued vector surviving a keep-alive reset would be flushed as a
+    ;; prefix of the next response on the same socket.
+    (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (web-skeleton::connection-append-write conn (bytes "first"))
+      (web-skeleton::connection-append-write conn (bytes "second"))
+      (web-skeleton::connection-reset-write conn)
+      (check "reset: head cleared"
+             (web-skeleton::connection-write-buf conn) nil)
+      (check "reset: queue cleared"
+             (web-skeleton::connection-write-queue conn) nil)
+      (check "reset: tail pointer cleared"
+             (web-skeleton::connection-write-queue-tail conn) nil)
+      (check "reset: nothing reported pending"
+             (web-skeleton::connection-write-pending conn) 0))
+
+    ;; --- The backlog bound refuses whole rather than appending a prefix ---
+    ;; LET is safe for the limit here: these calls run on this thread, not
+    ;; through a worker, so the binding is in scope for every one of them.
+    (let ((web-skeleton:*max-write-backlog* 10)
+          (conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+      (check "backlog: empty connection is not full"
+             (web-skeleton::connection-write-full-p conn) nil)
+      (check "backlog: append within the bound accepted"
+             (web-skeleton::connection-append-write conn (bytes "12345678")) t)
+      (check "backlog: append past the bound refused"
+             (web-skeleton::connection-append-write conn (bytes "999")) nil)
+      (check "backlog: refused append queues nothing"
+             (web-skeleton::connection-write-pending conn) 8)
+      (check "backlog: an exact fit is still accepted"
+             (web-skeleton::connection-append-write conn (bytes "99")) t)
+      (check "backlog: reaching the bound reports full"
+             (web-skeleton::connection-write-full-p conn) t))
+
+    ;; --- The bound must clear the inbound message cap by a frame header ---
+    ;; At default settings the receive path accepts a payload of exactly
+    ;; *MAX-WS-MESSAGE-SIZE* (websocket.lisp tests > , not >=). Sending that
+    ;; back means framing it, and BUILD-WS-FRAME spends 10 bytes on the
+    ;; extended-length header for any payload past 65535. A bound merely
+    ;; equal to the message cap therefore refuses a maximal legal echo onto
+    ;; a completely empty queue. The two limits are exported and tunable
+    ;; apart, so the relationship is a requirement to hold, not an identity
+    ;; to assume.
+    (let* ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+           (payload (make-array web-skeleton:*max-ws-message-size*
+                                :element-type '(unsigned-byte 8)
+                                :initial-element 65))
+           (frame (web-skeleton::build-ws-frame
+                   web-skeleton::+ws-op-binary+ payload)))
+      (check "backlog: headroom over the message cap covers a frame header"
+             (>= (- web-skeleton:*max-write-backlog*
+                    web-skeleton:*max-ws-message-size*)
+                 10)
+             t)
+      (check "backlog: a maximal legal ws message fits an empty queue"
+             (web-skeleton::connection-append-write conn frame) t))))
+
+(defun test-write-queue-drain ()
+  (format t "~%Write queue drain~%")
+  (let ((path "/tmp/web-skeleton-write-queue.bin"))
+    (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
+           (str (v) (sb-ext:octets-to-string v :external-format :ascii))
+           (slurp ()
+             (with-open-file (s path :element-type '(unsigned-byte 8))
+               (let ((buf (make-array (file-length s)
+                                      :element-type '(unsigned-byte 8))))
+                 (read-sequence buf s)
+                 (sb-ext:octets-to-string buf :external-format :ascii)))))
+      ;; A regular file fd never reports EAGAIN and never short-writes, so
+      ;; ON-WRITE runs to completion in one pass and the file is exactly
+      ;; the byte stream the peer would have seen.
+      (let* ((stream (open path :direction :output :element-type '(unsigned-byte 8)
+                               :if-exists :supersede :if-does-not-exist :create))
+             (fd (sb-sys:fd-stream-fd stream))
+             (shared (bytes "SHARED")))
+        (unwind-protect
+             (let ((conn (web-skeleton::make-connection :fd fd :last-active 0)))
+               (web-skeleton::connection-queue-write conn (bytes "AAA"))
+               (web-skeleton::connection-append-write conn (bytes "BB"))
+               (web-skeleton::connection-append-write conn shared)
+               ;; Same vector twice: the queue holds references, so this is
+               ;; the case that would break if the head were ever compacted
+               ;; in place. Static serving hands one vector to every request.
+               (web-skeleton::connection-append-write conn shared)
+               (check "drain: one pass reports done"
+                      (web-skeleton::connection-on-write conn) :done)
+               (check "drain: nothing left pending"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "drain: shared vector is not mutated"
+                      (str shared) "SHARED"))
+          (ignore-errors (close stream))))
+      ;; The whole queue reached the wire, in order. A snapshotted ON-WRITE
+      ;; stops after "AAA".
+      (check "drain: every queued vector is written, in order"
+             (slurp) "AAABBSHAREDSHARED")
+      (ignore-errors (delete-file path)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Outbound address filter (SSRF policy hook)
 ;;; ---------------------------------------------------------------------------
 
@@ -4619,5 +4796,7 @@
   (test-shutdown-hooks)
   (test-read-available-eof)
   (test-awaiting-sweep-504)
+  (test-write-queue)
+  (test-write-queue-drain)
   (report-suite "Server")
   (zerop *tests-failed*))

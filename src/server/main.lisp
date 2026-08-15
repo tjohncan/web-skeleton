@@ -225,8 +225,11 @@
                    ;; Dead — too many missed pongs
                    ((>= (connection-missed-pongs conn) *ws-max-missed-pongs*)
                     (push conn dead))
-                   ;; No write in progress — send ping
-                   ((>= (connection-write-pos conn) (connection-write-end conn))
+                   ;; Nothing outstanding — send ping. Counts the append
+                   ;; queue, not just the head: a connection with frames
+                   ;; queued behind the one in flight is as clearly alive
+                   ;; as one mid-write, and QUEUE-WRITE would signal.
+                   ((zerop (connection-write-pending conn))
                     (incf (connection-missed-pongs conn))
                     (connection-queue-write conn ping-frame)
                     (epoll-modify epoll-fd (connection-fd conn)
@@ -553,8 +556,12 @@
                   ;; down after the partial write finishes — the
                   ;; peer sees a truncated frame rather than a
                   ;; corrupt one.
+                  ;; Pending counts the append queue as well as the head,
+                  ;; so a connection with frames stacked behind the one in
+                  ;; flight takes the same branch rather than having the
+                  ;; close frame overwrite the head out from under them.
                   (cond
-                    ((< (connection-write-pos conn) (connection-write-end conn))
+                    ((plusp (connection-write-pending conn))
                      (setf (connection-state conn) :closing))
                     (t
                      (connection-queue-write conn (build-ws-close 1001))
@@ -862,10 +869,8 @@
                           (when (> extra 0)
                             (replace fresh buf :end2 extra))
                           (setf (connection-read-buf conn) fresh))))
+                    (connection-reset-write conn)
                     (setf (connection-read-pos conn) (max extra 0)
-                          (connection-write-buf conn) nil
-                          (connection-write-pos conn) 0
-                          (connection-write-end conn) 0
                           (connection-request conn) nil
                           (connection-body-expected conn) 0
                           (connection-header-end conn) 0
@@ -885,10 +890,8 @@
                 (when (> extra 0)
                   (replace (connection-read-buf conn) (connection-read-buf conn)
                            :start1 0 :start2 http-end :end2 buffered))
+                (connection-reset-write conn)
                 (setf (connection-read-pos conn) (max extra 0)
-                      (connection-write-buf conn) nil
-                      (connection-write-pos conn) 0
-                      (connection-write-end conn) 0
                       (connection-request conn) nil
                       (connection-body-expected conn) 0
                       (connection-header-end conn) 0
@@ -912,10 +915,8 @@
               ;; handle-client-read immediately in case the body is
               ;; already buffered (edge-triggered epoll won't re-fire
               ;; on user-space bytes).
-              (setf (connection-write-buf conn) nil
-                    (connection-write-pos conn) 0
-                    (connection-write-end conn) 0
-                    (connection-state conn) :read-body)
+              (connection-reset-write conn)
+              (setf (connection-state conn) :read-body)
               (epoll-modify epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+))
               (return-from handle-client-write :keep-alive))

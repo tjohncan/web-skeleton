@@ -578,6 +578,47 @@ verification is wired to a DNS name and matching an IP SAN is not
 implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 `*dns-cache-ttl*` is it.
 
+### The write backlog bound
+
+A connection holds one buffer being flushed and, on the paths that queue,
+a list of vectors waiting behind it. `*max-write-backlog*` caps the two
+together, 2 MiB by default.
+
+**It has to clear `*max-ws-message-size*` by at least 10 bytes**, the
+largest header `build-ws-frame` emits, or a maximal legal message cannot
+be sent even onto an empty queue. The receive path accepts a payload of
+exactly `*max-ws-message-size*`; framing it for the trip back costs the
+extended-length header, so setting the two equal hands an echo handler a
+message it is then refused permission to return. Both are exported and
+tunable apart, so this is a requirement to keep rather than an identity
+to lean on — the default leaves a full MiB of room, not the ten bytes
+that would technically satisfy it.
+
+The bound exists because a producer and its peer run at different speeds.
+An app pushing events faster than a phone on a train can read them has to
+be stopped somewhere, and the alternative to a bound is a per-connection
+list that grows until the worker dies.
+
+A send that would cross the bound is refused whole rather than truncated:
+a short frame is a protocol error on the peer's side, while a refused one
+leaves the stream well-formed and short. What the refusal *means* is the
+caller's to decide, and the two answers differ. An app-generated stream
+should close — a dropped event is invisible to the client, so its view
+diverges from the server's permanently with nothing raised anywhere. A
+relay should stop reading its upstream instead, because the client has
+not misbehaved, and letting the upstream's TCP window fill turns a killed
+download into a slow one.
+
+Per connection, so the ceiling is `*max-write-backlog*` × `*max-connections*`
+× workers — the same shape as the read-buffer arithmetic above, and it takes
+every connection on the box being simultaneously backed up to reach it.
+Lower it for many connections and a generous `ulimit`; raise it for few
+connections and bursty output.
+
+Nothing queues yet. Each of the framework's write paths sends one vector
+and waits for it, so the bound is not reachable until the queueing surfaces
+land — `ws-send` is the first.
+
 ### ws-send and worker blocking
 
 `ws-send` writes a WebSocket frame to a connection synchronously,
