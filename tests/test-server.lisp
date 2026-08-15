@@ -4561,7 +4561,11 @@
                     (web-skeleton::connection-write-pending conn)
                     pending-before)))
       (ignore-errors (sb-ext:process-kill proc 9))
-      (ignore-errors (sb-ext:process-wait proc)))))
+      (ignore-errors (sb-ext:process-wait proc))
+      ;; PROCESS-KILL and PROCESS-WAIT reap the child; neither closes the
+      ;; pipe SBCL opened for :INPUT :STREAM. Without this the fd stays
+      ;; open for the rest of the run — the Server suite's one leak.
+      (ignore-errors (sb-ext:process-close proc)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
@@ -4860,7 +4864,53 @@
                     (body (wire :GET (cons "range" "bytes=-4")))
                     "wxyz")
              (check "static date: HEAD still has no body"
-                    (body (wire :HEAD)) "")))
+                    (body (wire :HEAD)) ""))
+
+           ;; --- A file larger than the backlog bound goes out whole ---
+           ;; *max-write-backlog* is for a producer outrunning its peer.
+           ;; A static file is complete in memory at queue time: there is
+           ;; nothing to throttle and nobody to decide a disposition, so
+           ;; refusing a piece of it does not conserve anything — it
+           ;; sends headers promising a body the peer never gets, and on
+           ;; a keep-alive connection the next response lands where that
+           ;; body should have been. The suite had no file over the bound
+           ;; because the bound is 2 MiB; the number is tunable and
+           ;; someone will lower it.
+           ;; SETF and restore rather than LET. Every other test that
+           ;; touches a tuning knob a worker might read does it this way,
+           ;; and the reason generalizes past thread visibility: a LET
+           ;; here leaves the binding live for everything the body calls,
+           ;; and this body calls into the server's own queueing code.
+           (let ((saved-backlog web-skeleton:*max-write-backlog*))
+             (unwind-protect
+                  (let* ((big (make-array 600 :element-type '(unsigned-byte 8)
+                                              :initial-element 88))
+                         (entry (web-skeleton::build-static-response
+                                 "application/wasm" big 0))
+                         (segments (web-skeleton::static-segments entry :get))
+                         (conn (web-skeleton::make-connection
+                                :fd -1 :last-active 0))
+                         (total (reduce #'+ segments :key #'length)))
+                    (setf web-skeleton:*max-write-backlog* 512)
+                    (check "static backlog: the whole response is queued, bound or not"
+                           (progn (web-skeleton::connection-queue-segments
+                                   conn segments)
+                                  (web-skeleton::connection-write-pending conn))
+                           total)
+                    (check "static backlog: the body is all of it"
+                           (- (web-skeleton::connection-write-pending conn)
+                              (length (first segments))
+                              (length (second segments))
+                              (length (third segments)))
+                           600)
+                    ;; The bound still means what it says for the path it
+                    ;; was written for.
+                    (let ((c2 (web-skeleton::make-connection
+                               :fd -1 :last-active 0)))
+                      (check "static backlog: an ordinary append is still bounded"
+                             (web-skeleton::connection-append-write c2 big)
+                             nil)))
+               (setf web-skeleton:*max-write-backlog* saved-backlog))))
       (setf web-skeleton::*static-cache* saved))))
 
 ;;; ---------------------------------------------------------------------------
