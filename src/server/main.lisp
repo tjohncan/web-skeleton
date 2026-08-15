@@ -941,14 +941,15 @@
                     ;; STRIP-BODY-FOR-HEAD since the bytes are already
                     ;; fully serialized and we have no encode step to
                     ;; short-circuit.
-                    ;; Segments — queue them in order. The first goes
-                    ;; through QUEUE-WRITE so its guard still runs on a
-                    ;; connection that should have nothing pending; the
-                    ;; rest append behind it.
+                    ;; Segments — a complete response in pieces, queued
+                    ;; as one act and outside the backlog bound. Routing
+                    ;; them through CONNECTION-APPEND-WRITE subjected a
+                    ;; finished in-memory response to a limit meant for a
+                    ;; producer outrunning its peer, and a static file
+                    ;; over *MAX-WRITE-BACKLOG* had its body refused
+                    ;; while its headers went out promising one.
                     ((consp response)
-                     (connection-queue-write conn (first response))
-                     (dolist (seg (rest response))
-                       (connection-append-write conn seg))
+                     (connection-queue-segments conn response)
                      (setf (connection-state conn) :write-response)
                      (epoll-modify epoll-fd (connection-fd conn)
                                    (logior +epollout+ +epollet+)))

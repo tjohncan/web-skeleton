@@ -973,14 +973,47 @@
              (connection-write-end conn) len
              (connection-write-progress-at conn) (get-universal-time))
        t)
-      (t
-       (let ((cell (list bytes)))
-         (if (connection-write-queue-tail conn)
-             (setf (cdr (connection-write-queue-tail conn)) cell)
-             (setf (connection-write-queue conn) cell))
-         (setf (connection-write-queue-tail conn) cell))
-       (incf (connection-write-queued conn) len)
-       t))))
+      (t (%queue-tail conn bytes) t))))
+
+(defun %queue-tail (conn bytes)
+  "Put BYTES on the tail of CONN's write queue. No bound check — whether
+   a bound applies is the caller's question, and the two callers answer
+   it differently."
+  (let ((cell (list bytes)))
+    (if (connection-write-queue-tail conn)
+        (setf (cdr (connection-write-queue-tail conn)) cell)
+        (setf (connection-write-queue conn) cell))
+    (setf (connection-write-queue-tail conn) cell))
+  (incf (connection-write-queued conn) (length bytes))
+  t)
+
+(defun connection-queue-segments (conn segments)
+  "Queue a complete response that arrives in pieces: the first becomes
+   the head, the rest follow it.
+
+   Signals if anything is already pending, exactly as
+   CONNECTION-QUEUE-WRITE does and for the same reason — this is the same
+   act, a whole response handed over at once, that happens to come in
+   more than one vector.
+
+   Deliberately outside *MAX-WRITE-BACKLOG*. That bound is for a producer
+   outrunning its peer, where refusing whole leaves the stream
+   well-formed and lets the caller pick a disposition; its own docstring
+   says as much. A response already complete in memory has no producer to
+   throttle and no caller to decide, so refusing one of its pieces
+   conserves nothing and truncates the message instead — headers
+   promising a body the peer never receives, and on a keep-alive
+   connection the next response arriving where that body should have
+   been. A static file served as one finished vector has always been
+   queued without a size limit; arriving in pieces does not change what
+   it is."
+  (unless segments
+    (error "connection-queue-segments: nothing to queue on fd ~d"
+           (connection-fd conn)))
+  (connection-queue-write conn (first segments))
+  (dolist (seg (rest segments))
+    (%queue-tail conn seg))
+  t)
 
 (defun connection-promote-write (conn)
   "Make the next queued vector the head. Returns NIL if the queue is empty."
