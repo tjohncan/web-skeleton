@@ -150,7 +150,16 @@
    dropped. Resume with FETCH-RESUME. A value rather than a condition,
    for the reason CONNECTION-APPEND-WRITE refuses by return: applying
    backpressure is ordinary control flow and should not unwind through
-   the middle of a read loop."
+   the middle of a read loop.
+
+   :PAUSE stops the upstream, not the current pass. Whatever was already
+   read stays in the read buffer and every chunk of it is still handed
+   over before EPOLLIN is dropped — CONNECTION-READ-AVAILABLE drains to
+   EAGAIN, so that can be a lot. This is deliberate and load-bearing: if
+   the walk stopped early, the undelivered bytes would sit in user space
+   where an EPOLL_CTL_MOD does not re-fire, and FETCH-RESUME could not be
+   a simple re-arm. The last answer in a pass is the one that counts, so
+   a caller may pause on one chunk and continue on a later one."
   (unless then
     (error "http-fetch requires :then callback"))
   (make-http-fetch-continuation :method method :url url
@@ -1633,19 +1642,21 @@
                   ;; SUBSEQ rather than the shared buffer: the app keeps
                   ;; whatever it is handed, and the read buffer is reused
                   ;; on the next wake-up.
-                  (when (eq (funcall (connection-fetch-on-body conn)
+                  ;; Last answer in a pass wins. A caller that pauses on
+                  ;; one chunk and continues on the next ends the pass
+                  ;; reading, which is the useful reading of a producer
+                  ;; that drained its own backlog partway through.
+                  (setf pause
+                        (eq (funcall (connection-fetch-on-body conn)
                                      conn (subseq buf start end))
-                            :pause)
-                    (setf pause t)))))
+                            :pause)))))
            (setf (connection-chunk-scan-pos conn) next-scan)
            (cond
              (complete (complete-fetch conn epoll-fd))
-             ;; Backpressure. Dropping EPOLLIN leaves the bytes in the
-             ;; kernel and lets the upstream's window fill, which is the
-             ;; disposition a relay wants — the client has not
-             ;; misbehaved, it is on a slower link. Unlike the user-space
-             ;; case the framework documents as "MOD won't re-fire", the
-             ;; unread bytes are in the kernel here, so re-arming does.
+             ;; Backpressure: leave the bytes in the kernel and let the
+             ;; upstream's window fill, which is the disposition a relay
+             ;; wants — the client has not misbehaved, it is on a slower
+             ;; link. FETCH-RESUME has why the re-arm works.
              (pause
               (setf (connection-fetch-paused conn) t)
               (epoll-modify epoll-fd (connection-fd conn) +epollet+)))))))))

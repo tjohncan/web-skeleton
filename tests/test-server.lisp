@@ -1472,7 +1472,11 @@
                   "STREAM-FULL-P"
                   "MAKE-SSE-RESPONSE"
                   "SSE-SEND"
-                  "SSE-COMMENT"))
+                  "SSE-COMMENT"
+                  ;; The backpressure half of :on-body. An app that
+                  ;; pauses and cannot name the function that resumes has
+                  ;; a relay that stops mid-body.
+                  "FETCH-RESUME"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -4849,6 +4853,123 @@
         (check "on-data: an incomplete chunk is withheld" seen nil)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; :on-body backpressure
+;;;
+;;; Over a real socket and a real epoll fd, because the whole mechanism
+;;; is an epoll interest change: :PAUSE drops EPOLLIN so the upstream's
+;;; send window fills, and FETCH-RESUME puts it back. Nothing about that
+;;; is observable from a struct.
+;;;
+;;; The property that makes the simple re-arm correct is that a pause
+;;; stops the *upstream*, not the current pass — everything already read
+;;; is still handed over, so no undelivered bytes are left in user space
+;;; where an EPOLL_CTL_MOD would not re-fire.
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-on-body-pause ()
+  (format t "~%Fetch :on-body backpressure~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (seen nil)
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-read
+                         :outbound-p t :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  ;; Three chunks in one write, so they all land in one
+                  ;; read and the walk sees them in a single pass.
+                  (body (concatenate
+                         '(vector (unsigned-byte 8))
+                         (sb-ext:string-to-octets
+                          (format nil "HTTP/1.1 200 OK~c~ctransfer-encoding: ~
+                                       chunked~c~c~c~c"
+                                  #\Return #\Newline #\Return #\Newline
+                                  #\Return #\Newline)
+                          :external-format :ascii)
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "aa" :external-format :ascii))
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "bb" :external-format :ascii))
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "cc" :external-format :ascii)))))
+             (web-skeleton::set-nonblocking out-fd)
+             (setf (web-skeleton::connection-fetch-on-body conn)
+                   (lambda (c chunk)
+                     (declare (ignore c))
+                     (push (sb-ext:octets-to-string
+                            chunk :external-format :ascii)
+                           seen)
+                     :pause))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (sb-bsd-sockets:socket-send client body nil)
+             ;; Give the bytes a moment to cross loopback, then let the
+             ;; read path drain them.
+             (sleep 0.1)
+             (web-skeleton::handle-outbound-read conn epfd)
+
+             (check "pause: the callback saw every chunk already read"
+                    (nreverse seen) '("aa" "bb" "cc"))
+             (check "pause: the connection is marked paused"
+                    (web-skeleton::connection-fetch-paused conn) t)
+             ;; The response is unterminated, so the fetch has not
+             ;; completed — the connection is still registered and no
+             ;; callback has fired.
+             (check "pause: the fetch has not completed"
+                    (hash-table-count web-skeleton::*connections*) 1)
+
+             ;; Resume clears the flag and re-arms. The re-arm is what
+             ;; makes the pause recoverable rather than a one-way door.
+             (web-skeleton::fetch-resume conn)
+             (check "resume: the paused flag is cleared"
+                    (web-skeleton::connection-fetch-paused conn) nil)
+             (check "resume: a second resume is a no-op, not an error"
+                    (progn (web-skeleton::fetch-resume conn)
+                           (web-skeleton::connection-fetch-paused conn))
+                    nil)
+
+             ;; The re-arm has to be asserted against epoll, not against a
+             ;; read. HANDLE-OUTBOUND-READ calls the socket directly, so
+             ;; it delivers bytes whatever the interest mask says — the
+             ;; mask only decides whether the event loop is ever woken to
+             ;; call it. Reverting the re-arm and re-running showed
+             ;; exactly that: a delivery check passed with the pause
+             ;; never lifted.
+             (let ((evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                      :element-type '(unsigned-byte 8))))
+               ;; Fresh bytes with the interest re-armed: the loop wakes.
+               (sb-bsd-sockets:socket-send
+                client
+                (web-skeleton::encode-chunk
+                 (sb-ext:string-to-octets "dd" :external-format :ascii))
+                nil)
+               (sleep 0.1)
+               (check "resume: epoll reports the fd once the interest is back"
+                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+               ;; And it really is our fd, not a stray wake-up.
+               (check "resume: and it is the outbound fd"
+                      (web-skeleton::epoll-event-fd evbuf 0) out-fd)
+               ;; Paused again, the same bytes produce no wake-up at all.
+               (web-skeleton::handle-outbound-read conn epfd)
+               (check "pause: a paused fd is not reported, with data waiting"
+                      (progn
+                        (sb-bsd-sockets:socket-send
+                         client
+                         (web-skeleton::encode-chunk
+                          (sb-ext:string-to-octets "ee" :external-format :ascii))
+                         nil)
+                        (sleep 0.1)
+                        (web-skeleton::epoll-wait epfd evbuf 4 50))
+                      0)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Static responses carry a Date
 ;;;
 ;;; The interesting assertion is not that the header is present. It is
@@ -6056,6 +6177,7 @@
   (test-chunked-body-complete-p)
   (test-chunked-encoder)
   (test-chunk-walk-on-data)
+  (test-fetch-on-body-pause)
   (test-streaming-head)
   (test-discard-available-eof)
   (test-stream-lifecycle)

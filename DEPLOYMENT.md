@@ -798,6 +798,9 @@ be dispatched to nobody. For a keepalive use `sse-comment`, which is the
 one emission that legitimately carries no data — that is also why it is a
 separate function rather than an empty event.
 
+`sse-comment` sends one by hand, for a producer that wants to nudge an
+intermediary on its own schedule rather than waiting for the sweep.
+
 By default the response installs a bare comment line as its keepalive,
 sent whenever the stream goes quiet for `*stream-keepalive-interval*`.
 That is what stops an intermediary reaping an idle stream, and it counts
