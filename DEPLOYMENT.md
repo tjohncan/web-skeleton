@@ -690,6 +690,66 @@ is marked not to be reused. A pipelined request behind a stream would
 have to wait for the stream to end, and the stream may never end — a
 clean close is retryable, a silently dropped request is not.
 
+### Server-Sent Events
+
+`make-sse-response` is a streaming response with the SSE framing on top.
+
+```lisp
+(defun handle-events (req)
+  (declare (ignore req))
+  (make-sse-response
+   :on-open (lambda (conn)
+              (subscribe (lambda (row)
+                           (sse-send conn :data (row-json row)
+                                          :event "update"
+                                          :id (row-id row)))))
+   :on-close (lambda (conn reason)
+               (declare (ignore conn))
+               (unsubscribe reason))))
+```
+
+Three headers are set for you and win over anything you pass:
+`content-type: text/event-stream` defines the protocol, `cache-control:
+no-cache` stops an intermediary serving a stale prefix of a response that
+never ends, and **`x-accel-buffering: no`** turns off nginx's buffering,
+which is on by default for this content type. Without that last one the
+events arrive in batches when a buffer fills, which is not a stream. The
+deployment story here assumes a proxy in front, so it is not decoration.
+An app that needs different proxy hints should build a
+`make-stream-response` directly rather than fight these.
+
+**Field values carrying a line break are refused, not escaped.** CR and
+LF both end a line for `EventSource`, so either one inside an `event` or
+`id` value ends that field early and hands the client whatever follows as
+a new field — or, on a blank line, dispatches an event the app never
+wrote, with a type it never chose. NUL is refused too, for a quieter
+reason: the spec has the client discard an `id` containing one, so the
+last-event-ID never updates and a reconnect replays from the wrong point
+with nothing raised anywhere.
+
+`data` is the exception and the only one: a line break in it is the
+protocol's own mechanism for multi-line payloads, and becomes one `data:`
+line per segment, which the client rejoins with LF. A **CR** in `data` is
+still refused, because the client's rejoin uses LF and passing one
+through would silently rewrite your bytes.
+
+The whole event is validated before a byte is queued, so a rejected field
+leaves the stream well-formed and short rather than half-written. Half an
+event on the wire is worse than none — the client splices it onto
+whatever comes next.
+
+**An event with no data is refused.** `EventSource` returns early on an
+empty data buffer, so such an event would look sent from the server and
+be dispatched to nobody. For a keepalive use `sse-comment`, which is the
+one emission that legitimately carries no data — that is also why it is a
+separate function rather than an empty event.
+
+By default the response installs a bare comment line as its keepalive,
+sent whenever the stream goes quiet for `*stream-keepalive-interval*`.
+That is what stops an intermediary reaping an idle stream, and it counts
+as production, so `*stream-idle-timeout*` never reaps a stream that is
+emitting them. Pass `:keepalive nil` to turn it off.
+
 ### ws-send and the write queue
 
 `ws-send` queues a WebSocket frame and flushes whatever the socket will

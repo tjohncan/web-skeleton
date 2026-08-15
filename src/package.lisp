@@ -132,6 +132,10 @@
            #:stream-send
            #:stream-close
            #:stream-full-p
+           ;; Server-Sent Events
+           #:make-sse-response
+           #:sse-send
+           #:sse-comment
            #:*stream-idle-timeout*
            #:*stream-keepalive-interval*
            ;; Connection lifecycle

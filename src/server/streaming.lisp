@@ -448,6 +448,152 @@
   (stream-flush conn)
   (values))
 
+;;; ---------------------------------------------------------------------------
+;;; Server-Sent Events
+;;;
+;;; Field validation follows VALIDATE-COOKIE-FIELD's register — refuse
+;;; before building anything, one named validator, a docstring naming the
+;;; grammar and the consequence. The register transplants; the character
+;;; set does not, and the two differ in every particular that matters:
+;;;
+;;;   BUILD-COOKIE guards a value going into a header the framework
+;;;   serializes. Its delimiters are ';' and CR/LF, and a bad value is
+;;;   header injection.
+;;;
+;;;   SSE guards a value going into a body whose framing is already
+;;;   committed. Its delimiter is a line break — LF, CR, or CRLF, all
+;;;   three per the EventSource spec — and a bad value is *event*
+;;;   injection: a client dispatching an event the app never sent, with
+;;;   fields it never wrote.
+;;;
+;;; NUL is refused here for a third reason again. It is not a delimiter;
+;;; the spec has the client silently ignore an id containing one, so the
+;;; last-event-ID never updates and a reconnect replays from the wrong
+;;; point — a failure with no symptom until the reconnect happens.
+;;; ---------------------------------------------------------------------------
+
+(defun validate-sse-field (kind value &key allow-lf)
+  "Reject characters that would let VALUE restructure the event stream.
+
+   CR and LF both end a line for EventSource, so either one inside a
+   field value ends the field early and hands whatever follows to the
+   client as a new field — or, on a blank line, dispatches an event the
+   app never wrote. NUL is rejected because the spec has the client drop
+   an id containing one on the floor, which turns a reconnect into a
+   replay from the wrong position with nothing raised anywhere.
+
+   DATA is the one field where a line break is legitimate and is handled
+   rather than refused — see SSE-EVENT-BYTES — but only LF. A lone CR
+   cannot survive the round trip in any case: the client would rejoin
+   consecutive data lines with LF, so passing one through would silently
+   rewrite the app's bytes."
+  (when (find #\Return value)
+    (error "sse: ~a contains a CR — EventSource treats it as a line ~
+            terminator, so it would end the field early" kind))
+  (unless allow-lf
+    (when (find #\Newline value)
+      (error "sse: ~a contains an LF — only data may span lines" kind)))
+  (when (find (code-char 0) value)
+    (error "sse: ~a contains a NUL — the client would discard the field ~
+            silently" kind)))
+
+(defun sse-comment-bytes (&optional (text ""))
+  "A comment line: ':' TEXT LF. Ignored by every client, which is what
+   makes it the keepalive.
+
+   The one SSE emission carrying no data, and deliberately its own
+   function rather than an empty event. An event with no data is not
+   dispatched at all — the spec returns early on an empty data buffer —
+   so routing a keepalive through SSE-SEND would produce bytes no client
+   acts on. It also must never encode to nothing: ENCODE-CHUNK treats an
+   empty payload as nothing to send, correctly, and an empty keepalive
+   would silently stop keeping anything alive. The bare form is still two
+   bytes."
+  (when (plusp (length text))
+    (validate-sse-field "comment" text))
+  (sb-ext:string-to-octets (format nil ":~a~c" text #\Newline)
+                           :external-format :utf-8))
+
+(defun sse-event-bytes (&key data event id retry)
+  "Serialize one Server-Sent Event.
+
+   DATA is required: EventSource does not dispatch an event whose data
+   buffer is empty, so an event without it would be delivered to nobody
+   while looking sent from here. A line break in DATA is legitimate and
+   becomes one `data:` line per segment, which is how the protocol
+   carries multi-line payloads; the client rejoins them with LF.
+
+   Everything is validated before anything is built, so a refused event
+   queues nothing and leaves the stream exactly as it was. Half an event
+   on the wire would be worse than no event: the client would splice it
+   onto whatever came next."
+  (unless (and data (plusp (length data)))
+    (error "sse: an event needs data — EventSource does not dispatch one ~
+            with an empty data buffer. Use SSE-COMMENT for a keepalive."))
+  (when event (validate-sse-field "event" event))
+  (when id (validate-sse-field "id" id))
+  (validate-sse-field "data" data :allow-lf t)
+  (when retry
+    (unless (and (integerp retry) (not (minusp retry)))
+      (error "sse: retry must be a non-negative integer of milliseconds, ~
+              got ~s" retry)))
+  (sb-ext:string-to-octets
+   (with-output-to-string (out)
+     (when event (format out "event: ~a~c" event #\Newline))
+     (when id (format out "id: ~a~c" id #\Newline))
+     (when retry (format out "retry: ~d~c" retry #\Newline))
+     (loop with start = 0
+           for nl = (position #\Newline data :start start)
+           do (format out "data: ~a~c"
+                      (subseq data start (or nl (length data))) #\Newline)
+              (if nl (setf start (1+ nl)) (return)))
+     (write-char #\Newline out))
+   :external-format :utf-8))
+
+(defun make-sse-response (&key headers on-open on-close (keepalive t))
+  "A streaming response carrying Server-Sent Events.
+
+   Sets the three headers this needs and lets them win over HEADERS: the
+   content type defines the protocol, `cache-control: no-cache` keeps an
+   intermediary from serving a stale prefix of an infinite response, and
+   `x-accel-buffering: no` turns off nginx's buffering, which is on by
+   default for this content type and would otherwise hold events until a
+   buffer filled — a stream delivered in batches is not a stream. The
+   deployment story here assumes a proxy in front, so the header is not
+   optional decoration. An app that needs different proxy hints can build
+   a MAKE-STREAM-RESPONSE directly.
+
+   KEEPALIVE T installs a bare comment line, sent whenever the stream
+   goes quiet for *STREAM-KEEPALIVE-INTERVAL*. That is what stops an
+   intermediary reaping an idle stream, and it is why the framework could
+   not supply a generic one: at the chunked layer the only zero-content
+   emission is the terminator."
+  (make-stream-response
+   :status 200
+   :headers (append headers
+                    (list (cons "content-type" "text/event-stream")
+                          (cons "cache-control" "no-cache")
+                          (cons "x-accel-buffering" "no")))
+   :on-open on-open
+   :on-close on-close
+   :keepalive (when keepalive (sse-comment-bytes))))
+
+(defun sse-send (conn &key data event id retry)
+  "Send one Server-Sent Event on CONN. Returns what STREAM-SEND returns:
+   T if everything reached the kernel, NIL if a remainder is queued.
+
+   Refuses whole. The event is serialized and validated before a byte is
+   queued, so a rejected field leaves the stream well-formed and short
+   rather than half-written — the same discipline CONNECTION-APPEND-WRITE
+   applies to a frame that will not fit, one layer up."
+  (stream-send conn (sse-event-bytes :data data :event event
+                                     :id id :retry retry)))
+
+(defun sse-comment (conn &optional (text ""))
+  "Send a comment line on CONN. Clients ignore it; intermediaries do not,
+   which is the point of sending one."
+  (stream-send conn (sse-comment-bytes text)))
+
 (defun stream-full-p (conn)
   "True when CONN's queue is at *MAX-WRITE-BACKLOG* and STREAM-SEND
    would signal. A producer that can pause should ask before generating

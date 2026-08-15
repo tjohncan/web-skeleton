@@ -1469,7 +1469,10 @@
                   "MAKE-STREAM-RESPONSE"
                   "STREAM-SEND"
                   "STREAM-CLOSE"
-                  "STREAM-FULL-P"))
+                  "STREAM-FULL-P"
+                  "MAKE-SSE-RESPONSE"
+                  "SSE-SEND"
+                  "SSE-COMMENT"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -4761,6 +4764,139 @@
       (check "discard-available: and still leaves the buffer alone" pos 0))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Server-Sent Events
+;;;
+;;; The validation follows VALIDATE-COOKIE-FIELD's register, but the
+;;; character set is re-derived rather than inherited: a cookie's
+;;; delimiters are ';' and CR/LF against header injection, an SSE field's
+;;; delimiter is a line break against *event* injection — a client
+;;; dispatching an event the app never sent. The tests below are written
+;;; against that consequence, not against the character list.
+;;; ---------------------------------------------------------------------------
+
+(defun test-sse ()
+  (format t "~%Server-Sent Events~%")
+  (flet ((str (v) (sb-ext:octets-to-string v :external-format :utf-8))
+         (refused (thunk)
+           (handler-case (progn (funcall thunk) nil) (error () t))))
+
+    ;; --- The ordinary shapes ---
+    (check "sse: a data-only event"
+           (str (web-skeleton::sse-event-bytes :data "hello"))
+           (format nil "data: hello~c~c" #\Newline #\Newline))
+    (check "sse: fields come before data, in spec order"
+           (str (web-skeleton::sse-event-bytes
+                 :data "x" :event "tick" :id "7" :retry 3000))
+           (format nil "event: tick~cid: 7~cretry: 3000~cdata: x~c~c"
+                   #\Newline #\Newline #\Newline #\Newline #\Newline))
+    ;; Multi-line data is the protocol's own mechanism, not an error: one
+    ;; data line per segment, rejoined with LF by the client.
+    (check "sse: multi-line data becomes one data line per segment"
+           (str (web-skeleton::sse-event-bytes :data
+                 (format nil "one~ctwo" #\Newline)))
+           (format nil "data: one~cdata: two~c~c"
+                   #\Newline #\Newline #\Newline))
+    (check "sse: a trailing newline round-trips as an empty segment"
+           (str (web-skeleton::sse-event-bytes :data
+                 (format nil "one~c" #\Newline)))
+           (format nil "data: one~cdata: ~c~c"
+                   #\Newline #\Newline #\Newline))
+
+    ;; --- Event injection: the consequence the validator exists for ---
+    ;; A blank line dispatches. An event value carrying one would end the
+    ;; app's event early and hand the client a second event it never
+    ;; wrote — including one that could carry a different event type.
+    (check "sse: LF in event is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :event
+                                (format nil "a~c~cdata: forged" #\Newline
+                                        #\Newline))))
+           t)
+    (check "sse: LF in id is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :id (format nil "1~cdata: forged"
+                                                      #\Newline))))
+           t)
+    ;; CR is a line terminator to EventSource too — the character a
+    ;; header-shaped validator would have caught for the wrong reason,
+    ;; and a body-shaped one that only knew about LF would have missed.
+    (check "sse: CR in event is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :event
+                                (format nil "a~cdata: forged" #\Return))))
+           t)
+    (check "sse: CR in data is refused, even though LF is allowed there"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data (format nil "a~cb" #\Return))))
+           t)
+    (check "sse: NUL in id is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :id (format nil "1~c2"
+                                                      (code-char 0)))))
+           t)
+    (check "sse: a non-integer retry is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes
+                                :data "x" :retry "soon")))
+           t)
+
+    ;; --- An event with no data reaches nobody, so it is refused ---
+    ;; EventSource returns early on an empty data buffer. Emitting one
+    ;; would look sent from here and be dispatched nowhere.
+    (check "sse: an event without data is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes :event "tick")))
+           t)
+    (check "sse: an event with empty data is refused"
+           (refused (lambda () (web-skeleton::sse-event-bytes :data "")))
+           t)
+
+    ;; --- The keepalive is the one emission with no data ---
+    (check "sse: a bare comment is still two bytes, not zero"
+           (str (web-skeleton::sse-comment-bytes))
+           (format nil ":~c" #\Newline))
+    (check "sse: a comment carries its text"
+           (str (web-skeleton::sse-comment-bytes "ka"))
+           (format nil ":ka~c" #\Newline))
+    (check "sse: a comment cannot smuggle a line break either"
+           (refused (lambda () (web-skeleton::sse-comment-bytes
+                                (format nil "x~c~cdata: forged"
+                                        #\Newline #\Newline))))
+           t)
+
+    ;; --- The response carries what a proxy needs to leave it alone ---
+    (let* ((sresp (web-skeleton:make-sse-response))
+           (head (sb-ext:octets-to-string
+                  (web-skeleton::format-streaming-head
+                   (web-skeleton::stream-response-response sresp) :chunked)
+                  :external-format :latin-1)))
+      (check "sse: content type declares the protocol"
+             (and (search "content-type: text/event-stream" head) t) t)
+      (check "sse: no-cache, so nothing serves a prefix of an endless body"
+             (and (search "cache-control: no-cache" head) t) t)
+      ;; nginx buffers this content type by default, and the deployment
+      ;; story assumes a proxy in front — without this the stream arrives
+      ;; in batches, which is not a stream.
+      (check "sse: x-accel-buffering off for the proxy in front"
+             (and (search "x-accel-buffering: no" head) t) t)
+      (check "sse: a keepalive is installed by default"
+             (str (web-skeleton::stream-response-keepalive sresp))
+             (format nil ":~c" #\Newline)))
+    (check "sse: the keepalive can be declined"
+           (web-skeleton::stream-response-keepalive
+            (web-skeleton:make-sse-response :keepalive nil))
+           nil)
+    ;; The framework's headers win: an app cannot quietly turn an SSE
+    ;; response into something a client will not parse as one.
+    (let ((head (sb-ext:octets-to-string
+                 (web-skeleton::format-streaming-head
+                  (web-skeleton::stream-response-response
+                   (web-skeleton:make-sse-response
+                    :headers '(("content-type" . "text/plain"))))
+                  :chunked)
+                 :external-format :latin-1)))
+      (check "sse: the protocol's content type is not overridable"
+             (and (search "content-type: text/event-stream" head) t) t))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Stream lifecycle
 ;;;
 ;;; START-STREAM through STREAM-CLOSE over a real loopback pair, reading
@@ -5674,6 +5810,7 @@
   (test-stream-lifecycle)
   (test-stream-head-request)
   (test-stream-keepalive-and-idle)
+  (test-sse)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)

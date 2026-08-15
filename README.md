@@ -221,6 +221,11 @@ tests/
   No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.
   The handler returns as soon as it has queued what it has, so a live stream
   costs a connection and not a worker
+- **Server-Sent Events** — `make-sse-response` / `sse-send` handle the
+  `text/event-stream` framing, the proxy headers an SSE stream needs, and a
+  comment-line keepalive. Field values carrying a line break are refused
+  rather than passed through, since either terminator would let an app's data
+  dispatch an event it never wrote
 - **WebSocket server push** — `ws-send` queues a frame and flushes what the
   socket takes immediately, so a handler can stream without returning and
   without a slow peer holding the worker

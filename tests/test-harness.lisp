@@ -1082,6 +1082,51 @@
         (ignore-errors (close stream))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-sse-e2e ()
+  "An SSE endpoint end to end. The events go out framed as chunks and
+   come back through the framework's own chunked decoder, so what is
+   asserted is the event text a browser would actually parse — not the
+   bytes the serializer happened to produce."
+  (format t "~%Harness: server-sent events end-to-end~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-sse-response
+                   :on-open (lambda (conn)
+                              (sse-send conn :data "first" :event "tick")
+                              (sse-send conn :data "second" :id "2")
+                              (sse-comment conn "keep")
+                              (stream-close conn)))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (%send-raw-get stream "/events" :extra
+                            (format nil "Connection: close~c~c"
+                                    #\Return #\Newline))
+             (let* ((buf (read-until-bounded stream))
+                    (raw (subseq buf 0 (fill-pointer buf)))
+                    (text (sb-ext:octets-to-string raw :external-format :latin-1))
+                    (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+               (check "sse e2e: the content type reaches the client"
+                      (and (search "content-type: text/event-stream" text) t) t)
+               (check "sse e2e: and so does the proxy hint"
+                      (and (search "x-accel-buffering: no" text) t) t)
+               (check "sse e2e: the events decode to what was sent"
+                      (handler-case
+                          (sb-ext:octets-to-string
+                           (web-skeleton::decode-chunked-body
+                            raw (+ hend 4) (length raw))
+                           :external-format :utf-8)
+                        (error (e) (princ-to-string e)))
+                      (format nil "event: tick~cdata: first~c~c~
+                                   id: 2~cdata: second~c~c~
+                                   :keep~c"
+                              #\Newline #\Newline #\Newline
+                              #\Newline #\Newline #\Newline
+                              #\Newline))))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 (defun test-harness-stream-does-not-hold-worker-e2e ()
   "The acceptance criterion for the whole issue, at :WORKERS 1.
 
@@ -1503,6 +1548,7 @@
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-streaming-e2e)
+  (test-harness-sse-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))
