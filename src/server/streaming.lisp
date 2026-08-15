@@ -308,6 +308,15 @@
 
    HEADERS is an alist. Content-Length and Transfer-Encoding are refused
    — the framework owns framing for a stream."
+  ;; An empty keepalive fires on schedule and sends nothing, forever:
+  ;; FRAME-STREAM-BYTES returns NIL for an empty payload on both paths,
+  ;; correctly, and the sweep skips it. The only symptom would be streams
+  ;; dying behind a proxy — which is what a keepalive is for, so it looks
+  ;; like the keepalive is not working rather than not existing. NIL is
+  ;; how you decline one.
+  (when (and keepalive (zerop (length keepalive)))
+    (error "make-stream-response: :keepalive is empty — that sends nothing ~
+            on every interval forever. Pass NIL to decline a keepalive."))
   (let ((resp (make-http-response :status status)))
     (loop for (name . value) in headers
           do (set-response-header resp name value))

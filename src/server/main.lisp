@@ -517,6 +517,19 @@
                   (http-request-method request)
                   (http-request-path request))
        (values response nil))
+      ;; A response already in pieces: a list of byte vectors to write in
+      ;; order. SERVE-STATIC's shape, so a pre-built file can carry a
+      ;; current Date without the vector it was built from being rebuilt
+      ;; or rewritten. The producer owns HEAD here — SERVE-STATIC decides
+      ;; which segments a HEAD gets, because only it knows where its own
+      ;; body begins, and STRIP-BODY-FOR-HEAD cannot find a boundary it
+      ;; was not given.
+      ((and (consp response)
+            (typep (car response) '(simple-array (unsigned-byte 8) (*))))
+       (log-debug "~a ~a -> static"
+                  (http-request-method request)
+                  (http-request-path request))
+       (values response nil))
       ;; Pre-formatted response (e.g., static file — already bytes).
       ;; HEAD truncation happens centrally in HANDLE-CLIENT-READ via
       ;; STRIP-BODY-FOR-HEAD on the way to CONNECTION-QUEUE-WRITE, so
@@ -928,6 +941,17 @@
                     ;; STRIP-BODY-FOR-HEAD since the bytes are already
                     ;; fully serialized and we have no encode step to
                     ;; short-circuit.
+                    ;; Segments — queue them in order. The first goes
+                    ;; through QUEUE-WRITE so its guard still runs on a
+                    ;; connection that should have nothing pending; the
+                    ;; rest append behind it.
+                    ((consp response)
+                     (connection-queue-write conn (first response))
+                     (dolist (seg (rest response))
+                       (connection-append-write conn seg))
+                     (setf (connection-state conn) :write-response)
+                     (epoll-modify epoll-fd (connection-fd conn)
+                                   (logior +epollout+ +epollet+)))
                     (t
                      (let* ((head-p (eq (http-request-method request) :HEAD))
                             (bytes
@@ -1345,7 +1369,12 @@
               ;; be the current universal time, so the first response of
               ;; the worker's life formats and the rest of that second
               ;; read.
-              (*http-date-cache* (cons 0 "")))
+              (*http-date-cache* (cons 0 ""))
+              ;; Same shape, different consumer: the pre-built static
+              ;; responses want the date as a finished header line rather
+              ;; than a string to hand a serializer.
+              (*http-date-line-cache*
+                (cons 0 (make-array 0 :element-type '(unsigned-byte 8)))))
           ;; Split the listener and epoll-fd bindings so a failure of
           ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
           ;; listener socket — a shared let* would leak it because the

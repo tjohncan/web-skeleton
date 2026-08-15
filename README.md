@@ -396,8 +396,6 @@ read about here.
   do today. Fan-out across workers is not provided at all, deliberately —
   a framework that owned the subscriber registry would own per-process
   state and become the horizontal-scaling limit.
-- **Static responses omit `Date`.** Dynamic responses carry it. See
-  DEPLOYMENT.md — it matters if you put a caching CDN in front.
 
 ## Configuration
 

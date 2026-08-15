@@ -3491,8 +3491,8 @@
     (check "static-entry: etag is sha256 of content"
            (web-skeleton::static-entry-etag entry)
            (format nil "\"~a\"" (sha256-hex content)))
-    (check "static-entry: not-modified response pre-built"
-           (not (null (web-skeleton::static-entry-not-modified-response entry)))
+    (check "static-entry: not-modified prefix pre-built"
+           (not (null (web-skeleton::static-entry-not-modified-prefix entry)))
            t))
 
   ;; Same content → same etag (deterministic)
@@ -3562,19 +3562,19 @@
                            "public, max-age=31536000, immutable")))
       (check "cache-control: default present on GET"
              (header-present-p
-              (web-skeleton::static-entry-get-response default-entry)
+              (web-skeleton::static-entry-head-prefix default-entry)
               "cache-control: public, max-age=3600") t)
       (check "cache-control: default present on 304"
              (header-present-p
-              (web-skeleton::static-entry-not-modified-response default-entry)
+              (web-skeleton::static-entry-not-modified-prefix default-entry)
               "cache-control: public, max-age=3600") t)
       (check "cache-control: custom string present on GET"
              (header-present-p
-              (web-skeleton::static-entry-get-response custom-entry)
+              (web-skeleton::static-entry-head-prefix custom-entry)
               "cache-control: public, max-age=31536000, immutable") t)
       (check "cache-control: custom string present on 304"
              (header-present-p
-              (web-skeleton::static-entry-not-modified-response custom-entry)
+              (web-skeleton::static-entry-not-modified-prefix custom-entry)
               "cache-control: public, max-age=31536000, immutable") t)))
 
   ;; ---- LOAD-STATIC-FILES aliases ----
@@ -3772,14 +3772,23 @@
          (progn
            (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
            (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           ;; SERVE-STATIC answers either as one vector (the ranged and
+           ;; 416 paths, built per request) or as the segments a
+           ;; pre-built response is assembled from. What a client sees is
+           ;; the concatenation either way, and that is what these
+           ;; assertions are about.
            (flet ((fetch (&rest headers)
-                    (let ((bytes (serve-static
-                                  (make-test-request :method :GET
-                                                     :path "/data.txt"
-                                                     :headers headers))))
-                      (and bytes
+                    (let ((r (serve-static
+                              (make-test-request :method :GET
+                                                 :path "/data.txt"
+                                                 :headers headers))))
+                      (and r
                            (sb-ext:octets-to-string
-                            bytes :external-format :latin-1))))
+                            (if (consp r)
+                                (apply #'concatenate
+                                       '(vector (unsigned-byte 8)) r)
+                                r)
+                            :external-format :latin-1))))
                   (body-of (text)
                     (let ((i (search (format nil "~a~a~a~a"
                                              #\Return #\Newline
@@ -3850,13 +3859,17 @@
                                                      entry))))))
                     t)
              ;; HEAD has no body, so a Range on it is meaningless.
-             (let ((head (let ((bytes (serve-static
-                                       (make-test-request
-                                        :method :HEAD :path "/data.txt"
-                                        :headers (list (cons "range"
-                                                             "bytes=0-3"))))))
-                           (sb-ext:octets-to-string bytes
-                                                    :external-format :latin-1))))
+             (let ((head (let ((r (serve-static
+                                   (make-test-request
+                                    :method :HEAD :path "/data.txt"
+                                    :headers (list (cons "range"
+                                                         "bytes=0-3"))))))
+                           (sb-ext:octets-to-string
+                            (if (consp r)
+                                (apply #'concatenate
+                                       '(vector (unsigned-byte 8)) r)
+                                r)
+                            :external-format :latin-1))))
                (check "range: HEAD ignores range, stays 200"
                       (not (null (search "200 OK" head))) t)
                (check "range: HEAD emits no body"
@@ -4762,6 +4775,93 @@
       (check "discard-available: a payload past the sink still reports :ok-eof"
              result :ok-eof)
       (check "discard-available: and still leaves the buffer alone" pos 0))))
+
+;;; ---------------------------------------------------------------------------
+;;; Static responses carry a Date
+;;;
+;;; The interesting assertion is not that the header is present. It is
+;;; that the body is still exactly the file after a header was added to
+;;; the response — because the design this replaced derived the body's
+;;; offset from the header block's length, and anything spliced into one
+;;; pre-built vector and not the other would have moved a range slice
+;;; without moving its Content-Length. That failure has a correct status,
+;;; a correct length, and content starting a few bytes early, and it is
+;;; invisible to every test that does not ask for a byte range.
+;;; ---------------------------------------------------------------------------
+
+(defun test-static-date ()
+  (format t "~%Static Date~%")
+  (let ((saved web-skeleton::*static-cache*)
+        (content (sb-ext:string-to-octets
+                  "0123456789abcdefghijklmnopqrstuvwxyz"
+                  :external-format :latin-1)))
+    (unwind-protect
+         (let ((web-skeleton::*http-date-line-cache* (cons 0 #())))
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/d.txt" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response "text/plain" content 0))
+           (flet ((wire (method &rest headers)
+                    (let ((r (serve-static
+                              (make-test-request :method method :path "/d.txt"
+                                                 :headers headers))))
+                      (sb-ext:octets-to-string
+                       (if (consp r)
+                           (apply #'concatenate '(vector (unsigned-byte 8)) r)
+                           r)
+                       :external-format :latin-1)))
+                  (body (text)
+                    (let ((i (search (format nil "~c~c~c~c" #\Return #\Newline
+                                             #\Return #\Newline)
+                                     text)))
+                      (and i (subseq text (+ i 4))))))
+
+             ;; Every pre-built shape now carries one. RFC 7231 §7.1.1.2
+             ;; is a MUST, and 7232 §4.1 wants it on the 304 as well.
+             (check "static date: a GET carries a Date"
+                    (and (search "date: " (wire :GET)) t) t)
+             (check "static date: a HEAD carries a Date"
+                    (and (search "date: " (wire :HEAD)) t) t)
+             (check "static date: a 304 carries a Date"
+                    (and (search "date: "
+                                 (wire :GET (cons "if-none-match"
+                                                  (web-skeleton::static-entry-etag
+                                                   (gethash "/d.txt"
+                                                            web-skeleton::*static-cache*)))))
+                         t)
+                    t)
+             (check "static date: a 206 carries a Date"
+                    (and (search "date: "
+                                 (wire :GET (cons "range" "bytes=0-3")))
+                         t)
+                    t)
+             ;; A Date is exactly one header line, so it must appear once
+             ;; — a per-request line appended to a prefix that already
+             ;; had one would be two, and RFC 7230 §3.2.2 forbids that
+             ;; for a non-list-valued field.
+             (check "static date: exactly one Date on a GET"
+                    (let ((w (wire :GET)) (n 0) (i 0))
+                      (loop (let ((h (search "date: " w :start2 i)))
+                              (unless h (return n))
+                              (incf n)
+                              (setf i (1+ h)))))
+                    1)
+
+             ;; The assertions the retired offset used to be load-bearing
+             ;; for. The body of a whole GET is the file and nothing else,
+             ;; and a range is the matching slice of it — both true no
+             ;; matter how long the header block happens to be.
+             (check "static date: the GET body is exactly the file"
+                    (body (wire :GET))
+                    "0123456789abcdefghijklmnopqrstuvwxyz")
+             (check "static date: a range is the matching slice"
+                    (body (wire :GET (cons "range" "bytes=5-9")))
+                    "56789")
+             (check "static date: a suffix range is the matching slice"
+                    (body (wire :GET (cons "range" "bytes=-4")))
+                    "wxyz")
+             (check "static date: HEAD still has no body"
+                    (body (wire :HEAD)) "")))
+      (setf web-skeleton::*static-cache* saved))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server-Sent Events
@@ -5848,6 +5948,7 @@
   (test-static-helpers)
   (test-static-etag)
   (test-static-range)
+  (test-static-date)
   (test-jwt)
   (test-shutdown-hooks)
   (test-read-available-eof)

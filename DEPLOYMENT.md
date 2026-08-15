@@ -881,31 +881,32 @@ or leave large media to the reverse proxy, which is already in front of
 this server for TLS termination and is better at it. The cap is per-call,
 not global, so additive calls each bring their own budget.
 
-Static responses **omit the `Date` header** — the pre-built bytes
-are frozen at startup time and the framework will not patch each served
-response with a per-request date. This violates the RFC 7231 §7.1.1.2 `MUST`,
-but a stale `Date` from 14 hours ago would be strictly worse than none
-(CDN caches would use it as the freshness anchor).
-Downstream caches fall back to the time they received the response,
-which is correct.
-If you place web-skeleton behind a CDN or reverse proxy,
-the proxy will stamp its own `Date` on the way out —
-operators should not be surprised to see `Date` missing on `/static/*`
-when watching the upstream directly with `curl -v`.
+Static responses **carry a `Date`**, like every other response, and the
+pre-built path survives intact. RFC 7231 §7.1.1.2 makes it a `MUST` and
+this used to be the one place the server did not comply.
 
-**Dynamic responses do carry it.** `format-response` stamps `Date` on
-anything it builds, unless the handler set one itself. So compliance with
-that `MUST` depends on which path answered: `/api/thing` carries a `Date`
-and `/static/app.css` does not, from the same server, in the same second.
-Both behaviours are defensible on their own and the pair is worth knowing
-about before you write a cache rule, a conformance test, or a monitoring
-check that assumes the header is always present.
+The bytes are still built once at startup, but they are stored as pieces
+rather than as a finished response: a prefix holding the status line and
+headers, and the file's content. At request time the write queue takes
+the prefix, a date line, the blank line that ends the headers, and the
+body — four entries, no copying, no rebuild. The date line is cached per
+second per worker, so a busy second serializes one.
 
-Closing the gap is possible without giving up the pre-built path — `Date`
-has one-second granularity, so a per-worker cached header refreshed on
-the existing maintenance tick would cost nothing per request. It would
-mean moving the header out of the frozen block into a small prefix write.
-Not done; noted so the choice is visible rather than inherited.
+Nothing is patched in place. The pre-built vectors are shared by every
+worker and by every request for that file, and the write queue holds them
+by reference while it drains — a `Date` rewritten under a half-sent
+response would be a torn header with nothing to catch it. A new line is
+built when the second turns instead.
+
+Storing the body separately also retired an offset that used to matter: a
+range was sliced out of the pre-built 200 at a position derived from the
+header block's length. Anything added to the headers of one pre-built
+vector and not the other would have moved the body under the slice — a
+`206` with a correct status, a correct `Content-Length`, and content
+starting a few bytes early. No offset depends on header length now.
+
+`206` and `416` build their headers per request, so they get a `Date`
+from the ordinary serializer along with everything else.
 
 **Range requests are served** (RFC 7233): `Range: bytes=…` returns `206 Partial Content`
 with a `Content-Range`, so `<video>`/`<audio>` seeking and resumable downloads work
