@@ -32,6 +32,7 @@
   ;;   :write-response        — sending HTTP response (keep-alive or close when done)
   ;;   :ws-upgrade            — sending WebSocket handshake
   ;;   :websocket             — reading/writing WebSocket frames
+  ;;   :streaming             — response head sent, app is producing a body
   ;;   :closing               — sending close frame (disconnect when done)
   ;;   :awaiting              — parked, waiting for outbound fetch to complete
   ;;   :out-dns               — outbound: getent subprocess resolving hostname
@@ -86,6 +87,17 @@
   ;; per outbound connection — outbound connections are never reused —
   ;; so it needs no reset.
   (chunk-scan-pos  0  :type fixnum)
+  ;; Streaming response — set while STATE is :streaming
+  (stream-framing   nil :type (or null keyword))  ; :chunked or :close
+  ;; (CONN REASON) called exactly once when the stream ends, however it
+  ;; ends. Nulled as it fires, the same discipline the fetch callback
+  ;; uses, because an app that releases a resource twice is worse off
+  ;; than one that never hears.
+  (stream-on-close  nil :type (or null function))
+  ;; Bytes to send when a stream goes quiet, or NIL for no keepalive.
+  ;; Necessarily supplied from above: a chunked stream has no idle form
+  ;; of its own, since the empty chunk is the terminator.
+  (stream-keepalive nil :type (or null (simple-array (unsigned-byte 8) (*))))
   ;; Keep-alive
   (close-after-p  nil :type boolean)          ; T = close after response sent
   ;; WebSocket fragment reassembly
@@ -291,6 +303,33 @@
             ((eq result :again) (return (if any-read :ok :again)))
             (t (incf (connection-read-pos conn) result)
                (setf any-read t))))))))
+
+(defun connection-discard-available (conn sink)
+  "Drain everything readable on CONN's fd into SINK and throw it away.
+
+   Returns the same verdicts as CONNECTION-READ-AVAILABLE, and the cond
+   below is deliberately the same shape so the two can be read side by
+   side. The caller needs to tell 'the peer said something' from 'the
+   peer is gone', and those two arrive in one wake-up often enough that
+   collapsing them cost this framework two bugs already.
+
+   Separate from CONNECTION-READ-AVAILABLE because that one accumulates
+   into the connection's own read buffer — where, on a :STREAMING
+   connection, the original request's bytes and any pipelined ones are
+   still sitting at the offsets the keep-alive reset works from. Growing
+   that buffer with data we mean to discard would both hold memory for
+   the life of the stream and disturb those offsets.
+
+   SINK is reused and never read, so one per worker is enough and it
+   never needs clearing between uses."
+  (declare (type (simple-array (unsigned-byte 8) (*)) sink))
+  (let ((any-read nil))
+    (loop
+      (let ((result (nb-read (connection-fd conn) sink 0 (length sink))))
+        (cond
+          ((eq result :eof)   (return (if any-read :ok-eof :eof)))
+          ((eq result :again) (return (if any-read :ok :again)))
+          (t (setf any-read t)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Extract Content-Length from raw header bytes
@@ -802,6 +841,15 @@
    it needs every connection to be simultaneously backed up to get
    there. Lower it if the deployment has many connections and a
    generous ulimit; raise it for few connections and bursty output.")
+
+(defvar *epoll-fd* nil
+  "The epoll fd of the worker running on this thread, bound by RUN-WORKER.
+
+   Exists so a writer reachable from app code can arm EPOLLOUT without
+   the fd being threaded through an exported signature. NIL outside a
+   worker, which is the case unit tests and REPL calls run in — writers
+   check rather than assume, since a stream driven by hand has no event
+   loop to hand the remainder to anyway.")
 
 (defparameter *write-stall-timeout* 10
   "Seconds a connection may sit on a write backlog that is not moving

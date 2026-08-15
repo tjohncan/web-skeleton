@@ -619,6 +619,77 @@ connections and bursty output.
 sends one vector and waits for it, so a plain request/response connection
 never builds a queue.
 
+### Streaming responses
+
+A handler that returns `make-stream-response` gets the head serialized
+immediately — status, headers, no `Content-Length` — and is then handed
+the connection through `:on-open`. It produces the body with `stream-send`
+and ends it with `stream-close`.
+
+```lisp
+(defun handle-events (req)
+  (declare (ignore req))
+  (make-stream-response
+   :headers '(("content-type" . "text/plain"))
+   :on-close (lambda (conn reason)
+               (declare (ignore conn))
+               (unsubscribe-from-feed reason))
+   :on-open (lambda (conn)
+              (subscribe-to-feed
+               (lambda (event) (stream-send conn event))))))
+```
+
+**The handler returns while the response is still being delivered.** That
+is the whole point: `:on-open` queues what it has and returns, and the
+worker goes back to the event loop. A stream costs a connection slot, not
+a worker. Nothing here is synchronized, though — `stream-send` is safe
+from the worker that owns the connection and nowhere else, so an app
+doing fan-out holds its own registry and pushes from the owning worker.
+
+Framing follows the client. HTTP/1.1 gets `Transfer-Encoding: chunked`;
+HTTP/1.0 cannot read chunked at all, so it gets close-delimited framing
+with `Connection: close` and the socket goes when the stream ends. Both
+are handled for you — the app sends bytes and never sees a chunk header.
+
+**The framework owns the terminator.** `stream-close` writes it; there is
+no way for an app to write one and no way for it to forget. Any other way
+a stream ends — the peer disconnects, a deadline fires, the server drains
+— closes the socket instead, so an unterminated chunked body is never
+followed by a reused connection. That matters more than it sounds: the
+next response's status line landing where a downstream reader expects a
+chunk-size is a request-smuggling primitive, and it would be one we built
+ourselves.
+
+`:on-close` fires exactly once however the stream ends, with a reason —
+`:done`, `:disconnected`, `:idle`, `:stalled`, `:shutdown`, or `:closed`.
+Register teardown there rather than after `stream-close`, because most of
+those reasons never reach the app's own code path.
+
+Three deadlines apply, and they answer different questions:
+
+| Knob | Question |
+|---|---|
+| `*stream-idle-timeout*` | Is the app still producing? |
+| `*write-stall-timeout*` | Are bytes still leaving for the peer? |
+| `*max-write-backlog*`   | How much may pile up before we give up? |
+
+A stream can be perfectly healthy at the socket and dead at the source,
+which is why the first two are separate. `*stream-keepalive-interval*`
+refreshes the first — but only if the `make-stream-response` supplied
+keepalive bytes, because there is nothing generic to send. A chunked
+stream's only zero-content emission is the empty chunk, and that is the
+terminator; anything that keeps a stream warm is content at the layer
+above.
+
+A `HEAD` to a streaming endpoint gets the headers a `GET` would have got
+and no body, per RFC 7231 §4.3.2. No stream starts and `:on-open` is not
+called, so a handler that opens a resource there is not left holding one.
+
+Data arriving from the client mid-stream is discarded and the connection
+is marked not to be reused. A pipelined request behind a stream would
+have to wait for the stream to end, and the stream may never end — a
+clean close is retryable, a silently dropped request is not.
+
 ### ws-send and the write queue
 
 `ws-send` queues a WebSocket frame and flushes whatever the socket will

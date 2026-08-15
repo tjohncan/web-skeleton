@@ -66,6 +66,7 @@
                                                       "src/server/fetch"))
                (:file "src/server/streaming" :depends-on ("src/package"
                                                            "src/log"
+                                                           "src/epoll"
                                                            "src/server/http"
                                                            "src/server/connection"))
                (:file "src/server/main"  :depends-on ("src/package"

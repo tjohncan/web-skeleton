@@ -223,3 +223,200 @@
        (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
        headers
        nil))))
+
+;;; ---------------------------------------------------------------------------
+;;; The app-facing stream
+;;;
+;;; A handler returns a STREAM-RESPONSE instead of an HTTP-RESPONSE. The
+;;; framework sends the head, moves the connection to :STREAMING, and
+;;; hands the connection to ON-OPEN. From there the app calls STREAM-SEND
+;;; as it has something to say and STREAM-CLOSE when it does not.
+;;;
+;;; The connection is the handle, which is the shape WS-SEND already
+;;; established — one fewer object for an app to hold, and no way for a
+;;; handle to outlive the thing it refers to.
+;;;
+;;; Producing from another thread is out of scope, deliberately: nothing
+;;; here is synchronized, and the event loop owning the connection is
+;;; what makes the write queue safe without a lock. An app that wants
+;;; fan-out holds its own registry and pushes from the worker that owns
+;;; each connection.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *stream-idle-timeout* 300
+  "Seconds a :STREAMING connection may go without the app producing
+   anything before it is closed. Default 5 minutes. Zero disables it.
+
+   Separate from *IDLE-TIMEOUT* because they are different judgments
+   about different things. An HTTP connection idle for ten seconds has
+   most likely gone away; a stream idle for ten seconds is usually a
+   stream, and reaping it would make the feature useless. Separate from
+   *WS-IDLE-TIMEOUT* for the same reason in the other direction — a day
+   is far too long to hold a connection whose producer has quietly
+   stopped.
+
+   Distinct again from *WRITE-STALL-TIMEOUT*, which asks whether bytes
+   are leaving. This one asks whether any are arriving to send. A stream
+   can be perfectly healthy at the socket and dead at the source.
+
+   A keepalive refreshes it, so a stream that emits keepalives is never
+   reaped by this — which is the point of having one.")
+
+(defparameter *stream-keepalive-interval* 30
+  "Seconds of quiet before a :STREAMING connection is sent its keepalive
+   bytes, if it has any. Zero disables keepalives entirely.
+
+   The bytes come from the STREAM-RESPONSE, because there is no generic
+   keepalive to send. A chunked stream has no idle form of its own: the
+   only zero-content thing it can emit is the empty chunk, and that is
+   the terminator. Anything that keeps a stream warm has to be content
+   at the layer above — an SSE comment line is the standard one.")
+
+(defstruct (stream-response (:constructor %make-stream-response))
+  (response  nil)                      ; HTTP-RESPONSE — status and headers
+  (on-open   nil :type (or null function))
+  (on-close  nil :type (or null function))
+  (keepalive nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+
+(defun make-stream-response (&key (status 200) headers on-open on-close keepalive)
+  "A response whose body the app produces over time.
+
+   Return one from a handler the way you would return an HTTP-RESPONSE.
+   The framework serializes the head — no Content-Length, framing chosen
+   from the client's HTTP version — and then calls ON-OPEN with the
+   connection.
+
+   ON-OPEN   (CONN)          — the stream is live; send if you have
+                               something now, or hand CONN to whatever
+                               will produce later.
+   ON-CLOSE  (CONN REASON)   — fires exactly once, however the stream
+                               ends: :DONE when the app closed it,
+                               :DISCONNECTED when the peer went away,
+                               :IDLE or :STALLED when a deadline took it,
+                               :SHUTDOWN on server drain. Release
+                               whatever the app registered here.
+   KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See
+                               *STREAM-KEEPALIVE-INTERVAL* for why the
+                               framework cannot invent these.
+
+   HEADERS is an alist. Content-Length and Transfer-Encoding are refused
+   — the framework owns framing for a stream."
+  (let ((resp (make-http-response :status status)))
+    (loop for (name . value) in headers
+          do (set-response-header resp name value))
+    (%make-stream-response :response resp
+                           :on-open on-open
+                           :on-close on-close
+                           :keepalive keepalive)))
+
+(defun stream-send (conn bytes)
+  "Send BYTES on CONN's stream. Returns T if everything reached the
+   kernel, NIL if a remainder is queued for the event loop.
+
+   Does not block, and a NIL return is what a slow peer looks like
+   rather than an error — the same contract as WS-SEND, for the same
+   reason. Framing is applied here: a :CHUNKED stream gets each call
+   framed as one chunk, a :CLOSE stream sends the bytes as they are.
+
+   An empty BYTES is a no-op on both paths and returns T. On the chunked
+   path that is ENCODE-CHUNK's rule; on the close-delimited path there
+   is simply nothing to write.
+
+   Signals if the connection is not streaming, or if it is already at
+   *MAX-WRITE-BACKLOG* — the frame is not queued, not truncated, and the
+   caller learns the peer is too far behind rather than discovering it
+   as a gap the peer can never detect."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (unless (eq (connection-state conn) :streaming)
+    (error "stream-send: fd ~d is in state ~a, not :streaming"
+           (connection-fd conn) (connection-state conn)))
+  (let ((framed (ecase (connection-stream-framing conn)
+                  (:chunked (encode-chunk bytes))
+                  (:close (when (plusp (length bytes)) bytes)))))
+    (cond
+      ((null framed) t)
+      ((connection-append-write conn framed)
+       (setf (connection-last-active conn) (get-universal-time))
+       (stream-flush conn))
+      (t
+       (error "stream-send: fd ~d is at *max-write-backlog* (~d bytes ~
+               pending, this send is ~d); the peer is not draining."
+              (connection-fd conn)
+              (connection-write-pending conn)
+              (length framed))))))
+
+(defun stream-flush (conn)
+  "Write what the socket will take now. Returns T if the queue emptied,
+   NIL if a remainder is left for the event loop — in which case
+   EPOLLOUT is armed so there is an event to finish it on.
+
+   The arming is conditional and self-limiting: it happens only when a
+   send does not fully flush, which means the socket is genuinely backed
+   up. A peer keeping up costs no epoll_ctl at all, the same property
+   the ping sweep gained when its write moved inline.
+
+   EPOLLIN stays in the mask because a stream still has to notice its
+   peer going away — that is the only read event a :STREAMING connection
+   cares about, and missing it means producing into a socket nobody is
+   on the other end of."
+  (let ((done (eq (connection-on-write conn) :done)))
+    (unless (or done (null *epoll-fd*))
+      (epoll-modify *epoll-fd* (connection-fd conn)
+                    (logior +epollin+ +epollout+ +epollet+)))
+    done))
+
+(defun notify-stream-closed (conn reason)
+  "Fire CONN's stream ON-CLOSE exactly once, with REASON.
+
+   Nulls the slot before calling, not after: a callback that signals
+   must not leave the slot armed for a second delivery from whatever
+   handles the signal. The fetch callback contract is kept the same way
+   and for the same reason — an app that releases a resource twice is
+   worse off than one that never hears."
+  (let ((fn (connection-stream-on-close conn)))
+    (when fn
+      (setf (connection-stream-on-close conn) nil)
+      (handler-case (funcall fn conn reason)
+        (error (e)
+          (log-warn "stream on-close signalled on fd ~d (~a): ~a"
+                    (connection-fd conn) reason e))))))
+
+(defun stream-close (conn)
+  "End the stream on CONN normally.
+
+   Emits the terminator when the framing needs one, fires ON-CLOSE with
+   :DONE, and hands the connection back to the ordinary write path —
+   which flushes what is queued and then either resets for keep-alive or
+   closes, exactly as it does for a non-streaming response.
+
+   This is the only route from :STREAMING back to :READ-HTTP, which is
+   what enforces the rule that a chunked body cannot be reused as a
+   connection without its terminator having been written. Every other
+   way a stream can end goes through CLOSE-CONNECTION and takes the
+   socket with it."
+  (unless (eq (connection-state conn) :streaming)
+    (error "stream-close: fd ~d is in state ~a, not :streaming"
+           (connection-fd conn) (connection-state conn)))
+  (when (eq (connection-stream-framing conn) :chunked)
+    (unless (connection-append-write conn (chunked-terminator))
+      ;; No room for five bytes means the peer is hopelessly behind. The
+      ;; body cannot be terminated, so the connection must not survive to
+      ;; be reused — an unterminated chunked body followed by a fresh
+      ;; response is the smuggling shape this all exists to avoid.
+      (log-warn "stream-close: no room for the terminator on fd ~d — ~
+                 closing rather than reusing" (connection-fd conn))
+      (setf (connection-close-after-p conn) t)))
+  (notify-stream-closed conn :done)
+  (setf (connection-stream-framing conn) nil
+        (connection-stream-keepalive conn) nil
+        (connection-state conn) :write-response)
+  (stream-flush conn)
+  (values))
+
+(defun stream-full-p (conn)
+  "True when CONN's queue is at *MAX-WRITE-BACKLOG* and STREAM-SEND
+   would signal. A producer that can pause should ask before generating
+   an expensive payload — but this is a hint about bytes already queued,
+   not a promise about the next send, which only STREAM-SEND's own
+   return can give. See CONNECTION-WRITE-FULL-P."
+  (connection-write-full-p conn))

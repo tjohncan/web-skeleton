@@ -1458,7 +1458,18 @@
                   ;; only half-tune a slow peer. A limit nobody can set
                   ;; is not a limit.
                   "*MAX-WRITE-BACKLOG*"
-                  "*WRITE-STALL-TIMEOUT*"))
+                  "*WRITE-STALL-TIMEOUT*"
+                  ;; The stream knobs, and the surface an app reaches
+                  ;; them through. A handler in another package that
+                  ;; cannot name MAKE-STREAM-RESPONSE cannot stream at
+                  ;; all, and one that cannot name the timeouts gets the
+                  ;; defaults whatever it writes in its config block.
+                  "*STREAM-IDLE-TIMEOUT*"
+                  "*STREAM-KEEPALIVE-INTERVAL*"
+                  "MAKE-STREAM-RESPONSE"
+                  "STREAM-SEND"
+                  "STREAM-CLOSE"
+                  "STREAM-FULL-P"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -4680,6 +4691,299 @@
              '(t t)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; connection-discard-available: the same EOF contract, on a scratch sink
+;;;
+;;; A :STREAMING connection notices its peer leaving through this, so it
+;;; needs the same discrimination CONNECTION-READ-AVAILABLE gained: a
+;;; peer whose last bytes and FIN arrive in one wake-up must not report
+;;; :OK and be mistaken for one that is still there. Two readers with the
+;;; same job disagreeing is the failure this codebase names as its threat
+;;; model, so the twin is pinned against the same deterministic fixture
+;;; rather than against an e2e race.
+;;; ---------------------------------------------------------------------------
+
+(defun test-discard-available-eof ()
+  (format t "~%connection-discard-available: EOF reporting~%")
+  (flet ((drain (sh-command)
+           (let* ((proc (sb-ext:run-program "/bin/sh" (list "-c" sh-command)
+                                            :output :stream :wait t))
+                  (fd (web-skeleton::%process-output-fd proc))
+                  (sink (make-array 64 :element-type '(unsigned-byte 8))))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd fd :state :streaming :last-active 0)))
+                    (web-skeleton::set-nonblocking fd)
+                    (list (web-skeleton::connection-discard-available conn sink)
+                          ;; The connection's own buffer must be untouched:
+                          ;; a stream's pipelined bytes still live at the
+                          ;; offsets the keep-alive reset works from.
+                          (web-skeleton::connection-read-pos conn)))
+               (ignore-errors (sb-ext:process-close proc))))))
+    (destructuring-bind (result pos) (drain "printf 'noise'")
+      (check "discard-available: bytes then EOF reports :ok-eof" result :ok-eof)
+      (check "discard-available: the connection buffer is not disturbed"
+             pos 0))
+    (destructuring-bind (result pos) (drain "exit 0")
+      (check "discard-available: no bytes at EOF reports :eof" result :eof)
+      (check "discard-available: still nothing in the connection buffer"
+             pos 0))
+    ;; More than one sink-full, so the loop is exercised rather than a
+    ;; single read that happens to see everything.
+    (destructuring-bind (result pos)
+        (drain "printf '%0.s-' $(seq 1 500)")
+      (check "discard-available: a payload past the sink still reports :ok-eof"
+             result :ok-eof)
+      (check "discard-available: and still leaves the buffer alone" pos 0))))
+
+;;; ---------------------------------------------------------------------------
+;;; Stream lifecycle
+;;;
+;;; START-STREAM through STREAM-CLOSE over a real loopback pair, reading
+;;; back what the peer would have seen. The interesting assertions are
+;;; the ones about the terminator: that it is written on the way out,
+;;; and that the only route from :STREAMING back to :READ-HTTP is the one
+;;; that writes it.
+;;; ---------------------------------------------------------------------------
+
+(defun test-stream-lifecycle ()
+  (format t "~%Stream lifecycle~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (closed-with :never))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :read-http
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (request (web-skeleton::make-http-request
+                            :method :GET :path "/s" :version "1.1"))
+                  (sresp (web-skeleton:make-stream-response
+                          :headers '(("content-type" . "text/plain"))
+                          :on-close (lambda (c reason)
+                                      (declare (ignore c))
+                                      (setf closed-with reason))
+                          :on-open
+                          (lambda (c)
+                            (web-skeleton:stream-send
+                             c (sb-ext:string-to-octets
+                                "hello " :external-format :ascii))
+                            (web-skeleton:stream-send
+                             c (sb-ext:string-to-octets
+                                "world" :external-format :ascii))))))
+             (web-skeleton::set-nonblocking server-fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::start-stream conn epfd request sresp)
+
+             (check "stream: the connection is streaming after the head"
+                    (web-skeleton::connection-state conn) :streaming)
+             (check "stream: framing came from the client's version"
+                    (web-skeleton::connection-stream-framing conn) :chunked)
+             (check "stream: on-close has not fired while the stream is open"
+                    closed-with :never)
+
+             ;; Closing writes the terminator and hands the socket back to
+             ;; the ordinary write path.
+             (web-skeleton:stream-close conn)
+             (check "stream: close fires on-close exactly once, with :done"
+                    closed-with :done)
+             (check "stream: close leaves the ordinary write path in charge"
+                    (web-skeleton::connection-state conn) :write-response)
+             (check "stream: nothing is left queued after close"
+                    (web-skeleton::connection-write-pending conn) 0)
+
+             ;; A second teardown must not deliver a second notification.
+             (setf closed-with :never)
+             (web-skeleton::notify-stream-closed conn :disconnected)
+             (check "stream: on-close does not fire twice" closed-with :never)
+
+             ;; What the peer actually received: head, two chunks, the
+             ;; terminator — and the body decodes to what was sent.
+             (let ((buf (make-array 4096 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (b n)
+                   (sb-bsd-sockets:socket-receive client buf 4096)
+                 (declare (ignore b))
+                 (let* ((raw (subseq buf 0 n))
+                        (text (sb-ext:octets-to-string
+                               raw :external-format :latin-1))
+                        (hend (web-skeleton::scan-crlf-crlf raw 0 n)))
+                   (check "stream: the head declares chunked framing"
+                          (and (search "transfer-encoding: chunked" text) t) t)
+                   (check "stream: the head declares no length"
+                          (search "content-length" text) nil)
+                   ;; Caught: a stream that stopped writing its terminator
+                   ;; makes this raise, and an unhandled raise ends the
+                   ;; run with a backtrace instead of a failed check.
+                   (check "stream: the body decodes to everything sent"
+                          (handler-case
+                              (sb-ext:octets-to-string
+                               (web-skeleton::decode-chunked-body
+                                raw (+ hend 4) n)
+                               :external-format :ascii)
+                            (error (e) (princ-to-string e)))
+                          "hello world")))))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-stream-head-request ()
+  (format t "~%Stream HEAD request~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (opened nil))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :read-http
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (request (web-skeleton::make-http-request
+                            :method :HEAD :path "/s" :version "1.1"))
+                  (sresp (web-skeleton:make-stream-response
+                          :on-open (lambda (c) (declare (ignore c))
+                                     (setf opened t)))))
+             (web-skeleton::set-nonblocking server-fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::start-stream conn epfd request sresp)
+             ;; Headers a GET would have carried, and nothing after them.
+             (check "stream HEAD: no stream is started"
+                    (web-skeleton::connection-state conn) :write-response)
+             (check "stream HEAD: on-open is never called" opened nil)
+             (check "stream HEAD: no terminator is owed"
+                    (web-skeleton::connection-stream-framing conn) nil)
+             (web-skeleton::connection-on-write conn)
+             (let ((buf (make-array 4096 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (b n)
+                   (sb-bsd-sockets:socket-receive client buf 4096)
+                 (declare (ignore b))
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 n) :external-format :latin-1)))
+                   (check "stream HEAD: the head still declares the framing"
+                          (and (search "transfer-encoding: chunked" text) t) t)
+                   (check "stream HEAD: and nothing follows the headers"
+                          (- n (+ 4 (web-skeleton::scan-crlf-crlf
+                                     (subseq buf 0 n) 0 n)))
+                          0)))))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Stream keepalive and idle
+;;;
+;;; Two knobs answering two questions. *STREAM-IDLE-TIMEOUT* asks whether
+;;; the app is still producing; *WRITE-STALL-TIMEOUT* asks whether bytes
+;;; are still leaving. A stream can be healthy at the socket and dead at
+;;; the source, which is why reusing either of the existing idle knobs
+;;; would be wrong — ten seconds reaps live streams, a day holds dead
+;;; ones.
+;;; ---------------------------------------------------------------------------
+
+(defun test-stream-keepalive-and-idle ()
+  (format t "~%Stream keepalive and idle~%")
+  (flet ((streaming-conn (epfd connfd &key keepalive (age 0))
+           (let ((conn (web-skeleton::make-connection
+                        :fd connfd :state :streaming
+                        :last-active (- (get-universal-time) age))))
+             (setf (web-skeleton::connection-stream-framing conn) :chunked
+                   (web-skeleton::connection-stream-keepalive conn) keepalive)
+             (web-skeleton::epoll-add
+              epfd connfd (logior web-skeleton::+epollin+
+                                  web-skeleton::+epollet+))
+             (web-skeleton::register-connection conn)
+             conn)))
+
+    ;; --- Idle: a stream producing nothing for long enough is closed ---
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (reason :never)
+                 (now (get-universal-time)))
+             (let ((conn (streaming-conn epfd connfd
+                                         :age (+ web-skeleton:*stream-idle-timeout*
+                                                 1))))
+               (setf (web-skeleton::connection-stream-on-close conn)
+                     (lambda (c r) (declare (ignore c)) (setf reason r))))
+             (web-skeleton::sweep-idle-connections epfd now)
+             (check "stream idle: a quiet stream is reaped"
+                    (hash-table-count web-skeleton::*connections*) 0)
+             (check "stream idle: the app is told why" reason :idle))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))
+
+    ;; --- Control: within the deadline it survives ---
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (now (get-universal-time)))
+             (streaming-conn epfd connfd :age 1)
+             (web-skeleton::sweep-idle-connections epfd now)
+             (check "stream idle: a recent stream is left alone"
+                    (hash-table-count web-skeleton::*connections*) 1))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))
+
+    ;; --- Keepalive: sent inline, and it refreshes the idle clock ---
+    ;; /dev/null stands in for a socket with room, so the write completes
+    ;; and no arming is needed — the same shape as the ping sweep.
+    (let ((epfd (web-skeleton::epoll-create))
+          (sink (open "/dev/null" :direction :output
+                                  :element-type '(unsigned-byte 8)
+                                  :if-exists :append)))
+      (unwind-protect
+           (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (now (get-universal-time))
+                  (ka (sb-ext:string-to-octets ": ping" :external-format :ascii))
+                  (conn (web-skeleton::make-connection
+                         :fd (sb-sys:fd-stream-fd sink)
+                         :state :streaming
+                         :last-active (- now
+                                         web-skeleton:*stream-keepalive-interval*
+                                         1))))
+             (setf (web-skeleton::connection-stream-framing conn) :chunked
+                   (web-skeleton::connection-stream-keepalive conn) ka)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::keepalive-streams epfd now)
+             (check "stream keepalive: nothing is left queued"
+                    (web-skeleton::connection-write-pending conn) 0)
+             (check "stream keepalive: it counts as activity"
+                    (web-skeleton::connection-last-active conn) now)
+             (check "stream keepalive: the connection survives without arming"
+                    (hash-table-count web-skeleton::*connections*) 1))
+        (ignore-errors (close sink))
+        (ignore-errors (web-skeleton::%close epfd))))
+
+    ;; --- A stream with no keepalive bytes is left alone ---
+    ;; There is nothing generic to send: a chunked stream's only
+    ;; zero-content emission is the empty chunk, and that is the
+    ;; terminator. Inventing one here would end the message.
+    (let ((epfd (web-skeleton::epoll-create))
+          (connfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                 (now (get-universal-time)))
+             (let ((conn (streaming-conn
+                          epfd connfd
+                          :age (+ web-skeleton:*stream-keepalive-interval* 1))))
+               (web-skeleton::keepalive-streams epfd now)
+               (check "stream keepalive: none configured means none sent"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "stream keepalive: and the idle clock is not touched"
+                      (< (web-skeleton::connection-last-active conn) now) t)))
+        (ignore-errors (web-skeleton::%close connfd))
+        (ignore-errors (web-skeleton::%close epfd))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Streaming response head
 ;;;
 ;;; The strongest check available is that the head we emit, followed by
@@ -5307,6 +5611,10 @@
   (test-chunked-body-complete-p)
   (test-chunked-encoder)
   (test-streaming-head)
+  (test-discard-available-eof)
+  (test-stream-lifecycle)
+  (test-stream-head-request)
+  (test-stream-keepalive-and-idle)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)

@@ -127,6 +127,13 @@
            #:*max-ws-message-size*
            #:*max-connections*
            #:*max-write-backlog*
+           ;; Streaming responses
+           #:make-stream-response
+           #:stream-send
+           #:stream-close
+           #:stream-full-p
+           #:*stream-idle-timeout*
+           #:*stream-keepalive-interval*
            ;; Connection lifecycle
            #:*idle-timeout*
            #:*ws-idle-timeout*

@@ -1015,6 +1015,144 @@
                   t))
       (setf *write-stall-timeout* saved))))
 
+(defun %raw-connect ()
+  "A raw socket to the live test server, plus its byte stream."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+    (values socket
+            (sb-bsd-sockets:socket-make-stream
+             socket :input t :output t :element-type '(unsigned-byte 8)))))
+
+(defun %send-raw-get (stream path &key (extra ""))
+  (write-sequence (sb-ext:string-to-octets
+                   (format nil "GET ~a HTTP/1.1~c~cHost: localhost~c~c~a~c~c"
+                           path #\Return #\Newline #\Return #\Newline
+                           extra #\Return #\Newline)
+                   :external-format :ascii)
+                  stream)
+  (force-output stream))
+
+(defun test-harness-streaming-e2e ()
+  "A streaming response, end to end: head, chunks, terminator, and the
+   framework's own decoder reading its own encoder's output back off a
+   real socket. The handler returns as soon as it has queued its content,
+   which is the shape the whole issue is about — the worker is free while
+   the response is still being delivered."
+  (format t "~%Harness: streaming response end-to-end~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-stream-response
+                   :headers '(("content-type" . "text/plain"))
+                   :on-open (lambda (conn)
+                              (stream-send conn (sb-ext:string-to-octets
+                                                 "alpha " :external-format :ascii))
+                              (stream-send conn (sb-ext:string-to-octets
+                                                 "beta" :external-format :ascii))
+                              (stream-close conn)))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (%send-raw-get stream "/stream" :extra
+                            (format nil "Connection: close~c~c"
+                                    #\Return #\Newline))
+             (let* ((buf (read-until-bounded stream))
+                    (raw (subseq buf 0 (fill-pointer buf)))
+                    (text (sb-ext:octets-to-string raw :external-format :latin-1))
+                    (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+               (check "streaming e2e: 200 with chunked framing"
+                      (and (search "200 OK" text)
+                           (search "transfer-encoding: chunked" text)
+                           t)
+                      t)
+               (check "streaming e2e: no Content-Length"
+                      (search "content-length" text) nil)
+               ;; Caught for the same reason as the unit-level decode: a
+               ;; missing terminator raises here, and a raise ends the
+               ;; run rather than reporting.
+               (check "streaming e2e: the body decodes to what was streamed"
+                      (handler-case
+                          (sb-ext:octets-to-string
+                           (web-skeleton::decode-chunked-body
+                            raw (+ hend 4) (length raw))
+                           :external-format :ascii)
+                        (error (e) (princ-to-string e)))
+                      "alpha beta")))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-stream-does-not-hold-worker-e2e ()
+  "The acceptance criterion for the whole issue, at :WORKERS 1.
+
+   One client opens a stream and leaves it open. A second client then
+   makes an ordinary request on the same single worker and must be
+   answered while the first is still streaming. If holding a stream held
+   the worker, the second request could not complete at all.
+
+   The same fixture then covers disconnect detection: the streaming
+   client goes away without a word, and the server has to notice and run
+   the app's teardown rather than producing into a socket with nobody on
+   the far end."
+  (format t "~%Harness: a live stream does not hold the worker~%")
+  (let ((live-conn nil)
+        (closed-reason :never))
+    (with-test-server
+        (:handler (lambda (req)
+                    (if (search "/stream" (http-request-path req))
+                        (make-stream-response
+                         :on-close (lambda (c reason)
+                                     (declare (ignore c))
+                                     (setf closed-reason reason))
+                         :on-open (lambda (conn)
+                                    ;; Send something so the client can
+                                    ;; prove the stream is live, then
+                                    ;; return without closing it.
+                                    (setf live-conn conn)
+                                    (stream-send conn
+                                                 (sb-ext:string-to-octets
+                                                  "tick" :external-format :ascii))))
+                        (make-text-response 200 "fast"))))
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/stream")
+               ;; Read only as far as the first chunk. The response is
+               ;; keep-alive and open-ended, so it never reaches EOF —
+               ;; without a predicate this would sit here until the
+               ;; deadline and prove nothing.
+               (multiple-value-bind (got reason)
+                   (read-until-bounded
+                    stream :seconds 3
+                    :until (lambda (buf fill)
+                             (search "tick"
+                                     (sb-ext:octets-to-string
+                                      (subseq buf 0 fill)
+                                      :external-format :latin-1))))
+                 (declare (ignore got))
+                 (check "stream/worker: the stream delivered its first chunk"
+                        reason :satisfied))
+               (check "stream/worker: the stream is still open"
+                      (null live-conn) nil)
+               ;; The worker must still be able to serve someone else.
+               (multiple-value-bind (status headers body)
+                   (test-http-request :get "/fast")
+                 (declare (ignore headers))
+                 (check "stream/worker: a concurrent request is answered"
+                        status 200)
+                 (check "stream/worker: and answered correctly" body "fast")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; The streaming client is gone now. The server should notice and
+      ;; tell the app, rather than holding a connection to nobody.
+      (let ((deadline (+ (get-internal-real-time)
+                         (* 3 internal-time-units-per-second))))
+        (loop until (or (not (eq closed-reason :never))
+                        (> (get-internal-real-time) deadline))
+              do (sleep 0.05)))
+      (check "stream/worker: the app is told the peer disconnected"
+             closed-reason :disconnected))))
+
 (defun test-harness-pipelined-with-fin-e2e ()
   "Two HTTP/1.1 requests pipelined onto one connection, followed by
    a half-close from the client, both dispatch. After the keep-alive
@@ -1364,5 +1502,7 @@
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-streaming-e2e)
+  (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

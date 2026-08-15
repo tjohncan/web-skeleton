@@ -101,6 +101,16 @@
    Sized to hold an ordinary request in one or two passes; the drain is
    capped at four of them regardless.")
 
+(defvar *stream-drain-buf* nil
+  "Scratch buffer a :STREAMING connection's reads are discarded into,
+   bound per worker by RUN-WORKER.
+
+   A stream watches EPOLLIN only to notice the peer leaving; whatever
+   the peer sends while a response streams is not a request this
+   connection can answer. Kept out of the connection's own read buffer
+   so a long stream cannot grow it, and so the offsets the keep-alive
+   reset works from are the ones the original request left.")
+
 (defvar *refusal-drain-buf* nil
   "Scratch buffer REFUSE-CONNECTION drains into, bound per worker by
    RUN-WORKER alongside *EPOLL-CTL-BUF* and *POLL-BUF*.
@@ -194,6 +204,17 @@
                  (let* ((state (connection-state conn))
                         (timeout (cond
                                    ((eq state :websocket) *ws-idle-timeout*)
+                                   ;; A stream and a parked inbound are
+                                   ;; different judgments. *FETCH-TIMEOUT*
+                                   ;; asks how long an upstream may take to
+                                   ;; answer; this asks how long an app may
+                                   ;; produce nothing before its stream is
+                                   ;; presumed dead. Reusing either
+                                   ;; *IDLE-TIMEOUT* or *WS-IDLE-TIMEOUT*
+                                   ;; would be wrong in opposite directions
+                                   ;; — ten seconds reaps healthy streams, a
+                                   ;; day holds dead ones.
+                                   ((eq state :streaming) *stream-idle-timeout*)
                                    ((eq state :awaiting)  *fetch-timeout*)
                                    (t                     *idle-timeout*))))
                    (cond
@@ -235,7 +256,7 @@
                 *write-stall-timeout* (connection-fd conn)
                 (connection-state conn)
                 (connection-write-pending conn))
-      (close-connection conn epoll-fd))
+      (close-connection conn epoll-fd :stalled))
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
                  (connection-fd conn) (connection-state conn))
@@ -253,8 +274,54 @@
             (error (e)
               (log-warn "awaiting timeout: could not answer 504 on fd ~d: ~a"
                         (connection-fd conn) e)
-              (close-connection conn epoll-fd)))
-          (close-connection conn epoll-fd)))))
+              (close-connection conn epoll-fd :idle)))
+          (close-connection conn epoll-fd :idle)))))
+
+(defun keepalive-streams (epoll-fd now)
+  "Send the keepalive bytes of any :STREAMING connection that has gone
+   quiet for *STREAM-KEEPALIVE-INTERVAL*.
+
+   Only connections whose STREAM-RESPONSE supplied keepalive bytes are
+   touched, because there is nothing generic to send: a chunked stream's
+   only zero-content emission is the empty chunk, and that is the
+   terminator. Keeping a stream warm is necessarily the business of
+   whatever protocol is riding on top of it.
+
+   Skipped when anything is already queued — a connection with bytes
+   waiting is not quiet, and adding to a backlog that is not draining
+   would help nothing. The write goes out inline for the same reason the
+   ping does: a keepalive is small, an idle socket takes it whole, and
+   arming EPOLLOUT to deliver bytes that already fit is a wake-up for
+   nothing. Failures close the connection rather than escaping into
+   RUN-EVENT-LOOP, which has no handler."
+  (when (plusp *stream-keepalive-interval*)
+    (let ((broken nil))
+      (maphash
+       (lambda (fd conn)
+         (declare (ignore fd))
+         (when (and (eq (connection-state conn) :streaming)
+                    (connection-stream-keepalive conn)
+                    (zerop (connection-write-pending conn))
+                    (>= (- now (connection-last-active conn))
+                        *stream-keepalive-interval*))
+           (handler-case
+               (progn
+                 ;; Counts as activity, which is the point: a stream
+                 ;; emitting keepalives is never reaped by
+                 ;; *STREAM-IDLE-TIMEOUT*.
+                 (setf (connection-last-active conn) now)
+                 (when (connection-append-write
+                        conn (connection-stream-keepalive conn))
+                   (unless (eq (connection-on-write conn) :done)
+                     (epoll-modify epoll-fd (connection-fd conn)
+                                   (logior +epollin+ +epollout+ +epollet+)))))
+             (error (e)
+               (log-debug "stream keepalive failed fd ~d: ~a"
+                          (connection-fd conn) e)
+               (push conn broken)))))
+       *connections*)
+      (dolist (conn broken)
+        (close-connection conn epoll-fd :disconnected)))))
 
 (defun ping-ws-connections (epoll-fd)
   "Send pings to WebSocket connections and close dead ones.
@@ -420,6 +487,14 @@
                   (http-request-path request)
                   (http-fetch-continuation-url response))
        (values response nil))
+      ;; Streaming response — the handler has headers now and a body it
+      ;; will produce over time. Passed through for START-STREAM, which
+      ;; is the only thing that knows how to frame one.
+      ((typep response 'stream-response)
+       (log-debug "~a ~a -> stream"
+                  (http-request-method request)
+                  (http-request-path request))
+       (values response nil))
       ;; Pre-formatted response (e.g., static file — already bytes).
       ;; HEAD truncation happens centrally in HANDLE-CLIENT-READ via
       ;; STRIP-BODY-FOR-HEAD on the way to CONNECTION-QUEUE-WRITE, so
@@ -551,8 +626,15 @@
 ;;; Close and clean up a connection
 ;;; ---------------------------------------------------------------------------
 
-(defun close-connection (conn epoll-fd)
+(defun close-connection (conn epoll-fd &optional (reason :closed))
   "Remove from epoll, unregister, close fd.
+
+   REASON is passed to a streaming connection's ON-CLOSE callback, which
+   fires here rather than at each call site so that no way of tearing a
+   stream down can forget it — the same argument as the fetch cleanup
+   sentinel below. Callers that know why they are closing say so;
+   :CLOSED is the honest answer for the ones that do not.
+
    If CONN is :awaiting, also closes its outbound connection via
    CLOSE-OUTBOUND — which fires the app's fetch cleanup callback if
    the outbound was still carrying one, so DB handles / metrics /
@@ -562,6 +644,11 @@
    half-finished DNS lookup never leaks."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
+      ;; Before anything else is torn down, so the app's callback still
+      ;; sees a live connection to read state off. NOTIFY-STREAM-CLOSED
+      ;; is a no-op once fired, so a stream ended normally through
+      ;; STREAM-CLOSE does not hear about it twice.
+      (notify-stream-closed conn reason)
       ;; If parked waiting for a fetch, close the orphaned outbound too.
       (when (eq (connection-state conn) :awaiting)
         (let ((out-fd (connection-awaiting-fd conn)))
@@ -606,7 +693,14 @@
                (cond
                  ((connection-outbound-p conn)
                   (push conn outbounds-to-close))
-                 ((member (connection-state conn) '(:read-http :read-body :awaiting))
+                 ;; A stream will not end on its own, so waiting for it
+                 ;; would spend the whole drain timeout. Closed without a
+                 ;; terminator on purpose: the client reads a truncated
+                 ;; chunked body, which is exactly what happened, and a
+                 ;; terminator would claim a complete response the app
+                 ;; never finished sending. The app hears :SHUTDOWN.
+                 ((member (connection-state conn)
+                          '(:read-http :read-body :awaiting :streaming))
                   (push conn inbounds-to-close))
                  ((eq (connection-state conn) :websocket)
                   ;; Must not clobber an in-flight write. The race:
@@ -647,7 +741,7 @@
     (dolist (conn outbounds-to-close)
       (close-outbound conn epoll-fd))
     (dolist (conn inbounds-to-close)
-      (close-connection conn epoll-fd)))
+      (close-connection conn epoll-fd :shutdown)))
   ;; Phase 2: flush remaining writes until drained or timeout
   (let ((deadline (+ (get-universal-time) *drain-timeout*)))
     (loop
@@ -674,6 +768,54 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Handle readable event on a client fd
 ;;; ---------------------------------------------------------------------------
+
+(defun start-stream (conn epoll-fd request sresp)
+  "Send the head of a streaming response and hand CONN to the app.
+
+   The head goes out through CONNECTION-QUEUE-WRITE, whose guard is a
+   real check here: nothing should be pending on a connection that has
+   just finished parsing a request, and a stream is the last thing that
+   should be appended behind someone else's half-written response.
+
+   Arming happens once, after ON-OPEN returns, from what is actually
+   pending — the same reason HANDLE-CLIENT-READ's :websocket branch
+   centralized it. ON-OPEN may send nothing, may send and flush
+   completely, may leave a remainder, or may close the stream outright,
+   and each of those wants a different interest."
+  (let* ((framing (stream-framing-for request))
+         (head (format-streaming-head (stream-response-response sresp) framing
+                                      :connection-hint (connection-hint-for conn))))
+    (connection-queue-write conn head)
+    (cond
+      ;; HEAD: RFC 7231 §4.3.2 wants the headers a GET would have
+      ;; carried, which is what the head already is. No body follows, so
+      ;; no stream starts, no terminator is owed, and the connection is
+      ;; reusable exactly as it would be for any other response.
+      ((eq (http-request-method request) :HEAD)
+       (setf (connection-state conn) :write-response)
+       (epoll-modify epoll-fd (connection-fd conn)
+                     (logior +epollout+ +epollet+)))
+      (t
+       (when (eq framing :close)
+         ;; Close-delimited framing *is* the end of the connection.
+         (setf (connection-close-after-p conn) t))
+       (setf (connection-stream-framing conn) framing
+             (connection-stream-on-close conn) (stream-response-on-close sresp)
+             (connection-stream-keepalive conn) (stream-response-keepalive sresp)
+             (connection-state conn) :streaming
+             (connection-last-active conn) (get-universal-time))
+       (let ((on-open (stream-response-on-open sresp)))
+         (when on-open
+           (funcall on-open conn)))
+       (epoll-modify
+        epoll-fd (connection-fd conn)
+        (if (eq (connection-state conn) :streaming)
+            (logior +epollin+ +epollet+
+                    (if (plusp (connection-write-pending conn)) +epollout+ 0))
+            ;; ON-OPEN closed the stream already — a one-shot producer
+            ;; that had everything to say up front. The terminator is
+            ;; queued and the ordinary write path takes it from here.
+            (logior +epollout+ +epollet+)))))))
 
 (defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection.
@@ -735,11 +877,21 @@
                   ;; fetch-callback path (fetch.lisp / tls.lisp) walks
                   ;; every 'connection' header via GET-HEADERS-equivalent,
                   ;; symmetric with the inbound-side walk ten lines up.
-                  (sync-close-after-p-from-response conn response)
+                  ;; A stream's Connection header lives on the response it
+                  ;; carries, not on the wrapper — an app that asks to
+                  ;; close after a stream has to be heard the same way as
+                  ;; one asking after an ordinary response.
+                  (sync-close-after-p-from-response
+                   conn (if (typep response 'stream-response)
+                            (stream-response-response response)
+                            response))
                   (cond
                     ;; Outbound fetch — park and initiate
                     ((typep response 'http-fetch-continuation)
                      (initiate-fetch conn epoll-fd response))
+                    ;; Streaming response — send the head, hand over
+                    ((typep response 'stream-response)
+                     (start-stream conn epoll-fd request response))
                     ;; Normal response — queue for writing.
                     ;; Handler-returned response structs are treated as
                     ;; immutable: a caller that caches a (make-error-response
@@ -855,6 +1007,34 @@
               (close-connection conn epoll-fd))
              ;; :continue — wait for more data
              )))
+        ;; A stream watches EPOLLIN for one thing: the peer leaving.
+        (:streaming
+         (let ((result (connection-discard-available
+                        conn (or *stream-drain-buf*
+                                 (make-array 4096
+                                             :element-type '(unsigned-byte 8))))))
+           (case result
+             ;; End of stream from the client's side. Producing into a
+             ;; socket with nobody on the far end is the thing this
+             ;; branch exists to stop, and noticing it needs :OK-EOF —
+             ;; a peer whose last bytes and FIN land in one wake-up
+             ;; would otherwise report :OK and be missed entirely.
+             ((:eof :ok-eof)
+              (log-debug "stream peer disconnected fd ~d" (connection-fd conn))
+              (close-connection conn epoll-fd :disconnected))
+             ;; The peer sent something. It cannot be answered on this
+             ;; connection — a pipelined request behind a stream would
+             ;; have to wait for the stream to end, and the stream may
+             ;; not end — so the bytes are discarded and the connection
+             ;; is marked not to be reused. A client that gets a clean
+             ;; close retries; one whose request vanished silently
+             ;; waits forever.
+             (:ok
+              (log-debug "stream peer sent data mid-stream fd ~d — ~
+                          will not reuse" (connection-fd conn))
+              (setf (connection-close-after-p conn) t))
+             ;; :again — spurious wake-up, nothing to do.
+             (t nil))))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
         ;; Stale EPOLLIN for a state that isn't currently reading.
@@ -995,6 +1175,13 @@
               ;; WebSocket frame response sent — back to reading
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+)))
+             (:streaming
+              ;; Backlog drained; the stream stays open. Drop EPOLLOUT
+              ;; and keep EPOLLIN, which is the only event a stream with
+              ;; nothing queued has any use for. STREAM-FLUSH arms it
+              ;; again the moment a send fails to complete.
+              (epoll-modify epoll-fd (connection-fd conn)
+                            (logior +epollin+ +epollet+)))
              (:closing
               ;; Close frame sent — disconnect
               (close-connection conn epoll-fd))
@@ -1094,6 +1281,13 @@
       (let ((now (get-universal-time)))
         (when (>= (- now last-sweep-time) 1)
           (sweep-idle-connections epoll-fd now)
+          ;; Rides the same 1 s gate rather than taking a third timer.
+          ;; The interval is per connection and measured from that
+          ;; connection's own last activity, so this needs to be asked
+          ;; often enough, not on a schedule of its own — and a second
+          ;; walk of the table per second would be the waste the gate
+          ;; above exists to prevent.
+          (keepalive-streams epoll-fd now)
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
@@ -1122,6 +1316,8 @@
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
+              (*stream-drain-buf*
+                (make-array 4096 :element-type '(unsigned-byte 8)))
               ;; CAR is the second the string was built for. 0 can never
               ;; be the current universal time, so the first response of
               ;; the worker's life formats and the rest of that second
@@ -1134,7 +1330,16 @@
           ;; that path.
           (let ((listener (make-tcp-listener host port)))
             (unwind-protect
-                 (let ((epoll-fd (epoll-create)))
+                 (let* ((epoll-fd (epoll-create))
+                        ;; Bound per worker alongside the other share-nothing
+                        ;; slots, so app-facing writers can arm EPOLLOUT
+                        ;; without an epoll fd being threaded through an
+                        ;; exported signature. STREAM-SEND may be called from
+                        ;; a fetch callback or a producer the read branch
+                        ;; never returns through, and a remainder left queued
+                        ;; with nothing armed waits for an event that is not
+                        ;; coming.
+                        (*epoll-fd* epoll-fd))
                    (log-info "worker ~d started (epoll fd ~d)"
                              worker-id epoll-fd)
                    (epoll-add epoll-fd (socket-fd listener)

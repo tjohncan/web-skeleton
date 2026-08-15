@@ -216,6 +216,11 @@ tests/
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly with size limits)
+- **Streaming responses** — a handler returns `make-stream-response` instead of
+  a response and produces the body over time with `stream-send` / `stream-close`.
+  No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.
+  The handler returns as soon as it has queued what it has, so a live stream
+  costs a connection and not a worker
 - **WebSocket server push** — `ws-send` queues a frame and flushes what the
   socket takes immediately, so a handler can stream without returning and
   without a slow peer holding the worker
@@ -376,6 +381,16 @@ read about here.
   a connection slot and its backlog, not unbounded growth. This is the
   deliberate trade for `ws-send` no longer holding the worker: the old
   ten-second bound was a total, and it was a total on the wrong thing.
+- **A stream can only be written from the worker that owns it.**
+  `stream-send` touches an unsynchronized write queue, and the connection
+  belonging to exactly one event loop is what lets that queue exist
+  without a lock. So the framework holds connections open and writes
+  bytes; deciding *who* receives an event is the app's, and its registry
+  has to push from the owning worker. Delivering to a connection this
+  thread does not own is a designed-for next step and not a thing you can
+  do today. Fan-out across workers is not provided at all, deliberately —
+  a framework that owned the subscriber registry would own per-process
+  state and become the horizontal-scaling limit.
 - **Static responses omit `Date`.** Dynamic responses carry it. See
   DEPLOYMENT.md — it matters if you put a caching CDN in front.
 
@@ -401,6 +416,8 @@ All configurable via `setf` before calling `start-server`.
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
 | `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed |
 | `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
+| `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |
+| `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice |
 | `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed                                                                                                                                                                                                   |
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
