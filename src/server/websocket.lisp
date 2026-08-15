@@ -290,10 +290,19 @@
    Measured from the last forward progress on the backlog, not from the
    last event on the connection — see CONNECTION-WRITE-PROGRESS-AT.
 
+   An inactivity bound, not a total. The old deadline was computed once
+   per frame and expired regardless of progress; this one restarts on any
+   byte the peer accepts, so a peer that trickles is never closed. Its
+   memory is still capped by *MAX-WRITE-BACKLOG*; its time is not. The
+   trade is deliberate — the total bound was a total on the worker, which
+   is the more expensive thing to hold.
+
    There is still no setting that disables it. Zero used to mean a worker
    pinned forever; it would now mean a connection holding up to
    *MAX-WRITE-BACKLOG* forever, against a *WS-IDLE-TIMEOUT* that defaults
-   to a day and is bumped by reads the stuck peer may still be sending.")
+   to a day and is bumped by reads the stuck peer may still be sending.
+   START-SERVER enforces it, because the check below is only reached by
+   callers of WS-SEND and a handler that returns a frame is not one.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Frame send

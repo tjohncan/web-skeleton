@@ -259,6 +259,9 @@
                    ;; as one mid-write.
                    ((zerop (connection-write-pending conn))
                     (incf (connection-missed-pongs conn))
+                    ;; Return ignored, and provably so: the guard above is
+                    ;; that nothing is pending, and two bytes cannot
+                    ;; overrun a bound the docs require to clear 1 MiB.
                     (connection-append-write conn ping-frame)
                     ;; Write it here rather than arming EPOLLOUT and coming
                     ;; back. A two-byte ping onto an empty queue is taken
@@ -1215,6 +1218,17 @@
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
+  ;; WS-SEND checks this too, but only WS-SEND does, and a handler that
+  ;; returns a frame instead of pushing one never goes through it — that
+  ;; path appends directly. A zero here would therefore leave the primary
+  ;; documented shape with no time bound on an undrained queue at all,
+  ;; while three docs promise there is no setting that disables it.
+  (unless (and (realp *ws-send-timeout*) (plusp *ws-send-timeout*))
+    (error "start-server: *ws-send-timeout* is ~s; it must be positive. ~
+            It is the only deadline on a write queue the peer may never ~
+            drain — *ws-idle-timeout* defaults to a day and a peer that ~
+            stops reading may keep sending, which refreshes it."
+           *ws-send-timeout*))
   (setf *shutdown* nil)
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an

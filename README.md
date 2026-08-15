@@ -366,6 +366,16 @@ read about here.
   - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
     keep `EMFILE` from spinning the log. Under fd exhaustion that is a
     worker doing nothing else, 100 ms at a time.
+- **A WebSocket peer that reads slowly enough is never timed out.**
+  Separate from the list above, because what it holds is one connection
+  rather than a worker. `*ws-send-timeout*` bounds *inactivity* on the
+  write queue, not the total time a frame may take: every byte the peer
+  accepts restarts the clock, so a client taking one byte per interval
+  keeps its connection open indefinitely. Memory is still bounded —
+  `*max-write-backlog*` caps what may pile up behind it — so the cost is
+  a connection slot and its backlog, not unbounded growth. This is the
+  deliberate trade for `ws-send` no longer holding the worker: the old
+  ten-second bound was a total, and it was a total on the wrong thing.
 - **Static responses omit `Date`.** Dynamic responses carry it. See
   DEPLOYMENT.md — it matters if you put a caching CDN in front.
 
@@ -395,7 +405,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
-| `*ws-send-timeout*`            | `10`      | Seconds a connection may sit on a write backlog that is not moving before it is closed. Must be positive — there is no unbounded setting. Measured from the last forward progress on the queue, not the last activity on the connection, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Bounds one connection; `ws-send` itself does not block the worker |
+| `*ws-send-timeout*`            | `10`      | Inactivity bound on a write backlog, not a total. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped by `*max-write-backlog*`, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
 | `*fetch-timeout*`              | `30`      | Per-phase bound, not a total. On the async `http://` path it *is* end-to-end (the `:awaiting` reap covers DNS + connect + read together). On the blocking paths it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |

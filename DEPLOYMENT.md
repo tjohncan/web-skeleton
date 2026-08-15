@@ -660,13 +660,25 @@ anything. **The blast radius is one connection.**
 
 Two limits bound what is left, and they answer different questions.
 `*max-write-backlog*` is how much may pile up; `*ws-send-timeout*` is how
-long it may sit without moving. Cross either and that one connection is
-closed. `*ws-send-timeout*` must still be positive — it used to be the
-only bound on a pinned worker, and it is now the only bound on a queue
-the peer may never drain. Note that it is measured from the last forward
-progress on the queue and not from the connection's last activity: a peer
-that keeps sending while refusing to read would otherwise keep its own
-backlog alive indefinitely.
+long it may sit **without moving**. Cross either and that one connection
+is closed. It is measured from the last forward progress on the queue and
+not from the connection's last activity, so a peer that keeps sending
+while refusing to read cannot keep its own backlog alive.
+
+`*ws-send-timeout*` must be positive, and `start-server` refuses to start
+otherwise. `ws-send` checks it too, but only `ws-send` does — a handler
+that returns a frame rather than pushing one appends through a path that
+never sees it, so the startup check is what actually backs the promise.
+
+**It is an inactivity bound, not a total.** The old ten-second deadline
+was a total: one frame, ten seconds, trickle or not. This one restarts
+every time the peer accepts any bytes at all, so a client reading one
+byte per interval holds its connection open indefinitely. That is the
+deliberate trade for not holding the worker — the total bound was a total
+on the wrong thing — and the cost is capped at one connection slot plus
+`*max-write-backlog*` rather than 1/N of the server. If your deployment
+needs a hard ceiling on how long a single peer may occupy a slot, that is
+the proxy's job, not this one's.
 
 This changes the advice for fan-out. One unresponsive subscriber used to
 be enough to stall a broadcast, which was the reason to prefer your own

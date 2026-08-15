@@ -964,6 +964,57 @@
     (check "start-server: :workers :auto signals error"
            (try-workers :auto) t)))
 
+(defun test-harness-ws-send-timeout-zero-rejected ()
+  "start-server must refuse a non-positive *ws-send-timeout*.
+
+   WS-SEND checks it too, but only callers of WS-SEND reach that check,
+   and a handler that returns a frame instead of pushing one appends
+   through a path that never sees it. With the deadline disabled, that
+   path — the primary documented shape — has no time bound on an
+   undrained queue at all: *ws-idle-timeout* defaults to a day and is
+   refreshed by reads a peer that stopped reading may still be sending.
+   Three documents promise no setting disables the deadline. This is
+   where that promise is kept.
+
+   The error message is asserted, not merely the fact of an error, so
+   this cannot pass on a rejection that happened for some other reason.
+   The positive case needs no check here: every other harness test starts
+   a server at the default of 10.
+
+   SETF rather than LET, and restored in an UNWIND-PROTECT — the probe
+   runs in a fresh thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: start-server *ws-send-timeout* 0 rejects~%")
+  (let ((saved *ws-send-timeout*))
+    (unwind-protect
+         (flet ((try-timeout (v)
+                  (setf *ws-send-timeout* v)
+                  (let ((msg nil))
+                    (let ((th (sb-thread:make-thread
+                               (lambda ()
+                                 (handler-case
+                                     (progn
+                                       (start-server
+                                        :workers 1
+                                        :handler (lambda (r) (declare (ignore r))))
+                                       nil)
+                                   (error (e) (setf msg (princ-to-string e)))))
+                               :name "ws-send-timeout-validation-probe")))
+                      (handler-case
+                          (sb-thread:join-thread th :timeout 2)
+                        (error ()
+                          (ignore-errors (sb-thread:terminate-thread th))
+                          (ignore-errors (sb-thread:join-thread th)))))
+                    msg)))
+           (check "start-server: *ws-send-timeout* 0 signals error"
+                  (let ((m (try-timeout 0)))
+                    (and m (not (null (search "*ws-send-timeout*" m))) t))
+                  t)
+           (check "start-server: *ws-send-timeout* -1 signals error"
+                  (let ((m (try-timeout -1)))
+                    (and m (not (null (search "*ws-send-timeout*" m))) t))
+                  t))
+      (setf *ws-send-timeout* saved))))
+
 (defun test-harness-pipelined-with-fin-e2e ()
   "Two HTTP/1.1 requests pipelined onto one connection, followed by
    a half-close from the client, both dispatch. After the keep-alive
@@ -1312,5 +1363,6 @@
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
+  (test-harness-ws-send-timeout-zero-rejected)
   (report-suite "Harness")
   (zerop *tests-failed*))
