@@ -337,22 +337,7 @@
   (unless (eq (connection-state conn) :streaming)
     (error "stream-send: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
-  (let ((framed (ecase (connection-stream-framing conn)
-                  (:chunked (encode-chunk bytes))
-                  ;; Copied, not passed through. The queue holds vectors
-                  ;; by reference and advances an offset through them, so
-                  ;; handing it the app's own buffer means anything
-                  ;; written into that buffer before it drains goes out
-                  ;; instead of what was sent. Reusing one buffer is the
-                  ;; obvious way to write a producer, and without this
-                  ;; the rule for whether that is allowed would depend on
-                  ;; the client's HTTP version — chunked copies here
-                  ;; because ENCODE-CHUNK builds a new vector, close
-                  ;; framing did not. An app cannot see which framing it
-                  ;; got, so it would be correct against every browser
-                  ;; and corrupt against one old client. Uniformity costs
-                  ;; the copy the other path already pays.
-                  (:close (when (plusp (length bytes)) (copy-seq bytes))))))
+  (let ((framed (frame-stream-bytes conn bytes)))
     (cond
       ((null framed) t)
       ((connection-append-write conn framed)
@@ -366,6 +351,31 @@
               (connection-fd conn)
               (connection-write-pending conn)
               (length framed))))))
+
+(defun frame-stream-bytes (conn bytes)
+  "Frame BYTES for CONN's stream, or NIL when there is nothing to send.
+
+   The one place a stream's framing is applied, because there is more
+   than one writer and they land in the same body. The keepalive sweep
+   is the other, and it appended raw bytes until it was found doing so —
+   on a chunked stream that put a comment line where the peer's decoder
+   expects a chunk-size, which kills the stream the keepalive exists to
+   keep alive. Two writers deciding framing separately is the same
+   hazard as two readers deciding acceptance separately, and this
+   codebase already names that one."
+  (ecase (connection-stream-framing conn)
+    (:chunked (encode-chunk bytes))
+    ;; Copied, not passed through. The queue holds vectors by reference
+    ;; and advances an offset through them, so handing it the app's own
+    ;; buffer means anything written into that buffer before it drains
+    ;; goes out instead of what was sent. Reusing one buffer is the
+    ;; obvious way to write a producer, and without this the rule for
+    ;; whether that is allowed would depend on the client's HTTP version
+    ;; — chunked copies here because ENCODE-CHUNK builds a new vector,
+    ;; close framing did not. An app cannot see which framing it got, so
+    ;; it would be correct against every browser and corrupt against one
+    ;; old client.
+    (:close (when (plusp (length bytes)) (copy-seq bytes)))))
 
 (defun stream-flush (conn)
   "Write what the socket will take now. Returns T if the queue emptied,
@@ -487,6 +497,15 @@
    cannot survive the round trip in any case: the client would rejoin
    consecutive data lines with LF, so passing one through would silently
    rewrite the app's bytes."
+  ;; Named rather than left to FIND's type error. An integer id is the
+  ;; most natural thing an app passes — sequence numbers are what
+  ;; Last-Event-ID replay is for — and "The value 42 is not of type
+  ;; SEQUENCE" names neither the argument nor the fix. RETRY already had
+  ;; a check of its own; three of the four fields did not.
+  (unless (stringp value)
+    (error "sse: ~a must be a string, got ~s. Field values go on the wire ~
+            as text; convert first (WRITE-TO-STRING for a number)."
+           kind value))
   (when (find #\Return value)
     (error "sse: ~a contains a CR — EventSource treats it as a line ~
             terminator, so it would end the field early" kind))
@@ -527,6 +546,12 @@
    queues nothing and leaves the stream exactly as it was. Half an event
    on the wire would be worse than no event: the client would splice it
    onto whatever came next."
+  ;; Type before emptiness: (LENGTH 7) raises on the way to the length
+  ;; check, and the caller learns about SEQUENCE rather than about data.
+  (when (and data (not (stringp data)))
+    (error "sse: data must be a string, got ~s. Field values go on the ~
+            wire as text; convert first (WRITE-TO-STRING for a number)."
+           data))
   (unless (and data (plusp (length data)))
     (error "sse: an event needs data — EventSource does not dispatch one ~
             with an empty data buffer. Use SSE-COMMENT for a keepalive."))

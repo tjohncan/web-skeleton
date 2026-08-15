@@ -322,11 +322,21 @@
                  ;; *STREAM-IDLE-TIMEOUT*. Measured on the same clock the
                  ;; idle sweep reads, so the two cannot drift apart.
                  (setf (connection-stream-produced-at conn) now)
-                 (when (connection-append-write
-                        conn (connection-stream-keepalive conn))
-                   (unless (eq (connection-on-write conn) :done)
-                     (epoll-modify epoll-fd (connection-fd conn)
-                                   (logior +epollin+ +epollout+ +epollet+)))))
+                 ;; Framed, not appended raw. These bytes land in the same
+                 ;; body the app's sends land in, so on a chunked stream a
+                 ;; raw comment line sits exactly where the peer's decoder
+                 ;; expects a chunk-size — and the keepalive whose whole
+                 ;; job is to stop a quiet stream being dropped becomes
+                 ;; what drops it. FRAME-STREAM-BYTES is the one place
+                 ;; that decision is made, so this writer cannot drift
+                 ;; from STREAM-SEND again.
+                 (let ((framed (frame-stream-bytes
+                                conn (connection-stream-keepalive conn))))
+                   (when (and framed (connection-append-write conn framed))
+                     (unless (eq (connection-on-write conn) :done)
+                       (epoll-modify epoll-fd (connection-fd conn)
+                                     (logior +epollin+ +epollout+
+                                             +epollet+))))))
              (error (e)
                (log-debug "stream keepalive failed fd ~d: ~a"
                           (connection-fd conn) e)

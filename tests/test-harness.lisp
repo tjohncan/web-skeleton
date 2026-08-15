@@ -1127,6 +1127,85 @@
         (ignore-errors (close stream))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-sse-keepalive-framed-e2e ()
+  "A keepalive on a chunked stream has to be framed as a chunk.
+
+   Every check written for the keepalive before this one looked at the
+   response struct or the connection's queue — 'installed by default',
+   'nothing left queued', 'counts as production' — and all of those are
+   true of raw bytes and framed bytes alike. The only site that can tell
+   them apart is the wire, so this reads the bytes back and puts them
+   through the framework's own chunked decoder.
+
+   Unframed, the comment line sits where the peer's decoder expects a
+   chunk-size, and the keepalive whose job is to stop a quiet stream
+   being dropped is what drops it — in the default configuration, with
+   no app error required.
+
+   SETF rather than LET on the interval: the worker reads it from another
+   thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: sse keepalive is framed~%")
+  (let ((saved *stream-keepalive-interval*))
+    (unwind-protect
+         (progn
+           (setf *stream-keepalive-interval* 1)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-sse-response
+                            :on-open (lambda (conn)
+                                       ;; One real event, then silence —
+                                       ;; the sweep supplies the rest.
+                                       (sse-send conn :data "start")))))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (%send-raw-get stream "/events")
+                      ;; No predicate: the stream never ends, so the
+                      ;; deadline is the mechanism. Four seconds at a
+                      ;; one-second interval collects the event plus
+                      ;; several keepalives.
+                      (let ((buf (read-until-bounded stream :seconds 4)))
+                        (let* ((raw (subseq buf 0 (fill-pointer buf)))
+                               (hend (or (web-skeleton::scan-crlf-crlf
+                                          raw 0 (length raw))
+                                         (error "no header boundary in ~d bytes"
+                                                (length raw))))
+                               (body (subseq raw (+ hend 4)))
+                               ;; The stream is still open, so it has no
+                               ;; terminator. Append one and the decoder
+                               ;; can pass judgement on everything sent
+                               ;; so far.
+                               (terminated
+                                 (concatenate '(vector (unsigned-byte 8))
+                                              body
+                                              (web-skeleton::chunked-terminator))))
+                          (check "sse keepalive: the stream so far is valid chunked"
+                                 (handler-case
+                                     (progn (web-skeleton::decode-chunked-body
+                                             terminated 0 (length terminated))
+                                            :decoded)
+                                   (error (e) (princ-to-string e)))
+                                 :decoded)
+                          (check "sse keepalive: and a comment line reached the client"
+                                 (let ((decoded
+                                         (handler-case
+                                             (sb-ext:octets-to-string
+                                              (web-skeleton::decode-chunked-body
+                                               terminated 0 (length terminated))
+                                              :external-format :utf-8)
+                                           (error () ""))))
+                                   (and (search "data: start" decoded)
+                                        (search ":" decoded :start2
+                                                (+ 11 (or (search "data: start"
+                                                                  decoded)
+                                                          0)))
+                                        t))
+                                 t))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf *stream-keepalive-interval* saved))))
+
 (defun test-harness-stream-does-not-hold-worker-e2e ()
   "The acceptance criterion for the whole issue, at :WORKERS 1.
 
@@ -1549,6 +1628,7 @@
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
+  (test-harness-sse-keepalive-framed-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

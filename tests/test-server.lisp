@@ -4838,6 +4838,23 @@
            (refused (lambda () (web-skeleton::sse-event-bytes
                                 :data "x" :retry "soon")))
            t)
+    ;; A named refusal, not FIND's type error. An integer id is the most
+    ;; natural thing an app passes — sequence numbers are what
+    ;; Last-Event-ID replay is for — and "the value 42 is not of type
+    ;; SEQUENCE" names neither the argument nor the fix.
+    (dolist (case '((:id 42) (:event :tick) (:data 7)))
+      (check (format nil "sse: a non-string ~a is refused by name"
+                     (string-downcase (symbol-name (first case))))
+             (handler-case
+                 (progn (apply #'web-skeleton::sse-event-bytes
+                               (if (eq (first case) :data)
+                                   case
+                                   (list* :data "x" case)))
+                        nil)
+               (error (e) (and (search "must be a string"
+                                       (princ-to-string e))
+                               t)))
+             t))
 
     ;; --- An event with no data reaches nobody, so it is refused ---
     ;; EventSource returns early on an empty data buffer. Emitting one
@@ -5127,35 +5144,50 @@
         (ignore-errors (web-skeleton::%close connfd))
         (ignore-errors (web-skeleton::%close epfd))))
 
-    ;; --- Keepalive: sent inline, and it refreshes the idle clock ---
-    ;; /dev/null stands in for a socket with room, so the write completes
-    ;; and no arming is needed — the same shape as the ping sweep.
-    (let ((epfd (web-skeleton::epoll-create))
-          (sink (open "/dev/null" :direction :output
-                                  :element-type '(unsigned-byte 8)
-                                  :if-exists :append)))
-      (unwind-protect
-           (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                  (now (get-universal-time))
-                  (ka (sb-ext:string-to-octets ": ping" :external-format :ascii))
-                  (conn (web-skeleton::make-connection
-                         :fd (sb-sys:fd-stream-fd sink)
-                         :state :streaming
-                         :last-active now)))
-             (setf (web-skeleton::connection-stream-framing conn) :chunked
-                   (web-skeleton::connection-stream-produced-at conn)
-                   (- now web-skeleton:*stream-keepalive-interval* 1)
-                   (web-skeleton::connection-stream-keepalive conn) ka)
-             (web-skeleton::register-connection conn)
-             (web-skeleton::keepalive-streams epfd now)
-             (check "stream keepalive: nothing is left queued"
-                    (web-skeleton::connection-write-pending conn) 0)
-             (check "stream keepalive: it counts as production"
-                    (web-skeleton::connection-stream-produced-at conn) now)
-             (check "stream keepalive: the connection survives without arming"
-                    (hash-table-count web-skeleton::*connections*) 1))
-        (ignore-errors (close sink))
-        (ignore-errors (web-skeleton::%close epfd))))
+    ;; --- Keepalive: framed, sent inline, and it refreshes the idle clock ---
+    ;; Over a real pair rather than /dev/null, because the only site that
+    ;; can tell a framed keepalive from a raw one is the wire. "Nothing
+    ;; left queued", "counts as production" and "survives without arming"
+    ;; are all true either way — they were, for a whole item.
+    (multiple-value-bind (server client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (now (get-universal-time))
+                    (ka (sb-ext:string-to-octets ":ka" :external-format :ascii))
+                    (conn (web-skeleton::make-connection
+                           :fd (web-skeleton::socket-fd server)
+                           :socket server :state :streaming
+                           :last-active now)))
+               (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
+               (setf (web-skeleton::connection-stream-framing conn) :chunked
+                     (web-skeleton::connection-stream-produced-at conn)
+                     (- now web-skeleton:*stream-keepalive-interval* 1)
+                     (web-skeleton::connection-stream-keepalive conn) ka)
+               (web-skeleton::register-connection conn)
+               (web-skeleton::keepalive-streams epfd now)
+               (check "stream keepalive: nothing is left queued"
+                      (web-skeleton::connection-write-pending conn) 0)
+               (check "stream keepalive: it counts as production"
+                      (web-skeleton::connection-stream-produced-at conn) now)
+               (check "stream keepalive: the connection survives without arming"
+                      (hash-table-count web-skeleton::*connections*) 1)
+               ;; The assertion that needed a wire: these bytes share a
+               ;; body with the app's sends, so on a chunked stream they
+               ;; have to arrive as a chunk. Raw, they sit where the
+               ;; peer's decoder expects a chunk-size.
+               (let ((buf (make-array 64 :element-type '(unsigned-byte 8))))
+                 (multiple-value-bind (b n)
+                     (sb-bsd-sockets:socket-receive client buf 64)
+                   (declare (ignore b))
+                   (check "stream keepalive: it reaches the peer framed as a chunk"
+                          (sb-ext:octets-to-string (subseq buf 0 n)
+                                                   :external-format :latin-1)
+                          (format nil "3~c~c:ka~c~c"
+                                  #\Return #\Newline #\Return #\Newline)))))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close server))
+          (ignore-errors (sb-bsd-sockets:socket-close client)))))
 
     ;; --- A stream with no keepalive bytes is left alone ---
     ;; There is nothing generic to send: a chunked stream's only
