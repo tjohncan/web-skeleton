@@ -646,6 +646,15 @@ rather than buffering the whole body first.
 incrementally; handing them over again would double the memory the
 callback exists to avoid.
 
+**Chunked framing only, and it degrades rather than disappearing.** A
+`Content-Length` or close-delimited response has no chunk walk to hand
+bytes back from, so `:on-body` is never called and `:then` receives the
+whole body the ordinary way — not incremental, but not lost. You do not
+choose which framing an upstream uses: the same origin will switch by
+response size or by whatever proxy sits in front of it. Write the relay
+to take the bytes from `:on-body` when they arrive there and from
+`:then`'s body when they do not.
+
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
 partial-line state carried across reads. A second implementation here

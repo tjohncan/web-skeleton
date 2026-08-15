@@ -1257,6 +1257,48 @@
       (check "on-body e2e: :then got no body to re-deliver"
              (second final) :nil))))
 
+(defun test-harness-fetch-on-body-content-length-e2e ()
+  "An :ON-BODY fetch against a Content-Length upstream must still deliver
+   the body — through :THEN, since there is no chunk walk to hand it back
+   from.
+
+   Suppressing the buffered body on the strength of ON-BODY merely being
+   *supplied* dropped it entirely on this framing: no chunks, NIL in
+   :THEN, nothing raised. An app cannot choose which framing an upstream
+   uses — the same origin switches by response size or by whatever proxy
+   is in front — so the two paths have to agree that the bytes arrive
+   somewhere."
+  (format t "~%Harness: fetch :on-body against a Content-Length upstream~%")
+  (let ((chunks nil)
+        (final :never)
+        (port-box (list nil)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               ;; An ordinary response: Content-Length, no chunking.
+               (make-text-response 200 "plain-body")
+               (http-fetch
+                :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                :on-body (lambda (conn chunk)
+                           (declare (ignore conn))
+                           (push (sb-ext:octets-to-string
+                                  chunk :external-format :ascii)
+                                 chunks))
+                :then (lambda (status headers body)
+                        (declare (ignore status headers))
+                        (setf final (if body
+                                        (sb-ext:octets-to-string
+                                         body :external-format :ascii)
+                                        :nil))
+                        (make-text-response 200 "relayed"))))))
+      (setf (first port-box) *test-port*)
+      (test-http-request :get "/relay")
+      (check "on-body/CL: no chunks, because there is no chunk walk"
+             chunks nil)
+      (check "on-body/CL: and the body still arrives, through :then"
+             final "plain-body"))))
+
 (defun test-harness-stream-does-not-hold-worker-e2e ()
   "The acceptance criterion for the whole issue, at :WORKERS 1.
 
@@ -1681,6 +1723,7 @@
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)
   (test-harness-fetch-on-body-e2e)
+  (test-harness-fetch-on-body-content-length-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

@@ -137,6 +137,15 @@
    accumulated, and handing them over twice would double the memory the
    callback exists to avoid.
 
+   Chunked framing only, and it degrades rather than disappearing. A
+   Content-Length or close-delimited response has no chunk walk to hand
+   bytes back from, so ON-BODY is never called and THEN receives the
+   whole body the ordinary way — not incremental, but not lost. An app
+   cannot choose which framing an upstream uses: the same origin will
+   switch by response size or by whatever proxy is in front, so a relay
+   has to be written to accept the body either way. Read the bytes from
+   ON-BODY when they arrive there and from THEN's body when they do not.
+
    Chunk-granular, not line-granular, and deliberately. Line splitting
    already exists once, in READER-READ-BYTES on the blocking path, with
    CR/LF/CRLF handling and partial-line state carried across reads. A
@@ -2013,11 +2022,18 @@
                          body-end))
            (raw-body (when (> body-end body-start)
                        (subseq buf body-start body-end)))
-           ;; NIL when ON-BODY already delivered the bytes chunk by chunk.
-           ;; Handing them over a second time would double the memory the
-           ;; callback exists to avoid, and the app has them.
+           ;; NIL only when ON-BODY *actually* delivered the bytes, which
+           ;; is the chunked path and no other — ON-DATA is threaded into
+           ;; CHUNKED-BODY-COMPLETE-P's walk and nowhere else. Keying this
+           ;; on the callback merely being supplied dropped the body of
+           ;; every Content-Length and close-delimited response: no chunks
+           ;; delivered, NIL in :THEN, nothing raised. That is the majority
+           ;; of responses in the wild, and the caller does not choose the
+           ;; framing — the same origin switches by response size or by
+           ;; whatever proxy is in front, so a relay would work against one
+           ;; upstream and come back empty against the next.
            (body (cond
-                   ((connection-fetch-on-body out-conn) nil)
+                   ((and (connection-fetch-on-body out-conn) chunked-p) nil)
                    ((and raw-body chunked-p)
                     (decode-chunked-body raw-body 0 (length raw-body)))
                    (t raw-body)))
