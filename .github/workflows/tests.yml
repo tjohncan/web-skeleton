@@ -1,21 +1,15 @@
 name: tests
 
-# Pull requests, main itself, plus a manual button.
-#
-# main is here because a PR run only ever proves the PR. Two branches that
-# are each green can merge into a tree that is not — the conflict is
-# semantic, so git resolves it silently and nothing runs afterwards to
-# notice. Merges are the moment that is worth knowing about.
+# Pull requests, pushes to main, plus a manual button.
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
 
-# A new push to the same PR cancels the in-flight run. Runs on main are not
-# cancelled: superseding a PR run discards an answer about a commit nobody
-# will look at again, while superseding a main run discards the only answer
-# there is about whether that merge left the tree green.
+# A new push to the same PR cancels the in-flight run.
+# Runs on main are not cancelled: every merge deserves a full test-suite report card.
+# Two branches that are each green, individually, can merge into a red tree.
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
