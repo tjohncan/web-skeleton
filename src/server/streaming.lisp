@@ -66,6 +66,15 @@
    only as connections dying behind a proxy, in the deployment the docs
    assume and in none of the tests."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  ;; A reversed or out-of-bounds range is a caller bug, and without this
+  ;; it would borrow the quiet return that an empty range is entitled to:
+  ;; (:start 2 :end 1) and (:start 2 :end 2) would answer NIL alike, one
+  ;; of them correctly. Bytes vanishing from a stream is the failure this
+  ;; whole file is arranged against, so the two do not get to look the
+  ;; same — the more so once app code is passing the offsets.
+  (unless (<= 0 start end (length bytes))
+    (error "encode-chunk: bad range (start ~d, end ~d, length ~d)"
+           start end (length bytes)))
   (let ((len (- end start)))
     (when (plusp len)
       (let* ((header (sb-ext:string-to-octets
@@ -79,3 +88,116 @@
         (setf (aref out (+ hlen len)) 13
               (aref out (+ hlen len 1)) 10)
         out))))
+
+;;; ---------------------------------------------------------------------------
+;;; Streaming response head
+;;;
+;;; The terminator's lifecycle, decided here because this is the function
+;;; that decides there is no Content-Length:
+;;;
+;;;   The framework emits CHUNKED-TERMINATOR on stream teardown, on every
+;;;   path out — normal end, handler error, connection reaped. The app
+;;;   never writes it and is given no way to.
+;;;
+;;;   A stream whose terminator was not written may not return its
+;;;   connection to :READ-HTTP. If the terminator cannot be emitted at all
+;;;   — the backlog is full, the socket is gone — the connection is closed
+;;;   rather than reused.
+;;;
+;;; Both halves are needed and they cover different failures. Splitting
+;;; the terminator behind its own door made truncation impossible *inside*
+;;; the encoder; it did not make anything emit it. A handler that returns
+;;; early, raises after its first chunk, or takes a path nobody thought
+;;; about leaves an unterminated body on the socket, and a keep-alive
+;;; reuse then puts the next response's status line exactly where a
+;;; downstream reader expects a chunk-size. That is the parser
+;;; disagreement PARSE-CHUNKED-SIZE-LINE's docstring is written to defend
+;;; against, manufactured by us instead of by an upstream.
+;;;
+;;; Enforcement lands with the :STREAMING state; the contract is stated
+;;; here so it is not invented there.
+;;; ---------------------------------------------------------------------------
+
+(defun stream-framing-for (request)
+  "The body framing a streaming response to REQUEST must use.
+
+     :CHUNKED — HTTP/1.1.
+     :CLOSE   — anything older. Chunked transfer coding is an HTTP/1.1
+                feature (RFC 7230 §4.1); a 1.0 client cannot read it, so
+                the only framing left is the one the end of the
+                connection provides.
+
+   Close-delimited framing is the shape whose *reading* side was broken
+   until :OK-EOF landed — a peer's FIN arriving in the same read as the
+   last data was swallowed, and the response hung. Named here because
+   this is the function that decides to start producing them."
+  (if (string= (http-request-version request) "1.1")
+      :chunked
+      :close))
+
+(defun format-streaming-head (response framing &key connection-hint)
+  "Serialize the status line and headers of a streaming response.
+   No body, and deliberately no Content-Length — a response whose length
+   is unknown when the headers go out is the entire point.
+
+   FRAMING comes from STREAM-FRAMING-FOR. :CHUNKED stamps
+   Transfer-Encoding; :CLOSE stamps Connection: close, because the end of
+   the connection is the framing and the caller must actually close.
+
+   HEAD is the caller's business, not this function's. RFC 7231 §4.3.2
+   wants a HEAD response carrying the headers the GET would have carried,
+   which is exactly what this already produces — so a HEAD dispatch emits
+   this head, starts no stream, and owes no terminator.
+
+   Shares SERIALIZE-HTTP-MESSAGE with FORMAT-RESPONSE rather than taking
+   a third behavioral flag on it. Almost everything FORMAT-RESPONSE does
+   with a body is Content-Length work — computing it, defaulting it to
+   zero for bodiless statuses, preserving it across HEAD — and a stream
+   wants none of it. The flag would have switched off most of the
+   function it was added to.
+
+   Refuses rather than reconciling. A caller-supplied Content-Length or
+   Transfer-Encoding means the caller thinks it owns framing, and two
+   opinions about framing on one response is the disagreement this
+   codebase treats as the threat model. A status that cannot carry a body
+   is refused for the same reason: there is nothing to stream."
+  (let ((status (http-response-status response))
+        (headers (http-response-headers response)))
+    (unless (<= 100 status 599)
+      (error "HTTP status ~d out of range (must be 100-599)" status))
+    (when (or (<= 100 status 199) (= status 204) (= status 304))
+      (error "streaming response: status ~d cannot carry a body" status))
+    (when (assoc "content-length" headers :test #'string-equal)
+      (error "streaming response: caller set Content-Length; a stream ~
+              has no length to declare"))
+    (when (assoc "transfer-encoding" headers :test #'string-equal)
+      (error "streaming response: caller set Transfer-Encoding; the ~
+              framework owns the framing of a stream"))
+    (let* ((headers (ecase framing
+                      (:chunked (cons (cons "transfer-encoding" "chunked")
+                                      headers))
+                      (:close (if (assoc "connection" headers
+                                         :test #'string-equal)
+                                  headers
+                                  (cons (cons "connection" "close") headers)))))
+           ;; The hint still applies on the chunked path — a server that
+           ;; has decided to close SHOULD say so (RFC 7230 §6.1) even
+           ;; when the body is self-framing. On the :CLOSE path the
+           ;; header is already there.
+           (headers (if (and connection-hint
+                             (not (assoc "connection" headers
+                                         :test #'string-equal)))
+                        (cons (cons "connection"
+                                    (ecase connection-hint
+                                      (:close "close")
+                                      (:keep-alive "keep-alive")))
+                              headers)
+                        headers))
+           ;; RFC 7231 §7.1.1.2: origin server MUST send Date.
+           (headers (if (assoc "date" headers :test #'string-equal)
+                        headers
+                        (cons (cons "date" (http-date)) headers))))
+      (serialize-http-message
+       (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+       headers
+       nil))))

@@ -4613,6 +4613,21 @@
     (check "encode-chunk: an empty range of a non-empty vector yields nothing"
            (web-skeleton::encode-chunk (bytes "hello") :start 2 :end 2)
            nil)
+    ;; A reversed range must not borrow the empty range's quiet NIL. One
+    ;; of them means "nothing to send"; the other means the caller has its
+    ;; offsets backwards and is about to lose bytes.
+    (check "encode-chunk: a reversed range signals rather than answering nothing"
+           (handler-case (progn (web-skeleton::encode-chunk
+                                 (bytes "hello") :start 2 :end 1)
+                                nil)
+             (error () t))
+           t)
+    (check "encode-chunk: a range past the end signals"
+           (handler-case (progn (web-skeleton::encode-chunk
+                                 (bytes "hello") :start 0 :end 99)
+                                nil)
+             (error () t))
+           t)
 
     ;; --- An empty chunk between two real ones truncates nothing ---
     (let* ((framed (concatenate '(vector (unsigned-byte 8))
@@ -4645,6 +4660,113 @@
                      (= resume (- (length framed)
                                   (length (web-skeleton::chunked-terminator))))))
              '(t t)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Streaming response head
+;;;
+;;; The strongest check available is that the head we emit, followed by
+;;; the chunks we encode, is read back as a complete response by the
+;;; framework's own outbound reader. Producing and consuming are separate
+;;; code paths that must agree on framing, which is the disagreement this
+;;; codebase treats as the threat model.
+;;; ---------------------------------------------------------------------------
+
+(defun test-streaming-head ()
+  (format t "~%Streaming response head~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1))
+         (resp (&optional headers)
+           (let ((r (web-skeleton::make-http-response :status 200)))
+             (loop for (n . v) in headers
+                   do (web-skeleton::set-response-header r n v))
+             r)))
+
+    ;; --- Framing follows the client's version, not our preference ---
+    (check "streaming framing: HTTP/1.1 gets chunked"
+           (web-skeleton::stream-framing-for
+            (web-skeleton::make-http-request :method :GET :version "1.1"))
+           :chunked)
+    (check "streaming framing: HTTP/1.0 cannot read chunked, so close"
+           (web-skeleton::stream-framing-for
+            (web-skeleton::make-http-request :method :GET :version "1.0"))
+           :close)
+
+    ;; --- The chunked head declares the framing and no length ---
+    (let ((head (str (web-skeleton::format-streaming-head (resp) :chunked))))
+      (check "streaming head: declares chunked transfer-encoding"
+             (and (search "transfer-encoding: chunked" head) t) t)
+      (check "streaming head: carries no Content-Length at all"
+             (search "content-length" head) nil)
+      (check "streaming head: carries a Date"
+             (and (search "date: " head) t) t)
+      (check "streaming head: ends at the header boundary"
+             (and (search (format nil "~c~c~c~c" #\Return #\Newline
+                                  #\Return #\Newline)
+                          head)
+                  t)
+             t))
+
+    ;; --- The close-delimited head says so, and declares no encoding ---
+    (let ((head (str (web-skeleton::format-streaming-head (resp) :close))))
+      (check "streaming head: close framing stamps Connection: close"
+             (and (search "connection: close" head) t) t)
+      (check "streaming head: close framing declares no transfer-encoding"
+             (search "transfer-encoding" head) nil)
+      (check "streaming head: close framing carries no Content-Length"
+             (search "content-length" head) nil))
+
+    ;; --- Two opinions about framing are refused, not reconciled ---
+    (check "streaming head: a caller-set Content-Length is refused"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("content-length" . "5"))) :chunked)
+                                nil)
+             (error () t))
+           t)
+    (check "streaming head: a caller-set Transfer-Encoding is refused"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("transfer-encoding" . "chunked")))
+                                 :chunked)
+                                nil)
+             (error () t))
+           t)
+    (dolist (status '(204 304 100))
+      (check (format nil "streaming head: status ~d cannot stream" status)
+             (handler-case
+                 (progn (web-skeleton::format-streaming-head
+                         (web-skeleton::make-http-response :status status)
+                         :chunked)
+                        nil)
+               (error () t))
+             t))
+
+    ;; --- Round-trip: our head plus our chunks, read by our own reader ---
+    (let* ((head (web-skeleton::format-streaming-head (resp) :chunked))
+           (full (concatenate '(vector (unsigned-byte 8))
+                              head
+                              (web-skeleton::encode-chunk (bytes "hello "))
+                              (web-skeleton::encode-chunk (bytes "world"))
+                              (web-skeleton::chunked-terminator))))
+      (check "streaming head: the outbound reader sees a complete response"
+             (and (web-skeleton::outbound-response-complete-p
+                   full (length full) :GET)
+                  t)
+             t)
+      (let ((hend (web-skeleton::scan-crlf-crlf full 0 (length full))))
+        (check "streaming head: and the body decodes to what was streamed"
+               (str (web-skeleton::decode-chunked-body
+                     full (+ hend 4) (length full)))
+               "hello world"))
+      ;; Without the terminator the reader must keep waiting rather than
+      ;; declaring the response done — which is what makes an unterminated
+      ;; stream a hazard worth a lifecycle rule.
+      (let ((unterminated (concatenate '(vector (unsigned-byte 8))
+                                       head
+                                       (web-skeleton::encode-chunk
+                                        (bytes "hello ")))))
+        (check "streaming head: an unterminated body never reads as complete"
+               (web-skeleton::outbound-response-complete-p
+                unterminated (length unterminated) :GET)
+               nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; A handler that pushes and also returns
@@ -5144,6 +5266,7 @@
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
   (test-chunked-encoder)
+  (test-streaming-head)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
