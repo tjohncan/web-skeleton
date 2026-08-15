@@ -87,6 +87,12 @@
   ;; per outbound connection — outbound connections are never reused —
   ;; so it needs no reset.
   (chunk-scan-pos  0  :type fixnum)
+  ;; (CONN BYTES) per chunk as an outbound response arrives, or NIL to
+  ;; buffer the whole body. Set from the continuation by INITIATE-FETCH.
+  (fetch-on-body   nil :type (or null function))
+  ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
+  ;; the upstream's send window fills. FETCH-RESUME re-arms.
+  (fetch-paused    nil :type boolean)
   ;; Streaming response — set while STATE is :streaming
   (stream-framing   nil :type (or null keyword))  ; :chunked or :close
   ;; (CONN REASON) called exactly once when the stream ends, however it

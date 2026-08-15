@@ -216,6 +216,10 @@ tests/
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly with size limits)
+- **Incremental relay** — `http-fetch` takes `:on-body`, called with each chunk
+  of a chunked upstream response as its framing is proved, so a relay forwards
+  as it reads instead of buffering the whole body first. Return `:pause` to stop
+  reading upstream and let its send window fill; `fetch-resume` re-arms
 - **Streaming responses** — a handler returns `make-stream-response` instead of
   a response and produces the body over time with `stream-send` / `stream-close`.
   No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.

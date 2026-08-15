@@ -4781,6 +4781,74 @@
       (check "discard-available: and still leaves the buffer alone" pos 0))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Incremental delivery from the chunk walk
+;;;
+;;; CHUNKED-BODY-COMPLETE-P already visited every chunk exactly once, to
+;;; step over it. ON-DATA hands those bytes back from the same visit, so
+;;; the properties worth pinning are that it sees each chunk once, sees
+;;; exactly what DECODE-CHUNKED-BODY would have produced, and never sees
+;;; a chunk whose framing has not yet fully arrived.
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunk-walk-on-data ()
+  (format t "~%Chunk walk on-data~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1)))
+    (let* ((framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk (bytes "alpha"))
+                                (web-skeleton::encode-chunk (bytes "beta"))
+                                (web-skeleton::encode-chunk (bytes "gamma"))
+                                (web-skeleton::chunked-terminator)))
+           (n (length framed)))
+
+      ;; --- One pass over a whole body: every chunk, in order, once ---
+      (let ((seen nil))
+        (multiple-value-bind (complete resume)
+            (web-skeleton::chunked-body-complete-p
+             framed 0 n 0
+             (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+          (declare (ignore resume))
+          (check "on-data: the body is complete" complete t)
+          (check "on-data: every chunk, in order"
+                 (nreverse seen) '("alpha" "beta" "gamma"))))
+
+      ;; --- What it hands back is what the decoder would have produced ---
+      (let ((seen (make-string-output-stream)))
+        (web-skeleton::chunked-body-complete-p
+         framed 0 n 0
+         (lambda (buf s e) (write-string (str (subseq buf s e)) seen)))
+        (check "on-data: the concatenation is the decoded body"
+               (get-output-stream-string seen)
+               (str (web-skeleton::decode-chunked-body framed 0 n))))
+
+      ;; --- A dribbling upstream: each chunk delivered once, never twice ---
+      ;; This is what RESUME buys, and the reason ON-DATA can live in the
+      ;; walk at all — a caller threading the offset back never revisits
+      ;; a chunk, so it cannot re-deliver one.
+      (let ((seen nil)
+            (scan 0))
+        (loop for end from 0 to n
+              do (multiple-value-bind (complete next)
+                     (web-skeleton::chunked-body-complete-p
+                      framed 0 end scan
+                      (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+                   (declare (ignore complete))
+                   (setf scan next)))
+        (check "on-data: a byte-at-a-time upstream delivers each chunk once"
+               (nreverse seen) '("alpha" "beta" "gamma")))
+
+      ;; --- A partial chunk is never handed over ---
+      ;; The walk returns before ON-DATA when the data or its trailing
+      ;; CRLF has not landed, so an app is never given bytes whose
+      ;; framing has not been proved.
+      (let ((seen nil))
+        ;; "5\r\nalph" — one byte of payload short, and no CRLF.
+        (web-skeleton::chunked-body-complete-p
+         framed 0 8 0
+         (lambda (buf s e) (push (str (subseq buf s e)) seen)))
+        (check "on-data: an incomplete chunk is withheld" seen nil)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Static responses carry a Date
 ;;;
 ;;; The interesting assertion is not that the header is present. It is
@@ -5987,6 +6055,7 @@
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
   (test-chunked-encoder)
+  (test-chunk-walk-on-data)
   (test-streaming-head)
   (test-discard-available-eof)
   (test-stream-lifecycle)

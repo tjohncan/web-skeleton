@@ -1206,6 +1206,57 @@
                  (ignore-errors (sb-bsd-sockets:socket-close socket))))))
       (setf *stream-keepalive-interval* saved))))
 
+(defun test-harness-fetch-on-body-e2e ()
+  "A chunked response relayed incrementally, end to end and on one
+   worker: the same server streams it and fetches it.
+
+   ON-BODY sees each chunk as its framing is proved, and THEN still fires
+   once at the end with a NIL body — the bytes went out incrementally
+   rather than being accumulated, and delivering them twice would double
+   the memory the callback exists to avoid.
+
+   The upstream is item 5's streaming surface, so this also checks that
+   what the encoder produces is what the walk hands back."
+  (format t "~%Harness: fetch :on-body incremental delivery~%")
+  (let ((collected nil)
+        (final :never)
+        (port-box (list nil)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (sb-ext:string-to-octets
+                                           "one" :external-format :ascii))
+                           (stream-send c (sb-ext:string-to-octets
+                                           "two" :external-format :ascii))
+                           (stream-close c)))
+               (http-fetch
+                :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                :on-body (lambda (conn chunk)
+                           (declare (ignore conn))
+                           (push (sb-ext:octets-to-string
+                                  chunk :external-format :ascii)
+                                 collected))
+                :then (lambda (status headers body)
+                        (declare (ignore headers))
+                        (setf final (list status (if body :present :nil)))
+                        (make-text-response 200 "relayed"))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (status headers body)
+          (test-http-request :get "/relay")
+        (declare (ignore headers))
+        (check "on-body e2e: the relay answered" status 200)
+        (check "on-body e2e: and its own body came through" body "relayed"))
+      (check "on-body e2e: every chunk arrived, in order"
+             (reverse collected) '("one" "two"))
+      ;; The final callback still fires exactly once, and its body is NIL
+      ;; because the bytes were already handed over.
+      (check "on-body e2e: :then saw the upstream status" (first final) 200)
+      (check "on-body e2e: :then got no body to re-deliver"
+             (second final) :nil))))
+
 (defun test-harness-stream-does-not-hold-worker-e2e ()
   "The acceptance criterion for the whole issue, at :WORKERS 1.
 
@@ -1629,6 +1680,7 @@
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)
+  (test-harness-fetch-on-body-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

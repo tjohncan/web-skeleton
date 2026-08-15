@@ -619,6 +619,60 @@ connections and bursty output.
 sends one vector and waits for it, so a plain request/response connection
 never builds a queue.
 
+### Relaying an upstream incrementally
+
+`http-fetch` takes an `:on-body` callback, called `(conn bytes)` with each
+chunk of a chunked upstream response as it arrives on the async `http://`
+path. Pair it with a streaming response and a relay forwards as it reads
+rather than buffering the whole body first.
+
+```lisp
+(defun handle-relay (req)
+  (declare (ignore req))
+  (make-stream-response
+   :on-open
+   (lambda (client)
+     (http-fetch :get "http://upstream.internal/feed"
+                 :on-body (lambda (out chunk)
+                            (declare (ignore out))
+                            (stream-send client chunk))
+                 :then (lambda (status headers body)
+                         (declare (ignore status headers body))
+                         (stream-close client)
+                         nil)))))
+```
+
+**`:then` still fires exactly once, with a NIL body.** The bytes went out
+incrementally; handing them over again would double the memory the
+callback exists to avoid.
+
+**Chunk-granular, not line-granular, and deliberately.** Line splitting
+already exists once, on the blocking path, with CR/LF/CRLF handling and
+partial-line state carried across reads. A second implementation here
+would be two readers that could disagree about where a line ends, which
+is the disagreement this codebase treats as its threat model. Split what
+you are given if you want lines.
+
+**Backpressure is a return value.** Return `:pause` from `:on-body` to
+stop reading the upstream — its send window fills and the pressure
+propagates back without anything being dropped or buffered — and call
+`fetch-resume` on the outbound connection to start again. A value rather
+than a condition, for the same reason `connection-append-write` refuses
+by return: applying backpressure is ordinary control flow and should not
+unwind through the middle of a read loop.
+
+The re-arm works here for a reason worth knowing. Elsewhere the docs warn
+that an `EPOLL_CTL_MOD` will not re-fire for data already sitting in
+user space; the bytes a paused fetch has not read are still in the
+kernel, so the edge does fire.
+
+`*fetch-timeout*` stays a **total** on this path, not an inactivity
+bound. It is the only end-to-end network deadline the framework has, and
+it is what distinguishes the async path from every blocking one. A relay
+that legitimately runs long wants a larger number, not a different shape
+— converting it to idle would delete the guarantee and add one more
+entry to the trickling-upstream list.
+
 ### Streaming responses
 
 A handler that returns `make-stream-response` gets the head serialized

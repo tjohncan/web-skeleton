@@ -136,6 +136,7 @@
            #:make-sse-response
            #:sse-send
            #:sse-comment
+           #:fetch-resume
            #:*stream-idle-timeout*
            #:*stream-keepalive-interval*
            ;; Connection lifecycle
