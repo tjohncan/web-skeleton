@@ -94,6 +94,14 @@
   ;; uses, because an app that releases a resource twice is worse off
   ;; than one that never hears.
   (stream-on-close  nil :type (or null function))
+  ;; When the app last produced something for this stream. Not
+  ;; LAST-ACTIVE, which HANDLE-CLIENT-WRITE bumps on EPOLLOUT entry: a
+  ;; draining backlog would keep refreshing the deadline of a stream
+  ;; whose producer has stopped, which is the same conflation
+  ;; WRITE-PROGRESS-AT exists to break, one level up. The two clocks
+  ;; answer different questions — are bytes leaving, and is anything
+  ;; arriving to send.
+  (stream-produced-at 0 :type integer)
   ;; Bytes to send when a stream goes quiet, or NIL for no keepalive.
   ;; Necessarily supplied from above: a chunked stream has no idle form
   ;; of its own, since the empty chunk is the terminator.

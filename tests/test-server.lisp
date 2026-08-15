@@ -4374,6 +4374,31 @@
       (check "backlog: reaching the bound reports full"
              (web-skeleton::connection-write-full-p conn) t))
 
+    ;; --- The queue never holds the caller's own vector ---
+    ;; A producer reusing one buffer is the obvious way to write one, and
+    ;; the queue advances an offset through what it is given. Chunked
+    ;; framing copies because ENCODE-CHUNK builds a new vector; close
+    ;; framing has nothing to build, so it has to copy on purpose. An app
+    ;; cannot see which framing it got.
+    (let ((sink (open "/dev/null" :direction :output
+                                  :element-type '(unsigned-byte 8)
+                                  :if-exists :append)))
+      (unwind-protect
+           (let ((conn (web-skeleton::make-connection
+                        :fd (sb-sys:fd-stream-fd sink)
+                        :state :streaming :last-active 0))
+                 (buf (make-array 4 :element-type '(unsigned-byte 8)
+                                    :initial-element 65)))
+             (setf (web-skeleton::connection-stream-framing conn) :close)
+             (web-skeleton:stream-send conn buf)
+             (fill buf 90)
+             (check "stream-send: close framing copies the caller's vector"
+                    (sb-ext:octets-to-string
+                     (subseq (web-skeleton::connection-write-buf conn) 0 4)
+                     :external-format :ascii)
+                    "AAAA"))
+        (ignore-errors (close sink))))
+
     ;; --- The bound must clear the inbound message cap by a frame header ---
     ;; At default settings the receive path accepts a payload of exactly
     ;; *MAX-WS-MESSAGE-SIZE* (websocket.lisp tests > , not >=). Sending that
@@ -4749,7 +4774,8 @@
   (format t "~%Stream lifecycle~%")
   (multiple-value-bind (server client) (%loopback-pair)
     (let ((epfd (web-skeleton::epoll-create))
-          (closed-with :never))
+          (closed-with :never)
+          (sent-from-on-close :never))
       (unwind-protect
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
@@ -4761,9 +4787,23 @@
                             :method :GET :path "/s" :version "1.1"))
                   (sresp (web-skeleton:make-stream-response
                           :headers '(("content-type" . "text/plain"))
-                          :on-close (lambda (c reason)
-                                      (declare (ignore c))
-                                      (setf closed-with reason))
+                          :on-close
+                          (lambda (c reason)
+                            (setf closed-with reason)
+                            ;; A goodbye event from on-close is an
+                            ;; ordinary shape. It must be refused, and
+                            ;; refusing depends on the state having moved
+                            ;; before the callback ran — otherwise these
+                            ;; bytes land behind the terminator and, on a
+                            ;; keep-alive connection, prefix the next
+                            ;; response.
+                            (setf sent-from-on-close
+                                  (handler-case
+                                      (progn (web-skeleton:stream-send
+                                              c (sb-ext:string-to-octets
+                                                 "bye" :external-format :ascii))
+                                             :accepted)
+                                    (error () :refused))))
                           :on-open
                           (lambda (c)
                             (web-skeleton:stream-send
@@ -4800,6 +4840,8 @@
              (setf closed-with :never)
              (web-skeleton::notify-stream-closed conn :disconnected)
              (check "stream: on-close does not fire twice" closed-with :never)
+             (check "stream: a send from inside on-close is refused"
+                    sent-from-on-close :refused)
 
              ;; What the peer actually received: head, two chunks, the
              ;; terminator — and the body decodes to what was sent.
@@ -4825,7 +4867,16 @@
                                 raw (+ hend 4) n)
                                :external-format :ascii)
                             (error (e) (princ-to-string e)))
-                          "hello world")))))
+                          "hello world")
+                   ;; Checked on the wire rather than on the queue. A
+                   ;; send accepted from ON-CLOSE flushes straight out,
+                   ;; so an empty queue afterwards proves nothing — and
+                   ;; the decoder stops at the terminator, so the body
+                   ;; check would not see the extra bytes either. What
+                   ;; the peer received has to be the terminator last.
+                   (check "stream: the terminator is the last thing sent"
+                          (coerce (subseq raw (- n 5) n) 'list)
+                          (coerce (web-skeleton::chunked-terminator) 'list))))))
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
@@ -4890,10 +4941,17 @@
 (defun test-stream-keepalive-and-idle ()
   (format t "~%Stream keepalive and idle~%")
   (flet ((streaming-conn (epfd connfd &key keepalive (age 0))
+           ;; LAST-ACTIVE is held *current* while the production clock is
+           ;; aged. That is the shape a draining backlog produces —
+           ;; EPOLLOUT keeps the connection looking busy while the app
+           ;; has stopped saying anything — and judging a stream on
+           ;; LAST-ACTIVE would miss every one of them.
            (let ((conn (web-skeleton::make-connection
                         :fd connfd :state :streaming
-                        :last-active (- (get-universal-time) age))))
+                        :last-active (get-universal-time))))
              (setf (web-skeleton::connection-stream-framing conn) :chunked
+                   (web-skeleton::connection-stream-produced-at conn)
+                   (- (get-universal-time) age)
                    (web-skeleton::connection-stream-keepalive conn) keepalive)
              (web-skeleton::epoll-add
               epfd connfd (logior web-skeleton::+epollin+
@@ -4947,17 +5005,17 @@
                   (conn (web-skeleton::make-connection
                          :fd (sb-sys:fd-stream-fd sink)
                          :state :streaming
-                         :last-active (- now
-                                         web-skeleton:*stream-keepalive-interval*
-                                         1))))
+                         :last-active now)))
              (setf (web-skeleton::connection-stream-framing conn) :chunked
+                   (web-skeleton::connection-stream-produced-at conn)
+                   (- now web-skeleton:*stream-keepalive-interval* 1)
                    (web-skeleton::connection-stream-keepalive conn) ka)
              (web-skeleton::register-connection conn)
              (web-skeleton::keepalive-streams epfd now)
              (check "stream keepalive: nothing is left queued"
                     (web-skeleton::connection-write-pending conn) 0)
-             (check "stream keepalive: it counts as activity"
-                    (web-skeleton::connection-last-active conn) now)
+             (check "stream keepalive: it counts as production"
+                    (web-skeleton::connection-stream-produced-at conn) now)
              (check "stream keepalive: the connection survives without arming"
                     (hash-table-count web-skeleton::*connections*) 1))
         (ignore-errors (close sink))
@@ -4979,7 +5037,8 @@
                (check "stream keepalive: none configured means none sent"
                       (web-skeleton::connection-write-pending conn) 0)
                (check "stream keepalive: and the idle clock is not touched"
-                      (< (web-skeleton::connection-last-active conn) now) t)))
+                      (< (web-skeleton::connection-stream-produced-at conn) now)
+                      t)))
         (ignore-errors (web-skeleton::%close connfd))
         (ignore-errors (web-skeleton::%close epfd))))))
 

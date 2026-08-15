@@ -216,7 +216,18 @@
                                    ;; day holds dead ones.
                                    ((eq state :streaming) *stream-idle-timeout*)
                                    ((eq state :awaiting)  *fetch-timeout*)
-                                   (t                     *idle-timeout*))))
+                                   (t                     *idle-timeout*)))
+                        ;; A stream is judged on when its app last
+                        ;; produced, not on when the connection last saw
+                        ;; an event. HANDLE-CLIENT-WRITE bumps LAST-ACTIVE
+                        ;; on EPOLLOUT entry, so a draining backlog would
+                        ;; keep refreshing the deadline of a stream whose
+                        ;; producer stopped — the conflation
+                        ;; WRITE-PROGRESS-AT was added to break, one level
+                        ;; up and in a new knob.
+                        (since (if (eq state :streaming)
+                                   (connection-stream-produced-at conn)
+                                   (connection-last-active conn))))
                    (cond
                      ;; Stall is checked first: a connection can be both,
                      ;; and closing it for the reason that is actually
@@ -248,7 +259,7 @@
                               *write-stall-timeout*))
                       (push conn stalled))
                      ((and (> timeout 0)
-                           (> (- now (connection-last-active conn)) timeout))
+                           (> (- now since) timeout))
                       (push conn idle))))))
              *connections*)
     (dolist (conn stalled)
@@ -302,14 +313,15 @@
          (when (and (eq (connection-state conn) :streaming)
                     (connection-stream-keepalive conn)
                     (zerop (connection-write-pending conn))
-                    (>= (- now (connection-last-active conn))
+                    (>= (- now (connection-stream-produced-at conn))
                         *stream-keepalive-interval*))
            (handler-case
                (progn
-                 ;; Counts as activity, which is the point: a stream
+                 ;; Counts as production, which is the point: a stream
                  ;; emitting keepalives is never reaped by
-                 ;; *STREAM-IDLE-TIMEOUT*.
-                 (setf (connection-last-active conn) now)
+                 ;; *STREAM-IDLE-TIMEOUT*. Measured on the same clock the
+                 ;; idle sweep reads, so the two cannot drift apart.
+                 (setf (connection-stream-produced-at conn) now)
                  (when (connection-append-write
                         conn (connection-stream-keepalive conn))
                    (unless (eq (connection-on-write conn) :done)
@@ -803,7 +815,8 @@
              (connection-stream-on-close conn) (stream-response-on-close sresp)
              (connection-stream-keepalive conn) (stream-response-keepalive sresp)
              (connection-state conn) :streaming
-             (connection-last-active conn) (get-universal-time))
+             (connection-last-active conn) (get-universal-time)
+             (connection-stream-produced-at conn) (get-universal-time))
        (let ((on-open (stream-response-on-open sresp)))
          (when on-open
            (funcall on-open conn)))

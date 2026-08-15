@@ -259,6 +259,13 @@
    are leaving. This one asks whether any are arriving to send. A stream
    can be perfectly healthy at the socket and dead at the source.
 
+   Measured on CONNECTION-STREAM-PRODUCED-AT and deliberately not on
+   LAST-ACTIVE, or that distinction would be false exactly when it
+   matters: HANDLE-CLIENT-WRITE bumps LAST-ACTIVE on EPOLLOUT entry, so a
+   draining backlog would refresh the deadline of a stream whose producer
+   had stopped, and the knob would quietly be measuring the other one's
+   question.
+
    A keepalive refreshes it, so a stream that emits keepalives is never
    reaped by this — which is the point of having one.")
 
@@ -332,11 +339,26 @@
            (connection-fd conn) (connection-state conn)))
   (let ((framed (ecase (connection-stream-framing conn)
                   (:chunked (encode-chunk bytes))
-                  (:close (when (plusp (length bytes)) bytes)))))
+                  ;; Copied, not passed through. The queue holds vectors
+                  ;; by reference and advances an offset through them, so
+                  ;; handing it the app's own buffer means anything
+                  ;; written into that buffer before it drains goes out
+                  ;; instead of what was sent. Reusing one buffer is the
+                  ;; obvious way to write a producer, and without this
+                  ;; the rule for whether that is allowed would depend on
+                  ;; the client's HTTP version — chunked copies here
+                  ;; because ENCODE-CHUNK builds a new vector, close
+                  ;; framing did not. An app cannot see which framing it
+                  ;; got, so it would be correct against every browser
+                  ;; and corrupt against one old client. Uniformity costs
+                  ;; the copy the other path already pays.
+                  (:close (when (plusp (length bytes)) (copy-seq bytes))))))
     (cond
       ((null framed) t)
       ((connection-append-write conn framed)
-       (setf (connection-last-active conn) (get-universal-time))
+       ;; The production clock, not LAST-ACTIVE — see
+       ;; CONNECTION-STREAM-PRODUCED-AT.
+       (setf (connection-stream-produced-at conn) (get-universal-time))
        (stream-flush conn))
       (t
        (error "stream-send: fd ~d is at *max-write-backlog* (~d bytes ~
@@ -406,10 +428,23 @@
       (log-warn "stream-close: no room for the terminator on fd ~d — ~
                  closing rather than reusing" (connection-fd conn))
       (setf (connection-close-after-p conn) t)))
-  (notify-stream-closed conn :done)
+  ;; State first, notification second. STREAM-SEND's guard is what stops
+  ;; a callback appending after the terminator, and it can only fire if
+  ;; the state has already moved — otherwise a goodbye event sent from
+  ;; ON-CLOSE lands behind the terminator, and on a keep-alive connection
+  ;; those bytes prefix the next response. That is the smuggling shape
+  ;; this file's header comment exists to prevent, manufactured from
+  ;; inside the callback announcing the stream is over.
+  ;;
+  ;; CLOSE-CONNECTION deliberately does the opposite, and its comment is
+  ;; right there: the fd is about to close, so nothing can be appended
+  ;; and the callback may as well see a live connection. Here the
+  ;; connection survives, which is exactly what makes that ordering
+  ;; unsafe. The reasoning does not transplant.
   (setf (connection-stream-framing conn) nil
         (connection-stream-keepalive conn) nil
         (connection-state conn) :write-response)
+  (notify-stream-closed conn :done)
   (stream-flush conn)
   (values))
 
