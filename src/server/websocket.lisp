@@ -276,34 +276,6 @@
    (build-ws-frame +ws-op-ping+
                    (make-array 0 :element-type '(unsigned-byte 8)))))
 
-(defparameter *ws-send-timeout* 10
-  "Seconds a connection may sit on an undrained write backlog before it
-   is closed. Must be positive.
-
-   This used to bound a blocking spin inside WS-SEND, where the thing at
-   risk was the worker: one peer that stopped reading froze every other
-   connection on it. WS-SEND now queues and returns, so the failure it
-   describes changed shape — the worker never waits, and what can go
-   wrong instead is that one connection's queue never drains. Same name,
-   units, export and spirit; the blast radius is one connection.
-
-   Measured from the last forward progress on the backlog, not from the
-   last event on the connection — see CONNECTION-WRITE-PROGRESS-AT.
-
-   An inactivity bound, not a total. The old deadline was computed once
-   per frame and expired regardless of progress; this one restarts on any
-   byte the peer accepts, so a peer that trickles is never closed. Its
-   memory is still capped by *MAX-WRITE-BACKLOG*; its time is not. The
-   trade is deliberate — the total bound was a total on the worker, which
-   is the more expensive thing to hold.
-
-   There is still no setting that disables it. Zero used to mean a worker
-   pinned forever; it would now mean a connection holding up to
-   *MAX-WRITE-BACKLOG* forever, against a *WS-IDLE-TIMEOUT* that defaults
-   to a day and is bumped by reads the stuck peer may still be sending.
-   START-SERVER enforces it, because the check below is only reached by
-   callers of WS-SEND and a handler that returns a frame is not one.")
-
 ;;; ---------------------------------------------------------------------------
 ;;; Frame send
 ;;;
@@ -344,11 +316,11 @@
    is not queued, not truncated, and the peer is far enough behind that
    dropping it silently would leave the app's view and the peer's view of
    the stream permanently different."
-  (unless (plusp *ws-send-timeout*)
-    (error "ws-send: *ws-send-timeout* is ~s; it must be positive. There is ~
-            no unbounded setting, because it is the only deadline on a ~
-            queue this connection may never drain."
-           *ws-send-timeout*))
+  (unless (plusp *write-stall-timeout*)
+    (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
+            There is no unbounded setting, because it is the only ~
+            deadline on a queue this connection may never drain."
+           *write-stall-timeout*))
   (unless (connection-append-write conn frame-bytes)
     (error "ws-send: fd ~d is at *max-write-backlog* (~d bytes pending, ~
             frame is ~d); the peer is not draining."

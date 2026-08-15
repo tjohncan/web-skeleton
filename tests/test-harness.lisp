@@ -964,8 +964,8 @@
     (check "start-server: :workers :auto signals error"
            (try-workers :auto) t)))
 
-(defun test-harness-ws-send-timeout-zero-rejected ()
-  "start-server must refuse a non-positive *ws-send-timeout*.
+(defun test-harness-write-stall-timeout-zero-rejected ()
+  "start-server must refuse a non-positive *write-stall-timeout*.
 
    WS-SEND checks it too, but only callers of WS-SEND reach that check,
    and a handler that returns a frame instead of pushing one appends
@@ -983,11 +983,11 @@
 
    SETF rather than LET, and restored in an UNWIND-PROTECT — the probe
    runs in a fresh thread and dynamic bindings do not cross MAKE-THREAD."
-  (format t "~%Harness: start-server *ws-send-timeout* 0 rejects~%")
-  (let ((saved *ws-send-timeout*))
+  (format t "~%Harness: start-server *write-stall-timeout* 0 rejects~%")
+  (let ((saved *write-stall-timeout*))
     (unwind-protect
          (flet ((try-timeout (v)
-                  (setf *ws-send-timeout* v)
+                  (setf *write-stall-timeout* v)
                   (let ((msg nil))
                     (let ((th (sb-thread:make-thread
                                (lambda ()
@@ -998,22 +998,22 @@
                                         :handler (lambda (r) (declare (ignore r))))
                                        nil)
                                    (error (e) (setf msg (princ-to-string e)))))
-                               :name "ws-send-timeout-validation-probe")))
+                               :name "write-stall-timeout-validation-probe")))
                       (handler-case
                           (sb-thread:join-thread th :timeout 2)
                         (error ()
                           (ignore-errors (sb-thread:terminate-thread th))
                           (ignore-errors (sb-thread:join-thread th)))))
                     msg)))
-           (check "start-server: *ws-send-timeout* 0 signals error"
+           (check "start-server: *write-stall-timeout* 0 signals error"
                   (let ((m (try-timeout 0)))
-                    (and m (not (null (search "*ws-send-timeout*" m))) t))
+                    (and m (not (null (search "*write-stall-timeout*" m))) t))
                   t)
-           (check "start-server: *ws-send-timeout* -1 signals error"
+           (check "start-server: *write-stall-timeout* -1 signals error"
                   (let ((m (try-timeout -1)))
-                    (and m (not (null (search "*ws-send-timeout*" m))) t))
+                    (and m (not (null (search "*write-stall-timeout*" m))) t))
                   t))
-      (setf *ws-send-timeout* saved))))
+      (setf *write-stall-timeout* saved))))
 
 (defun test-harness-pipelined-with-fin-e2e ()
   "Two HTTP/1.1 requests pipelined onto one connection, followed by
@@ -1363,6 +1363,6 @@
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
-  (test-harness-ws-send-timeout-zero-rejected)
+  (test-harness-write-stall-timeout-zero-rejected)
   (report-suite "Harness")
   (zerop *tests-failed*))

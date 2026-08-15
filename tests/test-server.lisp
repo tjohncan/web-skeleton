@@ -1452,11 +1452,13 @@
                   "*MAX-STREAMING-LINE-SIZE*"
                   "*MAX-WS-PAYLOAD-SIZE*"
                   "*MAX-WS-MESSAGE-SIZE*"
-                  ;; WS-SEND is exported; its only tuning knob was not, so
-                  ;; the deadline that decides how long one slow peer may
-                  ;; hold a whole worker was unreachable through the
-                  ;; public API. A limit nobody can set is not a limit.
-                  "*WS-SEND-TIMEOUT*"))
+                  ;; The two limits on the write queue. They are a pair —
+                  ;; too much queued, and queued too long — and a
+                  ;; deployment that can set one but not the other can
+                  ;; only half-tune a slow peer. A limit nobody can set
+                  ;; is not a limit.
+                  "*MAX-WRITE-BACKLOG*"
+                  "*WRITE-STALL-TIMEOUT*"))
     (check (format nil "~a exported from :web-skeleton" name)
            (nth-value 1 (find-symbol name :web-skeleton))
            :external))
@@ -3039,7 +3041,7 @@
             (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
 
-  ;; *ws-send-timeout* used to document 0 as "disable", which set no
+  ;; *write-stall-timeout* used to document 0 as "disable", which set no
   ;; deadline and left the write loop with no exit — a peer that stopped
   ;; draining its receive window pinned the worker permanently, and the
   ;; worker is every other connection on it, not just this one. An empty
@@ -3048,20 +3050,20 @@
   (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (check "ws-send: zero timeout refused"
-           (let ((*ws-send-timeout* 0))
+           (let ((*write-stall-timeout* 0))
              (handler-case (progn (web-skeleton::ws-send conn empty) nil)
-               (error (e) (not (null (search "*ws-send-timeout*"
+               (error (e) (not (null (search "*write-stall-timeout*"
                                              (princ-to-string e)))))))
            t)
     (check "ws-send: negative timeout refused"
-           (let ((*ws-send-timeout* -1))
+           (let ((*write-stall-timeout* -1))
              (handler-case (progn (web-skeleton::ws-send conn empty) nil)
                (error () t)))
            t)
     ;; A positive value still passes the guard, or the two checks above
     ;; would be satisfied by a function that refused everything.
     (check "ws-send: positive timeout passes the guard"
-           (let ((*ws-send-timeout* 10))
+           (let ((*write-stall-timeout* 10))
              (handler-case (progn (web-skeleton::ws-send conn empty) :sent)
                (error () :error)))
            :sent))
@@ -4433,7 +4435,7 @@
 ;;; that size is guaranteed to leave a remainder.
 ;;;
 ;;; The elapsed-time check is the point of the whole item. The old ws-send
-;;; sat in POLL-WRITABLE until the peer read or *WS-SEND-TIMEOUT* expired,
+;;; sat in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT* expired,
 ;;; holding the worker and every other connection on it. Against this
 ;;; fixture — a peer that never reads at all — that is a full ten seconds.
 ;;; ---------------------------------------------------------------------------
@@ -4512,24 +4514,30 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
 ;;;
-;;; *ws-send-timeout* used to bound a spin inside ws-send. It now bounds
+;;; *write-stall-timeout* used to bound a spin inside ws-send. It now bounds
 ;;; how long a connection may sit on a backlog that is not moving. The
 ;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
 ;;; a day, and a peer that has stopped reading may still be sending, which
 ;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
 ;;; current — that is precisely the case the idle timeout would miss.
+;;;
+;;; The sweep asks whether there is a backlog and whether it has moved,
+;;; not what state the connection is in. It used to name :WEBSOCKET, which
+;;; left every other state — including the long-lived ones most likely to
+;;; build a backlog — with no stall bound at all, so a second state is
+;;; swept here to hold the generalization in place.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-write-stall-sweep ()
-  (format t "~%ws write stall~%")
-  (flet ((sweep-one (&key stalled)
+  (format t "~%Write stall sweep~%")
+  (flet ((sweep-one (&key stalled (state :websocket))
            (let ((epfd (web-skeleton::epoll-create))
                  (connfd (web-skeleton::epoll-create))
                  (log (make-string-output-stream))
                  (now (get-universal-time)))
              (unwind-protect
                   (let ((conn (web-skeleton::make-connection
-                               :fd connfd :state :websocket
+                               :fd connfd :state state
                                ;; Fresh, so the idle sweep has no interest.
                                :last-active now))
                         (web-skeleton::*connections* (make-hash-table :test #'eql))
@@ -4543,7 +4551,7 @@
                      conn (make-array 64 :element-type '(unsigned-byte 8)))
                     (setf (web-skeleton::connection-write-progress-at conn)
                           (if stalled
-                              (- now web-skeleton:*ws-send-timeout* 1)
+                              (- now web-skeleton:*write-stall-timeout* 1)
                               now))
                     (web-skeleton::register-connection conn)
                     (web-skeleton::sweep-idle-connections epfd now)
@@ -4565,7 +4573,17 @@
     (destructuring-bind (count log) (sweep-one :stalled t)
       (check "ws stall: a stalled backlog is closed" count 0)
       (check "ws stall: the log names the reason"
-             (and (search "write stalled" log) t) t))))
+             (and (search "write stalled" log) t) t))
+
+    ;; A state that is not :WEBSOCKET. Gating the clause on one state left
+    ;; the long-lived ones — the ones that queue most — unbounded.
+    (destructuring-bind (count log) (sweep-one :stalled t :state :write-response)
+      (check "stall: a non-websocket state is swept too" count 0)
+      (check "stall: and the log names which state it was"
+             (and (search "WRITE-RESPONSE" log :test #'char-equal) t) t))
+    (destructuring-bind (count log) (sweep-one :state :write-response)
+      (declare (ignore log))
+      (check "stall: a moving non-websocket backlog is left alone" count 1))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked encoder
@@ -4728,6 +4746,28 @@
                                  :chunked)
                                 nil)
              (error () t))
+           t)
+    ;; On :CLOSE framing the Connection header *is* the framing — nothing
+    ;; else says where the body ends — so a caller promising reuse would
+    ;; leave the client unable to tell the eventual close from truncation.
+    ;; Contradiction refused; agreement accepted.
+    (check "streaming head: Connection: keep-alive is refused on close framing"
+           (handler-case (progn (web-skeleton::format-streaming-head
+                                 (resp '(("connection" . "keep-alive")))
+                                 :close)
+                                nil)
+             (error () t))
+           t)
+    (check "streaming head: a redundant Connection: close is accepted"
+           (let ((head (str (web-skeleton::format-streaming-head
+                             (resp '(("connection" . "close"))) :close))))
+             (and (search "connection: close" head) t))
+           t)
+    ;; The same header on chunked framing is only a hint, and stays one.
+    (check "streaming head: Connection: keep-alive is fine on chunked framing"
+           (let ((head (str (web-skeleton::format-streaming-head
+                             (resp '(("connection" . "keep-alive"))) :chunked))))
+             (and (search "transfer-encoding: chunked" head) t))
            t)
     (dolist (status '(204 304 100))
       (check (format nil "streaming head: status ~d cannot stream" status)

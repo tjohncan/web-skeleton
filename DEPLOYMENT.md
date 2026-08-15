@@ -645,7 +645,7 @@ response for a few seconds), but avoid unbounded blocking — that is your
 code on the worker thread, and no framework change removes it.
 
 **What `ws-send` contributes to that is now nothing.** It used to block
-until every byte was flushed or `*ws-send-timeout*` expired, and because
+until every byte was flushed or its send deadline expired, and because
 the event loop is paused while a handler runs, the thing being held was
 the worker: every other connection on it, frozen for up to ten seconds by
 one peer that stopped reading. With `(cpu-count)` workers that was 1/N of
@@ -659,16 +659,26 @@ to finish; a peer that is not accumulates a backlog instead of freezing
 anything. **The blast radius is one connection.**
 
 Two limits bound what is left, and they answer different questions.
-`*max-write-backlog*` is how much may pile up; `*ws-send-timeout*` is how
-long it may sit **without moving**. Cross either and that one connection
-is closed. It is measured from the last forward progress on the queue and
-not from the connection's last activity, so a peer that keeps sending
-while refusing to read cannot keep its own backlog alive.
+`*max-write-backlog*` is how much may pile up; `*write-stall-timeout*` is
+how long it may sit **without moving**. Cross either and that one
+connection is closed. The deadline is measured from the last forward
+progress on the queue and not from the connection's last activity, so a
+peer that keeps sending while refusing to read cannot keep its own
+backlog alive.
 
-`*ws-send-timeout*` must be positive, and `start-server` refuses to start
-otherwise. `ws-send` checks it too, but only `ws-send` does — a handler
-that returns a frame rather than pushing one appends through a path that
-never sees it, so the startup check is what actually backs the promise.
+`*write-stall-timeout*` applies to every connection with a backlog,
+whatever state it is in — WebSocket frames, server-sent streams, ordinary
+responses to a client that stopped reading. It was called
+`*ws-send-timeout*` while it bounded a spin inside `ws-send`; that name
+would have sent anyone tuning a stalled SSE stream looking at a WebSocket
+setting, and scoping the check to WebSocket connections would have left
+long-lived streams — the state most likely to build a backlog — as the
+one state with no stall bound at all.
+
+It must be positive, and `start-server` refuses to start otherwise.
+`ws-send` checks it too, but only `ws-send` does — a handler that returns
+a frame rather than pushing one appends through a path that never sees
+it, so the startup check is what actually backs the promise.
 
 **It is an inactivity bound, not a total.** The old ten-second deadline
 was a total: one frame, ten seconds, trickle or not. This one restarts

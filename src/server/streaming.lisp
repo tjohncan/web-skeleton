@@ -173,13 +173,35 @@
     (when (assoc "transfer-encoding" headers :test #'string-equal)
       (error "streaming response: caller set Transfer-Encoding; the ~
               framework owns the framing of a stream"))
-    (let* ((headers (ecase framing
-                      (:chunked (cons (cons "transfer-encoding" "chunked")
-                                      headers))
-                      (:close (if (assoc "connection" headers
-                                         :test #'string-equal)
-                                  headers
-                                  (cons (cons "connection" "close") headers)))))
+    (let* ((headers
+             (ecase framing
+               (:chunked (cons (cons "transfer-encoding" "chunked") headers))
+               ;; On this path Connection is not a hint, it is the framing:
+               ;; with no Content-Length and no Transfer-Encoding, the end
+               ;; of the connection is the only thing that says where the
+               ;; body stops. FORMAT-RESPONSE lets a caller-set Connection
+               ;; win, correctly, because there Content-Length does the
+               ;; framing and Connection only advises — the roles swap
+               ;; here, and inheriting the convention with the shape would
+               ;; put "connection: keep-alive" on a response nothing can
+               ;; find the end of. Agreement is accepted; contradiction is
+               ;; refused, same as Content-Length and Transfer-Encoding.
+               (:close
+                (let ((existing (assoc "connection" headers
+                                       :test #'string-equal)))
+                  (cond
+                    ((null existing)
+                     (cons (cons "connection" "close") headers))
+                    ((string-equal (string-trim '(#\Space #\Tab)
+                                                (cdr existing))
+                                   "close")
+                     headers)
+                    (t
+                     (error "streaming response: framing is close-delimited ~
+                             but the caller set Connection: ~a — on this ~
+                             path that header is the framing, and nothing ~
+                             else says where the body ends"
+                            (cdr existing))))))))
            ;; The hint still applies on the chunked path — a server that
            ;; has decided to close SHOULD say so (RFC 7230 §6.1) even
            ;; when the body is self-framing. On the :CLOSE path the

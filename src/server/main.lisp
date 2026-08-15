@@ -178,12 +178,12 @@
    An :AWAITING connection is answered 504 first — see
    DELIVER-AWAITING-TIMEOUT.
 
-   Also closes a :WEBSOCKET connection whose write backlog has not moved
-   for *WS-SEND-TIMEOUT*. That is a different question from idleness and
-   the idle timeout cannot answer it: *WS-IDLE-TIMEOUT* defaults to a
-   day, and a peer that has stopped reading may still be sending, which
-   bumps LAST-ACTIVE and keeps the connection looking healthy while its
-   queue grows toward *MAX-WRITE-BACKLOG*."
+   Also closes any connection whose write backlog has not moved for
+   *WRITE-STALL-TIMEOUT*, whatever state it is in. That is a different
+   question from idleness and the idle timeouts cannot answer it: they
+   are measured on LAST-ACTIVE, which a peer that has stopped reading
+   keeps fresh merely by continuing to send, and they are long by design
+   on exactly the long-lived states most likely to build a backlog."
   (let ((idle nil)
         (stalled nil))
     (maphash (lambda (fd conn)
@@ -204,19 +204,36 @@
                      ;; backlog, never from LAST-ACTIVE — HANDLE-CLIENT-WRITE
                      ;; bumps that on EPOLLOUT entry, which would refresh
                      ;; the deadline of precisely the stuck connection.
-                     ((and (eq state :websocket)
-                           (plusp *ws-send-timeout*)
+                     ;; Any connection sitting on a backlog, not just a
+                     ;; WebSocket one. This used to name :WEBSOCKET, which
+                     ;; made the state most likely to build a backlog —
+                     ;; a long-lived stream — the one state with no stall
+                     ;; bound, falling through to an idle test measured on
+                     ;; LAST-ACTIVE, the clock this exists to avoid. Asking
+                     ;; "is there a backlog and has it moved" needs no list
+                     ;; of states to keep up to date.
+                     ;; :AWAITING is the one exclusion, and not because of
+                     ;; its state so much as because it already has a more
+                     ;; specific answer: DELIVER-AWAITING-TIMEOUT's 504 is
+                     ;; the documented floor under every way a fetch can
+                     ;; strand, and a stall close would take that away and
+                     ;; hand the client a bare disconnect instead. The
+                     ;; state is also supposed to have nothing pending, so
+                     ;; excluding it costs nothing that should ever exist.
+                     ((and (not (eq state :awaiting))
+                           (plusp *write-stall-timeout*)
                            (plusp (connection-write-pending conn))
                            (> (- now (connection-write-progress-at conn))
-                              *ws-send-timeout*))
+                              *write-stall-timeout*))
                       (push conn stalled))
                      ((and (> timeout 0)
                            (> (- now (connection-last-active conn)) timeout))
                       (push conn idle))))))
              *connections*)
     (dolist (conn stalled)
-      (log-info "ws write stalled ~ds fd ~d (~d bytes pending) — closing"
-                *ws-send-timeout* (connection-fd conn)
+      (log-info "write stalled ~ds fd ~d (~a, ~d bytes pending) — closing"
+                *write-stall-timeout* (connection-fd conn)
+                (connection-state conn)
                 (connection-write-pending conn))
       (close-connection conn epoll-fd))
     (dolist (conn idle)
@@ -1223,12 +1240,12 @@
   ;; path appends directly. A zero here would therefore leave the primary
   ;; documented shape with no time bound on an undrained queue at all,
   ;; while three docs promise there is no setting that disables it.
-  (unless (and (realp *ws-send-timeout*) (plusp *ws-send-timeout*))
-    (error "start-server: *ws-send-timeout* is ~s; it must be positive. ~
+  (unless (and (realp *write-stall-timeout*) (plusp *write-stall-timeout*))
+    (error "start-server: *write-stall-timeout* is ~s; it must be positive. ~
             It is the only deadline on a write queue the peer may never ~
-            drain — *ws-idle-timeout* defaults to a day and a peer that ~
-            stops reading may keep sending, which refreshes it."
-           *ws-send-timeout*))
+            drain — the idle timeouts are measured on last activity, which ~
+            a peer that stops reading keeps fresh by continuing to send."
+           *write-stall-timeout*))
   (setf *shutdown* nil)
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an

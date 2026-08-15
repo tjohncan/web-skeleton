@@ -803,6 +803,39 @@
    there. Lower it if the deployment has many connections and a
    generous ulimit; raise it for few connections and bursty output.")
 
+(defparameter *write-stall-timeout* 10
+  "Seconds a connection may sit on a write backlog that is not moving
+   before it is closed. Must be positive; START-SERVER enforces that.
+
+   The time half of the pair whose byte half is *MAX-WRITE-BACKLOG*: too
+   much queued, and queued too long. They share a prefix because they are
+   two limits on one thing.
+
+   This was *WS-SEND-TIMEOUT*, which bounded a blocking spin inside
+   WS-SEND back when the thing at risk was the worker. WS-SEND queues and
+   returns now, so what can go wrong is that one connection's queue never
+   drains — and once SSE and chunked streams queue through the same path,
+   a name saying 'ws' pointed operators at the wrong knob for every
+   surface but the one it was named after. Renamed rather than widened
+   quietly: an operator tuning a stalled SSE stream would never have
+   looked at a WebSocket setting.
+
+   Measured from the last forward progress on the backlog, never from the
+   connection's last activity — HANDLE-CLIENT-WRITE bumps LAST-ACTIVE on
+   EPOLLOUT *entry*, which would refresh the deadline of precisely the
+   connection that is stuck. See CONNECTION-WRITE-PROGRESS-AT.
+
+   An inactivity bound, not a total. It restarts on any byte the peer
+   accepts, so a peer that trickles is never closed: its memory is capped
+   by *MAX-WRITE-BACKLOG*, its time is not. Deliberate — the total bound
+   it replaced was a total on the worker, which is the more expensive
+   thing to hold.
+
+   No setting disables it. Zero used to mean a worker pinned forever; it
+   would now mean a connection holding a full backlog forever, against
+   idle timeouts that are long by design on exactly the states most
+   likely to build one.")
+
 (defun connection-write-pending (conn)
   "Unsent bytes on CONN: what is left of the head, plus the queue behind it."
   (+ (- (connection-write-end conn) (connection-write-pos conn))
