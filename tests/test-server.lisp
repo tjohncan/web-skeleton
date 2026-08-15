@@ -4568,6 +4568,85 @@
              (and (search "write stalled" log) t) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Chunked encoder
+;;;
+;;; The generated property covers agreement with the three readers. These
+;;; are the cases worth naming rather than discovering: the byte-exact
+;;; wire shape, and the two ways a plausible encoder corrupts a stream
+;;; while emitting bytes every reader accepts.
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunked-encoder ()
+  (format t "~%Chunked encoder~%")
+  (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :latin-1))
+         (str (v) (sb-ext:octets-to-string v :external-format :latin-1)))
+
+    ;; --- The wire shape is the intersection, not any reader's tolerance ---
+    (check "encode-chunk: size line is bare lowercase hex plus CRLF"
+           (str (web-skeleton::encode-chunk (bytes "hello")))
+           (format nil "5~c~chello~c~c" #\Return #\Newline #\Return #\Newline))
+    (check "encode-chunk: multi-digit sizes stay lowercase hex"
+           (subseq (str (web-skeleton::encode-chunk
+                         (make-array 255 :element-type '(unsigned-byte 8)
+                                         :initial-element 65)))
+                   0 4)
+           (format nil "ff~c~c" #\Return #\Newline))
+    (check "chunked-terminator: last-chunk plus empty trailer section"
+           (str (web-skeleton::chunked-terminator))
+           (format nil "0~c~c~c~c" #\Return #\Newline #\Return #\Newline))
+    ;; Shared and reused, like the ping frame — the write queue holds it by
+    ;; reference, so a fresh vector per call would be waste and a mutated
+    ;; one would be a bug.
+    (check "chunked-terminator: the same vector every time"
+           (eq (web-skeleton::chunked-terminator)
+               (web-skeleton::chunked-terminator))
+           t)
+
+    ;; --- An empty payload must never become the terminator ---
+    ;; This is the failure that produces bytes every reader accepts: the
+    ;; message ends early, nothing raises anywhere, and the peer believes
+    ;; it received the whole thing.
+    (check "encode-chunk: an empty payload yields nothing at all"
+           (web-skeleton::encode-chunk
+            (make-array 0 :element-type '(unsigned-byte 8)))
+           nil)
+    (check "encode-chunk: an empty range of a non-empty vector yields nothing"
+           (web-skeleton::encode-chunk (bytes "hello") :start 2 :end 2)
+           nil)
+
+    ;; --- An empty chunk between two real ones truncates nothing ---
+    (let* ((framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk (bytes "AAA"))
+                                (or (web-skeleton::encode-chunk
+                                     (make-array 0 :element-type '(unsigned-byte 8)))
+                                    #())
+                                (web-skeleton::encode-chunk (bytes "BBB"))
+                                (web-skeleton::chunked-terminator))))
+      (check "encode-chunk: an empty chunk mid-stream does not end it"
+             (str (web-skeleton::decode-chunked-body framed 0 (length framed)))
+             "AAABBB"))
+
+    ;; --- Content that looks like framing survives it ---
+    ;; The decoders skip *over* chunk data rather than scanning it, which
+    ;; is what makes this safe; asserting it keeps a future encoder from
+    ;; deciding to be clever about escaping.
+    (let* ((payload (bytes (format nil "0~c~c~c~cmore"
+                                   #\Return #\Newline #\Return #\Newline)))
+           (framed (concatenate '(vector (unsigned-byte 8))
+                                (web-skeleton::encode-chunk payload)
+                                (web-skeleton::chunked-terminator))))
+      (check "encode-chunk: a payload containing a terminator round-trips"
+             (str (web-skeleton::decode-chunked-body framed 0 (length framed)))
+             (str payload))
+      (check "encode-chunk: and the predicate is not fooled by it either"
+             (multiple-value-bind (complete resume)
+                 (web-skeleton::chunked-body-complete-p framed 0 (length framed))
+               (list complete
+                     (= resume (- (length framed)
+                                  (length (web-skeleton::chunked-terminator))))))
+             '(t t)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; A handler that pushes and also returns
 ;;;
 ;;; DEPLOYMENT.md's own example calls ws-send from inside ws-handler. A
@@ -5064,6 +5143,7 @@
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
+  (test-chunked-encoder)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
