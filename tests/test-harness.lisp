@@ -60,40 +60,11 @@
 ;;; End-to-end server tests
 ;;; ---------------------------------------------------------------------------
 
-(defun call-with-read-deadline (seconds thunk)
-  "Run THUNK on its own thread and abandon it after SECONDS.
-   Returns (values RESULT COMPLETED-P).
+;;; Every socket read in this file is bounded. READ-UNTIL-BOUNDED lives in
+;;; the harness system and carries the argument for why; the two helpers
+;;; below are the shapes this file needs on top of it.
 
-   READ-BYTE on a socket stream has no deadline, so a server that answers
-   late, answers partially, or never answers does not fail the test — it
-   stops the suite, and CI kills the job ten minutes later with a log
-   ending at the name of the test that started and nothing said about
-   what it was waiting for. A thread and a deadline turn that into an
-   ordinary failed check holding whatever bytes did arrive.
-
-   This is not yet universal, and a reader should not assume the file is
-   hang-proof. The pipelined drain and the connection-refusal reads come
-   through here. The older end-to-end reads in this file do not, nor does
-   PARSE-TEST-RESPONSE in the harness, which every TEST-HTTP-REQUEST
-   routes through — any of those can still block until CI gives up. New
-   reads should use this, and converting the rest is worth doing.
-
-   SECONDS is a diagnostic backstop, not a latency assertion: a healthy
-   response lands in milliseconds, so any value a working server cannot
-   reach will do."
-  (let* ((completed nil)
-         (result nil)
-         (thread (sb-thread:make-thread
-                  (lambda ()
-                    (setf result (funcall thunk)
-                          completed t))
-                  :name "bounded-reader")))
-    (sb-thread:join-thread thread :timeout seconds :default nil)
-    (unless completed
-      (ignore-errors (sb-thread:terminate-thread thread)))
-    (values result completed)))
-
-(defun read-to-eof-bounded (stream buf &key (seconds 10))
+(defun read-to-eof-bounded (stream buf &key (seconds *test-read-timeout*))
   "Drain STREAM into BUF until it ends, giving up after SECONDS.
    Returns (values ENDED-P CLEAN-P).
 
@@ -103,19 +74,24 @@
    stream — a reset, in practice — which is a different outcome from a
    graceful close and precisely the one REFUSE-CONNECTION's drain
    decides. Collapsing them would make this unusable for the test that
-   cares."
-  (multiple-value-bind (clean completed)
-      (call-with-read-deadline
-       seconds
-       (lambda ()
-         (handler-case
-             (progn
-               (loop for byte = (read-byte stream nil nil)
-                     while byte
-                     do (vector-push-extend byte buf))
-               t)
-           (error () nil))))
-    (values completed (and completed clean))))
+   cares.
+
+   The caller supplies BUF because it wants the bytes whether or not the
+   read ended, which is also why READ-UNTIL-BOUNDED takes :INTO."
+  (multiple-value-bind (filled reason)
+      (read-until-bounded stream :into buf :seconds seconds)
+    (declare (ignore filled))
+    (values (not (eq reason :deadline))
+            (eq reason :eof))))
+
+(defun drain-response (stream)
+  "Read a whole close-delimited response and return it as a string.
+   Bounded, and decoded as latin-1 so that a truncated multi-byte
+   sequence in whatever did arrive cannot raise on top of the failure
+   being diagnosed."
+  (let ((buf (read-until-bounded stream)))
+    (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                             :external-format :latin-1)))
 
 (defun test-harness-basic-get ()
   (format t "~%Harness: basic GET~%")
@@ -298,14 +274,7 @@
              ;; subsequent read-until-EOF validates what came back.
              (ignore-errors
               (sb-bsd-sockets:socket-shutdown socket :direction :output))
-             (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
-                                         :fill-pointer 0 :adjustable t)))
-               (loop for byte = (handler-case (read-byte stream nil nil)
-                                  (error () nil))
-                     while byte
-                     do (vector-push-extend byte buf))
-               (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
-                                        :external-format :utf-8))))
+             (drain-response stream)))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-harness-http10-keepalive-no-mutation-e2e ()
@@ -361,14 +330,7 @@
              ;; when the server has already closed after processing.
              (ignore-errors
               (sb-bsd-sockets:socket-shutdown socket :direction :output))
-             (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
-                                         :fill-pointer 0 :adjustable t)))
-               (loop for byte = (handler-case (read-byte stream nil nil)
-                                  (error () nil))
-                     while byte
-                     do (vector-push-extend byte buf))
-               (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
-                                        :external-format :utf-8))))
+             (drain-response stream)))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-harness-http10-expect-100-continue-no-fire-e2e ()
@@ -442,22 +404,14 @@
                                   headers :external-format :ascii)
                                  stream)
                  (force-output stream)
-                 (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
-                                             :fill-pointer 0 :adjustable t)))
-                   (loop for byte = (handler-case (read-byte stream nil nil)
-                                      (error () nil))
-                         while byte
-                         do (vector-push-extend byte buf))
-                   (let ((raw (sb-ext:octets-to-string
-                               (subseq buf 0 (fill-pointer buf))
-                               :external-format :utf-8)))
-                     (check "417: handler not reached" reached-handler nil)
-                     (check "417: status line on wire"
-                            (not (null (search "HTTP/1.1 417" raw))) t)
-                     (check "417: connection: close on wire"
-                            (not (null (search "connection: close" raw))) t)
-                     (check "417: date header present"
-                            (not (null (search "date:" raw))) t)))))
+                 (let ((raw (drain-response stream)))
+                   (check "417: handler not reached" reached-handler nil)
+                   (check "417: status line on wire"
+                          (not (null (search "HTTP/1.1 417" raw))) t)
+                   (check "417: connection: close on wire"
+                          (not (null (search "connection: close" raw))) t)
+                   (check "417: date header present"
+                          (not (null (search "date:" raw))) t))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
 
 (defun test-harness-expect-417-on-unknown-no-body-e2e ()
@@ -493,22 +447,14 @@
                                   req :external-format :ascii)
                                  stream)
                  (force-output stream)
-                 (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
-                                             :fill-pointer 0 :adjustable t)))
-                   (loop for byte = (handler-case (read-byte stream nil nil)
-                                      (error () nil))
-                         while byte
-                         do (vector-push-extend byte buf))
-                   (let ((raw (sb-ext:octets-to-string
-                               (subseq buf 0 (fill-pointer buf))
-                               :external-format :utf-8)))
-                     (check "417 no-body: handler not reached" reached-handler nil)
-                     (check "417 no-body: status line on wire"
-                            (not (null (search "HTTP/1.1 417" raw))) t)
-                     (check "417 no-body: connection: close on wire"
-                            (not (null (search "connection: close" raw))) t)
-                     (check "417 no-body: date header present"
-                            (not (null (search "date:" raw))) t)))))
+                 (let ((raw (drain-response stream)))
+                   (check "417 no-body: handler not reached" reached-handler nil)
+                   (check "417 no-body: status line on wire"
+                          (not (null (search "HTTP/1.1 417" raw))) t)
+                   (check "417 no-body: connection: close on wire"
+                          (not (null (search "connection: close" raw))) t)
+                   (check "417 no-body: date header present"
+                          (not (null (search "date:" raw))) t))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
 
 (defun test-harness-expect-417-head-no-body-e2e ()
@@ -541,27 +487,19 @@
                                 req :external-format :ascii)
                                stream)
                (force-output stream)
-               (let ((buf (make-array 1024 :element-type '(unsigned-byte 8)
-                                           :fill-pointer 0 :adjustable t)))
-                 (loop for byte = (handler-case (read-byte stream nil nil)
-                                    (error () nil))
-                       while byte
-                       do (vector-push-extend byte buf))
-                 (let* ((raw (sb-ext:octets-to-string
-                              (subseq buf 0 (fill-pointer buf))
-                              :external-format :utf-8))
-                        (hdr-end (search (format nil "~c~c~c~c"
-                                                 #\Return #\Newline
-                                                 #\Return #\Newline)
-                                         raw)))
-                   (check "HEAD+417: status line on wire"
-                          (not (null (search "HTTP/1.1 417" raw))) t)
-                   (check "HEAD+417: connection: close on wire"
-                          (not (null (search "connection: close" raw))) t)
-                   (check "HEAD+417: headers terminator present"
-                          (not (null hdr-end)) t)
-                   (check "HEAD+417: no body bytes after headers"
-                          (- (length raw) (+ (or hdr-end 0) 4)) 0)))))
+               (let* ((raw (drain-response stream))
+                      (hdr-end (search (format nil "~c~c~c~c"
+                                               #\Return #\Newline
+                                               #\Return #\Newline)
+                                       raw)))
+                 (check "HEAD+417: status line on wire"
+                        (not (null (search "HTTP/1.1 417" raw))) t)
+                 (check "HEAD+417: connection: close on wire"
+                        (not (null (search "connection: close" raw))) t)
+                 (check "HEAD+417: headers terminator present"
+                        (not (null hdr-end)) t)
+                 (check "HEAD+417: no body bytes after headers"
+                        (- (length raw) (+ (or hdr-end 0) 4)) 0))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-handler-connection-close-honored-e2e ()
@@ -605,26 +543,18 @@
                            :external-format :ascii)))
                (write-sequence req1 stream)
                (force-output stream)
-               ;; Drain first response until EOF. Correct close →
-               ;; EOF arrives promptly; regression would block here,
-               ;; caught by the per-test join timeout in with-test-
-               ;; server's teardown (still a failure shape rather
-               ;; than a pass).
-               (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
-                                           :fill-pointer 0 :adjustable t)))
-                 (loop for byte = (handler-case (read-byte stream nil nil)
-                                    (error () nil))
-                       while byte
-                       do (vector-push-extend byte buf))
-                 (let ((text (sb-ext:octets-to-string
-                              (subseq buf 0 (fill-pointer buf))
-                              :external-format :utf-8)))
-                   (check "handler close: response present"
-                          (not (null (search "HTTP/1.1 200" text))) t)
-                   (check "handler close: body delivered"
-                          (not (null (search "bye" text))) t)
-                   (check "handler close: Connection: close stamped on wire"
-                          (not (null (search "connection: close" text))) t)))
+               ;; Drain the first response until EOF. A correct close
+               ;; makes EOF arrive promptly; a regression that held the
+               ;; socket open used to block here until with-test-server's
+               ;; teardown noticed. Bounded now, so the same regression
+               ;; fails these checks with whatever did arrive instead.
+               (let ((text (drain-response stream)))
+                 (check "handler close: response present"
+                        (not (null (search "HTTP/1.1 200" text))) t)
+                 (check "handler close: body delivered"
+                        (not (null (search "bye" text))) t)
+                 (check "handler close: Connection: close stamped on wire"
+                        (not (null (search "connection: close" text))) t))
                ;; Probe: attempt a second request. Socket should be
                ;; closed — write may succeed buffering to the closed
                ;; socket or raise EPIPE; either way the read returns
@@ -693,21 +623,13 @@
                              :external-format :ascii)))
                  (write-sequence req1 stream)
                  (force-output stream)
-                 (let ((buf (make-array 8192 :element-type '(unsigned-byte 8)
-                                             :fill-pointer 0 :adjustable t)))
-                   (loop for byte = (handler-case (read-byte stream nil nil)
-                                      (error () nil))
-                         while byte
-                         do (vector-push-extend byte buf))
-                   (let ((text (sb-ext:octets-to-string
-                                (subseq buf 0 (fill-pointer buf))
-                                :external-format :utf-8)))
-                     (check "fetch close: response present"
-                            (not (null (search "HTTP/1.1 200" text))) t)
-                     (check "fetch close: body delivered"
-                            (not (null (search "bye" text))) t)
-                     (check "fetch close: Connection: close stamped on wire"
-                            (not (null (search "connection: close" text))) t)))
+                 (let ((text (drain-response stream)))
+                   (check "fetch close: response present"
+                          (not (null (search "HTTP/1.1 200" text))) t)
+                   (check "fetch close: body delivered"
+                          (not (null (search "bye" text))) t)
+                   (check "fetch close: Connection: close stamped on wire"
+                          (not (null (search "connection: close" text))) t))
                  (let ((got-second nil))
                    (handler-case
                        (sb-ext:with-timeout 1
@@ -719,6 +641,242 @@
                    (check "fetch close: second request on same socket fails"
                           got-second nil))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
+(defun test-harness-awaiting-timeout-answers-504-e2e ()
+  "An inbound parked on a fetch that never comes back is answered 504,
+   not closed without a word.
+
+   DEPLOYMENT.md promised this and the code did not do it: the sweeper
+   collected the timed-out connection and called CLOSE-CONNECTION, which
+   removes it from epoll, unregisters it, and closes the fd. The client
+   got a bare TCP close after *FETCH-TIMEOUT* seconds and nothing to
+   distinguish it from the server dying.
+
+   The upstream is a listener that accepts and never writes, built inline
+   rather than added to the harness — the harness ships, and one internal
+   test is not a reason to widen what it promises. The TCP connect
+   succeeds because the kernel completes the handshake into the accept
+   queue without anyone calling accept, so the fetch gets all the way to
+   :out-read and waits there, which is the state under test.
+
+   *FETCH-TIMEOUT* is set globally rather than bound: the worker runs in a
+   thread START-SERVER spawned, and a LET here would not reach it."
+  (format t "~%Harness: :awaiting timeout answers 504~%")
+  (let ((saved web-skeleton:*fetch-timeout*)
+        (silent (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (setf web-skeleton:*fetch-timeout* 2)
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address silent) t)
+           (sb-bsd-sockets:socket-bind silent #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen silent 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name silent)
+             (declare (ignore host))
+             (let ((cleanup-fired nil))
+               (with-test-server
+                   (:handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (defer-to-fetch :GET
+                        (format nil "http://127.0.0.1:~d/never" upstream-port)
+                        :then (lambda (status headers body)
+                                (declare (ignore headers body))
+                                (unless status (setf cleanup-fired t))
+                                (make-text-response (or status 500)
+                                                    "unreached")))))
+                 (let ((start (get-internal-real-time)))
+                   ;; A regression here answers nothing at all, and
+                   ;; TEST-HTTP-REQUEST raises rather than returning on a
+                   ;; response it cannot parse. Caught so that becomes a
+                   ;; failed check with the diagnostic attached instead of
+                   ;; a backtrace that ends the whole suite run.
+                   (multiple-value-bind (status headers body)
+                       (handler-case (test-http-request :get "/proxy")
+                         (error (e) (values nil nil (princ-to-string e))))
+                     (declare (ignore headers))
+                     (let ((secs (/ (float (- (get-internal-real-time) start))
+                                    internal-time-units-per-second)))
+                       (check "awaiting timeout: answers 504, not a bare close"
+                              status 504)
+                       (check "awaiting timeout: body names the condition"
+                              (and body (search "Gateway Timeout" body) t) t)
+                       ;; Bounded on both sides. Too early would mean
+                       ;; something other than the sweeper answered; too
+                       ;; late would mean the sweeper is not the thing
+                       ;; that did. The sweep runs at 1 Hz against a
+                       ;; one-second clock, so a 2 s timeout lands in
+                       ;; [2, 4) plus scheduling.
+                       (check "awaiting timeout: at roughly *fetch-timeout*"
+                              (and (> secs 1.0) (< secs 10.0)) t)))))
+               ;; The fetch callback's cleanup sentinel must still fire
+               ;; exactly once — CLOSE-OUTBOUND is what fires it, and
+               ;; answering the inbound must not skip tearing the
+               ;; outbound down.
+               (check "awaiting timeout: fetch cleanup sentinel fired"
+                      cleanup-fired t))))
+      (setf web-skeleton:*fetch-timeout* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close silent)))))
+
+(defun %close-delimited-upstream (listener)
+  "Accept once, read the request head, answer with a response framed only
+   by the close, then close. Returns the thread.
+
+   No Content-Length and no Transfer-Encoding, so end-of-stream is the
+   only framing there is — which is what OUTBOUND-RESPONSE-COMPLETE-P
+   defers to the caller's EOF branch for. Written and closed back to
+   back so the body and the FIN reach the framework in one wake-up, which
+   is the ordinary shape on loopback and the one that produced :OK-EOF
+   instead of :EOF."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (loop for byte = (read-byte st nil nil)
+                 while byte
+                 do (vector-push-extend byte b)
+                 until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
+           (write-sequence
+            (sb-ext:string-to-octets
+             (format nil "HTTP/1.1 200 OK~c~cContent-Type: text/plain~c~c~c~c~a"
+                     #\Return #\Newline #\Return #\Newline
+                     #\Return #\Newline "close-framed-body")
+             :external-format :ascii)
+            st)
+           (force-output st)
+           (sb-bsd-sockets:socket-close s))
+       (error () nil)))
+   :name "close-delimited-upstream"))
+
+(defun test-harness-close-delimited-fetch-e2e ()
+  "A fetch of a close-delimited upstream completes when the close arrives,
+   not when *FETCH-TIMEOUT* expires.
+
+   CONNECTION-READ-AVAILABLE used to report \"read bytes, then EOF\" as
+   :OK, discarding the end of stream. For a response with no
+   Content-Length and no Transfer-Encoding that end of stream *is* the
+   framing — OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
+   deferring to the caller's EOF branch — so the branch never ran and the
+   fetch hung until the sweeper took it.
+
+   A TCP peer's close does not set EPOLLHUP, so HANDLE-OUTBOUND-EVENT's
+   error arm did not rescue it either. Nothing about this needs
+   configuring: our own outbound requests send Connection: close, which
+   invites an upstream to frame this way.
+
+   Uses an IP literal so the numeric fast path skips DNS — the framing is
+   what is under test here, not resolution."
+  (format t "~%Harness: close-delimited upstream fetch~%")
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread (%close-delimited-upstream listener))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (defer-to-fetch :GET
+                      (format nil "http://127.0.0.1:~d/framed" upstream-port)
+                      :then (lambda (status headers body)
+                              (declare (ignore headers))
+                              (make-text-response
+                               (or status 500)
+                               (format nil "~a|~a" status
+                                       (if body
+                                           (sb-ext:octets-to-string
+                                            body :external-format :utf-8)
+                                           "(none)")))))))
+               (let ((start (get-internal-real-time)))
+                 (multiple-value-bind (status headers body)
+                     (handler-case (test-http-request :get "/proxy")
+                       (error (e) (values nil nil (princ-to-string e))))
+                   (declare (ignore headers))
+                   (let ((secs (/ (float (- (get-internal-real-time) start))
+                                  internal-time-units-per-second)))
+                     (check "close-delimited: status delivered" status 200)
+                     (check "close-delimited: body survives the framing"
+                            (and body (search "200|close-framed-body" body) t) t)
+                     ;; The discriminating one. *FETCH-TIMEOUT* is 30 by
+                     ;; default and the harness read deadline is 10, so a
+                     ;; regression shows up here as a wait rather than as
+                     ;; a wrong answer.
+                     (check "close-delimited: completes on the close, promptly"
+                            (< secs 5.0) t)))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-dns-all-addresses-refused-e2e ()
+  "A hostname whose every resolved address the policy refuses fails the
+   fetch promptly, with a 502, rather than stranding until the sweeper.
+
+   Read this before trusting it: **this test passes without the fix**, and
+   is here as an end-to-end assertion of the DEPLOYMENT.md promise rather
+   than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is the check with
+   teeth.
+
+   The reason is the mechanism. getent writes its output in one go and the
+   EOF appears when it exits, so whether one drain sees both depends on
+   whether it has exited by the time we read — and usually it has not. The
+   bytes come back :OK, the exit arrives as a separate event, and the old
+   code handled it on a clean :EOF. Only when getent finishes first do the
+   two coalesce, and that is the ordering the bug needed. A race, not a
+   certainty, which is exactly why it survived a suite that covers the
+   parser it sits behind.
+
+   What the test does assert is the promise: a name whose every resolved
+   address *FETCH-ADDRESS-FILTER* refuses fails the fetch promptly with a
+   502 and fires the cleanup sentinel once. That is the SSRF-defense path,
+   which is where DEPLOYMENT.md made the promise and the worst place for
+   it to go unkept.
+
+   The filter is set globally, not bound: the worker reads it on a thread
+   START-SERVER spawned."
+  (format t "~%Harness: DNS with every address refused~%")
+  (let ((saved web-skeleton:*fetch-address-filter*))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore ip family host))
+            nil))
+    (unwind-protect
+         (let ((sentinel nil))
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (declare (ignore req))
+                  ;; A name, not a literal — the literal fast paths skip
+                  ;; DNS and this is about what happens after getent runs.
+                  (defer-to-fetch :GET "http://localhost:9/refused"
+                    :then (lambda (status headers body)
+                            (declare (ignore headers body))
+                            (unless status (setf sentinel t))
+                            (make-text-response (or status 500) "unreached")))))
+             (let ((start (get-internal-real-time)))
+               (multiple-value-bind (status headers body)
+                   (handler-case (test-http-request :get "/proxy")
+                     (error (e) (values nil nil (princ-to-string e))))
+                 (declare (ignore headers body))
+                 (let ((secs (/ (float (- (get-internal-real-time) start))
+                                internal-time-units-per-second)))
+                   (check "dns all-refused: answers 502" status 502)
+                   (check "dns all-refused: promptly, not at the sweep"
+                          (< secs 5.0) t)))))
+           (check "dns all-refused: fetch cleanup sentinel fired" sentinel t))
+      (setf web-skeleton:*fetch-address-filter* saved))))
 
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
   "When an HTTP/1.1 client sends 'Connection: close', the server's
@@ -869,25 +1027,23 @@
 
 (defun read-response-status-head (stream)
   "Read through the CRLFCRLF ending a response's header block and return
-   the status. NIL if the peer closed before a complete block arrived.
+   the status. NIL if the peer closed, or the deadline passed, before a
+   complete block arrived.
 
-   PARSE-TEST-RESPONSE reads to EOF, which is right for a
+   PARSE-TEST-RESPONSE reads to end-of-stream, which is right for a
    Connection: close request and wrong here — the point of the holder
-   connection below is that it stays open and keeps its slot."
-  (let ((buf (make-array 4096 :element-type '(unsigned-byte 8)
-                              :fill-pointer 0 :adjustable t)))
-    (values
-     (call-with-read-deadline
-      10
-      (lambda ()
-        (loop for byte = (handler-case (read-byte stream nil nil)
-                           (error () nil))
-              while byte
-              do (vector-push-extend byte buf)
-              until (web-skeleton::scan-crlf-crlf buf 0 (fill-pointer buf)))
-        (let ((end (fill-pointer buf)))
-          (when (web-skeleton::scan-crlf-crlf buf 0 end)
-            (web-skeleton::parse-response-status buf 0 end))))))))
+   connection below is that it stays open and keeps its slot, so there is
+   no EOF to wait for. This is what READ-UNTIL-BOUNDED's :UNTIL is for:
+   stop at the header terminator rather than at a close that will not
+   come."
+  (multiple-value-bind (buf reason)
+      (read-until-bounded
+       stream
+       :until (lambda (b fill) (web-skeleton::scan-crlf-crlf b 0 fill)))
+    (declare (ignore reason))
+    (let ((end (fill-pointer buf)))
+      (when (web-skeleton::scan-crlf-crlf buf 0 end)
+        (web-skeleton::parse-response-status buf 0 end)))))
 
 (defun claim-connection-slot (&key (attempts 40))
   "Open a keep-alive connection and return its socket once the server has
@@ -1149,6 +1305,9 @@
   (test-harness-connection-header-split-e2e)
   (test-harness-handler-connection-close-honored-e2e)
   (test-harness-fetch-callback-connection-close-honored-e2e)
+  (test-harness-awaiting-timeout-answers-504-e2e)
+  (test-harness-close-delimited-fetch-e2e)
+  (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)

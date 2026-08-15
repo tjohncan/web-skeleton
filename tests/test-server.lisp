@@ -110,6 +110,56 @@
     (check "http-date format"
            date "Thu, 09 Apr 2026 21:00:00 GMT")))
 
+(defun test-http-date-cache ()
+  (format t "~%HTTP Date cache~%")
+  ;; No cache bound is the state every existing test and every REPL call
+  ;; runs in, and it must keep formatting.
+  (let ((web-skeleton::*http-date-cache* nil))
+    (check "date: no cache bound still formats correctly"
+           (string= (web-skeleton::http-date)
+                    (web-skeleton::%format-http-date (get-universal-time)))
+           t))
+  (let ((web-skeleton::*http-date-cache* (cons 0 "")))
+    ;; A cold cache formats and fills.
+    (check "date: cold cache produces the right string"
+           (string= (web-skeleton::http-date)
+                    (web-skeleton::%format-http-date (get-universal-time)))
+           t)
+    (check "date: cold cache records the second it built for"
+           (eql (car web-skeleton::*http-date-cache*) (get-universal-time))
+           t)
+    ;; A hit is served without reformatting. Asserted through a sentinel
+    ;; that formatting could never produce, and tolerant of the second
+    ;; ticking between setup and call — rare, and a fresh format is the
+    ;; correct answer when it happens, so this is not a flake.
+    (let ((now (get-universal-time)))
+      (setf (car web-skeleton::*http-date-cache*) now
+            (cdr web-skeleton::*http-date-cache*) "SENTINEL")
+      (let ((got (web-skeleton::http-date)))
+        (check "date: a hit in the same second is served from the cache"
+               (or (string= got "SENTINEL")
+                   (string= got (web-skeleton::%format-http-date
+                                 (get-universal-time))))
+               t)))
+    ;; A stale second must not be served. Without this the cache would be
+    ;; a clock that stopped.
+    (setf (car web-skeleton::*http-date-cache*) 1
+          (cdr web-skeleton::*http-date-cache*) "STALE")
+    (check "date: a different second is not served from the cache"
+           (string= (web-skeleton::http-date) "STALE")
+           nil)
+    ;; The load-bearing one. BUILD-STATIC-RESPONSE passes file mtimes, and
+    ;; if an explicit time consulted the cache every static file's
+    ;; Last-Modified would read as the moment the server started.
+    (setf (car web-skeleton::*http-date-cache*) (get-universal-time)
+          (cdr web-skeleton::*http-date-cache*) "SENTINEL")
+    (check "date: an explicit time bypasses the cache"
+           (web-skeleton::http-date 0)
+           (web-skeleton::%format-http-date 0))
+    (check "date: an explicit time does not disturb the cache"
+           (cdr web-skeleton::*http-date-cache*)
+           "SENTINEL")))
+
 (defun test-http-parser-errors ()
   (format t "~%HTTP Parser — rejection~%")
 
@@ -4070,6 +4120,134 @@
              (eq (web-skeleton:register-cleanup fn) fn) t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; CONNECTION-READ-AVAILABLE tells "read data, then EOF" from "read data"
+;;;
+;;; This is the discriminating test for :OK-EOF. Both bugs it fixes are
+;;; end-to-end shapes whose reproduction depends on whether a peer's last
+;;; bytes and its end-of-stream land in the same read, and that is a race:
+;;; the e2e close-delimited test hits it reliably on loopback, the e2e DNS
+;;; test does not, because the framework usually reads getent's output
+;;; before getent has exited.
+;;;
+;;; The contract underneath both is not a race. A pipe from a process that
+;;; has already exited holds its bytes and its end of stream together,
+;;; every time — which is precisely the fully-buffered shape getent
+;;; produces, arrived at deterministically.
+;;; ---------------------------------------------------------------------------
+
+(defun test-read-available-eof ()
+  (format t "~%connection-read-available: EOF reporting~%")
+  (flet ((drain (sh-command)
+           (let* ((proc (sb-ext:run-program "/bin/sh" (list "-c" sh-command)
+                                            :output :stream :wait t))
+                  (fd (web-skeleton::%process-output-fd proc)))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd fd :state :out-dns :outbound-p t
+                               :last-active 0)))
+                    (web-skeleton::set-nonblocking fd)
+                    (list (web-skeleton::connection-read-available conn)
+                          (web-skeleton::connection-read-pos conn)))
+               (ignore-errors (sb-ext:process-close proc))))))
+    ;; Bytes and end-of-stream in one drain. Reported as :OK, the EOF is
+    ;; discarded, and every caller that treats it as terminal loses it.
+    (destructuring-bind (result pos)
+        (drain "printf '10.0.0.5 STREAM internal\\n'")
+      (check "read-available: bytes then EOF reports :ok-eof" result :ok-eof)
+      (check "read-available: :ok-eof still delivers the bytes"
+             (> pos 0) t))
+    ;; Nothing written before exit — no bytes to report, so plain :EOF.
+    ;; Both arms are live in the DNS path: this one on the common
+    ;; ordering, where the bytes arrive as :OK and the exit follows as a
+    ;; separate event, and :OK-EOF above when getent has already finished.
+    ;; Which of the two shows up is not the caller's to decide, so the
+    ;; branch has to take both.
+    (destructuring-bind (result pos) (drain "exit 0")
+      (check "read-available: no bytes at EOF reports :eof" result :eof)
+      (check "read-available: :eof delivers nothing" pos 0))))
+
+;;; ---------------------------------------------------------------------------
+;;; The :awaiting sweeper's 504, and its fallback
+;;;
+;;; The e2e test proves the 504 reaches a client. This proves the branch
+;;; underneath it: DELIVER-AWAITING-TIMEOUT runs inside SWEEP-IDLE-
+;;; CONNECTIONS, which runs inside RUN-EVENT-LOOP, which has no handler —
+;;; so a signal escaping the sweep restarts the worker mid-walk and costs
+;;; every other connection on it. The handler-case falls back to the bare
+;;; close instead.
+;;;
+;;; A fallback is the one thing that fails silently by succeeding: if it
+;;; fires when it shouldn't, the connection is closed without a word,
+;;; which is exactly the behavior the 504 exists to remove. So both
+;;; branches are asserted, and the clean case is the control that makes
+;;; the dirty one mean something.
+;;; ---------------------------------------------------------------------------
+
+(defun test-awaiting-sweep-504 ()
+  (format t "~%Awaiting sweep~%")
+  (flet ((sweep-one (&key dirty)
+           ;; Two epoll fds: one to sweep against, one standing in for a
+           ;; connection. An epoll fd is pollable, so EPOLL_CTL accepts
+           ;; it, and no socket or listener is needed.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (log (make-string-output-stream)))
+             (unwind-protect
+                  (let* ((conn (web-skeleton::make-connection
+                                :fd connfd
+                                :state :awaiting
+                                :last-active 0
+                                :request (web-skeleton::make-http-request
+                                          :method :GET :path "/")))
+                         (web-skeleton::*connections*
+                           (make-hash-table :test #'eql))
+                         (web-skeleton:*log-level* :warn)
+                         (web-skeleton:*log-stream* log))
+                    (web-skeleton::epoll-add
+                     epfd connfd (logior web-skeleton::+epollin+
+                                         web-skeleton::+epollet+))
+                    (when dirty
+                      ;; A write half-flushed. CONNECTION-QUEUE-WRITE
+                      ;; refuses to clobber it — that guard is what turns
+                      ;; a broken invariant into a signal here.
+                      (setf (web-skeleton::connection-write-buf conn)
+                            (make-array 2 :element-type '(unsigned-byte 8))
+                            (web-skeleton::connection-write-pos conn) 1
+                            (web-skeleton::connection-write-end conn) 2))
+                    (web-skeleton::register-connection conn)
+                    (let ((signalled
+                            (handler-case
+                                (progn (web-skeleton::sweep-idle-connections
+                                        epfd (get-universal-time))
+                                       nil)
+                              (error (e) (princ-to-string e)))))
+                      (list signalled
+                            (web-skeleton::connection-state conn)
+                            (get-output-stream-string log))))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Control: a drained buffer takes the 504 path.
+    (destructuring-bind (signalled state log) (sweep-one)
+      (check "awaiting sweep: clean case does not signal" signalled nil)
+      (check "awaiting sweep: clean case queues a response"
+             state :write-response)
+      (check "awaiting sweep: clean case does not take the fallback"
+             (search "could not answer 504" log) nil))
+
+    ;; A broken invariant must not escape into the event loop.
+    (destructuring-bind (signalled state log) (sweep-one :dirty t)
+      (check "awaiting sweep: dirty buffer does not signal out of the sweep"
+             signalled nil)
+      (check "awaiting sweep: dirty buffer takes the fallback"
+             (and (search "could not answer 504" log) t) t)
+      ;; CONNECTION-CLOSE is what the fallback ends in, and it leaves the
+      ;; state :closing — so the connection was torn down rather than left
+      ;; parked forever, which is the whole point of falling back.
+      (check "awaiting sweep: dirty buffer still gets closed"
+             state :closing))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Outbound address filter (SSRF policy hook)
 ;;; ---------------------------------------------------------------------------
 
@@ -4415,6 +4593,7 @@
   (test-http-parser-errors)
   (test-expect-100-continue)
   (test-http-date)
+  (test-http-date-cache)
   (test-http-response)
   (test-cookie-builder)
   (test-fetch)
@@ -4438,5 +4617,7 @@
   (test-static-range)
   (test-jwt)
   (test-shutdown-hooks)
+  (test-read-available-eof)
+  (test-awaiting-sweep-504)
   (report-suite "Server")
   (zerop *tests-failed*))

@@ -952,9 +952,19 @@
         (http-response-headers response))
   response)
 
-(defun http-date (&optional (universal-time (get-universal-time)))
-  "Return UTC time in RFC 7231 IMF-fixdate format.
-   Defaults to current time if no argument given."
+(defvar *http-date-cache* nil
+  "Per-worker (SECOND . STRING) cons for the current second's Date header,
+   bound by RUN-WORKER alongside *EPOLL-CTL-BUF* and the other worker-local
+   scratch. NIL outside a worker — the REPL, the test suite — where
+   HTTP-DATE simply formats every time, as it always did.
+
+   A cons that is mutated rather than a pair of specials that are rebound:
+   the binding is established once per worker and the second's value
+   changes underneath it, which is a write to a cell the worker owns
+   outright. No lock, because no other thread can see it.")
+
+(defun %format-http-date (universal-time)
+  "Format UNIVERSAL-TIME as an RFC 7231 IMF-fixdate string."
   (multiple-value-bind (sec min hour day month year dow)
       (decode-universal-time universal-time 0)
     (format nil "~a, ~2,'0d ~a ~4,'0d ~2,'0d:~2,'0d:~2,'0d GMT"
@@ -963,6 +973,33 @@
             (nth (1- month) '("Jan" "Feb" "Mar" "Apr" "May" "Jun"
                               "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"))
             year hour min sec)))
+
+(defun http-date (&optional universal-time)
+  "Return UTC time in RFC 7231 IMF-fixdate format.
+   Defaults to the current time when called with no argument.
+
+   The no-argument call is cached per worker for the current second,
+   because it is on every dynamic response and it is most of what building
+   one costs: measured at 1.26 us against FORMAT-RESPONSE's 1.76 us total,
+   so roughly seventy percent of serializing a small response went on
+   rebuilding a string that changes once a second. The cached read is
+   0.02 us. DECODE-UNIVERSAL-TIME and a seven-directive FORMAT are simply
+   not cheap, and neither is needed twice in the same second.
+
+   An explicit UNIVERSAL-TIME bypasses the cache entirely — that call is
+   for file modification times in BUILD-STATIC-RESPONSE, which are neither
+   now nor repeated."
+  (if universal-time
+      (%format-http-date universal-time)
+      (let ((now (get-universal-time))
+            (cache *http-date-cache*))
+        (cond
+          ((null cache) (%format-http-date now))
+          ((eql (car cache) now) (cdr cache))
+          (t (let ((formatted (%format-http-date now)))
+               (setf (car cache) now
+                     (cdr cache) formatted)
+               formatted))))))
 
 (defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
@@ -997,66 +1034,66 @@
     ;; circuits before the body encode + header build below.
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
-  (let* ((body   (http-response-body response))
-         ;; String bodies encode to UTF-8; byte bodies pass through
-         ;; untouched. Everything downstream (Content-Length, the
-         ;; HEAD-ONLY-P short-circuit, the serializer) already works on
-         ;; BODY-BYTES, so this is the only place that has to know the
-         ;; difference. An empty body of either kind still lands in the
-         ;; "body present" branch below and gets Content-Length: 0.
-         (body-bytes (etypecase body
-                       (null nil)
-                       (string (sb-ext:string-to-octets
-                                body :external-format :utf-8))
-                       ((simple-array (unsigned-byte 8) (*)) body)))
-         (headers (http-response-headers response))
-         (headers (cond
-                   ;; Body present — add CL if not already set
-                   ((and body-bytes
-                         (not (assoc "content-length" headers
-                                     :test #'string-equal)))
-                    (cons (cons "content-length"
-                                (write-to-string (length body-bytes)))
-                          headers))
-                   ;; No body, status requires CL:0 to prevent
-                   ;; keep-alive clients from waiting forever
-                   ((and (null body-bytes)
-                         (not (or (<= 100 status 199)
-                                  (= status 204) (= status 304)))
-                         (not (assoc "content-length" headers
-                                     :test #'string-equal)))
-                    (cons (cons "content-length" "0") headers))
-                   (t headers)))
-         ;; Stamp the Connection header from the hint without touching
-         ;; the caller's struct. App-set Connection header wins — if
-         ;; the handler already put one in the alist, the hint is
-         ;; ignored. :CLOSE maps to 'close' (RFC 7230 §6.1 SHOULD on
-         ;; server-initiated close); :KEEP-ALIVE maps to 'keep-alive'
-         ;; (only meaningful for HTTP/1.0 — 1.1 defaults to keep-alive
-         ;; so the header would be redundant); NIL leaves framing to
-         ;; the default for the request's HTTP version.
-         (headers (if (and connection-hint
-                           (not (assoc "connection" headers
+    (let* ((body   (http-response-body response))
+           ;; String bodies encode to UTF-8; byte bodies pass through
+           ;; untouched. Everything downstream (Content-Length, the
+           ;; HEAD-ONLY-P short-circuit, the serializer) already works on
+           ;; BODY-BYTES, so this is the only place that has to know the
+           ;; difference. An empty body of either kind still lands in the
+           ;; "body present" branch below and gets Content-Length: 0.
+           (body-bytes (etypecase body
+                         (null nil)
+                         (string (sb-ext:string-to-octets
+                                  body :external-format :utf-8))
+                         ((simple-array (unsigned-byte 8) (*)) body)))
+           (headers (http-response-headers response))
+           (headers (cond
+                     ;; Body present — add CL if not already set
+                     ((and body-bytes
+                           (not (assoc "content-length" headers
                                        :test #'string-equal)))
-                      (cons (cons "connection"
-                                  (ecase connection-hint
-                                    (:close      "close")
-                                    (:keep-alive "keep-alive")))
-                            headers)
-                      headers))
-         ;; RFC 7231 §7.1.1.2: origin server MUST send Date
-         (headers (if (assoc "date" headers :test #'string-equal)
-                      headers
-                      (cons (cons "date" (http-date)) headers))))
-    (serialize-http-message
-     (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-     headers
-     ;; HEAD short-circuit: keep the computed Content-Length in the
-     ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
-     ;; response's CL) but omit the body bytes from the emitted
-     ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
-     ;; without the large subseq allocation.
-     (if head-only-p nil body-bytes)))))
+                      (cons (cons "content-length"
+                                  (write-to-string (length body-bytes)))
+                            headers))
+                     ;; No body, status requires CL:0 to prevent
+                     ;; keep-alive clients from waiting forever
+                     ((and (null body-bytes)
+                           (not (or (<= 100 status 199)
+                                    (= status 204) (= status 304)))
+                           (not (assoc "content-length" headers
+                                       :test #'string-equal)))
+                      (cons (cons "content-length" "0") headers))
+                     (t headers)))
+           ;; Stamp the Connection header from the hint without touching
+           ;; the caller's struct. App-set Connection header wins — if
+           ;; the handler already put one in the alist, the hint is
+           ;; ignored. :CLOSE maps to 'close' (RFC 7230 §6.1 SHOULD on
+           ;; server-initiated close); :KEEP-ALIVE maps to 'keep-alive'
+           ;; (only meaningful for HTTP/1.0 — 1.1 defaults to keep-alive
+           ;; so the header would be redundant); NIL leaves framing to
+           ;; the default for the request's HTTP version.
+           (headers (if (and connection-hint
+                             (not (assoc "connection" headers
+                                         :test #'string-equal)))
+                        (cons (cons "connection"
+                                    (ecase connection-hint
+                                      (:close      "close")
+                                      (:keep-alive "keep-alive")))
+                              headers)
+                        headers))
+           ;; RFC 7231 §7.1.1.2: origin server MUST send Date
+           (headers (if (assoc "date" headers :test #'string-equal)
+                        headers
+                        (cons (cons "date" (http-date)) headers))))
+      (serialize-http-message
+       (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+       headers
+       ;; HEAD short-circuit: keep the computed Content-Length in the
+       ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
+       ;; response's CL) but omit the body bytes from the emitted
+       ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
+       ;; without the large subseq allocation.
+       (if head-only-p nil body-bytes)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors

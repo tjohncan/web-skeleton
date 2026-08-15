@@ -4,25 +4,41 @@
 ;;; IP address classification
 ;;;
 ;;; IS-PUBLIC-ADDRESS-P answers "is this byte vector a publicly routable
-;;; IP?" for SSRF allowlisting. A handler that proxies an attacker-controlled
-;;; URL wants to reject loopback, RFC 1918 private, link-local, CGNAT,
-;;; multicast, cloud metadata endpoints, and so on before calling
-;;; HTTP-FETCH / DEFER-TO-FETCH.
+;;; IP?" — loopback, RFC 1918 private, link-local, CGNAT, multicast,
+;;; documentation prefixes and cloud metadata endpoints all answer NIL.
+;;; It classifies one concrete address and does nothing else. It knows
+;;; nothing about hostnames, URL schemes, or when a dial is about to
+;;; happen.
 ;;;
-;;; Usage
+;;; Knowing when is *FETCH-ADDRESS-FILTER*'s job, and the two are meant
+;;; to be used together. That pairing is the whole integration:
 ;;;
-;;;   (defun handle-proxy (req)
-;;;     (let* ((url  (get-query-param req "url"))
-;;;            (host (and url (host-from-url url)))    ; app-level parser
-;;;            (ip   (and host (parse-ipv4-literal host))))
-;;;       (unless (and ip (is-public-address-p ip :inet))
-;;;         (return-from handle-proxy (make-error-response 403)))
-;;;       (defer-to-fetch :get url :then ...)))
+;;;   (setf *fetch-address-filter*
+;;;         (lambda (ip family host)
+;;;           (declare (ignore host))
+;;;           (is-public-address-p ip family)))
 ;;;
-;;; The helper is deliberately unaware of hostnames or URL schemes — it
-;;; answers "given a concrete address, is it safe to dial?" and nothing
-;;; more. Apps that accept hostnames must resolve first (via their own
-;;; DNS path) and then call this on each resolved address.
+;;; Set once before START-SERVER. The framework then consults it for
+;;; every address an outbound fetch is about to dial, IP literals
+;;; included — those skip DNS entirely, so a resolver-only check would
+;;; walk straight past http://169.254.169.254/.
+;;;
+;;; Why the filter and not a check in the handler: an app that resolves a
+;;; hostname itself, approves the address, and then hands DEFER-TO-FETCH
+;;; the *name* has checked one resolution and dialed another. The
+;;; framework resolves again, and an attacker's nameserver is free to
+;;; answer differently the second time. Nothing the app does closes that,
+;;; because the app does not control the dial. The filter runs on the
+;;; resolution that is actually used, which is the only place it can be
+;;; closed.
+;;;
+;;; Calling this directly is fine when the address is one the app already
+;;; holds — an allowlist entry, a literal it parsed. Checking an address
+;;; and then passing a name is the shape to avoid.
+;;;
+;;; DEPLOYMENT.md "Fetch URL safety (SSRF)" carries the rest: what a
+;;; refusal does to an in-flight fetch, and why an allowlist of upstream
+;;; hosts is better still where the app can name them.
 ;;; ===========================================================================
 
 (defun format-ip (bytes)

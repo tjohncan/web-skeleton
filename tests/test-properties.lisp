@@ -428,6 +428,48 @@
       (format s "HTTP/1.1 200 OK~aContent-Type: application/x-ndjson~a~a~a"
               crlf crlf crlf body))))
 
+(defun tls-stream-lines (raw &key (method :GET))
+  "Drive TLS-STREAM-RESPONSE over RAW through its READ-FN seam.
+   Returns (STATUS LINES), or :SKIPPED when web-skeleton-tls is absent.
+
+   Resolved at run time rather than written literally, for the reason
+   TEST-TLS's TLS-SYM gives: the TLS system is optional and loaded by the
+   entry script, so naming the symbol at read time would intern it and
+   emit undefined-function warnings on every compile of a tree without it.
+
+   SSL is NIL and never dereferenced — supplying READ-FN is what takes the
+   %SSL-READ path out of play, which is the whole point of the seam."
+  (let ((fn (and web-skeleton:*https-fetch-fn*
+                 (find-symbol "TLS-STREAM-RESPONSE" :web-skeleton))))
+    (if (null fn)
+        :skipped
+        (let ((pos 0)
+              (lines nil))
+          ;; A divergence in the reader shows up as a raise as often as a
+          ;; wrong answer — a chunk-accounting slip reaches the end of the
+          ;; bytes without the zero-size terminator and signals. Caught so
+          ;; that lands as a failed CHECK carrying the message, rather than
+          ;; a backtrace that ends the suite before the other arms run.
+          (handler-case
+              (list (funcall fn nil
+                         (lambda (line) (push line lines))
+                         :method method
+                         :read-fn
+                         (lambda (buf len)
+                           ;; Hand the bytes over in buffer-sized bites,
+                           ;; so a record boundary can fall anywhere and
+                           ;; the cross-read state (PREV-CR, the chunk
+                           ;; phase flags) is exercised rather than
+                           ;; bypassed by one big read.
+                           (if (>= pos (length raw))
+                               :eof
+                               (let ((n (min len (- (length raw) pos))))
+                                 (replace buf raw :start2 pos :end2 (+ pos n))
+                                 (incf pos n)
+                                 n))))
+                    (nreverse lines))
+            (error (e) (list :raised (princ-to-string e))))))))
+
 (defun test-transport-parity ()
   "Same bytes through the buffered and streaming readers; same verdict."
   (dolist (interims '(() (100) (103) (103 103 100)))
@@ -459,7 +501,52 @@
       (check (format nil "parity: ~d interim block(s), body survives"
                      (length interims))
              (nreverse streamed-lines)
-             (list "{\"a\":1}" "{\"b\":2}"))))
+             (list "{\"a\":1}" "{\"b\":2}"))
+      ;; The third transport. tls.lisp carries an independent
+      ;; implementation of this same read, and the file header of this
+      ;; suite recorded it as an unclosable gap — %SSL-READ takes a raw
+      ;; pointer with no seam to substitute a byte source into. There is
+      ;; one now, so the same fixture goes through all three and the
+      ;; "two readers must never disagree" principle covers the reader
+      ;; that most needed it.
+      (let ((tls (tls-stream-lines raw)))
+        (if (eq tls :skipped)
+            (format t "  SKIP  parity: TLS arm (web-skeleton-tls not loaded)~%")
+            (check (format nil "parity: ~d interim block(s), TLS agrees"
+                           (length interims))
+                   tls
+                   (list 200 (list "{\"a\":1}" "{\"b\":2}")))))))
+  ;; Chunked framing through the TLS reader. This is where the duplicate
+  ;; implementation is densest — its own chunk-size scanner, its own
+  ;; CR/LF partner tracking, its own expect-CR/expect-LF pair — and where
+  ;; a divergence from stream-chunked-lines would be least visible.
+  (let* ((crlf (coerce (list #\Return #\Linefeed) 'string))
+         (lines (list (format nil "{\"a\":1}~%") (format nil "{\"b\":2}~%")))
+         ;; GEN-CHUNKED frames the payload and splits it at random chunk
+         ;; boundaries, which is exactly the case a line-oriented decoder
+         ;; is most likely to get wrong — so it is seeded rather than
+         ;; hand-built, both for determinism and because hand-computing
+         ;; chunk-size hex is how a fixture ends up testing the fixture.
+         (body (let ((*random-state* (sb-ext:seed-random-state 20260814)))
+                 (gen-chunked lines)))
+         (raw (concatenate '(simple-array (unsigned-byte 8) (*))
+                           (ascii-bytes
+                            (format nil "HTTP/1.1 200 OK~a~
+                                         Transfer-Encoding: chunked~a~a"
+                                    crlf crlf crlf))
+                           body))
+         (tls (tls-stream-lines raw)))
+    (if (eq tls :skipped)
+        (format t "  SKIP  parity: TLS chunked arm~%")
+        (check "parity: chunked body, TLS agrees with the plain reader"
+               tls
+               (let ((lines nil)
+                     (stream (make-mock-stream raw)))
+                 (unwind-protect
+                      (list (web-skeleton::stream-response-lines
+                             stream (lambda (l) (push l lines)))
+                            (nreverse lines))
+                   (close stream))))))
   ;; And the cap is the same number on both paths — three transports
   ;; reading one variable was the point of *max-interim-responses*.
   (check "parity: interim cap is one shared value"

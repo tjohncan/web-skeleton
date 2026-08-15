@@ -27,7 +27,11 @@
   (callback nil    :type function))
 
 (defparameter *fetch-timeout* 30
-  "Seconds for blocking fetch I/O timeout and :awaiting connection reaping.")
+  "Seconds, per phase — not a total, except on the async http:// path
+   where the :awaiting reap does bound the whole exchange. Elsewhere it
+   bounds DNS, connect, and each individual socket read separately, so a
+   trickling upstream never trips it. README Limitations has what that
+   costs.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound address policy (SSRF)
@@ -1248,6 +1252,29 @@
         (if end (subseq bytes 0 (+ end 4)) bytes))
       bytes))
 
+(defun awaiting-inbound-for (inbound-fd out-fd)
+  "Return the inbound connection parked on OUT-FD, or NIL.
+
+   The delivery paths resume an inbound by looking up a raw fd *number*
+   that was recorded when the fetch was parked. Numbers are recycled: an
+   inbound that closed while its outbound was still in flight frees its
+   fd for the next accept, and delivering to whatever now answers to that
+   number would queue one caller's response onto another caller's socket.
+
+   Not reachable today — every route that closes an :AWAITING inbound goes
+   through CLOSE-CONNECTION, which tears the paired outbound down with it.
+   But that is a property of today's callers rather than of these
+   functions, which is the reasoning CONNECTION-QUEUE-WRITE's own guard
+   rejects, and the window widens with every long-lived parked state the
+   roadmap adds.
+
+   Refusing costs a delay, never a wrong delivery: an inbound this
+   declines to answer is left parked, and the :AWAITING sweeper answers it
+   504."
+  (let ((inbound (lookup-connection inbound-fd)))
+    (when (and inbound (= (connection-awaiting-fd inbound) out-fd))
+      inbound)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------
@@ -1511,8 +1538,10 @@
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
   (let ((result (connection-read-available conn)))
     (case result
-      (:eof
-       ;; Server closed connection — response is complete (Connection: close)
+      ((:eof :ok-eof)
+       ;; Server closed — for a close-delimited response that IS the
+       ;; framing. :OK-EOF is the same event with the last bytes attached;
+       ;; see CONNECTION-READ-AVAILABLE for why they are told apart.
        (complete-fetch conn epoll-fd))
       (:full
        ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. Route through
@@ -1732,8 +1761,7 @@
             (found nil)
             (digits 0))
         (loop while (< pos end)
-              for byte = (aref buf pos)
-              do (let ((digit (hex-digit-value byte)))
+              do (let ((digit (hex-digit-value (aref buf pos))))
                    (if digit
                        (progn (incf digits)
                               (when (> digits 16)
@@ -1902,7 +1930,11 @@
                      raw-body))
            ;; Call the user's callback.
            (callback (connection-fetch-callback out-conn))
-           (inbound-fd (connection-inbound-fd out-conn)))
+           (inbound-fd (connection-inbound-fd out-conn))
+           ;; Captured before CLOSE-OUTBOUND nulls it — AWAITING-INBOUND-FOR
+           ;; needs it to confirm the inbound it finds is the one that
+           ;; parked on this outbound rather than a reuse of its number.
+           (out-fd (connection-fd out-conn)))
       ;; Clear the slot so close-outbound's cleanup-firing path does
       ;; not re-invoke the callback on the happy path. We already
       ;; captured the actual callback into the CALLBACK local above.
@@ -1914,63 +1946,63 @@
       ;; anywhere — but the contract is still "callback fires exactly
       ;; once per fetch lifetime", so fire the cleanup sentinel here
       ;; before returning so app state gets released.
-      (let ((inbound (lookup-connection inbound-fd)))
+      (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
         (if inbound
             (handler-case
-              (let ((response (funcall callback
-                                       status (or headers nil)
-                                       (or body nil))))
-                ;; Sync close-after-p from the callback's response BEFORE
-                ;; computing the connection-hint — a handler-set
-                ;; Connection: close flips close-after-p to T so the
-                ;; hint resolves to :CLOSE and the server stamps the
-                ;; header on the wire instead of leaving the framing
-                ;; implicit.
-                (sync-close-after-p-from-response inbound response)
-                ;; Queue the response on the inbound connection. On
-                ;; HEAD, FORMAT-RESPONSE emits headers only via
-                ;; :HEAD-ONLY-P — saves the full body encode + the
-                ;; downstream STRIP-BODY-FOR-HEAD subseq, which on a
-                ;; large response body doubled the peak allocation.
-                ;; Byte-vector responses still go through the strip
-                ;; because they're already-serialized blocks.
-                (let* ((head-p (and (connection-request inbound)
-                                    (eq (http-request-method
-                                         (connection-request inbound))
-                                        :HEAD)))
-                       (bytes (cond
-                                ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                 (strip-body-for-head response inbound))
-                                ((typep response 'http-fetch-continuation)
-                                 ;; Chained fetch — initiate another outbound call
-                                 (initiate-fetch inbound epoll-fd response)
-                                 (return-from complete-fetch))
-                                (t (format-response
-                                    response
-                                    :connection-hint
-                                    (connection-hint-for inbound)
-                                    :head-only-p head-p)))))
-                  (connection-queue-write inbound bytes)
+                (let ((response (funcall callback
+                                         status (or headers nil)
+                                         (or body nil))))
+                  ;; Sync close-after-p from the callback's response BEFORE
+                  ;; computing the connection-hint — a handler-set
+                  ;; Connection: close flips close-after-p to T so the
+                  ;; hint resolves to :CLOSE and the server stamps the
+                  ;; header on the wire instead of leaving the framing
+                  ;; implicit.
+                  (sync-close-after-p-from-response inbound response)
+                  ;; Queue the response on the inbound connection. On
+                  ;; HEAD, FORMAT-RESPONSE emits headers only via
+                  ;; :HEAD-ONLY-P — saves the full body encode + the
+                  ;; downstream STRIP-BODY-FOR-HEAD subseq, which on a
+                  ;; large response body doubled the peak allocation.
+                  ;; Byte-vector responses still go through the strip
+                  ;; because they're already-serialized blocks.
+                  (let* ((head-p (and (connection-request inbound)
+                                      (eq (http-request-method
+                                           (connection-request inbound))
+                                          :HEAD)))
+                         (bytes (cond
+                                  ((typep response '(simple-array (unsigned-byte 8) (*)))
+                                   (strip-body-for-head response inbound))
+                                  ((typep response 'http-fetch-continuation)
+                                   ;; Chained fetch — initiate another outbound call
+                                   (initiate-fetch inbound epoll-fd response)
+                                   (return-from complete-fetch))
+                                  (t (format-response
+                                      response
+                                      :connection-hint
+                                      (connection-hint-for inbound)
+                                      :head-only-p head-p)))))
+                    (connection-queue-write inbound bytes)
+                    (setf (connection-state inbound) :write-response
+                          (connection-awaiting-fd inbound) -1
+                          (connection-last-active inbound) (get-universal-time))
+                    (epoll-modify epoll-fd (connection-fd inbound)
+                                  (logior +epollout+ +epollet+))
+                    (log-debug "fetch: resumed fd ~d" inbound-fd)))
+              (error (e)
+                (log-error "fetch callback error: ~a" e)
+                (let ((err-bytes (strip-body-for-head
+                                  (format-response
+                                   (make-error-response 500)
+                                   :connection-hint
+                                   (connection-hint-for inbound))
+                                  inbound)))
+                  (connection-queue-write inbound err-bytes)
                   (setf (connection-state inbound) :write-response
                         (connection-awaiting-fd inbound) -1
                         (connection-last-active inbound) (get-universal-time))
                   (epoll-modify epoll-fd (connection-fd inbound)
-                                (logior +epollout+ +epollet+))
-                  (log-debug "fetch: resumed fd ~d" inbound-fd)))
-            (error (e)
-              (log-error "fetch callback error: ~a" e)
-              (let ((err-bytes (strip-body-for-head
-                                (format-response
-                                 (make-error-response 500)
-                                 :connection-hint
-                                 (connection-hint-for inbound))
-                                inbound)))
-                (connection-queue-write inbound err-bytes)
-                (setf (connection-state inbound) :write-response
-                      (connection-awaiting-fd inbound) -1
-                      (connection-last-active inbound) (get-universal-time))
-                (epoll-modify epoll-fd (connection-fd inbound)
-                              (logior +epollout+ +epollet+)))))
+                                (logior +epollout+ +epollet+)))))
             ;; Inbound vanished between :awaiting parking and now
             ;; (drain race, idle reap, I/O error). Fire the cleanup
             ;; sentinel so app state gets released — we can't deliver
@@ -1983,9 +2015,10 @@
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."
   (log-warn "fetch error fd ~d: ~a" (connection-fd out-conn) message)
-  (let ((inbound-fd (connection-inbound-fd out-conn)))
+  (let ((inbound-fd (connection-inbound-fd out-conn))
+        (out-fd (connection-fd out-conn)))
     (close-outbound out-conn epoll-fd)
-    (let ((inbound (lookup-connection inbound-fd)))
+    (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
       (when inbound
         (let ((err-bytes (strip-body-for-head
                          (format-response

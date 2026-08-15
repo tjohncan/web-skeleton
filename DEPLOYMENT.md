@@ -138,6 +138,7 @@ specific status, not a blanket 400:
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
 | `501 Not Implemented` | A method not in the accepted set, or any `Transfer-Encoding` (RFC 7230 §3.3.1) |
 | `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
+| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised |
 
@@ -313,7 +314,17 @@ together. A slow DNS phase shortens the budget remaining for connect and respons
 Blocking paths (`http-fetch-stream`, HTTPS) get the three per-phase bounds above;
 the async path gets one total. Tune `*fetch-timeout*` with this in mind —
 it is the worst-case wall time the parked inbound will sit in `:awaiting`
-before the idle sweeper hands back a 502.
+before the idle sweeper answers **`504 Gateway Timeout`** and closes.
+
+That 504 is the floor under every way a fetch can fail to come back,
+including ones with no specific handler: an upstream that accepts and then
+says nothing, a DNS lookup that produces no usable address, a response
+whose framing never completes. Wherever the fetch machinery has something
+more specific to say it says it — `deliver-fetch-error`'s 502 covers a
+refused connect, a short body, an unparseable status line — and everything
+else lands here. The fetch callback still fires its `(nil nil nil)` cleanup
+sentinel exactly once, because the paired outbound is torn down through the
+same `close-outbound` path either way.
 
 **Chunked completion on the async path.** The non-blocking `http-fetch` path
 detects response completion three ways: by `Content-Length`, by the
@@ -605,6 +616,33 @@ in a fan-out broadcast, one unresponsive subscriber is enough.
 `*ws-send-timeout*` must be positive. There is no setting that disables
 the deadline: it used to accept `0` for no deadline at all, which meant a
 peer that never drained its receive window pinned the worker permanently.
+
+### Logging holds the only shared lock
+
+`log-msg` takes a single global mutex and holds it across both the
+`format` and the `force-output`. It is the one lock every worker contends
+for — connections, the DNS cache, the scratch buffers and `/dev/urandom`
+are per-worker precisely so that the request path needs none.
+
+At the `:info` default this costs nothing measurable, because a request
+that parses and dispatches cleanly logs nothing at all. At `:debug` it is
+several acquisitions per request with every worker serialized behind
+them, which is worth knowing before turning `:debug` on under load rather
+than after.
+
+Two operational consequences:
+
+- **`*log-stream*` pointed at a slow consumer stalls the server, not one
+  connection.** A pipe to a log shipper that stops reading leaves the
+  blocked `force-output` holding the lock while every worker queues
+  behind it. A file or the terminal is fine; anything whose reader can
+  block deserves a moment's thought, and a bounded local buffer in front
+  of it is cheap insurance.
+- **An access log would put this on the hot path by construction** — one
+  line per request, every request, every worker, through one mutex. The
+  framework does not ship one. If you add one, per-worker buffers drained
+  on a timer are the shape that avoids the contention; routing it through
+  `log-msg` is the shape that does not.
 
 ### Static files
 
@@ -959,6 +997,41 @@ For unit-style tests that bypass the network entirely,
 
 `make-test-ws-frame` is the analogue for WebSocket handler unit tests —
 it builds a masked client frame that `ws-handler` code can parse and process.
+
+**Reads are bounded, and yours should be too.** `read-byte` on a socket
+stream has no deadline, so a server that answers late, answers partially,
+or never answers does not fail a test — it stops the run, and CI kills the
+job minutes later with a log ending at the name of the test that started
+and nothing said about what it was waiting for.
+
+Every read `test-http-request` performs goes through a deadline
+(`*test-read-timeout*`, 10 seconds, rebindable with a plain `let` since it
+is read on the calling thread). A test that times out raises immediately,
+naming the deadline, the byte count, and the first 200 bytes that did
+arrive.
+
+For reads of your own — anything that talks to a handler over a raw
+socket — `read-until-bounded` is exported:
+
+```lisp
+;; Read to the end of the stream, bounded. Right for a
+;; Connection: close response.
+(multiple-value-bind (buf reason) (read-until-bounded stream)
+  ;; reason is :eof, :error, or :deadline; buf holds whatever arrived
+  ...)
+
+;; Read until a predicate is satisfied. Necessary for anything the
+;; server keeps open — a kept-alive response or a stream never
+;; reaches EOF, so reading to the end means waiting out the deadline.
+(read-until-bounded stream
+                    :until (lambda (buf fill)
+                             (>= (count-events buf fill) 3))
+                    :seconds 5)
+```
+
+It always returns the buffer, including on the deadline, so a test that
+gives up can still assert against the bytes it did get and say what was
+missing. `:until` is called after each byte, so keep it cheap.
 
 End-to-end tests are slower than unit-style tests
 (~1-2 seconds per `with-test-server` call, mostly shutdown latency).

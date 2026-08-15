@@ -209,7 +209,52 @@
 (defun connection-read-available (conn)
   "Drain all available bytes from fd into read buffer (edge-triggered).
    Grows the buffer as needed, up to CONNECTION-READ-CAP.
-   Returns :OK if any data was read, :EOF, :FULL, or :AGAIN."
+
+   Returns:
+     :OK      — read some bytes, and the fd would block on the next read
+     :OK-EOF  — read some bytes, and then hit end of stream
+     :EOF     — read nothing, already at end of stream
+     :AGAIN   — read nothing, would block
+     :FULL    — buffer is at CONNECTION-READ-CAP with no room to grow
+
+   :OK-EOF is separate from :OK because the difference is the whole
+   framing on two paths, and collapsing them cost this framework two
+   bugs.
+
+   Both arise when a peer's last bytes and its end-of-stream arrive in the
+   same wake-up, which is the ordinary shape on loopback and a coin-toss
+   across a network. Reported as :OK, the EOF is simply discarded here,
+   and every caller that treats end-of-stream as terminal loses it:
+
+     A close-delimited outbound response — no Content-Length, no
+     Transfer-Encoding — is framed by the close and nothing else.
+     OUTBOUND-RESPONSE-COMPLETE-P says so in as many words and returns NIL
+     forever, deferring to the caller's EOF branch. That branch was
+     unreachable, so the fetch sat until *FETCH-TIMEOUT*.
+
+     A `getent` pipe carries the same hazard, on a race rather than
+     reliably. getent writes its output in one go and the EOF appears when
+     it exits, so whether one drain sees both depends on whether it has
+     exited by the time we read. Usually it has not: the data comes back
+     :OK, the exit arrives as a later event, and HANDLE-DNS-READY's \"no
+     usable address\" branch fires on a clean :EOF. When it has — a cached
+     answer, a loaded box, any scheduling that lets it finish first — the
+     two coalesce and that branch was skipped. The name it strands is one
+     whose every address *FETCH-ADDRESS-FILTER* refused, so the failure
+     lands on the SSRF-defense path and only sometimes.
+
+   Neither is rescued by epoll. A TCP peer calling close(2) does not set
+   EPOLLHUP — that flag means both directions are down, and a FIN alone
+   does not qualify; measured, not assumed. The pipe does set it, and the
+   :OUT-DNS branch of HANDLE-OUTBOUND-EVENT dispatches without looking at
+   flags. So the one fd type that gets the signal is the one that ignores
+   it.
+
+   Subscribing to EPOLLRDHUP (0x2000) is the obvious alternative and is
+   the wrong shape: it would mean re-registering every fd's event mask, it
+   does nothing for the pipe, and it asks the kernel to tell us something
+   we already know. The EOF is in hand at the moment this function
+   returns. The defect is that the return value had nowhere to put it."
   (let ((any-read nil)
         (max-size (connection-read-cap conn)))
     (loop
@@ -229,7 +274,7 @@
                       space (- new-size pos)))))
         (let ((result (nb-read (connection-fd conn) buf pos space)))
           (cond
-            ((eq result :eof)   (return (if any-read :ok :eof)))
+            ((eq result :eof)   (return (if any-read :ok-eof :eof)))
             ((eq result :again) (return (if any-read :ok :again)))
             (t (incf (connection-read-pos conn) result)
                (setf any-read t))))))))
@@ -461,6 +506,10 @@
 (defun connection-on-read (conn)
   "Handle readable event. Reads available data and advances protocol state."
   (let ((read-result (connection-read-available conn)))
+    ;; :OK and :OK-EOF both fall through to the state machine below, and
+    ;; deliberately: bytes are bytes, and a fire-and-close client whose
+    ;; request arrived with its FIN still deserves an answer. The :EOF arm
+    ;; matters only when there is nothing buffered to answer with.
     (case read-result
       (:eof
        ;; Peer closed. If user-space still has buffered bytes (a pipelined
@@ -603,15 +652,22 @@
                           (setf (connection-read-buf conn) new-buf))
                         ;; Re-drain: buffer grew past connection-read-available's
                         ;; original cap, kernel may still have data (edge-triggered).
-                        ;; :EOF (peer FIN'd) and :FULL (buffer at cap) are
-                        ;; terminal only if the body is still incomplete.
+                        ;; :EOF and :OK-EOF (peer FIN'd, with or without
+                        ;; bytes on the way past) and :FULL (buffer at cap)
+                        ;; are terminal only if the body is still
+                        ;; incomplete. :OK-EOF belongs here for the same
+                        ;; reason :EOF does — a body that arrives with its
+                        ;; own FIN and is still short of Content-Length is
+                        ;; never going to be completed, and waiting for a
+                        ;; wake-up that cannot come just holds the slot
+                        ;; until the idle sweeper takes it.
                         ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
                         ;; the pre-grown buffer exceeds the drain cap and
                         ;; :FULL fires at pos = body-start+CL — which IS
                         ;; the complete body. Close only on truly incomplete
                         ;; bodies so that CL-at-cap requests still dispatch.
                         (case (connection-read-available conn)
-                          ((:eof :full)
+                          ((:eof :ok-eof :full)
                            (when (< (- (connection-read-pos conn) body-start)
                                     content-length)
                              (return-from connection-on-read :close))))))

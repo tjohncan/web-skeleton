@@ -9,7 +9,30 @@
 ;;; ===========================================================================
 
 (defvar *log-lock* (sb-thread:make-mutex :name "log")
-  "Serializes log output so lines from concurrent threads don't interleave.")
+  "Serializes log output so lines from concurrent threads don't interleave.
+
+   This is the one lock every worker contends for. Sharing nothing in the
+   request hot path is the framework's defining property — connections,
+   the DNS cache, the scratch buffers and /dev/urandom are per-worker
+   precisely so that no lock is needed — and LOG-MSG holds this one
+   across both the FORMAT and the FORCE-OUTPUT.
+
+   At the :INFO default that costs nothing measurable: a request that
+   parses and dispatches cleanly logs nothing at all. At :DEBUG it is
+   several acquisitions per request, with every worker serialized behind
+   them.
+
+   Two consequences worth knowing before building on it. An access log
+   would put this on the hot path by construction — one line per request,
+   every request, every worker, through one mutex with a FORCE-OUTPUT
+   inside it. And *LOG-STREAM* pointed at a pipe to a log shipper that
+   stalls does not slow one connection; it stops the server, because the
+   stalled write is holding the lock the other workers need.
+
+   The shape of a fix is per-worker buffers drained on the existing
+   maintenance tick. Not done: nothing in the framework logs often enough
+   today to pay for it. Recorded so that whoever adds something that does
+   meets this first rather than afterwards.")
 
 (defparameter *log-levels* '(:debug :info :warn :error)
   "Ordered from least to most severe.")
@@ -41,7 +64,9 @@
   "Log a message at LEVEL. Suppressed if below *log-level*.
    A broken-pipe or closed *log-stream* falls back to *error-output*
    rather than raising into the worker's hot path — a missed log line
-   is less harmful than a logger that crashes the request pipeline."
+   is less harmful than a logger that crashes the request pipeline.
+   Holds *LOG-LOCK* across the format and the flush; see that variable
+   before putting this on a per-request path."
   (when (>= (log-level-value level) (log-level-value *log-level*))
     (sb-thread:with-mutex (*log-lock*)
       (let ((stream (or *log-stream* *standard-output*)))

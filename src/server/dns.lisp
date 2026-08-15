@@ -346,9 +346,10 @@
    error. Reply to the parked inbound with a 502 and tear down the
    dns-conn through CLOSE-OUTBOUND, which fires the fetch callback
    with (NIL NIL NIL) so app-level cleanup runs."
-  (let ((inbound-fd (connection-inbound-fd dns-conn)))
+  (let ((inbound-fd (connection-inbound-fd dns-conn))
+        (out-fd (connection-fd dns-conn)))
     (close-outbound dns-conn epoll-fd)
-    (let ((inbound (lookup-connection inbound-fd)))
+    (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
       (when inbound
         (let ((err-bytes (strip-body-for-head
                          (format-response
@@ -369,7 +370,7 @@
    deliver a 502 on EOF-without-answer."
   (let ((result (connection-read-available dns-conn)))
     (case result
-      ((:ok :eof)
+      ((:ok :ok-eof :eof)
        (let ((parsed (parse-getent-output
                       (connection-read-buf dns-conn)
                       (connection-read-pos dns-conn)
@@ -396,10 +397,29 @@
                   ;; close-outbound fires the cleanup sentinel.
                   (log-warn "dns: chain to TCP failed: ~a" e)
                   (deliver-dns-error dns-conn epoll-fd)))))
-           ((eq result :eof)
+           ((member result '(:eof :ok-eof))
             ;; No parseable STREAM row, or every address the name
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
             ;; are "no address we are willing to dial" — same 502.
+            ;;
+            ;; :OK-EOF used to be missing here, and its absence was a
+            ;; race rather than a certainty — which is why the branch
+            ;; mostly worked and the bug was hard to see.
+            ;;
+            ;; getent writes its output in one go and the EOF appears
+            ;; when it exits. Usually it has not exited by the time we
+            ;; drain, so the bytes come back :OK, the exit arrives as a
+            ;; later event, and this branch fires on a clean :EOF — which
+            ;; is the common ordering and the reason the old code was
+            ;; right most of the time. When getent has already exited,
+            ;; both land in one read; reported as :OK, that fell straight
+            ;; past here to wait for a wake-up the closed pipe would
+            ;; never deliver, and the parked inbound sat until the
+            ;; sweeper took it.
+            ;;
+            ;; So neither arm is dead. :EOF is the common path and
+            ;; :OK-EOF is the coalesced one, and the branch has to accept
+            ;; both because which one arrives is not ours to decide.
             (log-warn "dns: no usable address for ~a in getent output"
                       (or (connection-dns-host dns-conn) "<host>"))
             (deliver-dns-error dns-conn epoll-fd))

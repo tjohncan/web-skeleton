@@ -96,6 +96,30 @@
    construction on the one path that exists because the worker is already
    out of room.")
 
+(defconstant +refusal-drain-size+ 2048
+  "Bytes REFUSE-CONNECTION clears per read while draining a refused peer.
+   Sized to hold an ordinary request in one or two passes; the drain is
+   capped at four of them regardless.")
+
+(defvar *refusal-drain-buf* nil
+  "Scratch buffer REFUSE-CONNECTION drains into, bound per worker by
+   RUN-WORKER alongside *EPOLL-CTL-BUF* and *POLL-BUF*.
+
+   The bytes read into it are discarded — the drain exists so that
+   close(2) sends FIN rather than RST, not to look at what the peer
+   said — so one buffer per worker is enough and its contents never
+   need clearing between refusals.
+
+   Per-worker rather than global for the reason every other scratch
+   buffer here is: workers share nothing in the hot path, and a shared
+   sink would be two threads writing one array. Nothing reads it, so
+   that would in fact be harmless, which is exactly the kind of thing
+   that stops being true after an edit nobody connected to it.
+
+   NIL outside a worker — the REPL, the test suite driving
+   REFUSE-CONNECTION directly — where the per-call allocation this
+   replaces is still what happens.")
+
 (defparameter *idle-timeout* 10
   "Seconds before an idle HTTP connection is closed. 0 to disable.")
 
@@ -109,9 +133,50 @@
 (defparameter *ws-max-missed-pongs* 3
   "Close a WebSocket connection after this many consecutive unanswered pings.")
 
+(defun deliver-awaiting-timeout (conn epoll-fd)
+  "Answer 504 on an inbound parked in :AWAITING past *FETCH-TIMEOUT*, then
+   hand it to the write path to close.
+
+   504 rather than 502 because the condition is specifically that the
+   upstream did not answer in time. DELIVER-FETCH-ERROR's 502s are right
+   for their cases — connect refused, short body, unparseable status, all
+   genuinely a bad response from the gateway — and this is the other one.
+   Answering everything with a single code is what *STATUS-REASONS*
+   already declines to do.
+
+   The paired outbound goes first, through CLOSE-OUTBOUND, because that
+   is what fires the fetch callback's (NIL NIL NIL) sentinel. Skipping it
+   would leak the app's cleanup on exactly the path where the fetch never
+   returned.
+
+   The write buffer is drained by construction: a connection reaches
+   :AWAITING only from dispatch, after its request was fully read and
+   before any response was queued, and both the keep-alive reset and the
+   100-continue flush zero the buffer on the way. CONNECTION-QUEUE-WRITE
+   enforces that rather than trusting it, which is why the caller catches
+   — a signal here would take down a worker mid-sweep."
+  (let ((out-fd (connection-awaiting-fd conn)))
+    (when (>= out-fd 0)
+      (let ((out-conn (lookup-connection out-fd)))
+        (when out-conn
+          (close-outbound out-conn epoll-fd)))))
+  (setf (connection-close-after-p conn) t
+        (connection-awaiting-fd conn) -1)
+  (let ((bytes (strip-body-for-head
+                (format-response (make-error-response 504)
+                                 :connection-hint (connection-hint-for conn))
+                conn)))
+    (connection-queue-write conn bytes)
+    (setf (connection-state conn) :write-response
+          (connection-last-active conn) (get-universal-time))
+    (epoll-modify epoll-fd (connection-fd conn)
+                  (logior +epollout+ +epollet+))))
+
 (defun sweep-idle-connections (epoll-fd now)
   "Close connections that have been idle too long.
-   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*."
+   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*.
+   An :AWAITING connection is answered 504 first — see
+   DELIVER-AWAITING-TIMEOUT."
   (let ((idle nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
@@ -130,7 +195,22 @@
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
                  (connection-fd conn) (connection-state conn))
-      (close-connection conn epoll-fd))))
+      ;; Collect-then-act: nothing here queues a write inside the MAPHASH
+      ;; above, because DELIVER-AWAITING-TIMEOUT tears down the paired
+      ;; outbound and that mutates the table being walked.
+      (if (eq (connection-state conn) :awaiting)
+          ;; A failure to answer must not be worse than not trying. If
+          ;; anything in the 504 path signals — a write buffer that was
+          ;; not drained after all, a serializer refusing a header — fall
+          ;; back to the bare close this used to do unconditionally,
+          ;; rather than letting it escape into RUN-EVENT-LOOP, which has
+          ;; no handler and would restart the worker mid-sweep.
+          (handler-case (deliver-awaiting-timeout conn epoll-fd)
+            (error (e)
+              (log-warn "awaiting timeout: could not answer 504 on fd ~d: ~a"
+                        (connection-fd conn) e)
+              (close-connection conn epoll-fd)))
+          (close-connection conn epoll-fd)))))
 
 (defun ping-ws-connections (epoll-fd)
   "Send pings to WebSocket connections and close dead ones.
@@ -171,12 +251,18 @@
 
 (defparameter *shutdown-poll-interval* 1
   "Seconds between shutdown-signal checks in the main thread's wait loop
-   and each worker's event-loop epoll timeout. Also governs the worker's
-   periodic-maintenance cadence (idle-connection sweep, WebSocket ping).
+   and each worker's event-loop epoll timeout.
    Default 1 second balances wake-up overhead against shutdown
    responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
    so teardown doesn't wait a full second per call. Float accepted —
-   the worker converts to ms for epoll_wait.")
+   the worker converts to ms for epoll_wait.
+
+   It does not set the periodic-maintenance cadence. RUN-EVENT-LOOP gates
+   the idle sweep on a hardcoded one second and the WebSocket ping on
+   *WS-PING-INTERVAL*; this only bounds how often the loop can wake to
+   check them. Lowering it makes shutdown prompt without making either
+   scan run more often — the harness sets it to 0.05 and the sweep still
+   runs at 1 Hz.")
 
 (defconstant +max-events+ 64
   "Maximum events to process per epoll_wait call. Internal — not a
@@ -333,7 +419,9 @@
       (ignore-errors
        (nb-write fd *connection-limit-response* 0
                  (length *connection-limit-response*)))
-      (let ((sink (make-array 2048 :element-type '(unsigned-byte 8))))
+      (let ((sink (or *refusal-drain-buf*
+                      (make-array +refusal-drain-size+
+                                  :element-type '(unsigned-byte 8)))))
         (dotimes (i 4)
           (declare (ignorable i))
           ;; NB-READ returns :AGAIN once the queue is empty and :EOF once
@@ -940,7 +1028,15 @@
               (*dns-cache* (make-hash-table :test #'equal))
               (*epoll-ctl-buf* (make-array +epoll-event-size+
                                            :element-type '(unsigned-byte 8)))
-              (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8))))
+              (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8)))
+              (*refusal-drain-buf*
+                (make-array +refusal-drain-size+
+                            :element-type '(unsigned-byte 8)))
+              ;; CAR is the second the string was built for. 0 can never
+              ;; be the current universal time, so the first response of
+              ;; the worker's life formats and the rest of that second
+              ;; read.
+              (*http-date-cache* (cons 0 "")))
           ;; Split the listener and epoll-fd bindings so a failure of
           ;; EPOLL-CREATE (EMFILE, ENOMEM) still tears down the bound
           ;; listener socket — a shared let* would leak it because the
@@ -1016,18 +1112,18 @@
                 with start = 0
                 with len = (length line)
                 while (< start len)
-                for comma = (or (position #\, line :start start) len)
-                for dash  = (position #\- line :start start :end comma)
-                do (if dash
-                       (let ((lo (parse-integer line :start start :end dash))
-                             (hi (parse-integer line :start (1+ dash)
-                                                     :end comma)))
-                         (incf total (1+ (- hi lo))))
-                       (progn
-                         ;; Single-CPU token — still parse to validate.
-                         (parse-integer line :start start :end comma)
-                         (incf total)))
-                   (setf start (1+ comma))
+                do (let* ((comma (or (position #\, line :start start) len))
+                          (dash  (position #\- line :start start :end comma)))
+                     (if dash
+                         (let ((lo (parse-integer line :start start :end dash))
+                               (hi (parse-integer line :start (1+ dash)
+                                                       :end comma)))
+                           (incf total (1+ (- hi lo))))
+                         (progn
+                           ;; Single-CPU token — still parse to validate.
+                           (parse-integer line :start start :end comma)
+                           (incf total)))
+                     (setf start (1+ comma)))
                 finally (return (max 1 total)))))
     (error ()
       (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")
