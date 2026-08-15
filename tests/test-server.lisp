@@ -4425,6 +4425,283 @@
       (ignore-errors (delete-file path)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; ws-send queues instead of spinning
+;;;
+;;; Needs a fd that genuinely returns EAGAIN, which a regular file never
+;;; does. A pipe to a child that never reads its stdin is deterministic:
+;;; the buffer is 64 KiB, `sleep` does not drain it, so a payload past
+;;; that size is guaranteed to leave a remainder.
+;;;
+;;; The elapsed-time check is the point of the whole item. The old ws-send
+;;; sat in POLL-WRITABLE until the peer read or *WS-SEND-TIMEOUT* expired,
+;;; holding the worker and every other connection on it. Against this
+;;; fixture — a peer that never reads at all — that is a full ten seconds.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-send-queues ()
+  (format t "~%ws-send queueing~%")
+  (let ((proc (sb-ext:run-program "/bin/sleep" '("30")
+                                  :input :stream :output nil :wait nil)))
+    (unwind-protect
+         (let* ((fd (sb-sys:fd-stream-fd (sb-ext:process-input proc)))
+                (conn (web-skeleton::make-connection
+                       :fd fd :state :websocket :last-active 0))
+                (big (web-skeleton::build-ws-frame
+                      web-skeleton::+ws-op-binary+
+                      (make-array (* 256 1024) :element-type '(unsigned-byte 8)
+                                               :initial-element 88)))
+                (small (web-skeleton::build-ws-frame
+                        web-skeleton::+ws-op-binary+
+                        (make-array 100 :element-type '(unsigned-byte 8)
+                                        :initial-element 89))))
+           (web-skeleton::set-nonblocking fd)
+           (let* ((start (get-internal-real-time))
+                  ;; Caught rather than allowed to propagate: a ws-send that
+                  ;; went back to blocking would raise its timeout here and
+                  ;; end the run with a backtrace instead of a failed check.
+                  (flushed (handler-case (web-skeleton::ws-send conn big)
+                             (error (e) (format nil "signalled: ~a" e))))
+                  (elapsed (/ (- (get-internal-real-time) start)
+                              internal-time-units-per-second)))
+             (check "ws-send: reports a remainder rather than full delivery"
+                    flushed nil)
+             (check "ws-send: the remainder is queued"
+                    (plusp (web-skeleton::connection-write-pending conn)) t)
+             (check "ws-send: returns without waiting for the peer"
+                    (< elapsed 1) t))
+           ;; Append, not substitute. The old ws-send never touched the
+           ;; connection's buffer at all; the new one must add to it.
+           (let ((before (web-skeleton::connection-write-pending conn)))
+             ;; Caught for the same reason as the first send: a blocking
+             ;; ws-send raises here, and an unhandled raise ends the run
+             ;; instead of reporting. The delta check below still tells
+             ;; the two apart — a send that raised queued nothing.
+             (handler-case (web-skeleton::ws-send conn small) (error () nil))
+             (check "ws-send: a second frame is appended behind the first"
+                    (- (web-skeleton::connection-write-pending conn) before)
+                    (length small)))
+           ;; The invariant the sweeps depend on: a drained head never sits
+           ;; in front of a non-empty queue, because ON-WRITE promotes
+           ;; before it returns and APPEND takes the head slot whenever
+           ;; nothing is pending. Asserted after a real partial write, not
+           ;; argued.
+           (flet ((head-drained-with-queue-p ()
+                    (and (zerop (- (web-skeleton::connection-write-end conn)
+                                   (web-skeleton::connection-write-pos conn)))
+                         (web-skeleton::connection-write-queue conn))))
+             (check "ws-send: no drained head in front of a queue"
+                    (head-drained-with-queue-p) nil)
+             (web-skeleton::connection-on-write conn)
+             (check "ws-send: still none after another write pass"
+                    (head-drained-with-queue-p) nil))
+           ;; At the bound ws-send signals. It must not truncate the frame
+           ;; and must not drop it quietly.
+           (let ((web-skeleton:*max-write-backlog*
+                   (web-skeleton::connection-write-pending conn))
+                 (pending-before (web-skeleton::connection-write-pending conn)))
+             (check "ws-send: signals at the backlog bound"
+                    (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                      (error () t))
+                    t)
+             (check "ws-send: the refused frame queued nothing"
+                    (web-skeleton::connection-write-pending conn)
+                    pending-before)))
+      (ignore-errors (sb-ext:process-kill proc 9))
+      (ignore-errors (sb-ext:process-wait proc)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The write-stall deadline
+;;;
+;;; *ws-send-timeout* used to bound a spin inside ws-send. It now bounds
+;;; how long a connection may sit on a backlog that is not moving. The
+;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
+;;; a day, and a peer that has stopped reading may still be sending, which
+;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
+;;; current — that is precisely the case the idle timeout would miss.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-write-stall-sweep ()
+  (format t "~%ws write stall~%")
+  (flet ((sweep-one (&key stalled)
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (log (make-string-output-stream))
+                 (now (get-universal-time)))
+             (unwind-protect
+                  (let ((conn (web-skeleton::make-connection
+                               :fd connfd :state :websocket
+                               ;; Fresh, so the idle sweep has no interest.
+                               :last-active now))
+                        (web-skeleton::*connections* (make-hash-table :test #'eql))
+                        (web-skeleton:*log-level* :info)
+                        (web-skeleton:*log-stream* log))
+                    (web-skeleton::epoll-add
+                     epfd connfd (logior web-skeleton::+epollin+
+                                         web-skeleton::+epollet+))
+                    ;; A backlog that exists either way; only its age differs.
+                    (web-skeleton::connection-append-write
+                     conn (make-array 64 :element-type '(unsigned-byte 8)))
+                    (setf (web-skeleton::connection-write-progress-at conn)
+                          (if stalled
+                              (- now web-skeleton:*ws-send-timeout* 1)
+                              now))
+                    (web-skeleton::register-connection conn)
+                    (web-skeleton::sweep-idle-connections epfd now)
+                    (list (hash-table-count web-skeleton::*connections*)
+                          (get-output-stream-string log)))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Control: same backlog, progress just made. Must survive — and would
+    ;; also survive the old code, which is why the stalled case below is
+    ;; what carries the check.
+    (destructuring-bind (count log) (sweep-one)
+      (check "ws stall: a moving backlog is left alone" count 1)
+      (check "ws stall: control logs nothing about stalling"
+             (search "stalled" log) nil))
+
+    ;; Stalled past the deadline with LAST-ACTIVE fresh: the idle sweep
+    ;; would never touch this connection.
+    (destructuring-bind (count log) (sweep-one :stalled t)
+      (check "ws stall: a stalled backlog is closed" count 0)
+      (check "ws stall: the log names the reason"
+             (and (search "write stalled" log) t) t))))
+
+;;; ---------------------------------------------------------------------------
+;;; A handler that pushes and also returns
+;;;
+;;; DEPLOYMENT.md's own example calls ws-send from inside ws-handler. A
+;;; handler that does that *and* returns a frame is the natural next step,
+;;; and it is the case the read branch had to convert for: the returned
+;;; frame used to go through CONNECTION-QUEUE-WRITE, which either
+;;; overwrites what ws-send queued or — now that its guard counts the
+;;; queue — signals, taking the connection down through the handler-case.
+;;;
+;;; Needs a genuinely bidirectional fd, so this builds a connected
+;;; loopback pair rather than a pipe.
+;;; ---------------------------------------------------------------------------
+
+(defun %loopback-pair ()
+  "Two connected TCP sockets over loopback. Returns (values server client)."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (multiple-value-bind (addr port) (sb-bsd-sockets:socket-name listener)
+      (declare (ignore addr))
+      (let ((client (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp)))
+        (sb-bsd-sockets:socket-connect client #(127 0 0 1) port)
+        (let ((server (sb-bsd-sockets:socket-accept listener)))
+          (sb-bsd-sockets:socket-close listener)
+          (values server client))))))
+
+(defun test-ws-handler-push-and-return ()
+  (format t "~%ws handler push and return~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((server-fd (web-skeleton::socket-fd server))
+                  (conn (web-skeleton::make-connection
+                         :fd server-fd :socket server :state :websocket
+                         :last-active (get-universal-time)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  ;; Half a megabyte, against a shrunk send buffer and a
+                  ;; client that never reads. The two paths are only
+                  ;; distinguishable when ws-send leaves a remainder: with
+                  ;; room to spare it flushes completely, the queue is
+                  ;; empty by the time the handler returns, and a write
+                  ;; that replaces the head looks exactly like one that
+                  ;; appends behind it.
+                  (pushed (web-skeleton::build-ws-frame
+                           web-skeleton::+ws-op-binary+
+                           (make-array (* 512 1024)
+                                       :element-type '(unsigned-byte 8)
+                                       :initial-element 80)))
+                  (returned (web-skeleton::build-ws-text "RETURNED"))
+                  (handler (lambda (c frame)
+                             (declare (ignore frame))
+                             ;; Push one frame, then hand back another.
+                             (web-skeleton::ws-send c pushed)
+                             returned)))
+             (web-skeleton::set-nonblocking server-fd)
+             ;; SO_SNDBUF is 7 on Linux. The kernel doubles the value and
+             ;; enforces its own floor, so this asks for "as small as you
+             ;; will give me" rather than an exact size.
+             (web-skeleton::set-socket-option-int
+              server-fd web-skeleton::+sol-socket+ 7 2048)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd server-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; The client sends one masked text frame to trigger the handler.
+             (let ((req (make-test-ws-frame "GO")))
+               (sb-bsd-sockets:socket-send client req nil))
+             (let ((signalled
+                     (handler-case
+                         (progn (web-skeleton::handle-client-read
+                                 conn epfd nil handler)
+                                nil)
+                       (error (e) (princ-to-string e)))))
+               (check "ws push+return: the read branch does not signal"
+                      signalled nil))
+             (check "ws push+return: the connection is still open"
+                    (hash-table-count web-skeleton::*connections*) 1)
+             ;; The pushed frame is still the head, partly written; the
+             ;; returned frame sits behind it rather than on top of it.
+             (check "ws push+return: the pushed frame is still the head"
+                    (web-skeleton::connection-write-end conn) (length pushed))
+             (check "ws push+return: the head is only partly written"
+                    (< (web-skeleton::connection-write-pos conn)
+                       (web-skeleton::connection-write-end conn))
+                    t)
+             (check "ws push+return: the returned frame is queued behind it"
+                    (coerce (first (web-skeleton::connection-write-queue conn))
+                            'list)
+                    (coerce returned 'list)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The ping sweep flushes inline
+;;;
+;;; A two-byte ping onto an empty queue fits in any socket with room, so
+;;; the sweep should hand it over on the spot and arm nothing. Under the
+;;; old shape the frame sat queued until EPOLLOUT came back — one
+;;; epoll_ctl per WebSocket connection per interval, in a burst, to
+;;; deliver two bytes that had already fit. PENDING = 0 on return is the
+;;; observable form of "no arming was needed".
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-ping-flush ()
+  (format t "~%ws ping flush~%")
+  (let ((epfd (web-skeleton::epoll-create))
+        (sink (open "/dev/null" :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :append)))
+    (unwind-protect
+         (let* ((conn (web-skeleton::make-connection
+                       :fd (sb-sys:fd-stream-fd sink)
+                       :state :websocket
+                       :last-active (get-universal-time)))
+                (web-skeleton::*connections* (make-hash-table :test #'eql)))
+           (web-skeleton::register-connection conn)
+           (web-skeleton::ping-ws-connections epfd)
+           (check "ws ping: nothing is left queued after the sweep"
+                  (web-skeleton::connection-write-pending conn) 0)
+           (check "ws ping: the ping was counted against the pong budget"
+                  (web-skeleton::connection-missed-pongs conn) 1)
+           ;; The fd was never registered with EPFD, so had the sweep tried
+           ;; to arm EPOLLOUT the epoll_ctl would have failed and the
+           ;; connection would have been collected as broken.
+           (check "ws ping: the connection survives without any arming"
+                  (hash-table-count web-skeleton::*connections*) 1))
+      (ignore-errors (close sink))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Outbound address filter (SSRF policy hook)
 ;;; ---------------------------------------------------------------------------
 
@@ -4798,5 +5075,9 @@
   (test-awaiting-sweep-504)
   (test-write-queue)
   (test-write-queue-drain)
+  (test-ws-send-queues)
+  (test-ws-write-stall-sweep)
+  (test-ws-handler-push-and-return)
+  (test-ws-ping-flush)
   (report-suite "Server")
   (zerop *tests-failed*))

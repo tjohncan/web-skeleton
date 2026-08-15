@@ -176,8 +176,16 @@
   "Close connections that have been idle too long.
    HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*.
    An :AWAITING connection is answered 504 first — see
-   DELIVER-AWAITING-TIMEOUT."
-  (let ((idle nil))
+   DELIVER-AWAITING-TIMEOUT.
+
+   Also closes a :WEBSOCKET connection whose write backlog has not moved
+   for *WS-SEND-TIMEOUT*. That is a different question from idleness and
+   the idle timeout cannot answer it: *WS-IDLE-TIMEOUT* defaults to a
+   day, and a peer that has stopped reading may still be sending, which
+   bumps LAST-ACTIVE and keeps the connection looking healthy while its
+   queue grows toward *MAX-WRITE-BACKLOG*."
+  (let ((idle nil)
+        (stalled nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
                ;; Outbound connections are cleaned up via their paired
@@ -188,10 +196,29 @@
                                    ((eq state :websocket) *ws-idle-timeout*)
                                    ((eq state :awaiting)  *fetch-timeout*)
                                    (t                     *idle-timeout*))))
-                   (when (and (> timeout 0)
-                              (> (- now (connection-last-active conn)) timeout))
-                     (push conn idle)))))
+                   (cond
+                     ;; Stall is checked first: a connection can be both,
+                     ;; and closing it for the reason that is actually
+                     ;; wrong with it makes the log line worth reading.
+                     ;; Measured from the last forward progress on the
+                     ;; backlog, never from LAST-ACTIVE — HANDLE-CLIENT-WRITE
+                     ;; bumps that on EPOLLOUT entry, which would refresh
+                     ;; the deadline of precisely the stuck connection.
+                     ((and (eq state :websocket)
+                           (plusp *ws-send-timeout*)
+                           (plusp (connection-write-pending conn))
+                           (> (- now (connection-write-progress-at conn))
+                              *ws-send-timeout*))
+                      (push conn stalled))
+                     ((and (> timeout 0)
+                           (> (- now (connection-last-active conn)) timeout))
+                      (push conn idle))))))
              *connections*)
+    (dolist (conn stalled)
+      (log-info "ws write stalled ~ds fd ~d (~d bytes pending) — closing"
+                *ws-send-timeout* (connection-fd conn)
+                (connection-write-pending conn))
+      (close-connection conn epoll-fd))
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
                  (connection-fd conn) (connection-state conn))
@@ -217,6 +244,7 @@
    Dead = exceeded *ws-max-missed-pongs* consecutive unanswered pings.
    Skips connections with a write in progress (they're clearly not dead)."
   (let ((dead nil)
+        (broken nil)
         (ping-frame (build-ws-ping)))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
@@ -228,16 +256,38 @@
                    ;; Nothing outstanding — send ping. Counts the append
                    ;; queue, not just the head: a connection with frames
                    ;; queued behind the one in flight is as clearly alive
-                   ;; as one mid-write, and QUEUE-WRITE would signal.
+                   ;; as one mid-write.
                    ((zerop (connection-write-pending conn))
                     (incf (connection-missed-pongs conn))
-                    (connection-queue-write conn ping-frame)
-                    (epoll-modify epoll-fd (connection-fd conn)
-                                 (logior +epollout+ +epollet+))))))
+                    (connection-append-write conn ping-frame)
+                    ;; Write it here rather than arming EPOLLOUT and coming
+                    ;; back. A two-byte ping onto an empty queue is taken
+                    ;; whole by any socket with room, so the arm-and-wake
+                    ;; round trip was one epoll_ctl per connection per
+                    ;; interval, issued as a single burst with the event
+                    ;; loop serving nobody, to deliver two bytes that had
+                    ;; already fit. Only a socket already backed up needs
+                    ;; the arm.
+                    ;;
+                    ;; A peer that has gone away makes this write signal
+                    ;; (EPIPE), and PING-WS-CONNECTIONS runs from the
+                    ;; maintenance tick inside RUN-EVENT-LOOP, which has no
+                    ;; handler and would restart the worker. Collected and
+                    ;; closed alongside the unresponsive ones instead.
+                    (handler-case
+                        (unless (eq (connection-on-write conn) :done)
+                          (epoll-modify epoll-fd (connection-fd conn)
+                                        (logior +epollout+ +epollet+)))
+                      (error (e)
+                        (log-debug "ws ping write failed fd ~d: ~a"
+                                   (connection-fd conn) e)
+                        (push conn broken)))))))
              *connections*)
     (dolist (conn dead)
       (log-info "ws dead (missed ~d pongs) fd ~d"
                 (connection-missed-pongs conn) (connection-fd conn))
+      (close-connection conn epoll-fd))
+    (dolist (conn broken)
       (close-connection conn epoll-fd))))
 
 ;;; ---------------------------------------------------------------------------
@@ -723,45 +773,64 @@
                       (websocket-on-read conn ws-handler)
                     (error (e)
                       ;; Handler error — close directly without a close frame.
-                      ;; ws-send may have left partial bytes on the wire,
-                      ;; corrupting the stream. A close frame would be
-                      ;; misinterpreted as continuation of the partial frame.
+                      ;; A ws-send may have put part of a frame on the wire
+                      ;; and left the rest queued, and this teardown drops
+                      ;; the queue; appending a close frame instead would
+                      ;; land it where the peer is still reading payload
+                      ;; and be taken as continuation of the partial one.
                       (log-warn "ws handler error fd ~d: ~a"
                                 (connection-fd conn) e)
                       (close-connection conn epoll-fd)
                       (return-from handle-client-read)))
+                ;; Every branch appends rather than replaces. The handler
+                ;; may already have queued frames through WS-SEND, and
+                ;; CONNECTION-QUEUE-WRITE would either clobber them or,
+                ;; now that its guard counts the queue, signal.
                 (cond
                   ;; Close requested — send close frame back, then shut down
                   ((eq response :close)
+                   ;; Best-effort: a full queue means the peer already is
+                   ;; not draining, and the teardown is what matters.
                    (when close-frame
-                     (connection-queue-write conn close-frame)
-                     (epoll-modify epoll-fd (connection-fd conn)
-                                  (logior +epollout+ +epollet+)))
+                     (connection-append-write conn close-frame))
                    ;; Mark as closing so on-write knows to disconnect
                    (setf (connection-state conn) :closing))
                   ;; Response frame(s) to send
                   (response
-                   (connection-queue-write conn response)
-                   (setf (connection-state conn) :websocket)
-                   (epoll-modify epoll-fd (connection-fd conn)
-                                (logior +epollout+ +epollet+)))
-                  ;; No response — re-arm edge trigger in case kernel
-                  ;; still has data we couldn't buffer earlier.
-                  ;; But if buffer is at capacity (no frames were consumed),
-                  ;; a partial frame exceeds our limit — close with 1009
-                  ;; to prevent a spin loop.
+                   (unless (connection-append-write conn response)
+                     ;; The handler produced a frame for a peer already at
+                     ;; *MAX-WRITE-BACKLOG*. Dropping it would leave the
+                     ;; app's view of the stream and the peer's permanently
+                     ;; different with nothing raised anywhere, so the
+                     ;; connection goes instead.
+                     (log-warn "ws backlog full fd ~d (~d bytes pending) — closing"
+                               (connection-fd conn)
+                               (connection-write-pending conn))
+                     (close-connection conn epoll-fd)
+                     (return-from handle-client-read))
+                   (setf (connection-state conn) :websocket))
+                  ;; No response. If the buffer is at capacity (no frames
+                  ;; were consumed), a partial frame exceeds our limit —
+                  ;; close with 1009 to prevent a spin loop.
                   (t
-                   (if (>= (connection-read-pos conn)
-                           (length (connection-read-buf conn)))
-                       (progn
-                         (log-warn "ws buffer full, no parseable frames fd ~d"
-                                   (connection-fd conn))
-                         (connection-queue-write conn (build-ws-close 1009))
-                         (setf (connection-state conn) :closing)
-                         (epoll-modify epoll-fd (connection-fd conn)
-                                      (logior +epollout+ +epollet+)))
-                       (epoll-modify epoll-fd (connection-fd conn)
-                                    (logior +epollin+ +epollet+)))))))
+                   (when (>= (connection-read-pos conn)
+                             (length (connection-read-buf conn)))
+                     (log-warn "ws buffer full, no parseable frames fd ~d"
+                               (connection-fd conn))
+                     (connection-append-write conn (build-ws-close 1009))
+                     (setf (connection-state conn) :closing))))
+                ;; One arming decision for all of them. What is pending
+                ;; now decides the interest, not which branch ran: the
+                ;; handler's own WS-SEND calls may have flushed everything
+                ;; already, or left a remainder the event loop has to
+                ;; finish. Arming EPOLLIN when nothing is pending also
+                ;; re-arms the edge trigger, in case the kernel still holds
+                ;; data that did not fit the read buffer earlier.
+                (epoll-modify epoll-fd (connection-fd conn)
+                              (logior (if (plusp (connection-write-pending conn))
+                                          +epollout+
+                                          +epollin+)
+                                      +epollet+))))
              (:close
               (close-connection conn epoll-fd))
              ;; :continue — wait for more data

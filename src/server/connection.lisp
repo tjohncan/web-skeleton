@@ -54,6 +54,12 @@
   (write-queue      nil :type list)
   (write-queue-tail nil :type list)          ; last cons of write-queue, for O(1) append
   (write-queued     0   :type fixnum)        ; unsent bytes in write-queue, head excluded
+  ;; When this connection last made forward progress on its write backlog:
+  ;; the moment the current episode began, or the last time bytes actually
+  ;; left for the peer. Deliberately not LAST-ACTIVE, which HANDLE-CLIENT-WRITE
+  ;; bumps on EPOLLOUT *entry* — that would refresh the deadline of exactly
+  ;; the connection that is stuck. See the stall sweep in main.lisp.
+  (write-progress-at 0 :type integer)
   ;; Parsed request (set once headers + body are complete)
   (request   nil :type (or null http-request))
   ;; Content-Length tracking (during :read-body state)
@@ -868,10 +874,15 @@
       ((> (+ (connection-write-pending conn) len) *max-write-backlog*) nil)
       ;; Nothing outstanding — become the head. Skips a cons, and keeps
       ;; the common single-vector case identical in shape to QUEUE-WRITE.
+      ;; Start of a backlog episode, so the stall clock starts here; an
+      ;; append onto a queue that is already busy deliberately does not
+      ;; restart it, or a producer that keeps pushing would hold a peer
+      ;; that never reads alive indefinitely.
       ((zerop (connection-write-pending conn))
        (setf (connection-write-buf conn) bytes
              (connection-write-pos conn) 0
-             (connection-write-end conn) len)
+             (connection-write-end conn) len
+             (connection-write-progress-at conn) (get-universal-time))
        t)
       (t
        (let ((cell (list bytes)))
@@ -921,7 +932,10 @@
              pending (connection-fd conn))))
   (setf (connection-write-buf conn) bytes
         (connection-write-pos conn) 0
-        (connection-write-end conn) (length bytes)))
+        (connection-write-end conn) (length bytes)
+        ;; Guard above proves nothing was pending, so this is always the
+        ;; start of an episode.
+        (connection-write-progress-at conn) (get-universal-time)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write
@@ -942,17 +956,26 @@
    loop is running. A stale END would stop the pass at the old vector's
    length and wait for an EPOLLOUT that — the socket having never
    reported unwritable — is not coming."
-  (loop
-    (let* ((pos (connection-write-pos conn))
-           (remaining (- (connection-write-end conn) pos)))
-      (cond
-        ((plusp remaining)
-         (let ((result (nb-write (connection-fd conn) (connection-write-buf conn)
-                                 pos remaining)))
-           (if (eq result :again)
-               (return :continue)
-               (incf (connection-write-pos conn) result))))
-        ;; Head drained; promote the next queued vector and keep writing.
-        ;; The socket is still writable and will not say so a second time.
-        ((connection-promote-write conn))
-        (t (return :done))))))
+  (let ((wrote nil))
+    (flet ((finish (result)
+             ;; One timestamp per pass rather than per chunk. GET-UNIVERSAL-TIME
+             ;; is a syscall and this loop runs per writable event; the stall
+             ;; deadline is in seconds, so per-chunk resolution buys nothing.
+             (when wrote
+               (setf (connection-write-progress-at conn) (get-universal-time)))
+             result))
+      (loop
+        (let* ((pos (connection-write-pos conn))
+               (remaining (- (connection-write-end conn) pos)))
+          (cond
+            ((plusp remaining)
+             (let ((result (nb-write (connection-fd conn) (connection-write-buf conn)
+                                     pos remaining)))
+               (if (eq result :again)
+                   (return (finish :continue))
+                   (progn (setf wrote t)
+                          (incf (connection-write-pos conn) result)))))
+            ;; Head drained; promote the next queued vector and keep writing.
+            ;; The socket is still writable and will not say so a second time.
+            ((connection-promote-write conn))
+            (t (return (finish :done)))))))))

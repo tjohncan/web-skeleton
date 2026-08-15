@@ -216,9 +216,9 @@ tests/
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly with size limits)
-- **WebSocket server push** — `ws-send` sends a frame to a connection synchronously
-  from within the handler, enabling streaming responses
-  without returning from the handler until the work is done
+- **WebSocket server push** — `ws-send` queues a frame and flushes what the
+  socket takes immediately, so a handler can stream without returning and
+  without a slow peer holding the worker
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
   MIME detection (including `application/wasm`, without which browsers refuse
@@ -359,11 +359,6 @@ read about here.
     an upstream that emits one byte before every timeout expires holds a
     worker indefinitely. `*fetch-timeout*`'s docstring ("Blocking fetch
     I/O timeout") reads as though it were a total. It is not.
-  - **`ws-send`** blocks until flushed or `*ws-send-timeout*` (10 s)
-    expires. One peer that stops reading freezes every other connection
-    on that worker for that long, and N such peers arriving together is a
-    full stall. See DEPLOYMENT.md for the arithmetic before building a
-    broadcast on it.
   - **Your handler, `ws-handler`, and any fetch `:then` callback** block
     for as long as they run, with no bound. Inherent rather than a
     shortcoming — that is your code on the worker thread — but it is the
@@ -400,7 +395,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
-| `*ws-send-timeout*`            | `10`      | Seconds before `ws-send` gives up writing a frame. Must be positive — there is no unbounded setting. `ws-send` blocks the **worker**, not just its connection, so this is how long one peer that stops reading may freeze every other connection on that worker |
+| `*ws-send-timeout*`            | `10`      | Seconds a connection may sit on a write backlog that is not moving before it is closed. Must be positive — there is no unbounded setting. Measured from the last forward progress on the queue, not the last activity on the connection, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Bounds one connection; `ws-send` itself does not block the worker |
 | `*fetch-timeout*`              | `30`      | Per-phase bound, not a total. On the async `http://` path it *is* end-to-end (the `:awaiting` reap covers DNS + connect + read together). On the blocking paths it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |

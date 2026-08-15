@@ -615,15 +615,17 @@ every connection on the box being simultaneously backed up to reach it.
 Lower it for many connections and a generous `ulimit`; raise it for few
 connections and bursty output.
 
-Nothing queues yet. Each of the framework's write paths sends one vector
-and waits for it, so the bound is not reachable until the queueing surfaces
-land — `ws-send` is the first.
+`ws-send` is the first surface to use it. The HTTP response path still
+sends one vector and waits for it, so a plain request/response connection
+never builds a queue.
 
-### ws-send and worker blocking
+### ws-send and the write queue
 
-`ws-send` writes a WebSocket frame to a connection synchronously,
-blocking until all bytes are flushed or `*ws-send-timeout*` expires
-(default 10 seconds).
+`ws-send` queues a WebSocket frame and flushes whatever the socket will
+take right now. It does not block, and it may return with bytes still
+queued — that is what a slow peer looks like, not an error. The event
+loop finishes the remainder.
+
 Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
@@ -637,26 +639,41 @@ so there is no write contention.
     nil))  ; return nil — we already sent our responses
 ```
 
-The worker thread is blocked for the duration of the handler call.
-With multiple workers this is fine for bounded work (e.g. streaming
-an LLM response for a few seconds), but avoid unbounded blocking —
-a slow client holds the worker hostage.
+The worker thread is blocked for the duration of the handler call. With
+multiple workers this is fine for bounded work (e.g. streaming an LLM
+response for a few seconds), but avoid unbounded blocking — that is your
+code on the worker thread, and no framework change removes it.
 
-**"Blocking" means the worker, not the connection**, and the number is
-worth stating plainly. The event loop being paused is the one serving
-*every other connection on that worker*, so one peer that stops reading
-freezes all of them for up to `*ws-send-timeout*`. With `(cpu-count)`
-workers that is 1/N of the server's capacity held by a single slow
-client, and N slow clients arriving together is a full stall.
+**What `ws-send` contributes to that is now nothing.** It used to block
+until every byte was flushed or `*ws-send-timeout*` expired, and because
+the event loop is paused while a handler runs, the thing being held was
+the worker: every other connection on it, frozen for up to ten seconds by
+one peer that stopped reading. With `(cpu-count)` workers that was 1/N of
+the server's capacity held by a single slow client, and N of them arriving
+together was a full stall.
 
-That is a property of the synchronous design rather than a defect in it.
-But an app that broadcasts to many peers, or serves any peer it does not
-control, wants the number before it picks `ws-send` over its own queue —
-in a fan-out broadcast, one unresponsive subscriber is enough.
+The frame now goes onto that connection's write queue and `ws-send`
+returns. A peer that is keeping up still gets incremental delivery,
+because the flush happens on the spot rather than waiting for the handler
+to finish; a peer that is not accumulates a backlog instead of freezing
+anything. **The blast radius is one connection.**
 
-`*ws-send-timeout*` must be positive. There is no setting that disables
-the deadline: it used to accept `0` for no deadline at all, which meant a
-peer that never drained its receive window pinned the worker permanently.
+Two limits bound what is left, and they answer different questions.
+`*max-write-backlog*` is how much may pile up; `*ws-send-timeout*` is how
+long it may sit without moving. Cross either and that one connection is
+closed. `*ws-send-timeout*` must still be positive — it used to be the
+only bound on a pinned worker, and it is now the only bound on a queue
+the peer may never drain. Note that it is measured from the last forward
+progress on the queue and not from the connection's last activity: a peer
+that keeps sending while refusing to read would otherwise keep its own
+backlog alive indefinitely.
+
+This changes the advice for fan-out. One unresponsive subscriber used to
+be enough to stall a broadcast, which was the reason to prefer your own
+queue over calling `ws-send` in a loop. It now costs that subscriber its
+own connection and nothing else. `ws-send` returns NIL when it leaves a
+remainder, so a broadcast loop that wants to know which subscribers are
+falling behind can see it without tracking anything itself.
 
 ### Logging holds the only shared lock
 
