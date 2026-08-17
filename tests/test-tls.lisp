@@ -9,7 +9,7 @@
         *tests-failed* 0
         *failed-names* nil)
   (format t "~%=== TLS Tests ===~%")
-  (if (null web-skeleton:*https-fetch-fn*)
+  (if (not (tls-loaded-p))
       (progn
         (format t "~%  SKIP  TLS not loaded (libssl not found)~%")
         (format t "~%0 passed, 0 failed (skipped)~%~%")
@@ -26,19 +26,6 @@
          (not (null web-skeleton:*https-fetch-fn*)) t)
   (check "https-stream-fn set"
          (not (null web-skeleton:*https-stream-fn*)) t))
-
-(defun tls-sym (name)
-  "Resolve a WEB-SKELETON symbol that exists only once web-skeleton-tls
-   is loaded. This test system does not depend on the TLS system — it is
-   optional, loaded at runtime by run-tests.lisp — so writing
-   WEB-SKELETON::%SSL-CTX-CTRL literally would intern the symbol at read
-   time and emit undefined-function / undefined-variable warnings on
-   every compile of a tree where TLS is not in the image. Looking the
-   name up at run time keeps the compile clean. Only ever called from
-   inside the libssl-is-loaded branch, so a miss is a real error."
-  (or (find-symbol name :web-skeleton)
-      (error "web-skeleton::~a not found — is web-skeleton-tls loaded?"
-             name)))
 
 (defun test-ssl-ctx-init ()
   ;; Smoke the shared-context init path for real. Registration checks

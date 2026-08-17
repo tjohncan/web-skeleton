@@ -1201,11 +1201,23 @@
           ;; because MAKE-THREAD plus a bind is microseconds. Only a
           ;; failing run spends the whole budget, and a failing check
           ;; should not also be the suite's longest sleep.
+          ;; Highest count seen, not the last one. Measured: a read of
+          ;; /proc/net/tcp intermittently returns 2, and once 1, while
+          ;; three healthy workers are demonstrably on the port — a
+          ;; seq_file read in chunks skips records when the table churns
+          ;; underneath it. Undercounting happens; overcounting would
+          ;; require another process on this exact port, which
+          ;; START-SERVER's own bind rules out. So a low read is noise and
+          ;; a high read is signal, and reporting the last read instead of
+          ;; the best one would fail this test at random.
           (let ((n (loop repeat 80
+                         with best = nil
                          for c = (%listen-socket-count port)
-                         when (and c (>= c workers)) return c
+                         do (when (and c (or (null best) (> c best)))
+                              (setf best c))
+                         when (and best (>= best workers)) return best
                          do (sleep 0.025)
-                         finally (return (%listen-socket-count port)))))
+                         finally (return best))))
             (check "port 0: every worker listens on the reported port"
                    n workers)))))))
 

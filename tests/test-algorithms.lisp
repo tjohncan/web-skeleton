@@ -297,12 +297,15 @@
              nil)))
 
   ;; DER encoding strips leading zeros per X.690 8.3.2.
-  ;; der-encode-ecdsa-signature lives in the optional TLS system —
-  ;; skip when libssl is not loaded.
-  (when (fboundp 'web-skeleton::der-encode-ecdsa-signature)
+  ;; der-encode-ecdsa-signature lives in the optional TLS system, so this
+  ;; asks TLS-LOADED-P whether to run and TLS-SYM for the function. It
+  ;; used to gate on (FBOUNDP 'WEB-SKELETON::DER-ENCODE-ECDSA-SIGNATURE),
+  ;; which cannot tell "no libssl" from "that name moved" and would have
+  ;; dropped this assertion silently on a rename. TLS-SYM raises instead.
+  (when (tls-loaded-p)
     (let* ((sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x42))
            (dummy (progn (setf (aref sig 0) #x00 (aref sig 1) #x4A) nil))
-           (der (funcall 'web-skeleton::der-encode-ecdsa-signature sig)))
+           (der (funcall (tls-sym "DER-ENCODE-ECDSA-SIGNATURE") sig)))
       (declare (ignore dummy))
       ;; The r INTEGER should be 31 bytes (stripped zero) not 32
       ;; Tag=0x02, then length byte
