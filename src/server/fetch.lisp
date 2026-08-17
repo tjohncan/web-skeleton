@@ -113,7 +113,8 @@
   "Maximum size of a single line in a streamed response (NDJSON,
    SSE, chunked text). Default 1 MiB. Applied by the streaming
    readers in FETCH-STREAM-PLAIN (via READER-READ-LINE /
-   READER-READ-BYTES) and TLS-STREAM-RESPONSE. Distinct from
+   READER-READ-BYTES), whichever byte source STREAM-READER is
+   wrapping. Distinct from
    *MAX-BODY-SIZE* (the inbound request-body cap) so tightening
    one does not move the other — an app tuning its request
    hardening should not incidentally break its NDJSON client.
@@ -560,8 +561,8 @@
 (defun parse-status-line-string (line)
   "String-level twin of PARSE-RESPONSE-STATUS. LINE is the first
    response line with CRLF already stripped (how the streaming
-   readers hand it over). Used by STREAM-RESPONSE-LINES and
-   TLS-STREAM-RESPONSE so their acceptance set is identical to
+   readers hand it over). Used by STREAM-RESPONSE-LINES, over either
+   transport, so its acceptance set is identical to
    the buffered path's byte-level check — without this, a non-HTTP
    upstream whose first line is '<junk> 200 OK' ('FUBAR 200 OK',
    'NOT-HTTP 418 Z') parses as status 200 on the streaming paths
@@ -1193,9 +1194,9 @@
    raises on parse failure. Returns the integer size (0 for the
    final chunk).
 
-   Shared between stream-chunked-lines (plain streaming) and
-   tls-stream-response (tls streaming) so both paths reject the
-   same garbage inputs. Strict rejection matters here because a
+   Shared between stream-chunked-lines (streaming, either
+   transport) and decode-chunked-body (buffered) so every path
+   rejects the same garbage inputs. Strict rejection matters because a
    permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
    the decoder loop as if the stream were complete — a parser-
    disagreement smuggling primitive against any stricter
@@ -1218,16 +1219,6 @@
       (when (> n *max-outbound-response-size*)
         (error "chunked: chunk-size ~d exceeds response cap" n))
       n)))
-
-(defun parse-chunked-size-bytes (bytes start end)
-  "Byte-buffer entry point for PARSE-CHUNKED-SIZE-LINE. Used by
-   tls-stream-response which accumulates the chunk-size line in a
-   (unsigned-byte 8) fill-pointered buffer — this wrapper converts
-   and calls the string-level parser so the strict acceptance set
-   is identical on both sides of the tls/plaintext split."
-  (parse-chunked-size-line
-   (sb-ext:octets-to-string bytes :start start :end end
-                                   :external-format :ascii)))
 
 (defun stream-chunked-lines (r on-line)
   "Decode chunked transfer encoding via buffered reader R. Requires

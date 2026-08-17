@@ -348,7 +348,7 @@ unrepresentable.
 for four distinct conditions — unexpected peer close without `close_notify`
 (benign for legacy HTTP/1.0-style servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`),
 real transport errors (`errno = ECONNRESET` / `EPIPE` / other),
-and read(2) failures. `tls-read-all` and `tls-stream-response` inspect `errno`
+and read(2) failures. `tls-read-all` and `ssl-byte-reader` inspect `errno`
 after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign cases
 so `*fetch-timeout*` actually bounds the HTTPS read path for close-delimited responses
 and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_notify`

@@ -1519,7 +1519,7 @@
              (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
 
   ;; String-level twin PARSE-STATUS-LINE-STRING is what the streaming
-  ;; paths (stream-response-lines, tls-stream-response) now delegate to.
+  ;; path (stream-response-lines, over either transport) delegates to.
   ;; Its acceptance set MUST match the buffered byte-level parse —
   ;; without the prefix check, a non-HTTP upstream whose first line
   ;; contains '<junk> 200' masquerades as HTTP status 200 on the
@@ -2221,6 +2221,114 @@
 (defun ascii-bytes (string)
   "Convert STRING to a byte vector."
   (sb-ext:string-to-octets string :external-format :ascii))
+
+(defun %response-corpus ()
+  "Response byte-strings covering every framing the line reader decides
+   between, each with the result TLS-STREAM-RESPONSE produced for it.
+   Entries are (NAME METHOD BYTES EXPECTED).
+
+   EXPECTED is recorded, not derived. It was captured from
+   TLS-STREAM-RESPONSE through its READ-FN seam while that function still
+   existed, at all three granularities below, which agreed — so a single
+   recorded triple is not a lie about any of them. That capture is what
+   makes the deletion of ~450 lines checkable rather than hopeful, and it
+   is the whole reason issue #4 put the seam there."
+  (let* ((cr (string #\Return))
+         (lf (string #\Newline))
+         (crlf (concatenate 'string cr lf)))
+    (flet ((raw (&rest parts)
+             (ascii-bytes (apply #'concatenate 'string parts))))
+      (list
+       ;; Byte counts here are load-bearing and were wrong once: a
+       ;; Content-Length longer than its body, or a chunk-size that
+       ;; misdescribes its chunk, makes the case test truncation under
+       ;; the name of the happy path. Three of these did, and the parity
+       ;; run still passed, because both readers agreed about the error.
+       ;; Count them.
+       (list "content-length" :GET               ; "one\ntwo\n" = 8
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
+                  "one" lf "two" lf)
+             '(200 ("one" "two") nil))
+       (list "chunked" :GET                      ; 6 = "alpha\n", 5 = "beta\n"
+             (raw "HTTP/1.1 200 OK" crlf "Transfer-Encoding: chunked" crlf crlf
+                  "6" crlf "alpha" lf crlf
+                  "5" crlf "beta" lf crlf
+                  "0" crlf crlf)
+             '(200 ("alpha" "beta") nil))
+       (list "interim 100 then 200" :GET         ; "hi\n" = 3
+             (raw "HTTP/1.1 100 Continue" crlf crlf
+                  "HTTP/1.1 200 OK" crlf "Content-Length: 3" crlf crlf
+                  "hi" lf)
+             '(200 ("hi") nil))
+       (list "interim 103 with headers" :GET
+             (raw "HTTP/1.1 103 Early Hints" crlf "Link: </s.css>" crlf crlf
+                  "HTTP/1.1 204 No Content" crlf "Content-Length: 0" crlf crlf)
+             '(204 nil nil))
+       (list "HEAD ignores echoed length" :HEAD
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 9" crlf crlf)
+             '(200 nil nil))
+       (list "close-delimited" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Type: text/plain" crlf crlf
+                  "tail" lf "end" lf)
+             '(200 ("tail" "end") nil))
+       ;; Well-framed chunk, then the stream simply stops — truncation on
+       ;; its own, not truncation plus a lying chunk-size.
+       (list "chunked truncated before terminator" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Transfer-Encoding: chunked" crlf crlf
+                  "5" crlf "beta" lf crlf)
+             '(nil ("beta") t))
+       (list "content-length short body" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 40" crlf crlf
+                  "not forty bytes" lf)
+             '(nil ("not forty bytes") t))
+       (list "bare LF terminators" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
+                  "a" lf "b" lf "c" lf "d" lf)
+             '(200 ("a" "b" "c" "d") nil))
+       (list "CR-only terminators" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 6" crlf crlf
+                  "a" cr "b" cr "c" cr)
+             '(200 ("a" "b" "c") nil))))))
+
+(defun %run-line-reader (raw method chunk)
+  "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
+   Returns (STATUS LINES RAISED-P).
+
+   RAISED-P rather than the condition text. The recorded expectations came
+   from a different implementation, which worded its truncation errors
+   differently; the claim under test is that the verdict and the lines
+   delivered before it survived the replacement, not the phrasing."
+  (let ((lines nil))
+    (handler-case
+        (let ((status (web-skeleton::stream-response-lines
+                       nil
+                       (lambda (line) (push line lines))
+                       :method method
+                       :read-fn (make-mock-read-fn raw :chunk chunk))))
+          (list status (nreverse lines) nil))
+      (error () (list nil (nreverse lines) t)))))
+
+(defun test-line-reader-over-read-fn ()
+  "STREAM-RESPONSE-LINES over a READ-FN reproduces, on every framing and
+   at three byte-source granularities, what the deleted
+   TLS-STREAM-RESPONSE produced for the same bytes.
+
+   The granularities are the part with teeth. READ-SEQUENCE fills a whole
+   buffer, so a corpus driven only through a stream never splits a token
+   across two fills and the reader's refill-and-resume paths go
+   unexercised; :CHUNK 1 puts a boundary between every pair of bytes.
+   Measured: disabling the CRLF-straddle refill in READER-READ-LINE
+   leaves all ten whole-response cases passing and the rest of the suite
+   green, while failing nine of ten at :CHUNK 1."
+  (format t "~%Shared line reader over a byte-source function~%")
+  (dolist (chunk '(nil 7 1))
+    (dolist (entry (%response-corpus))
+      (destructuring-bind (name method raw expected) entry
+        (check (format nil "capture [~a] ~a"
+                       (if chunk (format nil "chunk ~d" chunk) "whole")
+                       name)
+               (%run-line-reader raw method chunk)
+               expected)))))
 
 (defun test-streaming-fetch ()
   (format t "~%Streaming Fetch~%")
@@ -2984,8 +3092,8 @@
           '(("transfer-encoding" . "gzip")
             ("transfer-encoding" . "identity"))) nil)
 
-  ;; parse-chunked-size-line — shared by the streaming chunk parsers
-  ;; in stream-chunked-lines and tls-stream-response. Strict hex,
+  ;; parse-chunked-size-line — shared by stream-chunked-lines and the
+  ;; buffered decode-chunked-body. Strict hex,
   ;; strips chunk-extensions from ';' onwards, raises on garbage.
   ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
   ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
@@ -6194,6 +6302,7 @@
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-line-reader-over-read-fn)
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)

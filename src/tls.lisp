@@ -617,7 +617,15 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun https-fetch-stream (method host port path headers body on-line)
-  "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line."
+  "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line.
+
+   The response is read by STREAM-RESPONSE-LINES, the same function the
+   plain-HTTP path uses, with SSL-BYTE-READER supplying the bytes. This
+   used to be TLS-STREAM-RESPONSE: 386 lines reimplementing interim 1xx
+   handling, header caps, chunk framing, :HEAD gating and three
+   truncation disciplines the shared reader already had. Two readers of
+   the same bytes is the shape this codebase spends the most effort
+   refusing, and the largest instance of it was here."
   (multiple-value-bind (ssl socket)
       (tls-connect host port)
     (unwind-protect
@@ -625,17 +633,23 @@
           (tls-write-all ssl (build-outbound-request method host path
                                                      :scheme :https :port port
                                                      :headers headers :body body))
-          (tls-stream-response ssl on-line :method method))
+          (stream-response-lines nil on-line
+                                 :method method
+                                 :read-fn (ssl-byte-reader ssl)))
       (tls-close ssl socket))))
 
 (defun ssl-byte-reader (ssl)
-  "Default byte source for TLS-STREAM-RESPONSE: fill BUF, answer with the
+  "Byte source over SSL for STREAM-READER: fill BUF, answer with the
    count, :EOF on a benign close, or raise.
 
    The classification lives here rather than at the call site because a
    caller supplying its own source has no SSL pointer to hand
    SSL-READ-EOF-OR-RAISE — and that function's four-way reading of
-   SSL_ERROR_SYSCALL is not something a second site should restate."
+   SSL_ERROR_SYSCALL is not something a second site should restate.
+
+   The raise is load-bearing rather than incidental: READER-FILL treats
+   only 0 as end of stream, so answering :EOF for a reset mid-body would
+   deliver a truncated response as a clean one."
   (lambda (buf len)
     (sb-sys:with-pinned-objects (buf)
       (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) len)))
@@ -645,392 +659,6 @@
             ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
             ;; one of them is an ordinary end of stream.
             (ssl-read-eof-or-raise ssl n))))))
-
-(defun tls-stream-response (ssl on-line &key (method :GET) read-fn)
-  "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
-   Handles chunked transfer encoding. Returns the status code.
-
-   READ-FN substitutes the byte source: (READ-FN BUF LEN) fills BUF and
-   answers with the count, :EOF at a clean end of stream, or raises.
-   Defaults to SSL-BYTE-READER over SSL, which is then untouched.
-
-   A parameter added for testability is the kind of thing this codebase
-   declines, so: this function is a second implementation of what
-   STREAM-RESPONSE-LINES does, %SSL-READ takes a raw pointer, and
-   TEST-PROPERTIES.LISP's header recorded the resulting coverage gap as
-   one it could not close. The seam closes it, and it is what will make
-   deleting this function checkable rather than hopeful.
-
-   METHOD gates the body-framing discipline: for :HEAD, RFC 7231
-   §4.3.2 guarantees an empty body even when the upstream echoes
-   the GET-body Content-Length, so the body phase is skipped
-   entirely and the post-loop truncation checks are bypassed.
-
-   Truncation discipline on the TLS streaming path (twin of the
-   plain-path STREAM-RESPONSE-LINES):
-     - chunked: TERMINATED is set when the zero-size chunk header
-       arrives. The post-loop check raises if the outer loop exited
-       without seeing it (mid-body close, MITM RST, zero-byte SSL
-       read classified as benign :eof by ssl-read-eof-or-raise).
-     - content-length (no TE): BODY-CONSUMED counts body bytes as
-       they are processed, and the post-loop check raises if the
-       count is short of the declared length. The SSL-layer
-       classifier treats an errno=0 close as benign :eof, so the
-       CL comparison is the only thing standing between a MITM
-       mid-body close on a CL-framed HTTPS stream and the app
-       receiving a silently truncated response.
-     - close-delimited (no TE, no CL): the connection close IS
-       the framing signal; clean EOF is treated as complete."
-  (let ((read (or read-fn (ssl-byte-reader ssl)))
-        (buf (make-array 8192 :element-type '(unsigned-byte 8)))
-        (line-buf (make-array 4096 :element-type '(unsigned-byte 8)
-                                   :fill-pointer 0 :adjustable t))
-        (status nil)
-        (chunked nil)
-        (te-present nil)
-        (content-length nil)
-        (body-consumed 0)
-        (terminated nil)
-        (in-headers t)
-        (header-count 0)
-        (total-header-bytes 0)
-        ;; Count of 1xx interim blocks stepped over so far (RFC 7231
-        ;; §6.2). Bounded by *MAX-INTERIM-RESPONSES* so an upstream
-        ;; cannot feed well-formed interim blocks forever.
-        (interims 0)
-        ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
-        ;; line terminators. PREV-CR carries across SSL-read
-        ;; iterations so a CRLF pair split at a TLS record boundary
-        ;; collapses to one terminator. Scoped to content-phase use —
-        ;; header and chunk-size phases still use the lenient strip-CR
-        ;; behavior (headers and framing are strict CRLF in practice
-        ;; and a lone CR there is malformed either way).
-        (prev-cr nil)
-        (first-line t)
-        ;; Chunked state
-        (in-chunk-size nil)
-        (chunk-size-saw-cr nil)  ; CR seen, awaiting LF to complete CRLF
-        (chunk-remaining 0)
-        (expect-cr nil)    ; awaiting CR after chunk-data
-        (expect-lf nil)    ; awaiting LF after chunk-data
-        (chunk-size-buf (make-array 20 :element-type '(unsigned-byte 8)
-                                       :fill-pointer 0 :adjustable t)))
-    (flet ((emit-line ()
-             (let ((line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8)))
-               (setf (fill-pointer line-buf) 0)
-               line))
-           (emit-body-line ()
-             (let ((line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8)))
-               (setf (fill-pointer line-buf) 0)
-               (when on-line (funcall on-line line)))))
-      (loop
-        (when terminated (return))
-        (when (and content-length (not te-present)
-                   (>= body-consumed content-length))
-          (return))
-        (let ((n (funcall read buf (length buf))))
-          (cond
-            ((eq n :eof)
-             ;; The reader has already classified. SSL_ERROR_SYSCALL
-             ;; conflates timeout, transport error, and a benign
-             ;; HTTP/1.0-style close, so only the last of those reaches
-             ;; here — the rest raised, and the caller's unwind-protect
-             ;; tears the session down rather than presenting a
-             ;; silently-truncated NDJSON/SSE stream as success.
-             (return))
-              (t
-               (loop for i from 0 below n
-                     for byte = (aref buf i)
-                     do (let ((cap (if in-headers
-                                       *max-header-line-length*
-                                       *max-streaming-line-size*)))
-                          ;; Tighter cap during the header phase keeps a
-                          ;; 1 MiB attacker-framed "header" from coasting
-                          ;; on the body-line budget — symmetric with the
-                          ;; buffered parse-headers-bytes per-line cap.
-                          (when (>= (fill-pointer line-buf) cap)
-                            (error "streaming response line too large (~d bytes, max ~d)"
-                                   (fill-pointer line-buf) cap)))
-                        (cond
-                          ;; Header phase
-                          (in-headers
-                           (cond
-                             ((= byte 10)
-                              (let ((line (emit-line)))
-                                (if (zerop (length line))
-                                    (cond
-                                      ;; 1xx interim block (RFC 7231 §6.2).
-                                      ;; It is terminated by this empty line,
-                                      ;; carries no body, and is never the
-                                      ;; final response — so the next status
-                                      ;; line follows immediately. Reset the
-                                      ;; per-block state and stay in the
-                                      ;; header phase rather than reporting
-                                      ;; 103 as the result and streaming
-                                      ;; nothing. Checked before the HEAD arm
-                                      ;; because a HEAD request can receive an
-                                      ;; interim too.
-                                      ((and status (<= 100 status 199))
-                                       (incf interims)
-                                       (when (> interims *max-interim-responses*)
-                                         (error "https streaming: more than ~d ~
-                                                 interim responses"
-                                                *max-interim-responses*))
-                                       (setf status             nil
-                                             chunked            nil
-                                             te-present         nil
-                                             content-length     nil
-                                             first-line         t
-                                             header-count       0
-                                             total-header-bytes 0))
-                                      (t
-                                       (setf in-headers nil)
-                                       (when chunked (setf in-chunk-size t))
-                                       ;; Bodiless FINAL responses — 204 /
-                                       ;; 304 / HEAD. RFC 7230 §3.3.3 rule 1,
-                                       ;; RFC 7232 §4.1, RFC 7231 §4.3.2:
-                                       ;; the empty-line header boundary
-                                       ;; terminates regardless of CL / TE.
-                                       ;; Skip body phase and its truncation
-                                       ;; checks. Symmetric with the exempt
-                                       ;; set in complete-fetch's buffered
-                                       ;; path. 1xx is handled by the arm
-                                       ;; above and never reaches here.
-                                       (when (or (eq method :HEAD)
-                                                 (and status
-                                                      (or (= status 204)
-                                                          (= status 304))))
-                                         (return-from tls-stream-response
-                                           (or status
-                                               (error "https streaming: no parseable status line"))))))
-                                    (progn
-                                      (incf header-count)
-                                      (when (> header-count *max-header-count*)
-                                        (error "https streaming: too many headers (~d)"
-                                               header-count))
-                                      (incf total-header-bytes (length line))
-                                      (when (> total-header-bytes
-                                               *max-total-header-bytes*)
-                                        (error "https streaming: total header bytes exceed ~d"
-                                               *max-total-header-bytes*))
-                                      ;; RFC 7230 §3.2.4 — obs-fold.
-                                      ;; Buffered parse-headers-bytes
-                                      ;; rejects; streaming mirrors so
-                                      ;; the acceptance set doesn't
-                                      ;; drift. Skip the check on the
-                                      ;; status line.
-                                      (when (and (not first-line)
-                                                 (> (length line) 0)
-                                                 (or (char= (char line 0) #\Space)
-                                                     (char= (char line 0) #\Tab)))
-                                        (error "https streaming: obsolete line folding not accepted"))
-                                      (when first-line
-                                        (setf status
-                                              (parse-status-line-string line)
-                                              first-line nil))
-                                      (when (and (>= (length line) 18)
-                                                 (string-equal line "transfer-encoding:"
-                                                               :end1 18))
-                                        (setf te-present t)
-                                        (let ((value (string-trim '(#\Space #\Tab)
-                                                                   (subseq line 18))))
-                                          (when (header-has-token-p value "chunked")
-                                            (setf chunked t))))
-                                      ;; Capture Content-Length for
-                                      ;; the non-chunked truncation
-                                      ;; check. Strict digits-only
-                                      ;; parse — same discipline as
-                                      ;; SCAN-CONTENT-LENGTH on the
-                                      ;; inbound side so a malformed
-                                      ;; value does not silently
-                                      ;; disable the check.
-                                      (when (and (>= (length line) 15)
-                                                 (string-equal line "content-length:"
-                                                               :end1 15))
-                                        (let ((value (string-trim '(#\Space #\Tab)
-                                                                   (subseq line 15))))
-                                          (unless (and (> (length value) 0)
-                                                       (every (lambda (c)
-                                                                (char<= #\0 c #\9))
-                                                              value))
-                                            (error "https streaming: malformed Content-Length ~s"
-                                                   value))
-                                          (unless (<= (length value) 10)
-                                            (error "https streaming: Content-Length too many digits"))
-                                          (let ((n (parse-integer value)))
-                                            (when (and content-length (/= n content-length))
-                                              (error "https streaming: conflicting Content-Length ~d vs ~d"
-                                                     content-length n))
-                                            (setf content-length n))))))))
-                             ((= byte 13) nil)
-                             (t (vector-push-extend byte line-buf))))
-                          ;; Chunked body — reading chunk size (separate
-                          ;; buffer so body content in line-buf is not
-                          ;; corrupted across chunk boundaries). Strict
-                          ;; parse: parse-chunked-size-bytes strips
-                          ;; chunk-extensions (RFC 7230 §4.1.1 — anything
-                          ;; from ';' onwards), requires at least one
-                          ;; hex digit, and raises on parse failure.
-                          ;; The prior :junk-allowed t + NIL → final-
-                          ;; chunk behavior was a parser-disagreement
-                          ;; smuggling primitive between us and any
-                          ;; stricter downstream.
-                          ((and chunked in-chunk-size)
-                           ;; Strict CRLF only. Bare LF and bare CR
-                           ;; both reject. Empty chunk-size lines
-                           ;; reject via PARSE-CHUNKED-SIZE-LINE's
-                           ;; own empty-hex guard. Symmetric with
-                           ;; the plain path's READER-READ-CRLF-LINE
-                           ;; and the buffered path's
-                           ;; DECODE-CHUNKED-BODY — without this,
-                           ;; bare-LF or bare-CR terminators were a
-                           ;; parser-disagreement primitive against
-                           ;; strict downstream re-parsers.
-                           (cond
-                             ((= byte 13)
-                              (when chunk-size-saw-cr
-                                (error "https streaming: double CR in chunk-size"))
-                              (setf chunk-size-saw-cr t))
-                             ((= byte 10)
-                              (unless chunk-size-saw-cr
-                                (error "https streaming: bare LF in chunk-size line"))
-                              (let ((size (parse-chunked-size-bytes
-                                           chunk-size-buf 0
-                                           (fill-pointer chunk-size-buf))))
-                                (setf (fill-pointer chunk-size-buf) 0
-                                      chunk-size-saw-cr nil)
-                                (cond
-                                  ((zerop size)
-                                   ;; Final chunk — mark terminated
-                                   ;; so the outer loop's guard
-                                   ;; exits cleanly. The post-loop
-                                   ;; check then passes, and a
-                                   ;; stream that closed mid-body
-                                   ;; without reaching this point
-                                   ;; will raise.
-                                   (setf terminated t)
-                                   (return))
-                                  (t (setf chunk-remaining size
-                                           in-chunk-size nil)))))
-                             (t
-                              (when chunk-size-saw-cr
-                                (error "https streaming: bare CR in chunk-size line"))
-                              (when (>= (fill-pointer chunk-size-buf)
-                                        *max-header-line-length*)
-                                (error "https streaming: chunk-size line too long (max ~d)"
-                                       *max-header-line-length*))
-                              (vector-push-extend byte chunk-size-buf))))
-                          ;; Strict CRLF after chunk-data (RFC 7230 4.1).
-                          ;; Symmetric with decode-chunked-body and
-                          ;; reader-expect-crlf on the plain paths.
-                          (expect-cr
-                           (unless (= byte 13)
-                             (error "chunked stream: expected CR after chunk-data"))
-                           (setf expect-cr nil
-                                 expect-lf t))
-                          (expect-lf
-                           (unless (= byte 10)
-                             (error "chunked stream: expected LF after chunk-data"))
-                           (setf expect-lf nil
-                                 in-chunk-size t))
-                          ;; Chunked body — reading chunk data. Content-
-                          ;; phase terminators are CR / LF / CRLF
-                          ;; (WHATWG EventStream §9.2); PREV-CR carries
-                          ;; a CR's LF-partner across subsequent bytes
-                          ;; so the LF does not emit a second line.
-                          (chunked
-                           (when (> chunk-remaining 0)
-                             (decf chunk-remaining)
-                             (cond
-                               ((= byte 13)
-                                (emit-body-line)
-                                (setf prev-cr t))
-                               ((= byte 10)
-                                (cond
-                                  (prev-cr (setf prev-cr nil))
-                                  (t (emit-body-line))))
-                               (t
-                                (setf prev-cr nil)
-                                (vector-push-extend byte line-buf))))
-                           (when (zerop chunk-remaining)
-                             (setf expect-cr t)))
-                          ;; Non-chunked body. BODY-CONSUMED tracks
-                          ;; every byte that flows through the body
-                          ;; cond, so the post-loop CL check can
-                          ;; compare against declared length. For
-                          ;; close-delimited responses (no CL set),
-                          ;; the count is still maintained but never
-                          ;; compared. CR / LF / CRLF treated as
-                          ;; equivalent terminators (same as chunked
-                          ;; and the plain-path reader).
-                          (t
-                           (incf body-consumed)
-                           (cond
-                             ((= byte 13)
-                              (emit-body-line)
-                              (setf prev-cr t))
-                             ((= byte 10)
-                              (cond
-                                (prev-cr (setf prev-cr nil))
-                                (t (emit-body-line))))
-                             (t
-                              (setf prev-cr nil)
-                              (vector-push-extend byte line-buf)))
-                           (when (and content-length (not te-present)
-                                      (>= body-consumed content-length))
-                             ;; Hit declared length — stop processing
-                             ;; and let the outer loop exit via its
-                             ;; pre-read guard so any trailing bytes
-                             ;; in the current buffer are discarded.
-                             (return))))))))))
-    ;; Post-loop truncation checks. Raise loud on either framing
-    ;; shape that came up short — the outer UNWIND-PROTECT in
-    ;; HTTPS-FETCH-STREAM closes the TLS session and the error
-    ;; propagates to the app so a silently-truncated NDJSON / SSE
-    ;; stream is no longer presented as 'success with short body'.
-    (when (and chunked (not terminated))
-      (error "https streaming: chunked response missing zero-size terminator"))
-    (when (and content-length (not te-present)
-               (< body-consumed content-length))
-      (error "https streaming: short body (~d of ~d bytes)"
-             body-consumed content-length))
-    ;; Flush any remaining unterminated line
-    (when (> (fill-pointer line-buf) 0)
-      (when on-line
-        (funcall on-line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8))))
-    (unless status
-      (error "https streaming: no parseable status line"))
-    status))
-
-;;; ===========================================================================
-;;; Crypto primitives — EVP digest + ECDSA verify
-;;;
-;;; At load time, this file swaps web-skeleton's public SHA-1, SHA-256,
-;;; and ECDSA-VERIFY-P256 symbols for libssl-backed implementations via
-;;; SETF SYMBOL-FUNCTION. The pure-Lisp originals stay reachable as
-;;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP for framework-dev
-;;; verification via TEST-PURE-LISP-CRYPTO.
-;;;
-;;; SHA uses the EVP_MD_CTX interface — the modern, non-deprecated path.
-;;; We deliberately avoid the one-shot SHA1() / SHA256() symbols, which
-;;; are marked OSSL_DEPRECATEDIN_3_0 in OpenSSL 3's headers.
-;;;
-;;; ECDSA uses d2i_PUBKEY (not deprecated in 3.0) to parse a hand-built
-;;; SubjectPublicKeyInfo, then EVP_PKEY_verify against a DER-encoded
-;;; SEQUENCE { r, s } signature. HMAC-SHA256 is not accelerated
-;;; directly — it's pure-Lisp, but its internal SHA-256 calls route
-;;; through the function cell and pick up the libssl swap for free.
-;;; ===========================================================================
-
-;;; ---------------------------------------------------------------------------
-;;; FFI bindings (digest)
-;;; ---------------------------------------------------------------------------
 
 (sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
 
