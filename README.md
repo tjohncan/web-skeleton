@@ -439,7 +439,8 @@ All configurable via `setf` before calling `start-server`.
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*shutdown-poll-interval*`     | `1`       | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout)                                                                                                                                                                  |
 
-The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, and `on-listen` are
+passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)
@@ -448,6 +449,25 @@ The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword
               :handler #'my-app:handle-request
               :ws-handler #'my-app:handle-ws-message)
 ```
+
+`:port 0` asks the kernel for an ephemeral port, and `:on-listen` — a
+function of one argument, called once after the workers are spawned —
+receives the port actually bound. It fires for a fixed port too, so a
+caller need not know which kind it asked for.
+
+```lisp
+(start-server :port 0
+              :on-listen (lambda (port) (format t "listening on ~d~%" port))
+              :handler #'my-app:handle-request)
+```
+
+Resolve the port this way rather than binding port 0 yourself, reading the
+number, closing, and passing it in. Every listener sets `SO_REUSEPORT`, so
+a second process handed that number in the gap between your close and the
+server's bind does not fail its bind — both hold the port and the kernel
+splits traffic between them, with nothing in either log. `start-server`
+hands its own bound socket to worker 0, so the port is never free between
+being chosen and being served.
 
 `:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector
 and dispatches the listener family accordingly.

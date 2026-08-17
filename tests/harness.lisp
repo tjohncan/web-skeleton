@@ -36,60 +36,36 @@
   "Port the live test server is listening on inside WITH-TEST-SERVER.")
 
 ;;; ---------------------------------------------------------------------------
-;;; Ephemeral port discovery + readiness
+;;; Readiness and ownership
+;;;
+;;; There used to be a FIND-FREE-PORT here: bind port 0, close, hand the
+;;; number to START-SERVER, which rebound it milliseconds later. The gap
+;;; between that close and that rebind cost two investigations. Every
+;;; listener sets SO_REUSEPORT, so a second process handed the same
+;;; number in the gap did not fail its bind — both held the port and the
+;;; kernel split traffic between them, silently, measured at 17/23 across
+;;; 40 requests. From inside a test that looked like a ten-second read
+;;; deadline expiring somewhere unrelated to whatever was being changed.
+;;;
+;;; START-SERVER now takes :PORT 0 and reports the bound port through
+;;; :ON-LISTEN, so the number is never knowable before a listener holds
+;;; it and there is no gap to lose. CHECK-OWNS-PORT stays anyway — see
+;;; its docstring for why a closed hole still gets a detector.
 ;;; ---------------------------------------------------------------------------
-
-(defun find-free-port ()
-  "Bind a temporary socket to port 0, let the kernel pick a free port,
-   then close and return it.
-
-   There is a race between that close and the caller's rebind, and it is
-   not theoretical — it has cost two investigations. What this docstring
-   used to get wrong was the symptom. It assumed a collision would show
-   up as a bind failure; every listener sets SO_REUSEPORT, so the second
-   bind *succeeds* and the kernel load-balances between two servers on
-   one port. Measured, with two suites racing: 40 requests split 17/23,
-   no error, no warning, nothing in either log.
-
-   What that looks like from inside a test is a request answered by the
-   other suite's handler, or accepted into the backlog of a server that
-   is mid-teardown and never answers. Ten seconds later, a read deadline
-   expires in a test that has nothing to do with whatever was being
-   changed at the time.
-
-   The durable fix is the one this docstring already named: teach
-   START-SERVER to accept port 0 and report the bound port back, so the
-   listener exists before the number can be handed to anyone else. Until
-   then CALL-WITH-TEST-SERVER probes for a nonce, which does not close
-   the window but does turn a ten-minute mystery into a named failure.
-
-   Operationally: one suite at a time on a machine."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream :protocol :tcp)))
-    (unwind-protect
-         (progn
-           (sb-bsd-sockets:socket-bind socket #(127 0 0 1) 0)
-           (multiple-value-bind (host port)
-               (sb-bsd-sockets:socket-name socket)
-             (declare (ignore host))
-             port))
-      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun check-owns-port (nonce)
   "Confirm the server answering *TEST-PORT* is the one this test started.
 
-   Cannot close FIND-FREE-PORT's window — the durable fix for that is a
-   START-SERVER that reports its own bound port. What it does is name the
-   failure. With SO_REUSEPORT two servers can hold one port and the
-   kernel splits traffic between them silently, so the symptom is a
-   request answered by someone else's handler, or a connection accepted
-   by a server that is shutting down and will never reply. Left alone
-   that surfaces ten seconds later as a read deadline in an unrelated
-   test, and costs an afternoon.
+   START-SERVER resolving port 0 itself closes the close-then-rebind
+   window this was written for, so the probe is a detector against that
+   resolution regressing rather than a warning about a live hazard. It
+   costs one request per server start and nothing else would report the
+   regression: with SO_REUSEPORT a shared port produces no error
+   anywhere, and the suite's first symptom is a read deadline in an
+   unrelated test.
 
-   Probing once per server start catches roughly half of any given
-   collision, which across a suite of forty is plenty — and one clear
-   line beats one silent hang.
+   It also covers what the resolution does not: a port passed in by
+   hand, or another process that binds this one explicitly.
 
    Raises only on positive evidence: a 200 whose body is somebody else's.
    Anything else is inconclusive and passes, because some tests lower
@@ -105,12 +81,24 @@
               Another process is bound to the same port — every listener ~
               sets SO_REUSEPORT, so a collision shares the port instead of ~
               failing the bind, and the kernel splits traffic between the ~
-              two. Run one suite at a time; see FIND-FREE-PORT."
+              two. This port came from START-SERVER's own bind, so reaching ~
+              here means either something bound it explicitly or that ~
+              resolution regressed; see START-SERVER's :ON-LISTEN."
              *test-port* nonce body))))
 
 (defun wait-for-port (port &key (timeout 5))
   "Poll PORT every 50ms until it accepts a TCP connection, or TIMEOUT
-   seconds elapse. Signals an error on timeout."
+   seconds elapse. Signals an error on timeout.
+
+   Nearly redundant with :ON-LISTEN, which does not fire until a listener
+   is bound and listening — but not entirely, and the remainder is the
+   reason it stays. RUN-WORKER restarts on an unhandled error, and its
+   cleanup closes the listener before the retry rebinds it; a worker that
+   loses EPOLL-CREATE to EMFILE spends its backoff with the port shut.
+   This waits that out. Dropping it would push the same wait onto
+   CHECK-OWNS-PORT, which treats a connection error as inconclusive and
+   passes — turning a recoverable stumble into a confusing failure in the
+   test body."
   (let ((deadline (+ (get-internal-real-time)
                      (* timeout internal-time-units-per-second))))
     (loop
@@ -143,8 +131,7 @@
   `(call-with-test-server ,handler ,ws-handler (lambda () ,@body)))
 
 (defun call-with-test-server (handler ws-handler thunk)
-  (let ((port (find-free-port))
-        (saved-hooks web-skeleton::*shutdown-hooks*)
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
         (saved-poll  web-skeleton:*shutdown-poll-interval*))
     ;; Global SETF (not a LET binding) for the shutdown-related specials:
@@ -161,12 +148,26 @@
     (unwind-protect
          (let* ((nonce (format nil "~36r~36r" (random (expt 36 8))
                                (get-internal-real-time)))
+                ;; Written by the server thread, read by this one. The
+                ;; semaphore is the happens-before edge, so no lock and no
+                ;; polling loop — and unlike a poll, a server that dies
+                ;; before binding fails here by name instead of by timeout
+                ;; somewhere later.
+                (bound-port nil)
+                (listening (sb-thread:make-semaphore :name "test-server-port"))
                 (server-thread
                   (sb-thread:make-thread
                    (lambda ()
                      (start-server :host #(127 0 0 1)
-                                   :port port
+                                   ;; 0, not a pre-picked number: the port
+                                   ;; must not exist as a value anywhere
+                                   ;; before a listener is holding it.
+                                   :port 0
                                    :workers 1
+                                   :on-listen
+                                   (lambda (p)
+                                     (setf bound-port p)
+                                     (sb-thread:signal-semaphore listening))
                                    ;; Wrapped so every server answers one
                                    ;; reserved path with its own nonce,
                                    ;; whatever the test's handler does.
@@ -183,8 +184,13 @@
                    :name "web-skeleton-test-server")))
            (unwind-protect
                 (progn
-                  (wait-for-port port)
-                  (let ((*test-port* port))
+                  (unless (sb-thread:wait-on-semaphore listening :timeout 10)
+                    (error "test server never reported a bound port within ~
+                            10s — START-SERVER raised before :ON-LISTEN, or ~
+                            the bind failed. The server thread's own error ~
+                            should be above this one."))
+                  (wait-for-port bound-port)
+                  (let ((*test-port* bound-port))
                     (check-owns-port nonce)
                     (funcall thunk)))
              ;; Teardown: signal shutdown, join with a bounded timeout,
