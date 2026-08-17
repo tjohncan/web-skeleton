@@ -402,11 +402,17 @@
                    (ssl-write-error-raise ssl n))
                  (incf pos n))))))
 
-(defun ssl-read-eof-or-raise (ssl n)
+(defun ssl-read-eof-or-raise (ssl n &optional (err (%ssl-get-error ssl n)))
   "Classify a non-positive SSL_read return. Returns :EOF if the peer
    cleanly closed the stream, raises otherwise so the outer
    handler-case converts the error into a 502 and fires the fetch
    callback's cleanup sentinel.
+
+   ERR defaults to asking SSL_get_error here, and is passed in by a caller
+   that has already asked. SSL_get_error may consult errno, so the answer
+   belongs to the SSL_read it followed; taking it as an argument keeps a
+   caller that needed to branch on WANT_READ first from having to ask a
+   second time and hope nothing moved in between.
 
    SSL_ERROR_SYSCALL conflates at least four distinct conditions
    and must NOT be treated uniformly as clean EOF:
@@ -430,7 +436,7 @@
                                  response and the app sees 'success'.
                               Loud raise.
    Other SSL errors (WANT_READ / WANT_WRITE / SSL / etc) also raise."
-  (let ((err (%ssl-get-error ssl n)))
+  (progn
     (cond
       ((= err +ssl-error-zero-return+) :eof)
       ((= err +ssl-error-syscall+)
@@ -714,6 +720,49 @@
                                  :method method
                                  :read-fn (ssl-byte-reader ssl)))
       (tls-close ssl socket))))
+
+(defun ssl-connection-reader (ssl)
+  "A CONNECTION read-fn over SSL. Fills BUFFER[START..START+MAX-BYTES) and
+   answers NB-READ's contract: bytes read, :AGAIN, :EOF, or a raise.
+
+   WANT_READ becomes :AGAIN, and that one mapping is what makes
+   CONNECTION-READ-AVAILABLE's existing drain loop enforce the SSL_pending
+   discipline for free. SSL_read hands back whatever it has already
+   decrypted before it goes near the socket and returns at most one record
+   per call, so a loop that runs until :AGAIN empties OpenSSL's buffer as
+   well as the kernel's. Stopping earlier leaves decrypted bytes in user
+   space with nothing left on the fd, and an edge-triggered epoll has no
+   reason to wake again — the connection hangs holding its own answer.
+
+   WANT_WRITE is deliberately not :AGAIN. It means the SSL wants to send
+   before it can read — a renegotiation or a post-handshake message — and
+   what it is asking for is another SSL_READ once the socket is *writable*.
+   The event loop outside :OUT-HANDSHAKE is built on readable-means-read,
+   so there is nowhere to put that request; answering :AGAIN would park the
+   connection waiting for a readability event that is not coming, turning a
+   condition we can name into a hang we cannot. Raising is the honest
+   answer until the direction inversion lands.
+
+   Everything else defers to SSL-READ-EOF-OR-RAISE, with the error code
+   passed along, so the four-way reading of SSL_ERROR_SYSCALL stays in one
+   place and this function cannot drift from the blocking path's idea of
+   what a clean end of stream is."
+  (lambda (buffer start max-bytes)
+    (sb-sys:with-pinned-objects (buffer)
+      (let ((n (%ssl-read ssl
+                          (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                          max-bytes)))
+        (if (> n 0)
+            n
+            (let ((err (%ssl-get-error ssl n)))
+              (cond
+                ((= err +ssl-error-want-read+) :again)
+                ((= err +ssl-error-want-write+)
+                 (error "SSL_read returned WANT_WRITE: the retry it wants ~
+                         is another SSL_read once the socket is writable, ~
+                         which this state machine cannot express. See ~
+                         SSL-CONNECTION-READER."))
+                (t (ssl-read-eof-or-raise ssl n err)))))))))
 
 (defun ssl-byte-reader (ssl)
   "Byte source over SSL for STREAM-READER: fill BUF, answer with the

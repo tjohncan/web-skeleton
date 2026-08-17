@@ -19,6 +19,7 @@
         (test-ssl-ctx-init)
         (test-tls-client-ssl)
         (test-tls-end-to-end)
+        (test-tls-ssl-pending)
         (report-suite "TLS")
         (zerop *tests-failed*))))
 
@@ -55,6 +56,10 @@ for n in right wrong; do
   openssl req -newkey rsa:2048 -nodes -keyout \"$n.key\" -out \"$n.csr\" -subj \"/CN=$n.test\" >/dev/null 2>&1
   openssl x509 -req -in \"$n.csr\" -CA ca.pem -CAkey ca.key -CAcreateserial -out \"$n.pem\" -days 2 -sha256 -extfile \"$n.ext\" >/dev/null 2>&1
 done
+i=0
+while [ $i -lt 1024 ]; do printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ012345ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\\n'; i=$((i+1)); done > body.txt
+printf 'TAIL-MARKER\\n' >> body.txt
+{ printf 'HTTP/1.0 200 OK\\r\\nContent-Length: %d\\r\\n\\r\\n' \"$(wc -c < body.txt)\"; cat body.txt; } > response.txt
 "
   "Generates a CA and two leaves, one per hostname.
 
@@ -98,21 +103,62 @@ done
             (ignore-errors (sb-bsd-sockets:socket-close s))
             (sleep 0.05)))))))
 
-(defun %call-with-tls-peer (dir leaf fn)
+(defun %call-with-tls-peer (dir leaf fn &key relay-file)
   "Run openssl s_server in DIR presenting LEAF's certificate, call FN with
-   the port, then stop it. FN gets NIL if the server never came up."
+   the port, then stop it. FN gets NIL if the server never came up.
+
+   With no RELAY-FILE it runs -www, whose canned status page is a few
+   hundred bytes. RELAY-FILE instead feeds a file on s_server's stdin,
+   which relay mode sends to the client as-is — the way to arrange a
+   response bigger than one TLS record, and bigger than the read buffer.
+
+   Not -HTTP, which looked like the obvious way to serve a large file and
+   is not: measured, it truncates at around 10 KB against a reader that
+   consumes in 4 KiB steps driven by epoll, while delivering the whole file
+   to s_client. The cause is s_server's, not ours — a clean close_notify
+   arrives mid-body — but a fixture that stops early for reasons belonging
+   to the fixture cannot support an assertion about our drain loop."
   (let* ((port (%pick-free-port))
+         ;; Bare name with :SEARCH T, matching dns.lisp's getent call. The
+         ;; fixture script runs openssl through /bin/sh and so resolves it
+         ;; via PATH; hardcoding /usr/bin/openssl here would make the two
+         ;; halves disagree about where openssl is on any machine that keeps
+         ;; it elsewhere — Homebrew, Nix, /usr/local in a slim image. Cert
+         ;; generation would succeed, the peer would not come up, and the
+         ;; failure would read as a TLS problem.
          (proc (sb-ext:run-program
-                "/usr/bin/openssl"
-                (list "s_server" "-accept" (princ-to-string port)
-                      "-cert" (format nil "~a/~a.pem" dir leaf)
-                      "-key"  (format nil "~a/~a.key" dir leaf)
-                      "-www" "-quiet")
-                :wait nil :output nil :error nil)))
+                "openssl"
+                (append
+                 (list "s_server" "-accept" (princ-to-string port)
+                       "-cert" (format nil "~a/~a.pem" dir leaf)
+                       "-key"  (format nil "~a/~a.key" dir leaf)
+                       "-quiet")
+                 (if relay-file (list "-naccept" "1") (list "-www")))
+                :wait nil :output nil :error nil
+                :directory dir :search t
+                :input (and relay-file (pathname relay-file)))))
     (unwind-protect
-         (funcall fn (and (%wait-for-accept port) port))
+         ;; Relay mode serves exactly one connection, so it cannot be
+         ;; probed: a probe that connects consumes the connection the test
+         ;; needs and s_server exits before the test arrives. The port goes
+         ;; through unprobed and %TLS-CONNECT-RETRYING is the readiness
+         ;; check instead.
+         (funcall fn (if relay-file port (and (%wait-for-accept port) port)))
       (ignore-errors (sb-ext:process-kill proc 15))
       (ignore-errors (sb-ext:process-wait proc)))))
+
+(defun %tls-connect-retrying (host port &key (attempts 60))
+  "TLS-CONNECT, retrying while the peer is still coming up.
+
+   Needed because the relay-mode peer cannot be probed for readiness
+   without spending the one connection it will serve. Retrying the real
+   connect asks the same question without consuming the answer."
+  (loop for i from 1 to attempts
+        do (handler-case
+               (return (funcall (tls-sym "TLS-CONNECT") host port))
+             (error (e)
+               (when (= i attempts) (error e))
+               (sleep 0.05)))))
 
 (defun test-tls-end-to-end ()
   "A real handshake against a real peer, and a trusted-but-wrong
@@ -172,6 +218,32 @@ done
                                   200))
                       (ignore-errors
                        (funcall (tls-sym "TLS-CLOSE") ssl socket)))))))
+              ;; WANT_READ becomes :AGAIN, asserted on its own because the
+              ;; large-response test never reaches it: a peer that sends
+              ;; everything and closes ends the drain on close_notify, so
+              ;; the mapping is invisible there — removing it changed
+              ;; nothing in a full suite run. Here nothing has been
+              ;; requested yet, so the socket is genuinely empty and
+              ;; SSL_read has no answer but "not yet".
+              (%call-with-tls-peer
+               dir "right"
+               (lambda (port)
+                 (check "tls e2e: peer came up (want-read)" (not (null port)) t)
+                 (when port
+                   (multiple-value-bind (ssl socket)
+                       (funcall (tls-sym "TLS-CONNECT") "right.test" port)
+                     (unwind-protect
+                          (let ((fd (web-skeleton::socket-fd socket))
+                                (buf (make-array 4096
+                                                 :element-type '(unsigned-byte 8))))
+                            (web-skeleton::set-nonblocking fd)
+                            (check "tls e2e: an empty TLS socket answers :again"
+                                   (funcall
+                                    (funcall (tls-sym "SSL-CONNECTION-READER") ssl)
+                                    buf 0 4096)
+                                   :again))
+                      (ignore-errors
+                       (funcall (tls-sym "TLS-CLOSE") ssl socket)))))))
              ;; Wrong name, same CA. Trusted issuer, wrong subject.
              (%call-with-tls-peer
               dir "wrong"
@@ -181,6 +253,143 @@ done
                   (check-error
                    "tls e2e: a trusted certificate for another host is refused"
                    (funcall (tls-sym "TLS-CONNECT") "right.test" port)))))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-tls-ssl-pending ()
+  "A TLS response far larger than the read buffer arrives complete, through
+   CONNECTION-READ-AVAILABLE over an SSL byte source, driven only by
+   edge-triggered epoll.
+
+   This is the trap issue #8 calls the one that will bite, and until now it
+   was an argument rather than a test. SSL_read returns at most one record
+   per call and hands back already-decrypted bytes before it touches the
+   socket. Consume part of a record and the remainder sits in OpenSSL's
+   buffer with nothing left on the fd, so an edge-triggered epoll has no
+   transition to report and never fires again. The connection then hangs
+   holding its own answer.
+
+   The shape of the assertion is what makes it a test of that and not of
+   something easier. Reads are driven exclusively from EPOLL-WAIT, and the
+   loop stops the moment epoll goes quiet. A drain that leaves bytes inside
+   OpenSSL therefore loses them for good, exactly as it would in the event
+   loop, and the body comes up short. Calling CONNECTION-READ-AVAILABLE in a
+   plain loop instead would find those bytes on the next call and pass
+   against the bug.
+
+   64 KiB of body, against a 4 KiB starting buffer: OpenSSL sends bulk data
+   in records up to 16 KiB, so most SSL_read calls here return a partial
+   record and leave the rest pending. One record larger than one buffer is
+   the condition; this arranges several."
+  (format t "~%TLS SSL_pending discipline~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/response.txt" dir))
+             (check "ssl-pending: fixture generated" nil t)
+             (return-from test-tls-ssl-pending))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           (let ((web-skeleton::*dns-resolve-blocking-fn*
+                   (lambda (host) (declare (ignore host))
+                     (values #(127 0 0 1) :inet)))
+                 (expected (with-open-file (s (format nil "~a/body.txt" dir)
+                                              :element-type '(unsigned-byte 8))
+                             (file-length s))))
+             (check "ssl-pending: fixture body is bigger than one record"
+                    (> expected 16384) t)
+             (%call-with-tls-peer
+              dir "right"
+              (lambda (port)
+                (check "ssl-pending: peer came up" (not (null port)) t)
+                (when port
+                  (multiple-value-bind (ssl socket)
+                      (%tls-connect-retrying "right.test" port)
+                    (let ((epfd (web-skeleton::epoll-create)))
+                      (unwind-protect
+                           (let* ((fd (web-skeleton::socket-fd socket))
+                                  (reads (list 0))
+                                  (conn (web-skeleton::make-connection
+                                         :fd fd :socket socket :state :out-read
+                                         :outbound-p t
+                                         :last-active (get-universal-time)
+                                         :read-fn
+                                         (let ((inner (funcall
+                                                       (tls-sym "SSL-CONNECTION-READER")
+                                                       ssl)))
+                                           (lambda (b s m)
+                                             (incf (car reads))
+                                             (funcall inner b s m)))))
+                                  (evbuf (make-array
+                                          (* 4 web-skeleton::+epoll-event-size+)
+                                          :element-type '(unsigned-byte 8)))
+                                  (verdicts nil))
+                             ;; No request is sent: relay mode pushes the
+                             ;; canned response as soon as the handshake
+                             ;; completes, and the read path is what is
+                             ;; under test.
+                             (web-skeleton::set-nonblocking fd)
+                             (web-skeleton::epoll-add
+                              epfd fd (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+                             ;; Reads happen only when epoll says so. If a
+                             ;; drain ever leaves bytes inside OpenSSL, epoll
+                             ;; goes quiet and this loop ends short.
+                             (loop repeat 200
+                                   while (not (member (first verdicts)
+                                                      '(:eof :ok-eof)))
+                                   do (if (plusp (web-skeleton::epoll-wait
+                                                  epfd evbuf 4 1000))
+                                          (push (web-skeleton::connection-read-available
+                                                 conn)
+                                                verdicts)
+                                          (return)))
+                             (let* ((got (web-skeleton::connection-read-pos conn))
+                                    (raw (sb-ext:octets-to-string
+                                          (subseq (web-skeleton::connection-read-buf conn)
+                                                  0 got)
+                                          :external-format :latin-1))
+                                    (blank (search (format nil "~c~c~c~c"
+                                                           #\Return #\Newline
+                                                           #\Return #\Newline)
+                                                   raw)))
+                               (check "ssl-pending: stream ended, not stalled"
+                                      (and (member (first verdicts) '(:eof :ok-eof))
+                                           t)
+                                      t)
+                               ;; The discriminating pair. Many SSL_read
+                               ;; calls were needed, and they happened
+                               ;; *inside* the drain rather than one per
+                               ;; epoll wake-up — which is the whole
+                               ;; SSL_pending property. A drain that
+                               ;; returned after one SSL_read would need
+                               ;; one wake-up per record, and the records
+                               ;; it had already decrypted would never
+                               ;; produce one.
+                               ;; Loose on purpose. The exact count depends
+                               ;; on OpenSSL's record sizing and on the
+                               ;; buffer's doubling schedule, and pinning it
+                               ;; would make this test track both. What
+                               ;; matters is that it is many, not one.
+                               (check "ssl-pending: many SSL_read calls were needed"
+                                      (> (car reads) 5) t)
+                               (check "ssl-pending: and they ran inside the drain"
+                                      (> (car reads) (* 2 (length verdicts))) t)
+                               (check "ssl-pending: headers arrived"
+                                      (and blank t) t)
+                               (check "ssl-pending: the whole body arrived"
+                                      (and blank (= (- got (+ blank 4)) expected))
+                                      t)
+                               (check "ssl-pending: and its last line is intact"
+                                      (and (search "TAIL-MARKER" raw) t) t)))
+                        (ignore-errors (web-skeleton::%close epfd))
+                        (ignore-errors
+                         (funcall (tls-sym "TLS-CLOSE") ssl socket)))))))
+              :relay-file (format nil "~a/response.txt" dir))))
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
