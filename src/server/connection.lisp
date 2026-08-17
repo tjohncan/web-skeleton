@@ -25,6 +25,18 @@
   (fd        -1  :type fixnum)               ; raw file descriptor
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
   (remote-addr nil)                           ; peer IP as string, or NIL for outbound
+  ;; Byte source and sink. NIL means the raw fd, via NB-READ / NB-WRITE.
+  ;; A transport that is not the fd — TLS, whose bytes come out of
+  ;; SSL_read rather than read(2) — installs a closure of the same
+  ;; contract here, and the rest of the state machine does not change.
+  ;;
+  ;; INVARIANT: CONNECTION-READ-INTO and CONNECTION-WRITE-FROM are the
+  ;; only paths to a connection's transport. Not a style preference —
+  ;; it is load-bearing for TLS, and the reason is in
+  ;; CONNECTION-READ-INTO's docstring. A "just this once" direct call at
+  ;; some site that looks special is how it gets broken.
+  (read-fn   nil :type (or null function))
+  (write-fn  nil :type (or null function))
   ;; Protocol state
   ;;   :read-http             — accumulating HTTP request bytes
   ;;   :read-body             — have headers, reading Content-Length body
@@ -245,8 +257,51 @@
         (* 2 *max-header-count*)  ; CRLF ending each header
         4))))                     ; request-line and blank-line CRLFs
 
+(defun connection-read-into (conn buffer start max-bytes)
+  "Read from CONN's transport into BUFFER[START..START+MAX-BYTES).
+   Returns bytes read, :AGAIN if it would block, :EOF at end of stream,
+   or raises — NB-READ's contract, because the raw fd is the default and
+   a second contract at this seam would be a second thing to get wrong.
+
+   Every read of a connection goes through here, and that is an invariant
+   rather than a tidiness. Edge-triggered epoll reports a transition, so
+   readability has to be drained in one pass or the remainder waits for an
+   event that will not come; CONNECTION-READ-AVAILABLE is that pass, and
+   it terminates on :AGAIN. Under TLS a second buffer appears beneath the
+   socket — SSL_read decrypts a whole record, and consuming part of it
+   leaves the rest in OpenSSL's buffer with nothing left on the fd for
+   epoll to notice. Mapping SSL_ERROR_WANT_READ to :AGAIN makes the
+   existing drain loop enforce that too, at no cost and with no new
+   discipline to remember.
+
+   That structural closure holds only while this is the sole path in. A
+   direct SSL_read anywhere else re-opens exactly the hang it removes, and
+   it would do so intermittently, on records that happen to be larger than
+   one buffer. It also covers WANT_READ alone: WANT_WRITE from a read is a
+   direction inversion the state machine cannot express yet, and belongs
+   to a later round rather than to this seam."
+  (let ((fn (connection-read-fn conn)))
+    (if fn
+        (funcall fn buffer start max-bytes)
+        (nb-read (connection-fd conn) buffer start max-bytes))))
+
+(defun connection-write-from (conn buffer start nbytes)
+  "Write BUFFER[START..START+NBYTES) to CONN's transport. Returns bytes
+   written, :AGAIN if it would block, or raises — NB-WRITE's contract.
+
+   The counterpart to CONNECTION-READ-INTO and the same invariant: every
+   write of a connection goes through here. The write queue holds vectors
+   by reference and never mutates them, which is what lets a partial write
+   resume from an offset, and a transport that needs the bytes to sit still
+   across a retry depends on that already."
+  (let ((fn (connection-write-fn conn)))
+    (if fn
+        (funcall fn buffer start nbytes)
+        (nb-write (connection-fd conn) buffer start nbytes))))
+
 (defun connection-read-available (conn)
-  "Drain all available bytes from fd into read buffer (edge-triggered).
+  "Drain all available bytes from the transport into the read buffer
+   (edge-triggered).
    Grows the buffer as needed, up to CONNECTION-READ-CAP.
 
    Returns:
@@ -311,7 +366,7 @@
                 (setf (connection-read-buf conn) new-buf
                       buf new-buf
                       space (- new-size pos)))))
-        (let ((result (nb-read (connection-fd conn) buf pos space)))
+        (let ((result (connection-read-into conn buf pos space)))
           (cond
             ((eq result :eof)   (return (if any-read :ok-eof :eof)))
             ((eq result :again) (return (if any-read :ok :again)))
@@ -339,7 +394,7 @@
   (declare (type (simple-array (unsigned-byte 8) (*)) sink))
   (let ((any-read nil))
     (loop
-      (let ((result (nb-read (connection-fd conn) sink 0 (length sink))))
+      (let ((result (connection-read-into conn sink 0 (length sink))))
         (cond
           ((eq result :eof)   (return (if any-read :ok-eof :eof)))
           ((eq result :again) (return (if any-read :ok :again)))
@@ -1097,8 +1152,8 @@
                (remaining (- (connection-write-end conn) pos)))
           (cond
             ((plusp remaining)
-             (let ((result (nb-write (connection-fd conn) (connection-write-buf conn)
-                                     pos remaining)))
+             (let ((result (connection-write-from
+                            conn (connection-write-buf conn) pos remaining)))
                (if (eq result :again)
                    (return (finish :continue))
                    (progn (setf wrote t)

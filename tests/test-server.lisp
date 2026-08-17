@@ -4572,6 +4572,140 @@
       (check "backlog: a maximal legal ws message fits an empty queue"
              (web-skeleton::connection-append-write conn frame) t))))
 
+(defun %scripted-read-fn (script counter)
+  "A CONNECTION read-fn replaying SCRIPT. An integer fabricates that many
+   0x41 bytes; :AGAIN and :EOF are answered as themselves. Bumps COUNTER's
+   CAR per call.
+
+   Past the end of SCRIPT it answers :AGAIN rather than erroring, so a
+   drain loop that should already have stopped fails as a wrong call count
+   instead of spinning until CI kills the job."
+  (let ((remaining script))
+    (lambda (buffer start max-bytes)
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :again)))
+        (if (integerp step)
+            (let ((n (min step max-bytes)))
+              (fill buffer 65 :start start :end (+ start n))
+              n)
+            step)))))
+
+(defun %scripted-write-fn (script counter sink)
+  "A CONNECTION write-fn replaying SCRIPT. An integer accepts up to that
+   many bytes and appends them to SINK, so a test can assert what actually
+   went out and in what order; :AGAIN is answered as itself. Bumps
+   COUNTER's CAR per call, and answers :AGAIN past the end of SCRIPT."
+  (let ((remaining script))
+    (lambda (buffer start nbytes)
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :again)))
+        (if (integerp step)
+            (let ((n (min step nbytes)))
+              (loop for i from start below (+ start n)
+                    do (vector-push-extend (aref buffer i) sink))
+              n)
+            step)))))
+
+(defun test-connection-transport-seam ()
+  "Reads and writes route through CONNECTION-READ-FN / -WRITE-FN when set,
+   and the drain loop runs until the transport says :AGAIN.
+
+   Every connection here has :FD -1. That is the assertion, not tidiness:
+   -1 is not a file descriptor, so NB-READ and NB-WRITE on it would raise
+   EBADF. A seam that quietly fell through to the raw fd cannot pass these
+   at all, which a valid fd would have let it do.
+
+   The drain discipline is the part worth having. Edge-triggered epoll
+   reports a transition, so readability must be drained in one pass —
+   stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
+   and until now not assertable without a real socket and a real partial
+   read. A scripted byte source makes it deterministic, which matters
+   because issue #8 rests the whole SSL_pending argument on this loop
+   behaving exactly this way."
+  (format t "~%Connection transport seam~%")
+  ;; ---- reads ----
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(5 5 5 :again) calls))))
+    (check "seam: drain returns :ok when the source blocks"
+           (web-skeleton::connection-read-available conn) :ok)
+    (check "seam: every available byte accumulated"
+           (web-skeleton::connection-read-pos conn) 15)
+    (check "seam: drained until :again, not once"
+           (car calls) 4))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(4 :eof) calls))))
+    (check "seam: bytes then end of stream is :ok-eof"
+           (web-skeleton::connection-read-available conn) :ok-eof)
+    (check "seam: :ok-eof keeps the bytes"
+           (web-skeleton::connection-read-pos conn) 4))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(:eof) calls))))
+    (check "seam: nothing then end of stream is :eof"
+           (web-skeleton::connection-read-available conn) :eof))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(:again) calls))))
+    (check "seam: nothing available is :again"
+           (web-skeleton::connection-read-available conn) :again)
+    (check "seam: :again costs exactly one call" (car calls) 1))
+
+  ;; Growth through the seam. The initial buffer is 4 KiB, so this needs
+  ;; two grows, and a seam that handed the source a stale buffer after a
+  ;; grow would corrupt or short-count here rather than anywhere visible.
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1
+                :read-fn (%scripted-read-fn '(4096 4096 2000 :again) calls))))
+    (check "seam: read buffer grows and keeps everything"
+           (web-skeleton::connection-read-available conn) :ok)
+    (check "seam: grown total is exact"
+           (web-skeleton::connection-read-pos conn) 10192)
+    (check "seam: buffer grew past its initial size"
+           (> (length (web-skeleton::connection-read-buf conn)) 4096) t))
+
+  ;; CONNECTION-DISCARD-AVAILABLE is the other reader and must not have
+  ;; kept its own path to the fd.
+  (let* ((calls (list 0))
+         (sink (make-array 64 :element-type '(unsigned-byte 8)))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(64 64 :again) calls))))
+    (check "seam: discard drains through the seam too"
+           (web-skeleton::connection-discard-available conn sink) :ok)
+    (check "seam: discard drained until :again" (car calls) 3))
+
+  ;; ---- writes ----
+  (let* ((calls (list 0))
+         (sink (make-array 0 :element-type '(unsigned-byte 8)
+                             :fill-pointer 0 :adjustable t))
+         (conn (web-skeleton::make-connection
+                :fd -1 :write-fn (%scripted-write-fn '(3 99) calls sink))))
+    (web-skeleton::connection-queue-write
+     conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+    (check "seam: a partial write then the rest reports :done"
+           (web-skeleton::connection-on-write conn) :done)
+    (check "seam: the peer saw the bytes once, in order"
+           (sb-ext:octets-to-string (coerce sink '(vector (unsigned-byte 8)))
+                                    :external-format :ascii)
+           "HELLO"))
+
+  (let* ((calls (list 0))
+         (sink (make-array 0 :element-type '(unsigned-byte 8)
+                             :fill-pointer 0 :adjustable t))
+         (conn (web-skeleton::make-connection
+                :fd -1 :write-fn (%scripted-write-fn '(2 :again) calls sink))))
+    (web-skeleton::connection-queue-write
+     conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+    (check "seam: a blocked write reports :continue"
+           (web-skeleton::connection-on-write conn) :continue)
+    (check "seam: and resumes from what was accepted"
+           (web-skeleton::connection-write-pos conn) 2)))
+
 (defun test-write-queue-drain ()
   (format t "~%Write queue drain~%")
   (let ((path "/tmp/web-skeleton-write-queue.bin"))
@@ -6326,6 +6460,7 @@
   (test-read-available-eof)
   (test-awaiting-sweep-504)
   (test-write-queue)
+  (test-connection-transport-seam)
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-write-stall-sweep)
