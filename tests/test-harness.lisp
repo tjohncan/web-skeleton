@@ -1040,8 +1040,19 @@
    equally true when the other workers landed somewhere else entirely.
    Counting the sockets is the only way to see the difference.
 
-   Column 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, column 3 is the state,
-   0A = TCP_LISTEN.
+   Field 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, field 3 is the state
+   (0A = TCP_LISTEN), field 9 is the socket inode. Ten fields, not
+   twelve: TX_QUEUE:RX_QUEUE and TR:TM->WHEN are each colon-joined.
+
+   Distinct inodes, not matching rows, and that is the whole reason the
+   inode is parsed at all. This file is a seq_file: the iterator saves a
+   position and re-walks it for the next chunk, so records removed before
+   that position make the resume land late and skip rows, while records
+   added before it make the resume land early and re-emit rows already
+   delivered. A suite running live servers does both constantly. Counting
+   rows therefore both under- and over-reports; counting inodes, which are
+   unique per socket, cannot over-report, and leaves only the undercount
+   for the caller to handle.
 
    NIL rather than 0 because a read of this file has been seen to fail,
    and 'no listeners there' and 'could not look' are different answers:
@@ -1050,12 +1061,12 @@
   (handler-case
       (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
         (when in
-          (let ((count 0))
+          (let ((inodes nil))
             (read-line in nil nil)      ; column header
             (loop for line = (read-line in nil nil)
                   while line
                   do (let ((fields (%split-ws line)))
-                       (when (and (>= (length fields) 4)
+                       (when (and (>= (length fields) 10)
                                   (string= (fourth fields) "0A"))
                          (let* ((local (second fields))
                                 (colon (position #\: local)))
@@ -1064,8 +1075,9 @@
                                        (= port (parse-integer
                                                 local :start (1+ colon)
                                                       :radix 16))))
-                             (incf count))))))
-            count)))
+                             (pushnew (nth 9 fields) inodes
+                                      :test #'string=))))))
+            (length inodes))))
     (error () nil)))
 
 (defun %call-with-bare-server (workers fn)
@@ -1203,13 +1215,13 @@
           ;; should not also be the suite's longest sleep.
           ;; Highest count seen, not the last one. Measured: a read of
           ;; /proc/net/tcp intermittently returns 2, and once 1, while
-          ;; three healthy workers are demonstrably on the port — a
-          ;; seq_file read in chunks skips records when the table churns
-          ;; underneath it. Undercounting happens; overcounting would
-          ;; require another process on this exact port, which
-          ;; START-SERVER's own bind rules out. So a low read is noise and
-          ;; a high read is signal, and reporting the last read instead of
-          ;; the best one would fail this test at random.
+          ;; three healthy workers are demonstrably on the port, because a
+          ;; seq_file resume can land late and skip records. Overcounting
+          ;; is ruled out by %LISTEN-SOCKET-COUNT counting distinct socket
+          ;; inodes — the same resume can land early and re-emit a row, so
+          ;; the row count alone was not one-directional. So a low read is
+          ;; noise, a high read is signal, and reporting the last read
+          ;; rather than the best would fail this test at random.
           (let ((n (loop repeat 80
                          with best = nil
                          for c = (%listen-socket-count port)
