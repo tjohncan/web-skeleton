@@ -1043,10 +1043,14 @@
    Column 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, column 3 is the state,
    0A = TCP_LISTEN.
 
-   The NIL is not defensive padding. /proc/net/tcp is a seq_file whose
-   contents shift underneath a multi-chunk read, so a buffered READ-LINE
-   loop over it can die mid-file with EBADF on a machine that is opening
-   and closing sockets — which a test suite running live servers is.
+   The NIL is not defensive padding: a READ-LINE loop over this file has
+   been seen to die mid-file with EBADF while the suite was running live
+   servers. The mechanism is not known and is deliberately not guessed at
+   here — seq_file churn, the first suspect, produces torn or short
+   reads and cannot produce EBADF, which is a claim about the descriptor
+   rather than the contents. See RUN-WORKER for the other half of the
+   same symptom and the recipe that reproduces it.
+
    Returning NIL rather than 0 keeps 'no listeners there' distinguishable
    from 'could not look'; a caller that conflates them reports a
    load-bearing failure whenever the machine is busy."
@@ -1186,9 +1190,8 @@
    silently has one member.
 
    Counting listen sockets is what sees that; making requests is not.
-   Polled
-   because the count legitimately lags: START-SERVER binds worker 0's
-   listener before spawning anything, and workers 1..N-1 bind inside
+   Polled because the count legitimately lags: START-SERVER binds worker
+   0's listener before spawning anything, and workers 1..N-1 bind inside
    their own threads some time after :ON-LISTEN has already fired."
   (format t "~%Harness: start-server :port 0 shares one port across workers~%")
   (let ((workers 3))
@@ -1202,10 +1205,14 @@
           ;;
           ;; The budget is slack for a loaded CI box and nothing more:
           ;; measured, all three listeners are present on the first read,
-          ;; because MAKE-THREAD plus a bind is microseconds. Keeping it
-          ;; tight matters because the only run that spends the whole
-          ;; budget is a failing one, and a failing check should not also
-          ;; be the suite's longest sleep.
+          ;; because MAKE-THREAD plus a bind is microseconds. Only a
+          ;; failing run spends the whole budget, and a failing check
+          ;; should not also be the suite's longest sleep.
+          ;;
+          ;; Raising it is how the open EBADF in RUN-WORKER's docstring
+          ;; is reproduced, which is worth knowing in both directions:
+          ;; this bound is not a fix for that, it is why a healthy tree
+          ;; never spends long enough here to meet it.
           (let ((n (loop repeat 80
                          for c = (%listen-socket-count port)
                          when (and c (>= c workers)) return c

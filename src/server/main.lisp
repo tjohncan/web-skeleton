@@ -1358,7 +1358,33 @@
    Adopted for the first pass only. A restart after a crash binds
    normally, and lands on the right port because by then PORT is the
    concrete number START-SERVER resolved — so the restarted worker
-   rejoins its siblings rather than appearing somewhere new."
+   rejoins its siblings rather than appearing somewhere new.
+
+   OPEN, UNEXPLAINED — read this before changing anything about when a
+   file descriptor is closed. A worker parked in EPOLL-WAIT has been
+   seen to fail with EBADF on its own epoll fd, 3.2-3.7 s into an idle
+   dwell, sometimes taking two workers on two different epoll fds in the
+   same millisecond. Reproduces 11 times in 12 from a clean tree with
+   two edits: pass 0 rather than PORT to this function, so the workers
+   scatter, and raise TEST-HARNESS-PORT-ZERO-WORKERS-SHARE-ONE-PORT's
+   poll to 200 iterations, so the failing check dwells for five seconds
+   while the main thread reads /proc/net/tcp two hundred times.
+
+   Eliminated by measurement, so do not re-derive them: an unchecked
+   EPOLL-CREATE, SBCL finalizing dropped socket objects, harness
+   teardown or FETCH-STREAM-PLAIN stealing descriptors (6.4M and 6.8M
+   waits, no steals), a GC finalizer batch, a clobbered errno, and
+   *EPOLL-FD* being closed by app-facing code. Every close path was
+   logged except SB-BSD-SOCKETS:SOCKET-CLOSE, which is where to look
+   next. Note also that a retry on the same value cannot tell a closed
+   descriptor from a wrong one arriving here — EPOLL-WAIT now names the
+   fd in its error for exactly that comparison, against the number this
+   function already logs at startup.
+
+   Instrumenting the close path very nearly suppresses it, so the window
+   is narrow and sensitive to work done there. That is the reason this
+   note is here rather than only in a scratch file: it is the paragraph
+   an fd-lifetime change needs to have read first."
   (loop
     (handler-case
         (with-worker-urandom
