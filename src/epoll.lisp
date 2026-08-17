@@ -255,11 +255,9 @@
          (let ((err (get-errno)))
            (if (= err +eintr+)
                0
-               ;; EPOLL-FD is in the message because EBADF is a claim
-               ;; about this argument and nothing else, and without the
-               ;; number there is no way to tell a descriptor that was
-               ;; closed underneath us from a wrong value arriving here.
-               ;; Compare against the fd EPOLL-CREATE reported.
+               ;; Named, because EBADF is a claim about this argument and
+               ;; nothing else, and the bare message cannot distinguish a
+               ;; closed descriptor from a wrong one arriving.
                (error "epoll_wait failed on epoll fd ~d: ~a"
                       epoll-fd (errno-string err)))))))))
 
