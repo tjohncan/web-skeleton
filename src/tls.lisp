@@ -143,6 +143,16 @@
   (ssl (* t))
   (hostname sb-alien:c-string))
 
+;;; SNI read-back. Bound for the same reason the GET twin of the
+;;; min-proto-version ctrl is: SSL_set_tlsext_host_name reports success
+;;; without the name necessarily being what a later handshake will send,
+;;; and reading it off the SSL is the only check that distinguishes a
+;;; configured SNI from a call that returned 1.
+(sb-alien:define-alien-routine ("SSL_get_servername" %ssl-get-servername)
+    sb-alien:c-string
+  (ssl (* t))
+  (type sb-alien:int))
+
 ;;; Constants
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
@@ -153,8 +163,12 @@
    SSL_CTX_ctrl mixup) can return 1 while writing to a garbage offset,
    and only the read-back exposes that the floor never landed.")
 (defconstant +tls1-2-version+ #x0303)
+(defconstant +ssl-error-want-read+ 2)
+(defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-syscall+ 5)
 (defconstant +ssl-error-zero-return+ 6)
+(defconstant +tlsext-nametype-host-name+ 0
+  "The only SNI name type OpenSSL implements; SSL_get_servername takes it.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; SSL_CTX — shared context, created once
@@ -231,6 +245,79 @@
 ;;; TLS connection lifecycle
 ;;; ---------------------------------------------------------------------------
 
+(defun tls-client-ssl (hostname fd)
+  "Build an SSL for an outbound client connection on FD, with SNI and
+   hostname verification set for HOSTNAME. Returns the SSL pointer, or
+   frees it and raises.
+
+   One implementation, shared by the blocking TLS-CONNECT and the
+   non-blocking handshake path, because these are the two settings whose
+   absence a successful handshake does not report. Without SNI a
+   multi-tenant upstream answers with the wrong certificate and the failure
+   arrives as an opaque verify error several layers down. Without
+   SSL_set1_host the chain is checked for validity but never for whose it
+   is, so any certificate a trusted CA ever issued will do. Two copies of
+   this would be two chances to omit one, and the omission is silent in
+   both directions.
+
+   The read-back is not ceremony. SSL_set_tlsext_host_name answers 1
+   without that guaranteeing the name is what a later handshake sends, so
+   asking the SSL what its servername is is the only check that separates a
+   configured SNI from a call that returned 1 — the same discipline the
+   min-proto-version ctrl already gets, and for the same reason."
+  (let ((ctx (ensure-ssl-ctx))
+        (ssl nil))
+    (handler-case
+        (progn
+          (setf ssl (%ssl-new ctx))
+          (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
+            (error "SSL_new failed"))
+          ;; Null-terminated: SSL_ctrl reads this with strlen.
+          (let ((hostname-bytes
+                  (concatenate '(simple-array (unsigned-byte 8) (*))
+                               (sb-ext:string-to-octets
+                                hostname :external-format :ascii)
+                               #(0))))
+            (sb-sys:with-pinned-objects (hostname-bytes)
+              (unless (= 1 (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
+                                      (sb-sys:vector-sap hostname-bytes)))
+                (error "SSL_set_tlsext_host_name failed for ~a" hostname))))
+          (let ((sni (%ssl-get-servername ssl +tlsext-nametype-host-name+)))
+            (unless (equal sni hostname)
+              (error "SNI did not take: set ~s, SSL reports ~s"
+                     hostname sni)))
+          (when (zerop (%ssl-set1-host ssl hostname))
+            (error "SSL_set1_host failed for ~a" hostname))
+          (unless (= 1 (%ssl-set-fd ssl fd))
+            (error "SSL_set_fd failed"))
+          ssl)
+      (error (e)
+        (when ssl (ignore-errors (%ssl-free ssl)))
+        (error "tls-client-ssl ~a: ~a" hostname e)))))
+
+(defun ssl-handshake-stepper (ssl)
+  "A handshake step function for CONNECTION-HANDSHAKE-FN. Each call runs
+   SSL_connect once and answers :DONE, :WANT-READ, :WANT-WRITE, or raises.
+
+   SSL_connect on a non-blocking socket is resumable: it is called again,
+   unchanged, until it stops asking. Which direction it is blocked on is
+   not the caller's to guess — a handshake sends and receives several
+   times, and the direction changes between calls — so the answer carries
+   it and the state machine arms what it is told.
+
+   Only the two WANT codes are continuable. Anything else is a failed
+   handshake, and treating one as retryable would spin the event loop on a
+   connection that is never going to complete."
+  (lambda ()
+    (let ((result (%ssl-connect ssl)))
+      (if (= result 1)
+          :done
+          (let ((err (%ssl-get-error ssl result)))
+            (cond
+              ((= err +ssl-error-want-read+)  :want-read)
+              ((= err +ssl-error-want-write+) :want-write)
+              (t (error "SSL_connect failed: error ~d" err))))))))
+
 (defun tls-connect (hostname port)
   "Open a blocking TLS connection to HOSTNAME:PORT.
    Returns (values ssl-ptr socket) on success. DNS resolution and the
@@ -238,8 +325,10 @@
    the shared *DNS-RESOLVE-BLOCKING-FN* getent resolver (same one the
    async HTTP path uses) so both v4 and v6 addresses are handled and
    there is exactly one DNS primitive in the framework."
-  (let ((ctx (ensure-ssl-ctx))
-        (ssl nil)
+  ;; No CTX binding here any more: TLS-CLIENT-SSL calls ENSURE-SSL-CTX,
+  ;; which is idempotent and mutex-guarded, so touching it twice would
+  ;; only be a second place to get the ordering wrong.
+  (let ((ssl nil)
         (socket nil))
     (multiple-value-bind (ip family)
         (funcall *dns-resolve-blocking-fn* hostname)
@@ -254,31 +343,9 @@
             (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
                                 *fetch-timeout*)
             (blocking-connect socket ip port *fetch-timeout*)
-            ;; Create SSL object
-            (setf ssl (%ssl-new ctx))
-            (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
-              (error "SSL_new failed"))
-            ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses
-            ;; strlen). SSL_set_tlsext_host_name returns 1 on success,
-            ;; 0 on failure. A silent failure here meant the handshake
-            ;; proceeded without SNI and the upstream typically rejected
-            ;; with an opaque 'unknown certificate' further down the
-            ;; stack — raising loud at the call site is much easier to
-            ;; diagnose than debugging the eventual cert mismatch.
-            (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
-                                                (sb-ext:string-to-octets hostname
-                                                                         :external-format :ascii)
-                                                #(0))))
-              (sb-sys:with-pinned-objects (hostname-bytes)
-                (unless (= 1 (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
-                                        (sb-sys:vector-sap hostname-bytes)))
-                  (error "SSL_set_tlsext_host_name failed for ~a" hostname))))
-            ;; Enable hostname verification (OpenSSL 1.1.0+)
-            (when (zerop (%ssl-set1-host ssl hostname))
-              (error "SSL_set1_host failed"))
-            ;; Attach to socket fd
-            (unless (= 1 (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket)))
-              (error "SSL_set_fd failed"))
+            (setf ssl (tls-client-ssl
+                       hostname
+                       (sb-bsd-sockets:socket-file-descriptor socket)))
             ;; TLS handshake
             (let ((result (%ssl-connect ssl)))
               (unless (= result 1)

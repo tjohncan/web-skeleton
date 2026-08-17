@@ -4606,6 +4606,143 @@
               n)
             step)))))
 
+(defun %scripted-handshake-fn (script counter)
+  "A CONNECTION handshake-fn replaying SCRIPT. Entries are :WANT-READ,
+   :WANT-WRITE, :DONE, or :RAISE. Bumps COUNTER's CAR per call, and raises
+   past the end of SCRIPT — a state machine that keeps stepping a finished
+   handshake should say so rather than loop."
+  (let ((remaining script))
+    (lambda ()
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :overrun)))
+        (case step
+          (:raise   (error "handshake failed: scripted"))
+          (:overrun (error "handshake stepped past :done"))
+          (t step))))))
+
+(defun %peer-has-bytes-p (fd)
+  "T if anything is readable on FD right now. FD must be non-blocking."
+  (integerp (web-skeleton::nb-read
+             fd (make-array 256 :element-type '(unsigned-byte 8)) 0 256)))
+
+(defun test-outbound-handshake-state ()
+  "The handshake state arms the direction its transport asks for, and the
+   request does not go on the wire until the handshake finishes.
+
+   Both halves need a real epoll fd and a real socket, because both are
+   claims about an interest mask. A loopback socket with nothing sent to it
+   is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
+   does not — which is what makes the two masks distinguishable without any
+   data timing. Asserting delivery instead would pass against a mask that
+   never changed: issue #5 produced exactly that test, twice.
+
+   The second half is the security-relevant one. A connection whose
+   transport has a handshake is not usable when the TCP connect lands, and
+   writing the queued request there would put the plaintext HTTP request on
+   a socket the peer is waiting for a ClientHello on."
+  (format t "~%Outbound transport handshake~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (peer-fd (web-skeleton::socket-fd client))
+                  (calls (list 0))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-connecting
+                         :outbound-p t :last-active (get-universal-time)
+                         :handshake-fn (%scripted-handshake-fn
+                                        '(:want-write :want-read :done)
+                                        calls))))
+             (web-skeleton::set-nonblocking peer-fd)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+
+             ;; TCP connect landed. With a handshake pending this must not
+             ;; become :out-write.
+             (web-skeleton::handle-outbound-connect conn epfd)
+             (check "handshake: connect hands off to the handshake state"
+                    (web-skeleton::connection-state conn) :out-handshake)
+             (check "handshake: stepped once"  (car calls) 1)
+             (check "handshake: nothing on the wire yet"
+                    (%peer-has-bytes-p peer-fd) nil)
+             (check "handshake: :want-write arms EPOLLOUT, and the loop wakes"
+                    (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+             (check "handshake: and it is this fd"
+                    (web-skeleton::epoll-event-fd evbuf 0) out-fd)
+
+             ;; :want-read next. The same socket is still writable, so a
+             ;; mask that failed to change would wake again here.
+             (web-skeleton::handle-outbound-handshake conn epfd)
+             (check "handshake: still handshaking"
+                    (web-skeleton::connection-state conn) :out-handshake)
+             (check "handshake: :want-read arms EPOLLIN, and nothing wakes"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+             (check "handshake: still nothing on the wire"
+                    (%peer-has-bytes-p peer-fd) nil)
+
+             ;; :done hands off to the write path, which flushes and moves
+             ;; to :out-read.
+             (web-skeleton::handle-outbound-handshake conn epfd)
+             (check "handshake: :done advances past the handshake"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "handshake: the request goes out only now"
+                    (%peer-has-bytes-p peer-fd) t)
+             (check "handshake: three steps, no more"  (car calls) 3))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; No handshake-fn: the pre-existing path, unchanged.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (peer-fd (web-skeleton::socket-fd client))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-connecting
+                         :outbound-p t :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking peer-fd)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::handle-outbound-connect conn epfd)
+             (check "no handshake: connect goes straight through to reading"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "no handshake: and the request went out immediately"
+                    (%peer-has-bytes-p peer-fd) t))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; A failing handshake raises rather than being retried. The outbound
+  ;; dispatcher's handler-case is what turns that into a 502; what matters
+  ;; here is that it is not swallowed and not looped on.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((calls (list 0))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd (web-skeleton::socket-fd server)
+                         :socket server :state :out-handshake
+                         :outbound-p t :last-active (get-universal-time)
+                         :handshake-fn (%scripted-handshake-fn '(:raise) calls))))
+             (check-error "handshake: a failed handshake raises"
+                          (web-skeleton::handle-outbound-handshake conn epfd))
+             (check "handshake: and it was not retried" (car calls) 1))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
 (defun test-connection-transport-seam ()
   "Reads and writes route through CONNECTION-READ-FN / -WRITE-FN when set,
    and the drain loop runs until the transport says :AGAIN.
@@ -6461,6 +6598,7 @@
   (test-awaiting-sweep-504)
   (test-write-queue)
   (test-connection-transport-seam)
+  (test-outbound-handshake-state)
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-write-stall-sweep)

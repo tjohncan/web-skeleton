@@ -37,6 +37,12 @@
   ;; some site that looks special is how it gets broken.
   (read-fn   nil :type (or null function))
   (write-fn  nil :type (or null function))
+  ;; One step of a transport handshake, or NIL for a transport that has
+  ;; none. Called with no arguments; answers :DONE, :WANT-READ,
+  ;; :WANT-WRITE, or raises. Its presence is what tells
+  ;; HANDLE-OUTBOUND-CONNECT that a completed TCP connect is not yet a
+  ;; usable connection.
+  (handshake-fn nil :type (or null function))
   ;; Protocol state
   ;;   :read-http             — accumulating HTTP request bytes
   ;;   :read-body             — have headers, reading Content-Length body
@@ -49,6 +55,9 @@
   ;;   :awaiting              — parked, waiting for outbound fetch to complete
   ;;   :out-dns               — outbound: getent subprocess resolving hostname
   ;;   :out-connecting        — outbound: TCP connect in progress
+  ;;   :out-handshake         — outbound: transport handshake in progress,
+  ;;                            the one state where readable does not mean
+  ;;                            read and writable does not mean write
   ;;   :out-write             — outbound: sending HTTP request
   ;;   :out-read              — outbound: reading HTTP response
   (state     :read-http :type keyword)

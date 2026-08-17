@@ -1541,6 +1541,9 @@
          (when (logtest flags +epollin+)
            (case (connection-state conn)
              (:out-read (handle-outbound-read conn epoll-fd))
+             ;; A handshake blocked on :WANT-READ armed EPOLLIN, so this
+             ;; is the wake-up it asked for.
+             (:out-handshake (handle-outbound-handshake conn epoll-fd))
              ;; Stale EPOLLIN in another state — ignore silently.
              (otherwise nil)))
          ;; 2. Handle writable. Gated on (lookup-connection ...) so
@@ -1550,6 +1553,7 @@
                     (lookup-connection (connection-fd conn)))
            (case (connection-state conn)
              (:out-connecting (handle-outbound-connect conn epoll-fd))
+             (:out-handshake  (handle-outbound-handshake conn epoll-fd))
              (:out-write      (handle-outbound-write conn epoll-fd))
              (otherwise nil)))
          ;; 3. HUP/ERR after draining. If we still have a live
@@ -1579,17 +1583,55 @@
         (deliver-fetch-error conn epoll-fd "outbound request failed")))))
 
 (defun handle-outbound-connect (conn epoll-fd)
-  "Check if non-blocking connect succeeded, then start writing the request."
+  "Check if non-blocking connect succeeded, then hand off to the handshake
+   if the transport has one, or start writing the request if it does not."
   (let ((err (get-socket-option-int (connection-fd conn)
                                      +sol-socket+ +so-error+)))
-    (if (zerop err)
-        (progn
-          ;; Connect succeeded — start writing request (already queued)
-          (setf (connection-state conn) :out-write)
-          (handle-outbound-write conn epoll-fd))
-        ;; Connect failed
-        (deliver-fetch-error conn epoll-fd
-                             (format nil "connect failed: errno ~d" err)))))
+    (cond
+      ((not (zerop err))
+       (deliver-fetch-error conn epoll-fd
+                            (format nil "connect failed: errno ~d" err)))
+      ;; A transport with a handshake is not usable just because the TCP
+      ;; connect landed. Writing the request here would put plaintext on a
+      ;; socket the peer is expecting a ClientHello on.
+      ((connection-handshake-fn conn)
+       (setf (connection-state conn) :out-handshake)
+       (handle-outbound-handshake conn epoll-fd))
+      (t
+       ;; Connect succeeded — start writing request (already queued)
+       (setf (connection-state conn) :out-write)
+       (handle-outbound-write conn epoll-fd)))))
+
+(defun handle-outbound-handshake (conn epoll-fd)
+  "Run one step of the transport handshake and arm whichever direction it
+   asks for, or advance to :OUT-WRITE when it finishes.
+
+   This is the one state in the outbound machine where readable does not
+   mean read and writable does not mean write. A TLS handshake exchanges
+   several messages in both directions and only the handshake itself knows
+   which way it is currently blocked, so the step function answers with the
+   direction and this arms it.
+
+   Confining that to a state of its own is deliberate. The steady-state
+   read and write paths are built on readable-means-read, one to one, and
+   generalising them is a separate and much larger change; a handshake does
+   not need it, because a single state that re-arms per step expresses the
+   inversion completely for as long as it lasts.
+
+   Re-arming on every step, rather than only on a change, is the cheap and
+   correct choice: EPOLL_CTL_MOD on an unchanged mask costs one syscall per
+   handshake message, and tracking the current mask to avoid it would add
+   state whose only purpose is to be wrong once."
+  (ecase (funcall (connection-handshake-fn conn))
+    (:done
+     (setf (connection-state conn) :out-write)
+     (handle-outbound-write conn epoll-fd))
+    (:want-read
+     (epoll-modify epoll-fd (connection-fd conn)
+                   (logior +epollin+ +epollet+)))
+    (:want-write
+     (epoll-modify epoll-fd (connection-fd conn)
+                   (logior +epollout+ +epollet+)))))
 
 (defun handle-outbound-write (conn epoll-fd)
   "Flush the outbound HTTP request. When done, switch to reading the response."
