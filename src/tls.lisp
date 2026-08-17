@@ -86,6 +86,16 @@
   (mode sb-alien:int)
   (callback (* t)))
 
+;;; Additional trust anchors. Bound for the integration test, which needs a
+;;; CA it generated to be trusted alongside the system roots — additive, so
+;;; it does not weaken verification, which is the only reason it is
+;;; acceptable to point at the shared context.
+(sb-alien:define-alien-routine ("SSL_CTX_load_verify_locations"
+                                %ssl-ctx-load-verify-locations) sb-alien:int
+  (ctx (* t))
+  (ca-file sb-alien:c-string)
+  (ca-path sb-alien:c-string))
+
 ;;; Connection
 (sb-alien:define-alien-routine ("SSL_new" %ssl-new) (* t)
   (ctx (* t)))
