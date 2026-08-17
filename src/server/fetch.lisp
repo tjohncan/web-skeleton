@@ -784,8 +784,16 @@
 ;;; line-by-line without issuing one syscall per byte.
 ;;; ---------------------------------------------------------------------------
 
-(defstruct (stream-reader (:constructor make-stream-reader (stream)))
+(defstruct (stream-reader
+            (:constructor make-stream-reader (stream &optional read-fn)))
   (stream nil)
+  ;; READ-FN, when present, replaces STREAM as the byte source:
+  ;; (READ-FN BUF LEN) fills BUF and answers with the count, :EOF at a
+  ;; clean end of stream, or raises. That is the contract
+  ;; SSL-BYTE-READER already answers, and it is the whole reason one
+  ;; line reader can serve both transports rather than TLS carrying a
+  ;; second implementation of this file's job.
+  (read-fn nil)
   (buf    (make-array 8192 :element-type '(unsigned-byte 8)))
   (pos    0 :type fixnum)
   (end    0 :type fixnum)
@@ -800,9 +808,28 @@
   (prev-cr nil :type boolean))
 
 (defun reader-fill (r)
-  "Refill the buffer. Returns bytes read (0 = EOF)."
+  "Refill the buffer. Returns bytes read (0 = EOF).
+
+   0 is the contract, not 'fewer than asked for', and the two byte
+   sources differ on exactly that: READ-SEQUENCE on a blocking stream
+   fills the whole buffer or stops at end of stream, so a short return
+   does mean EOF there, while a READ-FN answers as soon as any bytes are
+   available and a short fill means nothing at all. Every caller loops
+   and treats only 0 as terminal, so both work — but a caller that ever
+   reads a short fill as EOF would be correct on one source and silently
+   truncating on the other.
+
+   A READ-FN may also raise, which this function otherwise cannot. That
+   is deliberate on the TLS side: SSL-READ-EOF-OR-RAISE answers :EOF for
+   a benign close only and raises for everything else, which is what
+   keeps a reset mid-body from arriving here as a clean end of stream."
   (setf (stream-reader-pos r) 0)
-  (let ((n (read-sequence (stream-reader-buf r) (stream-reader-stream r))))
+  (let* ((buf (stream-reader-buf r))
+         (fn (stream-reader-read-fn r))
+         (n (if fn
+                (let ((v (funcall fn buf (length buf))))
+                  (if (eq v :EOF) 0 v))
+                (read-sequence buf (stream-reader-stream r)))))
     (setf (stream-reader-end r) n)
     n))
 
@@ -996,10 +1023,15 @@
 ;;; HTTP response streaming
 ;;; ---------------------------------------------------------------------------
 
-(defun stream-response-lines (stream on-line &key (method :GET))
+(defun stream-response-lines (stream on-line &key (method :GET) read-fn)
   "Read an HTTP response from a byte stream. Skip headers, call
    ON-LINE per body line. Handles chunked transfer encoding.
    Returns the status code.
+
+   READ-FN substitutes the byte source and STREAM is then ignored; see
+   READER-FILL for the contract. TLS supplies SSL-BYTE-READER, which is
+   how this function serves both transports and why there is no second
+   copy of it in tls.lisp.
 
    METHOD gates the body-framing discipline: for :HEAD, RFC 7231
    §4.3.2 guarantees an empty body even when the upstream echoes
@@ -1021,7 +1053,7 @@
        a premature RST without out-of-band framing, so treat clean
        EOF as complete. Apps that care about this case should use a
        framed path upstream."
-  (let ((r (make-stream-reader stream))
+  (let ((r (make-stream-reader stream read-fn))
         (status nil)
         (chunked nil)
         (te-present nil)

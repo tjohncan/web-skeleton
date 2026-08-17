@@ -1045,8 +1045,8 @@
 
    NIL rather than 0 because a read of this file has been seen to fail,
    and 'no listeners there' and 'could not look' are different answers:
-   a caller that conflates them reports a load-bearing failure whenever
-   the machine is busy."
+   a caller that conflates them reports a spurious failure whenever the
+   machine is busy."
   (handler-case
       (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
         (when in

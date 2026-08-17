@@ -11,7 +11,11 @@
                (:file "tests/test-server" :depends-on ("tests/run"))
                (:file "tests/test-store" :depends-on ("tests/run"))
                (:file "tests/test-harness" :depends-on ("tests/run"))
-               (:file "tests/test-tls" :depends-on ("tests/run"))
+               ;; The line-reader parity test drives both readers through
+               ;; MAKE-MOCK-READ-FN and builds its corpus with
+               ;; ASCII-BYTES, both of which test-server defines.
+               (:file "tests/test-tls" :depends-on ("tests/run"
+                                                    "tests/test-server"))
                ;; The property suite drives the streaming reader through
                ;; MAKE-MOCK-STREAM, which test-server defines.
                (:file "tests/test-properties" :depends-on ("tests/run"

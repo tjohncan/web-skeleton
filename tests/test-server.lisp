@@ -2196,6 +2196,28 @@
   "Return an in-memory binary input stream over BYTES."
   (make-instance 'byte-array-stream :bytes bytes))
 
+(defun make-mock-read-fn (bytes &key chunk)
+  "A READ-FN byte source over BYTES — the read-fn twin of
+   MAKE-MOCK-STREAM. Answers the count, or :EOF once BYTES is spent.
+
+   CHUNK caps how much any single call will hand back. That is the point
+   of the parameter rather than a convenience: READ-SEQUENCE on a real
+   stream fills the whole buffer, so a corpus driven only through a
+   stream never splits a token across two fills, and the reader's
+   refill-and-resume paths — a CRLF pair straddling a boundary, a
+   chunk-size line arriving in pieces — go untested. CHUNK 1 puts a
+   boundary between every pair of bytes."
+  (let ((pos 0)
+        (len (length bytes)))
+    (lambda (buf want)
+      (let ((n (min want (if chunk (min chunk (- len pos)) (- len pos)))))
+        (if (<= n 0)
+            :EOF
+            (progn
+              (replace buf bytes :start1 0 :start2 pos :end2 (+ pos n))
+              (incf pos n)
+              n))))))
+
 (defun ascii-bytes (string)
   "Convert STRING to a byte vector."
   (sb-ext:string-to-octets string :external-format :ascii))

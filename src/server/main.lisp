@@ -1362,8 +1362,9 @@
 
    The epoll fd is logged at startup because a worker has been seen to
    fail with EBADF on its own, and the number is what distinguishes a
-   descriptor closed underneath it from a wrong one arriving. Open, and
-   only reproducible from a deliberately broken tree."
+   descriptor closed underneath it from a wrong one arriving. Open.
+   Reproduced only from a deliberately broken tree; whether it can touch
+   a shipping one is not settled."
   (loop
     (handler-case
         (with-worker-urandom
