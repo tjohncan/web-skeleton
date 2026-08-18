@@ -379,17 +379,25 @@
           (ignore-errors (sb-bsd-sockets:socket-close socket))
           (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
 
-(defun ssl-write-error-raise (ssl n)
+(defun ssl-write-error-raise (ssl n &optional
+                                      (errno (get-errno))
+                                      (err (%ssl-get-error ssl n)))
   "Classify a non-positive SSL_write return and raise with the same
    errno discipline as SSL-READ-EOF-OR-RAISE: distinguish a
    SO_SNDTIMEO expiry (errno = EAGAIN/EWOULDBLOCK) from a real
    transport failure so operators chasing timeouts can tell them
    apart in the log. Write has no benign-EOF case — every
-   non-positive return is an error."
-  (let ((err (%ssl-get-error ssl n)))
+   non-positive return is an error.
+
+   ERRNO before ERR, and the ordering is load-bearing: &OPTIONAL defaults
+   evaluate left to right, so errno is taken before SSL_get_error runs.
+   SSL_get_error is a foreign call and can set errno itself, so reading it
+   afterwards reports what that call did rather than what SSL_write did --
+   and errno is the entire basis of the split below."
+  (progn
     (cond
       ((= err +ssl-error-syscall+)
-       (let ((errno (get-errno)))
+       (progn
          (cond
            ((or (= errno +eagain+) (= errno +ewouldblock+))
             (error "SSL_write: timed out (~a)" (errno-string errno)))
@@ -413,17 +421,24 @@
                    (ssl-write-error-raise ssl n))
                  (incf pos n))))))
 
-(defun ssl-read-eof-or-raise (ssl n &optional (err (%ssl-get-error ssl n)))
+(defun ssl-read-eof-or-raise (ssl n &optional
+                                      (errno (get-errno))
+                                      (err (%ssl-get-error ssl n)))
   "Classify a non-positive SSL_read return. Returns :EOF if the peer
    cleanly closed the stream, raises otherwise so the outer
    handler-case converts the error into a 502 and fires the fetch
    callback's cleanup sentinel.
 
-   ERR defaults to asking SSL_get_error here, and is passed in by a caller
-   that has already asked. SSL_get_error may consult errno, so the answer
-   belongs to the SSL_read it followed; taking it as an argument keeps a
-   caller that needed to branch on WANT_READ first from having to ask a
-   second time and hope nothing moved in between.
+   ERRNO is declared before ERR and that ordering is the point, not a
+   style: &OPTIONAL defaults evaluate left to right, so errno is taken
+   before SSL_get_error is called. SSL_get_error is a foreign call and can
+   set errno itself, so reading errno afterwards reports what *it* did
+   rather than what SSL_read did. That is not hypothetical -- it is how a
+   plain EAGAIN came back from this codebase reading as EBADF, and errno
+   is the whole basis of the SSL_ERROR_SYSCALL split below.
+
+   Both are passed in by a caller that already sampled them, which is what
+   a caller must do if it needed to branch on WANT_READ first.
 
    SSL_ERROR_SYSCALL conflates at least four distinct conditions
    and must NOT be treated uniformly as clean EOF:
@@ -451,7 +466,7 @@
     (cond
       ((= err +ssl-error-zero-return+) :eof)
       ((= err +ssl-error-syscall+)
-       (let ((errno (get-errno)))
+       (progn
          (cond
            ((zerop errno) :eof)
            ((or (= errno +eagain+) (= errno +ewouldblock+))
@@ -844,9 +859,11 @@
    what a clean end of stream is."
   (lambda (buffer start max-bytes)
     (sb-sys:with-pinned-objects (buffer)
-      (let ((n (%ssl-read ssl
-                          (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
-                          max-bytes)))
+      (let* ((n (%ssl-read ssl
+                           (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                           max-bytes))
+             ;; Before SSL_get_error, which can set errno itself.
+             (errno (if (> n 0) 0 (get-errno))))
         (if (> n 0)
             n
             (let ((err (%ssl-get-error ssl n)))
@@ -857,7 +874,7 @@
                          is another SSL_read once the socket is writable, ~
                          which this state machine cannot express. See ~
                          SSL-CONNECTION-READER."))
-                (t (ssl-read-eof-or-raise ssl n err)))))))))
+                (t (ssl-read-eof-or-raise ssl n errno err)))))))))
 
 (defun ssl-byte-reader (ssl)
   "Byte source over SSL for STREAM-READER: fill BUF, answer with the
@@ -873,13 +890,15 @@
    deliver a truncated response as a clean one."
   (lambda (buf len)
     (sb-sys:with-pinned-objects (buf)
-      (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) len)))
+      (let* ((n (%ssl-read ssl (sb-sys:vector-sap buf) len))
+             ;; Sampled before SSL-READ-EOF-OR-RAISE asks SSL_get_error.
+             (errno (if (> n 0) 0 (get-errno))))
         (if (> n 0)
             n
             ;; Returns :EOF for a benign close, raises for everything
             ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
             ;; one of them is an ordinary end of stream.
-            (ssl-read-eof-or-raise ssl n))))))
+            (ssl-read-eof-or-raise ssl n errno))))))
 
 (sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
 

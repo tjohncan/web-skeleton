@@ -1360,11 +1360,16 @@
    concrete number START-SERVER resolved — so the restarted worker
    rejoins its siblings rather than appearing somewhere new.
 
-   The epoll fd is logged at startup because a worker has been seen to
-   fail with EBADF on its own, and the number is what distinguishes a
-   descriptor closed underneath it from a wrong one arriving. Open.
-   Reproduced only from a deliberately broken tree; whether it can touch
-   a shipping one is not settled."
+   The epoll fd is logged at startup because a worker was once seen to
+   fail with EBADF on its own, and the number is what distinguished a
+   descriptor closed underneath it from a wrong one arriving. That is
+   settled now, and the answer was the worse of the two: CONNECTION-CLOSE
+   closed descriptors with %CLOSE and left SB-BSD-SOCKETS' finalizer armed
+   on a number the kernel had already reissued, so a later GC closed it
+   under its new owner. An epoll fd is a bare number with nothing owning
+   it, which made a worker the ideal victim. It reached shipping servers,
+   not only test trees. See CONNECTION-CLOSE; the log line stays because
+   it is what made the failure legible."
   (loop
     (handler-case
         (with-worker-urandom
