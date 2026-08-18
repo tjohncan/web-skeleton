@@ -4743,6 +4743,117 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-outbound-direction-inversion ()
+  "A read that must wait for writability, and a write that must wait for
+   readability — and in both cases the operation that gets re-issued is the
+   one that blocked, not the one the direction suggests.
+
+   That last clause is the assertion with teeth. Retrying a WANT_WRITE from
+   a read by doing a *write* is a protocol error, and OpenSSL reports it as
+   a generic SSL failure that reads like a broken peer — the kind of defect
+   that gets blamed on an upstream for a week. Both fns are counted, so a
+   dispatcher that ran the wrong one is visible as a count rather than as a
+   plausible-looking error later.
+
+   The masks are checked against a real epoll fd on a real socket, because
+   they are the whole mechanism. A loopback socket with nothing sent to it
+   is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN does
+   not, and the two are distinguishable with no data timing involved."
+  (format t "~%Outbound direction inversion~%")
+  ;; ---- a read that wants writability ----
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (reads (list 0))
+                  (writes (list 0))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-read
+                         :outbound-p t :last-active (get-universal-time)
+                         :read-fn (%scripted-read-fn '(:want-write 12 :again) reads)
+                         :write-fn (%scripted-write-fn '(99) writes
+                                                       (make-array 0 :fill-pointer 0
+                                                                     :adjustable t)))))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; First read blocks on the wrong direction.
+             (web-skeleton::handle-outbound-read conn epfd)
+             (check "inversion: a read that wants writability is marked"
+                    (web-skeleton::connection-interest-inverted conn) t)
+             (check "inversion: and EPOLLOUT is armed, so the loop wakes"
+                    (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+             (check "inversion: one read so far, no writes"
+                    (list (car reads) (car writes)) (list 1 0))
+             ;; The dispatcher sees writability. It must re-issue the READ.
+             (web-skeleton::handle-outbound-event
+              conn epfd (logior web-skeleton::+epollout+ web-skeleton::+epollet+))
+             ;; Reads went up and writes did not. Not an exact read count:
+             ;; CONNECTION-READ-AVAILABLE drains until :AGAIN, so one pass
+             ;; is several read-fn calls, and pinning the number would make
+             ;; this track the drain loop rather than the dispatch.
+             (check "inversion: writability re-issued the read, not a write"
+                    (list (> (car reads) 1) (car writes)) (list t 0))
+             (check "inversion: the inversion is cleared once it clears"
+                    (web-skeleton::connection-interest-inverted conn) nil)
+             (check "inversion: and EPOLLIN is back, so nothing wakes"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; ---- a write that wants readability ----
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (reads (list 0))
+                  (writes (list 0))
+                  (sink (make-array 0 :element-type '(unsigned-byte 8)
+                                      :fill-pointer 0 :adjustable t))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-write
+                         :outbound-p t :last-active (get-universal-time)
+                         :read-fn (%scripted-read-fn '(:again) reads)
+                         :write-fn (%scripted-write-fn '(:want-read 5) writes sink))))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollout+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::handle-outbound-write conn epfd)
+             (check "inversion: a write that wants readability is marked"
+                    (web-skeleton::connection-interest-inverted conn) t)
+             (check "inversion: EPOLLIN armed, and an empty socket is quiet"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+             (check "inversion: one write so far, no reads"
+                    (list (car reads) (car writes)) (list 0 1))
+             ;; Readability arrives. It must re-issue the WRITE.
+             (web-skeleton::handle-outbound-event
+              conn epfd (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+             (check "inversion: readability re-issued the write, not a read"
+                    (list (car reads) (car writes)) (list 0 2))
+             (check "inversion: the write completed and moved to reading"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "inversion: cleared on the way through"
+                    (web-skeleton::connection-interest-inverted conn) nil)
+             (check "inversion: and the peer got the bytes"
+                    (sb-ext:octets-to-string
+                     (coerce sink '(vector (unsigned-byte 8)))
+                     :external-format :ascii)
+                    "HELLO"))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
 (defun test-connection-transport-seam ()
   "Reads and writes route through CONNECTION-READ-FN / -WRITE-FN when set,
    and the drain loop runs until the transport says :AGAIN.
@@ -6599,6 +6710,7 @@
   (test-write-queue)
   (test-connection-transport-seam)
   (test-outbound-handshake-state)
+  (test-outbound-direction-inversion)
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-write-stall-sweep)

@@ -807,11 +807,9 @@
                (let ((err (%ssl-get-error ssl w)))
                  (cond
                    ((= err +ssl-error-want-write+) (setf pending n) :again)
-                   ((= err +ssl-error-want-read+)
-                    (error "SSL_write returned WANT_READ: the retry it wants ~
-                            is another SSL_write once the socket is readable, ~
-                            which this state machine cannot express. See ~
-                            SSL-CONNECTION-WRITER."))
+                   ;; Mirror of the read side: arm readability, re-issue
+                   ;; the write.
+                   ((= err +ssl-error-want-read+) (setf pending n) :want-read)
                    ;; errno is in the message for the same reason the fd is
                    ;; in EPOLL-WAIT's: SSL_ERROR_SYSCALL is a pointer at the
                    ;; socket layer and says nothing on its own.
@@ -869,11 +867,11 @@
             (let ((err (%ssl-get-error ssl n)))
               (cond
                 ((= err +ssl-error-want-read+) :again)
-                ((= err +ssl-error-want-write+)
-                 (error "SSL_read returned WANT_WRITE: the retry it wants ~
-                         is another SSL_read once the socket is writable, ~
-                         which this state machine cannot express. See ~
-                         SSL-CONNECTION-READER."))
+                ;; The state machine can express this now: the caller
+                ;; arms writability and re-issues the read. It must be the
+                ;; read -- retrying as a write is a protocol error that
+                ;; surfaces looking like a broken peer.
+                ((= err +ssl-error-want-write+) :want-write)
                 (t (ssl-read-eof-or-raise ssl n errno err)))))))))
 
 (defun ssl-byte-reader (ssl)

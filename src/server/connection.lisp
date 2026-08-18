@@ -48,6 +48,12 @@
   ;; puts its release here rather than trusting call sites to remember,
   ;; which is the argument NOTIFY-STREAM-CLOSED already won.
   (close-fn nil :type (or null function))
+  ;; T while the epoll interest is armed on the opposite direction to the
+  ;; one this connection's state implies -- a read waiting for writability,
+  ;; or a write waiting for readability. Only a transport that can invert
+  ;; ever sets it; it exists so the ordinary path pays no extra
+  ;; EPOLL_CTL_MOD to restore an interest it never changed.
+  (interest-inverted nil :type boolean)
   ;; Protocol state
   ;;   :read-http             — accumulating HTTP request bytes
   ;;   :read-body             — have headers, reading Content-Length body
@@ -347,6 +353,11 @@
      :EOF     — read nothing, already at end of stream
      :AGAIN   — read nothing, would block
      :FULL    — buffer is at CONNECTION-READ-CAP with no room to grow
+     :WANT-WRITE / :OK-WANT-WRITE
+              — read nothing / read some, and the transport now needs the
+                socket to become *writable* before this read can continue.
+                Only a TLS-style transport produces these; a raw fd never
+                does. See CONNECTION-READ-INTO.
 
    :OK-EOF is separate from :OK because the difference is the whole
    framing on two paths, and collapsing them cost this framework two
@@ -407,6 +418,15 @@
           (cond
             ((eq result :eof)   (return (if any-read :ok-eof :eof)))
             ((eq result :again) (return (if any-read :ok :again)))
+            ;; The transport wants to send before it can read again. Told
+            ;; apart from :AGAIN because the answer is different -- :AGAIN
+            ;; waits for readability, this waits for writability and then
+            ;; re-issues the *read*. Split into two verdicts for the same
+            ;; reason :OK-EOF is split from :EOF: the caller has bytes to
+            ;; process in one case and not the other, and collapsing that
+            ;; distinction has cost this framework two bugs already.
+            ((eq result :want-write)
+             (return (if any-read :ok-want-write :want-write)))
             (t (incf (connection-read-pos conn) result)
                (setf any-read t))))))))
 
@@ -1191,10 +1211,14 @@
             ((plusp remaining)
              (let ((result (connection-write-from
                             conn (connection-write-buf conn) pos remaining)))
-               (if (eq result :again)
-                   (return (finish :continue))
-                   (progn (setf wrote t)
-                          (incf (connection-write-pos conn) result)))))
+               (cond
+                 ((eq result :again) (return (finish :continue)))
+                 ;; The mirror image: the transport must receive before it
+                 ;; can send again, and what it wants re-issued is this
+                 ;; *write* once the socket is readable.
+                 ((eq result :want-read) (return (finish :want-read)))
+                 (t (setf wrote t)
+                    (incf (connection-write-pos conn) result)))))
             ;; Head drained; promote the next queued vector and keep writing.
             ;; The socket is still writable and will not say so a second time.
             ((connection-promote-write conn))

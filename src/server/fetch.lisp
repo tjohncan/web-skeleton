@@ -1544,6 +1544,12 @@
              ;; A handshake blocked on :WANT-READ armed EPOLLIN, so this
              ;; is the wake-up it asked for.
              (:out-handshake (handle-outbound-handshake conn epoll-fd))
+             ;; A write that asked to be woken on readability. Retried as a
+             ;; write, because that is the operation the transport wants
+             ;; re-issued — running the read the direction suggests is a
+             ;; protocol error that surfaces looking like a broken peer.
+             (:out-write (when (connection-interest-inverted conn)
+                           (handle-outbound-write conn epoll-fd)))
              ;; Stale EPOLLIN in another state — ignore silently.
              (otherwise nil)))
          ;; 2. Handle writable. Gated on (lookup-connection ...) so
@@ -1555,6 +1561,10 @@
              (:out-connecting (handle-outbound-connect conn epoll-fd))
              (:out-handshake  (handle-outbound-handshake conn epoll-fd))
              (:out-write      (handle-outbound-write conn epoll-fd))
+             ;; The mirror: a read that asked for writability is retried as
+             ;; a read.
+             (:out-read       (when (connection-interest-inverted conn)
+                                (handle-outbound-read conn epoll-fd)))
              (otherwise nil)))
          ;; 3. HUP/ERR after draining. If we still have a live
          ;;    :out-read connection, give it one more shot at
@@ -1581,6 +1591,40 @@
       ;; of a 502 on top of an already-queued real response.
       (when (lookup-connection (connection-fd conn))
         (deliver-fetch-error conn epoll-fd "outbound request failed")))))
+
+(defun natural-interest (conn)
+  "The epoll interest CONN's state implies: read when it is reading, write
+   when it is writing. The one assumption the whole event loop is built on,
+   named here because the inversion below is the only thing that departs
+   from it and has to know what to depart from."
+  (if (eq (connection-state conn) :out-read)
+      (logior +epollin+ +epollet+)
+      (logior +epollout+ +epollet+)))
+
+(defun invert-interest (conn epoll-fd)
+  "Arm the direction opposite to what CONN's state implies, because the
+   transport asked to be woken that way before the *same* operation can be
+   re-issued.
+
+   The operation is not recorded anywhere, and does not need to be: the
+   state already says which one is in flight, so the dispatcher retries by
+   state rather than by which direction woke it. Recording it separately
+   would be a second copy of a fact the state machine already holds, and
+   the two could disagree."
+  (setf (connection-interest-inverted conn) t)
+  (epoll-modify epoll-fd (connection-fd conn)
+                (if (eq (connection-state conn) :out-read)
+                    (logior +epollout+ +epollet+)
+                    (logior +epollin+ +epollet+))))
+
+(defun restore-interest (conn epoll-fd)
+  "Put the interest back where the state says it belongs, if an inversion
+   moved it. Gated on the flag so the ordinary path — which never inverts —
+   pays nothing: an EPOLL_CTL_MOD per wake-up to restore an interest that
+   was never changed is a syscall for no reason."
+  (when (connection-interest-inverted conn)
+    (setf (connection-interest-inverted conn) nil)
+    (epoll-modify epoll-fd (connection-fd conn) (natural-interest conn))))
 
 (defun handle-outbound-connect (conn epoll-fd)
   "Check if non-blocking connect succeeded, then hand off to the handshake
@@ -1638,12 +1682,19 @@
   (let ((result (connection-on-write conn)))
     (case result
       (:done
+       ;; The state change makes EPOLLIN natural, so an inversion that was
+       ;; outstanding is resolved by this same MOD rather than by a second.
        (setf (connection-state conn) :out-read
-             (connection-read-pos conn) 0)
+             (connection-read-pos conn) 0
+             (connection-interest-inverted conn) nil)
        (epoll-modify epoll-fd (connection-fd conn)
                     (logior +epollin+ +epollet+)))
+      ;; The transport must receive before it can send again. Arm
+      ;; readability; the dispatcher comes back into this function, because
+      ;; it retries by state and the state still says :OUT-WRITE.
+      (:want-read (invert-interest conn epoll-fd))
       ;; :continue — more bytes to write
-      )))
+      (t (restore-interest conn epoll-fd)))))
 
 (defun fetch-resume (conn)
   "Resume reading an outbound response that ON-BODY paused.
@@ -1686,8 +1737,11 @@
         conn epoll-fd
         (format nil "response exceeds ~d bytes (cap)"
                 *max-outbound-response-size*)))
-      (:again nil)  ; wait for more data
-      (:ok
+      (:again (restore-interest conn epoll-fd))  ; wait for more data
+      ;; Nothing read, and the transport wants to send first. Arm
+      ;; writability; the dispatcher will come back into *this* function.
+      (:want-write (invert-interest conn epoll-fd))
+      ((:ok :ok-want-write)
        ;; Got data — is the response framed-complete yet? OUTBOUND-
        ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
        ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
@@ -1733,7 +1787,13 @@
              ;; link. FETCH-RESUME has why the re-arm works.
              (pause
               (setf (connection-fetch-paused conn) t)
-              (epoll-modify epoll-fd (connection-fd conn) +epollet+)))))))))
+              (setf (connection-interest-inverted conn) nil)
+              (epoll-modify epoll-fd (connection-fd conn) +epollet+))
+             ;; Bytes arrived and the transport then asked to send. The
+             ;; response is not complete, so the same read has to be
+             ;; re-issued — once the socket is writable.
+             ((eq result :ok-want-write) (invert-interest conn epoll-fd))
+             (t (restore-interest conn epoll-fd)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
