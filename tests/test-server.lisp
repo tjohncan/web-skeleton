@@ -1315,6 +1315,24 @@
          (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
     (check "ipv6 host rebracketed default port"
            (not (null (search "host: [2001:db8::1]" text))) t))
+  ;; SCHEME exists in this builder for one observable reason: which port
+  ;; counts as default and is therefore left out of the Host header. It
+  ;; had no test, which is how a revert that stopped passing :SCHEME from
+  ;; the async fetch path went unnoticed — the fixture there binds an
+  ;; ephemeral port, where both schemes agree.
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "example.test" "/" :scheme :https :port 443))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "https default port is omitted from Host"
+           (not (null (search "host: example.test" text))) t)
+    (check "and not written out as :443"
+           (null (search ":443" text)) t))
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "example.test" "/" :scheme :http :port 443))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "443 is not default for http, so it stays"
+           (not (null (search "host: example.test:443" text))) t))
+
   ;; End-to-end: parse-url → build-outbound-request pipeline for an
   ;; IPv6 literal URL. The two tests above cover the builder directly;
   ;; this one locks in that the whole chain behaves correctly, so a

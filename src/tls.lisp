@@ -512,255 +512,11 @@
         (error "SSL_read: timed out (~a)" (errno-string errno))
         verdict)))
 
-(defun tls-read-all (ssl &key (method :GET))
-  "Read the HTTP response through the SSL connection and return it as a
-   byte vector. Bounded by *MAX-OUTBOUND-RESPONSE-SIZE* (headers + body
-   together) — the inbound *MAX-BODY-SIZE* cap is the wrong knob here,
-   since a legitimate 1 MB HTTPS response with a few hundred bytes of
-   headers exceeds the inbound-request budget on principle.
-
-   Stops as soon as the response is framed-complete, via the same
-   OUTBOUND-RESPONSE-COMPLETE-P the non-blocking plain-HTTP path uses:
-   Content-Length satisfied, chunked terminator seen, or (for HEAD)
-   headers done. METHOD is the request method, needed for that last case.
-
-   Reading to EOF unconditionally — which this did — worked only because
-   BUILD-OUTBOUND-REQUEST sends Connection: close by default, and it was
-   never free:
-
-     * It cost a round trip on *every* HTTPS fetch. The complete response
-       is already in hand; we were waiting for the peer's close_notify to
-       tell us something the framing had already said.
-     * An upstream that keeps the connection open — because the caller
-       passed its own Connection header — pinned this worker thread until
-       SO_RCVTIMEO fired (*FETCH-TIMEOUT*, 30s by default). HTTPS fetch is
-       blocking, so that is a worker, not merely a parked connection.
-     * It left the two transports disagreeing about when a response ends:
-       plain HTTP recognized the chunked terminator, TLS did not. The same
-       upstream behaved differently over http:// and https://.
-
-   Close-delimited responses (no Content-Length, no Transfer-Encoding)
-   still read to EOF, because for those EOF genuinely is the framing."
-  (let* ((cap 8192)
-         (out (make-array cap :element-type '(unsigned-byte 8)))
-         (len 0)
-         (chunk-scan 0)
-         (buf (make-array 8192 :element-type '(unsigned-byte 8))))
-    (loop
-      ;; Framed-complete? Ask before reading again, so a response whose
-      ;; last byte arrived on the previous pass does not wait on a read
-      ;; that has nothing left to deliver.
-      (multiple-value-bind (complete next-scan)
-          (outbound-response-complete-p out len method chunk-scan)
-        (setf chunk-scan next-scan)
-        (when complete (return)))
-      (sb-sys:with-pinned-objects (buf)
-        (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
-          (cond
-            ((> n 0)
-             (when (> (+ len n) *max-outbound-response-size*)
-               (error "HTTPS response too large (~d bytes, max ~d)"
-                      (+ len n) *max-outbound-response-size*))
-             ;; Grow geometrically and copy in one REPLACE — a
-             ;; VECTOR-PUSH-EXTEND per byte would dominate the read.
-             (when (> (+ len n) cap)
-               (loop while (< cap (+ len n)) do (setf cap (* cap 2)))
-               (let ((bigger (make-array cap :element-type '(unsigned-byte 8))))
-                 (replace bigger out :end2 len)
-                 (setf out bigger)))
-             (replace out buf :start1 len :end2 n)
-             (incf len n))
-            (t
-             ;; :EOF (benign close) or a raise — SSL-READ-EOF-OR-RAISE
-             ;; decides which, and a benign EOF is what completes a
-             ;; close-delimited response.
-             (ssl-blocking-read-eof-or-raise ssl n)
-             (return))))))
-    (subseq out 0 len)))
-
 (defun tls-close (ssl socket)
   "Shut down a TLS connection and close the socket."
   (ignore-errors (%ssl-shutdown ssl))
   (ignore-errors (%ssl-free ssl))
   (ignore-errors (sb-bsd-sockets:socket-close socket)))
-
-;;; ---------------------------------------------------------------------------
-;;; Blocking HTTPS fetch — called by the core framework via *https-fetch-fn*
-;;; ---------------------------------------------------------------------------
-
-(defun https-fetch (conn epoll-fd fetch-req host port path)
-  "Perform a blocking HTTPS fetch and deliver the result to CONN.
-   Called by initiate-fetch when the URL scheme is :https.
-
-   The fetch callback fires exactly once per call — either with real
-   (status headers body) arguments on the happy path, or with
-   (nil nil nil) as a cleanup sentinel in every error path
-   (tls-connect failure, handshake error, parse error, truncation).
-   Apps get a single defined moment to release DB handles, close
-   metric spans, or decrement rate-limit counters regardless of how
-   the fetch ends. CALLBACK-FIRED is flipped just before the happy-
-   path funcall so that if the user callback itself raises, the
-   outer handler-case does not re-invoke it."
-  (let ((callback (http-fetch-continuation-callback fetch-req))
-        (callback-fired nil))
-    (handler-case
-        (multiple-value-bind (ssl socket)
-            (tls-connect host port)
-          (unwind-protect
-              (let ((method (http-fetch-continuation-method fetch-req)))
-                ;; Build and send the HTTP request
-                (let ((request-bytes (build-outbound-request
-                                     method host path
-                                     :scheme :https :port port
-                                     :headers (http-fetch-continuation-headers fetch-req)
-                                     :body (http-fetch-continuation-body fetch-req))))
-                  (tls-write-all ssl request-bytes))
-                ;; Read the complete response. The parsing discipline
-                ;; here mirrors COMPLETE-FETCH on the plain path:
-                ;; header-end and status must both be present before
-                ;; the callback fires the happy-path branch, otherwise
-                ;; we raise and let the outer handler-case convert to
-                ;; 502 + cleanup sentinel. A 'status = 0' happy-path
-                ;; callback is a DEPLOYMENT.md contract violation —
-                ;; apps pattern-matching on (if status ...) treat the
-                ;; integer 0 as truthy and blow up interpreting it as
-                ;; an HTTP status.
-                (let* ((response-buf (tls-read-all ssl :method method))
-                       (buf-len (length response-buf))
-                       ;; Step over any 1xx interim blocks (RFC 7231 §6.2)
-                       ;; before locating the header boundary — a CDN's
-                       ;; unsolicited 103 Early Hints would otherwise supply
-                       ;; the status and headers this fetch reports, and the
-                       ;; real response would be dropped without a word.
-                       ;; Same helper the plain-HTTP path uses, so the two
-                       ;; transports cannot drift on where a response starts.
-                       (start (skip-interim-responses response-buf 0 buf-len))
-                       (header-end (scan-crlf-crlf response-buf start buf-len)))
-                  (unless header-end
-                    (error "https: upstream response has no parseable headers"))
-                  (let* ((status (parse-response-status response-buf start buf-len))
-                         (headers
-                          (let ((first-crlf (scan-crlf response-buf start header-end)))
-                            (when first-crlf
-                              (parse-headers-bytes response-buf
-                                                   (+ first-crlf 2)
-                                                   (+ header-end 4)))))
-                         (body-start (+ header-end 4))
-                         ;; RFC 7230 §3.3.3: TE takes precedence over CL
-                         (chunked-p (response-chunked-p headers))
-                         ;; RFC 7230 §3.3.3 rule 3: any TE present means
-                         ;; CL is ignored — read-until-close, not CL-framed.
-                         (te-present (scan-transfer-encoding response-buf
-                                                             header-end start))
-                         (content-length (unless te-present
-                                           (scan-content-length response-buf
-                                                                header-end start))))
-                    (unless status
-                      (error "https: upstream status line unparseable"))
-                    ;; Truncation guard: an upstream that declares a
-                    ;; Content-Length and then closes short must not be
-                    ;; allowed to hand us a silently-truncated body. The
-                    ;; MITM case is the nasty one — attacker RSTs
-                    ;; mid-stream and the app receives short data with no
-                    ;; indication. Signal an error so the outer
-                    ;; handler-case converts it into a 502 and fires
-                    ;; the cleanup sentinel.
-                    ;;
-                    ;; Skipped for 204/304 (carry CL but MUST NOT
-                    ;; have a body per RFC 7230 §3.3.3 rule 1 / RFC 7232
-                    ;; §4.1) and for HEAD (RFC 7231 §4.3.2 — upstream
-                    ;; echoes the GET-body CL but MUST NOT send a body).
-                    ;; Twin of the exemption in fetch.lisp COMPLETE-FETCH
-                    ;; on the plain-HTTP path, 1xx included: the skip
-                    ;; above has consumed every complete interim, so
-                    ;; STATUS is >= 200 here and testing for 1xx would be
-                    ;; dead code implying an interim could be final.
-                    (when (and content-length
-                               (not (or (= status 204) (= status 304)))
-                               (not (eq method :HEAD))
-                               (< (- buf-len body-start) content-length))
-                      (error "https: short body (~d of ~d bytes)"
-                             (- buf-len body-start) content-length))
-                    (let* ((body-end (if content-length
-                                         (min buf-len (+ body-start content-length))
-                                         buf-len))
-                           ;; 204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
-                           ;; HEAD MUST NOT include a body (RFC 7231 §4.3.2).
-                           ;; Force empty regardless of what the upstream sent.
-                           ;; 1xx cannot reach here — see the guard above.
-                           (body-end (if (or (= status 204) (= status 304)
-                                             (eq method :HEAD))
-                                         body-start
-                                         body-end))
-                           (raw-body (when (> body-end body-start)
-                                       (subseq response-buf body-start body-end)))
-                           (body (if (and raw-body chunked-p)
-                                     (decode-chunked-body raw-body 0 (length raw-body))
-                                     raw-body)))
-                    ;; Mark the callback as fired before the funcall so
-                    ;; that a raising user callback doesn't get invoked
-                    ;; a second time with nil sentinels in the outer
-                    ;; handler-case's cleanup branch.
-                    (setf callback-fired t)
-                    (let ((response (funcall callback
-                                             status (or headers nil)
-                                             (or body nil))))
-                      ;; Sync close-after-p from the callback's response
-                      ;; before format-response — a handler-set
-                      ;; Connection: close should zero out the hint too.
-                      (sync-close-after-p-from-response conn response)
-                      ;; Deliver to inbound connection. :HEAD-ONLY-P
-                      ;; short-circuits the body encode on HEAD (matches
-                      ;; the plain COMPLETE-FETCH path); byte-vector
-                      ;; responses still strip post-serialize.
-                      (let* ((head-p (and (connection-request conn)
-                                          (eq (http-request-method
-                                               (connection-request conn))
-                                              :HEAD)))
-                             (bytes (cond
-                                      ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                       (strip-body-for-head response conn))
-                                      ((typep response 'http-fetch-continuation)
-                                       ;; Chained fetch
-                                       (initiate-fetch conn epoll-fd response)
-                                       (return-from https-fetch))
-                                      (t (format-response
-                                          response
-                                          :connection-hint
-                                          (connection-hint-for conn)
-                                          :head-only-p head-p)))))
-                        (connection-queue-write conn bytes)
-                        (setf (connection-state conn) :write-response
-                              (connection-last-active conn) (get-universal-time))
-                        (epoll-modify epoll-fd (connection-fd conn)
-                                      (logior +epollout+ +epollet+))
-                        (log-debug "fetch: https ~a:~d~a -> fd ~d"
-                                   host port path (connection-fd conn))))))))
-            (tls-close ssl socket)))
-      (error (e)
-        (log-error "https fetch failed: ~a" e)
-        ;; Fire the cleanup sentinel in every pre-delivery error
-        ;; path so the app's :then closure runs exactly once.
-        ;; Wrapped in its own handler-case — a raising cleanup hook
-        ;; must not block the 502 from reaching the inbound.
-        (unless callback-fired
-          (handler-case (funcall callback nil nil nil)
-            (error (e2)
-              (log-warn "fetch cleanup callback raised: ~a" e2))))
-        (let ((err-bytes (strip-body-for-head
-                         (format-response
-                          (make-error-response 502)
-                          :connection-hint (connection-hint-for conn))
-                         conn)))
-          (connection-queue-write conn err-bytes)
-          (setf (connection-state conn) :write-response
-                (connection-last-active conn) (get-universal-time))
-          (epoll-modify epoll-fd (connection-fd conn)
-                        (logior +epollout+ +epollet+)))))))
-
-;;; ---------------------------------------------------------------------------
-;;; Blocking streaming HTTPS fetch
-;;; ---------------------------------------------------------------------------
 
 (defun https-fetch-stream (method host port path headers body on-line)
   "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line.
@@ -783,6 +539,39 @@
                                  :method method
                                  :read-fn (ssl-byte-reader ssl)))
       (tls-close ssl socket))))
+
+(defun tls-setup-outbound (conn host)
+  "Install the TLS transport on an outbound CONN. Called by INITIATE-FETCH
+   once the socket exists and the non-blocking connect is under way, before
+   the request is queued or epoll is armed.
+
+   This is the function items 3 through 8 were built for. Everything it
+   installs is a closure over one SSL: a handshake step, a byte source, a
+   byte sink, and a release. Nothing about the outbound state machine knows
+   that TLS exists — it asks a connection to read, to write, to take one
+   more handshake step, and to let go.
+
+   HOST rather than the connection's peer address, because the certificate
+   is checked against the name the caller asked for. Checking it against
+   the address DNS produced would verify that whoever answered holds a
+   certificate for themselves, which is not a check.
+
+   CLOSE-FN releases in the order the peer needs: the staging buffer, then
+   a best-effort close_notify, then the SSL. CONNECTION-CLOSE runs it
+   before the descriptor goes, which is what makes the shutdown possible at
+   all — it has nothing to send over afterwards. Best-effort because a peer
+   that has already vanished must not stop us freeing anything."
+  (let ((ssl (tls-client-ssl host (connection-fd conn))))
+    (multiple-value-bind (write-fn release-staging) (ssl-connection-writer ssl)
+      (setf (connection-handshake-fn conn) (ssl-handshake-stepper ssl)
+            (connection-read-fn conn)      (ssl-connection-reader ssl)
+            (connection-write-fn conn)     write-fn
+            (connection-close-fn conn)
+            (lambda ()
+              (funcall release-staging)
+              (ignore-errors (%ssl-shutdown ssl))
+              (%ssl-free ssl))))
+    conn))
 
 (defun ssl-connection-writer (ssl)
   "Returns (values WRITE-FN RELEASE-FN) for a CONNECTION over SSL.
@@ -1164,7 +953,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
-  (setf *https-fetch-fn* #'https-fetch)
+  (setf *tls-outbound-setup-fn* #'tls-setup-outbound)
   (setf *https-stream-fn* #'https-fetch-stream)
   ;; Swap the pure-Lisp crypto primitives for libssl-backed versions.
   ;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP remain reachable

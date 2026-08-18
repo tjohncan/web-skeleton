@@ -352,27 +352,21 @@ read about here.
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
   is the honest answer; silently skipping verification would not be.
   Plain `http://` to an IP literal works.
-- **Exactly one network operation is non-blocking, and "blocking" means
-  the worker rather than the connection.** `http-fetch` over `http://`
-  runs on the event loop: the inbound parks, the outbound uses the same
-  epoll, and one `*fetch-timeout*` bounds the whole exchange. Every other
-  operation below holds the worker thread, which is every connection that
-  worker is serving and not only the one that asked. With `(cpu-count)`
-  workers, one held worker is 1/N of the server.
+- **No network operation holds a worker; your own code does.** "Blocking"
+  here means the worker rather than the connection, and a held worker is
+  every connection that worker is serving, not only the one that asked.
+  `http-fetch` runs on the event loop for **both** schemes: the inbound
+  parks, the outbound uses the same epoll, and one `*fetch-timeout*`
+  bounds the whole exchange. For `https://` that now includes the TLS
+  handshake and every encrypted read and write. What remains below is
+  either your code or a deliberate sleep.
 
-  - **`http-fetch` over `https://`** blocks for the entire request
-    lifecycle. The API is identical to the `http://` form — the feature
-    list says "just use `https://` URLs" and means it — so one character
-    of scheme changes the concurrency model with nothing else to signal
-    it. The three setup phases (DNS, connect, request I/O) are each
-    bounded by `*fetch-timeout*`; the response read is not bounded in
-    time at all, only by `*max-outbound-response-size*`, so a trickling
-    upstream is stopped by 8 MiB rather than by a clock.
   - **`http-fetch-stream`, both schemes**, blocks and has **no total
     deadline of any kind**. `SO_RCVTIMEO` bounds each individual read, so
     an upstream that emits one byte before every timeout expires holds a
-    worker indefinitely. `*fetch-timeout*`'s docstring ("Blocking fetch
-    I/O timeout") reads as though it were a total. It is not.
+    worker indefinitely. It is a separate, line-oriented API and was left
+    blocking on purpose; `http-fetch` with `:on-body` is the non-blocking
+    way to consume a response incrementally.
   - **Your handler, `ws-handler`, and any fetch `:then` callback** block
     for as long as they run, with no bound. Inherent rather than a
     shortcoming — that is your code on the worker thread — but it is the
@@ -380,6 +374,20 @@ read about here.
   - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
     keep `EMFILE` from spinning the log. Under fd exhaustion that is a
     worker doing nothing else, 100 ms at a time.
+- **TLS renegotiation mid-transfer is handled but not exercised.** OpenSSL
+  can answer a read with "I need to write first" and a write with "I need
+  to read first" — a renegotiation or a post-handshake message. The state
+  machine represents both: it arms the opposite direction and re-issues
+  the *same* operation, which is what OpenSSL requires. What has not been
+  provoked is OpenSSL actually producing the condition, because that needs
+  a peer that renegotiates at a chosen moment and `openssl s_server` gives
+  no way to arrange one. Review-verified and unit-tested through a
+  scripted transport; not observed against a real peer.
+- **A truncated HTTPS response is an error, but only ECONNRESET proves
+  it.** The classifier that separates a clean end of stream from a
+  transport failure is asserted directly rather than provoked, for the
+  same reason: nothing available makes a peer send RST at a chosen point
+  mid-body.
 - **A WebSocket peer that reads slowly enough is never timed out.**
   Separate from the list above, because what it holds is one connection
   rather than a worker. `*write-stall-timeout*` bounds *inactivity* on the

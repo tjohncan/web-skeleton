@@ -23,6 +23,8 @@
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
         (test-ssl-read-classification)
+        (test-https-fetch-async-e2e)
+        (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
 
@@ -618,6 +620,172 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
+(defun test-https-does-not-hold-the-worker ()
+  "Issue #8's headline criterion: with one worker, a request relaying from
+   an https:// upstream must not delay a concurrent request to a fast
+   endpoint.
+
+   The stall is a SIGSTOPped peer, and that choice is what makes this a
+   test rather than a race. A frozen process completes the TCP connect —
+   the kernel does that — and then answers nothing, so the handshake parks
+   in :OUT-HANDSHAKE for as long as we like, deterministically. Timing the
+   fast request against a peer that merely happens to be slow would be a
+   measurement of the machine.
+
+   Before this branch the relay held the worker for the whole exchange,
+   and /fast would not have been answered until the upstream finished.
+   With one worker there is no other thread to rescue it: whether the fast
+   request is served at all is the entire question."
+  (format t "~%HTTPS relay does not hold the worker~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "no-hold: fixture generated" nil t)
+             (return-from test-https-does-not-hold-the-worker))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet)))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (peer-port)
+              (check "no-hold: peer came up" (not (null peer-port)) t)
+              (when peer-port
+                (let ((peer *tls-peer-process*))
+                  (with-test-server
+                      (:handler
+                       (lambda (req)
+                         (if (search "/fast" (http-request-path req))
+                             (make-text-response 200 "fast")
+                             (http-fetch
+                              :get (format nil "https://right.test:~d/" peer-port)
+                              :then (lambda (status headers body)
+                                      (declare (ignore status headers body))
+                                      (make-text-response 200 "relayed"))))))
+                    (let ((port *test-port*)
+                          (relay-done nil))
+                      ;; Frozen before anything connects, so the handshake
+                      ;; cannot complete until we say so.
+                      (sb-ext:process-kill peer 19)
+                      (let ((relay (sb-thread:make-thread
+                                    (lambda ()
+                                      (let ((*test-port* port))
+                                        (setf relay-done
+                                              (attempt
+                                               (nth-value
+                                                0 (test-http-request :get "/relay"))))))
+                                    :name "https-relay")))
+                        (unwind-protect
+                             (progn
+                               ;; Let the relay reach the stalled handshake.
+                               (sleep 0.5)
+                               (check "no-hold: the relay is still in flight"
+                                      relay-done nil)
+                               (let* ((start (get-internal-real-time))
+                                      (status (attempt
+                                               (nth-value
+                                                0 (test-http-request :get "/fast"))))
+                                      (elapsed (/ (- (get-internal-real-time) start)
+                                                  internal-time-units-per-second)))
+                                 (check "no-hold: the fast request was answered"
+                                        status 200)
+                                 ;; Generous on purpose. The claim is "not
+                                 ;; blocked behind a stalled TLS handshake",
+                                 ;; not a latency budget; a worker that was
+                                 ;; held would not answer at all until we
+                                 ;; released the peer, seconds later.
+                                 (check "no-hold: and answered promptly"
+                                        (< elapsed 2) t)))
+                          (ignore-errors (sb-ext:process-kill peer 18))
+                          (ignore-errors
+                           (sb-thread:join-thread relay :timeout 15))))
+                      ;; And the relay still completes once the peer moves.
+                      (check "no-hold: the stalled relay finished afterwards"
+                             relay-done 200))))))))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-fetch-async-e2e ()
+  "An https:// fetch through the event loop, end to end, on one worker.
+
+   This is what items 3 through 8 were for. Until now every one of them
+   was mechanism with tests and no production caller: the seam, the
+   handshake state, the byte source, the byte sink, the direction
+   inversion and the errno discipline had never all been wired at once,
+   let alone driven by a real request. Here a handler calls HTTP-FETCH on
+   an https:// URL, and the worker returns to the event loop between every
+   step of it.
+
+   DNS is overridden through *DNS-LOOKUP-FN*, the hook dns.lisp fills, and
+   SETF globally rather than bound: the worker reading it lives in a
+   thread WITH-TEST-SERVER spawned, and dynamic bindings do not cross
+   MAKE-THREAD. Restored in the UNWIND-PROTECT.
+
+   A name, not an address, because https:// to an IP literal is refused by
+   design — a certificate has to be checked against something, and an
+   address is not it. That refusal is the reason this test needs a
+   resolver at all."
+  (format t "~%HTTPS fetch through the event loop~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "https async: fixture generated" nil t)
+             (return-from test-https-fetch-async-e2e))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet)))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (port)
+              (check "https async: peer came up" (not (null port)) t)
+              (when port
+                (let ((upstream :never))
+                  (with-test-server
+                      (:handler
+                       (lambda (req)
+                         (declare (ignore req))
+                         (http-fetch
+                          :get (format nil "https://right.test:~d/" port)
+                          :then (lambda (status headers body)
+                                  (declare (ignore headers))
+                                  (setf upstream
+                                        (list status
+                                              (if (and body (plusp (length body)))
+                                                  :present :empty)))
+                                  (make-text-response 200 "relayed")))))
+                    (multiple-value-bind (status headers body)
+                        (test-http-request :get "/relay")
+                      (declare (ignore headers))
+                      (check "https async: the inbound request was answered"
+                             status 200)
+                      (check "https async: and answered from the relay"
+                             body "relayed")))
+                  ;; The upstream half, asserted separately: a 200 to the
+                  ;; client proves the handler ran, not that TLS worked.
+                  (check "https async: the upstream answered over TLS"
+                         upstream (list 200 :present)))))))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
 (defun test-ssl-read-classification ()
   "Every branch of the SSL_read classifier, and the blocking wrapper's one
    difference from it.
@@ -761,8 +929,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
 (defun test-tls-registration ()
   (format t "~%TLS Registration~%")
-  (check "https-fetch-fn set"
-         (not (null web-skeleton:*https-fetch-fn*)) t)
+  (check "tls-outbound-setup-fn set"
+         (not (null (symbol-value (tls-sym "*TLS-OUTBOUND-SETUP-FN*")))) t)
   (check "https-stream-fn set"
          (not (null web-skeleton:*https-stream-fn*)) t))
 

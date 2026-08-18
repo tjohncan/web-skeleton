@@ -107,7 +107,7 @@ Tune parameters before calling `start-server`:
 
 `*max-body-size*` caps the inbound request body.
 `*max-outbound-response-size*` caps the total bytes (headers + body)
-that `tls-read-all` will buffer for an HTTPS fetch —
+an `http-fetch` will buffer for a response, either scheme —
 tune this when your app's `:then` callback expects responses
 larger than the 8 MiB default.
 `*max-streaming-line-size*` caps one line inside a streamed response
@@ -285,9 +285,10 @@ Wrap it in `handler-case` to reject malformed signatures gracefully.
 
 ### Blocking fetch paths
 
-`http-fetch-stream` and HTTPS fetch are **blocking** —
-they hold the worker thread for the duration of the upstream call,
-bounded by `*fetch-timeout*` (default 30s) across each of three setup phases:
+`http-fetch-stream` is **blocking** — it holds the worker thread for the
+duration of the upstream call, bounded by `*fetch-timeout*` (default 30s)
+across each of three setup phases. `http-fetch` is not, for either scheme;
+see the async budget below.
 
 1. **DNS resolution** — shared `getent ahosts` subprocess,
    spawned with `:wait nil` and deadline-polled until exit or
@@ -303,16 +304,19 @@ bounded by `*fetch-timeout*` (default 30s) across each of three setup phases:
    so the subsequent read/write use the familiar blocking semantics.
 3. **Request I/O** — bounded by `SO_RCVTIMEO` / `SO_SNDTIMEO` on the connected socket.
    This is fine for bounded work inside a `ws-handler`,
-   but avoid calling them from HTTP handlers under load.
-   `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
-   For `https://` URLs it blocks the worker thread for the full request lifecycle.
+   but avoid calling it from HTTP handlers under load.
 
-**Async fetch timeout budget.** On the non-blocking `http-fetch` path for `http://` URLs,
+**Async fetch timeout budget.** On the `http-fetch` path — **both schemes** —
 `*fetch-timeout*` applies as a **single end-to-end budget** rather than per-phase:
-the inbound connection's `:awaiting` idle timer covers DNS + TCP connect + request I/O
-together. A slow DNS phase shortens the budget remaining for connect and response read.
-Blocking paths (`http-fetch-stream`, HTTPS) get the three per-phase bounds above;
-the async path gets one total. Tune `*fetch-timeout*` with this in mind —
+the inbound connection's `:awaiting` idle timer covers DNS + TCP connect + TLS
+handshake + request I/O together. A slow DNS phase shortens the budget remaining
+for everything after it. `http-fetch-stream` still gets the three per-phase bounds
+above; `http-fetch` gets one total.
+
+This is not a tuning detail on the HTTPS path, it is the only bound there is:
+`SO_RCVTIMEO` does nothing on a non-blocking socket, so the per-phase reading
+that used to bound encrypted reads no longer applies to them at all. The
+`:awaiting` timer replaced it. Tune `*fetch-timeout*` with this in mind —
 it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper answers **`504 Gateway Timeout`** and closes.
 

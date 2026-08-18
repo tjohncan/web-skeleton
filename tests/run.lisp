@@ -141,11 +141,11 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun tls-loaded-p ()
-  "True when web-skeleton-tls is in the image. *HTTPS-FETCH-FN* is the
+  "True when web-skeleton-tls is in the image. *HTTPS-STREAM-FN* is the
    signal because registering it is the last thing tls.lisp does on load,
    so it is set only once the FFI bindings and the crypto swaps have all
    succeeded."
-  (not (null web-skeleton:*https-fetch-fn*)))
+  (not (null web-skeleton:*https-stream-fn*)))
 
 (defun tls-sym (name)
   "Resolve a WEB-SKELETON symbol that exists only once web-skeleton-tls
@@ -259,7 +259,7 @@
     ;; too. No-op when libssl is absent: the default function
     ;; cells already are the pure-Lisp versions, so there is
     ;; nothing to re-verify.
-    (when web-skeleton:*https-fetch-fn*
+    (when web-skeleton:*https-stream-fn*
       (unless (test-pure-lisp-crypto)
         (setf all-passed nil))
       (incf total-passed *tests-passed*)

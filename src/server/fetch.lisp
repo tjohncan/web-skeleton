@@ -27,14 +27,31 @@
   (callback nil    :type function)
   ;; (BYTES) called per chunk as the response arrives, on the async
   ;; http:// path. NIL buffers the whole body as before.
-  (on-body  nil    :type (or null function)))
+  (on-body  nil    :type (or null function))
+  ;; :HTTP or :HTTPS, filled in by INITIATE-FETCH from the parsed URL.
+  ;; It lives here rather than being re-derived because the DNS path
+  ;; resumes several call frames later, carrying this struct and nothing
+  ;; else, and a second PARSE-URL there would be a second chance to
+  ;; disagree with the first about what the caller asked for.
+  (scheme   :http  :type keyword))
 
 (defparameter *fetch-timeout* 30
-  "Seconds, per phase — not a total, except on the async http:// path
-   where the :awaiting reap does bound the whole exchange. Elsewhere it
-   bounds DNS, connect, and each individual socket read separately, so a
-   trickling upstream never trips it. README Limitations has what that
-   costs.")
+  "Seconds. A total on the HTTP-FETCH path, both schemes: the inbound
+   parks in :AWAITING and the reaper bounds the whole exchange, handshake
+   included, however many reads and writes it took.
+
+   Per phase everywhere else, which now means HTTP-FETCH-STREAM and the
+   blocking setup paths only. There it bounds DNS, connect, and each
+   individual socket read separately, so a trickling upstream never trips
+   it. README Limitations has what that costs.
+
+   This docstring has now been wrong twice in opposite directions, so:
+   the trigger for revisiting it is not 'find the sentence about
+   timeouts', it is any change to which paths reach the event loop.
+   SO_RCVTIMEO does nothing on a non-blocking socket, so a path that
+   becomes non-blocking silently stops being bounded by the per-phase
+   reading and starts being bounded by the :AWAITING timer instead — a
+   change in what this number means, with nothing here to notice it.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound address policy (SSRF)
@@ -710,9 +727,17 @@
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
 ;;; ---------------------------------------------------------------------------
 
-(defvar *https-fetch-fn* nil
-  "When non-NIL, a function (conn epoll-fd fetch-req host port path) that
-   performs a blocking HTTPS fetch.  Set by web-skeleton-tls on load.")
+(defvar *tls-outbound-setup-fn* nil
+  "When non-NIL, a function (CONN HOST) that installs a TLS transport on
+   an outbound connection: a handshake step, a byte source, a byte sink,
+   and a release. Set by web-skeleton-tls on load.
+
+   Internal, like *DNS-LOOKUP-FN* and for the same reason — it is how
+   fetch.lisp reaches an optional system loaded after it, not something an
+   application sets. It replaced *HTTPS-FETCH-FN*, which named a blocking
+   whole-exchange function that no longer exists; *HTTPS-STREAM-FN* is
+   still the exported one, because HTTP-FETCH-STREAM is still blocking by
+   design.")
 
 (defvar *https-stream-fn* nil
   "When non-NIL, a function (method host port path headers body on-line) that
@@ -770,7 +795,8 @@
               (unwind-protect
                   (let ((request-bytes (build-outbound-request
                                        method host path
-                                       :port port
+                                       :scheme scheme
+                                      :port port
                                        :headers headers :body body)))
                     (write-sequence request-bytes stream)
                     (force-output stream)
@@ -1351,18 +1377,19 @@
   "Start an outbound HTTP(S) request.
    CONN is the inbound connection to park.
    FETCH-REQ is the http-fetch-continuation descriptor.
-   HTTP uses non-blocking epoll I/O. HTTPS dispatches to *https-fetch-fn*
-   (blocking on the worker thread) — requires web-skeleton-tls."
+
+   Both schemes take the same non-blocking epoll path. HTTPS used to
+   branch here into a blocking call that held the worker for the whole
+   exchange; what differs now is a transport installed on the outbound
+   connection — a handshake step, a byte source, a byte sink and a
+   release — and nothing about the state machine that drives them."
   (handler-case
       (multiple-value-bind (scheme host port path)
           (parse-url (http-fetch-continuation-url fetch-req))
-        (if (eq scheme :https)
-            ;; HTTPS — blocking path via TLS hook
-            (if *https-fetch-fn*
-                (funcall *https-fetch-fn* conn epoll-fd fetch-req host port path)
-                (error "HTTPS not available — load web-skeleton-tls"))
-            ;; HTTP — non-blocking epoll path
-            (initiate-http-fetch conn epoll-fd fetch-req host port path)))
+        (setf (http-fetch-continuation-scheme fetch-req) scheme)
+        (when (and (eq scheme :https) (null *tls-outbound-setup-fn*))
+          (error "HTTPS not available — load web-skeleton-tls"))
+        (initiate-http-fetch conn epoll-fd fetch-req host port path))
     (error (e)
       (log-error "fetch setup failed: ~a" e)
       ;; Fire the cleanup sentinel so the app's :then closure runs
@@ -1432,6 +1459,7 @@
                                  (= errno +eagain+))
                        (error "connect: ~a" (errno-string errno))))))
                (let* ((out-fd (socket-fd socket))
+                      (scheme (http-fetch-continuation-scheme fetch-req))
                       (request-bytes (build-outbound-request
                                       (http-fetch-continuation-method fetch-req)
                                       host path
@@ -1448,6 +1476,13 @@
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :last-active (get-universal-time)))
+                 ;; Before the request is queued and before epoll is armed,
+                 ;; so no path can reach a write with the transport half
+                 ;; installed. HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN
+                 ;; to decide that a completed TCP connect is not yet a
+                 ;; usable connection, and it has to be there by then.
+                 (when (eq scheme :https)
+                   (funcall *tls-outbound-setup-fn* out-conn host))
                  (connection-queue-write out-conn request-bytes)
                  (register-connection out-conn)
                  (setf registered t)
