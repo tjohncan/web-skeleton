@@ -559,6 +559,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                          (multiple-value-bind (write-fn release-fn)
                              (funcall (tls-sym "SSL-CONNECTION-WRITER") ssl)
                            (let* ((writes (list 0))
+                                  (releases (list 0))
                                   (conn (web-skeleton::make-connection
                                          :fd (web-skeleton::socket-fd socket)
                                          :socket socket :state :out-write
@@ -568,7 +569,17 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                          (lambda (b st n)
                                            (incf (car writes))
                                            (funcall write-fn b st n))
-                                         :close-fn release-fn))
+                                         ;; Counted, so the assertion below
+                                         ;; can observe the release running
+                                         ;; rather than the slot being
+                                         ;; cleared. CONNECTION-CLOSE nulls
+                                         ;; the slot before calling it, so a
+                                         ;; version that deleted only the
+                                         ;; call would still look tidy.
+                                         :close-fn
+                                         (lambda ()
+                                           (incf (car releases))
+                                           (funcall release-fn))))
                                   ;; Padding rides in a header value, so the
                                   ;; request stays well-formed and the peer
                                   ;; still has to parse it.
@@ -607,13 +618,17 @@ printf 'TAIL-MARKER\\n' >> body.txt
                              ;; Release is the connection's job, once.
                              (web-skeleton::connection-close conn)
                              (check "tls write: close ran the release"
+                                    (car releases) 1)
+                             (check "tls write: and cleared the slot with it"
                                     (web-skeleton::connection-close-fn conn) nil)
                              (check "tls write: and a second close is safe"
                                     (handler-case
                                         (progn (web-skeleton::connection-close conn)
                                                :ok)
                                       (error (e) (princ-to-string e)))
-                                    :ok)))
+                                    :ok)
+                             (check "tls write: which did not release twice"
+                                    (car releases) 1)))
                       (ignore-errors
                        (funcall (tls-sym "%SSL-FREE") ssl)))))))))
       (ignore-errors

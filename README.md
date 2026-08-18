@@ -441,7 +441,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
-| `*fetch-timeout*`              | `30`      | Per-phase bound, not a total. On the async `http://` path it *is* end-to-end (the `:awaiting` reap covers DNS + connect + read together). On the blocking paths it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
+| `*fetch-timeout*`              | `30`      | A **total** on the `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
@@ -496,7 +496,8 @@ carrying the outbound method, URL, headers, body, and a `:then` callback.
 The framework recognizes the continuation as the handler's return value,
 parks the inbound connection, resolves the hostname asynchronously via a `getent`
 subprocess if needed, makes the outbound call on the same epoll loop
-(non-blocking for plain HTTP), then invokes the callback with
+(non-blocking for both schemes — an `https://` fetch runs its handshake
+and every encrypted read and write there too), then invokes the callback with
 `(status headers body-bytes)`. Whatever the callback returns becomes
 the final response to the original caller:
 

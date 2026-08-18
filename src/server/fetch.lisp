@@ -1476,11 +1476,9 @@
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :last-active (get-universal-time)))
-                 ;; Before the request is queued and before epoll is armed,
-                 ;; so no path can reach a write with the transport half
-                 ;; installed. HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN
-                 ;; to decide that a completed TCP connect is not yet a
-                 ;; usable connection, and it has to be there by then.
+                 ;; Before the request is queued and before epoll is armed:
+                 ;; HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN, so no path
+                 ;; may reach a write with the transport half installed.
                  (when (eq scheme :https)
                    (funcall *tls-outbound-setup-fn* out-conn host))
                  (connection-queue-write out-conn request-bytes)
@@ -1504,7 +1502,19 @@
               (ignore-errors
                (epoll-remove epoll-fd (connection-fd out-conn))))
             (when (and registered out-conn)
-              (unregister-connection out-conn))))
+              (unregister-connection out-conn))
+            ;; Last, and unconditional on REGISTERED, because what it
+            ;; releases was installed before any of the flags were set.
+            ;; A TLS transport is an SSL and a 16 KiB foreign staging
+            ;; buffer, and both are freed by CLOSE-FN or by nothing —
+            ;; the connection object is collected, the memory behind it
+            ;; is not. Unwinding here without this leaked both, and the
+            ;; realistic trigger is EPOLL-ADD failing with ENOSPC or
+            ;; ENOMEM: exactly when the machine is already short, once
+            ;; per retry. After this the outer SOCKET-CLOSE is a no-op
+            ;; on a socket already closed, which is why it stays wrapped.
+            (when out-conn
+              (ignore-errors (connection-close out-conn)))))
       (error (e)
         (ignore-errors (sb-bsd-sockets:socket-close socket))
         (error e)))))
@@ -1596,8 +1606,7 @@
              (:out-connecting (handle-outbound-connect conn epoll-fd))
              (:out-handshake  (handle-outbound-handshake conn epoll-fd))
              (:out-write      (handle-outbound-write conn epoll-fd))
-             ;; The mirror: a read that asked for writability is retried as
-             ;; a read.
+             ;; The mirror of the EPOLLIN arm above.
              (:out-read       (when (connection-interest-inverted conn)
                                 (handle-outbound-read conn epoll-fd)))
              (otherwise nil)))
@@ -1724,9 +1733,8 @@
              (connection-interest-inverted conn) nil)
        (epoll-modify epoll-fd (connection-fd conn)
                     (logior +epollin+ +epollet+)))
-      ;; The transport must receive before it can send again. Arm
-      ;; readability; the dispatcher comes back into this function, because
-      ;; it retries by state and the state still says :OUT-WRITE.
+      ;; Must receive before it can send again. The dispatcher returns
+      ;; here because it retries by state, and the state is still :OUT-WRITE.
       (:want-read (invert-interest conn epoll-fd))
       ;; :continue — more bytes to write
       (t (restore-interest conn epoll-fd)))))
@@ -1803,8 +1811,7 @@
         (format nil "response exceeds ~d bytes (cap)"
                 *max-outbound-response-size*)))
       (:again (restore-interest conn epoll-fd))  ; wait for more data
-      ;; Nothing read, and the transport wants to send first. Arm
-      ;; writability; the dispatcher will come back into *this* function.
+      ;; Nothing read; the transport wants to send first.
       (:want-write (invert-interest conn epoll-fd))
       ((:ok :ok-want-write)
        ;; Got data — is the response framed-complete yet? OUTBOUND-
@@ -1854,22 +1861,14 @@
               (setf (connection-fetch-paused conn) t)
               (setf (connection-interest-inverted conn) nil)
               (epoll-modify epoll-fd (connection-fd conn) +epollet+)
-              ;; Record the back-link so the inbound can end this pause
-              ;; when its own backlog drains. Issue #5 described the resume
-              ;; as an inbound->outbound edge and what shipped was
-              ;; FETCH-RESUME, a primitive the app had to call itself —
-              ;; which meant an app that paused and then never ran again,
-              ;; because its next opportunity was the callback that is now
-              ;; not firing, had no way back. The edge closes that loop.
-              ;; FETCH-RESUME stays: an app that knows better than the
-              ;; backlog can still say so, and calling it is idempotent.
+              ;; The back-link RESUME-PAUSED-OUTBOUND reads; its docstring
+              ;; has why the edge exists.
               (let ((in (lookup-connection (connection-inbound-fd conn))))
                 (when in
                   (setf (connection-paused-outbound-fd in)
                         (connection-fd conn)))))
-             ;; Bytes arrived and the transport then asked to send. The
-             ;; response is not complete, so the same read has to be
-             ;; re-issued — once the socket is writable.
+             ;; Bytes arrived, then the transport asked to send. The
+             ;; response is incomplete, so this same read is re-issued.
              ((eq result :ok-want-write) (invert-interest conn epoll-fd))
              (t (restore-interest conn epoll-fd)))))))))
 

@@ -4761,6 +4761,66 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-fetch-setup-releases-transport-on-error ()
+  "A fetch that fails while wiring itself up still releases the transport
+   it had already installed.
+
+   The transport is an SSL and a 16 KiB foreign staging buffer. Both are
+   freed by CLOSE-FN or by nothing at all — the connection object is
+   collected, the memory behind it is not — so an unwind that skipped it
+   leaked once per attempt, for the life of the process.
+
+   EPOLL-ADD is the realistic trigger and the one used here: epoll_ctl
+   answers ENOSPC when max_user_watches is exhausted and ENOMEM under
+   pressure, which means this path is reached precisely when the machine
+   is already short, and every retry adds another 16 KiB. Passing -1 as
+   the epoll fd reproduces the failure without having to exhaust anything.
+
+   The assertion observes the release, not the connection's state.
+   Checking a slot after teardown would pass against a version that
+   cleared the slot and freed nothing, which is the whole shape of the
+   defect: the state looked tidy and the memory was gone."
+  (format t "~%Fetch setup releases its transport on error~%")
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 1)
+           (let* ((port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+                  (released 0)
+                  (installed 0)
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*tls-outbound-setup-fn*
+                    (lambda (out-conn host)
+                      (declare (ignore host))
+                      (incf installed)
+                      ;; Stands in for the SSL and the staging buffer. What
+                      ;; matters is only that it is installed the same way
+                      ;; and released by the same hook.
+                      (setf (web-skeleton::connection-close-fn out-conn)
+                            (lambda () (incf released)))))
+                  (inbound (web-skeleton::make-connection
+                            :fd -1 :state :read-http
+                            :last-active (get-universal-time)))
+                  (fetch-req (web-skeleton::make-http-fetch-continuation
+                              :method :GET
+                              :url (format nil "https://right.test:~d/" port)
+                              :scheme :https
+                              :callback (lambda (s h b)
+                                          (declare (ignore s h b)) nil))))
+             ;; -1 is not an epoll fd, so EPOLL-ADD raises after the
+             ;; transport is in place. ATTEMPT because the raise is the
+             ;; point and must not end the run.
+             (attempt
+              (web-skeleton::initiate-http-fetch-to-address
+               inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet))
+             (check "fetch setup: the transport was installed" installed 1)
+             (check "fetch setup: and released when the wiring failed"
+                    released 1)))
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
 (defun test-automatic-resume-edge ()
   "A paused outbound is resumed when the inbound it relays into drains its
    own backlog — without the application calling FETCH-RESUME.
@@ -6793,6 +6853,7 @@
   (test-write-queue)
   (test-connection-transport-seam)
   (test-outbound-handshake-state)
+  (test-fetch-setup-releases-transport-on-error)
   (test-automatic-resume-edge)
   (test-outbound-direction-inversion)
   (test-write-queue-drain)
