@@ -43,6 +43,11 @@
   ;; HANDLE-OUTBOUND-CONNECT that a completed TCP connect is not yet a
   ;; usable connection.
   (handshake-fn nil :type (or null function))
+  ;; Transport teardown, or NIL. A transport that allocates anything whose
+  ;; lifetime is the connection's -- a foreign staging buffer, an SSL --
+  ;; puts its release here rather than trusting call sites to remember,
+  ;; which is the argument NOTIFY-STREAM-CLOSED already won.
+  (close-fn nil :type (or null function))
   ;; Protocol state
   ;;   :read-http             — accumulating HTTP request bytes
   ;;   :read-body             — have headers, reading Content-Length body
@@ -186,10 +191,33 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-close (conn)
-  "Close a connection's file descriptor. Safe to call multiple times."
+  "Close a connection's file descriptor. Safe to call multiple times.
+
+   Runs CLOSE-FN first, exactly once, and before the descriptor goes: a
+   transport teardown that needs to talk to the peer has nothing to talk
+   over afterwards. Cleared before it is called so a re-entrant close
+   cannot run it twice, and a raise inside it is logged rather than
+   propagated, because a failed release must not leave the descriptor
+   open on the way out."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
-      (ignore-errors (%close fd))
+      (let ((release (connection-close-fn conn)))
+        (when release
+          (setf (connection-close-fn conn) nil)
+          (handler-case (funcall release)
+            (error (e)
+              (log-warn "transport close failed on fd ~d: ~a" fd e)))))
+      ;; Close through the socket object when there is one, rather than
+      ;; %CLOSE on the raw descriptor. SB-BSD-SOCKETS arms a finalizer that
+      ;; closes the fd when the socket is collected, and %CLOSE does not
+      ;; disarm it: the number is freed, the kernel hands it to whoever
+      ;; opens next, and a later GC closes it under them. The symptom is an
+      ;; EBADF on a descriptor its owner never closed, arriving whenever a
+      ;; GC happens to run -- which is nowhere near the code that caused it.
+      (let ((socket (connection-socket conn)))
+        (if socket
+            (ignore-errors (sb-bsd-sockets:socket-close socket))
+            (ignore-errors (%close fd))))
       (setf (connection-fd conn) -1
             (connection-socket conn) nil
             (connection-state conn) :closing))))

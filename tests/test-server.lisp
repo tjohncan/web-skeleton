@@ -4765,7 +4765,7 @@
          (conn (web-skeleton::make-connection
                 :fd -1 :read-fn (%scripted-read-fn '(5 5 5 :again) calls))))
     (check "seam: drain returns :ok when the source blocks"
-           (web-skeleton::connection-read-available conn) :ok)
+           (attempt (web-skeleton::connection-read-available conn)) :ok)
     (check "seam: every available byte accumulated"
            (web-skeleton::connection-read-pos conn) 15)
     (check "seam: drained until :again, not once"
@@ -4775,7 +4775,7 @@
          (conn (web-skeleton::make-connection
                 :fd -1 :read-fn (%scripted-read-fn '(4 :eof) calls))))
     (check "seam: bytes then end of stream is :ok-eof"
-           (web-skeleton::connection-read-available conn) :ok-eof)
+           (attempt (web-skeleton::connection-read-available conn)) :ok-eof)
     (check "seam: :ok-eof keeps the bytes"
            (web-skeleton::connection-read-pos conn) 4))
 
@@ -4783,13 +4783,13 @@
          (conn (web-skeleton::make-connection
                 :fd -1 :read-fn (%scripted-read-fn '(:eof) calls))))
     (check "seam: nothing then end of stream is :eof"
-           (web-skeleton::connection-read-available conn) :eof))
+           (attempt (web-skeleton::connection-read-available conn)) :eof))
 
   (let* ((calls (list 0))
          (conn (web-skeleton::make-connection
                 :fd -1 :read-fn (%scripted-read-fn '(:again) calls))))
     (check "seam: nothing available is :again"
-           (web-skeleton::connection-read-available conn) :again)
+           (attempt (web-skeleton::connection-read-available conn)) :again)
     (check "seam: :again costs exactly one call" (car calls) 1))
 
   ;; Growth through the seam. The initial buffer is 4 KiB, so this needs
@@ -4800,7 +4800,7 @@
                 :fd -1
                 :read-fn (%scripted-read-fn '(4096 4096 2000 :again) calls))))
     (check "seam: read buffer grows and keeps everything"
-           (web-skeleton::connection-read-available conn) :ok)
+           (attempt (web-skeleton::connection-read-available conn)) :ok)
     (check "seam: grown total is exact"
            (web-skeleton::connection-read-pos conn) 10192)
     (check "seam: buffer grew past its initial size"
@@ -4813,7 +4813,7 @@
          (conn (web-skeleton::make-connection
                 :fd -1 :read-fn (%scripted-read-fn '(64 64 :again) calls))))
     (check "seam: discard drains through the seam too"
-           (web-skeleton::connection-discard-available conn sink) :ok)
+           (attempt (web-skeleton::connection-discard-available conn sink)) :ok)
     (check "seam: discard drained until :again" (car calls) 3))
 
   ;; ---- writes ----
@@ -4825,7 +4825,7 @@
     (web-skeleton::connection-queue-write
      conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
     (check "seam: a partial write then the rest reports :done"
-           (web-skeleton::connection-on-write conn) :done)
+           (attempt (web-skeleton::connection-on-write conn)) :done)
     (check "seam: the peer saw the bytes once, in order"
            (sb-ext:octets-to-string (coerce sink '(vector (unsigned-byte 8)))
                                     :external-format :ascii)
@@ -4839,7 +4839,7 @@
     (web-skeleton::connection-queue-write
      conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
     (check "seam: a blocked write reports :continue"
-           (web-skeleton::connection-on-write conn) :continue)
+           (attempt (web-skeleton::connection-on-write conn)) :continue)
     (check "seam: and resumes from what was accepted"
            (web-skeleton::connection-write-pos conn) 2)))
 
@@ -4871,7 +4871,7 @@
                ;; in place. Static serving hands one vector to every request.
                (web-skeleton::connection-append-write conn shared)
                (check "drain: one pass reports done"
-                      (web-skeleton::connection-on-write conn) :done)
+                      (attempt (web-skeleton::connection-on-write conn)) :done)
                (check "drain: nothing left pending"
                       (web-skeleton::connection-write-pending conn) 0)
                (check "drain: shared vector is not mutated"

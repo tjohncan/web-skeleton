@@ -128,6 +128,13 @@
   (buf (* t))
   (num sb-alien:int))
 
+;;; Staging a write into foreign memory is a byte copy on the write path,
+;;; so it goes through libc rather than a SAP loop.
+(sb-alien:define-alien-routine ("memcpy" %memcpy) (* t)
+  (dest (* t))
+  (src (* t))
+  (n sb-alien:unsigned-long))
+
 ;;; SNI
 (sb-alien:define-alien-routine ("SSL_ctrl" %ssl-ctrl) sb-alien:long
   (ssl (* t))
@@ -177,6 +184,10 @@
 (defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-syscall+ 5)
 (defconstant +ssl-error-zero-return+ 6)
+(defconstant +ssl-write-stage-size+ 16384
+  "Bytes staged per SSL_write, one TLS record. Capping here costs nothing:
+   CONNECTION-ON-WRITE loops until :AGAIN or empty, and OpenSSL would split
+   a larger write into records of about this size anyway.")
 (defconstant +tlsext-nametype-host-name+ 0
   "The only SNI name type OpenSSL implements; SSL_get_servername takes it.")
 
@@ -720,6 +731,90 @@
                                  :method method
                                  :read-fn (ssl-byte-reader ssl)))
       (tls-close ssl socket))))
+
+(defun ssl-connection-writer (ssl)
+  "Returns (values WRITE-FN RELEASE-FN) for a CONNECTION over SSL.
+
+   WRITE-FN answers NB-WRITE's contract: bytes written, :AGAIN, or a raise.
+
+   The bytes are copied into a malloc'd staging buffer and SSL_write is
+   issued from there, never from the Lisp vector. OpenSSL requires that a
+   write retried after WANT_WRITE present the same address and length as
+   the call that failed, and SB-SYS:WITH-PINNED-OBJECTS pins only for its
+   own dynamic extent — a partial write returns to the event loop, the pin
+   is gone, and a GC before the retry may move the vector. Foreign memory
+   does not move, so the requirement is met by where the bytes live rather
+   than by anything the caller has to keep true.
+
+   The alternative was SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, and it was
+   rejected on a rule rather than a preference: it would make TLS write
+   correctness depend on the write queue never mutating what it holds — an
+   invariant that lives in connection.lisp, is documented there for an
+   entirely different reason (static responses share one vector across
+   connections), and would be broken by anyone who later decided to compact
+   the queue as an optimisation. They would break static serving and TLS
+   writes together, and only one of those has a comment warning them.
+
+   RELEASE-FN frees the staging buffer and is idempotent. It belongs on the
+   connection's CLOSE-FN; a seam that allocates without a matching release
+   is a leak by construction.
+
+   WANT_READ from a write is refused for the same reason WANT_WRITE is
+   refused from a read: the retry it asks for is another SSL_write once the
+   socket is *readable*, and the event loop outside :OUT-HANDSHAKE cannot
+   express that."
+  (let ((stage (sb-alien:make-alien (sb-alien:unsigned 8)
+                                    +ssl-write-stage-size+))
+        (pending 0))
+    (values
+     (lambda (buffer start nbytes)
+       (let ((n (min nbytes +ssl-write-stage-size+)))
+         ;; A retry must be the same call. The queue head does not move
+         ;; while a write is outstanding, so a mismatch means something
+         ;; changed the plan mid-write and OpenSSL would reject it anyway —
+         ;; better to say which invariant broke than to hand it on.
+         (when (and (plusp pending) (/= n pending))
+           (error "SSL_write retry changed length: staged ~d, now asked ~d"
+                  pending n))
+         (sb-sys:with-pinned-objects (buffer)
+           (%memcpy (sb-alien:alien-sap stage)
+                    (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                    n))
+         (let* ((w (%ssl-write ssl (sb-alien:alien-sap stage) n))
+                ;; Sampled here, before SSL_get_error. errno belongs to the
+                ;; call that just returned, and SSL_get_error is itself a
+                ;; foreign call that may set it — reading errno afterwards
+                ;; reports whatever that did, which is how a plain EAGAIN
+                ;; came back looking like EBADF.
+                (errno (if (> w 0) 0 (get-errno))))
+           (if (> w 0)
+               (progn (setf pending 0) w)
+               (let ((err (%ssl-get-error ssl w)))
+                 (cond
+                   ((= err +ssl-error-want-write+) (setf pending n) :again)
+                   ((= err +ssl-error-want-read+)
+                    (error "SSL_write returned WANT_READ: the retry it wants ~
+                            is another SSL_write once the socket is readable, ~
+                            which this state machine cannot express. See ~
+                            SSL-CONNECTION-WRITER."))
+                   ;; errno is in the message for the same reason the fd is
+                   ;; in EPOLL-WAIT's: SSL_ERROR_SYSCALL is a pointer at the
+                   ;; socket layer and says nothing on its own.
+                   ;; OpenSSL reports a would-block on some paths as
+                   ;; SSL_ERROR_SYSCALL with errno EAGAIN rather than as
+                   ;; WANT_WRITE. It is the same condition and the same
+                   ;; answer; treating it as an error made a full socket
+                   ;; buffer look like a transport failure.
+                   ((and (= err +ssl-error-syscall+)
+                         (or (= errno +eagain+) (= errno +ewouldblock+)))
+                    (setf pending n)
+                    :again)
+                   (t (error "SSL_write failed: error ~d (errno ~d: ~a)"
+                             err errno (errno-string errno)))))))))
+     (lambda ()
+       (when stage
+         (sb-alien:free-alien stage)
+         (setf stage nil))))))
 
 (defun ssl-connection-reader (ssl)
   "A CONNECTION read-fn over SSL. Fills BUFFER[START..START+MAX-BYTES) and

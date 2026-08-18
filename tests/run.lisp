@@ -175,6 +175,18 @@
    a full-suite run surfaces the complete failure list once more —
    scrolling up through every suite's block is not required.")
 
+(defmacro attempt (&body body)
+  "Evaluate BODY, answering its value, or the error text if it raised.
+
+   For a CHECK whose subject can raise — a reader, a writer, anything over a
+   transport. An uncaught raise ends the run mid-file: no failure list, no
+   totals, and every later assertion unexecuted. That makes the check
+   unreadable by the discipline every revert here is read under, which is
+   the full failure list, three runs. A raise that becomes a failed CHECK
+   carrying the condition text costs nothing and stays countable."
+  `(handler-case (progn ,@body)
+     (error (e) (princ-to-string e))))
+
 (defmacro check (name expr expected)
   "Assert that EXPR produces EXPECTED. Logs pass/fail."
   `(let ((result ,expr))

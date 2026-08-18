@@ -20,6 +20,8 @@
         (test-tls-client-ssl)
         (test-tls-end-to-end)
         (test-tls-ssl-pending)
+        (test-tls-connection-write)
+        (test-tls-write-retry-after-gc)
         (report-suite "TLS")
         (zerop *tests-failed*))))
 
@@ -103,6 +105,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
             (ignore-errors (sb-bsd-sockets:socket-close s))
             (sleep 0.05)))))))
 
+(defvar *tls-peer-process* nil
+  "The s_server process, bound inside %CALL-WITH-TLS-PEER. A special rather
+   than another parameter on FN, so the one test that needs to signal the
+   peer can reach it without every other call site growing an argument it
+   ignores.")
+
 (defun %call-with-tls-peer (dir leaf fn &key relay-file)
   "Run openssl s_server in DIR presenting LEAF's certificate, call FN with
    the port, then stop it. FN gets NIL if the server never came up.
@@ -143,7 +151,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
          ;; needs and s_server exits before the test arrives. The port goes
          ;; through unprobed and %TLS-CONNECT-RETRYING is the readiness
          ;; check instead.
-         (funcall fn (if relay-file port (and (%wait-for-accept port) port)))
+         (let ((*tls-peer-process* proc))
+           (funcall fn (if relay-file port (and (%wait-for-accept port) port))))
       (ignore-errors (sb-ext:process-kill proc 15))
       (ignore-errors (sb-ext:process-wait proc)))))
 
@@ -237,10 +246,22 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                 (buf (make-array 4096
                                                  :element-type '(unsigned-byte 8))))
                             (web-skeleton::set-nonblocking fd)
+                            ;; The subject raises as readily as it answers,
+                            ;; so a raise is converted into a value the CHECK
+                            ;; can report. Uncaught, it ends the run
+                            ;; mid-file: no failure list, no totals, and 35
+                            ;; later assertions never execute — which makes
+                            ;; this detector unreadable by the full-list
+                            ;; discipline every revert here is read under.
+                            ;; Same handler-case, same reason, as the parity
+                            ;; arm in test-properties.lisp.
                             (check "tls e2e: an empty TLS socket answers :again"
-                                   (funcall
-                                    (funcall (tls-sym "SSL-CONNECTION-READER") ssl)
-                                    buf 0 4096)
+                                   (handler-case
+                                       (funcall
+                                        (funcall (tls-sym "SSL-CONNECTION-READER")
+                                                 ssl)
+                                        buf 0 4096)
+                                     (error (e) (princ-to-string e)))
                                    :again))
                       (ignore-errors
                        (funcall (tls-sym "TLS-CLOSE") ssl socket)))))))
@@ -344,9 +365,18 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                                       '(:eof :ok-eof)))
                                    do (if (plusp (web-skeleton::epoll-wait
                                                   epfd evbuf 4 1000))
-                                          (push (web-skeleton::connection-read-available
-                                                 conn)
-                                                verdicts)
+                                          ;; A raising read becomes a verdict
+                                          ;; rather than the end of the suite;
+                                          ;; the assertions below then report
+                                          ;; on what was actually collected.
+                                          (let ((v (handler-case
+                                                       (web-skeleton::connection-read-available
+                                                        conn)
+                                                     (error (e)
+                                                       (list :raised
+                                                             (princ-to-string e))))))
+                                            (push v verdicts)
+                                            (when (consp v) (return)))
                                           (return)))
                              (let* ((got (web-skeleton::connection-read-pos conn))
                                     (raw (sb-ext:octets-to-string
@@ -390,6 +420,199 @@ printf 'TAIL-MARKER\\n' >> body.txt
                         (ignore-errors
                          (funcall (tls-sym "TLS-CLOSE") ssl socket)))))))
               :relay-file (format nil "~a/response.txt" dir))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defconstant +so-sndbuf+ 7
+  "SO_SNDBUF. Defined here rather than in epoll.lisp because nothing the
+   framework does needs it — only this test, which has to make a socket
+   small enough to block.")
+
+(defun test-tls-write-retry-after-gc ()
+  "A blocked SSL_write, a full GC, and then the retry — the exact sequence
+   the foreign staging buffer exists for.
+
+   OpenSSL requires a write retried after WANT_WRITE to present the same
+   address and length as the call that failed. WITH-PINNED-OBJECTS pins only
+   for its own dynamic extent, so a partial write that returns to the event
+   loop is unpinned in between and a GC may move the vector. Staging into
+   malloc'd memory removes the requirement rather than satisfying it: the
+   bytes live somewhere that cannot move.
+
+   The peer is SIGSTOPped, which is the whole reason this is reliable rather
+   than a race. A stopped process cannot read, so its receive buffer fills
+   and stays full; and unlike a peer that has finished or exited, it cannot
+   close the connection underneath the retry. Racing a live peer instead
+   produced exactly that — SSL_write failing with SSL_ERROR_SYSCALL because
+   the far end had gone away mid-test.
+
+   Small vectors, not one large one: a full GC is free to relocate a 1 KiB
+   vector and would leave a multi-megabyte one where it is.
+
+   Measured: with staging removed, the retry raises \"SSL_write failed:
+   error 1\" — SSL_ERROR_SSL, OpenSSL's bad-write-retry — three runs of
+   three. That is this ruling demonstrated rather than argued."
+  (format t "~%TLS write retry across a GC~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "tls retry: fixture generated" nil t)
+             (return-from test-tls-write-retry-after-gc))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           (let ((web-skeleton::*dns-resolve-blocking-fn*
+                   (lambda (h) (declare (ignore h))
+                     (values #(127 0 0 1) :inet))))
+             (%call-with-tls-peer
+              dir "right"
+              (lambda (port)
+                (check "tls retry: peer came up" (not (null port)) t)
+                (when port
+                  (multiple-value-bind (ssl socket)
+                      (funcall (tls-sym "TLS-CONNECT") "right.test" port)
+                    (multiple-value-bind (write-fn release-fn)
+                        (funcall (tls-sym "SSL-CONNECTION-WRITER") ssl)
+                      (let* ((fd (web-skeleton::socket-fd socket))
+                             (peer *tls-peer-process*)
+                             (conn (web-skeleton::make-connection
+                                    :fd fd :socket socket :state :out-write
+                                    :outbound-p t
+                                    :last-active (get-universal-time)
+                                    :write-fn write-fn :close-fn release-fn)))
+                        (unwind-protect
+                             (progn
+                               ;; Frozen, so it cannot read and cannot close.
+                               (sb-ext:process-kill peer 19)
+                               (web-skeleton::set-socket-option-int
+                                fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
+                               (web-skeleton::set-nonblocking fd)
+                               (loop repeat 4000
+                                     do (web-skeleton::connection-append-write
+                                         conn
+                                         (make-array 1024
+                                                     :element-type '(unsigned-byte 8)
+                                                     :initial-element 88)))
+                               (check "tls retry: the socket actually blocked"
+                                      (attempt (web-skeleton::connection-on-write conn))
+                                      :continue)
+                               ;; The whole point.
+                               (sb-ext:gc :full t)
+                               (check "tls retry: and the retry survives a full GC"
+                                      (attempt (web-skeleton::connection-on-write conn))
+                                      :continue))
+                          (ignore-errors (sb-ext:process-kill peer 18))
+                          (ignore-errors (web-skeleton::connection-close conn))
+                          (ignore-errors
+                           (funcall (tls-sym "%SSL-FREE") ssl))))))))))) 
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-tls-connection-write ()
+  "A request written through the connection write queue over real TLS, and
+   the staging buffer released afterwards.
+
+   The round trip is the correctness assertion. Counting bytes out would
+   pass against a staging copy that dropped or reordered them; a peer that
+   parses the request and answers 200 could not.
+
+   The large payload is there for the chunking. It exceeds
+   +SSL-WRITE-STAGE-SIZE+ several times over, so CONNECTION-ON-WRITE has to
+   come back for more and each pass restages — which is the path the
+   foreign buffer exists to make safe.
+
+   Not covered, and it is the same gap as WANT_WRITE on the read side: the
+   WANT_WRITE retry itself. Provoking it needs a peer that stops reading
+   while its socket buffer fills, and a retry that never happens cannot
+   demonstrate that the address held still across it. Review-verified."
+  (format t "~%TLS connection write path~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "tls write: fixture generated" nil t)
+             (return-from test-tls-connection-write))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           (let ((web-skeleton::*dns-resolve-blocking-fn*
+                   (lambda (h) (declare (ignore h))
+                     (values #(127 0 0 1) :inet))))
+             (%call-with-tls-peer
+              dir "right"
+              (lambda (port)
+                (check "tls write: peer came up" (not (null port)) t)
+                (when port
+                  (multiple-value-bind (ssl socket)
+                      (funcall (tls-sym "TLS-CONNECT") "right.test" port)
+                    (unwind-protect
+                         (multiple-value-bind (write-fn release-fn)
+                             (funcall (tls-sym "SSL-CONNECTION-WRITER") ssl)
+                           (let* ((writes (list 0))
+                                  (conn (web-skeleton::make-connection
+                                         :fd (web-skeleton::socket-fd socket)
+                                         :socket socket :state :out-write
+                                         :outbound-p t
+                                         :last-active (get-universal-time)
+                                         :write-fn
+                                         (lambda (b st n)
+                                           (incf (car writes))
+                                           (funcall write-fn b st n))
+                                         :close-fn release-fn))
+                                  ;; Padding rides in a header value, so the
+                                  ;; request stays well-formed and the peer
+                                  ;; still has to parse it.
+                                  (pad (make-string 60000 :initial-element #\X))
+                                  (req (sb-ext:string-to-octets
+                                        (format nil "GET / HTTP/1.0~c~cX-Pad: ~a~c~c~c~c"
+                                                #\Return #\Newline pad
+                                                #\Return #\Newline
+                                                #\Return #\Newline)
+                                        :external-format :ascii)))
+                             (check "tls write: payload exceeds the staging buffer"
+                                    (> (length req)
+                                       (* 3 (symbol-value
+                                             (tls-sym "+SSL-WRITE-STAGE-SIZE+"))))
+                                    t)
+                             (web-skeleton::connection-queue-write conn req)
+                             (check "tls write: the queue drains to :done"
+                                    (handler-case
+                                        (web-skeleton::connection-on-write conn)
+                                      (error (e) (princ-to-string e)))
+                                    :done)
+                             (check "tls write: it took several staged passes"
+                                    (> (car writes) 3) t)
+                             ;; The peer parsed what arrived. Nothing about a
+                             ;; byte count proves that.
+                             (let ((lines nil))
+                               (check "tls write: and the peer answered it"
+                                      (handler-case
+                                          (web-skeleton::stream-response-lines
+                                           nil (lambda (l) (push l lines))
+                                           :read-fn (funcall
+                                                     (tls-sym "SSL-BYTE-READER")
+                                                     ssl))
+                                        (error (e) (princ-to-string e)))
+                                      200))
+                             ;; Release is the connection's job, once.
+                             (web-skeleton::connection-close conn)
+                             (check "tls write: close ran the release"
+                                    (web-skeleton::connection-close-fn conn) nil)
+                             (check "tls write: and a second close is safe"
+                                    (handler-case
+                                        (progn (web-skeleton::connection-close conn)
+                                               :ok)
+                                      (error (e) (princ-to-string e)))
+                                    :ok)))
+                      (ignore-errors
+                       (funcall (tls-sym "%SSL-FREE") ssl)))))))))
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
