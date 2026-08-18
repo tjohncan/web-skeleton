@@ -1155,6 +1155,13 @@
       (let ((result (connection-on-write conn)))
         (case result
           (:done
+           ;; The backlog is empty, which is the event a relay's paused
+           ;; upstream is waiting for. Here rather than in the :streaming
+           ;; arm below because every state that can be relayed into
+           ;; reaches this point, and a resume that only worked for one of
+           ;; them would be the kind of gap nobody finds until a different
+           ;; response shape turns up.
+           (resume-paused-outbound conn epoll-fd)
            ;; All bytes sent — next action depends on state
            (case (connection-state conn)
              (:write-response

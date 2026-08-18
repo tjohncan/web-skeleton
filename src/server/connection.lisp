@@ -125,6 +125,14 @@
   ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
   ;; the upstream's send window fills. FETCH-RESUME re-arms.
   (fetch-paused    nil :type boolean)
+  ;; On an *inbound* connection: the fd of an outbound that paused while
+  ;; relaying into it, or -1. The back-link exists because the pause is
+  ;; recorded on the outbound and the event that should end it — this
+  ;; connection's backlog draining — arrives here. Outbound connections
+  ;; already carry INBOUND-FD; this is the other direction, and it is set
+  ;; only while a pause is outstanding so nothing has to be cleaned up on
+  ;; the ordinary path.
+  (paused-outbound-fd -1 :type fixnum)
   ;; Streaming response — set while STATE is :streaming
   (stream-framing   nil :type (or null keyword))  ; :chunked or :close
   ;; (CONN REASON) called exactly once when the stream ends, however it

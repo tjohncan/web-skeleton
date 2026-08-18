@@ -1174,6 +1174,36 @@
                (ignore-errors (sb-bsd-sockets:socket-close socket))))
          (error () nil))))
 
+(defun test-harness-fetch-stream-plain-e2e ()
+  "HTTP-FETCH-STREAM over http://, end to end.
+
+   It had no test at all, and that is how it came to be shipped broken:
+   a botched edit put an undefined variable into its request builder, the
+   whole suite stayed green, and only a compiler warning said so — on a
+   run whose warning check was itself misgrepped. An exported API with no
+   assertion is a place where two mistakes can meet.
+
+   Called from the test thread rather than from a handler, deliberately.
+   HTTP-FETCH-STREAM blocks the caller for the whole exchange, so a
+   handler on a one-worker server that fetched from its own server would
+   wait for a worker it is itself occupying. That is not a flaw in the
+   test — it is the documented cost of the blocking API, and the shape of
+   this test is what that cost looks like."
+  (format t "~%Harness: http-fetch-stream over plain HTTP~%")
+  (let ((lines nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    (make-text-response
+                     200 (format nil "alpha~%beta~%gamma~%"))))
+      (let ((status (attempt
+                     (http-fetch-stream
+                      :get (format nil "http://127.0.0.1:~d/lines" *test-port*)
+                      :on-line (lambda (line) (push line lines))))))
+        (check "fetch-stream: the upstream answered" status 200)
+        (check "fetch-stream: every line arrived, in order"
+               (nreverse lines) (list "alpha" "beta" "gamma"))))))
+
 (defun test-harness-port-zero-reported ()
   "START-SERVER with :PORT 0 binds an ephemeral port and reports it
    through :ON-LISTEN, and the port it reports is the one that serves.
@@ -1945,6 +1975,7 @@
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-fetch-stream-plain-e2e)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)

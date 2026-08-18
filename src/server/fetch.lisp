@@ -794,10 +794,9 @@
                            :buffering :full)))
               (unwind-protect
                   (let ((request-bytes (build-outbound-request
-                                       method host path
-                                       :scheme scheme
-                                      :port port
-                                       :headers headers :body body)))
+                                        method host path
+                                        :port port
+                                        :headers headers :body body)))
                     (write-sequence request-bytes stream)
                     (force-output stream)
                     (stream-response-lines stream on-line :method method))
@@ -1463,6 +1462,7 @@
                       (request-bytes (build-outbound-request
                                       (http-fetch-continuation-method fetch-req)
                                       host path
+                                      :scheme scheme
                                       :port port
                                       :headers (http-fetch-continuation-headers fetch-req)
                                       :body (http-fetch-continuation-body fetch-req))))
@@ -1744,10 +1744,40 @@
    than tracking state is not punished for it."
   (when (connection-fetch-paused conn)
     (setf (connection-fetch-paused conn) nil)
+    ;; Drop the back-link with the pause it belongs to, so an inbound that
+    ;; drains later does not resume something that resumed itself.
+    (let ((in (lookup-connection (connection-inbound-fd conn))))
+      (when (and in (= (connection-paused-outbound-fd in)
+                       (connection-fd conn)))
+        (setf (connection-paused-outbound-fd in) -1)))
     (when *epoll-fd*
       (epoll-modify *epoll-fd* (connection-fd conn)
                     (logior +epollin+ +epollet+))))
   (values))
+
+(defun resume-paused-outbound (conn epoll-fd)
+  "End a pause that CONN's own write backlog caused, now that it has
+   drained. A no-op unless an outbound paused while relaying into CONN.
+
+   This is the inbound->outbound edge issue #5 described and #7 shipped
+   without. Called where the backlog actually empties rather than on every
+   write, because a relay whose client is keeping up never pauses at all
+   and should not pay for the check twice per pass.
+
+   The outbound is looked up rather than held: it can be closed and its fd
+   reused between the pause and this call, and a stale pointer would
+   resume a stranger. The FD-identity check is the same discipline
+   CLOSE-OUTBOUND uses."
+  (let ((out-fd (connection-paused-outbound-fd conn)))
+    (when (>= out-fd 0)
+      (setf (connection-paused-outbound-fd conn) -1)
+      (let ((out (lookup-connection out-fd)))
+        (when (and out
+                   (connection-outbound-p out)
+                   (connection-fetch-paused out)
+                   (= (connection-inbound-fd out) (connection-fd conn)))
+          (let ((*epoll-fd* epoll-fd))
+            (fetch-resume out)))))))
 
 (defun handle-outbound-read (conn epoll-fd)
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
@@ -1823,7 +1853,20 @@
              (pause
               (setf (connection-fetch-paused conn) t)
               (setf (connection-interest-inverted conn) nil)
-              (epoll-modify epoll-fd (connection-fd conn) +epollet+))
+              (epoll-modify epoll-fd (connection-fd conn) +epollet+)
+              ;; Record the back-link so the inbound can end this pause
+              ;; when its own backlog drains. Issue #5 described the resume
+              ;; as an inbound->outbound edge and what shipped was
+              ;; FETCH-RESUME, a primitive the app had to call itself —
+              ;; which meant an app that paused and then never ran again,
+              ;; because its next opportunity was the callback that is now
+              ;; not firing, had no way back. The edge closes that loop.
+              ;; FETCH-RESUME stays: an app that knows better than the
+              ;; backlog can still say so, and calling it is idempotent.
+              (let ((in (lookup-connection (connection-inbound-fd conn))))
+                (when in
+                  (setf (connection-paused-outbound-fd in)
+                        (connection-fd conn)))))
              ;; Bytes arrived and the transport then asked to send. The
              ;; response is not complete, so the same read has to be
              ;; re-issued — once the socket is writable.

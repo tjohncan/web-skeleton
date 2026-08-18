@@ -4761,6 +4761,71 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-automatic-resume-edge ()
+  "A paused outbound is resumed when the inbound it relays into drains its
+   own backlog — without the application calling FETCH-RESUME.
+
+   Issue #5 described the resume as an inbound->outbound edge; what shipped
+   was FETCH-RESUME, a primitive the app had to invoke itself. The gap that
+   left is not theoretical: ON-BODY is the app's only scheduled contact
+   with a relay, pausing is what stops ON-BODY firing, so an app that
+   paused and had nothing else to run had removed its own way back.
+
+   Asserted against epoll rather than against a flag. Clearing
+   FETCH-PAUSED without re-arming EPOLLIN would look identical from the
+   struct and would leave the connection waiting for an event nobody is
+   going to send — which is exactly the mistake issue #5's own re-arm test
+   was rewritten to catch."
+  (format t "~%Automatic inbound-to-outbound resume~%")
+  (multiple-value-bind (in-server in-client) (%loopback-pair)
+    (multiple-value-bind (out-server out-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((in-fd (web-skeleton::socket-fd in-server))
+                    (out-fd (web-skeleton::socket-fd out-server))
+                    (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                       :element-type '(unsigned-byte 8)))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (inbound (web-skeleton::make-connection
+                              :fd in-fd :socket in-server :state :streaming
+                              :last-active (get-universal-time)))
+                    (outbound (web-skeleton::make-connection
+                               :fd out-fd :socket out-server :state :out-read
+                               :outbound-p t :inbound-fd in-fd
+                               :last-active (get-universal-time))))
+               (web-skeleton::register-connection inbound)
+               (web-skeleton::register-connection outbound)
+               ;; The state a pause leaves behind.
+               (setf (web-skeleton::connection-fetch-paused outbound) t
+                     (web-skeleton::connection-paused-outbound-fd inbound) out-fd)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (check "resume edge: paused means epoll reports nothing"
+                      (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+               ;; Give the inbound a backlog and drain it. :DONE is the
+               ;; event the edge hangs on.
+               (web-skeleton::connection-queue-write
+                inbound (sb-ext:string-to-octets "xyz" :external-format :ascii))
+               (check "resume edge: the inbound drained"
+                      (attempt (web-skeleton::handle-client-write inbound epfd))
+                      nil)
+               (check "resume edge: the outbound is no longer paused"
+                      (web-skeleton::connection-fetch-paused outbound) nil)
+               (check "resume edge: the back-link is cleared with it"
+                      (web-skeleton::connection-paused-outbound-fd inbound) -1)
+               ;; The assertion that matters: EPOLLIN is actually back.
+               (sb-bsd-sockets:socket-send out-client
+                                           (sb-ext:string-to-octets
+                                            "hi" :external-format :ascii)
+                                           nil)
+               (sleep 0.05)
+               (check "resume edge: and epoll reports the outbound again"
+                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 100)) t)
+               (check "resume edge: it is the outbound fd"
+                      (web-skeleton::epoll-event-fd evbuf 0) out-fd))
+          (ignore-errors (web-skeleton::%close epfd))
+          (dolist (s (list in-server in-client out-server out-client))
+            (ignore-errors (sb-bsd-sockets:socket-close s))))))))
+
 (defun test-outbound-direction-inversion ()
   "A read that must wait for writability, and a write that must wait for
    readability — and in both cases the operation that gets re-issued is the
@@ -6728,6 +6793,7 @@
   (test-write-queue)
   (test-connection-transport-seam)
   (test-outbound-handshake-state)
+  (test-automatic-resume-edge)
   (test-outbound-direction-inversion)
   (test-write-queue-drain)
   (test-ws-send-queues)

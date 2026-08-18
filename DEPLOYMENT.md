@@ -670,6 +670,11 @@ response size or by whatever proxy sits in front of it. Write the relay
 to take the bytes from `:on-body` when they arrive there and from
 `:then`'s body when they do not.
 
+The one asymmetry this used to have is gone: `:on-body` now behaves
+identically over `https://`, because both schemes take the same path and
+there is no second implementation to differ from. It is the framing that
+decides, not the transport.
+
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
 partial-line state carried across reads. A second implementation here
@@ -677,13 +682,24 @@ would be two readers that could disagree about where a line ends, which
 is the disagreement this codebase treats as its threat model. Split what
 you are given if you want lines.
 
-**Backpressure is a return value.** Return `:pause` from `:on-body` to
-stop reading the upstream — its send window fills and the pressure
-propagates back without anything being dropped or buffered — and call
-`fetch-resume` on the outbound connection to start again. A value rather
-than a condition, for the same reason `connection-append-write` refuses
-by return: applying backpressure is ordinary control flow and should not
-unwind through the middle of a read loop.
+**Backpressure is a return value, and it undoes itself.** Return `:pause`
+from `:on-body` to stop reading the upstream — its send window fills and
+the pressure propagates back without anything being dropped or buffered.
+Reading resumes on its own when the connection you are relaying *into*
+drains its write backlog, which is the event the pause was waiting for.
+
+You do not have to call anything. `fetch-resume` remains exported for an
+app that knows better than the backlog does — a producer that wants to
+resume early, or one relaying somewhere the framework is not writing —
+and calling it is idempotent. But an app that only ever pauses is no
+longer relying on itself to notice; `:on-body` is its scheduled contact
+with the relay, pausing is what stops `:on-body` firing, and an app whose
+only way back was a callback that is no longer running had removed it.
+
+A value rather than a condition, for the same reason
+`connection-append-write` refuses by return: applying backpressure is
+ordinary control flow and should not unwind through the middle of a read
+loop.
 
 The re-arm works here for a reason worth knowing. Elsewhere the docs warn
 that an `EPOLL_CTL_MOD` will not re-fire for data already sitting in

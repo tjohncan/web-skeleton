@@ -953,8 +953,6 @@
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
-  (setf *tls-outbound-setup-fn* #'tls-setup-outbound)
-  (setf *https-stream-fn* #'https-fetch-stream)
   ;; Swap the pure-Lisp crypto primitives for libssl-backed versions.
   ;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP remain reachable
   ;; internally; TEST-PURE-LISP-CRYPTO uses them to re-verify the
@@ -964,5 +962,16 @@
   (setf (symbol-function 'sha1)              #'sha1-libssl
         (symbol-function 'sha256)            #'sha256-libssl
         (symbol-function 'ecdsa-verify-p256) #'ecdsa-verify-p256-libssl)
-  (log-info "tls: HTTPS fetch enabled")
-  (log-info "tls: crypto swapped to libssl (sha1, sha256, ecdsa-p256)"))
+  (log-info "tls: crypto swapped to libssl (sha1, sha256, ecdsa-p256)")
+  ;; Registration goes last, after every swap above has returned, so that
+  ;; a hook being set means the whole file succeeded and not merely that
+  ;; execution reached this form. TLS-LOADED-P reads *HTTPS-STREAM-FN* as
+  ;; exactly that signal, and it was reading it before the swaps ran —
+  ;; a raise from one of them (an OpenSSL without EVP_MD_CTX_new, say)
+  ;; would have left TLS reporting itself loaded with sha1, sha256 and
+  ;; ecdsa-verify-p256 still pure-Lisp. TEST-PURE-LISP-CRYPTO exists to
+  ;; re-verify those on a libssl machine, so a half-swap could have read
+  ;; as a pass.
+  (setf *tls-outbound-setup-fn* #'tls-setup-outbound)
+  (setf *https-stream-fn* #'https-fetch-stream)
+  (log-info "tls: HTTPS fetch enabled"))
