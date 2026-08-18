@@ -440,40 +440,77 @@
    Both are passed in by a caller that already sampled them, which is what
    a caller must do if it needed to branch on WANT_READ first.
 
-   SSL_ERROR_SYSCALL conflates at least four distinct conditions
-   and must NOT be treated uniformly as clean EOF:
-     errno = 0                 — unexpected EOF with no close_notify.
-                                 Benign for HTTP/1.0-style legacy
-                                 servers that drop the TCP connection
-                                 as their framing signal. Treat as
-                                 clean EOF.
-     errno = EAGAIN/EWOULDBLOCK — SO_RCVTIMEO fired (the
-                                 *fetch-timeout* we install on the
-                                 socket in tls-connect). This is the
-                                 behavior DEPLOYMENT.md promises the
-                                 framework enforces; silent-EOF here
-                                 made that promise a lie for
-                                 close-delimited HTTPS responses and
-                                 for http-fetch-stream over HTTPS.
-     errno = ECONNRESET / EPIPE / ETIMEDOUT / other
-                              — real transport failure, including
-                                 the nasty MITM-RST-mid-stream case
-                                 where an attacker truncates a
-                                 response and the app sees 'success'.
-                              Loud raise.
-   Other SSL errors (WANT_READ / WANT_WRITE / SSL / etc) also raise."
-  (progn
-    (cond
-      ((= err +ssl-error-zero-return+) :eof)
-      ((= err +ssl-error-syscall+)
-       (progn
-         (cond
-           ((zerop errno) :eof)
-           ((or (= errno +eagain+) (= errno +ewouldblock+))
-            (error "SSL_read: timed out (~a)" (errno-string errno)))
-           (t
-            (error "SSL_read: transport error ~a" (errno-string errno))))))
-      (t (error "SSL_read failed: error ~d" err)))))
+   ARGUMENT ORDER IS A TRAP, and it belongs up here rather than at the
+   bottom because the next caller added is where it costs something.
+   ERRNO sits ahead of ERR. A caller written against the older shape and
+   passing ERR positionally now passes it as ERRNO, silently — and errno
+   is the whole basis of the split below, where a wrong value turns a
+   transport failure into a clean end of stream. Pass both or neither.
+
+   :AGAIN IS THE CALLER'S TO INTERPRET, and that is the re-derivation this
+   function needed once the socket stopped being blocking. EAGAIN used to
+   mean exactly one thing here — SO_RCVTIMEO fired — and the error message
+   said so. SO_RCVTIMEO does nothing on a non-blocking socket, so there
+   EAGAIN means only what it says: nothing to read yet. On a blocking
+   socket with the timeout installed it still cannot mean anything else,
+   because a blocking read does not return would-block unless the receive
+   timeout expired.
+
+   One classification, two readings, each made where the socket's mode is
+   known: SSL-CONNECTION-READER passes :AGAIN to the event loop, and
+   SSL-BLOCKING-READ-EOF-OR-RAISE turns it into the loud timeout
+   DEPLOYMENT.md promises. Deciding it here would mean guessing at a fact
+   this function cannot see.
+
+   SSL_ERROR_SYSCALL still conflates several conditions and still must NOT
+   be read uniformly as clean EOF:
+     errno = 0                  — end of stream with no close_notify.
+                                  Benign, and load-bearing: it is the
+                                  framing signal for HTTP/1.0-style
+                                  servers that never send one.
+     errno = EAGAIN/EWOULDBLOCK — would block. :AGAIN, per above.
+     errno = anything else      — real transport failure: ECONNRESET,
+                                  EPIPE, ETIMEDOUT. This is the MITM
+                                  RST-mid-stream case, where an attacker
+                                  truncates a response and a silent EOF
+                                  here delivers it as success. Loud
+                                  raise, always.
+
+   WANT_READ and WANT_WRITE reaching here is a caller bug: both are
+   continuable and belong to whoever knows how to continue them."
+  (cond
+    ((= err +ssl-error-zero-return+) :eof)
+    ((= err +ssl-error-syscall+)
+     (cond
+       ((zerop errno) :eof)
+       ((or (= errno +eagain+) (= errno +ewouldblock+)) :again)
+       (t (error "SSL_read: transport error ~a" (errno-string errno)))))
+    ((or (= err +ssl-error-want-read+) (= err +ssl-error-want-write+))
+     (error "SSL_read: ~a reached the classifier; it is continuable and ~
+             belongs to the caller that knows how to continue it"
+            (if (= err +ssl-error-want-read+) "WANT_READ" "WANT_WRITE")))
+    (t (error "SSL_read failed: error ~d" err))))
+
+(defun ssl-blocking-read-eof-or-raise (ssl n &optional
+                                            (errno (get-errno))
+                                            (err (%ssl-get-error ssl n)))
+  "SSL-READ-EOF-OR-RAISE for a socket still in blocking mode with
+   SO_RCVTIMEO installed.
+
+   The only difference is what :AGAIN means there, and it is not a
+   difference of degree: a blocking read does not return would-block
+   unless the receive timeout expired, so :AGAIN is the timeout and gets
+   the loud error DEPLOYMENT.md promises. Silence here made that promise
+   a lie once, for close-delimited HTTPS responses and for
+   http-fetch-stream over HTTPS.
+
+   A wrapper rather than a flag on the classifier: that one answers what
+   the transport reported, this one answers what it means on this kind of
+   socket, and neither has to know the other's business."
+  (let ((verdict (ssl-read-eof-or-raise ssl n errno err)))
+    (if (eq verdict :again)
+        (error "SSL_read: timed out (~a)" (errno-string errno))
+        verdict)))
 
 (defun tls-read-all (ssl &key (method :GET))
   "Read the HTTP response through the SSL connection and return it as a
@@ -537,7 +574,7 @@
              ;; :EOF (benign close) or a raise — SSL-READ-EOF-OR-RAISE
              ;; decides which, and a benign EOF is what completes a
              ;; close-delimited response.
-             (ssl-read-eof-or-raise ssl n)
+             (ssl-blocking-read-eof-or-raise ssl n)
              (return))))))
     (subseq out 0 len)))
 
@@ -896,7 +933,7 @@
             ;; Returns :EOF for a benign close, raises for everything
             ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
             ;; one of them is an ordinary end of stream.
-            (ssl-read-eof-or-raise ssl n errno))))))
+            (ssl-blocking-read-eof-or-raise ssl n errno))))))
 
 (sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
 

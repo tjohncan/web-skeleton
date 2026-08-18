@@ -22,6 +22,7 @@
         (test-tls-ssl-pending)
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
+        (test-ssl-read-classification)
         (report-suite "TLS")
         (zerop *tests-failed*))))
 
@@ -616,6 +617,110 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
+
+(defun test-ssl-read-classification ()
+  "Every branch of the SSL_read classifier, and the blocking wrapper's one
+   difference from it.
+
+   This code decides whether a truncated HTTPS response reaches an
+   application as success. It has carried that decision since the TLS path
+   was written and has never had a direct assertion on it — only the
+   end-to-end tests that happen to route through it on the happy path,
+   which exercise exactly one of its branches.
+
+   Both optionals are supplied at every call, so SSL is never dereferenced
+   and NIL is safe to pass. That is not a trick: it is the same shape a
+   real caller uses, because a caller that had to branch on WANT_READ
+   first has already sampled both.
+
+   The ECONNRESET case is the MITM one. Provoking a real reset mid-body
+   would need a peer that can be made to send RST rather than FIN at a
+   chosen moment, which openssl s_server gives no way to arrange; the
+   branch is asserted directly instead, and that is stated rather than
+   implied."
+  (format t "~%SSL_read classification~%")
+  (let ((classify (tls-sym "SSL-READ-EOF-OR-RAISE"))
+        (blocking (tls-sym "SSL-BLOCKING-READ-EOF-OR-RAISE"))
+        (syscall  (symbol-value (tls-sym "+SSL-ERROR-SYSCALL+")))
+        (zero-ret (symbol-value (tls-sym "+SSL-ERROR-ZERO-RETURN+")))
+        (want-rd  (symbol-value (tls-sym "+SSL-ERROR-WANT-READ+")))
+        (want-wr  (symbol-value (tls-sym "+SSL-ERROR-WANT-WRITE+")))
+        (eagain   (symbol-value (find-symbol "+EAGAIN+" :web-skeleton)))
+        (econnreset 104))
+    ;; A clean close_notify is the only unambiguous end of stream.
+    (check "classify: ZERO_RETURN is a clean end of stream"
+           (attempt (funcall classify nil 0 0 zero-ret)) :eof)
+    ;; errno 0 is end-of-stream without close_notify. Benign, and the
+    ;; framing signal HTTP/1.0-style servers actually use.
+    (check "classify: SYSCALL with errno 0 is end of stream"
+           (attempt (funcall classify nil -1 0 syscall)) :eof)
+    ;; The re-derivation. This used to be "the receive timeout fired",
+    ;; which is true only on a blocking socket.
+    (check "classify: SYSCALL with EAGAIN is would-block, not an error"
+           (attempt (funcall classify nil -1 eagain syscall)) :again)
+    ;; The one that must never be quiet.
+    (check "classify: SYSCALL with ECONNRESET raises"
+           (stringp (attempt (funcall classify nil -1 econnreset syscall))) t)
+    ;; ATTEMPT wraps the whole expression, not just the call. A revert
+    ;; that answers :EOF here would make SEARCH raise a type error
+    ;; *outside* a narrower wrapper, and the run would end instead of
+    ;; reporting -- which is the failure mode this suite spent a round
+    ;; removing.
+    (check "classify: and the message names the transport failure"
+           ;; Two ATTEMPTs, and both are needed. The inner one turns the
+           ;; expected raise into its text so SEARCH has something to look
+           ;; at; the outer one catches SEARCH itself when a revert answers
+           ;; a keyword instead, so the check fails rather than ending the
+           ;; run.
+           (attempt (and (search "transport error"
+                                 (attempt (funcall classify nil -1 econnreset syscall)))
+                         t))
+           t)
+    ;; Continuable codes are the caller's, and arriving here means a caller
+    ;; forgot. Loud, because silence would look like a transport failure.
+    (check "classify: WANT_READ here is a caller bug, and says so"
+           ;; Two ATTEMPTs, and both are needed. The inner one turns the
+           ;; expected raise into its text so SEARCH has something to look
+           ;; at; the outer one catches SEARCH itself when a revert answers
+           ;; a keyword instead, so the check fails rather than ending the
+           ;; run.
+           (attempt (and (search "continuable"
+                                 (attempt (funcall classify nil -1 0 want-rd)))
+                         t))
+           t)
+    (check "classify: WANT_WRITE likewise"
+           ;; Two ATTEMPTs, and both are needed. The inner one turns the
+           ;; expected raise into its text so SEARCH has something to look
+           ;; at; the outer one catches SEARCH itself when a revert answers
+           ;; a keyword instead, so the check fails rather than ending the
+           ;; run.
+           (attempt (and (search "continuable"
+                                 (attempt (funcall classify nil -1 0 want-wr)))
+                         t))
+           t)
+    ;; The blocking wrapper differs in exactly one place.
+    (check "blocking: EAGAIN is the receive timeout, and raises"
+           ;; Two ATTEMPTs, and both are needed. The inner one turns the
+           ;; expected raise into its text so SEARCH has something to look
+           ;; at; the outer one catches SEARCH itself when a revert answers
+           ;; a keyword instead, so the check fails rather than ending the
+           ;; run.
+           (attempt (and (search "timed out"
+                                 (attempt (funcall blocking nil -1 eagain syscall)))
+                         t))
+           t)
+    (check "blocking: end of stream still passes through"
+           (attempt (funcall blocking nil -1 0 syscall)) :eof)
+    (check "blocking: and a transport failure is still loud"
+           ;; Two ATTEMPTs, and both are needed. The inner one turns the
+           ;; expected raise into its text so SEARCH has something to look
+           ;; at; the outer one catches SEARCH itself when a revert answers
+           ;; a keyword instead, so the check fails rather than ending the
+           ;; run.
+           (attempt (and (search "transport error"
+                                 (attempt (funcall blocking nil -1 econnreset syscall)))
+                         t))
+           t)))
 
 (defun test-tls-client-ssl ()
   "TLS-CLIENT-SSL applies SNI, and the SSL says so when asked.

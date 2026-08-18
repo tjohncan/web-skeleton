@@ -344,16 +344,27 @@ chunked responses does not imply accepting chunked requests, and the
 ingress refusal is deliberate — it is what makes a CL-TE disagreement
 unrepresentable.
 
-**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL`
-for four distinct conditions — unexpected peer close without `close_notify`
-(benign for legacy HTTP/1.0-style servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`),
-real transport errors (`errno = ECONNRESET` / `EPIPE` / other),
-and read(2) failures. `tls-read-all` and `ssl-byte-reader` inspect `errno`
-after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign cases
-so `*fetch-timeout*` actually bounds the HTTPS read path for close-delimited responses
-and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_notify`
-is still accepted silently — that's the framing signal for HTTP/1.0-style servers
-that never send `close_notify` at all.
+**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL` for
+several distinct conditions and they must not be collapsed. `errno = 0` is
+end-of-stream without `close_notify` — benign, and load-bearing, because it
+is the framing signal HTTP/1.0-style servers actually use. `errno = EAGAIN`
+is would-block. Everything else (`ECONNRESET`, `EPIPE`, `ETIMEDOUT`) is a
+real transport failure and raises loudly, because that is the
+MITM-RST-mid-stream case: an attacker truncates a response, and a silent
+end-of-stream here would hand the application a partial body as success.
+
+What `EAGAIN` *means* depends on the socket, which is why one classifier
+answers it and two callers read it. On a socket left in blocking mode with
+`SO_RCVTIMEO` installed, a read cannot return would-block unless the receive
+timeout expired, so `ssl-blocking-read-eof-or-raise` turns it into the loud
+timeout this document promises — that is what bounds the HTTPS read path for
+close-delimited responses and for `http-fetch-stream` over HTTPS. On a
+non-blocking socket `SO_RCVTIMEO` does nothing at all, so `EAGAIN` means only
+what it says and the event loop waits for readability; there the bound comes
+from the parked inbound's timer rather than from the socket.
+
+Operationally the guarantee is unchanged: a truncated HTTPS response is an
+error, never a short success, on either path.
 
 **Framing headers are the framework's, not yours.** Passing either
 `Transfer-Encoding` or `Content-Length` in `:headers` signals an error
