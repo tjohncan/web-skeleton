@@ -27,14 +27,31 @@
   (callback nil    :type function)
   ;; (BYTES) called per chunk as the response arrives, on the async
   ;; http:// path. NIL buffers the whole body as before.
-  (on-body  nil    :type (or null function)))
+  (on-body  nil    :type (or null function))
+  ;; :HTTP or :HTTPS, filled in by INITIATE-FETCH from the parsed URL.
+  ;; It lives here rather than being re-derived because the DNS path
+  ;; resumes several call frames later, carrying this struct and nothing
+  ;; else, and a second PARSE-URL there would be a second chance to
+  ;; disagree with the first about what the caller asked for.
+  (scheme   :http  :type keyword))
 
 (defparameter *fetch-timeout* 30
-  "Seconds, per phase — not a total, except on the async http:// path
-   where the :awaiting reap does bound the whole exchange. Elsewhere it
-   bounds DNS, connect, and each individual socket read separately, so a
-   trickling upstream never trips it. README Limitations has what that
-   costs.")
+  "Seconds. A total on the HTTP-FETCH path, both schemes: the inbound
+   parks in :AWAITING and the reaper bounds the whole exchange, handshake
+   included, however many reads and writes it took.
+
+   Per phase everywhere else, which now means HTTP-FETCH-STREAM and the
+   blocking setup paths only. There it bounds DNS, connect, and each
+   individual socket read separately, so a trickling upstream never trips
+   it. README Limitations has what that costs.
+
+   This docstring has now been wrong twice in opposite directions, so:
+   the trigger for revisiting it is not 'find the sentence about
+   timeouts', it is any change to which paths reach the event loop.
+   SO_RCVTIMEO does nothing on a non-blocking socket, so a path that
+   becomes non-blocking silently stops being bounded by the per-phase
+   reading and starts being bounded by the :AWAITING timer instead — a
+   change in what this number means, with nothing here to notice it.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Outbound address policy (SSRF)
@@ -113,7 +130,8 @@
   "Maximum size of a single line in a streamed response (NDJSON,
    SSE, chunked text). Default 1 MiB. Applied by the streaming
    readers in FETCH-STREAM-PLAIN (via READER-READ-LINE /
-   READER-READ-BYTES) and TLS-STREAM-RESPONSE. Distinct from
+   READER-READ-BYTES), whichever byte source STREAM-READER is
+   wrapping. Distinct from
    *MAX-BODY-SIZE* (the inbound request-body cap) so tightening
    one does not move the other — an app tuning its request
    hardening should not incidentally break its NDJSON client.
@@ -560,8 +578,8 @@
 (defun parse-status-line-string (line)
   "String-level twin of PARSE-RESPONSE-STATUS. LINE is the first
    response line with CRLF already stripped (how the streaming
-   readers hand it over). Used by STREAM-RESPONSE-LINES and
-   TLS-STREAM-RESPONSE so their acceptance set is identical to
+   readers hand it over). Used by STREAM-RESPONSE-LINES, over either
+   transport, so its acceptance set is identical to
    the buffered path's byte-level check — without this, a non-HTTP
    upstream whose first line is '<junk> 200 OK' ('FUBAR 200 OK',
    'NOT-HTTP 418 Z') parses as status 200 on the streaming paths
@@ -709,9 +727,17 @@
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
 ;;; ---------------------------------------------------------------------------
 
-(defvar *https-fetch-fn* nil
-  "When non-NIL, a function (conn epoll-fd fetch-req host port path) that
-   performs a blocking HTTPS fetch.  Set by web-skeleton-tls on load.")
+(defvar *tls-outbound-setup-fn* nil
+  "When non-NIL, a function (CONN HOST) that installs a TLS transport on
+   an outbound connection: a handshake step, a byte source, a byte sink,
+   and a release. Set by web-skeleton-tls on load.
+
+   Internal, like *DNS-LOOKUP-FN* and for the same reason — it is how
+   fetch.lisp reaches an optional system loaded after it, not something an
+   application sets. It replaced *HTTPS-FETCH-FN*, which named a blocking
+   whole-exchange function that no longer exists; *HTTPS-STREAM-FN* is
+   still the exported one, because HTTP-FETCH-STREAM is still blocking by
+   design.")
 
 (defvar *https-stream-fn* nil
   "When non-NIL, a function (method host port path headers body on-line) that
@@ -768,9 +794,9 @@
                            :buffering :full)))
               (unwind-protect
                   (let ((request-bytes (build-outbound-request
-                                       method host path
-                                       :port port
-                                       :headers headers :body body)))
+                                        method host path
+                                        :port port
+                                        :headers headers :body body)))
                     (write-sequence request-bytes stream)
                     (force-output stream)
                     (stream-response-lines stream on-line :method method))
@@ -784,8 +810,16 @@
 ;;; line-by-line without issuing one syscall per byte.
 ;;; ---------------------------------------------------------------------------
 
-(defstruct (stream-reader (:constructor make-stream-reader (stream)))
+(defstruct (stream-reader
+            (:constructor make-stream-reader (stream &optional read-fn)))
   (stream nil)
+  ;; READ-FN, when present, replaces STREAM as the byte source:
+  ;; (READ-FN BUF LEN) fills BUF and answers with the count, :EOF at a
+  ;; clean end of stream, or raises. That is the contract
+  ;; SSL-BYTE-READER already answers, and it is the whole reason one
+  ;; line reader can serve both transports rather than TLS carrying a
+  ;; second implementation of this file's job.
+  (read-fn nil)
   (buf    (make-array 8192 :element-type '(unsigned-byte 8)))
   (pos    0 :type fixnum)
   (end    0 :type fixnum)
@@ -800,9 +834,28 @@
   (prev-cr nil :type boolean))
 
 (defun reader-fill (r)
-  "Refill the buffer. Returns bytes read (0 = EOF)."
+  "Refill the buffer. Returns bytes read (0 = EOF).
+
+   0 is the contract, not 'fewer than asked for', and the two byte
+   sources differ on exactly that: READ-SEQUENCE on a blocking stream
+   fills the whole buffer or stops at end of stream, so a short return
+   does mean EOF there, while a READ-FN answers as soon as any bytes are
+   available and a short fill means nothing at all. Every caller loops
+   and treats only 0 as terminal, so both work — but a caller that ever
+   reads a short fill as EOF would be correct on one source and silently
+   truncating on the other.
+
+   A READ-FN may also raise, which this function otherwise cannot. That
+   is deliberate on the TLS side: SSL-READ-EOF-OR-RAISE answers :EOF for
+   a benign close only and raises for everything else, which is what
+   keeps a reset mid-body from arriving here as a clean end of stream."
   (setf (stream-reader-pos r) 0)
-  (let ((n (read-sequence (stream-reader-buf r) (stream-reader-stream r))))
+  (let* ((buf (stream-reader-buf r))
+         (fn (stream-reader-read-fn r))
+         (n (if fn
+                (let ((v (funcall fn buf (length buf))))
+                  (if (eq v :EOF) 0 v))
+                (read-sequence buf (stream-reader-stream r)))))
     (setf (stream-reader-end r) n)
     n))
 
@@ -996,10 +1049,15 @@
 ;;; HTTP response streaming
 ;;; ---------------------------------------------------------------------------
 
-(defun stream-response-lines (stream on-line &key (method :GET))
+(defun stream-response-lines (stream on-line &key (method :GET) read-fn)
   "Read an HTTP response from a byte stream. Skip headers, call
    ON-LINE per body line. Handles chunked transfer encoding.
    Returns the status code.
+
+   READ-FN substitutes the byte source and STREAM is then ignored; see
+   READER-FILL for the contract. TLS supplies SSL-BYTE-READER, which is
+   how this function serves both transports and why there is no second
+   copy of it in tls.lisp.
 
    METHOD gates the body-framing discipline: for :HEAD, RFC 7231
    §4.3.2 guarantees an empty body even when the upstream echoes
@@ -1021,7 +1079,7 @@
        a premature RST without out-of-band framing, so treat clean
        EOF as complete. Apps that care about this case should use a
        framed path upstream."
-  (let ((r (make-stream-reader stream))
+  (let ((r (make-stream-reader stream read-fn))
         (status nil)
         (chunked nil)
         (te-present nil)
@@ -1161,9 +1219,9 @@
    raises on parse failure. Returns the integer size (0 for the
    final chunk).
 
-   Shared between stream-chunked-lines (plain streaming) and
-   tls-stream-response (tls streaming) so both paths reject the
-   same garbage inputs. Strict rejection matters here because a
+   Shared between stream-chunked-lines (streaming, either
+   transport) and decode-chunked-body (buffered) so every path
+   rejects the same garbage inputs. Strict rejection matters because a
    permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
    the decoder loop as if the stream were complete — a parser-
    disagreement smuggling primitive against any stricter
@@ -1186,16 +1244,6 @@
       (when (> n *max-outbound-response-size*)
         (error "chunked: chunk-size ~d exceeds response cap" n))
       n)))
-
-(defun parse-chunked-size-bytes (bytes start end)
-  "Byte-buffer entry point for PARSE-CHUNKED-SIZE-LINE. Used by
-   tls-stream-response which accumulates the chunk-size line in a
-   (unsigned-byte 8) fill-pointered buffer — this wrapper converts
-   and calls the string-level parser so the strict acceptance set
-   is identical on both sides of the tls/plaintext split."
-  (parse-chunked-size-line
-   (sb-ext:octets-to-string bytes :start start :end end
-                                   :external-format :ascii)))
 
 (defun stream-chunked-lines (r on-line)
   "Decode chunked transfer encoding via buffered reader R. Requires
@@ -1328,18 +1376,19 @@
   "Start an outbound HTTP(S) request.
    CONN is the inbound connection to park.
    FETCH-REQ is the http-fetch-continuation descriptor.
-   HTTP uses non-blocking epoll I/O. HTTPS dispatches to *https-fetch-fn*
-   (blocking on the worker thread) — requires web-skeleton-tls."
+
+   Both schemes take the same non-blocking epoll path. HTTPS used to
+   branch here into a blocking call that held the worker for the whole
+   exchange; what differs now is a transport installed on the outbound
+   connection — a handshake step, a byte source, a byte sink and a
+   release — and nothing about the state machine that drives them."
   (handler-case
       (multiple-value-bind (scheme host port path)
           (parse-url (http-fetch-continuation-url fetch-req))
-        (if (eq scheme :https)
-            ;; HTTPS — blocking path via TLS hook
-            (if *https-fetch-fn*
-                (funcall *https-fetch-fn* conn epoll-fd fetch-req host port path)
-                (error "HTTPS not available — load web-skeleton-tls"))
-            ;; HTTP — non-blocking epoll path
-            (initiate-http-fetch conn epoll-fd fetch-req host port path)))
+        (setf (http-fetch-continuation-scheme fetch-req) scheme)
+        (when (and (eq scheme :https) (null *tls-outbound-setup-fn*))
+          (error "HTTPS not available — load web-skeleton-tls"))
+        (initiate-http-fetch conn epoll-fd fetch-req host port path))
     (error (e)
       (log-error "fetch setup failed: ~a" e)
       ;; Fire the cleanup sentinel so the app's :then closure runs
@@ -1409,9 +1458,11 @@
                                  (= errno +eagain+))
                        (error "connect: ~a" (errno-string errno))))))
                (let* ((out-fd (socket-fd socket))
+                      (scheme (http-fetch-continuation-scheme fetch-req))
                       (request-bytes (build-outbound-request
                                       (http-fetch-continuation-method fetch-req)
                                       host path
+                                      :scheme scheme
                                       :port port
                                       :headers (http-fetch-continuation-headers fetch-req)
                                       :body (http-fetch-continuation-body fetch-req))))
@@ -1425,6 +1476,11 @@
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :last-active (get-universal-time)))
+                 ;; Before the request is queued and before epoll is armed:
+                 ;; HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN, so no path
+                 ;; may reach a write with the transport half installed.
+                 (when (eq scheme :https)
+                   (funcall *tls-outbound-setup-fn* out-conn host))
                  (connection-queue-write out-conn request-bytes)
                  (register-connection out-conn)
                  (setf registered t)
@@ -1446,7 +1502,19 @@
               (ignore-errors
                (epoll-remove epoll-fd (connection-fd out-conn))))
             (when (and registered out-conn)
-              (unregister-connection out-conn))))
+              (unregister-connection out-conn))
+            ;; Last, and unconditional on REGISTERED, because what it
+            ;; releases was installed before any of the flags were set.
+            ;; A TLS transport is an SSL and a 16 KiB foreign staging
+            ;; buffer, and both are freed by CLOSE-FN or by nothing —
+            ;; the connection object is collected, the memory behind it
+            ;; is not. Unwinding here without this leaked both, and the
+            ;; realistic trigger is EPOLL-ADD failing with ENOSPC or
+            ;; ENOMEM: exactly when the machine is already short, once
+            ;; per retry. After this the outer SOCKET-CLOSE is a no-op
+            ;; on a socket already closed, which is why it stays wrapped.
+            (when out-conn
+              (ignore-errors (connection-close out-conn)))))
       (error (e)
         (ignore-errors (sb-bsd-sockets:socket-close socket))
         (error e)))))
@@ -1518,6 +1586,15 @@
          (when (logtest flags +epollin+)
            (case (connection-state conn)
              (:out-read (handle-outbound-read conn epoll-fd))
+             ;; A handshake blocked on :WANT-READ armed EPOLLIN, so this
+             ;; is the wake-up it asked for.
+             (:out-handshake (handle-outbound-handshake conn epoll-fd))
+             ;; A write that asked to be woken on readability. Retried as a
+             ;; write, because that is the operation the transport wants
+             ;; re-issued — running the read the direction suggests is a
+             ;; protocol error that surfaces looking like a broken peer.
+             (:out-write (when (connection-interest-inverted conn)
+                           (handle-outbound-write conn epoll-fd)))
              ;; Stale EPOLLIN in another state — ignore silently.
              (otherwise nil)))
          ;; 2. Handle writable. Gated on (lookup-connection ...) so
@@ -1527,7 +1604,11 @@
                     (lookup-connection (connection-fd conn)))
            (case (connection-state conn)
              (:out-connecting (handle-outbound-connect conn epoll-fd))
+             (:out-handshake  (handle-outbound-handshake conn epoll-fd))
              (:out-write      (handle-outbound-write conn epoll-fd))
+             ;; The mirror of the EPOLLIN arm above.
+             (:out-read       (when (connection-interest-inverted conn)
+                                (handle-outbound-read conn epoll-fd)))
              (otherwise nil)))
          ;; 3. HUP/ERR after draining. If we still have a live
          ;;    :out-read connection, give it one more shot at
@@ -1555,30 +1636,108 @@
       (when (lookup-connection (connection-fd conn))
         (deliver-fetch-error conn epoll-fd "outbound request failed")))))
 
+(defun natural-interest (conn)
+  "The epoll interest CONN's state implies: read when it is reading, write
+   when it is writing. The one assumption the whole event loop is built on,
+   named here because the inversion below is the only thing that departs
+   from it and has to know what to depart from."
+  (if (eq (connection-state conn) :out-read)
+      (logior +epollin+ +epollet+)
+      (logior +epollout+ +epollet+)))
+
+(defun invert-interest (conn epoll-fd)
+  "Arm the direction opposite to what CONN's state implies, because the
+   transport asked to be woken that way before the *same* operation can be
+   re-issued.
+
+   The operation is not recorded anywhere, and does not need to be: the
+   state already says which one is in flight, so the dispatcher retries by
+   state rather than by which direction woke it. Recording it separately
+   would be a second copy of a fact the state machine already holds, and
+   the two could disagree."
+  (setf (connection-interest-inverted conn) t)
+  (epoll-modify epoll-fd (connection-fd conn)
+                (if (eq (connection-state conn) :out-read)
+                    (logior +epollout+ +epollet+)
+                    (logior +epollin+ +epollet+))))
+
+(defun restore-interest (conn epoll-fd)
+  "Put the interest back where the state says it belongs, if an inversion
+   moved it. Gated on the flag so the ordinary path — which never inverts —
+   pays nothing: an EPOLL_CTL_MOD per wake-up to restore an interest that
+   was never changed is a syscall for no reason."
+  (when (connection-interest-inverted conn)
+    (setf (connection-interest-inverted conn) nil)
+    (epoll-modify epoll-fd (connection-fd conn) (natural-interest conn))))
+
 (defun handle-outbound-connect (conn epoll-fd)
-  "Check if non-blocking connect succeeded, then start writing the request."
+  "Check if non-blocking connect succeeded, then hand off to the handshake
+   if the transport has one, or start writing the request if it does not."
   (let ((err (get-socket-option-int (connection-fd conn)
                                      +sol-socket+ +so-error+)))
-    (if (zerop err)
-        (progn
-          ;; Connect succeeded — start writing request (already queued)
-          (setf (connection-state conn) :out-write)
-          (handle-outbound-write conn epoll-fd))
-        ;; Connect failed
-        (deliver-fetch-error conn epoll-fd
-                             (format nil "connect failed: errno ~d" err)))))
+    (cond
+      ((not (zerop err))
+       (deliver-fetch-error conn epoll-fd
+                            (format nil "connect failed: errno ~d" err)))
+      ;; A transport with a handshake is not usable just because the TCP
+      ;; connect landed. Writing the request here would put plaintext on a
+      ;; socket the peer is expecting a ClientHello on.
+      ((connection-handshake-fn conn)
+       (setf (connection-state conn) :out-handshake)
+       (handle-outbound-handshake conn epoll-fd))
+      (t
+       ;; Connect succeeded — start writing request (already queued)
+       (setf (connection-state conn) :out-write)
+       (handle-outbound-write conn epoll-fd)))))
+
+(defun handle-outbound-handshake (conn epoll-fd)
+  "Run one step of the transport handshake and arm whichever direction it
+   asks for, or advance to :OUT-WRITE when it finishes.
+
+   This is the one state in the outbound machine where readable does not
+   mean read and writable does not mean write. A TLS handshake exchanges
+   several messages in both directions and only the handshake itself knows
+   which way it is currently blocked, so the step function answers with the
+   direction and this arms it.
+
+   Confining that to a state of its own is deliberate. The steady-state
+   read and write paths are built on readable-means-read, one to one, and
+   generalising them is a separate and much larger change; a handshake does
+   not need it, because a single state that re-arms per step expresses the
+   inversion completely for as long as it lasts.
+
+   Re-arming on every step, rather than only on a change, is the cheap and
+   correct choice: EPOLL_CTL_MOD on an unchanged mask costs one syscall per
+   handshake message, and tracking the current mask to avoid it would add
+   state whose only purpose is to be wrong once."
+  (ecase (funcall (connection-handshake-fn conn))
+    (:done
+     (setf (connection-state conn) :out-write)
+     (handle-outbound-write conn epoll-fd))
+    (:want-read
+     (epoll-modify epoll-fd (connection-fd conn)
+                   (logior +epollin+ +epollet+)))
+    (:want-write
+     (epoll-modify epoll-fd (connection-fd conn)
+                   (logior +epollout+ +epollet+)))))
 
 (defun handle-outbound-write (conn epoll-fd)
   "Flush the outbound HTTP request. When done, switch to reading the response."
   (let ((result (connection-on-write conn)))
     (case result
       (:done
+       ;; The state change makes EPOLLIN natural, so an inversion that was
+       ;; outstanding is resolved by this same MOD rather than by a second.
        (setf (connection-state conn) :out-read
-             (connection-read-pos conn) 0)
+             (connection-read-pos conn) 0
+             (connection-interest-inverted conn) nil)
        (epoll-modify epoll-fd (connection-fd conn)
                     (logior +epollin+ +epollet+)))
+      ;; Must receive before it can send again. The dispatcher returns
+      ;; here because it retries by state, and the state is still :OUT-WRITE.
+      (:want-read (invert-interest conn epoll-fd))
       ;; :continue — more bytes to write
-      )))
+      (t (restore-interest conn epoll-fd)))))
 
 (defun fetch-resume (conn)
   "Resume reading an outbound response that ON-BODY paused.
@@ -1593,10 +1752,40 @@
    than tracking state is not punished for it."
   (when (connection-fetch-paused conn)
     (setf (connection-fetch-paused conn) nil)
+    ;; Drop the back-link with the pause it belongs to, so an inbound that
+    ;; drains later does not resume something that resumed itself.
+    (let ((in (lookup-connection (connection-inbound-fd conn))))
+      (when (and in (= (connection-paused-outbound-fd in)
+                       (connection-fd conn)))
+        (setf (connection-paused-outbound-fd in) -1)))
     (when *epoll-fd*
       (epoll-modify *epoll-fd* (connection-fd conn)
                     (logior +epollin+ +epollet+))))
   (values))
+
+(defun resume-paused-outbound (conn epoll-fd)
+  "End a pause that CONN's own write backlog caused, now that it has
+   drained. A no-op unless an outbound paused while relaying into CONN.
+
+   This is the inbound->outbound edge issue #5 described and #7 shipped
+   without. Called where the backlog actually empties rather than on every
+   write, because a relay whose client is keeping up never pauses at all
+   and should not pay for the check twice per pass.
+
+   The outbound is looked up rather than held: it can be closed and its fd
+   reused between the pause and this call, and a stale pointer would
+   resume a stranger. The FD-identity check is the same discipline
+   CLOSE-OUTBOUND uses."
+  (let ((out-fd (connection-paused-outbound-fd conn)))
+    (when (>= out-fd 0)
+      (setf (connection-paused-outbound-fd conn) -1)
+      (let ((out (lookup-connection out-fd)))
+        (when (and out
+                   (connection-outbound-p out)
+                   (connection-fetch-paused out)
+                   (= (connection-inbound-fd out) (connection-fd conn)))
+          (let ((*epoll-fd* epoll-fd))
+            (fetch-resume out)))))))
 
 (defun handle-outbound-read (conn epoll-fd)
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
@@ -1621,8 +1810,10 @@
         conn epoll-fd
         (format nil "response exceeds ~d bytes (cap)"
                 *max-outbound-response-size*)))
-      (:again nil)  ; wait for more data
-      (:ok
+      (:again (restore-interest conn epoll-fd))  ; wait for more data
+      ;; Nothing read; the transport wants to send first.
+      (:want-write (invert-interest conn epoll-fd))
+      ((:ok :ok-want-write)
        ;; Got data — is the response framed-complete yet? OUTBOUND-
        ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
        ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
@@ -1668,7 +1859,18 @@
              ;; link. FETCH-RESUME has why the re-arm works.
              (pause
               (setf (connection-fetch-paused conn) t)
-              (epoll-modify epoll-fd (connection-fd conn) +epollet+)))))))))
+              (setf (connection-interest-inverted conn) nil)
+              (epoll-modify epoll-fd (connection-fd conn) +epollet+)
+              ;; The back-link RESUME-PAUSED-OUTBOUND reads; its docstring
+              ;; has why the edge exists.
+              (let ((in (lookup-connection (connection-inbound-fd conn))))
+                (when in
+                  (setf (connection-paused-outbound-fd in)
+                        (connection-fd conn)))))
+             ;; Bytes arrived, then the transport asked to send. The
+             ;; response is incomplete, so this same read is re-issued.
+             ((eq result :ok-want-write) (invert-interest conn epoll-fd))
+             (t (restore-interest conn epoll-fd)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)

@@ -1155,6 +1155,13 @@
       (let ((result (connection-on-write conn)))
         (case result
           (:done
+           ;; The backlog is empty, which is the event a relay's paused
+           ;; upstream is waiting for. Here rather than in the :streaming
+           ;; arm below because every state that can be relayed into
+           ;; reaches this point, and a resume that only worked for one of
+           ;; them would be the kind of gap nobody finds until a different
+           ;; response shape turns up.
+           (resume-paused-outbound conn epoll-fd)
            ;; All bytes sent — next action depends on state
            (case (connection-state conn)
              (:write-response
@@ -1345,9 +1352,31 @@
 ;;; Worker
 ;;; ---------------------------------------------------------------------------
 
-(defun run-worker (host port worker-id handler ws-handler)
+(defun run-worker (host port worker-id handler ws-handler &optional listener)
   "Run a single worker: own listener, own epoll fd, own connections.
-   Automatically restarts on unhandled errors (with backoff)."
+   Automatically restarts on unhandled errors (with backoff).
+
+   LISTENER, when supplied, is an already-bound socket this worker
+   adopts instead of binding one of its own. START-SERVER hands one to
+   worker 0 when :PORT was 0, so that the kernel-assigned port is held
+   by a real listener from the first instant it is knowable — see
+   START-SERVER for why closing it and rebinding is not survivable.
+
+   Adopted for the first pass only. A restart after a crash binds
+   normally, and lands on the right port because by then PORT is the
+   concrete number START-SERVER resolved — so the restarted worker
+   rejoins its siblings rather than appearing somewhere new.
+
+   The epoll fd is logged at startup because a worker was once seen to
+   fail with EBADF on its own, and the number is what distinguished a
+   descriptor closed underneath it from a wrong one arriving. That is
+   settled now, and the answer was the worse of the two: CONNECTION-CLOSE
+   closed descriptors with %CLOSE and left SB-BSD-SOCKETS' finalizer armed
+   on a number the kernel had already reissued, so a later GC closed it
+   under its new owner. An epoll fd is a bare number with nothing owning
+   it, which made a worker the ideal victim. It reached shipping servers,
+   not only test trees. See CONNECTION-CLOSE; the log line stays because
+   it is what made the failure legible."
   (loop
     (handler-case
         (with-worker-urandom
@@ -1381,7 +1410,12 @@
           ;; listener socket — a shared let* would leak it because the
           ;; cleanup form references EPOLL-FD which is never bound on
           ;; that path.
-          (let ((listener (make-tcp-listener host port)))
+          ;; SHIFTF rather than a plain read: an adopted listener belongs
+          ;; to this worker's first pass only. Reusing it after a restart
+          ;; would hand the new event loop a socket the crashed pass
+          ;; already closed in its own cleanup below.
+          (let ((listener (or (shiftf listener nil)
+                              (make-tcp-listener host port))))
             (unwind-protect
                  (let* ((epoll-fd (epoll-create))
                         ;; Bound per worker alongside the other share-nothing
@@ -1482,14 +1516,29 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler)
+                          handler ws-handler on-listen)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte vector (default #(127 0 0 1) = localhost only;
    use #(0 0 0 0) to listen on all interfaces).
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
-   and connection table. Ctrl-C shuts down all workers."
+   and connection table. Ctrl-C shuts down all workers.
+
+   PORT may be 0, in which case the kernel assigns one and ON-LISTEN —
+   a function of one argument, called once, on the calling thread, after
+   every worker thread has been spawned — receives the port actually
+   bound. It is called for a fixed port too, so a caller need not know
+   which kind it asked for. This function does not return until
+   shutdown, so a callback is the only way to answer the question.
+
+   A caller that binds port 0 itself, closes, and passes the number here
+   has a race. Every listener sets SO_REUSEPORT, so a second process
+   handed that number in the gap does not fail its bind: both hold the
+   port and the kernel splits traffic between them, silently — measured
+   on this repo at 40 requests split 17/23, with nothing in either log.
+   Resolving here means the port is never free between being chosen and
+   being served."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
@@ -1524,7 +1573,25 @@
                                  (declare (ignore signal info context))
                                  (setf *shutdown* t)))))
            (unwind-protect
-                (progn
+                ;; Resolve port 0 here, once, rather than letting the
+                ;; workers each pass it to bind(2). Two things break if
+                ;; they do: N workers on port 0 land on N *different*
+                ;; ephemeral ports, and RUN-WORKER's restart loop rebinds,
+                ;; so a crashed worker would come back somewhere its
+                ;; siblings are not. Neither shows up as an error — the
+                ;; server keeps serving on whichever port the caller
+                ;; happens to have been told about.
+                ;;
+                ;; The socket bound here is handed to worker 0 rather than
+                ;; closed and rebound: a port that is closed and rebound is
+                ;; free for an instant, and the docstring above is about
+                ;; what gets into that instant.
+                (let* ((listener0 (when (zerop port)
+                                    (make-tcp-listener host port)))
+                       (port (if listener0
+                                 (nth-value 1 (sb-bsd-sockets:socket-name
+                                               listener0))
+                                 port)))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
                   ;; Accumulate threads incrementally rather than via LOOP
@@ -1535,13 +1602,28 @@
                     (unwind-protect
                          (progn
                            (dotimes (i workers)
-                             (let ((id i))
+                             (let ((id i)
+                                   (adopted (when (zerop i) listener0)))
                                (push (sb-thread:make-thread
                                       (lambda ()
                                         (run-worker host port id
-                                                    handler ws-handler))
+                                                    handler ws-handler
+                                                    adopted))
                                       :name (format nil "web-skeleton-~d" i))
-                                     threads)))
+                                     threads)
+                               ;; Ownership passes to the thread only once
+                               ;; the thread exists. Clearing LISTENER0
+                               ;; after a successful MAKE-THREAD — never
+                               ;; before — is what keeps the cleanup below
+                               ;; and worker 0 from both closing it, while
+                               ;; still closing it if MAKE-THREAD raised.
+                               (when adopted (setf listener0 nil))))
+                           ;; After the spawn loop, so a caller that
+                           ;; connects the moment it learns the port finds
+                           ;; workers on their way up rather than a bound
+                           ;; socket with nobody behind it. The listener is
+                           ;; already accepting into its backlog either way.
+                           (when on-listen (funcall on-listen port))
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
                                (loop (sleep *shutdown-poll-interval*)
@@ -1555,6 +1637,12 @@
                       ;; exit, interactive-interrupt, AND a MAKE-THREAD
                       ;; raise partway through the spawn loop.
                       (setf *shutdown* t)
+                      ;; Non-NIL only if MAKE-THREAD raised before worker 0
+                      ;; adopted it, in which case nothing else will ever
+                      ;; close it.
+                      (when listener0
+                        (ignore-errors
+                         (sb-bsd-sockets:socket-close listener0)))
                       (dolist (thread threads)
                         (ignore-errors
                          (sb-thread:join-thread thread

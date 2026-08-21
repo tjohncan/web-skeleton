@@ -1315,6 +1315,24 @@
          (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
     (check "ipv6 host rebracketed default port"
            (not (null (search "host: [2001:db8::1]" text))) t))
+  ;; SCHEME exists in this builder for one observable reason: which port
+  ;; counts as default and is therefore left out of the Host header. It
+  ;; had no test, which is how a revert that stopped passing :SCHEME from
+  ;; the async fetch path went unnoticed — the fixture there binds an
+  ;; ephemeral port, where both schemes agree.
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "example.test" "/" :scheme :https :port 443))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "https default port is omitted from Host"
+           (not (null (search "host: example.test" text))) t)
+    (check "and not written out as :443"
+           (null (search ":443" text)) t))
+  (let* ((bytes (web-skeleton::build-outbound-request
+                 :GET "example.test" "/" :scheme :http :port 443))
+         (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
+    (check "443 is not default for http, so it stays"
+           (not (null (search "host: example.test:443" text))) t))
+
   ;; End-to-end: parse-url → build-outbound-request pipeline for an
   ;; IPv6 literal URL. The two tests above cover the builder directly;
   ;; this one locks in that the whole chain behaves correctly, so a
@@ -1519,7 +1537,7 @@
              (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
 
   ;; String-level twin PARSE-STATUS-LINE-STRING is what the streaming
-  ;; paths (stream-response-lines, tls-stream-response) now delegate to.
+  ;; path (stream-response-lines, over either transport) delegates to.
   ;; Its acceptance set MUST match the buffered byte-level parse —
   ;; without the prefix check, a non-HTTP upstream whose first line
   ;; contains '<junk> 200' masquerades as HTTP status 200 on the
@@ -2196,9 +2214,139 @@
   "Return an in-memory binary input stream over BYTES."
   (make-instance 'byte-array-stream :bytes bytes))
 
+(defun make-mock-read-fn (bytes &key chunk)
+  "A READ-FN byte source over BYTES — the read-fn twin of
+   MAKE-MOCK-STREAM. Answers the count, or :EOF once BYTES is spent.
+
+   CHUNK caps how much any single call will hand back. That is the point
+   of the parameter rather than a convenience: READ-SEQUENCE on a real
+   stream fills the whole buffer, so a corpus driven only through a
+   stream never splits a token across two fills, and the reader's
+   refill-and-resume paths — a CRLF pair straddling a boundary, a
+   chunk-size line arriving in pieces — go untested. CHUNK 1 puts a
+   boundary between every pair of bytes."
+  (let ((pos 0)
+        (len (length bytes)))
+    (lambda (buf want)
+      (let ((n (min want (if chunk (min chunk (- len pos)) (- len pos)))))
+        (if (<= n 0)
+            :EOF
+            (progn
+              (replace buf bytes :start1 0 :start2 pos :end2 (+ pos n))
+              (incf pos n)
+              n))))))
+
 (defun ascii-bytes (string)
   "Convert STRING to a byte vector."
   (sb-ext:string-to-octets string :external-format :ascii))
+
+(defun %response-corpus ()
+  "Response byte-strings covering every framing the line reader decides
+   between, each with the result TLS-STREAM-RESPONSE produced for it.
+   Entries are (NAME METHOD BYTES EXPECTED).
+
+   EXPECTED is recorded, not derived. It was captured from
+   TLS-STREAM-RESPONSE through its READ-FN seam while that function still
+   existed, at all three granularities below, which agreed — so a single
+   recorded triple is not a lie about any of them. That capture is what
+   makes the deletion of ~450 lines checkable rather than hopeful, and it
+   is the whole reason issue #4 put the seam there."
+  (let* ((cr (string #\Return))
+         (lf (string #\Newline))
+         (crlf (concatenate 'string cr lf)))
+    (flet ((raw (&rest parts)
+             (ascii-bytes (apply #'concatenate 'string parts))))
+      (list
+       ;; Byte counts here are load-bearing and were wrong once: a
+       ;; Content-Length longer than its body, or a chunk-size that
+       ;; misdescribes its chunk, makes the case test truncation under
+       ;; the name of the happy path. Three of these did, and the parity
+       ;; run still passed, because both readers agreed about the error.
+       ;; Count them.
+       (list "content-length" :GET               ; "one\ntwo\n" = 8
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
+                  "one" lf "two" lf)
+             '(200 ("one" "two") nil))
+       (list "chunked" :GET                      ; 6 = "alpha\n", 5 = "beta\n"
+             (raw "HTTP/1.1 200 OK" crlf "Transfer-Encoding: chunked" crlf crlf
+                  "6" crlf "alpha" lf crlf
+                  "5" crlf "beta" lf crlf
+                  "0" crlf crlf)
+             '(200 ("alpha" "beta") nil))
+       (list "interim 100 then 200" :GET         ; "hi\n" = 3
+             (raw "HTTP/1.1 100 Continue" crlf crlf
+                  "HTTP/1.1 200 OK" crlf "Content-Length: 3" crlf crlf
+                  "hi" lf)
+             '(200 ("hi") nil))
+       (list "interim 103 with headers" :GET
+             (raw "HTTP/1.1 103 Early Hints" crlf "Link: </s.css>" crlf crlf
+                  "HTTP/1.1 204 No Content" crlf "Content-Length: 0" crlf crlf)
+             '(204 nil nil))
+       (list "HEAD ignores echoed length" :HEAD
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 9" crlf crlf)
+             '(200 nil nil))
+       (list "close-delimited" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Type: text/plain" crlf crlf
+                  "tail" lf "end" lf)
+             '(200 ("tail" "end") nil))
+       ;; Well-framed chunk, then the stream simply stops — truncation on
+       ;; its own, not truncation plus a lying chunk-size.
+       (list "chunked truncated before terminator" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Transfer-Encoding: chunked" crlf crlf
+                  "5" crlf "beta" lf crlf)
+             '(nil ("beta") t))
+       (list "content-length short body" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 40" crlf crlf
+                  "not forty bytes" lf)
+             '(nil ("not forty bytes") t))
+       (list "bare LF terminators" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
+                  "a" lf "b" lf "c" lf "d" lf)
+             '(200 ("a" "b" "c" "d") nil))
+       (list "CR-only terminators" :GET
+             (raw "HTTP/1.1 200 OK" crlf "Content-Length: 6" crlf crlf
+                  "a" cr "b" cr "c" cr)
+             '(200 ("a" "b" "c") nil))))))
+
+(defun %run-line-reader (raw method chunk)
+  "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
+   Returns (STATUS LINES RAISED-P).
+
+   RAISED-P rather than the condition text. The recorded expectations came
+   from a different implementation, which worded its truncation errors
+   differently; the claim under test is that the verdict and the lines
+   delivered before it survived the replacement, not the phrasing."
+  (let ((lines nil))
+    (handler-case
+        (let ((status (web-skeleton::stream-response-lines
+                       nil
+                       (lambda (line) (push line lines))
+                       :method method
+                       :read-fn (make-mock-read-fn raw :chunk chunk))))
+          (list status (nreverse lines) nil))
+      (error () (list nil (nreverse lines) t)))))
+
+(defun test-line-reader-over-read-fn ()
+  "STREAM-RESPONSE-LINES over a READ-FN reproduces, on every framing and
+   at three byte-source granularities, what the deleted
+   TLS-STREAM-RESPONSE produced for the same bytes.
+
+   The granularities are the part with teeth. READ-SEQUENCE fills a whole
+   buffer, so a corpus driven only through a stream never splits a token
+   across two fills and the reader's refill-and-resume paths go
+   unexercised; :CHUNK 1 puts a boundary between every pair of bytes.
+   Measured: disabling the CRLF-straddle refill in READER-READ-LINE
+   leaves all ten whole-response cases passing and the rest of the suite
+   green, while failing nine of ten at :CHUNK 1."
+  (format t "~%Shared line reader over a byte-source function~%")
+  (dolist (chunk '(nil 7 1))
+    (dolist (entry (%response-corpus))
+      (destructuring-bind (name method raw expected) entry
+        (check (format nil "capture [~a] ~a"
+                       (if chunk (format nil "chunk ~d" chunk) "whole")
+                       name)
+               (%run-line-reader raw method chunk)
+               expected)))))
 
 (defun test-streaming-fetch ()
   (format t "~%Streaming Fetch~%")
@@ -2962,8 +3110,8 @@
           '(("transfer-encoding" . "gzip")
             ("transfer-encoding" . "identity"))) nil)
 
-  ;; parse-chunked-size-line — shared by the streaming chunk parsers
-  ;; in stream-chunked-lines and tls-stream-response. Strict hex,
+  ;; parse-chunked-size-line — shared by stream-chunked-lines and the
+  ;; buffered decode-chunked-body. Strict hex,
   ;; strips chunk-extensions from ';' onwards, raises on garbage.
   ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
   ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
@@ -4442,6 +4590,513 @@
       (check "backlog: a maximal legal ws message fits an empty queue"
              (web-skeleton::connection-append-write conn frame) t))))
 
+(defun %scripted-read-fn (script counter)
+  "A CONNECTION read-fn replaying SCRIPT. An integer fabricates that many
+   0x41 bytes; :AGAIN and :EOF are answered as themselves. Bumps COUNTER's
+   CAR per call.
+
+   Past the end of SCRIPT it answers :AGAIN rather than erroring, so a
+   drain loop that should already have stopped fails as a wrong call count
+   instead of spinning until CI kills the job."
+  (let ((remaining script))
+    (lambda (buffer start max-bytes)
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :again)))
+        (if (integerp step)
+            (let ((n (min step max-bytes)))
+              (fill buffer 65 :start start :end (+ start n))
+              n)
+            step)))))
+
+(defun %scripted-write-fn (script counter sink)
+  "A CONNECTION write-fn replaying SCRIPT. An integer accepts up to that
+   many bytes and appends them to SINK, so a test can assert what actually
+   went out and in what order; :AGAIN is answered as itself. Bumps
+   COUNTER's CAR per call, and answers :AGAIN past the end of SCRIPT."
+  (let ((remaining script))
+    (lambda (buffer start nbytes)
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :again)))
+        (if (integerp step)
+            (let ((n (min step nbytes)))
+              (loop for i from start below (+ start n)
+                    do (vector-push-extend (aref buffer i) sink))
+              n)
+            step)))))
+
+(defun %scripted-handshake-fn (script counter)
+  "A CONNECTION handshake-fn replaying SCRIPT. Entries are :WANT-READ,
+   :WANT-WRITE, :DONE, or :RAISE. Bumps COUNTER's CAR per call, and raises
+   past the end of SCRIPT — a state machine that keeps stepping a finished
+   handshake should say so rather than loop."
+  (let ((remaining script))
+    (lambda ()
+      (incf (car counter))
+      (let ((step (if remaining (pop remaining) :overrun)))
+        (case step
+          (:raise   (error "handshake failed: scripted"))
+          (:overrun (error "handshake stepped past :done"))
+          (t step))))))
+
+(defun %peer-has-bytes-p (fd)
+  "T if anything is readable on FD right now. FD must be non-blocking."
+  (integerp (web-skeleton::nb-read
+             fd (make-array 256 :element-type '(unsigned-byte 8)) 0 256)))
+
+(defun test-outbound-handshake-state ()
+  "The handshake state arms the direction its transport asks for, and the
+   request does not go on the wire until the handshake finishes.
+
+   Both halves need a real epoll fd and a real socket, because both are
+   claims about an interest mask. A loopback socket with nothing sent to it
+   is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
+   does not — which is what makes the two masks distinguishable without any
+   data timing. Asserting delivery instead would pass against a mask that
+   never changed: issue #5 produced exactly that test, twice.
+
+   The second half is the security-relevant one. A connection whose
+   transport has a handshake is not usable when the TCP connect lands, and
+   writing the queued request there would put the plaintext HTTP request on
+   a socket the peer is waiting for a ClientHello on."
+  (format t "~%Outbound transport handshake~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (peer-fd (web-skeleton::socket-fd client))
+                  (calls (list 0))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-connecting
+                         :outbound-p t :last-active (get-universal-time)
+                         :handshake-fn (%scripted-handshake-fn
+                                        '(:want-write :want-read :done)
+                                        calls))))
+             (web-skeleton::set-nonblocking peer-fd)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+
+             ;; TCP connect landed. With a handshake pending this must not
+             ;; become :out-write.
+             (web-skeleton::handle-outbound-connect conn epfd)
+             (check "handshake: connect hands off to the handshake state"
+                    (web-skeleton::connection-state conn) :out-handshake)
+             (check "handshake: stepped once"  (car calls) 1)
+             (check "handshake: nothing on the wire yet"
+                    (%peer-has-bytes-p peer-fd) nil)
+             (check "handshake: :want-write arms EPOLLOUT, and the loop wakes"
+                    (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+             (check "handshake: and it is this fd"
+                    (web-skeleton::epoll-event-fd evbuf 0) out-fd)
+
+             ;; :want-read next. The same socket is still writable, so a
+             ;; mask that failed to change would wake again here.
+             (web-skeleton::handle-outbound-handshake conn epfd)
+             (check "handshake: still handshaking"
+                    (web-skeleton::connection-state conn) :out-handshake)
+             (check "handshake: :want-read arms EPOLLIN, and nothing wakes"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+             (check "handshake: still nothing on the wire"
+                    (%peer-has-bytes-p peer-fd) nil)
+
+             ;; :done hands off to the write path, which flushes and moves
+             ;; to :out-read.
+             (web-skeleton::handle-outbound-handshake conn epfd)
+             (check "handshake: :done advances past the handshake"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "handshake: the request goes out only now"
+                    (%peer-has-bytes-p peer-fd) t)
+             (check "handshake: three steps, no more"  (car calls) 3))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; No handshake-fn: the pre-existing path, unchanged.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (peer-fd (web-skeleton::socket-fd client))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-connecting
+                         :outbound-p t :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking peer-fd)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::handle-outbound-connect conn epfd)
+             (check "no handshake: connect goes straight through to reading"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "no handshake: and the request went out immediately"
+                    (%peer-has-bytes-p peer-fd) t))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; A failing handshake raises rather than being retried. The outbound
+  ;; dispatcher's handler-case is what turns that into a 502; what matters
+  ;; here is that it is not swallowed and not looped on.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((calls (list 0))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd (web-skeleton::socket-fd server)
+                         :socket server :state :out-handshake
+                         :outbound-p t :last-active (get-universal-time)
+                         :handshake-fn (%scripted-handshake-fn '(:raise) calls))))
+             (check-error "handshake: a failed handshake raises"
+                          (web-skeleton::handle-outbound-handshake conn epfd))
+             (check "handshake: and it was not retried" (car calls) 1))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-fetch-setup-releases-transport-on-error ()
+  "A fetch that fails while wiring itself up still releases the transport
+   it had already installed.
+
+   The transport is an SSL and a 16 KiB foreign staging buffer. Both are
+   freed by CLOSE-FN or by nothing at all — the connection object is
+   collected, the memory behind it is not — so an unwind that skipped it
+   leaked once per attempt, for the life of the process.
+
+   EPOLL-ADD is the realistic trigger and the one used here: epoll_ctl
+   answers ENOSPC when max_user_watches is exhausted and ENOMEM under
+   pressure, which means this path is reached precisely when the machine
+   is already short, and every retry adds another 16 KiB. Passing -1 as
+   the epoll fd reproduces the failure without having to exhaust anything.
+
+   The assertion observes the release, not the connection's state.
+   Checking a slot after teardown would pass against a version that
+   cleared the slot and freed nothing, which is the whole shape of the
+   defect: the state looked tidy and the memory was gone."
+  (format t "~%Fetch setup releases its transport on error~%")
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 1)
+           (let* ((port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+                  (released 0)
+                  (installed 0)
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*tls-outbound-setup-fn*
+                    (lambda (out-conn host)
+                      (declare (ignore host))
+                      (incf installed)
+                      ;; Stands in for the SSL and the staging buffer. What
+                      ;; matters is only that it is installed the same way
+                      ;; and released by the same hook.
+                      (setf (web-skeleton::connection-close-fn out-conn)
+                            (lambda () (incf released)))))
+                  (inbound (web-skeleton::make-connection
+                            :fd -1 :state :read-http
+                            :last-active (get-universal-time)))
+                  (fetch-req (web-skeleton::make-http-fetch-continuation
+                              :method :GET
+                              :url (format nil "https://right.test:~d/" port)
+                              :scheme :https
+                              :callback (lambda (s h b)
+                                          (declare (ignore s h b)) nil))))
+             ;; -1 is not an epoll fd, so EPOLL-ADD raises after the
+             ;; transport is in place. ATTEMPT because the raise is the
+             ;; point and must not end the run.
+             (attempt
+              (web-skeleton::initiate-http-fetch-to-address
+               inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet))
+             (check "fetch setup: the transport was installed" installed 1)
+             (check "fetch setup: and released when the wiring failed"
+                    released 1)))
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-automatic-resume-edge ()
+  "A paused outbound is resumed when the inbound it relays into drains its
+   own backlog — without the application calling FETCH-RESUME.
+
+   Issue #5 described the resume as an inbound->outbound edge; what shipped
+   was FETCH-RESUME, a primitive the app had to invoke itself. The gap that
+   left is not theoretical: ON-BODY is the app's only scheduled contact
+   with a relay, pausing is what stops ON-BODY firing, so an app that
+   paused and had nothing else to run had removed its own way back.
+
+   Asserted against epoll rather than against a flag. Clearing
+   FETCH-PAUSED without re-arming EPOLLIN would look identical from the
+   struct and would leave the connection waiting for an event nobody is
+   going to send — which is exactly the mistake issue #5's own re-arm test
+   was rewritten to catch."
+  (format t "~%Automatic inbound-to-outbound resume~%")
+  (multiple-value-bind (in-server in-client) (%loopback-pair)
+    (multiple-value-bind (out-server out-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((in-fd (web-skeleton::socket-fd in-server))
+                    (out-fd (web-skeleton::socket-fd out-server))
+                    (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                       :element-type '(unsigned-byte 8)))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (inbound (web-skeleton::make-connection
+                              :fd in-fd :socket in-server :state :streaming
+                              :last-active (get-universal-time)))
+                    (outbound (web-skeleton::make-connection
+                               :fd out-fd :socket out-server :state :out-read
+                               :outbound-p t :inbound-fd in-fd
+                               :last-active (get-universal-time))))
+               (web-skeleton::register-connection inbound)
+               (web-skeleton::register-connection outbound)
+               ;; The state a pause leaves behind.
+               (setf (web-skeleton::connection-fetch-paused outbound) t
+                     (web-skeleton::connection-paused-outbound-fd inbound) out-fd)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (check "resume edge: paused means epoll reports nothing"
+                      (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+               ;; Give the inbound a backlog and drain it. :DONE is the
+               ;; event the edge hangs on.
+               (web-skeleton::connection-queue-write
+                inbound (sb-ext:string-to-octets "xyz" :external-format :ascii))
+               (check "resume edge: the inbound drained"
+                      (attempt (web-skeleton::handle-client-write inbound epfd))
+                      nil)
+               (check "resume edge: the outbound is no longer paused"
+                      (web-skeleton::connection-fetch-paused outbound) nil)
+               (check "resume edge: the back-link is cleared with it"
+                      (web-skeleton::connection-paused-outbound-fd inbound) -1)
+               ;; The assertion that matters: EPOLLIN is actually back.
+               (sb-bsd-sockets:socket-send out-client
+                                           (sb-ext:string-to-octets
+                                            "hi" :external-format :ascii)
+                                           nil)
+               (sleep 0.05)
+               (check "resume edge: and epoll reports the outbound again"
+                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 100)) t)
+               (check "resume edge: it is the outbound fd"
+                      (web-skeleton::epoll-event-fd evbuf 0) out-fd))
+          (ignore-errors (web-skeleton::%close epfd))
+          (dolist (s (list in-server in-client out-server out-client))
+            (ignore-errors (sb-bsd-sockets:socket-close s))))))))
+
+(defun test-outbound-direction-inversion ()
+  "A read that must wait for writability, and a write that must wait for
+   readability — and in both cases the operation that gets re-issued is the
+   one that blocked, not the one the direction suggests.
+
+   That last clause is the assertion with teeth. Retrying a WANT_WRITE from
+   a read by doing a *write* is a protocol error, and OpenSSL reports it as
+   a generic SSL failure that reads like a broken peer — the kind of defect
+   that gets blamed on an upstream for a week. Both fns are counted, so a
+   dispatcher that ran the wrong one is visible as a count rather than as a
+   plausible-looking error later.
+
+   The masks are checked against a real epoll fd on a real socket, because
+   they are the whole mechanism. A loopback socket with nothing sent to it
+   is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN does
+   not, and the two are distinguishable with no data timing involved."
+  (format t "~%Outbound direction inversion~%")
+  ;; ---- a read that wants writability ----
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (reads (list 0))
+                  (writes (list 0))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-read
+                         :outbound-p t :last-active (get-universal-time)
+                         :read-fn (%scripted-read-fn '(:want-write 12 :again) reads)
+                         :write-fn (%scripted-write-fn '(99) writes
+                                                       (make-array 0 :fill-pointer 0
+                                                                     :adjustable t)))))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; First read blocks on the wrong direction.
+             (web-skeleton::handle-outbound-read conn epfd)
+             (check "inversion: a read that wants writability is marked"
+                    (web-skeleton::connection-interest-inverted conn) t)
+             (check "inversion: and EPOLLOUT is armed, so the loop wakes"
+                    (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
+             (check "inversion: one read so far, no writes"
+                    (list (car reads) (car writes)) (list 1 0))
+             ;; The dispatcher sees writability. It must re-issue the READ.
+             (web-skeleton::handle-outbound-event
+              conn epfd (logior web-skeleton::+epollout+ web-skeleton::+epollet+))
+             ;; Reads went up and writes did not. Not an exact read count:
+             ;; CONNECTION-READ-AVAILABLE drains until :AGAIN, so one pass
+             ;; is several read-fn calls, and pinning the number would make
+             ;; this track the drain loop rather than the dispatch.
+             (check "inversion: writability re-issued the read, not a write"
+                    (list (> (car reads) 1) (car writes)) (list t 0))
+             (check "inversion: the inversion is cleared once it clears"
+                    (web-skeleton::connection-interest-inverted conn) nil)
+             (check "inversion: and EPOLLIN is back, so nothing wakes"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+
+  ;; ---- a write that wants readability ----
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((out-fd (web-skeleton::socket-fd server))
+                  (reads (list 0))
+                  (writes (list 0))
+                  (sink (make-array 0 :element-type '(unsigned-byte 8)
+                                      :fill-pointer 0 :adjustable t))
+                  (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                     :element-type '(unsigned-byte 8)))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (conn (web-skeleton::make-connection
+                         :fd out-fd :socket server :state :out-write
+                         :outbound-p t :last-active (get-universal-time)
+                         :read-fn (%scripted-read-fn '(:again) reads)
+                         :write-fn (%scripted-write-fn '(:want-read 5) writes sink))))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::connection-queue-write
+              conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+             (web-skeleton::epoll-add epfd out-fd
+                                      (logior web-skeleton::+epollout+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::handle-outbound-write conn epfd)
+             (check "inversion: a write that wants readability is marked"
+                    (web-skeleton::connection-interest-inverted conn) t)
+             (check "inversion: EPOLLIN armed, and an empty socket is quiet"
+                    (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+             (check "inversion: one write so far, no reads"
+                    (list (car reads) (car writes)) (list 0 1))
+             ;; Readability arrives. It must re-issue the WRITE.
+             (web-skeleton::handle-outbound-event
+              conn epfd (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+             (check "inversion: readability re-issued the write, not a read"
+                    (list (car reads) (car writes)) (list 0 2))
+             (check "inversion: the write completed and moved to reading"
+                    (web-skeleton::connection-state conn) :out-read)
+             (check "inversion: cleared on the way through"
+                    (web-skeleton::connection-interest-inverted conn) nil)
+             (check "inversion: and the peer got the bytes"
+                    (sb-ext:octets-to-string
+                     (coerce sink '(vector (unsigned-byte 8)))
+                     :external-format :ascii)
+                    "HELLO"))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-connection-transport-seam ()
+  "Reads and writes route through CONNECTION-READ-FN / -WRITE-FN when set,
+   and the drain loop runs until the transport says :AGAIN.
+
+   Every connection here has :FD -1. That is the assertion, not tidiness:
+   -1 is not a file descriptor, so NB-READ and NB-WRITE on it would raise
+   EBADF. A seam that quietly fell through to the raw fd cannot pass these
+   at all, which a valid fd would have let it do.
+
+   The drain discipline is the part worth having. Edge-triggered epoll
+   reports a transition, so readability must be drained in one pass —
+   stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
+   and until now not assertable without a real socket and a real partial
+   read. A scripted byte source makes it deterministic, which matters
+   because issue #8 rests the whole SSL_pending argument on this loop
+   behaving exactly this way."
+  (format t "~%Connection transport seam~%")
+  ;; ---- reads ----
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(5 5 5 :again) calls))))
+    (check "seam: drain returns :ok when the source blocks"
+           (attempt (web-skeleton::connection-read-available conn)) :ok)
+    (check "seam: every available byte accumulated"
+           (web-skeleton::connection-read-pos conn) 15)
+    (check "seam: drained until :again, not once"
+           (car calls) 4))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(4 :eof) calls))))
+    (check "seam: bytes then end of stream is :ok-eof"
+           (attempt (web-skeleton::connection-read-available conn)) :ok-eof)
+    (check "seam: :ok-eof keeps the bytes"
+           (web-skeleton::connection-read-pos conn) 4))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(:eof) calls))))
+    (check "seam: nothing then end of stream is :eof"
+           (attempt (web-skeleton::connection-read-available conn)) :eof))
+
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(:again) calls))))
+    (check "seam: nothing available is :again"
+           (attempt (web-skeleton::connection-read-available conn)) :again)
+    (check "seam: :again costs exactly one call" (car calls) 1))
+
+  ;; Growth through the seam. The initial buffer is 4 KiB, so this needs
+  ;; two grows, and a seam that handed the source a stale buffer after a
+  ;; grow would corrupt or short-count here rather than anywhere visible.
+  (let* ((calls (list 0))
+         (conn (web-skeleton::make-connection
+                :fd -1
+                :read-fn (%scripted-read-fn '(4096 4096 2000 :again) calls))))
+    (check "seam: read buffer grows and keeps everything"
+           (attempt (web-skeleton::connection-read-available conn)) :ok)
+    (check "seam: grown total is exact"
+           (web-skeleton::connection-read-pos conn) 10192)
+    (check "seam: buffer grew past its initial size"
+           (> (length (web-skeleton::connection-read-buf conn)) 4096) t))
+
+  ;; CONNECTION-DISCARD-AVAILABLE is the other reader and must not have
+  ;; kept its own path to the fd.
+  (let* ((calls (list 0))
+         (sink (make-array 64 :element-type '(unsigned-byte 8)))
+         (conn (web-skeleton::make-connection
+                :fd -1 :read-fn (%scripted-read-fn '(64 64 :again) calls))))
+    (check "seam: discard drains through the seam too"
+           (attempt (web-skeleton::connection-discard-available conn sink)) :ok)
+    (check "seam: discard drained until :again" (car calls) 3))
+
+  ;; ---- writes ----
+  (let* ((calls (list 0))
+         (sink (make-array 0 :element-type '(unsigned-byte 8)
+                             :fill-pointer 0 :adjustable t))
+         (conn (web-skeleton::make-connection
+                :fd -1 :write-fn (%scripted-write-fn '(3 99) calls sink))))
+    (web-skeleton::connection-queue-write
+     conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+    (check "seam: a partial write then the rest reports :done"
+           (attempt (web-skeleton::connection-on-write conn)) :done)
+    (check "seam: the peer saw the bytes once, in order"
+           (sb-ext:octets-to-string (coerce sink '(vector (unsigned-byte 8)))
+                                    :external-format :ascii)
+           "HELLO"))
+
+  (let* ((calls (list 0))
+         (sink (make-array 0 :element-type '(unsigned-byte 8)
+                             :fill-pointer 0 :adjustable t))
+         (conn (web-skeleton::make-connection
+                :fd -1 :write-fn (%scripted-write-fn '(2 :again) calls sink))))
+    (web-skeleton::connection-queue-write
+     conn (sb-ext:string-to-octets "HELLO" :external-format :ascii))
+    (check "seam: a blocked write reports :continue"
+           (attempt (web-skeleton::connection-on-write conn)) :continue)
+    (check "seam: and resumes from what was accepted"
+           (web-skeleton::connection-write-pos conn) 2)))
+
 (defun test-write-queue-drain ()
   (format t "~%Write queue drain~%")
   (let ((path "/tmp/web-skeleton-write-queue.bin"))
@@ -4470,7 +5125,7 @@
                ;; in place. Static serving hands one vector to every request.
                (web-skeleton::connection-append-write conn shared)
                (check "drain: one pass reports done"
-                      (web-skeleton::connection-on-write conn) :done)
+                      (attempt (web-skeleton::connection-on-write conn)) :done)
                (check "drain: nothing left pending"
                       (web-skeleton::connection-write-pending conn) 0)
                (check "drain: shared vector is not mutated"
@@ -6172,6 +6827,7 @@
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-line-reader-over-read-fn)
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
@@ -6195,6 +6851,11 @@
   (test-read-available-eof)
   (test-awaiting-sweep-504)
   (test-write-queue)
+  (test-connection-transport-seam)
+  (test-outbound-handshake-state)
+  (test-fetch-setup-releases-transport-on-error)
+  (test-automatic-resume-edge)
+  (test-outbound-direction-inversion)
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-write-stall-sweep)

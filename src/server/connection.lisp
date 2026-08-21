@@ -25,6 +25,35 @@
   (fd        -1  :type fixnum)               ; raw file descriptor
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
   (remote-addr nil)                           ; peer IP as string, or NIL for outbound
+  ;; Byte source and sink. NIL means the raw fd, via NB-READ / NB-WRITE.
+  ;; A transport that is not the fd — TLS, whose bytes come out of
+  ;; SSL_read rather than read(2) — installs a closure of the same
+  ;; contract here, and the rest of the state machine does not change.
+  ;;
+  ;; INVARIANT: CONNECTION-READ-INTO and CONNECTION-WRITE-FROM are the
+  ;; only paths to a connection's transport. Not a style preference —
+  ;; it is load-bearing for TLS, and the reason is in
+  ;; CONNECTION-READ-INTO's docstring. A "just this once" direct call at
+  ;; some site that looks special is how it gets broken.
+  (read-fn   nil :type (or null function))
+  (write-fn  nil :type (or null function))
+  ;; One step of a transport handshake, or NIL for a transport that has
+  ;; none. Called with no arguments; answers :DONE, :WANT-READ,
+  ;; :WANT-WRITE, or raises. Its presence is what tells
+  ;; HANDLE-OUTBOUND-CONNECT that a completed TCP connect is not yet a
+  ;; usable connection.
+  (handshake-fn nil :type (or null function))
+  ;; Transport teardown, or NIL. A transport that allocates anything whose
+  ;; lifetime is the connection's -- a foreign staging buffer, an SSL --
+  ;; puts its release here rather than trusting call sites to remember,
+  ;; which is the argument NOTIFY-STREAM-CLOSED already won.
+  (close-fn nil :type (or null function))
+  ;; T while the epoll interest is armed on the opposite direction to the
+  ;; one this connection's state implies -- a read waiting for writability,
+  ;; or a write waiting for readability. Only a transport that can invert
+  ;; ever sets it; it exists so the ordinary path pays no extra
+  ;; EPOLL_CTL_MOD to restore an interest it never changed.
+  (interest-inverted nil :type boolean)
   ;; Protocol state
   ;;   :read-http             — accumulating HTTP request bytes
   ;;   :read-body             — have headers, reading Content-Length body
@@ -37,6 +66,9 @@
   ;;   :awaiting              — parked, waiting for outbound fetch to complete
   ;;   :out-dns               — outbound: getent subprocess resolving hostname
   ;;   :out-connecting        — outbound: TCP connect in progress
+  ;;   :out-handshake         — outbound: transport handshake in progress,
+  ;;                            the one state where readable does not mean
+  ;;                            read and writable does not mean write
   ;;   :out-write             — outbound: sending HTTP request
   ;;   :out-read              — outbound: reading HTTP response
   (state     :read-http :type keyword)
@@ -93,6 +125,14 @@
   ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
   ;; the upstream's send window fills. FETCH-RESUME re-arms.
   (fetch-paused    nil :type boolean)
+  ;; On an *inbound* connection: the fd of an outbound that paused while
+  ;; relaying into it, or -1. The back-link exists because the pause is
+  ;; recorded on the outbound and the event that should end it — this
+  ;; connection's backlog draining — arrives here. Outbound connections
+  ;; already carry INBOUND-FD; this is the other direction, and it is set
+  ;; only while a pause is outstanding so nothing has to be cleaned up on
+  ;; the ordinary path.
+  (paused-outbound-fd -1 :type fixnum)
   ;; Streaming response — set while STATE is :streaming
   (stream-framing   nil :type (or null keyword))  ; :chunked or :close
   ;; (CONN REASON) called exactly once when the stream ends, however it
@@ -165,10 +205,33 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-close (conn)
-  "Close a connection's file descriptor. Safe to call multiple times."
+  "Close a connection's file descriptor. Safe to call multiple times.
+
+   Runs CLOSE-FN first, exactly once, and before the descriptor goes: a
+   transport teardown that needs to talk to the peer has nothing to talk
+   over afterwards. Cleared before it is called so a re-entrant close
+   cannot run it twice, and a raise inside it is logged rather than
+   propagated, because a failed release must not leave the descriptor
+   open on the way out."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
-      (ignore-errors (%close fd))
+      (let ((release (connection-close-fn conn)))
+        (when release
+          (setf (connection-close-fn conn) nil)
+          (handler-case (funcall release)
+            (error (e)
+              (log-warn "transport close failed on fd ~d: ~a" fd e)))))
+      ;; Close through the socket object when there is one, rather than
+      ;; %CLOSE on the raw descriptor. SB-BSD-SOCKETS arms a finalizer that
+      ;; closes the fd when the socket is collected, and %CLOSE does not
+      ;; disarm it: the number is freed, the kernel hands it to whoever
+      ;; opens next, and a later GC closes it under them. The symptom is an
+      ;; EBADF on a descriptor its owner never closed, arriving whenever a
+      ;; GC happens to run -- which is nowhere near the code that caused it.
+      (let ((socket (connection-socket conn)))
+        (if socket
+            (ignore-errors (sb-bsd-sockets:socket-close socket))
+            (ignore-errors (%close fd))))
       (setf (connection-fd conn) -1
             (connection-socket conn) nil
             (connection-state conn) :closing))))
@@ -245,8 +308,51 @@
         (* 2 *max-header-count*)  ; CRLF ending each header
         4))))                     ; request-line and blank-line CRLFs
 
+(defun connection-read-into (conn buffer start max-bytes)
+  "Read from CONN's transport into BUFFER[START..START+MAX-BYTES).
+   Returns bytes read, :AGAIN if it would block, :EOF at end of stream,
+   or raises — NB-READ's contract, because the raw fd is the default and
+   a second contract at this seam would be a second thing to get wrong.
+
+   Every read of a connection goes through here, and that is an invariant
+   rather than a tidiness. Edge-triggered epoll reports a transition, so
+   readability has to be drained in one pass or the remainder waits for an
+   event that will not come; CONNECTION-READ-AVAILABLE is that pass, and
+   it terminates on :AGAIN. Under TLS a second buffer appears beneath the
+   socket — SSL_read decrypts a whole record, and consuming part of it
+   leaves the rest in OpenSSL's buffer with nothing left on the fd for
+   epoll to notice. Mapping SSL_ERROR_WANT_READ to :AGAIN makes the
+   existing drain loop enforce that too, at no cost and with no new
+   discipline to remember.
+
+   That structural closure holds only while this is the sole path in. A
+   direct SSL_read anywhere else re-opens exactly the hang it removes, and
+   it would do so intermittently, on records that happen to be larger than
+   one buffer. It also covers WANT_READ alone: WANT_WRITE from a read is a
+   direction inversion the state machine cannot express yet, and belongs
+   to a later round rather than to this seam."
+  (let ((fn (connection-read-fn conn)))
+    (if fn
+        (funcall fn buffer start max-bytes)
+        (nb-read (connection-fd conn) buffer start max-bytes))))
+
+(defun connection-write-from (conn buffer start nbytes)
+  "Write BUFFER[START..START+NBYTES) to CONN's transport. Returns bytes
+   written, :AGAIN if it would block, or raises — NB-WRITE's contract.
+
+   The counterpart to CONNECTION-READ-INTO and the same invariant: every
+   write of a connection goes through here. The write queue holds vectors
+   by reference and never mutates them, which is what lets a partial write
+   resume from an offset, and a transport that needs the bytes to sit still
+   across a retry depends on that already."
+  (let ((fn (connection-write-fn conn)))
+    (if fn
+        (funcall fn buffer start nbytes)
+        (nb-write (connection-fd conn) buffer start nbytes))))
+
 (defun connection-read-available (conn)
-  "Drain all available bytes from fd into read buffer (edge-triggered).
+  "Drain all available bytes from the transport into the read buffer
+   (edge-triggered).
    Grows the buffer as needed, up to CONNECTION-READ-CAP.
 
    Returns:
@@ -255,6 +361,11 @@
      :EOF     — read nothing, already at end of stream
      :AGAIN   — read nothing, would block
      :FULL    — buffer is at CONNECTION-READ-CAP with no room to grow
+     :WANT-WRITE / :OK-WANT-WRITE
+              — read nothing / read some, and the transport now needs the
+                socket to become *writable* before this read can continue.
+                Only a TLS-style transport produces these; a raw fd never
+                does. See CONNECTION-READ-INTO.
 
    :OK-EOF is separate from :OK because the difference is the whole
    framing on two paths, and collapsing them cost this framework two
@@ -311,10 +422,19 @@
                 (setf (connection-read-buf conn) new-buf
                       buf new-buf
                       space (- new-size pos)))))
-        (let ((result (nb-read (connection-fd conn) buf pos space)))
+        (let ((result (connection-read-into conn buf pos space)))
           (cond
             ((eq result :eof)   (return (if any-read :ok-eof :eof)))
             ((eq result :again) (return (if any-read :ok :again)))
+            ;; The transport wants to send before it can read again. Told
+            ;; apart from :AGAIN because the answer is different -- :AGAIN
+            ;; waits for readability, this waits for writability and then
+            ;; re-issues the *read*. Split into two verdicts for the same
+            ;; reason :OK-EOF is split from :EOF: the caller has bytes to
+            ;; process in one case and not the other, and collapsing that
+            ;; distinction has cost this framework two bugs already.
+            ((eq result :want-write)
+             (return (if any-read :ok-want-write :want-write)))
             (t (incf (connection-read-pos conn) result)
                (setf any-read t))))))))
 
@@ -339,7 +459,7 @@
   (declare (type (simple-array (unsigned-byte 8) (*)) sink))
   (let ((any-read nil))
     (loop
-      (let ((result (nb-read (connection-fd conn) sink 0 (length sink))))
+      (let ((result (connection-read-into conn sink 0 (length sink))))
         (cond
           ((eq result :eof)   (return (if any-read :ok-eof :eof)))
           ((eq result :again) (return (if any-read :ok :again)))
@@ -1097,12 +1217,16 @@
                (remaining (- (connection-write-end conn) pos)))
           (cond
             ((plusp remaining)
-             (let ((result (nb-write (connection-fd conn) (connection-write-buf conn)
-                                     pos remaining)))
-               (if (eq result :again)
-                   (return (finish :continue))
-                   (progn (setf wrote t)
-                          (incf (connection-write-pos conn) result)))))
+             (let ((result (connection-write-from
+                            conn (connection-write-buf conn) pos remaining)))
+               (cond
+                 ((eq result :again) (return (finish :continue)))
+                 ;; The mirror image: the transport must receive before it
+                 ;; can send again, and what it wants re-issued is this
+                 ;; *write* once the socket is readable.
+                 ((eq result :want-read) (return (finish :want-read)))
+                 (t (setf wrote t)
+                    (incf (connection-write-pos conn) result)))))
             ;; Head drained; promote the next queued vector and keep writing.
             ;; The socket is still writable and will not say so a second time.
             ((connection-promote-write conn))

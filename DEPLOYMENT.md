@@ -107,7 +107,7 @@ Tune parameters before calling `start-server`:
 
 `*max-body-size*` caps the inbound request body.
 `*max-outbound-response-size*` caps the total bytes (headers + body)
-that `tls-read-all` will buffer for an HTTPS fetch —
+an `http-fetch` will buffer for a response, either scheme —
 tune this when your app's `:then` callback expects responses
 larger than the 8 MiB default.
 `*max-streaming-line-size*` caps one line inside a streamed response
@@ -285,9 +285,10 @@ Wrap it in `handler-case` to reject malformed signatures gracefully.
 
 ### Blocking fetch paths
 
-`http-fetch-stream` and HTTPS fetch are **blocking** —
-they hold the worker thread for the duration of the upstream call,
-bounded by `*fetch-timeout*` (default 30s) across each of three setup phases:
+`http-fetch-stream` is **blocking** — it holds the worker thread for the
+duration of the upstream call, bounded by `*fetch-timeout*` (default 30s)
+across each of three setup phases. `http-fetch` is not, for either scheme;
+see the async budget below.
 
 1. **DNS resolution** — shared `getent ahosts` subprocess,
    spawned with `:wait nil` and deadline-polled until exit or
@@ -303,16 +304,19 @@ bounded by `*fetch-timeout*` (default 30s) across each of three setup phases:
    so the subsequent read/write use the familiar blocking semantics.
 3. **Request I/O** — bounded by `SO_RCVTIMEO` / `SO_SNDTIMEO` on the connected socket.
    This is fine for bounded work inside a `ws-handler`,
-   but avoid calling them from HTTP handlers under load.
-   `http-fetch` is non-blocking for `http://` URLs (epoll event loop).
-   For `https://` URLs it blocks the worker thread for the full request lifecycle.
+   but avoid calling it from HTTP handlers under load.
 
-**Async fetch timeout budget.** On the non-blocking `http-fetch` path for `http://` URLs,
+**Async fetch timeout budget.** On the `http-fetch` path — **both schemes** —
 `*fetch-timeout*` applies as a **single end-to-end budget** rather than per-phase:
-the inbound connection's `:awaiting` idle timer covers DNS + TCP connect + request I/O
-together. A slow DNS phase shortens the budget remaining for connect and response read.
-Blocking paths (`http-fetch-stream`, HTTPS) get the three per-phase bounds above;
-the async path gets one total. Tune `*fetch-timeout*` with this in mind —
+the inbound connection's `:awaiting` idle timer covers DNS + TCP connect + TLS
+handshake + request I/O together. A slow DNS phase shortens the budget remaining
+for everything after it. `http-fetch-stream` still gets the three per-phase bounds
+above; `http-fetch` gets one total.
+
+This is not a tuning detail on the HTTPS path, it is the only bound there is:
+`SO_RCVTIMEO` does nothing on a non-blocking socket, so the per-phase reading
+that used to bound encrypted reads no longer applies to them at all. The
+`:awaiting` timer replaced it. Tune `*fetch-timeout*` with this in mind —
 it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper answers **`504 Gateway Timeout`** and closes.
 
@@ -344,16 +348,27 @@ chunked responses does not imply accepting chunked requests, and the
 ingress refusal is deliberate — it is what makes a CL-TE disagreement
 unrepresentable.
 
-**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL`
-for four distinct conditions — unexpected peer close without `close_notify`
-(benign for legacy HTTP/1.0-style servers), `SO_RCVTIMEO` firing (`errno = EAGAIN`),
-real transport errors (`errno = ECONNRESET` / `EPIPE` / other),
-and read(2) failures. `tls-read-all` and `tls-stream-response` inspect `errno`
-after each `SSL_ERROR_SYSCALL` and raise loud on the non-benign cases
-so `*fetch-timeout*` actually bounds the HTTPS read path for close-delimited responses
-and `http-fetch-stream` over HTTPS. Legitimate unexpected-EOF-without-`close_notify`
-is still accepted silently — that's the framing signal for HTTP/1.0-style servers
-that never send `close_notify` at all.
+**`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL` for
+several distinct conditions and they must not be collapsed. `errno = 0` is
+end-of-stream without `close_notify` — benign, and load-bearing, because it
+is the framing signal HTTP/1.0-style servers actually use. `errno = EAGAIN`
+is would-block. Everything else (`ECONNRESET`, `EPIPE`, `ETIMEDOUT`) is a
+real transport failure and raises loudly, because that is the
+MITM-RST-mid-stream case: an attacker truncates a response, and a silent
+end-of-stream here would hand the application a partial body as success.
+
+What `EAGAIN` *means* depends on the socket, which is why one classifier
+answers it and two callers read it. On a socket left in blocking mode with
+`SO_RCVTIMEO` installed, a read cannot return would-block unless the receive
+timeout expired, so `ssl-blocking-read-eof-or-raise` turns it into the loud
+timeout this document promises — that is what bounds the HTTPS read path for
+close-delimited responses and for `http-fetch-stream` over HTTPS. On a
+non-blocking socket `SO_RCVTIMEO` does nothing at all, so `EAGAIN` means only
+what it says and the event loop waits for readability; there the bound comes
+from the parked inbound's timer rather than from the socket.
+
+Operationally the guarantee is unchanged: a truncated HTTPS response is an
+error, never a short success, on either path.
 
 **Framing headers are the framework's, not yours.** Passing either
 `Transfer-Encoding` or `Content-Length` in `:headers` signals an error
@@ -655,6 +670,11 @@ response size or by whatever proxy sits in front of it. Write the relay
 to take the bytes from `:on-body` when they arrive there and from
 `:then`'s body when they do not.
 
+The one asymmetry this used to have is gone: `:on-body` now behaves
+identically over `https://`, because both schemes take the same path and
+there is no second implementation to differ from. It is the framing that
+decides, not the transport.
+
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
 partial-line state carried across reads. A second implementation here
@@ -662,13 +682,24 @@ would be two readers that could disagree about where a line ends, which
 is the disagreement this codebase treats as its threat model. Split what
 you are given if you want lines.
 
-**Backpressure is a return value.** Return `:pause` from `:on-body` to
-stop reading the upstream — its send window fills and the pressure
-propagates back without anything being dropped or buffered — and call
-`fetch-resume` on the outbound connection to start again. A value rather
-than a condition, for the same reason `connection-append-write` refuses
-by return: applying backpressure is ordinary control flow and should not
-unwind through the middle of a read loop.
+**Backpressure is a return value, and it undoes itself.** Return `:pause`
+from `:on-body` to stop reading the upstream — its send window fills and
+the pressure propagates back without anything being dropped or buffered.
+Reading resumes on its own when the connection you are relaying *into*
+drains its write backlog, which is the event the pause was waiting for.
+
+You do not have to call anything. `fetch-resume` remains exported for an
+app that knows better than the backlog does — a producer that wants to
+resume early, or one relaying somewhere the framework is not writing —
+and calling it is idempotent. But an app that only ever pauses is no
+longer relying on itself to notice; `:on-body` is its scheduled contact
+with the relay, pausing is what stops `:on-body` firing, and an app whose
+only way back was a callback that is no longer running had removed it.
+
+A value rather than a condition, for the same reason
+`connection-append-write` refuses by return: applying backpressure is
+ordinary control flow and should not unwind through the middle of a read
+loop.
 
 The re-arm works here for a reason worth knowing. Elsewhere the docs warn
 that an `EPOLL_CTL_MOD` will not re-fire for data already sitting in

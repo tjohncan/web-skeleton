@@ -219,7 +219,9 @@ tests/
 - **Incremental relay** — `http-fetch` takes `:on-body`, called with each chunk
   of a chunked upstream response as its framing is proved, so a relay forwards
   as it reads instead of buffering the whole body first. Return `:pause` to stop
-  reading upstream and let its send window fill; `fetch-resume` re-arms
+  reading upstream and let its send window fill; reading resumes by itself once
+  the connection being relayed into drains. Same behaviour over `https://` —
+  one path, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
   a response and produces the body over time with `stream-send` / `stream-close`.
   No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.
@@ -352,27 +354,21 @@ read about here.
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
   is the honest answer; silently skipping verification would not be.
   Plain `http://` to an IP literal works.
-- **Exactly one network operation is non-blocking, and "blocking" means
-  the worker rather than the connection.** `http-fetch` over `http://`
-  runs on the event loop: the inbound parks, the outbound uses the same
-  epoll, and one `*fetch-timeout*` bounds the whole exchange. Every other
-  operation below holds the worker thread, which is every connection that
-  worker is serving and not only the one that asked. With `(cpu-count)`
-  workers, one held worker is 1/N of the server.
+- **No network operation holds a worker; your own code does.** "Blocking"
+  here means the worker rather than the connection, and a held worker is
+  every connection that worker is serving, not only the one that asked.
+  `http-fetch` runs on the event loop for **both** schemes: the inbound
+  parks, the outbound uses the same epoll, and one `*fetch-timeout*`
+  bounds the whole exchange. For `https://` that now includes the TLS
+  handshake and every encrypted read and write. What remains below is
+  either your code or a deliberate sleep.
 
-  - **`http-fetch` over `https://`** blocks for the entire request
-    lifecycle. The API is identical to the `http://` form — the feature
-    list says "just use `https://` URLs" and means it — so one character
-    of scheme changes the concurrency model with nothing else to signal
-    it. The three setup phases (DNS, connect, request I/O) are each
-    bounded by `*fetch-timeout*`; the response read is not bounded in
-    time at all, only by `*max-outbound-response-size*`, so a trickling
-    upstream is stopped by 8 MiB rather than by a clock.
   - **`http-fetch-stream`, both schemes**, blocks and has **no total
     deadline of any kind**. `SO_RCVTIMEO` bounds each individual read, so
     an upstream that emits one byte before every timeout expires holds a
-    worker indefinitely. `*fetch-timeout*`'s docstring ("Blocking fetch
-    I/O timeout") reads as though it were a total. It is not.
+    worker indefinitely. It is a separate, line-oriented API and was left
+    blocking on purpose; `http-fetch` with `:on-body` is the non-blocking
+    way to consume a response incrementally.
   - **Your handler, `ws-handler`, and any fetch `:then` callback** block
     for as long as they run, with no bound. Inherent rather than a
     shortcoming — that is your code on the worker thread — but it is the
@@ -380,6 +376,20 @@ read about here.
   - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
     keep `EMFILE` from spinning the log. Under fd exhaustion that is a
     worker doing nothing else, 100 ms at a time.
+- **TLS renegotiation mid-transfer is handled but not exercised.** OpenSSL
+  can answer a read with "I need to write first" and a write with "I need
+  to read first" — a renegotiation or a post-handshake message. The state
+  machine represents both: it arms the opposite direction and re-issues
+  the *same* operation, which is what OpenSSL requires. What has not been
+  provoked is OpenSSL actually producing the condition, because that needs
+  a peer that renegotiates at a chosen moment and `openssl s_server` gives
+  no way to arrange one. Review-verified and unit-tested through a
+  scripted transport; not observed against a real peer.
+- **A truncated HTTPS response is an error, but only ECONNRESET proves
+  it.** The classifier that separates a clean end of stream from a
+  transport failure is asserted directly rather than provoked, for the
+  same reason: nothing available makes a peer send RST at a chosen point
+  mid-body.
 - **A WebSocket peer that reads slowly enough is never timed out.**
   Separate from the list above, because what it holds is one connection
   rather than a worker. `*write-stall-timeout*` bounds *inactivity* on the
@@ -431,7 +441,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
-| `*fetch-timeout*`              | `30`      | Per-phase bound, not a total. On the async `http://` path it *is* end-to-end (the `:awaiting` reap covers DNS + connect + read together). On the blocking paths it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
+| `*fetch-timeout*`              | `30`      | A **total** on the `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
@@ -439,7 +449,8 @@ All configurable via `setf` before calling `start-server`.
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*shutdown-poll-interval*`     | `1`       | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout)                                                                                                                                                                  |
 
-The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, and `on-listen` are
+passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)
@@ -448,6 +459,25 @@ The `host`, `port`, `workers`, `handler`, and `ws-handler` are passed as keyword
               :handler #'my-app:handle-request
               :ws-handler #'my-app:handle-ws-message)
 ```
+
+`:port 0` asks the kernel for an ephemeral port, and `:on-listen` — a
+function of one argument, called once after the workers are spawned —
+receives the port actually bound. It fires for a fixed port too, so a
+caller need not know which kind it asked for.
+
+```lisp
+(start-server :port 0
+              :on-listen (lambda (port) (format t "listening on ~d~%" port))
+              :handler #'my-app:handle-request)
+```
+
+Resolve the port this way rather than binding port 0 yourself, reading the
+number, closing, and passing it in. Every listener sets `SO_REUSEPORT`, so
+a second process handed that number in the gap between your close and the
+server's bind does not fail its bind — both hold the port and the kernel
+splits traffic between them, with nothing in either log. `start-server`
+hands its own bound socket to worker 0, so the port is never free between
+being chosen and being served.
 
 `:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector
 and dispatches the listener family accordingly.
@@ -466,7 +496,8 @@ carrying the outbound method, URL, headers, body, and a `:then` callback.
 The framework recognizes the continuation as the handler's return value,
 parks the inbound connection, resolves the hostname asynchronously via a `getent`
 subprocess if needed, makes the outbound call on the same epoll loop
-(non-blocking for plain HTTP), then invokes the callback with
+(non-blocking for both schemes — an `https://` fetch runs its handshake
+and every encrypted read and write there too), then invokes the callback with
 `(status headers body-bytes)`. Whatever the callback returns becomes
 the final response to the original caller:
 

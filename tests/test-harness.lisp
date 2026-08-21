@@ -1015,6 +1015,262 @@
                   t))
       (setf *write-stall-timeout* saved))))
 
+(defun %split-ws (line)
+  "LINE split on runs of space and tab. /proc/net/tcp columns are
+   space-padded to varying widths, so a fixed-offset read of it is
+   wrong on the first line whose inode or uid changes length."
+  (let ((out nil) (i 0) (n (length line)))
+    (flet ((wsp (c) (or (char= c #\Space) (char= c #\Tab))))
+      (loop
+        (loop while (and (< i n) (wsp (char line i))) do (incf i))
+        (when (>= i n) (return))
+        (let ((start i))
+          (loop while (and (< i n) (not (wsp (char line i)))) do (incf i))
+          (push (subseq line start i) out))))
+    (nreverse out)))
+
+(defun %listen-socket-count (port)
+  "How many sockets are in LISTEN state on PORT, per /proc/net/tcp — or
+   NIL if the file could not be read cleanly.
+
+   Linux-only, which this framework is. There is no portable substitute
+   and, more to the point, no *behavioral* substitute: with SO_REUSEPORT
+   the kernel balances across the listen group, so a client that gets an
+   answer has learned only that some worker is on the port — which is
+   equally true when the other workers landed somewhere else entirely.
+   Counting the sockets is the only way to see the difference.
+
+   Field 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, field 3 is the state
+   (0A = TCP_LISTEN), field 9 is the socket inode. Ten fields, not
+   twelve: TX_QUEUE:RX_QUEUE and TR:TM->WHEN are each colon-joined.
+
+   Distinct inodes, not matching rows, and that is the whole reason the
+   inode is parsed at all. This file is a seq_file: the iterator saves a
+   position and re-walks it for the next chunk, so records removed before
+   that position make the resume land late and skip rows, while records
+   added before it make the resume land early and re-emit rows already
+   delivered. A suite running live servers does both constantly. Counting
+   rows therefore both under- and over-reports; counting inodes, which are
+   unique per socket, cannot over-report, and leaves only the undercount
+   for the caller to handle.
+
+   NIL rather than 0 because a read of this file has been seen to fail,
+   and 'no listeners there' and 'could not look' are different answers:
+   a caller that conflates them reports a spurious failure whenever the
+   machine is busy.
+
+   Two separate things happen to this file and they were conflated once,
+   so: the undercount above is seq_file resume, measured directly. The
+   failed read was not. That was EBADF on a descriptor nothing here
+   closed, and its cause turned out to live in CONNECTION-CLOSE -- a
+   finalizer closing a reissued fd number under its new owner. Fixed
+   there. The guard stays because a busy machine can still make the
+   count late, and because a caller should not have to know which."
+  (handler-case
+      (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
+        (when in
+          (let ((inodes nil))
+            (read-line in nil nil)      ; column header
+            (loop for line = (read-line in nil nil)
+                  while line
+                  do (let ((fields (%split-ws line)))
+                       (when (and (>= (length fields) 10)
+                                  (string= (fourth fields) "0A"))
+                         (let* ((local (second fields))
+                                (colon (position #\: local)))
+                           (when (and colon
+                                      (ignore-errors
+                                       (= port (parse-integer
+                                                local :start (1+ colon)
+                                                      :radix 16))))
+                             (pushnew (nth 9 fields) inodes
+                                      :test #'string=))))))
+            (length inodes))))
+    (error () nil)))
+
+(defun %call-with-bare-server (workers fn)
+  "Start a real server with :PORT 0 and WORKERS workers, call FN with the
+   port :ON-LISTEN reported (NIL if it never fired), then tear down.
+
+   Deliberately not WITH-TEST-SERVER. That fixture is fixed at one worker
+   and it consumes the port resolution internally — and the port
+   resolution is the thing under test, so borrowing the fixture that
+   depends on it would assert nothing.
+
+   SETF rather than LET on the shutdown specials: the workers read them
+   from threads START-SERVER spawns, and dynamic bindings do not cross
+   MAKE-THREAD."
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *shutdown-poll-interval*)
+        (bound nil)
+        (sem (sb-thread:make-semaphore :name "bare-server-port")))
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *shutdown-poll-interval* 0.05)
+    (unwind-protect
+         (let ((th (sb-thread:make-thread
+                    (lambda ()
+                      (start-server
+                       :host #(127 0 0 1) :port 0 :workers workers
+                       :on-listen (lambda (p)
+                                    (setf bound p)
+                                    (sb-thread:signal-semaphore sem))
+                       :handler (lambda (req)
+                                  (declare (ignore req))
+                                  (make-text-response 200 "bare"))))
+                    :name "bare-server")))
+           (unwind-protect
+                (funcall fn (when (sb-thread:wait-on-semaphore sem :timeout 10)
+                              bound))
+             (setf web-skeleton::*shutdown* t)
+             (handler-case (sb-thread:join-thread th :timeout 10)
+               (error ()
+                 (ignore-errors (sb-thread:terminate-thread th))
+                 (ignore-errors (sb-thread:join-thread th))))))
+      (setf web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *shutdown-poll-interval* saved-poll))))
+
+(defun %port-answers-with-p (port marker)
+  "T if a plain GET / on PORT comes back containing MARKER.
+
+   Answers NIL for every way of not getting there — an unusable port
+   number, a refused connection, a read that never completes. The
+   alternative is a raise, and the caller is a CHECK: a regressed port
+   resolution reports 0, which is truthy, and CONNECT to 0 raises, so
+   letting errors through would turn a clean failed assertion into a
+   backtrace that takes the rest of the suite with it.
+
+   No readiness poll. Worker 0 adopts a socket START-SERVER already put
+   in LISTEN before :ON-LISTEN fired, so connect(2) succeeds whether or
+   not the worker has reached accept(2) yet. Needing a poll here would
+   itself be the bug."
+  (and (integerp port) (< 0 port 65536)
+       (handler-case
+           (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                        :type :stream :protocol :tcp)))
+             (unwind-protect
+                  (progn
+                    (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
+                    (let ((stream (sb-bsd-sockets:socket-make-stream
+                                   socket :input t :output t
+                                          :element-type '(unsigned-byte 8))))
+                      (write-sequence
+                       (sb-ext:string-to-octets
+                        (format nil "GET / HTTP/1.1~c~cHost: localhost~c~c~
+                                     Connection: close~c~c~c~c"
+                                #\Return #\Newline #\Return #\Newline
+                                #\Return #\Newline #\Return #\Newline)
+                        :external-format :ascii)
+                       stream)
+                      (force-output stream)
+                      (let ((raw (sb-ext:octets-to-string
+                                  (coerce (read-until-bounded stream)
+                                          '(vector (unsigned-byte 8)))
+                                  :external-format :latin-1)))
+                        (and (search marker raw) t))))
+               (ignore-errors (sb-bsd-sockets:socket-close socket))))
+         (error () nil))))
+
+(defun test-harness-fetch-stream-plain-e2e ()
+  "HTTP-FETCH-STREAM over http://, end to end.
+
+   It had no test at all, and that is how it came to be shipped broken:
+   a botched edit put an undefined variable into its request builder, the
+   whole suite stayed green, and only a compiler warning said so — on a
+   run whose warning check was itself misgrepped. An exported API with no
+   assertion is a place where two mistakes can meet.
+
+   Called from the test thread rather than from a handler, deliberately.
+   HTTP-FETCH-STREAM blocks the caller for the whole exchange, so a
+   handler on a one-worker server that fetched from its own server would
+   wait for a worker it is itself occupying. That is not a flaw in the
+   test — it is the documented cost of the blocking API, and the shape of
+   this test is what that cost looks like."
+  (format t "~%Harness: http-fetch-stream over plain HTTP~%")
+  (let ((lines nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (declare (ignore req))
+                    (make-text-response
+                     200 (format nil "alpha~%beta~%gamma~%"))))
+      (let ((status (attempt
+                     (http-fetch-stream
+                      :get (format nil "http://127.0.0.1:~d/lines" *test-port*)
+                      :on-line (lambda (line) (push line lines))))))
+        (check "fetch-stream: the upstream answered" status 200)
+        (check "fetch-stream: every line arrived, in order"
+               (nreverse lines) (list "alpha" "beta" "gamma"))))))
+
+(defun test-harness-port-zero-reported ()
+  "START-SERVER with :PORT 0 binds an ephemeral port and reports it
+   through :ON-LISTEN, and the port it reports is the one that serves.
+
+   The second half is the half worth having. A callback that fired with
+   the number the caller passed in — 0 — would satisfy 'ON-LISTEN was
+   called' and 'ON-LISTEN got an integer' alike. Only a real request
+   answered on the reported port distinguishes a resolved port from an
+   echoed argument."
+  (format t "~%Harness: start-server :port 0 reports its bound port~%")
+  (%call-with-bare-server 1
+    (lambda (port)
+      (check "port 0: :on-listen fired" (not (null port)) t)
+      (check "port 0: reported port is a real port"
+             (and (integerp port) (< 0 port 65536)) t)
+      (check "port 0: reported port serves"
+             (%port-answers-with-p port "bare") t))))
+
+(defun test-harness-port-zero-workers-share-one-port ()
+  "Every worker binds the port :ON-LISTEN reported — not just worker 0.
+
+   Each worker builds its own listener, so a :PORT 0 handed straight
+   down to them puts N workers on N *different* ephemeral ports. Nothing
+   about that state fails: worker 0 holds the reported port and answers
+   everything sent to it, so every request-shaped check passes while
+   N-1 workers sit on ports nobody will ever connect to and the pool
+   silently has one member.
+
+   Counting listen sockets is what sees that; making requests is not.
+   Polled because the count legitimately lags: START-SERVER binds worker
+   0's listener before spawning anything, and workers 1..N-1 bind inside
+   their own threads some time after :ON-LISTEN has already fired."
+  (format t "~%Harness: start-server :port 0 shares one port across workers~%")
+  (let ((workers 3))
+    (%call-with-bare-server workers
+      (lambda (port)
+        (check "port 0 (multi): :on-listen fired" (not (null port)) t)
+        (when port
+          ;; A NIL from an unreadable /proc keeps polling and, if it is
+          ;; still NIL at the end, fails as NIL-against-3 rather than
+          ;; being counted as zero listeners.
+          ;;
+          ;; The budget is slack for a loaded CI box and nothing more:
+          ;; measured, all three listeners are present on the first read,
+          ;; because MAKE-THREAD plus a bind is microseconds. Only a
+          ;; failing run spends the whole budget, and a failing check
+          ;; should not also be the suite's longest sleep.
+          ;; Highest count seen, not the last one. Measured: a read of
+          ;; /proc/net/tcp intermittently returns 2, and once 1, while
+          ;; three healthy workers are demonstrably on the port, because a
+          ;; seq_file resume can land late and skip records. Overcounting
+          ;; is ruled out by %LISTEN-SOCKET-COUNT counting distinct socket
+          ;; inodes — the same resume can land early and re-emit a row, so
+          ;; the row count alone was not one-directional. So a low read is
+          ;; noise, a high read is signal, and reporting the last read
+          ;; rather than the best would fail this test at random.
+          (let ((n (loop repeat 80
+                         with best = nil
+                         for c = (%listen-socket-count port)
+                         do (when (and c (or (null best) (> c best)))
+                              (setf best c))
+                         when (and best (>= best workers)) return best
+                         do (sleep 0.025)
+                         finally (return best))))
+            (check "port 0: every worker listens on the reported port"
+                   n workers)))))))
+
 (defun %raw-connect ()
   "A raw socket to the live test server, plus its byte stream."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
@@ -1719,6 +1975,9 @@
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-fetch-stream-plain-e2e)
+  (test-harness-port-zero-reported)
+  (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)

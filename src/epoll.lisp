@@ -255,7 +255,11 @@
          (let ((err (get-errno)))
            (if (= err +eintr+)
                0
-               (error "epoll_wait failed: ~a" (errno-string err)))))))))
+               ;; Named, because EBADF is a claim about this argument and
+               ;; nothing else, and the bare message cannot distinguish a
+               ;; closed descriptor from a wrong one arriving.
+               (error "epoll_wait failed on epoll fd ~d: ~a"
+                      epoll-fd (errno-string err)))))))))
 
 (declaim (inline epoll-event-fd epoll-event-flags))
 

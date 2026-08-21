@@ -86,6 +86,16 @@
   (mode sb-alien:int)
   (callback (* t)))
 
+;;; Additional trust anchors. Bound for the integration test, which needs a
+;;; CA it generated to be trusted alongside the system roots — additive, so
+;;; it does not weaken verification, which is the only reason it is
+;;; acceptable to point at the shared context.
+(sb-alien:define-alien-routine ("SSL_CTX_load_verify_locations"
+                                %ssl-ctx-load-verify-locations) sb-alien:int
+  (ctx (* t))
+  (ca-file sb-alien:c-string)
+  (ca-path sb-alien:c-string))
+
 ;;; Connection
 (sb-alien:define-alien-routine ("SSL_new" %ssl-new) (* t)
   (ctx (* t)))
@@ -118,6 +128,13 @@
   (buf (* t))
   (num sb-alien:int))
 
+;;; Staging a write into foreign memory is a byte copy on the write path,
+;;; so it goes through libc rather than a SAP loop.
+(sb-alien:define-alien-routine ("memcpy" %memcpy) (* t)
+  (dest (* t))
+  (src (* t))
+  (n sb-alien:unsigned-long))
+
 ;;; SNI
 (sb-alien:define-alien-routine ("SSL_ctrl" %ssl-ctrl) sb-alien:long
   (ssl (* t))
@@ -143,6 +160,16 @@
   (ssl (* t))
   (hostname sb-alien:c-string))
 
+;;; SNI read-back. Bound for the same reason the GET twin of the
+;;; min-proto-version ctrl is: SSL_set_tlsext_host_name reports success
+;;; without the name necessarily being what a later handshake will send,
+;;; and reading it off the SSL is the only check that distinguishes a
+;;; configured SNI from a call that returned 1.
+(sb-alien:define-alien-routine ("SSL_get_servername" %ssl-get-servername)
+    sb-alien:c-string
+  (ssl (* t))
+  (type sb-alien:int))
+
 ;;; Constants
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
@@ -153,8 +180,16 @@
    SSL_CTX_ctrl mixup) can return 1 while writing to a garbage offset,
    and only the read-back exposes that the floor never landed.")
 (defconstant +tls1-2-version+ #x0303)
+(defconstant +ssl-error-want-read+ 2)
+(defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-syscall+ 5)
 (defconstant +ssl-error-zero-return+ 6)
+(defconstant +ssl-write-stage-size+ 16384
+  "Bytes staged per SSL_write, one TLS record. Capping here costs nothing:
+   CONNECTION-ON-WRITE loops until :AGAIN or empty, and OpenSSL would split
+   a larger write into records of about this size anyway.")
+(defconstant +tlsext-nametype-host-name+ 0
+  "The only SNI name type OpenSSL implements; SSL_get_servername takes it.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; SSL_CTX — shared context, created once
@@ -231,6 +266,79 @@
 ;;; TLS connection lifecycle
 ;;; ---------------------------------------------------------------------------
 
+(defun tls-client-ssl (hostname fd)
+  "Build an SSL for an outbound client connection on FD, with SNI and
+   hostname verification set for HOSTNAME. Returns the SSL pointer, or
+   frees it and raises.
+
+   One implementation, shared by the blocking TLS-CONNECT and the
+   non-blocking handshake path, because these are the two settings whose
+   absence a successful handshake does not report. Without SNI a
+   multi-tenant upstream answers with the wrong certificate and the failure
+   arrives as an opaque verify error several layers down. Without
+   SSL_set1_host the chain is checked for validity but never for whose it
+   is, so any certificate a trusted CA ever issued will do. Two copies of
+   this would be two chances to omit one, and the omission is silent in
+   both directions.
+
+   The read-back is not ceremony. SSL_set_tlsext_host_name answers 1
+   without that guaranteeing the name is what a later handshake sends, so
+   asking the SSL what its servername is is the only check that separates a
+   configured SNI from a call that returned 1 — the same discipline the
+   min-proto-version ctrl already gets, and for the same reason."
+  (let ((ctx (ensure-ssl-ctx))
+        (ssl nil))
+    (handler-case
+        (progn
+          (setf ssl (%ssl-new ctx))
+          (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
+            (error "SSL_new failed"))
+          ;; Null-terminated: SSL_ctrl reads this with strlen.
+          (let ((hostname-bytes
+                  (concatenate '(simple-array (unsigned-byte 8) (*))
+                               (sb-ext:string-to-octets
+                                hostname :external-format :ascii)
+                               #(0))))
+            (sb-sys:with-pinned-objects (hostname-bytes)
+              (unless (= 1 (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
+                                      (sb-sys:vector-sap hostname-bytes)))
+                (error "SSL_set_tlsext_host_name failed for ~a" hostname))))
+          (let ((sni (%ssl-get-servername ssl +tlsext-nametype-host-name+)))
+            (unless (equal sni hostname)
+              (error "SNI did not take: set ~s, SSL reports ~s"
+                     hostname sni)))
+          (when (zerop (%ssl-set1-host ssl hostname))
+            (error "SSL_set1_host failed for ~a" hostname))
+          (unless (= 1 (%ssl-set-fd ssl fd))
+            (error "SSL_set_fd failed"))
+          ssl)
+      (error (e)
+        (when ssl (ignore-errors (%ssl-free ssl)))
+        (error "tls-client-ssl ~a: ~a" hostname e)))))
+
+(defun ssl-handshake-stepper (ssl)
+  "A handshake step function for CONNECTION-HANDSHAKE-FN. Each call runs
+   SSL_connect once and answers :DONE, :WANT-READ, :WANT-WRITE, or raises.
+
+   SSL_connect on a non-blocking socket is resumable: it is called again,
+   unchanged, until it stops asking. Which direction it is blocked on is
+   not the caller's to guess — a handshake sends and receives several
+   times, and the direction changes between calls — so the answer carries
+   it and the state machine arms what it is told.
+
+   Only the two WANT codes are continuable. Anything else is a failed
+   handshake, and treating one as retryable would spin the event loop on a
+   connection that is never going to complete."
+  (lambda ()
+    (let ((result (%ssl-connect ssl)))
+      (if (= result 1)
+          :done
+          (let ((err (%ssl-get-error ssl result)))
+            (cond
+              ((= err +ssl-error-want-read+)  :want-read)
+              ((= err +ssl-error-want-write+) :want-write)
+              (t (error "SSL_connect failed: error ~d" err))))))))
+
 (defun tls-connect (hostname port)
   "Open a blocking TLS connection to HOSTNAME:PORT.
    Returns (values ssl-ptr socket) on success. DNS resolution and the
@@ -238,8 +346,10 @@
    the shared *DNS-RESOLVE-BLOCKING-FN* getent resolver (same one the
    async HTTP path uses) so both v4 and v6 addresses are handled and
    there is exactly one DNS primitive in the framework."
-  (let ((ctx (ensure-ssl-ctx))
-        (ssl nil)
+  ;; No CTX binding here any more: TLS-CLIENT-SSL calls ENSURE-SSL-CTX,
+  ;; which is idempotent and mutex-guarded, so touching it twice would
+  ;; only be a second place to get the ordering wrong.
+  (let ((ssl nil)
         (socket nil))
     (multiple-value-bind (ip family)
         (funcall *dns-resolve-blocking-fn* hostname)
@@ -254,31 +364,9 @@
             (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
                                 *fetch-timeout*)
             (blocking-connect socket ip port *fetch-timeout*)
-            ;; Create SSL object
-            (setf ssl (%ssl-new ctx))
-            (when (sb-sys:sap= (sb-alien:alien-sap ssl) (sb-sys:int-sap 0))
-              (error "SSL_new failed"))
-            ;; Set SNI hostname (must be null-terminated — SSL_ctrl uses
-            ;; strlen). SSL_set_tlsext_host_name returns 1 on success,
-            ;; 0 on failure. A silent failure here meant the handshake
-            ;; proceeded without SNI and the upstream typically rejected
-            ;; with an opaque 'unknown certificate' further down the
-            ;; stack — raising loud at the call site is much easier to
-            ;; diagnose than debugging the eventual cert mismatch.
-            (let ((hostname-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
-                                                (sb-ext:string-to-octets hostname
-                                                                         :external-format :ascii)
-                                                #(0))))
-              (sb-sys:with-pinned-objects (hostname-bytes)
-                (unless (= 1 (%ssl-ctrl ssl +ssl-ctrl-set-tlsext-hostname+ 0
-                                        (sb-sys:vector-sap hostname-bytes)))
-                  (error "SSL_set_tlsext_host_name failed for ~a" hostname))))
-            ;; Enable hostname verification (OpenSSL 1.1.0+)
-            (when (zerop (%ssl-set1-host ssl hostname))
-              (error "SSL_set1_host failed"))
-            ;; Attach to socket fd
-            (unless (= 1 (%ssl-set-fd ssl (sb-bsd-sockets:socket-file-descriptor socket)))
-              (error "SSL_set_fd failed"))
+            (setf ssl (tls-client-ssl
+                       hostname
+                       (sb-bsd-sockets:socket-file-descriptor socket)))
             ;; TLS handshake
             (let ((result (%ssl-connect ssl)))
               (unless (= result 1)
@@ -291,17 +379,25 @@
           (ignore-errors (sb-bsd-sockets:socket-close socket))
           (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
 
-(defun ssl-write-error-raise (ssl n)
+(defun ssl-write-error-raise (ssl n &optional
+                                      (errno (get-errno))
+                                      (err (%ssl-get-error ssl n)))
   "Classify a non-positive SSL_write return and raise with the same
    errno discipline as SSL-READ-EOF-OR-RAISE: distinguish a
    SO_SNDTIMEO expiry (errno = EAGAIN/EWOULDBLOCK) from a real
    transport failure so operators chasing timeouts can tell them
    apart in the log. Write has no benign-EOF case — every
-   non-positive return is an error."
-  (let ((err (%ssl-get-error ssl n)))
+   non-positive return is an error.
+
+   ERRNO before ERR, and the ordering is load-bearing: &OPTIONAL defaults
+   evaluate left to right, so errno is taken before SSL_get_error runs.
+   SSL_get_error is a foreign call and can set errno itself, so reading it
+   afterwards reports what that call did rather than what SSL_write did --
+   and errno is the entire basis of the split below."
+  (progn
     (cond
       ((= err +ssl-error-syscall+)
-       (let ((errno (get-errno)))
+       (progn
          (cond
            ((or (= errno +eagain+) (= errno +ewouldblock+))
             (error "SSL_write: timed out (~a)" (errno-string errno)))
@@ -325,112 +421,96 @@
                    (ssl-write-error-raise ssl n))
                  (incf pos n))))))
 
-(defun ssl-read-eof-or-raise (ssl n)
+(defun ssl-read-eof-or-raise (ssl n &optional
+                                      (errno (get-errno))
+                                      (err (%ssl-get-error ssl n)))
   "Classify a non-positive SSL_read return. Returns :EOF if the peer
    cleanly closed the stream, raises otherwise so the outer
    handler-case converts the error into a 502 and fires the fetch
    callback's cleanup sentinel.
 
-   SSL_ERROR_SYSCALL conflates at least four distinct conditions
-   and must NOT be treated uniformly as clean EOF:
-     errno = 0                 — unexpected EOF with no close_notify.
-                                 Benign for HTTP/1.0-style legacy
-                                 servers that drop the TCP connection
-                                 as their framing signal. Treat as
-                                 clean EOF.
-     errno = EAGAIN/EWOULDBLOCK — SO_RCVTIMEO fired (the
-                                 *fetch-timeout* we install on the
-                                 socket in tls-connect). This is the
-                                 behavior DEPLOYMENT.md promises the
-                                 framework enforces; silent-EOF here
-                                 made that promise a lie for
-                                 close-delimited HTTPS responses and
-                                 for http-fetch-stream over HTTPS.
-     errno = ECONNRESET / EPIPE / ETIMEDOUT / other
-                              — real transport failure, including
-                                 the nasty MITM-RST-mid-stream case
-                                 where an attacker truncates a
-                                 response and the app sees 'success'.
-                              Loud raise.
-   Other SSL errors (WANT_READ / WANT_WRITE / SSL / etc) also raise."
-  (let ((err (%ssl-get-error ssl n)))
-    (cond
-      ((= err +ssl-error-zero-return+) :eof)
-      ((= err +ssl-error-syscall+)
-       (let ((errno (get-errno)))
-         (cond
-           ((zerop errno) :eof)
-           ((or (= errno +eagain+) (= errno +ewouldblock+))
-            (error "SSL_read: timed out (~a)" (errno-string errno)))
-           (t
-            (error "SSL_read: transport error ~a" (errno-string errno))))))
-      (t (error "SSL_read failed: error ~d" err)))))
+   ERRNO is declared before ERR and that ordering is the point, not a
+   style: &OPTIONAL defaults evaluate left to right, so errno is taken
+   before SSL_get_error is called. SSL_get_error is a foreign call and can
+   set errno itself, so reading errno afterwards reports what *it* did
+   rather than what SSL_read did. That is not hypothetical -- it is how a
+   plain EAGAIN came back from this codebase reading as EBADF, and errno
+   is the whole basis of the SSL_ERROR_SYSCALL split below.
 
-(defun tls-read-all (ssl &key (method :GET))
-  "Read the HTTP response through the SSL connection and return it as a
-   byte vector. Bounded by *MAX-OUTBOUND-RESPONSE-SIZE* (headers + body
-   together) — the inbound *MAX-BODY-SIZE* cap is the wrong knob here,
-   since a legitimate 1 MB HTTPS response with a few hundred bytes of
-   headers exceeds the inbound-request budget on principle.
+   Both are passed in by a caller that already sampled them, which is what
+   a caller must do if it needed to branch on WANT_READ first.
 
-   Stops as soon as the response is framed-complete, via the same
-   OUTBOUND-RESPONSE-COMPLETE-P the non-blocking plain-HTTP path uses:
-   Content-Length satisfied, chunked terminator seen, or (for HEAD)
-   headers done. METHOD is the request method, needed for that last case.
+   ARGUMENT ORDER IS A TRAP, and it belongs up here rather than at the
+   bottom because the next caller added is where it costs something.
+   ERRNO sits ahead of ERR. A caller written against the older shape and
+   passing ERR positionally now passes it as ERRNO, silently — and errno
+   is the whole basis of the split below, where a wrong value turns a
+   transport failure into a clean end of stream. Pass both or neither.
 
-   Reading to EOF unconditionally — which this did — worked only because
-   BUILD-OUTBOUND-REQUEST sends Connection: close by default, and it was
-   never free:
+   :AGAIN IS THE CALLER'S TO INTERPRET, and that is the re-derivation this
+   function needed once the socket stopped being blocking. EAGAIN used to
+   mean exactly one thing here — SO_RCVTIMEO fired — and the error message
+   said so. SO_RCVTIMEO does nothing on a non-blocking socket, so there
+   EAGAIN means only what it says: nothing to read yet. On a blocking
+   socket with the timeout installed it still cannot mean anything else,
+   because a blocking read does not return would-block unless the receive
+   timeout expired.
 
-     * It cost a round trip on *every* HTTPS fetch. The complete response
-       is already in hand; we were waiting for the peer's close_notify to
-       tell us something the framing had already said.
-     * An upstream that keeps the connection open — because the caller
-       passed its own Connection header — pinned this worker thread until
-       SO_RCVTIMEO fired (*FETCH-TIMEOUT*, 30s by default). HTTPS fetch is
-       blocking, so that is a worker, not merely a parked connection.
-     * It left the two transports disagreeing about when a response ends:
-       plain HTTP recognized the chunked terminator, TLS did not. The same
-       upstream behaved differently over http:// and https://.
+   One classification, two readings, each made where the socket's mode is
+   known: SSL-CONNECTION-READER passes :AGAIN to the event loop, and
+   SSL-BLOCKING-READ-EOF-OR-RAISE turns it into the loud timeout
+   DEPLOYMENT.md promises. Deciding it here would mean guessing at a fact
+   this function cannot see.
 
-   Close-delimited responses (no Content-Length, no Transfer-Encoding)
-   still read to EOF, because for those EOF genuinely is the framing."
-  (let* ((cap 8192)
-         (out (make-array cap :element-type '(unsigned-byte 8)))
-         (len 0)
-         (chunk-scan 0)
-         (buf (make-array 8192 :element-type '(unsigned-byte 8))))
-    (loop
-      ;; Framed-complete? Ask before reading again, so a response whose
-      ;; last byte arrived on the previous pass does not wait on a read
-      ;; that has nothing left to deliver.
-      (multiple-value-bind (complete next-scan)
-          (outbound-response-complete-p out len method chunk-scan)
-        (setf chunk-scan next-scan)
-        (when complete (return)))
-      (sb-sys:with-pinned-objects (buf)
-        (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) (length buf))))
-          (cond
-            ((> n 0)
-             (when (> (+ len n) *max-outbound-response-size*)
-               (error "HTTPS response too large (~d bytes, max ~d)"
-                      (+ len n) *max-outbound-response-size*))
-             ;; Grow geometrically and copy in one REPLACE — a
-             ;; VECTOR-PUSH-EXTEND per byte would dominate the read.
-             (when (> (+ len n) cap)
-               (loop while (< cap (+ len n)) do (setf cap (* cap 2)))
-               (let ((bigger (make-array cap :element-type '(unsigned-byte 8))))
-                 (replace bigger out :end2 len)
-                 (setf out bigger)))
-             (replace out buf :start1 len :end2 n)
-             (incf len n))
-            (t
-             ;; :EOF (benign close) or a raise — SSL-READ-EOF-OR-RAISE
-             ;; decides which, and a benign EOF is what completes a
-             ;; close-delimited response.
-             (ssl-read-eof-or-raise ssl n)
-             (return))))))
-    (subseq out 0 len)))
+   SSL_ERROR_SYSCALL still conflates several conditions and still must NOT
+   be read uniformly as clean EOF:
+     errno = 0                  — end of stream with no close_notify.
+                                  Benign, and load-bearing: it is the
+                                  framing signal for HTTP/1.0-style
+                                  servers that never send one.
+     errno = EAGAIN/EWOULDBLOCK — would block. :AGAIN, per above.
+     errno = anything else      — real transport failure: ECONNRESET,
+                                  EPIPE, ETIMEDOUT. This is the MITM
+                                  RST-mid-stream case, where an attacker
+                                  truncates a response and a silent EOF
+                                  here delivers it as success. Loud
+                                  raise, always.
+
+   WANT_READ and WANT_WRITE reaching here is a caller bug: both are
+   continuable and belong to whoever knows how to continue them."
+  (cond
+    ((= err +ssl-error-zero-return+) :eof)
+    ((= err +ssl-error-syscall+)
+     (cond
+       ((zerop errno) :eof)
+       ((or (= errno +eagain+) (= errno +ewouldblock+)) :again)
+       (t (error "SSL_read: transport error ~a" (errno-string errno)))))
+    ((or (= err +ssl-error-want-read+) (= err +ssl-error-want-write+))
+     (error "SSL_read: ~a reached the classifier; it is continuable and ~
+             belongs to the caller that knows how to continue it"
+            (if (= err +ssl-error-want-read+) "WANT_READ" "WANT_WRITE")))
+    (t (error "SSL_read failed: error ~d" err))))
+
+(defun ssl-blocking-read-eof-or-raise (ssl n &optional
+                                            (errno (get-errno))
+                                            (err (%ssl-get-error ssl n)))
+  "SSL-READ-EOF-OR-RAISE for a socket still in blocking mode with
+   SO_RCVTIMEO installed.
+
+   The only difference is what :AGAIN means there, and it is not a
+   difference of degree: a blocking read does not return would-block
+   unless the receive timeout expired, so :AGAIN is the timeout and gets
+   the loud error DEPLOYMENT.md promises. Silence here made that promise
+   a lie once, for close-delimited HTTPS responses and for
+   http-fetch-stream over HTTPS.
+
+   A wrapper rather than a flag on the classifier: that one answers what
+   the transport reported, this one answers what it means on this kind of
+   socket, and neither has to know the other's business."
+  (let ((verdict (ssl-read-eof-or-raise ssl n errno err)))
+    (if (eq verdict :again)
+        (error "SSL_read: timed out (~a)" (errno-string errno))
+        verdict)))
 
 (defun tls-close (ssl socket)
   "Shut down a TLS connection and close the socket."
@@ -438,186 +518,16 @@
   (ignore-errors (%ssl-free ssl))
   (ignore-errors (sb-bsd-sockets:socket-close socket)))
 
-;;; ---------------------------------------------------------------------------
-;;; Blocking HTTPS fetch — called by the core framework via *https-fetch-fn*
-;;; ---------------------------------------------------------------------------
-
-(defun https-fetch (conn epoll-fd fetch-req host port path)
-  "Perform a blocking HTTPS fetch and deliver the result to CONN.
-   Called by initiate-fetch when the URL scheme is :https.
-
-   The fetch callback fires exactly once per call — either with real
-   (status headers body) arguments on the happy path, or with
-   (nil nil nil) as a cleanup sentinel in every error path
-   (tls-connect failure, handshake error, parse error, truncation).
-   Apps get a single defined moment to release DB handles, close
-   metric spans, or decrement rate-limit counters regardless of how
-   the fetch ends. CALLBACK-FIRED is flipped just before the happy-
-   path funcall so that if the user callback itself raises, the
-   outer handler-case does not re-invoke it."
-  (let ((callback (http-fetch-continuation-callback fetch-req))
-        (callback-fired nil))
-    (handler-case
-        (multiple-value-bind (ssl socket)
-            (tls-connect host port)
-          (unwind-protect
-              (let ((method (http-fetch-continuation-method fetch-req)))
-                ;; Build and send the HTTP request
-                (let ((request-bytes (build-outbound-request
-                                     method host path
-                                     :scheme :https :port port
-                                     :headers (http-fetch-continuation-headers fetch-req)
-                                     :body (http-fetch-continuation-body fetch-req))))
-                  (tls-write-all ssl request-bytes))
-                ;; Read the complete response. The parsing discipline
-                ;; here mirrors COMPLETE-FETCH on the plain path:
-                ;; header-end and status must both be present before
-                ;; the callback fires the happy-path branch, otherwise
-                ;; we raise and let the outer handler-case convert to
-                ;; 502 + cleanup sentinel. A 'status = 0' happy-path
-                ;; callback is a DEPLOYMENT.md contract violation —
-                ;; apps pattern-matching on (if status ...) treat the
-                ;; integer 0 as truthy and blow up interpreting it as
-                ;; an HTTP status.
-                (let* ((response-buf (tls-read-all ssl :method method))
-                       (buf-len (length response-buf))
-                       ;; Step over any 1xx interim blocks (RFC 7231 §6.2)
-                       ;; before locating the header boundary — a CDN's
-                       ;; unsolicited 103 Early Hints would otherwise supply
-                       ;; the status and headers this fetch reports, and the
-                       ;; real response would be dropped without a word.
-                       ;; Same helper the plain-HTTP path uses, so the two
-                       ;; transports cannot drift on where a response starts.
-                       (start (skip-interim-responses response-buf 0 buf-len))
-                       (header-end (scan-crlf-crlf response-buf start buf-len)))
-                  (unless header-end
-                    (error "https: upstream response has no parseable headers"))
-                  (let* ((status (parse-response-status response-buf start buf-len))
-                         (headers
-                          (let ((first-crlf (scan-crlf response-buf start header-end)))
-                            (when first-crlf
-                              (parse-headers-bytes response-buf
-                                                   (+ first-crlf 2)
-                                                   (+ header-end 4)))))
-                         (body-start (+ header-end 4))
-                         ;; RFC 7230 §3.3.3: TE takes precedence over CL
-                         (chunked-p (response-chunked-p headers))
-                         ;; RFC 7230 §3.3.3 rule 3: any TE present means
-                         ;; CL is ignored — read-until-close, not CL-framed.
-                         (te-present (scan-transfer-encoding response-buf
-                                                             header-end start))
-                         (content-length (unless te-present
-                                           (scan-content-length response-buf
-                                                                header-end start))))
-                    (unless status
-                      (error "https: upstream status line unparseable"))
-                    ;; Truncation guard: an upstream that declares a
-                    ;; Content-Length and then closes short must not be
-                    ;; allowed to hand us a silently-truncated body. The
-                    ;; MITM case is the nasty one — attacker RSTs
-                    ;; mid-stream and the app receives short data with no
-                    ;; indication. Signal an error so the outer
-                    ;; handler-case converts it into a 502 and fires
-                    ;; the cleanup sentinel.
-                    ;;
-                    ;; Skipped for 204/304 (carry CL but MUST NOT
-                    ;; have a body per RFC 7230 §3.3.3 rule 1 / RFC 7232
-                    ;; §4.1) and for HEAD (RFC 7231 §4.3.2 — upstream
-                    ;; echoes the GET-body CL but MUST NOT send a body).
-                    ;; Twin of the exemption in fetch.lisp COMPLETE-FETCH
-                    ;; on the plain-HTTP path, 1xx included: the skip
-                    ;; above has consumed every complete interim, so
-                    ;; STATUS is >= 200 here and testing for 1xx would be
-                    ;; dead code implying an interim could be final.
-                    (when (and content-length
-                               (not (or (= status 204) (= status 304)))
-                               (not (eq method :HEAD))
-                               (< (- buf-len body-start) content-length))
-                      (error "https: short body (~d of ~d bytes)"
-                             (- buf-len body-start) content-length))
-                    (let* ((body-end (if content-length
-                                         (min buf-len (+ body-start content-length))
-                                         buf-len))
-                           ;; 204/304 MUST NOT have a body (RFC 7230 §3.3.3 rule 1).
-                           ;; HEAD MUST NOT include a body (RFC 7231 §4.3.2).
-                           ;; Force empty regardless of what the upstream sent.
-                           ;; 1xx cannot reach here — see the guard above.
-                           (body-end (if (or (= status 204) (= status 304)
-                                             (eq method :HEAD))
-                                         body-start
-                                         body-end))
-                           (raw-body (when (> body-end body-start)
-                                       (subseq response-buf body-start body-end)))
-                           (body (if (and raw-body chunked-p)
-                                     (decode-chunked-body raw-body 0 (length raw-body))
-                                     raw-body)))
-                    ;; Mark the callback as fired before the funcall so
-                    ;; that a raising user callback doesn't get invoked
-                    ;; a second time with nil sentinels in the outer
-                    ;; handler-case's cleanup branch.
-                    (setf callback-fired t)
-                    (let ((response (funcall callback
-                                             status (or headers nil)
-                                             (or body nil))))
-                      ;; Sync close-after-p from the callback's response
-                      ;; before format-response — a handler-set
-                      ;; Connection: close should zero out the hint too.
-                      (sync-close-after-p-from-response conn response)
-                      ;; Deliver to inbound connection. :HEAD-ONLY-P
-                      ;; short-circuits the body encode on HEAD (matches
-                      ;; the plain COMPLETE-FETCH path); byte-vector
-                      ;; responses still strip post-serialize.
-                      (let* ((head-p (and (connection-request conn)
-                                          (eq (http-request-method
-                                               (connection-request conn))
-                                              :HEAD)))
-                             (bytes (cond
-                                      ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                       (strip-body-for-head response conn))
-                                      ((typep response 'http-fetch-continuation)
-                                       ;; Chained fetch
-                                       (initiate-fetch conn epoll-fd response)
-                                       (return-from https-fetch))
-                                      (t (format-response
-                                          response
-                                          :connection-hint
-                                          (connection-hint-for conn)
-                                          :head-only-p head-p)))))
-                        (connection-queue-write conn bytes)
-                        (setf (connection-state conn) :write-response
-                              (connection-last-active conn) (get-universal-time))
-                        (epoll-modify epoll-fd (connection-fd conn)
-                                      (logior +epollout+ +epollet+))
-                        (log-debug "fetch: https ~a:~d~a -> fd ~d"
-                                   host port path (connection-fd conn))))))))
-            (tls-close ssl socket)))
-      (error (e)
-        (log-error "https fetch failed: ~a" e)
-        ;; Fire the cleanup sentinel in every pre-delivery error
-        ;; path so the app's :then closure runs exactly once.
-        ;; Wrapped in its own handler-case — a raising cleanup hook
-        ;; must not block the 502 from reaching the inbound.
-        (unless callback-fired
-          (handler-case (funcall callback nil nil nil)
-            (error (e2)
-              (log-warn "fetch cleanup callback raised: ~a" e2))))
-        (let ((err-bytes (strip-body-for-head
-                         (format-response
-                          (make-error-response 502)
-                          :connection-hint (connection-hint-for conn))
-                         conn)))
-          (connection-queue-write conn err-bytes)
-          (setf (connection-state conn) :write-response
-                (connection-last-active conn) (get-universal-time))
-          (epoll-modify epoll-fd (connection-fd conn)
-                        (logior +epollout+ +epollet+)))))))
-
-;;; ---------------------------------------------------------------------------
-;;; Blocking streaming HTTPS fetch
-;;; ---------------------------------------------------------------------------
-
 (defun https-fetch-stream (method host port path headers body on-line)
-  "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line."
+  "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line.
+
+   The response is read by STREAM-RESPONSE-LINES, the same function the
+   plain-HTTP path uses, with SSL-BYTE-READER supplying the bytes. This
+   used to be TLS-STREAM-RESPONSE: 386 lines reimplementing interim 1xx
+   handling, header caps, chunk framing, :HEAD gating and three
+   truncation disciplines the shared reader already had. Two readers of
+   the same bytes is the shape this codebase spends the most effort
+   refusing, and the largest instance of it was here."
   (multiple-value-bind (ssl socket)
       (tls-connect host port)
     (unwind-protect
@@ -625,412 +535,194 @@
           (tls-write-all ssl (build-outbound-request method host path
                                                      :scheme :https :port port
                                                      :headers headers :body body))
-          (tls-stream-response ssl on-line :method method))
+          (stream-response-lines nil on-line
+                                 :method method
+                                 :read-fn (ssl-byte-reader ssl)))
       (tls-close ssl socket))))
 
+(defun tls-setup-outbound (conn host)
+  "Install the TLS transport on an outbound CONN. Called by INITIATE-FETCH
+   once the socket exists and the non-blocking connect is under way, before
+   the request is queued or epoll is armed.
+
+   This is the function items 3 through 8 were built for. Everything it
+   installs is a closure over one SSL: a handshake step, a byte source, a
+   byte sink, and a release. Nothing about the outbound state machine knows
+   that TLS exists — it asks a connection to read, to write, to take one
+   more handshake step, and to let go.
+
+   HOST rather than the connection's peer address, because the certificate
+   is checked against the name the caller asked for. Checking it against
+   the address DNS produced would verify that whoever answered holds a
+   certificate for themselves, which is not a check.
+
+   CLOSE-FN releases in the order the peer needs: the staging buffer, then
+   a best-effort close_notify, then the SSL. CONNECTION-CLOSE runs it
+   before the descriptor goes, which is what makes the shutdown possible at
+   all — it has nothing to send over afterwards. Best-effort because a peer
+   that has already vanished must not stop us freeing anything."
+  (let ((ssl (tls-client-ssl host (connection-fd conn))))
+    (multiple-value-bind (write-fn release-staging) (ssl-connection-writer ssl)
+      (setf (connection-handshake-fn conn) (ssl-handshake-stepper ssl)
+            (connection-read-fn conn)      (ssl-connection-reader ssl)
+            (connection-write-fn conn)     write-fn
+            (connection-close-fn conn)
+            (lambda ()
+              (funcall release-staging)
+              (ignore-errors (%ssl-shutdown ssl))
+              (%ssl-free ssl))))
+    conn))
+
+(defun ssl-connection-writer (ssl)
+  "Returns (values WRITE-FN RELEASE-FN) for a CONNECTION over SSL.
+
+   WRITE-FN answers NB-WRITE's contract: bytes written, :AGAIN, or a raise.
+
+   The bytes are copied into a malloc'd staging buffer and SSL_write is
+   issued from there, never from the Lisp vector. OpenSSL requires that a
+   write retried after WANT_WRITE present the same address and length as
+   the call that failed, and SB-SYS:WITH-PINNED-OBJECTS pins only for its
+   own dynamic extent — a partial write returns to the event loop, the pin
+   is gone, and a GC before the retry may move the vector. Foreign memory
+   does not move, so the requirement is met by where the bytes live rather
+   than by anything the caller has to keep true.
+
+   The alternative was SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, and it was
+   rejected on a rule rather than a preference: it would make TLS write
+   correctness depend on the write queue never mutating what it holds — an
+   invariant that lives in connection.lisp, is documented there for an
+   entirely different reason (static responses share one vector across
+   connections), and would be broken by anyone who later decided to compact
+   the queue as an optimisation. They would break static serving and TLS
+   writes together, and only one of those has a comment warning them.
+
+   RELEASE-FN frees the staging buffer and is idempotent. It belongs on the
+   connection's CLOSE-FN; a seam that allocates without a matching release
+   is a leak by construction.
+
+   WANT_READ from a write is refused for the same reason WANT_WRITE is
+   refused from a read: the retry it asks for is another SSL_write once the
+   socket is *readable*, and the event loop outside :OUT-HANDSHAKE cannot
+   express that."
+  (let ((stage (sb-alien:make-alien (sb-alien:unsigned 8)
+                                    +ssl-write-stage-size+))
+        (pending 0))
+    (values
+     (lambda (buffer start nbytes)
+       (let ((n (min nbytes +ssl-write-stage-size+)))
+         ;; A retry must be the same call. The queue head does not move
+         ;; while a write is outstanding, so a mismatch means something
+         ;; changed the plan mid-write and OpenSSL would reject it anyway —
+         ;; better to say which invariant broke than to hand it on.
+         (when (and (plusp pending) (/= n pending))
+           (error "SSL_write retry changed length: staged ~d, now asked ~d"
+                  pending n))
+         (sb-sys:with-pinned-objects (buffer)
+           (%memcpy (sb-alien:alien-sap stage)
+                    (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                    n))
+         (let* ((w (%ssl-write ssl (sb-alien:alien-sap stage) n))
+                ;; Sampled here, before SSL_get_error. errno belongs to the
+                ;; call that just returned, and SSL_get_error is itself a
+                ;; foreign call that may set it — reading errno afterwards
+                ;; reports whatever that did, which is how a plain EAGAIN
+                ;; came back looking like EBADF.
+                (errno (if (> w 0) 0 (get-errno))))
+           (if (> w 0)
+               (progn (setf pending 0) w)
+               (let ((err (%ssl-get-error ssl w)))
+                 (cond
+                   ((= err +ssl-error-want-write+) (setf pending n) :again)
+                   ;; Mirror of the read side: arm readability, re-issue
+                   ;; the write.
+                   ((= err +ssl-error-want-read+) (setf pending n) :want-read)
+                   ;; errno is in the message for the same reason the fd is
+                   ;; in EPOLL-WAIT's: SSL_ERROR_SYSCALL is a pointer at the
+                   ;; socket layer and says nothing on its own.
+                   ;; OpenSSL reports a would-block on some paths as
+                   ;; SSL_ERROR_SYSCALL with errno EAGAIN rather than as
+                   ;; WANT_WRITE. It is the same condition and the same
+                   ;; answer; treating it as an error made a full socket
+                   ;; buffer look like a transport failure.
+                   ((and (= err +ssl-error-syscall+)
+                         (or (= errno +eagain+) (= errno +ewouldblock+)))
+                    (setf pending n)
+                    :again)
+                   (t (error "SSL_write failed: error ~d (errno ~d: ~a)"
+                             err errno (errno-string errno)))))))))
+     (lambda ()
+       (when stage
+         (sb-alien:free-alien stage)
+         (setf stage nil))))))
+
+(defun ssl-connection-reader (ssl)
+  "A CONNECTION read-fn over SSL. Fills BUFFER[START..START+MAX-BYTES) and
+   answers NB-READ's contract: bytes read, :AGAIN, :EOF, or a raise.
+
+   WANT_READ becomes :AGAIN, and that one mapping is what makes
+   CONNECTION-READ-AVAILABLE's existing drain loop enforce the SSL_pending
+   discipline for free. SSL_read hands back whatever it has already
+   decrypted before it goes near the socket and returns at most one record
+   per call, so a loop that runs until :AGAIN empties OpenSSL's buffer as
+   well as the kernel's. Stopping earlier leaves decrypted bytes in user
+   space with nothing left on the fd, and an edge-triggered epoll has no
+   reason to wake again — the connection hangs holding its own answer.
+
+   WANT_WRITE is deliberately not :AGAIN. It means the SSL wants to send
+   before it can read — a renegotiation or a post-handshake message — and
+   what it is asking for is another SSL_READ once the socket is *writable*.
+   The event loop outside :OUT-HANDSHAKE is built on readable-means-read,
+   so there is nowhere to put that request; answering :AGAIN would park the
+   connection waiting for a readability event that is not coming, turning a
+   condition we can name into a hang we cannot. Raising is the honest
+   answer until the direction inversion lands.
+
+   Everything else defers to SSL-READ-EOF-OR-RAISE, with the error code
+   passed along, so the four-way reading of SSL_ERROR_SYSCALL stays in one
+   place and this function cannot drift from the blocking path's idea of
+   what a clean end of stream is."
+  (lambda (buffer start max-bytes)
+    (sb-sys:with-pinned-objects (buffer)
+      (let* ((n (%ssl-read ssl
+                           (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                           max-bytes))
+             ;; Before SSL_get_error, which can set errno itself.
+             (errno (if (> n 0) 0 (get-errno))))
+        (if (> n 0)
+            n
+            (let ((err (%ssl-get-error ssl n)))
+              (cond
+                ((= err +ssl-error-want-read+) :again)
+                ;; The state machine can express this now: the caller
+                ;; arms writability and re-issues the read. It must be the
+                ;; read -- retrying as a write is a protocol error that
+                ;; surfaces looking like a broken peer.
+                ((= err +ssl-error-want-write+) :want-write)
+                (t (ssl-read-eof-or-raise ssl n errno err)))))))))
+
 (defun ssl-byte-reader (ssl)
-  "Default byte source for TLS-STREAM-RESPONSE: fill BUF, answer with the
+  "Byte source over SSL for STREAM-READER: fill BUF, answer with the
    count, :EOF on a benign close, or raise.
 
    The classification lives here rather than at the call site because a
    caller supplying its own source has no SSL pointer to hand
    SSL-READ-EOF-OR-RAISE — and that function's four-way reading of
-   SSL_ERROR_SYSCALL is not something a second site should restate."
+   SSL_ERROR_SYSCALL is not something a second site should restate.
+
+   The raise is load-bearing rather than incidental: READER-FILL treats
+   only 0 as end of stream, so answering :EOF for a reset mid-body would
+   deliver a truncated response as a clean one."
   (lambda (buf len)
     (sb-sys:with-pinned-objects (buf)
-      (let ((n (%ssl-read ssl (sb-sys:vector-sap buf) len)))
+      (let* ((n (%ssl-read ssl (sb-sys:vector-sap buf) len))
+             ;; Sampled before SSL-READ-EOF-OR-RAISE asks SSL_get_error.
+             (errno (if (> n 0) 0 (get-errno))))
         (if (> n 0)
             n
             ;; Returns :EOF for a benign close, raises for everything
             ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
             ;; one of them is an ordinary end of stream.
-            (ssl-read-eof-or-raise ssl n))))))
-
-(defun tls-stream-response (ssl on-line &key (method :GET) read-fn)
-  "Read HTTP response via SSL, skip headers, call ON-LINE per body line.
-   Handles chunked transfer encoding. Returns the status code.
-
-   READ-FN substitutes the byte source: (READ-FN BUF LEN) fills BUF and
-   answers with the count, :EOF at a clean end of stream, or raises.
-   Defaults to SSL-BYTE-READER over SSL, which is then untouched.
-
-   A parameter added for testability is the kind of thing this codebase
-   declines, so: this function is a second implementation of what
-   STREAM-RESPONSE-LINES does, %SSL-READ takes a raw pointer, and
-   TEST-PROPERTIES.LISP's header recorded the resulting coverage gap as
-   one it could not close. The seam closes it, and it is what will make
-   deleting this function checkable rather than hopeful.
-
-   METHOD gates the body-framing discipline: for :HEAD, RFC 7231
-   §4.3.2 guarantees an empty body even when the upstream echoes
-   the GET-body Content-Length, so the body phase is skipped
-   entirely and the post-loop truncation checks are bypassed.
-
-   Truncation discipline on the TLS streaming path (twin of the
-   plain-path STREAM-RESPONSE-LINES):
-     - chunked: TERMINATED is set when the zero-size chunk header
-       arrives. The post-loop check raises if the outer loop exited
-       without seeing it (mid-body close, MITM RST, zero-byte SSL
-       read classified as benign :eof by ssl-read-eof-or-raise).
-     - content-length (no TE): BODY-CONSUMED counts body bytes as
-       they are processed, and the post-loop check raises if the
-       count is short of the declared length. The SSL-layer
-       classifier treats an errno=0 close as benign :eof, so the
-       CL comparison is the only thing standing between a MITM
-       mid-body close on a CL-framed HTTPS stream and the app
-       receiving a silently truncated response.
-     - close-delimited (no TE, no CL): the connection close IS
-       the framing signal; clean EOF is treated as complete."
-  (let ((read (or read-fn (ssl-byte-reader ssl)))
-        (buf (make-array 8192 :element-type '(unsigned-byte 8)))
-        (line-buf (make-array 4096 :element-type '(unsigned-byte 8)
-                                   :fill-pointer 0 :adjustable t))
-        (status nil)
-        (chunked nil)
-        (te-present nil)
-        (content-length nil)
-        (body-consumed 0)
-        (terminated nil)
-        (in-headers t)
-        (header-count 0)
-        (total-header-bytes 0)
-        ;; Count of 1xx interim blocks stepped over so far (RFC 7231
-        ;; §6.2). Bounded by *MAX-INTERIM-RESPONSES* so an upstream
-        ;; cannot feed well-formed interim blocks forever.
-        (interims 0)
-        ;; WHATWG EventStream §9.2: CR, LF, and CRLF are equivalent
-        ;; line terminators. PREV-CR carries across SSL-read
-        ;; iterations so a CRLF pair split at a TLS record boundary
-        ;; collapses to one terminator. Scoped to content-phase use —
-        ;; header and chunk-size phases still use the lenient strip-CR
-        ;; behavior (headers and framing are strict CRLF in practice
-        ;; and a lone CR there is malformed either way).
-        (prev-cr nil)
-        (first-line t)
-        ;; Chunked state
-        (in-chunk-size nil)
-        (chunk-size-saw-cr nil)  ; CR seen, awaiting LF to complete CRLF
-        (chunk-remaining 0)
-        (expect-cr nil)    ; awaiting CR after chunk-data
-        (expect-lf nil)    ; awaiting LF after chunk-data
-        (chunk-size-buf (make-array 20 :element-type '(unsigned-byte 8)
-                                       :fill-pointer 0 :adjustable t)))
-    (flet ((emit-line ()
-             (let ((line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8)))
-               (setf (fill-pointer line-buf) 0)
-               line))
-           (emit-body-line ()
-             (let ((line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8)))
-               (setf (fill-pointer line-buf) 0)
-               (when on-line (funcall on-line line)))))
-      (loop
-        (when terminated (return))
-        (when (and content-length (not te-present)
-                   (>= body-consumed content-length))
-          (return))
-        (let ((n (funcall read buf (length buf))))
-          (cond
-            ((eq n :eof)
-             ;; The reader has already classified. SSL_ERROR_SYSCALL
-             ;; conflates timeout, transport error, and a benign
-             ;; HTTP/1.0-style close, so only the last of those reaches
-             ;; here — the rest raised, and the caller's unwind-protect
-             ;; tears the session down rather than presenting a
-             ;; silently-truncated NDJSON/SSE stream as success.
-             (return))
-              (t
-               (loop for i from 0 below n
-                     for byte = (aref buf i)
-                     do (let ((cap (if in-headers
-                                       *max-header-line-length*
-                                       *max-streaming-line-size*)))
-                          ;; Tighter cap during the header phase keeps a
-                          ;; 1 MiB attacker-framed "header" from coasting
-                          ;; on the body-line budget — symmetric with the
-                          ;; buffered parse-headers-bytes per-line cap.
-                          (when (>= (fill-pointer line-buf) cap)
-                            (error "streaming response line too large (~d bytes, max ~d)"
-                                   (fill-pointer line-buf) cap)))
-                        (cond
-                          ;; Header phase
-                          (in-headers
-                           (cond
-                             ((= byte 10)
-                              (let ((line (emit-line)))
-                                (if (zerop (length line))
-                                    (cond
-                                      ;; 1xx interim block (RFC 7231 §6.2).
-                                      ;; It is terminated by this empty line,
-                                      ;; carries no body, and is never the
-                                      ;; final response — so the next status
-                                      ;; line follows immediately. Reset the
-                                      ;; per-block state and stay in the
-                                      ;; header phase rather than reporting
-                                      ;; 103 as the result and streaming
-                                      ;; nothing. Checked before the HEAD arm
-                                      ;; because a HEAD request can receive an
-                                      ;; interim too.
-                                      ((and status (<= 100 status 199))
-                                       (incf interims)
-                                       (when (> interims *max-interim-responses*)
-                                         (error "https streaming: more than ~d ~
-                                                 interim responses"
-                                                *max-interim-responses*))
-                                       (setf status             nil
-                                             chunked            nil
-                                             te-present         nil
-                                             content-length     nil
-                                             first-line         t
-                                             header-count       0
-                                             total-header-bytes 0))
-                                      (t
-                                       (setf in-headers nil)
-                                       (when chunked (setf in-chunk-size t))
-                                       ;; Bodiless FINAL responses — 204 /
-                                       ;; 304 / HEAD. RFC 7230 §3.3.3 rule 1,
-                                       ;; RFC 7232 §4.1, RFC 7231 §4.3.2:
-                                       ;; the empty-line header boundary
-                                       ;; terminates regardless of CL / TE.
-                                       ;; Skip body phase and its truncation
-                                       ;; checks. Symmetric with the exempt
-                                       ;; set in complete-fetch's buffered
-                                       ;; path. 1xx is handled by the arm
-                                       ;; above and never reaches here.
-                                       (when (or (eq method :HEAD)
-                                                 (and status
-                                                      (or (= status 204)
-                                                          (= status 304))))
-                                         (return-from tls-stream-response
-                                           (or status
-                                               (error "https streaming: no parseable status line"))))))
-                                    (progn
-                                      (incf header-count)
-                                      (when (> header-count *max-header-count*)
-                                        (error "https streaming: too many headers (~d)"
-                                               header-count))
-                                      (incf total-header-bytes (length line))
-                                      (when (> total-header-bytes
-                                               *max-total-header-bytes*)
-                                        (error "https streaming: total header bytes exceed ~d"
-                                               *max-total-header-bytes*))
-                                      ;; RFC 7230 §3.2.4 — obs-fold.
-                                      ;; Buffered parse-headers-bytes
-                                      ;; rejects; streaming mirrors so
-                                      ;; the acceptance set doesn't
-                                      ;; drift. Skip the check on the
-                                      ;; status line.
-                                      (when (and (not first-line)
-                                                 (> (length line) 0)
-                                                 (or (char= (char line 0) #\Space)
-                                                     (char= (char line 0) #\Tab)))
-                                        (error "https streaming: obsolete line folding not accepted"))
-                                      (when first-line
-                                        (setf status
-                                              (parse-status-line-string line)
-                                              first-line nil))
-                                      (when (and (>= (length line) 18)
-                                                 (string-equal line "transfer-encoding:"
-                                                               :end1 18))
-                                        (setf te-present t)
-                                        (let ((value (string-trim '(#\Space #\Tab)
-                                                                   (subseq line 18))))
-                                          (when (header-has-token-p value "chunked")
-                                            (setf chunked t))))
-                                      ;; Capture Content-Length for
-                                      ;; the non-chunked truncation
-                                      ;; check. Strict digits-only
-                                      ;; parse — same discipline as
-                                      ;; SCAN-CONTENT-LENGTH on the
-                                      ;; inbound side so a malformed
-                                      ;; value does not silently
-                                      ;; disable the check.
-                                      (when (and (>= (length line) 15)
-                                                 (string-equal line "content-length:"
-                                                               :end1 15))
-                                        (let ((value (string-trim '(#\Space #\Tab)
-                                                                   (subseq line 15))))
-                                          (unless (and (> (length value) 0)
-                                                       (every (lambda (c)
-                                                                (char<= #\0 c #\9))
-                                                              value))
-                                            (error "https streaming: malformed Content-Length ~s"
-                                                   value))
-                                          (unless (<= (length value) 10)
-                                            (error "https streaming: Content-Length too many digits"))
-                                          (let ((n (parse-integer value)))
-                                            (when (and content-length (/= n content-length))
-                                              (error "https streaming: conflicting Content-Length ~d vs ~d"
-                                                     content-length n))
-                                            (setf content-length n))))))))
-                             ((= byte 13) nil)
-                             (t (vector-push-extend byte line-buf))))
-                          ;; Chunked body — reading chunk size (separate
-                          ;; buffer so body content in line-buf is not
-                          ;; corrupted across chunk boundaries). Strict
-                          ;; parse: parse-chunked-size-bytes strips
-                          ;; chunk-extensions (RFC 7230 §4.1.1 — anything
-                          ;; from ';' onwards), requires at least one
-                          ;; hex digit, and raises on parse failure.
-                          ;; The prior :junk-allowed t + NIL → final-
-                          ;; chunk behavior was a parser-disagreement
-                          ;; smuggling primitive between us and any
-                          ;; stricter downstream.
-                          ((and chunked in-chunk-size)
-                           ;; Strict CRLF only. Bare LF and bare CR
-                           ;; both reject. Empty chunk-size lines
-                           ;; reject via PARSE-CHUNKED-SIZE-LINE's
-                           ;; own empty-hex guard. Symmetric with
-                           ;; the plain path's READER-READ-CRLF-LINE
-                           ;; and the buffered path's
-                           ;; DECODE-CHUNKED-BODY — without this,
-                           ;; bare-LF or bare-CR terminators were a
-                           ;; parser-disagreement primitive against
-                           ;; strict downstream re-parsers.
-                           (cond
-                             ((= byte 13)
-                              (when chunk-size-saw-cr
-                                (error "https streaming: double CR in chunk-size"))
-                              (setf chunk-size-saw-cr t))
-                             ((= byte 10)
-                              (unless chunk-size-saw-cr
-                                (error "https streaming: bare LF in chunk-size line"))
-                              (let ((size (parse-chunked-size-bytes
-                                           chunk-size-buf 0
-                                           (fill-pointer chunk-size-buf))))
-                                (setf (fill-pointer chunk-size-buf) 0
-                                      chunk-size-saw-cr nil)
-                                (cond
-                                  ((zerop size)
-                                   ;; Final chunk — mark terminated
-                                   ;; so the outer loop's guard
-                                   ;; exits cleanly. The post-loop
-                                   ;; check then passes, and a
-                                   ;; stream that closed mid-body
-                                   ;; without reaching this point
-                                   ;; will raise.
-                                   (setf terminated t)
-                                   (return))
-                                  (t (setf chunk-remaining size
-                                           in-chunk-size nil)))))
-                             (t
-                              (when chunk-size-saw-cr
-                                (error "https streaming: bare CR in chunk-size line"))
-                              (when (>= (fill-pointer chunk-size-buf)
-                                        *max-header-line-length*)
-                                (error "https streaming: chunk-size line too long (max ~d)"
-                                       *max-header-line-length*))
-                              (vector-push-extend byte chunk-size-buf))))
-                          ;; Strict CRLF after chunk-data (RFC 7230 4.1).
-                          ;; Symmetric with decode-chunked-body and
-                          ;; reader-expect-crlf on the plain paths.
-                          (expect-cr
-                           (unless (= byte 13)
-                             (error "chunked stream: expected CR after chunk-data"))
-                           (setf expect-cr nil
-                                 expect-lf t))
-                          (expect-lf
-                           (unless (= byte 10)
-                             (error "chunked stream: expected LF after chunk-data"))
-                           (setf expect-lf nil
-                                 in-chunk-size t))
-                          ;; Chunked body — reading chunk data. Content-
-                          ;; phase terminators are CR / LF / CRLF
-                          ;; (WHATWG EventStream §9.2); PREV-CR carries
-                          ;; a CR's LF-partner across subsequent bytes
-                          ;; so the LF does not emit a second line.
-                          (chunked
-                           (when (> chunk-remaining 0)
-                             (decf chunk-remaining)
-                             (cond
-                               ((= byte 13)
-                                (emit-body-line)
-                                (setf prev-cr t))
-                               ((= byte 10)
-                                (cond
-                                  (prev-cr (setf prev-cr nil))
-                                  (t (emit-body-line))))
-                               (t
-                                (setf prev-cr nil)
-                                (vector-push-extend byte line-buf))))
-                           (when (zerop chunk-remaining)
-                             (setf expect-cr t)))
-                          ;; Non-chunked body. BODY-CONSUMED tracks
-                          ;; every byte that flows through the body
-                          ;; cond, so the post-loop CL check can
-                          ;; compare against declared length. For
-                          ;; close-delimited responses (no CL set),
-                          ;; the count is still maintained but never
-                          ;; compared. CR / LF / CRLF treated as
-                          ;; equivalent terminators (same as chunked
-                          ;; and the plain-path reader).
-                          (t
-                           (incf body-consumed)
-                           (cond
-                             ((= byte 13)
-                              (emit-body-line)
-                              (setf prev-cr t))
-                             ((= byte 10)
-                              (cond
-                                (prev-cr (setf prev-cr nil))
-                                (t (emit-body-line))))
-                             (t
-                              (setf prev-cr nil)
-                              (vector-push-extend byte line-buf)))
-                           (when (and content-length (not te-present)
-                                      (>= body-consumed content-length))
-                             ;; Hit declared length — stop processing
-                             ;; and let the outer loop exit via its
-                             ;; pre-read guard so any trailing bytes
-                             ;; in the current buffer are discarded.
-                             (return))))))))))
-    ;; Post-loop truncation checks. Raise loud on either framing
-    ;; shape that came up short — the outer UNWIND-PROTECT in
-    ;; HTTPS-FETCH-STREAM closes the TLS session and the error
-    ;; propagates to the app so a silently-truncated NDJSON / SSE
-    ;; stream is no longer presented as 'success with short body'.
-    (when (and chunked (not terminated))
-      (error "https streaming: chunked response missing zero-size terminator"))
-    (when (and content-length (not te-present)
-               (< body-consumed content-length))
-      (error "https streaming: short body (~d of ~d bytes)"
-             body-consumed content-length))
-    ;; Flush any remaining unterminated line
-    (when (> (fill-pointer line-buf) 0)
-      (when on-line
-        (funcall on-line (sb-ext:octets-to-string
-                          (subseq line-buf 0 (fill-pointer line-buf))
-                          :external-format :utf-8))))
-    (unless status
-      (error "https streaming: no parseable status line"))
-    status))
-
-;;; ===========================================================================
-;;; Crypto primitives — EVP digest + ECDSA verify
-;;;
-;;; At load time, this file swaps web-skeleton's public SHA-1, SHA-256,
-;;; and ECDSA-VERIFY-P256 symbols for libssl-backed implementations via
-;;; SETF SYMBOL-FUNCTION. The pure-Lisp originals stay reachable as
-;;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP for framework-dev
-;;; verification via TEST-PURE-LISP-CRYPTO.
-;;;
-;;; SHA uses the EVP_MD_CTX interface — the modern, non-deprecated path.
-;;; We deliberately avoid the one-shot SHA1() / SHA256() symbols, which
-;;; are marked OSSL_DEPRECATEDIN_3_0 in OpenSSL 3's headers.
-;;;
-;;; ECDSA uses d2i_PUBKEY (not deprecated in 3.0) to parse a hand-built
-;;; SubjectPublicKeyInfo, then EVP_PKEY_verify against a DER-encoded
-;;; SEQUENCE { r, s } signature. HMAC-SHA256 is not accelerated
-;;; directly — it's pure-Lisp, but its internal SHA-256 calls route
-;;; through the function cell and pick up the libssl swap for free.
-;;; ===========================================================================
-
-;;; ---------------------------------------------------------------------------
-;;; FFI bindings (digest)
-;;; ---------------------------------------------------------------------------
+            (ssl-blocking-read-eof-or-raise ssl n errno))))))
 
 (sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
 
@@ -1261,8 +953,6 @@
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
-  (setf *https-fetch-fn* #'https-fetch)
-  (setf *https-stream-fn* #'https-fetch-stream)
   ;; Swap the pure-Lisp crypto primitives for libssl-backed versions.
   ;; SHA1-LISP / SHA256-LISP / ECDSA-VERIFY-P256-LISP remain reachable
   ;; internally; TEST-PURE-LISP-CRYPTO uses them to re-verify the
@@ -1272,5 +962,16 @@
   (setf (symbol-function 'sha1)              #'sha1-libssl
         (symbol-function 'sha256)            #'sha256-libssl
         (symbol-function 'ecdsa-verify-p256) #'ecdsa-verify-p256-libssl)
-  (log-info "tls: HTTPS fetch enabled")
-  (log-info "tls: crypto swapped to libssl (sha1, sha256, ecdsa-p256)"))
+  (log-info "tls: crypto swapped to libssl (sha1, sha256, ecdsa-p256)")
+  ;; Registration goes last, after every swap above has returned, so that
+  ;; a hook being set means the whole file succeeded and not merely that
+  ;; execution reached this form. TLS-LOADED-P reads *HTTPS-STREAM-FN* as
+  ;; exactly that signal, and it was reading it before the swaps ran —
+  ;; a raise from one of them (an OpenSSL without EVP_MD_CTX_new, say)
+  ;; would have left TLS reporting itself loaded with sha1, sha256 and
+  ;; ecdsa-verify-p256 still pure-Lisp. TEST-PURE-LISP-CRYPTO exists to
+  ;; re-verify those on a libssl machine, so a half-swap could have read
+  ;; as a pass.
+  (setf *tls-outbound-setup-fn* #'tls-setup-outbound)
+  (setf *https-stream-fn* #'https-fetch-stream)
+  (log-info "tls: HTTPS fetch enabled"))
