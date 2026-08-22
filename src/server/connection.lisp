@@ -684,13 +684,29 @@
        ;; terminator is when the search does not find one. SCAN-CRLF is
        ;; not used for the same reason — its bound stops at (1- END), so
        ;; it answers NIL for a Transfer-Encoding that happens to come last.
-       ;;
-       ;; A bare CR smuggled into the value ends the scan early, which can
-       ;; only narrow what is classified and so can only refuse more;
-       ;; PARSE-HEADERS-BYTES rejects that byte outright at dispatch.
        (let ((line-end (or (position 13 buf :start value-start :end end)
                            end)))
          (cond
+           ;; A bare CR makes this reader see a different value than
+           ;; PARSE-HEADERS-BYTES will see, and this is the reader that
+           ;; decides how the body is framed. Measured against each shape's
+           ;; CR-free twin, on the code that had no arm here:
+           ;;
+           ;;   chunked<CR>,gzip   :CHUNKED     vs :INVALID       refuses less
+           ;;   chu<CR>nked        :UNSUPPORTED vs :CHUNKED       refuses more
+           ;;   gzip<CR>           :UNSUPPORTED vs :UNSUPPORTED   neither
+           ;;
+           ;; It moves in both directions and sometimes not at all, so the
+           ;; direction is incidental: the disagreement is the fault. That
+           ;; is the same argument the fold arm rests on, which is why the
+           ;; two sit together.
+           ;;
+           ;; LINE-END < END is exactly "this CR is not the fallback", so
+           ;; LINE-END+1 is in bounds whenever the test runs, and a real
+           ;; line terminator has its LF there.
+           ((and (< line-end end)
+                 (/= (aref buf (1+ line-end)) 10))
+            :invalid)
            ;; The value continues on a folded line this scan would not see.
            ((and (< (+ line-end 2) end)
                  (let ((b (aref buf (+ line-end 2))))
@@ -903,11 +919,31 @@
                  ;; whose framing is legal and simply unimplemented here.
                  (let ((coding (scan-transfer-encoding buf header-end hdr-start)))
                    (when coding
-                     ;; RFC 7230 §3.3.1 scopes chunked to HTTP/1.1. The
-                     ;; test is for 1.1 rather than against 1.0 so that a
-                     ;; version token this parser has not validated yet
+                     ;; Transfer-Encoding is an HTTP/1.1 field, so this
+                     ;; gates every coding and not only chunked: a 1.0
+                     ;; request naming `gzip` answers 400 here rather than
+                     ;; the 501 below, because the version is the reason it
+                     ;; is refused and the coding never gets to matter.
+                     ;;
+                     ;; The test is for 1.1 rather than against 1.0 so that
+                     ;; a version token this parser has not validated yet
                      ;; refuses too, instead of falling through on a byte
-                     ;; that merely is not 48.
+                     ;; that merely is not 48. HTTP/1.9 with a
+                     ;; Transfer-Encoding is the shape that separates the
+                     ;; two.
+                     ;;
+                     ;; And 400 rather than 505 for that shape, though
+                     ;; PARSE-REQUEST-BYTES answers 505 for the same request
+                     ;; without the header. The asymmetry is deliberate.
+                     ;; This gate answers "is this 1.1", which is the only
+                     ;; question a framing decision needs, and it declines
+                     ;; to answer "is this version supported" — that set
+                     ;; belongs to PARSE-REQUEST-BYTES, and a second copy of
+                     ;; it here is the two-readers disagreement these rules
+                     ;; exist to prevent, one release away from mattering.
+                     ;; The framing has to be settled at CRLFCRLF because it
+                     ;; decides how many body bytes to wait for; the version
+                     ;; fault is answered at dispatch, where it is owned.
                      (unless (= minor-version-byte 49)
                        (http-reject 400 "Transfer-Encoding requires HTTP/1.1"))
                      (ecase coding
@@ -922,7 +958,24 @@
                         ;; not at all, is the whole smuggling genre, and
                         ;; a server that never resolves the pair cannot
                         ;; be the half that resolves it wrongly.
-                        (when (scan-content-length buf header-end hdr-start)
+                        ;;
+                        ;; Only *presence* is the violation here; the value
+                        ;; is never consulted, so a Content-Length this
+                        ;; server refuses to parse is still a Content-Length
+                        ;; that is present. Letting SCAN-CONTENT-LENGTH's
+                        ;; own rejections through would answer 413 or 400
+                        ;; for the value on a request whose actual fault is
+                        ;; the pair — naming the wrong condition, and
+                        ;; making the rule above true only for
+                        ;; Content-Lengths that happen to parse. Catching
+                        ;; keeps one reader of the header rather than
+                        ;; adding a second that could disagree with it
+                        ;; about presence.
+                        (when (handler-case
+                                  (and (scan-content-length
+                                        buf header-end hdr-start)
+                                       t)
+                                (http-parse-error () t))
                           (http-reject 400
                                        "Transfer-Encoding with Content-Length"))
                         ;; Classified, not decoded.

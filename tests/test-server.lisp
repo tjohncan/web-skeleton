@@ -6814,6 +6814,15 @@
            (bytes (version headers)
              (sb-ext:string-to-octets (raw version headers)
                                       :external-format :ascii))
+           (te (value)
+             ;; A Transfer-Encoding header line carrying VALUE verbatim,
+             ;; so a case can put a bare CR inside it.
+             (concatenate 'string "Transfer-Encoding: " value))
+           (cr (before after)
+             ;; BEFORE and AFTER joined by a bare CR — a byte no header
+             ;; value may contain, and one this scan has to notice before
+             ;; PARSE-HEADERS-BYTES gets to at dispatch.
+             (concatenate 'string before (string #\Return) after))
            (coding-of (headers &optional (version "1.1"))
              ;; Called the way CONNECTION-ON-READ calls it: bounded by the
              ;; CRLFCRLF and started past the request line.
@@ -6847,9 +6856,6 @@
     ;; would answer a coding here.
     (check "TE: absent is NIL"
            (coding-of '("Host: x" "X-Transfer-Encoding: chunked")) nil)
-
-    (check "TE: chunked alone is :chunked"
-           (coding-of '("Host: x" "Transfer-Encoding: chunked")) :chunked)
 
     ;; END is the CRLFCRLF position, so the last header line's CR sits *at*
     ;; END and a value scan bounded by END cannot see its terminator. These
@@ -6898,6 +6904,24 @@
     (check "TE: a value naming no coding is invalid"
            (coding-of '("Host: x" "Transfer-Encoding:")) :invalid)
 
+    ;; A bare CR ends the value scan early, and the codings it cuts off are
+    ;; the ones that would have refused the header — so it refuses *less*,
+    ;; not more. `chunked,gzip` is :INVALID for chunked not being final;
+    ;; one CR turns it into the coding this framework decodes.
+    ;;
+    ;; The no-space case is the one that distinguishes this arm. The spaced
+    ;; case is here because it is what a natural probe writes, and the fold
+    ;; arm catches it for an unrelated reason — tested alone, it makes a
+    ;; missing bare-CR arm look present.
+    (check "TE: bare CR before a comma is invalid"
+           (coding-of (list "Host: x" (te (cr "chunked" ",gzip")))) :invalid)
+    (check "TE: bare CR with the natural spacing is invalid"
+           (coding-of (list "Host: x" (te (cr "chunked" ", gzip")))) :invalid)
+    (check "TE: bare CR inside a token is invalid"
+           (coding-of (list "Host: x" (te (cr "chu" "nked")))) :invalid)
+    (check "TE: bare CR at the end of the value is invalid"
+           (coding-of (list "Host: x" (te (cr "gzip" "")))) :invalid)
+
     ;; PARSE-HEADERS-BYTES rejects obsolete line folding too, but at
     ;; dispatch — after this scan has already decided how the body is
     ;; framed. Broken state: the fold is not noticed here, this reader
@@ -6917,8 +6941,52 @@
                       "Content-Length: 5"))
            400)
 
+    ;; Only *presence* is the violation, so the value is never consulted.
+    ;; Broken state: SCAN-CONTENT-LENGTH's own rejections reach the client,
+    ;; and the rule above holds only for Content-Lengths that happen to
+    ;; parse — 400 for the value here, 413 below, both naming a condition
+    ;; that is not why the request is refused.
+    (check "TE + unparseable Content-Length is still the pair, 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: abc"))
+           400)
+    (check "TE + oversized Content-Length is 400, not 413"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: 99999999999"))
+           400)
+
     (check "TE on HTTP/1.0 is 400"
            (on-read '("Host: x" "Transfer-Encoding: chunked") "1.0") 400)
+
+    ;; The gate is stated as "for 1.1", not "against 1.0". The two
+    ;; implementations agree on every 1.0 request and part here: under
+    ;; "against 1.0" this byte is not 48, the gate does not fire, and the
+    ;; coding answers 501. PARSE-REQUEST-BYTES would answer 505 for the
+    ;; version — but at dispatch, and the framing is decided before that.
+    (check "TE on an unvalidated version is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.9") 400)
+
+    ;; The other half of that answer, and the premise the gate's comment
+    ;; rests on: the same request without the header is the parser's 505,
+    ;; raised at dispatch. The gate answers 400 rather than 505 because it
+    ;; declines to hold a second copy of the supported-version set — this
+    ;; asserts that the set really does live somewhere else, so the
+    ;; asymmetry is a division of labour and not an oversight.
+    (check "no TE: an unsupported version is the parser's 505"
+           (let ((b (bytes "1.9" '("Host: x"))))
+             (handler-case (progn (web-skeleton::parse-request-bytes
+                                   b 0 (length b))
+                                  :no-error)
+               (web-skeleton:http-parse-error (e)
+                 (web-skeleton::http-parse-error-status e))))
+           505)
+
+    ;; Transfer-Encoding is a 1.1 field, so the gate covers every coding.
+    ;; Broken state: the gate sits inside the chunked arm, and a 1.0
+    ;; request naming gzip answers 501 — the coding, when the version is
+    ;; the reason it is refused.
+    (check "TE: gzip on HTTP/1.0 is 400, not 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip") "1.0") 400)
 
     (check "TE with chunked non-final is 400"
            (on-read '("Host: x" "Transfer-Encoding: chunked, gzip")) 400)
@@ -6927,6 +6995,9 @@
            (on-read '("Host: x" "Transfer-Encoding: gzip"
                       "Transfer-Encoding: chunked"))
            400)
+
+    (check "TE bare CR is 400"
+           (on-read (list "Host: x" (te (cr "chunked" ",gzip")))) 400)
 
     (check "TE obs-folded is 400"
            (on-read (list "Host: x" "Transfer-Encoding: chunked"
@@ -6950,6 +7021,7 @@
            (on-read '("Host: x")) :dispatch)
     (check "no TE: a Content-Length body still reads"
            (on-read '("Host: x" "Content-Length: 5")) :continue)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
