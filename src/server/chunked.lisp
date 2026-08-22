@@ -242,7 +242,9 @@
     ;; Anything that is not a CR starts a trailer field. No need to wait
     ;; for more bytes to know that much.
     ((/= (aref buf pos) 13) (values :present pos))
-    ;; A CR whose LF has not landed. This is the `...0 CRLF` case.
+    ;; A CR whose LF has not landed — the trailer terminator's own CR,
+    ;; arriving split. Not the `...0 CRLF` case: that one has nothing past
+    ;; the size line at all and is the first branch.
     ((>= (1+ pos) end) (values :incomplete pos))
     ;; CRLF: the empty trailer section, and the request ends past it.
     ((= (aref buf (1+ pos)) 10) (values :empty (+ pos 2)))

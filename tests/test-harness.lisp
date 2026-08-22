@@ -1768,7 +1768,18 @@
                    (check "pipelined body: /a body arrived whole"
                           (not (null (search "path=/a body=HELLO" text))) t)
                    (check "pipelined body: /b dispatched after it"
-                          (not (null (search "path=/b" text))) t)))))
+                          (not (null (search "path=/b" text))) t)
+                   ;; And carried no body of its own. BODY-EXPECTED is
+                   ;; written by the Content-Length arm and by the chunked
+                   ;; arm, and by neither of the paths a bodiless request
+                   ;; takes — so on this exact sequence, POST-with-body
+                   ;; then GET, the keep-alive reset is its only writer.
+                   ;; Left stale, CONNECTION-PARSE-REQUEST attaches five
+                   ;; bytes of whatever follows /b's headers to a request
+                   ;; the client sent no body with. The handler has always
+                   ;; printed this value; only the assertion was missing.
+                   (check "pipelined body: /b carried no body of its own"
+                          (not (null (search "path=/b body=-" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-chunked-keepalive-e2e ()
@@ -1784,7 +1795,7 @@
    Sized so it cannot: the first body is one 200-byte chunk, leaving the
    cursor near 270, while the second request's body begins near 84. With
    the clear neutered the second walk starts well past its own body, finds
-   no framing there, and the connection never answers — measured, 1633 / 2,
+   no framing there, and the connection never answers — measured, 1635 / 2,
    this test's `server closed the connection` and `second request
    dispatched`.
 
@@ -1822,9 +1833,14 @@
                                   "c8" *crlf* big *crlf* "0" *crlf* *crlf*
                                   "POST /b HTTP/1.1" *crlf*
                                   "Host: localhost" *crlf*
-                                  "Transfer-Encoding: chunked" *crlf*
-                                  "Connection: close" *crlf* *crlf*
-                                  "2" *crlf* "de" *crlf* "0" *crlf* *crlf*)))
+                                  "Transfer-Encoding: chunked" *crlf* *crlf*
+                                  "2" *crlf* "de" *crlf* "0" *crlf* *crlf*
+                                  ;; Third, and bodiless on purpose: it is
+                                  ;; the only shape that reads BODY-FRAMING
+                                  ;; without writing it first.
+                                  "GET /c HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Connection: close" *crlf* *crlf*)))
                (write-sequence (sb-ext:string-to-octets
                                 requests :external-format :ascii)
                                stream)
@@ -1841,7 +1857,17 @@
                    (check "chunked keepalive: first body decoded whole"
                           (not (null (search "path=/a len=200" text))) t)
                    (check "chunked keepalive: second request dispatched"
-                          (not (null (search "path=/b len=2" text))) t)))))
+                          (not (null (search "path=/b len=2" text))) t)
+                   ;; BODY-FRAMING is written by the chunked arm and by
+                   ;; nothing else, so a bodiless request following a
+                   ;; chunked one reads whatever the reset left. Left
+                   ;; stale at :CHUNKED, CONNECTION-PARSE-REQUEST decodes
+                   ;; /c over an empty range and a perfectly good GET
+                   ;; earns a 400. Both other requests here are chunked,
+                   ;; which is right for the cursor and is exactly what
+                   ;; leaves the framing field uncovered.
+                   (check "chunked keepalive: a bodiless request after them is served"
+                          (not (null (search "path=/c len=-1" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-chunked-trailer-smuggle-e2e ()

@@ -152,20 +152,38 @@
   ;;     runs to REQUEST-END.
   ;;
   ;; Both resets clear this alongside BODY-EXPECTED, HEADER-END and
-  ;; BODY-FRAMING. That is diagnosability rather than correctness, and no
-  ;; test can distinguish it — neutering either reset changes nothing
-  ;; today, because every path in states the boundary before anything
-  ;; reads it, and :WEBSOCKET never returns to :READ-HTTP. It is not dead
-  ;; and it is not load-bearing: it chooses what happens when a future
-  ;; path forgets. Cleared to 0, a forgotten boundary shifts the next
-  ;; request to offset 0 and fails unmissably; left over from the request
-  ;; before, it fails at a plausible offset, quietly. Do not delete it as
-  ;; dead, and do not trust it as a guarantee.
+  ;; BODY-FRAMING — but those four are not one kind of thing, and one
+  ;; justification stretched over all of them told the next reader not to
+  ;; trust two fields that are guarantees. The reset establishes the
+  ;; frame's default; each completing arm writes only what differs from
+  ;; it. Measured, each dropped from the keep-alive reset in turn:
   ;;
-  ;; CHUNK-SCAN-POS is deliberately *not* in that list, for a reason its
-  ;; own comment gives: the resets would write the same 0 its setter
-  ;; already writes, which changes no failure mode and hides the setter
-  ;; from every test.
+  ;;   BODY-FRAMING    the reset is its only writer of :LENGTH — the
+  ;;     chunked arm is the sole override. Left stale at :CHUNKED, a
+  ;;     bodiless request after a chunked one is decoded over an empty
+  ;;     range and a good GET earns a 400. 1638 / 1, caught by
+  ;;     TEST-HARNESS-CHUNKED-KEEPALIVE-E2E's third request, which is a
+  ;;     plain GET for exactly this reason.
+  ;;
+  ;;   BODY-EXPECTED   likewise for 0; the Content-Length arm is the sole
+  ;;     override. Left stale, a following bodiless request has that many
+  ;;     bytes of the next request attached to it. 1637 / 2, caught by
+  ;;     TEST-HARNESS-PIPELINED-AFTER-BODY-E2E.
+  ;;
+  ;;   HEADER-END and REQUEST-END   every completing arm states these, so
+  ;;     the reset cannot be reached with them stale. Those two writes are
+  ;;     diagnosability: no test distinguishes them, and they are not dead
+  ;;     either — they choose what happens if a future arm forgets.
+  ;;     Cleared to 0, a forgotten boundary shifts the next request to
+  ;;     offset 0 and fails unmissably; left over from the request before,
+  ;;     it fails at a plausible offset, quietly.
+  ;;
+  ;; CHUNK-SCAN-POS is deliberately not in that list, and the reason is
+  ;; the mirror of the rule above: the reset would write the same 0 its
+  ;; setter already writes, which changes no failure mode and hides the
+  ;; setter from every test. The same reason keeps BODY-EXPECTED and
+  ;; REQUEST-END out of the chunked arm, where they would restate this
+  ;; reset's default.
   (request-end   0 :type fixnum)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
@@ -207,7 +225,7 @@
   ;; covered the other.
   ;;
   ;; With one mechanism, TEST-HARNESS-CHUNKED-KEEPALIVE-E2E catches it —
-  ;; 1633 / 2, measured. That test's first body is large on purpose; the
+  ;; 1635 / 2, measured. That test's first body is large on purpose; the
   ;; clamp hides a leftover cursor that is smaller than the next request's
   ;; body-start.
   (chunk-scan-pos  0  :type fixnum)
@@ -1196,17 +1214,22 @@
                    ;; body" and dispatch a POST with its body still on the
                    ;; wire.
                    ((eq coding :chunked)
-                    ;; REQUEST-END stays 0 until the framing walk finds the
-                    ;; terminator. That is the "not known yet" state, and
-                    ;; the reason both resets clear this field rather than
-                    ;; leaving the previous request's value in it: 0 is a
-                    ;; boundary that fails loudly, a leftover is one that
-                    ;; fails quietly.
+                    ;; Only what differs from the frame the reset already
+                    ;; established. BODY-EXPECTED and REQUEST-END are
+                    ;; deliberately not written here: both would write
+                    ;; back the 0 the reset (and the struct default on a
+                    ;; fresh connection) already holds, and a write that
+                    ;; restates a default masks the default from every
+                    ;; test — measured, dropping either was silent.
+                    ;;
+                    ;; REQUEST-END staying 0 is meaningful rather than
+                    ;; incidental: it is the "not known yet" state, and
+                    ;; CONNECTION-BODY-COMPLETE-P is what states the real
+                    ;; boundary when the framing walk reaches the
+                    ;; terminator.
                     (setf (connection-header-end conn) header-end
                           (connection-body-framing conn) :chunked
-                          (connection-body-expected conn) 0
                           (connection-chunk-scan-pos conn) 0
-                          (connection-request-end conn) 0
                           (connection-state conn) :read-body)
                     ;; The whole body can already be buffered — a small
                     ;; upload arrives in one read — so ask before waiting
