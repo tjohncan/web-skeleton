@@ -24,11 +24,14 @@
                                                  "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/package"
                                                        "src/algorithms/hex"))
+               (:file "src/server/chunked" :depends-on ("src/package"
+                                                          "src/algorithms/hex"))
                (:file "src/server/connection" :depends-on ("src/package"
                                                             "src/log"
                                                             "src/epoll"
                                                             "src/address"
-                                                            "src/server/http"))
+                                                            "src/server/http"
+                                                            "src/server/chunked"))
                (:file "src/server/websocket" :depends-on ("src/package"
                                                            "src/log"
                                                            "src/epoll"
@@ -55,6 +58,7 @@
                                                         "src/epoll"
                                                         "src/address"
                                                         "src/server/http"
+                                                        "src/server/chunked"
                                                         "src/server/connection"
                                                         "src/server/websocket"))
                (:file "src/server/dns" :depends-on ("src/package"
