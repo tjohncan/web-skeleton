@@ -7164,6 +7164,44 @@
            (body-of (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)) 400)
 
 
+
+    ;; ---- the size cap, which has no declared length to read ----
+
+    ;; *MAX-BODY-SIZE* is enforced before allocating on the Content-Length
+    ;; path, against a number the client supplied. A chunked request
+    ;; supplies none, so the check has to become incremental, and this is
+    ;; the only place a *body*-size refusal can come from at all.
+    (let ((web-skeleton::*max-body-size* 4))
+      (check "chunked: a body over the cap is 413"
+             (verdict (format nil "5~ahello~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+             413)
+      ;; The boundary, so the comparison is > and not >=.
+      (check "chunked: a body exactly at the cap is served"
+             (verdict (format nil "4~ahell~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+             :dispatch)
+      ;; Spread across chunks: no single chunk crosses the cap, the
+      ;; running total does. Broken state: the check reads one chunk's
+      ;; size instead of accumulating, and three 2-byte chunks pass a
+      ;; 4-byte cap.
+      (check "chunked: the cap is a running total, not a per-chunk test"
+             (verdict (format nil "2~aab~a2~acd~a2~aef~a0~a~a"
+                              *crlf* *crlf* *crlf* *crlf*
+                              *crlf* *crlf* *crlf* *crlf*))
+             413))
+
+    ;; Refused on the *declared* size, the moment the header arrives.
+    ;; Broken state: the walk skips past the promised bytes, finds itself
+    ;; beyond the buffer, answers "keep reading", and the client is
+    ;; eventually told the read buffer filled — when what it actually did
+    ;; was declare a chunk larger than any body this server accepts. The
+    ;; buffer's answer is true and useless; a client cannot act on it.
+    (check "chunked: an oversized chunk header is refused on arrival"
+           (verdict (format nil "ffffffff~a" *crlf*)) 413)
+    ;; Sixteen digits is the walk's own limit, and the product is past
+    ;; MOST-POSITIVE-FIXNUM — the projected total is a local, so it may be
+    ;; a bignum without the accumulator slot ever leaving FIXNUM.
+    (check "chunked: a sixteen-digit chunk size is refused too"
+           (verdict (format nil "ffffffffffffffff~a" *crlf*)) 413)
     ;; ---- the buffer-full arm ----
 
     ;; A chunked body larger than the read cap has to answer 413, and this

@@ -1197,6 +1197,7 @@
                     (setf (connection-read-pos conn) (max extra 0)
                           (connection-request conn) nil
                           (connection-body-expected conn) 0
+                          (connection-body-decoded conn) 0
                           (connection-header-end conn) 0
                           (connection-request-end conn) 0
                           (connection-body-framing conn) :length
@@ -1220,6 +1221,7 @@
                 (setf (connection-read-pos conn) (max extra 0)
                       (connection-request conn) nil
                       (connection-body-expected conn) 0
+                      (connection-body-decoded conn) 0
                       (connection-header-end conn) 0
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length

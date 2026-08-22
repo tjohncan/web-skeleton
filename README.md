@@ -329,12 +329,20 @@ read about here.
   whole body exactly as it does for a `Content-Length` request — the
   wire bytes accumulate, and the body is decoded once when the terminator
   arrives. So `curl -T -` is served, and "chunked requests are supported"
-  does *not* mean a 4 GiB upload: the whole body is buffered before
-  your handler is called. A chunked request declares no length, so the
-  bound is the read buffer's — `*max-body-size*` plus the header
-  budgets — and overrunning it answers 413 naming the buffer rather
-  than the body cap. Streaming a request body into a handler would
-  change the handler contract and is out.
+  does *not* mean a 4 GiB upload: the whole body is buffered before your
+  handler is called, and `*max-body-size*` is enforced incrementally as
+  the decoded total grows — plus on a chunk header that declares more than
+  the cap on its own, which is refused the moment it arrives rather than
+  after its bytes fail to turn up. Streaming a request body into a handler
+  would change the handler contract and is out.
+- **Two different 413s, and they say which.** The body cap above answers
+  `chunked body too large`; the read buffer answers `request too large
+  (buffer full)`. Both are reachable for a chunked request and neither is
+  redundant: the wire carries framing the decoded body does not, and a
+  1-byte chunk costs six wire bytes, so a body made of very small chunks
+  fills the buffer well before its decoded total reaches
+  `*max-body-size*`. Which one fires depends on the chunk sizes, not on
+  the amount of data — so read the reason, not just the code.
 - **Trailers on a request are refused with 400.** A non-empty trailer
   section after the zero-size chunk gets a 400, not a silent discard.
   Nothing in the framework surfaces trailers to an app, so accepting them

@@ -52,7 +52,27 @@
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
    are not consumed), so the two agree on the completion point.
 
-   A third value, AFTER-SIZE-LINE, is returned with COMPLETE-P: the offset
+   Two further values come back with those, and they are what makes an
+   inbound size cap possible without a second parse of the chunk headers:
+
+     DATA-BYTES    chunk data proved whole by *this* call. RESUME means
+                   the walk never revisits a chunk, so a caller polling a
+                   growing buffer accumulates these into the decoded total
+                   without ever counting a chunk twice.
+     PENDING-SIZE  the declared size of a chunk whose data has not all
+                   arrived, or 0. Transient, not cumulative: that chunk is
+                   counted in DATA-BYTES by the later call that proves it
+                   whole. It exists so a caller can refuse a header
+                   claiming more than it will ever accept at the moment
+                   the header arrives — waiting for the bytes instead only
+                   ever reaches whatever answer the read buffer gives.
+
+   Neither is a policy. This file is direction-neutral and the two
+   directions have different caps — *MAX-BODY-SIZE* inbound,
+   *MAX-OUTBOUND-RESPONSE-SIZE* outbound — so the walk reports sizes and
+   the caller decides what is too big.
+
+   A third value, AFTER-SIZE-LINE
    just past the zero-size chunk header's own CRLF, which is where the
    trailer section begins. It exists so an inbound caller does not have to
    re-walk that line to find it — two walks of one header line is the
@@ -70,7 +90,8 @@
    framing this walk has just proved whole — the same visit, handing the
    bytes back instead of only stepping over them. Never called twice for
    a chunk, because RESUME means the walk never revisits one."
-  (let ((pos (max start resume)))
+  (let ((pos (max start resume))
+        (data-bytes 0))
     (loop
       ;; BOUNDARY is the start of the chunk header about to be parsed:
       ;; everything before it is validated framing, so it is the offset
@@ -86,22 +107,23 @@
             (unless digit (return))
             (incf digits)
             (when (> digits 16)
-              (return-from chunked-body-complete-p (values nil boundary)))
+              (return-from chunked-body-complete-p
+                (values nil boundary 0 data-bytes 0)))
             (setf size (+ (ash size 4) digit)
                   found t)
             (incf pos)))
         (unless found
-          (return (values nil boundary)))
+          (return (values nil boundary 0 data-bytes 0)))
         ;; Skip any chunk-extensions; the size line's LF must have landed.
         (let ((lf (position 10 buf :start pos :end end)))
-          (unless lf (return (values nil boundary)))
+          (unless lf (return (values nil boundary 0 data-bytes 0)))
           (setf pos (1+ lf)))
         ;; Zero-size chunk header = end of body.
         (when (zerop size)
           ;; POS is past that line's LF, which is where the trailer
           ;; section begins — handed back so an inbound caller need not
           ;; re-walk this line to find it.
-          (return (values t boundary pos)))
+          (return (values t boundary pos data-bytes 0)))
         ;; Skip the chunk data and its trailing CRLF. Note this jumps the
         ;; data rather than scanning it, which is what keeps a body whose
         ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
@@ -110,7 +132,16 @@
           (incf pos size)
           (incf pos 2)
           (when (> pos end)
-            (return (values nil boundary)))
+            ;; This chunk's data has not all landed. Its declared SIZE is
+            ;; the pending amount, and handing it back is the difference
+            ;; between an honest refusal and a stall: a header claiming
+            ;; ffffffff bytes is answerable *now*, while waiting for the
+            ;; bytes only ever produces the read buffer's answer.
+            (return (values nil boundary 0 data-bytes size)))
+          ;; Counted only once the framing proves the chunk whole, which
+          ;; is also why RESUME makes the sum safe to accumulate across
+          ;; calls: the walk never revisits a chunk it has counted.
+          (incf data-bytes size)
           ;; The walk has already proved this chunk whole; ON-DATA is how
           ;; the bytes leave without a second pass over them.
           (when on-data

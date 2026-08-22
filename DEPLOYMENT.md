@@ -132,7 +132,7 @@ specific status, not a blanket 400:
 | Code | Sent when |
 |------|-----------|
 | `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing the decoder rejects |
-| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request |
+| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
@@ -370,6 +370,23 @@ value this server would reject for its own reasons still answers as the
 pair. Only a bare final `chunked` is accepted. `gzip, chunked` is 501,
 legal and unimplemented; `chunked, gzip`, a repeated Transfer-Encoding
 header, an obs-folded value, and `Transfer-Encoding` on HTTP/1.0 are 400.
+
+**`*max-body-size*` for a chunked request.** The Content-Length path checks
+the declared length once, before allocating. A chunked request declares
+nothing, so the same limit is applied as the decoded total grows, and also
+to any single chunk header that declares more than the cap on its own —
+the latter matters because waiting for bytes a client will never send only
+ever reaches the read buffer's answer, which describes the buffer and not
+what the client did.
+
+Two 413s are therefore reachable for one chunked request and they name
+different limits: `chunked body too large` is the body cap, `request too
+large (buffer full)` is the read buffer. Neither is redundant. The wire
+carries framing the decoded body does not — a 1-byte chunk costs six wire
+bytes — so a body made of very small chunks fills the buffer well before
+its decoded total reaches `*max-body-size*`, and a body made of large ones
+does the opposite. If you alert on 413s, the reason string is the part
+that tells you which knob to turn.
 
 **`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL` for
 several distinct conditions and they must not be collapsed. `errno = 0` is

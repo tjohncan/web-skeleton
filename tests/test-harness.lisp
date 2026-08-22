@@ -1870,6 +1870,118 @@
                           (not (null (search "path=/c len=-1" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-chunked-body-cap-e2e ()
+  "Two chunked requests on one connection, each under `*max-body-size*`
+   and over it summed, plus one that genuinely exceeds it.
+
+   The detector for BODY-DECODED being cleared by the keep-alive reset.
+   That accumulator is written by CONNECTION-BODY-COMPLETE-P as chunks are
+   proved whole, and by no completing arm — so the reset is its only
+   writer of 0, the same position BODY-FRAMING and BODY-EXPECTED are in.
+   Left stale, the second request inherits the first's total and a
+   perfectly legal upload earns a 413 that names a cap it never reached.
+
+   `*max-body-size*` is set globally rather than bound, because the worker
+   runs in a thread that inherits nothing from this one's dynamic
+   environment — a LET here would be invisible to the code under test.
+   Restored on the way out."
+  (format t "~%Harness: the chunked body cap across a keep-alive~%")
+  (let ((saved web-skeleton:*max-body-size*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-body-size* 256)
+           (with-test-server
+               (:handler (lambda (req)
+                           (make-text-response
+                            200 (format nil "path=~a len=~a"
+                                        (http-request-path req)
+                                        (length (http-request-body req))))))
+             ;; Under the cap twice, over it summed.
+             (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+               (unwind-protect
+                    (progn
+                      (sb-bsd-sockets:socket-connect socket #(127 0 0 1)
+                                                     *test-port*)
+                      (let* ((stream (sb-bsd-sockets:socket-make-stream
+                                      socket :input t :output t
+                                      :element-type '(unsigned-byte 8)))
+                             (a (make-string 200 :initial-element #\a))
+                             (b (make-string 100 :initial-element #\b))
+                             (requests
+                              (concatenate 'string
+                                           "POST /a HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf* *crlf*
+                                           "c8" *crlf* a *crlf* "0" *crlf* *crlf*
+                                           "POST /b HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf*
+                                           "Connection: close" *crlf* *crlf*
+                                           "64" *crlf* b *crlf* "0" *crlf* *crlf*)))
+                        (write-sequence (sb-ext:string-to-octets
+                                         requests :external-format :ascii)
+                                        stream)
+                        (force-output stream)
+                        (ignore-errors
+                         (sb-bsd-sockets:socket-shutdown socket
+                                                         :direction :output))
+                        (let ((buf (make-array 16384
+                                               :element-type '(unsigned-byte 8)
+                                               :fill-pointer 0 :adjustable t)))
+                          (check "body cap: server closed the connection"
+                                 (read-to-eof-bounded stream buf) t)
+                          (let ((text (sb-ext:octets-to-string
+                                       (subseq buf 0 (fill-pointer buf))
+                                       :external-format :utf-8)))
+                            (check "body cap: first request under the cap is served"
+                                   (not (null (search "path=/a len=200" text))) t)
+                            ;; 200 + 100 is over 256. Only a cleared
+                            ;; accumulator lets this one through.
+                            (check "body cap: the second starts from zero, not 200"
+                                   (not (null (search "path=/b len=100" text))) t)
+                            (check "body cap: neither was refused"
+                                   (null (search "HTTP/1.1 413" text)) t)))))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))
+             ;; And one that really is too big, so the 413 is known to
+             ;; reach a client and not merely to be raised.
+             (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+               (unwind-protect
+                    (progn
+                      (sb-bsd-sockets:socket-connect socket #(127 0 0 1)
+                                                     *test-port*)
+                      (let* ((stream (sb-bsd-sockets:socket-make-stream
+                                      socket :input t :output t
+                                      :element-type '(unsigned-byte 8)))
+                             (big (make-string 300 :initial-element #\c))
+                             (request
+                              (concatenate 'string
+                                           "POST /big HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf* *crlf*
+                                           "12c" *crlf* big *crlf* "0" *crlf* *crlf*)))
+                        (write-sequence (sb-ext:string-to-octets
+                                         request :external-format :ascii)
+                                        stream)
+                        (force-output stream)
+                        (ignore-errors
+                         (sb-bsd-sockets:socket-shutdown socket
+                                                         :direction :output))
+                        (let ((buf (make-array 16384
+                                               :element-type '(unsigned-byte 8)
+                                               :fill-pointer 0 :adjustable t)))
+                          (read-to-eof-bounded stream buf)
+                          (let ((text (sb-ext:octets-to-string
+                                       (subseq buf 0 (fill-pointer buf))
+                                       :external-format :utf-8)))
+                            (check "body cap: an oversized body is 413 to the client"
+                                   (not (null (search "HTTP/1.1 413" text))) t)
+                            (check "body cap: and was never dispatched"
+                                   (null (search "path=/big" text)) t)))))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf web-skeleton:*max-body-size* saved))))
+
 (defun test-harness-chunked-trailer-smuggle-e2e ()
   "A trailer section carrying a complete HTTP request, end to end.
 
@@ -2209,6 +2321,7 @@
   (test-harness-pipelined-after-body-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
+  (test-harness-chunked-body-cap-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)

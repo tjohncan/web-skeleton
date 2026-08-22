@@ -105,6 +105,25 @@
   ;; body has not arrived yet would be indistinguishable from one that has
   ;; none. Two states sharing one encoding is how a body gets skipped.
   (body-framing  :length :type keyword)
+  ;; Running total of chunked body data proved whole so far, summed from
+  ;; CHUNKED-BODY-COMPLETE-P's DATA-BYTES. Meaningless under :LENGTH
+  ;; framing, where the declared length is the total and is known up
+  ;; front.
+  ;;
+  ;; A separate field from BODY-EXPECTED rather than an early write into
+  ;; it: BODY-EXPECTED is the *finished* body's length, and something that
+  ;; grows while a request is still arriving is a different fact. Sharing
+  ;; one field would mean the :LENGTH branch of CONNECTION-BODY-COMPLETE-P
+  ;; could not tell a partially-counted chunked body from a declared
+  ;; Content-Length.
+  ;;
+  ;; Part of the request frame, so the reset establishes its 0 and no
+  ;; completing arm writes it — a write there would restate the default
+  ;; and mask it. The reset is its only writer, which makes it a guarantee
+  ;; rather than diagnosability, and
+  ;; TEST-HARNESS-CHUNKED-BODY-CAP-E2E is what holds it: two chunked
+  ;; requests on one connection, each under the cap and over it summed.
+  (body-decoded  0 :type fixnum)
   ;; Content-Length tracking (during :read-body state)
   (body-expected 0 :type fixnum)             ; Content-Length value
   (header-end    0 :type fixnum)             ; byte offset where body starts
@@ -959,11 +978,31 @@
       (:length
        (>= (- end body-start) (connection-body-expected conn)))
       (:chunked
-       (multiple-value-bind (complete resume after-size-line)
+       (multiple-value-bind (complete resume after-size-line
+                             data-bytes pending-size)
            (chunked-body-complete-p (connection-read-buf conn)
                                     body-start end
                                     (connection-chunk-scan-pos conn))
          (setf (connection-chunk-scan-pos conn) resume)
+         (incf (connection-body-decoded conn) data-bytes)
+         ;; *MAX-BODY-SIZE* enforced incrementally, because a chunked
+         ;; request declares nothing for the Content-Length path's
+         ;; before-allocating check to read. PENDING-SIZE is included so a
+         ;; chunk header claiming more than the cap is refused the moment
+         ;; it arrives rather than after its bytes fail to turn up.
+         ;;
+         ;; The read buffer's own 413 is still reachable and is not
+         ;; redundant with this one: the wire carries framing the decoded
+         ;; total does not, and a 1-byte chunk costs six wire bytes, so a
+         ;; body made of tiny chunks fills the buffer long before its
+         ;; decoded total crosses the cap. Whichever fires names itself —
+         ;; this one names the body, CONNECTION-ON-READ's :FULL arm names
+         ;; the buffer — because a client told the wrong reason cannot act
+         ;; on it.
+         (let ((projected (+ (connection-body-decoded conn) pending-size)))
+           (when (> projected *max-body-size*)
+             (http-reject 413 "chunked body too large (~d bytes, max ~d)"
+                          projected *max-body-size*)))
          (when complete
            (multiple-value-bind (status offset)
                (chunked-trailer-status (connection-read-buf conn)
