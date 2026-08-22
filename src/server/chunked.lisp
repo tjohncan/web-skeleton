@@ -52,6 +52,20 @@
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
    are not consumed), so the two agree on the completion point.
 
+   A third value, AFTER-SIZE-LINE, is returned with COMPLETE-P: the offset
+   just past the zero-size chunk header's own CRLF, which is where the
+   trailer section begins. It exists so an inbound caller does not have to
+   re-walk that line to find it — two walks of one header line is the
+   second reader this file exists to avoid, even when both would agree.
+   Meaningless when COMPLETE-P is NIL, and existing callers that take two
+   values are unaffected.
+
+   RESUME is clamped up to START, never down. That guards a cursor that is
+   too low; a cursor that is too *high* — one left over from a previous
+   request on a reused connection — passes straight through and starts the
+   walk past framing it never validated. Nothing here can detect that, so
+   a caller that reuses a connection has to clear its cursor.
+
    ON-DATA, when supplied, is called (BUF START END) once per chunk whose
    framing this walk has just proved whole — the same visit, handing the
    bytes back instead of only stepping over them. Never called twice for
@@ -84,7 +98,10 @@
           (setf pos (1+ lf)))
         ;; Zero-size chunk header = end of body.
         (when (zerop size)
-          (return (values t boundary)))
+          ;; POS is past that line's LF, which is where the trailer
+          ;; section begins — handed back so an inbound caller need not
+          ;; re-walk this line to find it.
+          (return (values t boundary pos)))
         ;; Skip the chunk data and its trailing CRLF. Note this jumps the
         ;; data rather than scanning it, which is what keeps a body whose
         ;; *contents* happen to contain "0\\r\\n\\r\\n" from being mistaken
@@ -194,3 +211,40 @@
     (unless terminated
       (error "chunked: incomplete response (no zero-size terminator)"))
     (subseq out 0 (fill-pointer out))))
+
+(defun chunked-trailer-status (buf pos end)
+  "Classify the trailer section beginning at POS in BUF[POS..END).
+   POS is CHUNKED-BODY-COMPLETE-P's third value.
+
+   Returns (values STATUS OFFSET):
+
+     :EMPTY       there was no trailer section; OFFSET is one past its
+                  terminating CRLF, and is where the request ends.
+     :PRESENT     a trailer field begins at OFFSET.
+     :INCOMPLETE  not enough bytes have arrived to tell; OFFSET is POS.
+     :MALFORMED   a bare CR sits where the terminator should; OFFSET is POS.
+
+   Framing only. Whether a trailer section is acceptable is the caller's
+   decision — outbound, nothing follows the body and the question does not
+   arise; inbound, on a connection that will be reused, refusing or
+   consuming it changes where the *next* request starts, which is why this
+   answers the fact and not the policy.
+
+   The two-byte wait is the whole point of the function. A body whose last
+   bytes are `0 CRLF` and nothing else is NOT complete inbound: the CRLF
+   that terminates an empty trailer section has not arrived. Answering
+   :EMPTY there would put the request's end two bytes early, and those two
+   bytes would be shifted to offset 0 and read as the start of the next
+   request — a smuggled request, manufactured by us."
+  (cond
+    ;; Nothing past the size line yet.
+    ((>= pos end) (values :incomplete pos))
+    ;; Anything that is not a CR starts a trailer field. No need to wait
+    ;; for more bytes to know that much.
+    ((/= (aref buf pos) 13) (values :present pos))
+    ;; A CR whose LF has not landed. This is the `...0 CRLF` case.
+    ((>= (1+ pos) end) (values :incomplete pos))
+    ;; CRLF: the empty trailer section, and the request ends past it.
+    ((= (aref buf (1+ pos)) 10) (values :empty (+ pos 2)))
+    ;; CR followed by something else.
+    (t (values :malformed pos))))

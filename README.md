@@ -324,12 +324,30 @@ read about here.
   supported — `web-skeleton-tls` gives `https://` fetches — so the
   feature list above can read as if the inbound case were covered too. It
   isn't.
-- **No chunked request bodies.** A request carrying `Transfer-Encoding`
-  is refused with 501. Request bodies are framed by `Content-Length`
-  only, which is what closes the CL-TE smuggling shape, but it also
-  refuses any client streaming a body of unknown length — `curl -T -`,
-  Go's `http.Client` with a non-seekable body. Chunked *responses* from
-  an upstream are read normally; the two directions are unrelated.
+- **Chunked request bodies are accepted, but not streamed to a handler.**
+  `Transfer-Encoding: chunked` is decoded and the handler receives the
+  whole body exactly as it does for a `Content-Length` request — the
+  wire bytes accumulate, and the body is decoded once when the terminator
+  arrives. So `curl -T -` is served, and "chunked requests are supported"
+  does *not* mean a 4 GiB upload: the whole body is buffered before
+  your handler is called. A chunked request declares no length, so the
+  bound is the read buffer's — `*max-body-size*` plus the header
+  budgets — and overrunning it answers 413 naming the buffer rather
+  than the body cap. Streaming a request body into a handler would
+  change the handler contract and is out.
+- **Trailers on a request are refused with 400.** A non-empty trailer
+  section after the zero-size chunk gets a 400, not a silent discard.
+  Nothing in the framework surfaces trailers to an app, so accepting them
+  would drop data the client believed it sent — and refusing means the
+  request boundary for a trailer-bearing request is never computed, which
+  is the strongest available answer to a trailer carrying a smuggled
+  second request. A client that needs trailers delivered has no path here.
+- **`Transfer-Encoding` and `Content-Length` together are refused, never
+  reconciled**, and so is any coding other than a bare final `chunked`.
+  RFC 7230 §3.3.3 says TE overrides CL; every smuggling CVE in the genre
+  is two hops applying that rule differently. `gzip, chunked` is 501 —
+  legal, unimplemented. `chunked, gzip`, a repeated header, an obs-folded
+  value, and `Transfer-Encoding` on an HTTP/1.0 request are 400.
 - **No response compression.** No gzip, no `Content-Encoding`
   negotiation. Compressing static assets is the proxy's job today.
 - **No HTTP/2, no multipart.** A request whose version token is not
