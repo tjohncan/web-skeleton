@@ -98,6 +98,23 @@
   ;; Content-Length tracking (during :read-body state)
   (body-expected 0 :type fixnum)             ; Content-Length value
   (header-end    0 :type fixnum)             ; byte offset where body starts
+  ;; Byte offset one past the whole request on the wire — headers, the
+  ;; CRLFCRLF, and every byte the body's framing occupies. Read by the
+  ;; keep-alive reset and the ws-upgrade completion to find where pipelined
+  ;; data begins.
+  ;;
+  ;; A separate quantity from BODY-EXPECTED, not a convenience. For a
+  ;; Content-Length body the two agree — the wire length is the declared
+  ;; length — and for a chunked one they cannot: the wire carries chunk
+  ;; headers the decoded body does not, and a trailer section sits past
+  ;; both. Computing this end from BODY-EXPECTED is the identity that
+  ;; holds today and stops holding the moment a chunked body is accepted.
+  ;;
+  ;; These three are one fact about one request, so they move together.
+  ;; Every path that sets HEADER-END sets this, and both resets clear all
+  ;; three: a boundary left over from the previous request is a boundary
+  ;; that shifts the next one's bytes to the wrong offset.
+  (request-end   0 :type fixnum)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
   (missed-pongs  0 :type fixnum)
@@ -1057,7 +1074,14 @@
                              (return-from connection-on-read :close))))))
                     (let ((body-available (- (connection-read-pos conn) body-start)))
                       (setf (connection-body-expected conn) content-length
-                            (connection-header-end conn) header-end)
+                            (connection-header-end conn) header-end
+                            ;; The wire end of a Content-Length request is
+                            ;; its declared end. Stated rather than derived,
+                            ;; because the chunked arm cannot state it here
+                            ;; at all — it is not known until the framing
+                            ;; walk reaches the terminator.
+                            (connection-request-end conn)
+                            (+ body-start content-length))
                       (cond
                         ;; Already have the full body — dispatch even if
                         ;; Expect: 100-continue is set. The client chose
@@ -1081,7 +1105,15 @@
                          :continue))))
                    ;; No body — request is complete.
                    (t
-                    (setf (connection-header-end conn) header-end)
+                    ;; BODY-EXPECTED is deliberately not set here: it is
+                    ;; already 0, from the reset that ended the previous
+                    ;; request on this connection. The boundary is not
+                    ;; allowed the same shortcut — it is stated, because a
+                    ;; field whose correctness rides on what some other
+                    ;; path left behind is the staleness this slot exists
+                    ;; to remove.
+                    (setf (connection-header-end conn) header-end
+                          (connection-request-end conn) (+ header-end 4))
                     :dispatch))))))
              ;; No CRLFCRLF yet — keep reading
              :continue)))
@@ -1119,15 +1151,6 @@
           (http-parse-error "duplicate Host header"))))
     (setf (connection-request conn) request)
     request))
-
-;;; ---------------------------------------------------------------------------
-;;; Request boundary
-;;; ---------------------------------------------------------------------------
-
-(defun connection-request-end (conn)
-  "Byte offset past the complete HTTP request (headers + body).
-   Used by keep-alive and ws-upgrade to find pipelined/extra data."
-  (+ (connection-header-end conn) 4 (connection-body-expected conn)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: queue write

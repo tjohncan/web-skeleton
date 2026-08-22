@@ -1687,6 +1687,74 @@
                           (not (null (search "path=/b" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-pipelined-after-body-e2e ()
+  "A request carrying a Content-Length body, with a second request
+   pipelined behind it.
+
+   The keep-alive reset has to shift from past the *body*, and this is the
+   only shape where that differs from shifting past the headers: with no
+   body the two are the same offset, so TEST-HARNESS-PIPELINED-WITH-FIN-E2E
+   — two GETs — cannot tell a boundary that forgets the body from one that
+   does not. A boundary short by the body's length leaves the tail of /a's
+   body at offset 0 and the next parse reads a request line out of it.
+
+   Asserts the body as well as the path, because a boundary wrong in the
+   other direction delivers /b while quietly truncating /a."
+  (format t "~%Harness: a bodied request with one pipelined behind it~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "path=~a body=~a"
+                               (http-request-path req)
+                               (if (http-request-body req)
+                                   (sb-ext:octets-to-string
+                                    (http-request-body req)
+                                    :external-format :utf-8)
+                                   "-")))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (requests
+                     (concatenate 'string
+                                  "POST /a HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Content-Length: 5" *crlf* *crlf*
+                                  "HELLO"
+                                  "GET /b HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Connection: close" *crlf* *crlf*)))
+               (write-sequence (sb-ext:string-to-octets
+                                requests :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (check "pipelined body: server closed the connection"
+                        (read-to-eof-bounded stream buf) t)
+                 (let* ((text (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8))
+                        (first-200 (search "HTTP/1.1 200" text))
+                        (second-200 (and first-200
+                                         (search "HTTP/1.1 200" text
+                                                 :start2 (1+ first-200)))))
+                   (check "pipelined body: first response present"
+                          (not (null first-200)) t)
+                   (check "pipelined body: second response present"
+                          (not (null second-200)) t)
+                   (check "pipelined body: /a body arrived whole"
+                          (not (null (search "path=/a body=HELLO" text))) t)
+                   (check "pipelined body: /b dispatched after it"
+                          (not (null (search "path=/b" text))) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 (defun read-response-status-head (stream)
   "Read through the CRLFCRLF ending a response's header block and return
    the status. NIL if the peer closed, or the deadline passed, before a
@@ -1958,6 +2026,7 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
+  (test-harness-pipelined-after-body-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)

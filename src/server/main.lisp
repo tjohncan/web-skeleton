@@ -1198,6 +1198,7 @@
                           (connection-request conn) nil
                           (connection-body-expected conn) 0
                           (connection-header-end conn) 0
+                          (connection-request-end conn) 0
                           (connection-close-after-p conn) nil
                           (connection-state conn) :read-http
                           (connection-last-active conn) (get-universal-time))
@@ -1219,6 +1220,7 @@
                       (connection-request conn) nil
                       (connection-body-expected conn) 0
                       (connection-header-end conn) 0
+                      (connection-request-end conn) 0
                       (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+))

@@ -6904,10 +6904,12 @@
     (check "TE: a value naming no coding is invalid"
            (coding-of '("Host: x" "Transfer-Encoding:")) :invalid)
 
-    ;; A bare CR ends the value scan early, and the codings it cuts off are
-    ;; the ones that would have refused the header — so it refuses *less*,
-    ;; not more. `chunked,gzip` is :INVALID for chunked not being final;
-    ;; one CR turns it into the coding this framework decodes.
+    ;; A bare CR ends the value scan early, so this reader sees a different
+    ;; value than PARSE-HEADERS-BYTES will. Each of these four moves a
+    ;; different way against its CR-free twin — less refusing, more
+    ;; refusing, and twice not at all — which is why the arm rests on the
+    ;; disagreement and not on a direction. SCAN-TRANSFER-ENCODING carries
+    ;; the measured table.
     ;;
     ;; The no-space case is the one that distinguishes this arm. The spaced
     ;; case is here because it is what a natural probe writes, and the fold
@@ -6970,8 +6972,14 @@
     ;; rests on: the same request without the header is the parser's 505,
     ;; raised at dispatch. The gate answers 400 rather than 505 because it
     ;; declines to hold a second copy of the supported-version set — this
-    ;; asserts that the set really does live somewhere else, so the
-    ;; asymmetry is a division of labour and not an oversight.
+    ;; says the set really does live somewhere else, so the asymmetry is a
+    ;; division of labour and not an oversight.
+    ;;
+    ;; A pinned premise, not a detector, and the only one of these that no
+    ;; revert can reach — `typo'd version is 505` above exercises the same
+    ;; branch of the same function for the same reason. It earns its place
+    ;; by sitting beside the 400 it explains, and nowhere else. Anything
+    ;; that breaks it fails there first.
     (check "no TE: an unsupported version is the parser's 505"
            (let ((b (bytes "1.9" '("Host: x"))))
              (handler-case (progn (web-skeleton::parse-request-bytes
