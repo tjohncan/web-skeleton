@@ -110,10 +110,36 @@
   ;; both. Computing this end from BODY-EXPECTED is the identity that
   ;; holds today and stops holding the moment a chunked body is accepted.
   ;;
-  ;; These three are one fact about one request, so they move together.
-  ;; Every path that sets HEADER-END sets this, and both resets clear all
-  ;; three: a boundary left over from the previous request is a boundary
-  ;; that shifts the next one's bytes to the wrong offset.
+  ;; These three are one fact about one request, so they move together —
+  ;; but the two halves of that are on different axes, and conflating them
+  ;; gets one of them deleted.
+  ;;
+  ;; Every path that sets HEADER-END sets this. That is correctness, and it
+  ;; takes one test per setter: neither covers both, because each only
+  ;; exercises the keep-alive reset for the request shape it pipelines
+  ;; behind. Measured, each setter self-assigned in turn:
+  ;;
+  ;;   the no-body setter   TEST-HARNESS-PIPELINED-WITH-FIN-E2E fails on
+  ;;     `server closed the connection`, and the run dies there.
+  ;;     TEST-HARNESS-PIPELINED-AFTER-BODY-E2E prints nothing at all — it
+  ;;     is registered one line later — and could not catch this even if
+  ;;     it ran, because its second request carries Connection: close, so
+  ;;     no bodiless request in it is ever followed by a keep-alive reset.
+  ;;
+  ;;   the Content-Length setter   TEST-HARNESS-PIPELINED-AFTER-BODY-E2E
+  ;;     fails while all five of PIPELINED-WITH-FIN pass. With the
+  ;;     boundary merely wrong rather than absent, +3 or -3, it is a
+  ;;     countable 1612 / 2 rather than a dead run.
+  ;;
+  ;; Both resets clear all three. That is diagnosability, and no test can
+  ;; distinguish it — neutering either reset changes nothing today, because
+  ;; every path in sets the boundary before anything reads it, and
+  ;; :WEBSOCKET never returns to :READ-HTTP. It is not dead and it is not
+  ;; load-bearing: it chooses what happens when a future path forgets. A
+  ;; boundary cleared to 0 shifts the next request to offset 0 and fails
+  ;; unmissably; one left over from the request before fails at a plausible
+  ;; offset, quietly. Do not delete it as dead, and do not trust it as a
+  ;; guarantee.
   (request-end   0 :type fixnum)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only

@@ -1695,11 +1695,27 @@
    only shape where that differs from shifting past the headers: with no
    body the two are the same offset, so TEST-HARNESS-PIPELINED-WITH-FIN-E2E
    — two GETs — cannot tell a boundary that forgets the body from one that
-   does not. A boundary short by the body's length leaves the tail of /a's
-   body at offset 0 and the next parse reads a request line out of it.
+   does not.
 
-   Asserts the body as well as the path, because a boundary wrong in the
-   other direction delivers /b while quietly truncating /a."
+   What each assertion catches, measured against three sabotaged
+   boundaries rather than reasoned about:
+
+     never set, so 0    the whole request stays buffered and is re-parsed
+                        forever. The server never closes, and `server
+                        closed the connection` fails on its bounded read
+                        — after which the run dies, so this one is loud
+                        without being countable.
+     long by 3          the next parse begins inside /b's request line.
+     short by 3         same, from the other side.
+                        Both: `second response present` and `/b
+                        dispatched after it` fail. 1612 / 2, twice.
+
+   `/a body arrived whole` is a control, not a discriminator, and passed
+   under all three. REQUEST-END governs only what the *next* parse sees:
+   /a's body is sliced by BODY-EXPECTED in CONNECTION-PARSE-REQUEST and
+   answered before the keep-alive reset runs, so no boundary error can
+   truncate it. It stays because it costs nothing and says the bodied path
+   still works — but the discriminators here are the two that name /b."
   (format t "~%Harness: a bodied request with one pipelined behind it~%")
   (with-test-server
       (:handler (lambda (req)
