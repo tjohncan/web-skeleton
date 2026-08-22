@@ -544,41 +544,159 @@
     result))
 
 ;;; ---------------------------------------------------------------------------
-;;; Reject Transfer-Encoding (inbound chunked not implemented)
+;;; Transfer-Encoding: which coding, not merely whether one is present
+;;;
+;;; Three rules decide an inbound Transfer-Encoding. They are written as
+;;; rules rather than left to fall out of the parse, because each refuses
+;;; for a different reason and answers with a different code:
+;;;
+;;;   Transfer-Encoding and Content-Length together are refused, never
+;;;     reconciled. RFC 7230 §3.3.3 says TE overrides CL. Every
+;;;     request-smuggling CVE in the genre is two hops applying that rule
+;;;     differently, or one of them not applying it at all. Applying it
+;;;     here is what would make this server the hop that disagrees.
+;;;   Only `chunked`, and only as the final coding. `gzip, chunked` is
+;;;     legal and unimplemented; `chunked, gzip` is illegal.
+;;;   Transfer-Encoding requires HTTP/1.1. Chunked is a 1.1 framing.
+;;;
+;;; The classification lives here and the status codes live at the call
+;;; site, which is the split SCAN-CONTENT-LENGTH and
+;;; SCAN-EXPECT-DISPOSITION already use.
 ;;; ---------------------------------------------------------------------------
 
+(defun ascii-token-equal-p (buf start end token)
+  "T when BUF[START..END) equals TOKEN, ASCII case folded.
+   TOKEN is written lowercase; an uppercase byte matches the lowercase
+   letter 32 above it."
+  (and (= (- end start) (length token))
+       (loop for j below (length token)
+             for b = (aref buf (+ start j))
+             for n = (char-code (char token j))
+             always (or (= b n)
+                        (and (<= 97 n 122) (= b (- n 32)))))))
+
+(defun classify-transfer-coding (buf start end)
+  "Classify the Transfer-Encoding field-value in BUF[START..END).
+   Returns :CHUNKED, :UNSUPPORTED or :INVALID — SCAN-TRANSFER-ENCODING
+   documents what each one means.
+
+   The value is a comma-separated list (RFC 7230 §7 #rule), which permits
+   empty elements, so `chunked,,` names one coding and not three. Skipping
+   them is the grammar, not leniency: refusing them would refuse a legal
+   message, and counting them would move `chunked` out of final position
+   and refuse it for the wrong reason."
+  (let ((codings nil)
+        (pos start))
+    (loop
+      (let* ((comma (position 44 buf :start pos :end end))
+             (bound (or comma end)))
+        (multiple-value-bind (vs ve) (trim-ows-bounds buf pos bound)
+          (when (> ve vs)
+            (push (cons vs ve) codings)))
+        (unless comma (return))
+        (setf pos (1+ comma))))
+    (setf codings (nreverse codings))
+    (let* ((n (length codings))
+           (chunked (loop for c in codings
+                          for idx from 0
+                          when (ascii-token-equal-p buf (car c) (cdr c) "chunked")
+                          collect idx)))
+      (cond
+        ;; A Transfer-Encoding header naming no coding at all.
+        ((zerop n) :invalid)
+        ;; No chunked anywhere — `gzip`, `deflate`, `identity`. Legal
+        ;; codings, none of them implemented here.
+        ((null chunked) :unsupported)
+        ;; RFC 7230 §3.3.1: chunked is applied once, and applied last.
+        ;; Both violations are the same shape — a body whose framing
+        ;; depends on which coding a reader believes is outermost.
+        ((rest chunked) :invalid)
+        ((/= (first chunked) (1- n)) :invalid)
+        ;; Exactly `chunked`, alone: the one framing this can decode.
+        ((= n 1) :chunked)
+        ;; `gzip, chunked` — well formed, and chunked is final, but the
+        ;; inner coding is not implemented, so the framing could be
+        ;; walked and the body still could not be delivered.
+        (t :unsupported)))))
+
 (defun scan-transfer-encoding (buf end &optional (start 0))
-  "Return T if BUF[START..END) contains a Transfer-Encoding header.
+  "Classify the Transfer-Encoding of the message headed in BUF[START..END).
 
-   Used on two paths with different consequences:
-     Inbound: any Transfer-Encoding is rejected as an unimplemented
-       framing mode. We do not decode chunked request bodies —
-       accepting one would expose the CL-TE smuggling gap that
-       motivates the rejection.
-     Outbound response: a present Transfer-Encoding means 'ignore
-       any Content-Length' per RFC 7230 §3.3.3 (TE wins over CL).
-       HANDLE-OUTBOUND-READ and COMPLETE-FETCH use this to select
-       between the chunked decoder and the CL-bounded body slice.
+     NIL           no Transfer-Encoding header.
+     :CHUNKED      one header, whose value is the single token `chunked`.
+     :UNSUPPORTED  a coding this framework does not implement — `gzip`, or
+                   `gzip, chunked`. RFC 7230 §3.3.1 names 501 for exactly
+                   this: a transfer coding the server does not understand.
+     :INVALID      a framing no reader should try to reconcile: more than
+                   one Transfer-Encoding header, chunked repeated or in a
+                   non-final position, a value naming no coding, or a value
+                   continued by obsolete line folding. 400.
 
-   The function just answers 'is TE present?' — the policy
-   decision about what to do with the answer lives at the call
-   site. The older docstring only described the inbound path and
-   misled a reader grepping scan-transfer-encoding to wonder why
-   outbound chunked decoding worked at all."
+   NIL is the only absent answer and every classification is true, so the
+   outbound callers that test this for presence read it unchanged. There a
+   present Transfer-Encoding means 'ignore any Content-Length' per RFC 7230
+   §3.3.3, selecting the chunked decoder over the CL-bounded slice in
+   HANDLE-OUTBOUND-READ and COMPLETE-FETCH.
+
+   Repeated headers are :INVALID rather than combined. §3.3.1 defines the
+   combination — the field-values join into one comma list — but computing
+   it is the reconciliation step the first rule above exists to refuse.
+
+   Obsolete line folding is :INVALID here even though PARSE-HEADERS-BYTES
+   already rejects it, because that rejection fires at dispatch and this
+   scan runs at CRLFCRLF, and this is the reader that decides how the body
+   is framed. A folded
+
+     Transfer-Encoding: chunked
+      , gzip
+
+   reads as `chunked` to a scan that stops at the first CRLF and as
+   `chunked , gzip` to the parser. Refusing the fold is what keeps two
+   readers of one header from disagreeing about a body's framing."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "transfer-encoding:"
-                                         :external-format :ascii))))
+                                         :external-format :ascii)))
+        (value-start nil)
+        (count 0))
     (loop for i from start below end
-          thereis (and (and (>= i 2)
-                            (= (aref buf (- i 2)) 13)
-                            (= (aref buf (- i 1)) 10))
-                       (<= (+ i (length name)) end)
-                       (loop for j below (length name)
-                             for b = (aref buf (+ i j))
-                             for n = (aref name j)
-                             always (or (= b n)
-                                        (and (<= 97 n 122)
-                                             (= b (- n 32)))))))))
+          do (when (and (>= i 2)
+                        (= (aref buf (- i 2)) 13)
+                        (= (aref buf (- i 1)) 10)
+                        (<= (+ i (length name)) end)
+                        (loop for j below (length name)
+                              for b = (aref buf (+ i j))
+                              for n = (aref name j)
+                              always (or (= b n)
+                                         (and (<= 97 n 122)
+                                              (= b (- n 32))))))
+               (incf count)
+               (unless value-start
+                 (setf value-start (+ i (length name))))))
+    (cond
+      ((zerop count) nil)
+      ((> count 1) :invalid)
+      (t
+       ;; The value runs to its line terminator. END is the CRLFCRLF
+       ;; position, so when Transfer-Encoding is the *last* header its own
+       ;; CR sits exactly at END — outside the [VALUE-START, END) every
+       ;; other scanner here searches. That is why the fallback is END
+       ;; rather than a defensive guess: END is precisely where the
+       ;; terminator is when the search does not find one. SCAN-CRLF is
+       ;; not used for the same reason — its bound stops at (1- END), so
+       ;; it answers NIL for a Transfer-Encoding that happens to come last.
+       ;;
+       ;; A bare CR smuggled into the value ends the scan early, which can
+       ;; only narrow what is classified and so can only refuse more;
+       ;; PARSE-HEADERS-BYTES rejects that byte outright at dispatch.
+       (let ((line-end (or (position 13 buf :start value-start :end end)
+                           end)))
+         (cond
+           ;; The value continues on a folded line this scan would not see.
+           ((and (< (+ line-end 2) end)
+                 (let ((b (aref buf (+ line-end 2))))
+                   (or (= b 32) (= b 9))))
+            :invalid)
+           (t (classify-transfer-coding buf value-start line-end))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Expect: disposition scanning (RFC 7231 §5.1.1)
@@ -773,15 +891,42 @@
                  ;; interim 100 Continue response to HTTP/1.1.
                  (let ((minor-version-byte (aref buf (+ sp 8)))
                        (hdr-start (+ req-line-end 2)))
-                 ;; Found CRLFCRLF — reject Transfer-Encoding (not implemented)
-                 ;; RFC 7230 §3.3.1 names the code for this exactly: a
-                 ;; server that receives a transfer coding it does not
-                 ;; understand SHOULD answer 501. Not 411 — that is for
-                 ;; refusing a request until it carries a Content-Length,
-                 ;; and it would misdescribe a client whose framing is
-                 ;; legal and simply unimplemented here.
-                 (when (scan-transfer-encoding buf header-end hdr-start)
-                   (http-reject 501 "Transfer-Encoding not supported"))
+                 ;; Found CRLFCRLF — decide the Transfer-Encoding before
+                 ;; anything else reads the body, because this is the
+                 ;; header that says how the body is framed at all. Each
+                 ;; refusal carries the code that describes it: 501 is
+                 ;; RFC 7230 §3.3.1's answer for a transfer coding the
+                 ;; server does not understand, and 400 is for a framing
+                 ;; that two readers could resolve differently. Not 411 —
+                 ;; that is for refusing a request until it carries a
+                 ;; Content-Length, and it would misdescribe a client
+                 ;; whose framing is legal and simply unimplemented here.
+                 (let ((coding (scan-transfer-encoding buf header-end hdr-start)))
+                   (when coding
+                     ;; RFC 7230 §3.3.1 scopes chunked to HTTP/1.1. The
+                     ;; test is for 1.1 rather than against 1.0 so that a
+                     ;; version token this parser has not validated yet
+                     ;; refuses too, instead of falling through on a byte
+                     ;; that merely is not 48.
+                     (unless (= minor-version-byte 49)
+                       (http-reject 400 "Transfer-Encoding requires HTTP/1.1"))
+                     (ecase coding
+                       (:invalid
+                        (http-reject 400 "malformed Transfer-Encoding"))
+                       (:unsupported
+                        (http-reject 501 "Transfer-Encoding not supported"))
+                       (:chunked
+                        ;; RFC 7230 §3.3.3: Transfer-Encoding overrides
+                        ;; Content-Length. Refuse rather than apply that
+                        ;; rule — a front end applying it differently, or
+                        ;; not at all, is the whole smuggling genre, and
+                        ;; a server that never resolves the pair cannot
+                        ;; be the half that resolves it wrongly.
+                        (when (scan-content-length buf header-end hdr-start)
+                          (http-reject 400
+                                       "Transfer-Encoding with Content-Length"))
+                        ;; Classified, not decoded.
+                        (http-reject 501 "Transfer-Encoding not supported")))))
                  ;; Classify Expect once — disposition gates dispatch
                  ;; before the body-presence split so a no-body GET with
                  ;; Expect: x-foo 417s the same as a bodied POST does.

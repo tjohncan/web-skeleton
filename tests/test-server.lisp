@@ -6801,6 +6801,156 @@
              t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Transfer-Encoding: the rules, and the codes they answer with
+;;; ---------------------------------------------------------------------------
+
+(defun test-transfer-encoding-rules ()
+  (format t "~%Transfer-Encoding rules~%")
+  (labels ((raw (version headers)
+             (with-output-to-string (s)
+               (format s "POST / HTTP/~a~a" version *crlf*)
+               (dolist (h headers) (format s "~a~a" h *crlf*))
+               (format s "~a" *crlf*)))
+           (bytes (version headers)
+             (sb-ext:string-to-octets (raw version headers)
+                                      :external-format :ascii))
+           (coding-of (headers &optional (version "1.1"))
+             ;; Called the way CONNECTION-ON-READ calls it: bounded by the
+             ;; CRLFCRLF and started past the request line.
+             (let* ((b (bytes version headers))
+                    (header-end (web-skeleton::scan-crlf-crlf b 0 (length b)))
+                    (hdr-start (+ (web-skeleton::scan-crlf b 0 header-end) 2)))
+               (attempt (web-skeleton::scan-transfer-encoding
+                         b header-end hdr-start))))
+           (on-read (headers &optional (version "1.1"))
+             ;; The status the rules answer with, taken where the client
+             ;; would get it: the condition CONNECTION-ON-READ raises, which
+             ;; is what HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE. A
+             ;; read-fn answering :AGAIN keeps the whole request in the
+             ;; buffer and off any socket.
+             (let ((b (bytes version headers))
+                   (conn (web-skeleton::make-connection
+                          :fd -1
+                          :read-fn (lambda (buffer start max-bytes)
+                                     (declare (ignore buffer start max-bytes))
+                                     :again))))
+               (setf (web-skeleton::connection-read-buf conn) b
+                     (web-skeleton::connection-read-pos conn) (length b))
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))))))
+
+    ;; ---- classification ----
+
+    ;; The zero-count arm. A scanner that matched a header name as a
+    ;; substring — "x-transfer-encoding", or the word inside a value —
+    ;; would answer a coding here.
+    (check "TE: absent is NIL"
+           (coding-of '("Host: x" "X-Transfer-Encoding: chunked")) nil)
+
+    (check "TE: chunked alone is :chunked"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked")) :chunked)
+
+    ;; END is the CRLFCRLF position, so the last header line's CR sits *at*
+    ;; END and a value scan bounded by END cannot see its terminator. These
+    ;; two differ only in whether Transfer-Encoding is the final header; a
+    ;; scan that got the bound wrong passes the second and fails the first.
+    (check "TE: last header still reads its value"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked")) :chunked)
+    (check "TE: non-final header reads the same"
+           (coding-of '("Transfer-Encoding: chunked" "Host: x")) :chunked)
+
+    (check "TE: field name and value both case fold"
+           (coding-of '("Host: x" "TRANSFER-ENCODING: CHUNKED")) :chunked)
+
+    (check "TE: surrounding OWS trimmed"
+           (coding-of '("Host: x" "Transfer-Encoding:   chunked  ")) :chunked)
+
+    ;; RFC 7230 §7's list rule permits empty elements. Counting them would
+    ;; push chunked out of final position and refuse a legal message for a
+    ;; reason that is not true of it.
+    (check "TE: empty list elements are legal"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked,,")) :chunked)
+
+    (check "TE: gzip alone is unsupported"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip")) :unsupported)
+
+    ;; Legal, and chunked *is* final — the refusal is about the inner
+    ;; coding, not the framing, which is why it is not :INVALID.
+    (check "TE: gzip, chunked is unsupported"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip, chunked"))
+           :unsupported)
+
+    ;; RFC 7230 §3.3.1: chunked is applied once, and applied last.
+    (check "TE: chunked in a non-final position is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked, gzip")) :invalid)
+    (check "TE: chunked repeated in one value is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked, chunked"))
+           :invalid)
+
+    ;; The combination rule for repeated headers is defined, and computing
+    ;; it is the reconciliation step the first rule refuses.
+    (check "TE: two Transfer-Encoding headers are invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip"
+                        "Transfer-Encoding: chunked"))
+           :invalid)
+
+    (check "TE: a value naming no coding is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding:")) :invalid)
+
+    ;; PARSE-HEADERS-BYTES rejects obsolete line folding too, but at
+    ;; dispatch — after this scan has already decided how the body is
+    ;; framed. Broken state: the fold is not noticed here, this reader
+    ;; answers :CHUNKED for a value the parser reads as `chunked , gzip`,
+    ;; and the two disagree about the framing of a body.
+    (check "TE: obs-folded value is invalid"
+           (coding-of (list "Host: x" "Transfer-Encoding: chunked"
+                            (concatenate 'string (string #\Tab) ", gzip")))
+           :invalid)
+
+    ;; ---- the codes ----
+
+    ;; RFC 7230 §3.3.3 says TE overrides CL. Answering 400 is the refusal
+    ;; to apply that rule at all.
+    (check "TE + Content-Length is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: 5"))
+           400)
+
+    (check "TE on HTTP/1.0 is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.0") 400)
+
+    (check "TE with chunked non-final is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked, gzip")) 400)
+
+    (check "TE repeated as two headers is 400"
+           (on-read '("Host: x" "Transfer-Encoding: gzip"
+                      "Transfer-Encoding: chunked"))
+           400)
+
+    (check "TE obs-folded is 400"
+           (on-read (list "Host: x" "Transfer-Encoding: chunked"
+                          (concatenate 'string (string #\Tab) ", gzip")))
+           400)
+
+    ;; §3.3.1's own code for a coding the server does not understand.
+    (check "TE: gzip is 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip")) 501)
+    (check "TE: gzip, chunked is 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip, chunked")) 501)
+
+    ;; Classified, not decoded: the rules land before the body arm does,
+    ;; so no request is ever accepted under a rule set that is still
+    ;; being assembled.
+    (check "TE: chunked alone is 501"
+           (on-read '("Host: x" "Transfer-Encoding: chunked")) 501)
+
+    ;; The zero-behavior-change claim, asserted rather than assumed.
+    (check "no TE: request still dispatches"
+           (on-read '("Host: x")) :dispatch)
+    (check "no TE: a Content-Length body still reads"
+           (on-read '("Host: x" "Content-Length: 5")) :continue)))
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -6811,6 +6961,7 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-transfer-encoding-rules)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)
