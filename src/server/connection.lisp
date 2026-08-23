@@ -980,19 +980,20 @@
       (:chunked
        (multiple-value-bind (complete resume after-size-line
                              data-bytes pending-size)
-           ;; The walk raises on a chunk-size line it can already tell is
-           ;; invalid, which for a *request* is 400 and not the 500 an
-           ;; unhandled error becomes: the client's framing is malformed,
-           ;; not the server. Same conversion CONNECTION-PARSE-REQUEST
-           ;; does for DECODE-CHUNKED-BODY, at the other end of the same
-           ;; split — walk defers, decoder validates, and the two things
-           ;; the walk can decide on sight it decides here.
+           ;; The walk signals CHUNKED-FRAMING-ERROR on a chunk-size line
+           ;; it can already tell is invalid, which for a *request* is 400:
+           ;; the client's framing is malformed, not the server. Caught by
+           ;; condition rather than by ERROR, because ERROR would also
+           ;; catch a defect in the walk and answer 400 for it — telling a
+           ;; client their bytes were at fault when the bug was ours, in
+           ;; the middle of the one file whose job is deciding exactly
+           ;; that. Same conversion CONNECTION-PARSE-REQUEST does for
+           ;; DECODE-CHUNKED-BODY, at the other end of the same split.
            (handler-case
                (chunked-body-complete-p (connection-read-buf conn)
                                         body-start end
                                         (connection-chunk-scan-pos conn))
-             (http-parse-error (e) (error e))
-             (error (e)
+             (chunked-framing-error (e)
                (http-reject 400 "malformed chunked framing: ~a" e)))
          (setf (connection-chunk-scan-pos conn) resume)
          (incf (connection-body-decoded conn) data-bytes)
@@ -1398,14 +1399,15 @@
        ;; answers "do we have it all yet", and a too-strict predicate
        ;; would hang rather than refuse. DECODE-CHUNKED-BODY is the
        ;; validator, so a body the walk waved through can still be
-       ;; rejected here, and its error has to become the client's 400
-       ;; rather than the 500 that any other unhandled error becomes:
-       ;; the request is malformed, not the server.
+       ;; rejected here, and its CHUNKED-FRAMING-ERROR becomes the
+       ;; client's 400: the request is malformed, not the server. Any
+       ;; other condition out of the decoder is a defect in the decoder
+       ;; and is deliberately left to become a 500.
        (let ((decoded (handler-case
                           (decode-chunked-body (connection-read-buf conn)
                                                body-start
                                                (connection-request-end conn))
-                        (error (e)
+                        (chunked-framing-error (e)
                           (http-reject 400 "malformed chunked body: ~a" e)))))
          (setf (http-request-body request) decoded
                ;; BODY-EXPECTED becomes the decoded length, so it means the

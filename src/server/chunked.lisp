@@ -24,6 +24,29 @@
 ;;; and the caller has to say where the request really ended.
 ;;; ===========================================================================
 
+(define-condition chunked-framing-error (error)
+  ((message :initarg :message :reader chunked-framing-error-message))
+  (:report (lambda (c s) (write-string (chunked-framing-error-message c) s)))
+  (:documentation
+   "Chunked framing this file has decided is wrong.
+
+    Both readers here signal it and nothing else in this file signals at
+    all: HEX-DIGIT-VALUE is total, and every AREF is guarded by a bounds
+    test, so any *other* condition escaping these functions is a bug in
+    them rather than a fault in the bytes.
+
+    That distinction is the whole reason the condition exists. Callers
+    convert framing faults into the client's answer — 400 inbound, 502 for
+    an upstream — and a caller catching plain ERROR would hand a client a
+    400 for a defect in this code, which is the one thing that must not
+    happen in the middle of a file whose job is deciding whose fault a
+    malformed message is."))
+
+(defun chunked-error (format-string &rest args)
+  "Signal a CHUNKED-FRAMING-ERROR with a formatted message."
+  (error 'chunked-framing-error
+         :message (apply #'format nil format-string args)))
+
 (defun chunked-body-complete-p (buf start end &optional (resume start) on-data)
   "Return (values COMPLETE-P NEXT-RESUME) for the chunked body in
    BUF[START..END). COMPLETE-P is T once the zero-size chunk header has
@@ -116,7 +139,7 @@
             (incf digits)
             (when (> digits 16)
               ;; Decided, not incomplete — see the docstring.
-              (error "chunked: chunk-size too many hex digits"))
+              (chunked-error "chunked: chunk-size too many hex digits"))
             (setf size (+ (ash size 4) digit)
                   found t)
             (incf pos)))
@@ -185,7 +208,7 @@
                    (if digit
                        (progn (incf digits)
                               (when (> digits 16)
-                                (error "chunked: chunk-size too many hex digits"))
+                                (chunked-error "chunked: chunk-size too many hex digits"))
                               (setf size (+ (ash size 4) digit)
                                     found t)
                               (incf pos))
@@ -210,7 +233,7 @@
                         (= b 32)  ; SP
                         (= b 9)   ; HTAB
                         (= b 13)) ; CR
-              (error "chunked: invalid byte 0x~2,'0x after chunk-size" b))))
+              (chunked-error "chunked: invalid byte 0x~2,'0x after chunk-size" b))))
         ;; Require strict CRLF after the chunk-size (RFC 7230 §4.1).
         ;; Any chunk extensions between the hex digits and CRLF are
         ;; passed through untouched — we scan for the LF and verify
@@ -222,7 +245,7 @@
           (unless (and (< eol end)
                        (> eol pos)
                        (= (aref buf (1- eol)) 13))
-            (error "chunked: expected CRLF after chunk-size"))
+            (chunked-error "chunked: expected CRLF after chunk-size"))
           (setf pos (1+ eol)))
         ;; Zero-size chunk = end (the only clean exit from this loop).
         (when (zerop size)
@@ -231,7 +254,7 @@
         ;; Copy chunk data. Short-read here is truncation: we declared
         ;; SIZE bytes and need exactly that many.
         (when (> (+ pos size) end)
-          (error "chunked: short chunk-data (~d of ~d bytes)"
+          (chunked-error "chunked: short chunk-data (~d of ~d bytes)"
                  (- end pos) size))
         (loop for i from pos below (+ pos size)
               do (vector-push-extend (aref buf i) out))
@@ -245,10 +268,10 @@
         (unless (and (<= (+ pos 2) end)
                      (= (aref buf pos) 13)
                      (= (aref buf (1+ pos)) 10))
-          (error "chunked: expected CRLF after chunk-data"))
+          (chunked-error "chunked: expected CRLF after chunk-data"))
         (incf pos 2)))
     (unless terminated
-      (error "chunked: incomplete response (no zero-size terminator)"))
+      (chunked-error "chunked: incomplete response (no zero-size terminator)"))
     (subseq out 0 (fill-pointer out))))
 
 (defun chunked-trailer-status (buf pos end)

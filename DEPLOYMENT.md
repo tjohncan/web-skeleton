@@ -131,7 +131,7 @@ specific status, not a blanket 400:
 
 | Code | Sent when |
 |------|-----------|
-| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing the decoder rejects |
+| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing either the completion walk or the decoder rejects — the walk decides a chunk-size line it can already tell is invalid, the decoder decides everything else |
 | `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
