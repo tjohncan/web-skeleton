@@ -161,12 +161,12 @@
   ;;   the Content-Length path   TEST-HARNESS-PIPELINED-AFTER-BODY-E2E
   ;;     fails while all five of PIPELINED-WITH-FIN pass. With the
   ;;     boundary merely wrong rather than absent, +3 or -3, it is a
-  ;;     countable 1612 / 2 rather than a dead run.
+  ;;     countable two-failure run rather than a dead one.
   ;;
   ;;   the chunked path   the boundary is stated by
   ;;     CONNECTION-BODY-COMPLETE-P, where the framing walk finds it, and
   ;;     not by any arithmetic a caller could recompute. Five assertions
-  ;;     across both files catch its removal — 1632 / 5 — because a
+  ;;     across both files catch its removal, because a
   ;;     boundary of 0 there takes the decoded body with it: the decode
   ;;     runs to REQUEST-END.
   ;;
@@ -180,13 +180,13 @@
   ;;   BODY-FRAMING    the reset is its only writer of :LENGTH — the
   ;;     chunked arm is the sole override. Left stale at :CHUNKED, a
   ;;     bodiless request after a chunked one is decoded over an empty
-  ;;     range and a good GET earns a 400. 1638 / 1, caught by
+  ;;     range and a good GET earns a 400. Caught by
   ;;     TEST-HARNESS-CHUNKED-KEEPALIVE-E2E's third request, which is a
   ;;     plain GET for exactly this reason.
   ;;
   ;;   BODY-EXPECTED   likewise for 0; the Content-Length arm is the sole
   ;;     override. Left stale, a following bodiless request has that many
-  ;;     bytes of the next request attached to it. 1637 / 2, caught by
+  ;;     bytes of the next request attached to it. Caught by
   ;;     TEST-HARNESS-PIPELINED-AFTER-BODY-E2E.
   ;;
   ;;   HEADER-END and REQUEST-END   every completing arm states these, so
@@ -244,7 +244,7 @@
   ;; covered the other.
   ;;
   ;; With one mechanism, TEST-HARNESS-CHUNKED-KEEPALIVE-E2E catches it —
-  ;; 1635 / 2, measured. That test's first body is large on purpose; the
+  ;; measured. That test's first body is large on purpose; the
   ;; clamp hides a leftover cursor that is smaller than the next request's
   ;; body-start.
   (chunk-scan-pos  0  :type fixnum)
@@ -980,9 +980,20 @@
       (:chunked
        (multiple-value-bind (complete resume after-size-line
                              data-bytes pending-size)
-           (chunked-body-complete-p (connection-read-buf conn)
-                                    body-start end
-                                    (connection-chunk-scan-pos conn))
+           ;; The walk raises on a chunk-size line it can already tell is
+           ;; invalid, which for a *request* is 400 and not the 500 an
+           ;; unhandled error becomes: the client's framing is malformed,
+           ;; not the server. Same conversion CONNECTION-PARSE-REQUEST
+           ;; does for DECODE-CHUNKED-BODY, at the other end of the same
+           ;; split — walk defers, decoder validates, and the two things
+           ;; the walk can decide on sight it decides here.
+           (handler-case
+               (chunked-body-complete-p (connection-read-buf conn)
+                                        body-start end
+                                        (connection-chunk-scan-pos conn))
+             (http-parse-error (e) (error e))
+             (error (e)
+               (http-reject 400 "malformed chunked framing: ~a" e)))
          (setf (connection-chunk-scan-pos conn) resume)
          (incf (connection-body-decoded conn) data-bytes)
          ;; *MAX-BODY-SIZE* enforced incrementally, because a chunked

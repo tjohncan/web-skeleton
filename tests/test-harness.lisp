@@ -1708,7 +1708,7 @@
      long by 3          the next parse begins inside /b's request line.
      short by 3         same, from the other side.
                         Both: `second response present` and `/b
-                        dispatched after it` fail. 1612 / 2, twice.
+                        dispatched after it` fail. The same two, twice.
 
    `/a body arrived whole` is a control, not a discriminator, and passed
    under all three. REQUEST-END governs only what the *next* parse sees:
@@ -1795,7 +1795,7 @@
    Sized so it cannot: the first body is one 200-byte chunk, leaving the
    cursor near 270, while the second request's body begins near 84. With
    the clear neutered the second walk starts well past its own body, finds
-   no framing there, and the connection never answers — measured, 1635 / 2,
+   no framing there, and the connection never answers — measured:
    this test's `server closed the connection` and `second request
    dispatched`.
 

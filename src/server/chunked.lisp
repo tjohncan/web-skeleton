@@ -48,13 +48,28 @@
    reading' — so a too-strict predicate would hang, while a too-lax one
    merely reaches a loud decode error. Lean lax.
 
+   With one exception, and the exception is what the rule is actually
+   about. Laxness applies to framing that *more bytes could complete*. A
+   chunk-size line past the sixteen-hex-digit cap is not incomplete, it is
+   decided: no further byte makes it valid, so answering 'keep reading'
+   means waiting for a body that can never arrive, until some outer cap
+   fires and describes itself instead of the fault. That case raises here,
+   with the same wording DECODE-CHUNKED-BODY uses for it, and callers
+   convert — 400 inbound, and the outbound handler-case's 502.
+
    It stops at the zero-size chunk header rather than at the trailing
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
    are not consumed), so the two agree on the completion point.
 
-   Two further values come back with those, and they are what makes an
-   inbound size cap possible without a second parse of the chunk headers:
+   Beyond COMPLETE-P and NEXT-RESUME it returns three more values, in
+   order:
 
+     AFTER-SIZE-LINE  the offset just past the zero-size chunk header's
+                   own CRLF, which is where the trailer section begins. It
+                   exists so an inbound caller does not have to re-walk
+                   that line to find it — two walks of one header line is
+                   the second reader this file exists to avoid, even when
+                   both would agree. Meaningless when COMPLETE-P is NIL.
      DATA-BYTES    chunk data proved whole by *this* call. RESUME means
                    the walk never revisits a chunk, so a caller polling a
                    growing buffer accumulates these into the decoded total
@@ -67,18 +82,11 @@
                    the header arrives — waiting for the bytes instead only
                    ever reaches whatever answer the read buffer gives.
 
-   Neither is a policy. This file is direction-neutral and the two
-   directions have different caps — *MAX-BODY-SIZE* inbound,
-   *MAX-OUTBOUND-RESPONSE-SIZE* outbound — so the walk reports sizes and
-   the caller decides what is too big.
-
-   A third value, AFTER-SIZE-LINE
-   just past the zero-size chunk header's own CRLF, which is where the
-   trailer section begins. It exists so an inbound caller does not have to
-   re-walk that line to find it — two walks of one header line is the
-   second reader this file exists to avoid, even when both would agree.
-   Meaningless when COMPLETE-P is NIL, and existing callers that take two
-   values are unaffected.
+   Existing callers that take two values are unaffected. None of the three
+   is a policy: this file is direction-neutral and the two directions have
+   different caps — *MAX-BODY-SIZE* inbound, *MAX-OUTBOUND-RESPONSE-SIZE*
+   outbound — so the walk reports sizes and the caller decides what is too
+   big.
 
    RESUME is clamped up to START, never down. That guards a cursor that is
    too low; a cursor that is too *high* — one left over from a previous
@@ -107,8 +115,8 @@
             (unless digit (return))
             (incf digits)
             (when (> digits 16)
-              (return-from chunked-body-complete-p
-                (values nil boundary 0 data-bytes 0)))
+              ;; Decided, not incomplete — see the docstring.
+              (error "chunked: chunk-size too many hex digits"))
             (setf size (+ (ash size 4) digit)
                   found t)
             (incf pos)))

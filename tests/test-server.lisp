@@ -7058,7 +7058,16 @@
                      (web-skeleton::connection-read-pos conn) (length bytes))
                (values (handler-case (web-skeleton::connection-on-read conn)
                          (web-skeleton:http-parse-error (e)
-                           (web-skeleton::http-parse-error-status e)))
+                           (web-skeleton::http-parse-error-status e))
+                         ;; Anything else becomes its own text rather than
+                         ;; ending the run. CONNECTION-ON-READ can raise a
+                         ;; plain error — the walk does, on a size line it
+                         ;; can already tell is invalid — and a raise that
+                         ;; escapes here takes every later assertion in the
+                         ;; file with it. A failed CHECK carrying the
+                         ;; condition says the same thing and stays
+                         ;; countable.
+                         (error (e) (princ-to-string e)))
                        conn)))
            (verdict (body &rest args)
              (values (apply #'drive (list (apply #'req body args)))))
@@ -7202,6 +7211,14 @@
     ;; a bignum without the accumulator slot ever leaving FIXNUM.
     (check "chunked: a sixteen-digit chunk size is refused too"
            (verdict (format nil "ffffffffffffffff~a" *crlf*)) 413)
+    ;; One digit further and the size is not large, it is unrepresentable
+    ;; — the walk's own digit cap trips before any value exists to
+    ;; project. Broken state: that arm answers "keep reading", the
+    ;; projection sees nothing, and the request waits for bytes that
+    ;; cannot come until the read buffer fills and answers about itself.
+    ;; 400 rather than 413 because the fault is the framing, not a size.
+    (check "chunked: a size line past the digit limit is 400, not a stall"
+           (verdict (format nil "fffffffffffffffff~a" *crlf*)) 400)
     ;; ---- the buffer-full arm ----
 
     ;; A chunked body larger than the read cap has to answer 413, and this
@@ -7229,13 +7246,24 @@
             (web-skeleton::connection-read-pos conn) (length head))
       (check "chunked: buffer-full setup reaches :read-body"
              (attempt (web-skeleton::connection-on-read conn)) :continue)
-      ;; Second pass: a chunk header promising 0xfff bytes, then filler, in
-      ;; a buffer that is exactly at the cap and cannot grow.
+      ;; Second pass: a buffer at its cap holding framing that is
+      ;; *incomplete* rather than invalid, so this reaches the :FULL arm
+      ;; and not one of the refusals above it. `1;` opens a chunk-size
+      ;; line with an extension and the rest of the buffer never
+      ;; terminates it, so the walk finds no LF and answers keep reading
+      ;; with nothing pending — the body cap sees 0 and declines, which is
+      ;; the only way to isolate the buffer's 413 from the body's.
+      ;;
+      ;; The filler must not look like a chunk-size line. An earlier draft
+      ;; used a size header and left the rest as `a` bytes, which are hex
+      ;; digits: the walk read tens of thousands of them, tripped its
+      ;; sixteen-digit cap, and answered 400 — a correct answer to a
+      ;; different question, and this assertion failed for the right
+      ;; reason with the wrong subject.
       (let ((big (make-array cap :element-type '(unsigned-byte 8)
                                  :initial-element 97)))   ; #\a
         (replace big head)
-        (replace big (sb-ext:string-to-octets
-                      (format nil "fff~a" *crlf*) :external-format :ascii)
+        (replace big (sb-ext:string-to-octets "1;" :external-format :ascii)
                  :start1 (length head))
         (setf (web-skeleton::connection-read-buf conn) big
               (web-skeleton::connection-read-pos conn) cap)
