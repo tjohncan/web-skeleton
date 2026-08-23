@@ -415,6 +415,187 @@
                       complete resume (- (length framed) term-len)))))))
     bad))
 
+(defun drive-request-incrementally (bytes step)
+  "Feed BYTES to a fresh connection STEP bytes per wake-up.
+   Returns (values CALLS VERDICT CONN) — how many CONNECTION-ON-READ calls
+   it took to stop being :CONTINUE, what that call answered, and the
+   connection.
+
+   The read-fn hands over at most one piece per wake-up and then answers
+   :AGAIN, and the arming flag is what makes that true.
+   CONNECTION-READ-AVAILABLE drains until :AGAIN, so a read-fn that simply
+   kept returning bytes would deliver the whole request inside the first
+   call and test nothing — which is exactly the shape every other inbound
+   test in the suite has."
+  (let* ((total (length bytes))
+         (pos (list 0))
+         (armed (list nil))
+         (conn (web-skeleton::make-connection
+                :fd -1
+                :read-fn (lambda (buffer start max-bytes)
+                           (if (or (not (car armed)) (>= (car pos) total))
+                               :again
+                               (let ((n (min step max-bytes
+                                             (- total (car pos)))))
+                                 (setf (car armed) nil)
+                                 (replace buffer bytes
+                                          :start1 start
+                                          :start2 (car pos)
+                                          :end2 (+ (car pos) n))
+                                 (incf (car pos) n)
+                                 n))))))
+    (loop for calls from 1 to (+ total 2)
+          do (setf (car armed) t)
+             (let ((v (handler-case (web-skeleton::connection-on-read conn)
+                        (error (e) (princ-to-string e)))))
+               (when (or (not (eq v :continue)) (>= (car pos) total))
+                 (return (values calls v conn))))
+          finally (return (values (+ total 2) :runaway conn)))))
+
+(defun prop-chunked-inbound-parity (seed)
+  "The generated corpus, driven through the *request* path.
+
+   The instrument issue #9 asked for. The inbound acceptance set has to be
+   provably identical to the outbound one, and a disagreement is only ever
+   visible when both sides read the same input — a hand-written table of
+   cases cannot show it, because the two sides would be given different
+   tables. ENCODE-CHUNK-STREAM produces the bytes,
+   PROP-CHUNKED-ENCODER-ROUNDTRIP drives them through the three outbound
+   readers, and this drives the same bytes through CONNECTION-ON-READ:
+   the reader that decides where a *request* ends and what a handler
+   receives.
+
+   Driven twice: once with the whole request in the buffer, and once one
+   byte per wake-up, which is what makes the parity literal — the outbound
+   twin sweeps every prefix, so until the second drive existed `the same
+   corpus, both directions` was true of the bytes and not of the driving.
+
+   Two claims per case, and the first is the one that could not be made
+   before. The request must complete on exactly these bytes — not one
+   read later, which is what a boundary that stopped at the zero-size
+   chunk header instead of past the trailer terminator would do — and the
+   body a handler would receive must be the bytes that went in.
+
+   An empty corpus is a real case: every payload can be empty, which
+   frames as a bare terminator and decodes to zero bytes. The inbound
+   path returns an empty vector there rather than NIL, which is why this
+   compares against ORIGINAL rather than testing for a body at all."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((payloads (gen-chunk-payloads))
+             (original (apply #'concatenate '(vector (unsigned-byte 8))
+                              payloads))
+             (framed (encode-chunk-stream payloads))
+             (head (sb-ext:string-to-octets
+                    (concatenate 'string
+                                 "POST /u HTTP/1.1" *crlf*
+                                 "Host: x" *crlf*
+                                 "Transfer-Encoding: chunked" *crlf* *crlf*)
+                    :external-format :ascii))
+             (bytes (concatenate '(vector (unsigned-byte 8)) head framed))
+             (conn (web-skeleton::make-connection
+                    :fd -1
+                    :read-fn (lambda (buffer start max-bytes)
+                               (declare (ignore buffer start max-bytes))
+                               :again))))
+        (setf (web-skeleton::connection-read-buf conn) bytes
+              (web-skeleton::connection-read-pos conn) (length bytes))
+        (let ((verdict (handler-case
+                           (web-skeleton::connection-on-read conn)
+                         (error (e) (princ-to-string e)))))
+          (cond
+            ((not (eq verdict :dispatch))
+             (unless bad
+               (setf bad :verdict)
+               (fuzz-report nil seed framed)
+               (format t "    verdict ~s, want :DISPATCH~%" verdict)))
+            (t
+             ;; The boundary the framing produced must be the whole
+             ;; request and nothing more — asserted here rather than only
+             ;; through the body, because a boundary short by the trailer
+             ;; terminator still decodes the right body while leaving two
+             ;; bytes for the next parse to read as a request line.
+             (let ((end (web-skeleton::connection-request-end conn)))
+               (unless (= end (length bytes))
+                 (unless bad
+                   (setf bad :boundary)
+                   (fuzz-report nil seed framed)
+                   (format t "    request-end ~d, want ~d~%"
+                           end (length bytes)))))
+             (let ((body (handler-case
+                             (web-skeleton:http-request-body
+                              (web-skeleton::connection-parse-request conn))
+                           (error (e) (princ-to-string e)))))
+               (unless (equalp body original)
+                 (unless bad
+                   (setf bad :body)
+                   (fuzz-report nil seed framed)
+                   (format t "    in:  ~s~%    out: ~s~%" original body)))))))
+        ;; 2. The same request delivered one byte per wake-up. This is the
+        ;;    half that makes the parity claim literal — the outbound twin
+        ;;    sweeps every prefix, and until this existed the inbound side
+        ;;    was driven one-shot, so "the same corpus through both
+        ;;    directions" was true of the bytes and not of the driving.
+        ;;
+        ;;    It is also the only place the across-reads design is
+        ;;    exercised at all. DATA-BYTES is per-call rather than
+        ;;    cumulative so that CONNECTION-BODY-COMPLETE-P can accumulate
+        ;;    without double-counting, and CHUNK-SCAN-POS exists so the
+        ;;    walk resumes with progress; a request that arrives in one
+        ;;    read uses neither. If the accumulation ever broke, the
+        ;;    symptom would be a 413 on a legal upload that happened to
+        ;;    arrive in more than one read — which is every large upload,
+        ;;    and was no test in this suite.
+        (multiple-value-bind (calls verdict conn)
+            (drive-request-incrementally bytes 1)
+          (cond
+            ;; Not one byte early and not one late: the dispatch has to
+            ;; land on the wake-up that delivers the final byte. Early is
+            ;; a boundary short of the trailer terminator; late is a
+            ;; predicate that wants a byte the client will not send.
+            ((/= calls (length bytes))
+             (unless bad
+               (setf bad :prefix)
+               (fuzz-report nil seed framed)
+               (format t "    dispatched after ~d of ~d bytes (~s)~%"
+                       calls (length bytes) verdict)))
+            ((not (eq verdict :dispatch))
+             (unless bad
+               (setf bad :incremental-verdict)
+               (fuzz-report nil seed framed)
+               (format t "    verdict ~s, want :DISPATCH~%" verdict)))
+            (t
+             (let ((end (web-skeleton::connection-request-end conn))
+                   (decoded (web-skeleton::connection-body-decoded conn)))
+               (unless (= end (length bytes))
+                 (unless bad
+                   (setf bad :incremental-boundary)
+                   (fuzz-report nil seed framed)
+                   (format t "    request-end ~d, want ~d~%"
+                           end (length bytes))))
+               ;; The accumulator, summed across as many calls as there
+               ;; are bytes, must equal the decoded length exactly — one
+               ;; chunk counted twice is a 413 waiting for a big enough
+               ;; upload.
+               (unless (= decoded (length original))
+                 (unless bad
+                   (setf bad :accumulator)
+                   (fuzz-report nil seed framed)
+                   (format t "    body-decoded ~d, want ~d~%"
+                           decoded (length original)))))
+             (let ((body (handler-case
+                             (web-skeleton:http-request-body
+                              (web-skeleton::connection-parse-request conn))
+                           (error (e) (princ-to-string e)))))
+               (unless (equalp body original)
+                 (unless bad
+                   (setf bad :incremental-body)
+                   (fuzz-report nil seed framed)
+                   (format t "    in:  ~s~%    out: ~s~%" original body)))))))
+        ))
+    bad))
+
 (defun prop-byte-range-in-bounds (seed)
   "PARSE-BYTE-RANGE never returns a range outside [0, TOTAL). A range
    that escapes its resource becomes a SUBSEQ on the pre-built response
@@ -672,6 +853,8 @@
                       (cons "chunked decoders agree" #'prop-chunked-parity)
                       (cons "chunked encoder round-trips"
                             #'prop-chunked-encoder-roundtrip)
+                      (cons "chunked corpus through the request path"
+                            #'prop-chunked-inbound-parity)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

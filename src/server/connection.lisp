@@ -1298,12 +1298,16 @@
                        (setf (connection-state conn) :read-body)
                        :dispatch)
                       ;; RFC 7231 §5.1.1 scopes 1xx to HTTP/1.1. The
-                      ;; version test is redundant here — a chunked
-                      ;; request is already refused unless it is 1.1 —
-                      ;; and it is written out rather than assumed,
-                      ;; because the day that gate moves is the day this
-                      ;; sends an interim to a 1.0 client, and nothing
-                      ;; here would say why it used to be safe.
+                      ;; version test cannot fire here — a chunked request
+                      ;; is already refused unless it is 1.1, three arms
+                      ;; up — and it is stated anyway, for the reason
+                      ;; REQUEST-END is stated by every completing path
+                      ;; rather than inherited from the reset: a site's
+                      ;; correctness should not ride on a check somewhere
+                      ;; else. The Content-Length arm at this same
+                      ;; decision point carries the identical guard, so
+                      ;; with it the two arms read as one rule and without
+                      ;; it they read as two.
                       ((and (= minor-version-byte 49)
                             (eq expect :100-continue))
                        (connection-queue-write

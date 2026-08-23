@@ -7161,6 +7161,16 @@
 
     (check "chunked: an empty chunked body decodes to nothing"
            (body-of (format nil "0~a~a" *crlf* *crlf*)) "")
+    ;; `5g` — the issue names this one. The walk accepts it as framing:
+    ;; it reads one hex digit, stops at a byte that is not one, finds the
+    ;; line's LF and skips five bytes, exactly as a well-formed header
+    ;; would have it do. The decoder is what refuses, on the byte between
+    ;; the size and the CRLF, and that is the split working rather than
+    ;; failing — the walk defers what it cannot decide on sight.
+    (check "chunked: a junk byte after the chunk-size is 400"
+           (body-of (format nil "5g~ahello~a0~a~a"
+                            *crlf* *crlf* *crlf* *crlf*))
+           400)
 
     ;; The framing walk is deliberately lax — it answers "do we have it
     ;; all yet", and a too-strict predicate would hang instead of refusing.

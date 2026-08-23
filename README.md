@@ -176,6 +176,14 @@ tests/
   arbitrary bytes would come back corrupt
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
+- **Chunked request bodies** — `Transfer-Encoding: chunked` on a request is
+  decoded and handed to the handler whole, so a client that cannot know its
+  length up front (`curl -T -`, a non-seekable Go body, anything piping an
+  upload) is served. The same walk reads it that reads a chunked *response*,
+  so the two directions cannot drift apart. `Transfer-Encoding` with
+  `Content-Length` is refused rather than reconciled, and a trailer section
+  is refused rather than silently discarded — see Limitations for what that
+  costs and why
 - **Expect: 100-continue** — interim `100 Continue` sent before reading the
   body when a request carries the `Expect` header, for `Content-Length` and
   chunked bodies alike. Prevents 1-3s invisible latency with curl, Go,
@@ -304,7 +312,9 @@ tests/
   type, JSON and base64 round-trip, base64 accepts only the canonical
   spelling of the bytes it yields, and byte ranges stay inside the resource.
   Plus parity assertions between paths that must agree — the buffered and
-  streaming chunked decoders on the same framing, and the buffered and
+  streaming chunked decoders on the same framing, the same generated
+  chunked corpus driven through the request path so the inbound and
+  outbound acceptance sets cannot drift apart, and the buffered and
   streaming response readers on the same interim blocks. Seeds are fixed
   rather than drawn from the clock, so a failure is reproducible and a
   seed that once found a bug stays in the corpus
