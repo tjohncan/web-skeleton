@@ -7272,6 +7272,43 @@
                  (web-skeleton:http-parse-error (e)
                    (web-skeleton::http-parse-error-status e)))
                413)))
+
+    ;; ---- Expect: 100-continue ----
+
+    ;; Routed through :SENDING-100-CONTINUE rather than around it, so the
+    ;; interim leaves by the same path a Content-Length body's does.
+    ;; Broken state: the chunked arm answers :CONTINUE, the client waits
+    ;; its timeout and sends anyway, and every chunked upload from a
+    ;; well-behaved client pays a second or more it should not.
+    (multiple-value-bind (v conn)
+        (drive (req "" :headers '("Host: x" "Transfer-Encoding: chunked"
+                                  "Expect: 100-continue")))
+      (check "chunked + 100-continue: the interim is flushed"
+             v :flush-queued)
+      (check "chunked + 100-continue: it is the interim that was queued"
+             (let ((b (web-skeleton::connection-write-buf conn)))
+               (and b (search "100 Continue"
+                              (sb-ext:octets-to-string
+                               b :external-format :ascii))
+                    t))
+             t)
+      (check "chunked + 100-continue: and the state is the interim's"
+             (web-skeleton::connection-state conn) :sending-100-continue))
+
+    ;; The client did not wait. Sending an interim it has stopped
+    ;; listening for is latency on what is, for chunked, the common
+    ;; shape — a sender that ignored the expectation has usually sent the
+    ;; whole body. Broken state: the interim arm is tested before the
+    ;; already-complete one, and every such upload takes an extra
+    ;; round trip.
+    (multiple-value-bind (v conn)
+        (drive (req (format nil "3~aabc~a0~a~a" *crlf* *crlf* *crlf* *crlf*)
+                    :headers '("Host: x" "Transfer-Encoding: chunked"
+                               "Expect: 100-continue")))
+      (check "chunked + 100-continue: a body already here dispatches"
+             v :dispatch)
+      (check "chunked + 100-continue: and no interim was queued"
+             (null (web-skeleton::connection-write-buf conn)) t))
     ;; ---- interaction with the rules already in place ----
 
     ;; The chunked arm falls through to the body cond rather than

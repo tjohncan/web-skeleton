@@ -1280,14 +1280,39 @@
                     ;; terminator.
                     (setf (connection-header-end conn) header-end
                           (connection-body-framing conn) :chunked
-                          (connection-chunk-scan-pos conn) 0
-                          (connection-state conn) :read-body)
-                    ;; The whole body can already be buffered — a small
-                    ;; upload arrives in one read — so ask before waiting
-                    ;; for an event that would never come.
-                    (if (connection-body-complete-p conn)
-                        :dispatch
-                        :continue))
+                          (connection-chunk-scan-pos conn) 0)
+                    (cond
+                      ;; The whole body can already be buffered — a small
+                      ;; upload arrives in one read — so ask before
+                      ;; waiting for an event that would never come.
+                      ;;
+                      ;; This case matters more here than on the
+                      ;; Content-Length path. A client that sent
+                      ;; Expect: 100-continue and then sent its body
+                      ;; anyway did not wait, and a chunked sender that
+                      ;; did not wait has usually sent the whole thing —
+                      ;; so answering with an interim it is no longer
+                      ;; listening for is pure latency on the common
+                      ;; shape, not a rare one.
+                      ((connection-body-complete-p conn)
+                       (setf (connection-state conn) :read-body)
+                       :dispatch)
+                      ;; RFC 7231 §5.1.1 scopes 1xx to HTTP/1.1. The
+                      ;; version test is redundant here — a chunked
+                      ;; request is already refused unless it is 1.1 —
+                      ;; and it is written out rather than assumed,
+                      ;; because the day that gate moves is the day this
+                      ;; sends an interim to a 1.0 client, and nothing
+                      ;; here would say why it used to be safe.
+                      ((and (= minor-version-byte 49)
+                            (eq expect :100-continue))
+                       (connection-queue-write
+                        conn *http-100-continue-bytes*)
+                       (setf (connection-state conn) :sending-100-continue)
+                       :flush-queued)
+                      (t
+                       (setf (connection-state conn) :read-body)
+                       :continue)))
                    ;; Body present — read it, dispatching when complete.
                    ((and content-length (> content-length 0))
                     ;; Reject oversized bodies before allocating.

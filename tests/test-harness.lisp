@@ -2047,6 +2047,84 @@
                           (null (search "served=/a" text)) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-chunked-expect-100-continue-e2e ()
+  "A chunked upload from a client that actually waits for the interim.
+
+   The unit assertions cover the verdict and the queued bytes; this
+   covers the part they cannot, which is that the interim *arrives* and
+   that the chunked frame survives it. Between the two, the connection
+   passes through :SENDING-100-CONTINUE and back — CONNECTION-RESET-WRITE
+   runs on the way out, and if it or anything else cleared BODY-FRAMING,
+   CHUNK-SCAN-POS or HEADER-END, the body read would resume against a
+   frame belonging to no request.
+
+   Written by hand rather than through TEST-HTTP-REQUEST because the
+   waiting is the subject: the headers go out alone, the interim is read
+   back before a single body byte is sent, and only then does the body
+   follow."
+  (format t "~%Harness: a chunked upload that waits for its 100~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "got=~a"
+                               (sb-ext:octets-to-string
+                                (http-request-body req)
+                                :external-format :ascii)))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let ((stream (sb-bsd-sockets:socket-make-stream
+                            socket :input t :output t
+                            :element-type '(unsigned-byte 8))))
+               ;; Headers only. No body byte has been written.
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string
+                              "POST /upload HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf*
+                              "Transfer-Encoding: chunked" *crlf*
+                              "Expect: 100-continue" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               ;; The interim, read before anything else is sent. A
+               ;; server that skipped it would leave this read blocking
+               ;; until the harness's bound expires.
+               (check "chunked 100: the interim arrives before the body"
+                      (attempt (read-response-status-head stream)) 100)
+               ;; Now the body, in two chunks, so the walk resumes across
+               ;; a wake-up rather than seeing it all at once.
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string "3" *crlf* "abc" *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string "2" *crlf* "de" *crlf*
+                              "0" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (read-to-eof-bounded stream buf)
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 (fill-pointer buf))
+                              :external-format :utf-8)))
+                   (check "chunked 100: the response is 200"
+                          (not (null (search "HTTP/1.1 200" text))) t)
+                   ;; Both chunks, decoded, in order — which is the frame
+                   ;; having survived the interim.
+                   (check "chunked 100: the whole body arrived decoded"
+                          (not (null (search "got=abcde" text))) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 (defun read-response-status-head (stream)
   "Read through the CRLFCRLF ending a response's header block and return
    the status. NIL if the peer closed, or the deadline passed, before a
@@ -2322,6 +2400,7 @@
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
   (test-harness-chunked-body-cap-e2e)
+  (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)

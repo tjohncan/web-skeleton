@@ -177,8 +177,11 @@ tests/
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
 - **Expect: 100-continue** — interim `100 Continue` sent before reading the
-  body when a request carries the `Expect` header. Prevents 1-3s invisible
-  latency with curl, Go, Python, and Java HTTP clients on large POSTs
+  body when a request carries the `Expect` header, for `Content-Length` and
+  chunked bodies alike. Prevents 1-3s invisible latency with curl, Go,
+  Python, and Java HTTP clients on large POSTs. The interim is skipped when
+  the body has already arrived: a client that did not wait is not listening
+  for it, and sending it would only add a round trip
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
