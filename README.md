@@ -176,9 +176,20 @@ tests/
   arbitrary bytes would come back corrupt
 - **HTTP keep-alive** — persistent connections per HTTP/1.1 default. Connections
   are reused across requests; `Connection: close` and HTTP/1.0 are respected
+- **Chunked request bodies** — `Transfer-Encoding: chunked` on a request is
+  decoded and handed to the handler whole, so a client that cannot know its
+  length up front (`curl -T -`, a non-seekable Go body, anything piping an
+  upload) is served. The same walk reads it that reads a chunked *response*,
+  so the two directions cannot drift apart. `Transfer-Encoding` with
+  `Content-Length` is refused rather than reconciled, and a trailer section
+  is refused rather than silently discarded — see Limitations for what that
+  costs and why
 - **Expect: 100-continue** — interim `100 Continue` sent before reading the
-  body when a request carries the `Expect` header. Prevents 1-3s invisible
-  latency with curl, Go, Python, and Java HTTP clients on large POSTs
+  body when a request carries the `Expect` header, for `Content-Length` and
+  chunked bodies alike. Prevents 1-3s invisible latency with curl, Go,
+  Python, and Java HTTP clients on large POSTs. The interim is skipped when
+  the body has already arrived: a client that did not wait is not listening
+  for it, and sending it would only add a round trip
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -301,7 +312,9 @@ tests/
   type, JSON and base64 round-trip, base64 accepts only the canonical
   spelling of the bytes it yields, and byte ranges stay inside the resource.
   Plus parity assertions between paths that must agree — the buffered and
-  streaming chunked decoders on the same framing, and the buffered and
+  streaming chunked decoders on the same framing, the same generated
+  chunked corpus driven through the request path so the inbound and
+  outbound acceptance sets cannot drift apart, and the buffered and
   streaming response readers on the same interim blocks. Seeds are fixed
   rather than drawn from the clock, so a failure is reproducible and a
   seed that once found a bug stays in the corpus
@@ -324,12 +337,38 @@ read about here.
   supported — `web-skeleton-tls` gives `https://` fetches — so the
   feature list above can read as if the inbound case were covered too. It
   isn't.
-- **No chunked request bodies.** A request carrying `Transfer-Encoding`
-  is refused with 501. Request bodies are framed by `Content-Length`
-  only, which is what closes the CL-TE smuggling shape, but it also
-  refuses any client streaming a body of unknown length — `curl -T -`,
-  Go's `http.Client` with a non-seekable body. Chunked *responses* from
-  an upstream are read normally; the two directions are unrelated.
+- **Chunked request bodies are accepted, but not streamed to a handler.**
+  `Transfer-Encoding: chunked` is decoded and the handler receives the
+  whole body exactly as it does for a `Content-Length` request — the
+  wire bytes accumulate, and the body is decoded once when the terminator
+  arrives. So `curl -T -` is served, and "chunked requests are supported"
+  does *not* mean a 4 GiB upload: the whole body is buffered before your
+  handler is called, and `*max-body-size*` is enforced incrementally as
+  the decoded total grows — plus on a chunk header that declares more than
+  the cap on its own, which is refused the moment it arrives rather than
+  after its bytes fail to turn up. Streaming a request body into a handler
+  would change the handler contract and is out.
+- **Two different 413s, and they say which.** The body cap above answers
+  `chunked body too large`; the read buffer answers `request too large
+  (buffer full)`. Both are reachable for a chunked request and neither is
+  redundant: the wire carries framing the decoded body does not, and a
+  1-byte chunk costs six wire bytes, so a body made of very small chunks
+  fills the buffer well before its decoded total reaches
+  `*max-body-size*`. Which one fires depends on the chunk sizes, not on
+  the amount of data — so read the reason, not just the code.
+- **Trailers on a request are refused with 400.** A non-empty trailer
+  section after the zero-size chunk gets a 400, not a silent discard.
+  Nothing in the framework surfaces trailers to an app, so accepting them
+  would drop data the client believed it sent — and refusing means the
+  request boundary for a trailer-bearing request is never computed, which
+  is the strongest available answer to a trailer carrying a smuggled
+  second request. A client that needs trailers delivered has no path here.
+- **`Transfer-Encoding` and `Content-Length` together are refused, never
+  reconciled**, and so is any coding other than a bare final `chunked`.
+  RFC 7230 §3.3.3 says TE overrides CL; every smuggling CVE in the genre
+  is two hops applying that rule differently. `gzip, chunked` is 501 —
+  legal, unimplemented. `chunked, gzip`, a repeated header, an obs-folded
+  value, and `Transfer-Encoding` on an HTTP/1.0 request are 400.
 - **No response compression.** No gzip, no `Content-Encoding`
   negotiation. Compressing static assets is the proxy's job today.
 - **No HTTP/2, no multipart.** A request whose version token is not
@@ -432,11 +471,11 @@ All configurable via `setf` before calling `start-server`.
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
 | `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed |
-| `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
+| `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. Validated when the server starts, so a deployment that trims this below the message size is told at boot rather than at the first maximal message. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |
 | `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |
 | `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice |
-| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed                                                                                                                                                                                                   |
+| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end |
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |

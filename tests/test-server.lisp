@@ -6801,6 +6801,607 @@
              t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Transfer-Encoding: the rules, and the codes they answer with
+;;; ---------------------------------------------------------------------------
+
+(defun test-transfer-encoding-rules ()
+  (format t "~%Transfer-Encoding rules~%")
+  (labels ((raw (version headers)
+             (with-output-to-string (s)
+               (format s "POST / HTTP/~a~a" version *crlf*)
+               (dolist (h headers) (format s "~a~a" h *crlf*))
+               (format s "~a" *crlf*)))
+           (bytes (version headers)
+             (sb-ext:string-to-octets (raw version headers)
+                                      :external-format :ascii))
+           (te (value)
+             ;; A Transfer-Encoding header line carrying VALUE verbatim,
+             ;; so a case can put a bare CR inside it.
+             (concatenate 'string "Transfer-Encoding: " value))
+           (cr (before after)
+             ;; BEFORE and AFTER joined by a bare CR — a byte no header
+             ;; value may contain, and one this scan has to notice before
+             ;; PARSE-HEADERS-BYTES gets to at dispatch.
+             (concatenate 'string before (string #\Return) after))
+           (coding-of (headers &optional (version "1.1"))
+             ;; Called the way CONNECTION-ON-READ calls it: bounded by the
+             ;; CRLFCRLF and started past the request line.
+             (let* ((b (bytes version headers))
+                    (header-end (web-skeleton::scan-crlf-crlf b 0 (length b)))
+                    (hdr-start (+ (web-skeleton::scan-crlf b 0 header-end) 2)))
+               (attempt (web-skeleton::scan-transfer-encoding
+                         b header-end hdr-start))))
+           (on-read (headers &optional (version "1.1"))
+             ;; The status the rules answer with, taken where the client
+             ;; would get it: the condition CONNECTION-ON-READ raises, which
+             ;; is what HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE. A
+             ;; read-fn answering :AGAIN keeps the whole request in the
+             ;; buffer and off any socket.
+             (let ((b (bytes version headers))
+                   (conn (web-skeleton::make-connection
+                          :fd -1
+                          :read-fn (lambda (buffer start max-bytes)
+                                     (declare (ignore buffer start max-bytes))
+                                     :again))))
+               (setf (web-skeleton::connection-read-buf conn) b
+                     (web-skeleton::connection-read-pos conn) (length b))
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))))))
+
+    ;; ---- classification ----
+
+    ;; The zero-count arm. A scanner that matched a header name as a
+    ;; substring — "x-transfer-encoding", or the word inside a value —
+    ;; would answer a coding here.
+    (check "TE: absent is NIL"
+           (coding-of '("Host: x" "X-Transfer-Encoding: chunked")) nil)
+
+    ;; END is the CRLFCRLF position, so the last header line's CR sits *at*
+    ;; END and a value scan bounded by END cannot see its terminator. These
+    ;; two differ only in whether Transfer-Encoding is the final header; a
+    ;; scan that got the bound wrong passes the second and fails the first.
+    (check "TE: last header still reads its value"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked")) :chunked)
+    (check "TE: non-final header reads the same"
+           (coding-of '("Transfer-Encoding: chunked" "Host: x")) :chunked)
+
+    (check "TE: field name and value both case fold"
+           (coding-of '("Host: x" "TRANSFER-ENCODING: CHUNKED")) :chunked)
+
+    (check "TE: surrounding OWS trimmed"
+           (coding-of '("Host: x" "Transfer-Encoding:   chunked  ")) :chunked)
+
+    ;; RFC 7230 §7's list rule permits empty elements. Counting them would
+    ;; push chunked out of final position and refuse a legal message for a
+    ;; reason that is not true of it.
+    (check "TE: empty list elements are legal"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked,,")) :chunked)
+
+    (check "TE: gzip alone is unsupported"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip")) :unsupported)
+
+    ;; Legal, and chunked *is* final — the refusal is about the inner
+    ;; coding, not the framing, which is why it is not :INVALID.
+    (check "TE: gzip, chunked is unsupported"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip, chunked"))
+           :unsupported)
+
+    ;; RFC 7230 §3.3.1: chunked is applied once, and applied last.
+    (check "TE: chunked in a non-final position is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked, gzip")) :invalid)
+    (check "TE: chunked repeated in one value is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: chunked, chunked"))
+           :invalid)
+
+    ;; The combination rule for repeated headers is defined, and computing
+    ;; it is the reconciliation step the first rule refuses.
+    (check "TE: two Transfer-Encoding headers are invalid"
+           (coding-of '("Host: x" "Transfer-Encoding: gzip"
+                        "Transfer-Encoding: chunked"))
+           :invalid)
+
+    (check "TE: a value naming no coding is invalid"
+           (coding-of '("Host: x" "Transfer-Encoding:")) :invalid)
+
+    ;; A bare CR ends the value scan early, so this reader sees a different
+    ;; value than PARSE-HEADERS-BYTES will. Each of these four moves a
+    ;; different way against its CR-free twin — less refusing, more
+    ;; refusing, and twice not at all — which is why the arm rests on the
+    ;; disagreement and not on a direction. SCAN-TRANSFER-ENCODING carries
+    ;; the measured table.
+    ;;
+    ;; The no-space case is the one that distinguishes this arm. The spaced
+    ;; case is here because it is what a natural probe writes, and the fold
+    ;; arm catches it for an unrelated reason — tested alone, it makes a
+    ;; missing bare-CR arm look present.
+    (check "TE: bare CR before a comma is invalid"
+           (coding-of (list "Host: x" (te (cr "chunked" ",gzip")))) :invalid)
+    (check "TE: bare CR with the natural spacing is invalid"
+           (coding-of (list "Host: x" (te (cr "chunked" ", gzip")))) :invalid)
+    (check "TE: bare CR inside a token is invalid"
+           (coding-of (list "Host: x" (te (cr "chu" "nked")))) :invalid)
+    (check "TE: bare CR at the end of the value is invalid"
+           (coding-of (list "Host: x" (te (cr "gzip" "")))) :invalid)
+
+    ;; PARSE-HEADERS-BYTES rejects obsolete line folding too, but at
+    ;; dispatch — after this scan has already decided how the body is
+    ;; framed. Broken state: the fold is not noticed here, this reader
+    ;; answers :CHUNKED for a value the parser reads as `chunked , gzip`,
+    ;; and the two disagree about the framing of a body.
+    (check "TE: obs-folded value is invalid"
+           (coding-of (list "Host: x" "Transfer-Encoding: chunked"
+                            (concatenate 'string (string #\Tab) ", gzip")))
+           :invalid)
+
+    ;; ---- the codes ----
+
+    ;; RFC 7230 §3.3.3 says TE overrides CL. Answering 400 is the refusal
+    ;; to apply that rule at all.
+    (check "TE + Content-Length is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: 5"))
+           400)
+
+    ;; Only *presence* is the violation, so the value is never consulted.
+    ;; Broken state: SCAN-CONTENT-LENGTH's own rejections reach the client,
+    ;; and the rule above holds only for Content-Lengths that happen to
+    ;; parse — 400 for the value here, 413 below, both naming a condition
+    ;; that is not why the request is refused.
+    (check "TE + unparseable Content-Length is still the pair, 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: abc"))
+           400)
+    (check "TE + oversized Content-Length is 400, not 413"
+           (on-read '("Host: x" "Transfer-Encoding: chunked"
+                      "Content-Length: 99999999999"))
+           400)
+
+    (check "TE on HTTP/1.0 is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.0") 400)
+
+    ;; The gate is stated as "for 1.1", not "against 1.0". The two
+    ;; implementations agree on every 1.0 request and part here: under
+    ;; "against 1.0" this byte is not 48, the gate does not fire, and the
+    ;; coding answers 501. PARSE-REQUEST-BYTES would answer 505 for the
+    ;; version — but at dispatch, and the framing is decided before that.
+    (check "TE on an unvalidated version is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.9") 400)
+
+    ;; The other half of that answer, and the premise the gate's comment
+    ;; rests on: the same request without the header is the parser's 505,
+    ;; raised at dispatch. The gate answers 400 rather than 505 because it
+    ;; declines to hold a second copy of the supported-version set — this
+    ;; says the set really does live somewhere else, so the asymmetry is a
+    ;; division of labour and not an oversight.
+    ;;
+    ;; A pinned premise, not a detector, and the only one of these that no
+    ;; revert can reach — `typo'd version is 505` above exercises the same
+    ;; branch of the same function for the same reason. It earns its place
+    ;; by sitting beside the 400 it explains, and nowhere else. Anything
+    ;; that breaks it fails there first.
+    (check "no TE: an unsupported version is the parser's 505"
+           (let ((b (bytes "1.9" '("Host: x"))))
+             (handler-case (progn (web-skeleton::parse-request-bytes
+                                   b 0 (length b))
+                                  :no-error)
+               (web-skeleton:http-parse-error (e)
+                 (web-skeleton::http-parse-error-status e))))
+           505)
+
+    ;; Transfer-Encoding is a 1.1 field, so the gate covers every coding.
+    ;; Broken state: the gate sits inside the chunked arm, and a 1.0
+    ;; request naming gzip answers 501 — the coding, when the version is
+    ;; the reason it is refused.
+    (check "TE: gzip on HTTP/1.0 is 400, not 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip") "1.0") 400)
+
+    (check "TE with chunked non-final is 400"
+           (on-read '("Host: x" "Transfer-Encoding: chunked, gzip")) 400)
+
+    (check "TE repeated as two headers is 400"
+           (on-read '("Host: x" "Transfer-Encoding: gzip"
+                      "Transfer-Encoding: chunked"))
+           400)
+
+    (check "TE bare CR is 400"
+           (on-read (list "Host: x" (te (cr "chunked" ",gzip")))) 400)
+
+    (check "TE obs-folded is 400"
+           (on-read (list "Host: x" "Transfer-Encoding: chunked"
+                          (concatenate 'string (string #\Tab) ", gzip")))
+           400)
+
+    ;; §3.3.1's own code for a coding the server does not understand.
+    (check "TE: gzip is 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip")) 501)
+    (check "TE: gzip, chunked is 501"
+           (on-read '("Host: x" "Transfer-Encoding: gzip, chunked")) 501)
+    ;; Chunked is accepted now, so what this pins is the rules running
+    ;; ahead of the body arm: the request is well formed, no body byte has
+    ;; arrived, and the answer is to keep reading rather than to refuse or
+    ;; to dispatch a POST with its body still on the wire.
+    ;; TEST-CHUNKED-REQUEST-BODY covers where it ends.
+    (check "TE: chunked alone is accepted and waits for its body"
+           (on-read '("Host: x" "Transfer-Encoding: chunked")) :continue)
+
+    ;; The zero-behavior-change claim, asserted rather than assumed.
+    (check "no TE: request still dispatches"
+           (on-read '("Host: x")) :dispatch)
+    (check "no TE: a Content-Length body still reads"
+           (on-read '("Host: x" "Content-Length: 5")) :continue)))
+
+;;; ---------------------------------------------------------------------------
+;;; Chunked request bodies: where the request ends, and what ends it
+;;; ---------------------------------------------------------------------------
+
+(defun test-chunked-request-body ()
+  (format t "~%Chunked request bodies~%")
+  (labels ((req (body &key (headers '("Host: x" "Transfer-Encoding: chunked"))
+                           (version "1.1"))
+             (sb-ext:string-to-octets
+              (with-output-to-string (s)
+                (format s "POST /u HTTP/~a~a" version *crlf*)
+                (dolist (h headers) (format s "~a~a" h *crlf*))
+                (format s "~a~a" *crlf* body))
+              :external-format :ascii))
+           (drive (bytes)
+             ;; Returns (values VERDICT CONN). A read-fn answering :AGAIN
+             ;; keeps everything in the buffer and off any socket, so the
+             ;; verdict is the state machine's and nothing else.
+             (let ((conn (web-skeleton::make-connection
+                          :fd -1
+                          :read-fn (lambda (buffer start max-bytes)
+                                     (declare (ignore buffer start max-bytes))
+                                     :again))))
+               (setf (web-skeleton::connection-read-buf conn) bytes
+                     (web-skeleton::connection-read-pos conn) (length bytes))
+               (values (handler-case (web-skeleton::connection-on-read conn)
+                         (web-skeleton:http-parse-error (e)
+                           (web-skeleton::http-parse-error-status e))
+                         ;; Anything else becomes its own text rather than
+                         ;; ending the run. CONNECTION-ON-READ can raise a
+                         ;; plain error — the walk does, on a size line it
+                         ;; can already tell is invalid — and a raise that
+                         ;; escapes here takes every later assertion in the
+                         ;; file with it. A failed CHECK carrying the
+                         ;; condition says the same thing and stays
+                         ;; countable.
+                         (error (e) (princ-to-string e)))
+                       conn)))
+           (verdict (body &rest args)
+             (values (apply #'drive (list (apply #'req body args)))))
+           (body-of (body)
+             ;; Drive to :DISPATCH, then parse — the decoded body is what
+             ;; a handler would receive.
+             (multiple-value-bind (v conn) (drive (req body))
+               (declare (ignore v))
+               (handler-case
+                   (let ((r (web-skeleton::connection-parse-request conn)))
+                     (sb-ext:octets-to-string (web-skeleton:http-request-body r)
+                                              :external-format :ascii))
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))))))
+
+    ;; ---- where a chunked request ends ----
+
+    ;; Headers only: the framing says a body is coming and none of it has
+    ;; arrived. Broken state: the Content-Length arm answers "no body" for
+    ;; this request and dispatches a POST with its body still on the wire.
+    (check "chunked: no body bytes yet keeps reading"
+           (verdict "") :continue)
+
+    ;; The whole thing in one read.
+    (check "chunked: a complete body dispatches"
+           (verdict (format nil "3~a123~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+           :dispatch)
+
+    ;; THE two-byte rule. `...0 CRLF` is the zero-size chunk header and
+    ;; nothing else; the CRLF that terminates an empty trailer section has
+    ;; not arrived. Broken state: complete is answered here, REQUEST-END
+    ;; lands two bytes early, and those two bytes are shifted to offset 0
+    ;; and read as the beginning of the next request.
+    (check "chunked: the terminator alone is not the end of the request"
+           (verdict (format nil "3~a123~a0~a" *crlf* *crlf* *crlf*))
+           :continue)
+    (check "chunked: the empty trailer's CRLF is what ends it"
+           (verdict (format nil "3~a123~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+           :dispatch)
+
+    ;; An empty body is still a body, and still needs its terminator.
+    (check "chunked: zero chunks, terminated, dispatches"
+           (verdict (format nil "0~a~a" *crlf* *crlf*)) :dispatch)
+
+    ;; The boundary itself, not a delivery-shaped proxy for it: with a
+    ;; second request pipelined behind, REQUEST-END has to land exactly on
+    ;; its first byte. Computed from the pieces rather than written as a
+    ;; number — a hand-counted offset is a second implementation of the
+    ;; arithmetic this slot exists to delete, and the first draft of this
+    ;; assertion got it wrong by five bytes.
+    (let* ((first-req (req (format nil "3~a123~a0~a~a"
+                                   *crlf* *crlf* *crlf* *crlf*)))
+           (both (concatenate '(vector (unsigned-byte 8))
+                              first-req
+                              (sb-ext:string-to-octets
+                               "GET /b HTTP/1.1" :external-format :ascii))))
+      (multiple-value-bind (v conn) (drive both)
+        (declare (ignore v))
+        (check "chunked: the boundary lands on the next request's first byte"
+               (web-skeleton::connection-request-end conn)
+               (length first-req))))
+
+    ;; ---- trailers ----
+
+    ;; The decision: refuse. Nothing surfaces trailers to an app, so
+    ;; accepting silently discards data the client believed it sent, and
+    ;; consuming needs a second header parser whose disagreement with the
+    ;; first is the shape these rules exist to prevent.
+    (check "chunked: a trailer field is refused"
+           (verdict (format nil "0~aX-T: 1~a~a" *crlf* *crlf* *crlf*)) 400)
+
+    ;; The headline acceptance criterion, asserted at the boundary rather
+    ;; than at delivery: a trailer section carrying a complete HTTP request
+    ;; must not become a second request. Refusing means the boundary for
+    ;; this request is never computed at all.
+    (check "chunked: a trailer holding a whole request is refused"
+           (verdict (format nil "0~aGET /admin HTTP/1.1~aHost: x~a~a"
+                            *crlf* *crlf* *crlf* *crlf*))
+           400)
+
+    ;; A bare CR where the terminator belongs.
+    (check "chunked: a bare CR after the terminator is refused"
+           (verdict (format nil "0~a~a!" *crlf* (string #\Return))) 400)
+
+    ;; ---- the body a handler receives ----
+
+    (check "chunked: the decoded body reaches the request"
+           (body-of (format nil "3~aabc~a2~ade~a0~a~a"
+                            *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+           "abcde")
+
+    (check "chunked: an empty chunked body decodes to nothing"
+           (body-of (format nil "0~a~a" *crlf* *crlf*)) "")
+    ;; `5g` — the issue names this one. The walk accepts it as framing:
+    ;; it reads one hex digit, stops at a byte that is not one, finds the
+    ;; line's LF and skips five bytes, exactly as a well-formed header
+    ;; would have it do. The decoder is what refuses, on the byte between
+    ;; the size and the CRLF, and that is the split working rather than
+    ;; failing — the walk defers what it cannot decide on sight.
+    (check "chunked: a junk byte after the chunk-size is 400"
+           (body-of (format nil "5g~ahello~a0~a~a"
+                            *crlf* *crlf* *crlf* *crlf*))
+           400)
+
+    ;; The framing walk is deliberately lax — it answers "do we have it
+    ;; all yet", and a too-strict predicate would hang instead of refusing.
+    ;; DECODE-CHUNKED-BODY is the validator, and its error has to become
+    ;; the client's 400 rather than the 500 an unhandled error becomes.
+    ;; Broken state: the decode error escapes CONNECTION-PARSE-REQUEST and
+    ;; HANDLE-CLIENT-READ's generic arm answers 500 — the server blamed
+    ;; for a malformed request.
+    (check "chunked: a size line the decoder rejects is 400, not 500"
+           (body-of (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)) 400)
+
+
+
+    ;; ---- the size cap, which has no declared length to read ----
+
+    ;; *MAX-BODY-SIZE* is enforced before allocating on the Content-Length
+    ;; path, against a number the client supplied. A chunked request
+    ;; supplies none, so the check has to become incremental, and this is
+    ;; the only place a *body*-size refusal can come from at all.
+    (let ((web-skeleton::*max-body-size* 4))
+      (check "chunked: a body over the cap is 413"
+             (verdict (format nil "5~ahello~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+             413)
+      ;; The boundary, so the comparison is > and not >=.
+      (check "chunked: a body exactly at the cap is served"
+             (verdict (format nil "4~ahell~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
+             :dispatch)
+      ;; Spread across chunks: no single chunk crosses the cap, the
+      ;; running total does. Broken state: the check reads one chunk's
+      ;; size instead of accumulating, and three 2-byte chunks pass a
+      ;; 4-byte cap.
+      (check "chunked: the cap is a running total, not a per-chunk test"
+             (verdict (format nil "2~aab~a2~acd~a2~aef~a0~a~a"
+                              *crlf* *crlf* *crlf* *crlf*
+                              *crlf* *crlf* *crlf* *crlf*))
+             413))
+
+    ;; Refused on the *declared* size, the moment the header arrives.
+    ;; Broken state: the walk skips past the promised bytes, finds itself
+    ;; beyond the buffer, answers "keep reading", and the client is
+    ;; eventually told the read buffer filled — when what it actually did
+    ;; was declare a chunk larger than any body this server accepts. The
+    ;; buffer's answer is true and useless; a client cannot act on it.
+    (check "chunked: an oversized chunk header is refused on arrival"
+           (verdict (format nil "ffffffff~a" *crlf*)) 413)
+    ;; Sixteen digits is the walk's own limit, and the product is past
+    ;; MOST-POSITIVE-FIXNUM — the projected total is a local, so it may be
+    ;; a bignum without the accumulator slot ever leaving FIXNUM.
+    (check "chunked: a sixteen-digit chunk size is refused too"
+           (verdict (format nil "ffffffffffffffff~a" *crlf*)) 413)
+    ;; One digit further and the size is not large, it is unrepresentable
+    ;; — the walk's own digit cap trips before any value exists to
+    ;; project. Broken state: that arm answers "keep reading", the
+    ;; projection sees nothing, and the request waits for bytes that
+    ;; cannot come until the read buffer fills and answers about itself.
+    ;; 400 rather than 413 because the fault is the framing, not a size.
+    (check "chunked: a size line past the digit limit is 400, not a stall"
+           (verdict (format nil "fffffffffffffffff~a" *crlf*)) 400)
+    ;; ---- the buffer-full arm ----
+
+    ;; A chunked body larger than the read cap has to answer 413, and this
+    ;; is the assertion for the third reader of "is the body complete".
+    ;; The :FULL arm used to be Content-Length arithmetic, which a chunked
+    ;; request satisfies unconditionally — BODY-EXPECTED is 0 — so it would
+    ;; call a half-arrived body complete, fall through, and then :READ-BODY
+    ;; would answer :CONTINUE while the buffer sat at its cap with nothing
+    ;; able to read further. The connection would be held until the idle
+    ;; sweeper took it. Broken state: :CONTINUE here instead of 413.
+    ;;
+    ;; Two calls because the arm is only reachable from :READ-BODY: the
+    ;; first establishes the framing, the second arrives with the buffer
+    ;; already at its cap.
+    (let* ((web-skeleton::*max-body-size* 256)
+           (conn (web-skeleton::make-connection
+                  :fd -1
+                  :read-fn (lambda (buffer start max-bytes)
+                             (declare (ignore buffer start max-bytes))
+                             :again)))
+           (head (req ""))
+           (cap (web-skeleton::connection-read-cap conn)))
+      ;; First pass: headers only, framing established, waiting on a body.
+      (setf (web-skeleton::connection-read-buf conn) head
+            (web-skeleton::connection-read-pos conn) (length head))
+      (check "chunked: buffer-full setup reaches :read-body"
+             (attempt (web-skeleton::connection-on-read conn)) :continue)
+      ;; Second pass: a buffer at its cap holding framing that is
+      ;; *incomplete* rather than invalid, so this reaches the :FULL arm
+      ;; and not one of the refusals above it. `1;` opens a chunk-size
+      ;; line with an extension and the rest of the buffer never
+      ;; terminates it, so the walk finds no LF and answers keep reading
+      ;; with nothing pending — the body cap sees 0 and declines, which is
+      ;; the only way to isolate the buffer's 413 from the body's.
+      ;;
+      ;; The filler must not look like a chunk-size line. An earlier draft
+      ;; used a size header and left the rest as `a` bytes, which are hex
+      ;; digits: the walk read tens of thousands of them, tripped its
+      ;; sixteen-digit cap, and answered 400 — a correct answer to a
+      ;; different question, and this assertion failed for the right
+      ;; reason with the wrong subject.
+      (let ((big (make-array cap :element-type '(unsigned-byte 8)
+                                 :initial-element 97)))   ; #\a
+        (replace big head)
+        (replace big (sb-ext:string-to-octets "1;" :external-format :ascii)
+                 :start1 (length head))
+        (setf (web-skeleton::connection-read-buf conn) big
+              (web-skeleton::connection-read-pos conn) cap)
+        (check "chunked: a body past the read cap is 413, not a stall"
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e)))
+               413)))
+
+    ;; ---- Expect: 100-continue ----
+
+    ;; Routed through :SENDING-100-CONTINUE rather than around it, so the
+    ;; interim leaves by the same path a Content-Length body's does.
+    ;; Broken state: the chunked arm answers :CONTINUE, the client waits
+    ;; its timeout and sends anyway, and every chunked upload from a
+    ;; well-behaved client pays a second or more it should not.
+    (multiple-value-bind (v conn)
+        (drive (req "" :headers '("Host: x" "Transfer-Encoding: chunked"
+                                  "Expect: 100-continue")))
+      (check "chunked + 100-continue: the interim is flushed"
+             v :flush-queued)
+      (check "chunked + 100-continue: it is the interim that was queued"
+             (let ((b (web-skeleton::connection-write-buf conn)))
+               (and b (search "100 Continue"
+                              (sb-ext:octets-to-string
+                               b :external-format :ascii))
+                    t))
+             t)
+      (check "chunked + 100-continue: and the state is the interim's"
+             (web-skeleton::connection-state conn) :sending-100-continue))
+
+    ;; The client did not wait. Sending an interim it has stopped
+    ;; listening for is latency on what is, for chunked, the common
+    ;; shape — a sender that ignored the expectation has usually sent the
+    ;; whole body. Broken state: the interim arm is tested before the
+    ;; already-complete one, and every such upload takes an extra
+    ;; round trip.
+    (multiple-value-bind (v conn)
+        (drive (req (format nil "3~aabc~a0~a~a" *crlf* *crlf* *crlf* *crlf*)
+                    :headers '("Host: x" "Transfer-Encoding: chunked"
+                               "Expect: 100-continue")))
+      (check "chunked + 100-continue: a body already here dispatches"
+             v :dispatch)
+      (check "chunked + 100-continue: and no interim was queued"
+             (null (web-skeleton::connection-write-buf conn)) t))
+    ;; ---- interaction with the rules already in place ----
+
+    ;; The chunked arm falls through to the body cond rather than
+    ;; returning early, so the Expect gate still runs ahead of it.
+    ;; Broken state: chunked returns from the classification block and a
+    ;; chunked POST with an unknown expectation is accepted where a
+    ;; Content-Length one is refused.
+    (check "chunked: an unknown Expect still 417s"
+           (verdict "" :headers '("Host: x" "Transfer-Encoding: chunked"
+                                  "Expect: x-foo"))
+           :flush-queued)))
+
+
+;;; ---------------------------------------------------------------------------
+;;; A request that can never be finished does not keep its slot
+;;; ---------------------------------------------------------------------------
+
+(defun test-unfinishable-request-closes ()
+  (format t "~%Unfinishable request + peer FIN~%")
+  (labels ((drive (raw eof-verdict)
+             ;; RAW arrives in one read, then the peer's end-of-stream.
+             ;; CONNECTION-READ-AVAILABLE reports :OK-EOF for bytes and
+             ;; FIN together and :EOF for FIN alone, and both mean the
+             ;; same thing to a request still waiting on bytes.
+             (let* ((bytes (sb-ext:string-to-octets raw
+                                                    :external-format :ascii))
+                    (sent (list nil))
+                    (conn (web-skeleton::make-connection
+                           :fd -1
+                           :read-fn
+                           (lambda (buffer start max-bytes)
+                             (cond
+                               ((car sent) eof-verdict)
+                               (t (setf (car sent) t)
+                                  (let ((n (min (length bytes) max-bytes)))
+                                    (replace buffer bytes :start1 start
+                                                          :end2 n)
+                                    n)))))))
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))
+                 (error (e) (princ-to-string e))))))
+
+    ;; Headers that never terminate. Nothing more is coming, so waiting
+    ;; for a CRLFCRLF that cannot arrive holds a connection slot for
+    ;; *IDLE-TIMEOUT* with no peer on the other end — free for whoever
+    ;; sent it and walked away.
+    (check "unfinishable: half a request line with FIN closes"
+           (drive "GET /par" :eof) :close)
+
+    ;; A Content-Length body short of its declared length.
+    (check "unfinishable: a body short of its Content-Length closes"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aContent-Length: 10~a~aabc"
+                          *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :close)
+
+    ;; And chunked, which is the framing that has no declared length to
+    ;; be short of — the terminator is missing and no byte can supply it.
+    ;; Broken state: the check reads BODY-EXPECTED, which is 0 here, and
+    ;; a half-arrived chunked upload is held rather than closed.
+    (check "unfinishable: a chunked body without its terminator closes"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aab"
+                          *crlf* *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :close)
+
+    ;; The other half of the rule, and the one that must not move: a
+    ;; *complete* request arriving with its own FIN is answered, not
+    ;; closed. This is what TEST-HARNESS-PIPELINED-WITH-FIN-E2E covers
+    ;; end to end; asserted here too because it is the failure this
+    ;; change could plausibly cause and a unit check names it directly.
+    (check "unfinishable: a complete request with FIN still dispatches"
+           (drive (format nil "GET / HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*)
+                  :eof)
+           :dispatch)
+    (check "unfinishable: a complete chunked request with FIN dispatches"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aabc~a0~a~a"
+                          *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :dispatch)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -6811,6 +7412,9 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-transfer-encoding-rules)
+  (test-chunked-request-body)
+  (test-unfinishable-request-closes)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)

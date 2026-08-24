@@ -1015,6 +1015,72 @@
                   t))
       (setf *write-stall-timeout* saved))))
 
+(defun test-harness-write-backlog-minimum-rejected ()
+  "start-server must refuse a *max-write-backlog* that cannot carry a
+   maximal WebSocket message.
+
+   The backlog has to clear *max-ws-message-size* by ten bytes — the
+   largest header BUILD-WS-FRAME emits — or the receive path accepts a
+   payload the send path is then refused permission to return. Three
+   places said so and nothing checked it, which is the worst combination:
+   documented as a boundary and reachable anyway. Nobody hits it at the
+   defaults, 2 MiB against 1 MiB, and the deployment that does hit it is
+   the obvious one — someone trimming memory lowers the backlog and the
+   MiB of headroom disappears.
+
+   The error message is asserted rather than merely the fact of an error,
+   so this cannot pass on a rejection that happened for another reason —
+   the probe passes :workers 1 and a valid handler precisely so the other
+   two validations have nothing to say.
+
+   Exactly-at-the-bound is asserted too, because a >= written as > is the
+   plausible slip and refusing a legal configuration is its own defect.
+
+   SETF rather than LET, and restored in an UNWIND-PROTECT: the probe
+   runs in a fresh thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: start-server *max-write-backlog* minimum~%")
+  (let ((saved *max-write-backlog*))
+    (unwind-protect
+         (flet ((try-backlog (v)
+                  (setf *max-write-backlog* v)
+                  (let ((msg nil))
+                    (let ((th (sb-thread:make-thread
+                               (lambda ()
+                                 (handler-case
+                                     (progn
+                                       (start-server
+                                        :workers 1
+                                        :handler (lambda (r) (declare (ignore r))))
+                                       nil)
+                                   (error (e) (setf msg (princ-to-string e)))))
+                               :name "write-backlog-validation-probe")))
+                      (handler-case
+                          (sb-thread:join-thread th :timeout 2)
+                        (error ()
+                          (ignore-errors (sb-thread:terminate-thread th))
+                          (ignore-errors (sb-thread:join-thread th)))))
+                    msg)))
+           (check "start-server: a backlog under the message size signals"
+                  (let ((m (try-backlog 1024)))
+                    (and m (not (null (search "*max-write-backlog*" m))) t))
+                  t)
+           ;; One byte short of the ten-byte header allowance: the case
+           ;; the requirement is actually about, and the one a naive
+           ;; "backlog >= message size" check would let through.
+           (check "start-server: nine bytes of headroom is still too few"
+                  (let ((m (try-backlog (+ *max-ws-message-size* 9))))
+                    (and m (not (null (search "*max-write-backlog*" m))) t))
+                  t)
+           ;; And exactly at the bound must start. Asserted by the absence
+           ;; of a message, since this probe's server is torn down by the
+           ;; thread timeout rather than returning.
+           (check "start-server: exactly ten bytes of headroom is accepted"
+                  (let ((m (try-backlog (+ *max-ws-message-size* 10))))
+                    (or (null m)
+                        (null (search "*max-write-backlog*" m))))
+                  t))
+      (setf *max-write-backlog* saved))))
+
 (defun %split-ws (line)
   "LINE split on runs of space and tab. /proc/net/tcp columns are
    space-padded to varying widths, so a fixed-offset read of it is
@@ -1687,6 +1753,444 @@
                           (not (null (search "path=/b" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun test-harness-pipelined-after-body-e2e ()
+  "A request carrying a Content-Length body, with a second request
+   pipelined behind it.
+
+   The keep-alive reset has to shift from past the *body*, and this is the
+   only shape where that differs from shifting past the headers: with no
+   body the two are the same offset, so TEST-HARNESS-PIPELINED-WITH-FIN-E2E
+   — two GETs — cannot tell a boundary that forgets the body from one that
+   does not.
+
+   What each assertion catches, measured against three sabotaged
+   boundaries rather than reasoned about:
+
+     never set, so 0    the whole request stays buffered and is re-parsed
+                        forever. The server never closes, and `server
+                        closed the connection` fails on its bounded read
+                        — after which the run dies, so this one is loud
+                        without being countable.
+     long by 3          the next parse begins inside /b's request line.
+     short by 3         same, from the other side.
+                        Both: `second response present` and `/b
+                        dispatched after it` fail. The same two, twice.
+
+   `/a body arrived whole` is a control, not a discriminator, and passed
+   under all three. REQUEST-END governs only what the *next* parse sees:
+   /a's body is sliced by BODY-EXPECTED in CONNECTION-PARSE-REQUEST and
+   answered before the keep-alive reset runs, so no boundary error can
+   truncate it. It stays because it costs nothing and says the bodied path
+   still works — but the discriminators here are the two that name /b."
+  (format t "~%Harness: a bodied request with one pipelined behind it~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "path=~a body=~a"
+                               (http-request-path req)
+                               (if (http-request-body req)
+                                   (sb-ext:octets-to-string
+                                    (http-request-body req)
+                                    :external-format :utf-8)
+                                   "-")))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (requests
+                     (concatenate 'string
+                                  "POST /a HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Content-Length: 5" *crlf* *crlf*
+                                  "HELLO"
+                                  "GET /b HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Connection: close" *crlf* *crlf*)))
+               (write-sequence (sb-ext:string-to-octets
+                                requests :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (check "pipelined body: server closed the connection"
+                        (read-to-eof-bounded stream buf) t)
+                 (let* ((text (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8))
+                        (first-200 (search "HTTP/1.1 200" text))
+                        (second-200 (and first-200
+                                         (search "HTTP/1.1 200" text
+                                                 :start2 (1+ first-200)))))
+                   (check "pipelined body: first response present"
+                          (not (null first-200)) t)
+                   (check "pipelined body: second response present"
+                          (not (null second-200)) t)
+                   (check "pipelined body: /a body arrived whole"
+                          (not (null (search "path=/a body=HELLO" text))) t)
+                   (check "pipelined body: /b dispatched after it"
+                          (not (null (search "path=/b" text))) t)
+                   ;; And carried no body of its own. BODY-EXPECTED is
+                   ;; written by the Content-Length arm and by the chunked
+                   ;; arm, and by neither of the paths a bodiless request
+                   ;; takes — so on this exact sequence, POST-with-body
+                   ;; then GET, the keep-alive reset is its only writer.
+                   ;; Left stale, CONNECTION-PARSE-REQUEST attaches five
+                   ;; bytes of whatever follows /b's headers to a request
+                   ;; the client sent no body with. The handler has always
+                   ;; printed this value; only the assertion was missing.
+                   (check "pipelined body: /b carried no body of its own"
+                          (not (null (search "path=/b body=-" text))) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-chunked-keepalive-e2e ()
+  "Two chunked requests on one keep-alive connection.
+
+   The detector for CHUNK-SCAN-POS being cleared per request, and the
+   first body is large on purpose. The walk clamps a resume that is too
+   *low* up to START, so a leftover cursor only bites when it exceeds the
+   *next* request's body-start. With a short first body the leftover is
+   smaller than the second request's header block, the clamp hides it, and
+   this test passes with the clear removed — proving nothing.
+
+   Sized so it cannot: the first body is one 200-byte chunk, leaving the
+   cursor near 270, while the second request's body begins near 84. With
+   the clear neutered the second walk starts well past its own body, finds
+   no framing there, and the connection never answers — measured:
+   this test's `server closed the connection` and `second request
+   dispatched`.
+
+   That was measured after removing a second clear, not before. The
+   connection resets used to zero the cursor as well, and with both in
+   place neutering either one was silent: each masked the other, and this
+   test detected neither. Two mechanisms, one guarantee, no way to tell
+   them apart.
+
+   The second request is chunked too, rather than a plain GET, because a
+   GET would never consult the cursor at all."
+  (format t "~%Harness: two chunked requests on one connection~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "path=~a len=~a"
+                               (http-request-path req)
+                               (if (http-request-body req)
+                                   (length (http-request-body req))
+                                   -1)))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (big (make-string 200 :initial-element #\a))
+                    (requests
+                     (concatenate 'string
+                                  "POST /a HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Transfer-Encoding: chunked" *crlf* *crlf*
+                                  "c8" *crlf* big *crlf* "0" *crlf* *crlf*
+                                  "POST /b HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Transfer-Encoding: chunked" *crlf* *crlf*
+                                  "2" *crlf* "de" *crlf* "0" *crlf* *crlf*
+                                  ;; Third, and bodiless on purpose: it is
+                                  ;; the only shape that reads BODY-FRAMING
+                                  ;; without writing it first.
+                                  "GET /c HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Connection: close" *crlf* *crlf*)))
+               (write-sequence (sb-ext:string-to-octets
+                                requests :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (check "chunked keepalive: server closed the connection"
+                        (read-to-eof-bounded stream buf) t)
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 (fill-pointer buf))
+                              :external-format :utf-8)))
+                   (check "chunked keepalive: first body decoded whole"
+                          (not (null (search "path=/a len=200" text))) t)
+                   (check "chunked keepalive: second request dispatched"
+                          (not (null (search "path=/b len=2" text))) t)
+                   ;; BODY-FRAMING is written by the chunked arm and by
+                   ;; nothing else, so a bodiless request following a
+                   ;; chunked one reads whatever the reset left. Left
+                   ;; stale at :CHUNKED, CONNECTION-PARSE-REQUEST decodes
+                   ;; /c over an empty range and a perfectly good GET
+                   ;; earns a 400. Both other requests here are chunked,
+                   ;; which is right for the cursor and is exactly what
+                   ;; leaves the framing field uncovered.
+                   (check "chunked keepalive: a bodiless request after them is served"
+                          (not (null (search "path=/c len=-1" text))) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-chunked-body-cap-e2e ()
+  "Two chunked requests on one connection, each under `*max-body-size*`
+   and over it summed, plus one that genuinely exceeds it.
+
+   The detector for BODY-DECODED being cleared by the keep-alive reset.
+   That accumulator is written by CONNECTION-BODY-COMPLETE-P as chunks are
+   proved whole, and by no completing arm — so the reset is its only
+   writer of 0, the same position BODY-FRAMING and BODY-EXPECTED are in.
+   Left stale, the second request inherits the first's total and a
+   perfectly legal upload earns a 413 that names a cap it never reached.
+
+   `*max-body-size*` is set globally rather than bound, because the worker
+   runs in a thread that inherits nothing from this one's dynamic
+   environment — a LET here would be invisible to the code under test.
+   Restored on the way out."
+  (format t "~%Harness: the chunked body cap across a keep-alive~%")
+  (let ((saved web-skeleton:*max-body-size*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-body-size* 256)
+           (with-test-server
+               (:handler (lambda (req)
+                           (make-text-response
+                            200 (format nil "path=~a len=~a"
+                                        (http-request-path req)
+                                        (length (http-request-body req))))))
+             ;; Under the cap twice, over it summed.
+             (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+               (unwind-protect
+                    (progn
+                      (sb-bsd-sockets:socket-connect socket #(127 0 0 1)
+                                                     *test-port*)
+                      (let* ((stream (sb-bsd-sockets:socket-make-stream
+                                      socket :input t :output t
+                                      :element-type '(unsigned-byte 8)))
+                             (a (make-string 200 :initial-element #\a))
+                             (b (make-string 100 :initial-element #\b))
+                             (requests
+                              (concatenate 'string
+                                           "POST /a HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf* *crlf*
+                                           "c8" *crlf* a *crlf* "0" *crlf* *crlf*
+                                           "POST /b HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf*
+                                           "Connection: close" *crlf* *crlf*
+                                           "64" *crlf* b *crlf* "0" *crlf* *crlf*)))
+                        (write-sequence (sb-ext:string-to-octets
+                                         requests :external-format :ascii)
+                                        stream)
+                        (force-output stream)
+                        (ignore-errors
+                         (sb-bsd-sockets:socket-shutdown socket
+                                                         :direction :output))
+                        (let ((buf (make-array 16384
+                                               :element-type '(unsigned-byte 8)
+                                               :fill-pointer 0 :adjustable t)))
+                          (check "body cap: server closed the connection"
+                                 (read-to-eof-bounded stream buf) t)
+                          (let ((text (sb-ext:octets-to-string
+                                       (subseq buf 0 (fill-pointer buf))
+                                       :external-format :utf-8)))
+                            (check "body cap: first request under the cap is served"
+                                   (not (null (search "path=/a len=200" text))) t)
+                            ;; 200 + 100 is over 256. Only a cleared
+                            ;; accumulator lets this one through.
+                            (check "body cap: the second starts from zero, not 200"
+                                   (not (null (search "path=/b len=100" text))) t)
+                            (check "body cap: neither was refused"
+                                   (null (search "HTTP/1.1 413" text)) t)))))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))
+             ;; And one that really is too big, so the 413 is known to
+             ;; reach a client and not merely to be raised.
+             (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                          :type :stream :protocol :tcp)))
+               (unwind-protect
+                    (progn
+                      (sb-bsd-sockets:socket-connect socket #(127 0 0 1)
+                                                     *test-port*)
+                      (let* ((stream (sb-bsd-sockets:socket-make-stream
+                                      socket :input t :output t
+                                      :element-type '(unsigned-byte 8)))
+                             (big (make-string 300 :initial-element #\c))
+                             (request
+                              (concatenate 'string
+                                           "POST /big HTTP/1.1" *crlf*
+                                           "Host: localhost" *crlf*
+                                           "Transfer-Encoding: chunked" *crlf* *crlf*
+                                           "12c" *crlf* big *crlf* "0" *crlf* *crlf*)))
+                        (write-sequence (sb-ext:string-to-octets
+                                         request :external-format :ascii)
+                                        stream)
+                        (force-output stream)
+                        (ignore-errors
+                         (sb-bsd-sockets:socket-shutdown socket
+                                                         :direction :output))
+                        (let ((buf (make-array 16384
+                                               :element-type '(unsigned-byte 8)
+                                               :fill-pointer 0 :adjustable t)))
+                          (read-to-eof-bounded stream buf)
+                          (let ((text (sb-ext:octets-to-string
+                                       (subseq buf 0 (fill-pointer buf))
+                                       :external-format :utf-8)))
+                            (check "body cap: an oversized body is 413 to the client"
+                                   (not (null (search "HTTP/1.1 413" text))) t)
+                            (check "body cap: and was never dispatched"
+                                   (null (search "path=/big" text)) t)))))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf web-skeleton:*max-body-size* saved))))
+
+(defun test-harness-chunked-trailer-smuggle-e2e ()
+  "A trailer section carrying a complete HTTP request, end to end.
+
+   The headline acceptance criterion of the issue, and a delivery-shaped
+   assertion cannot see it: if the smuggle succeeded the client would get
+   *two* responses, so what this asserts is that it gets one, and that the
+   one it gets is the 400 the trailer earned rather than a 200 for /a
+   followed by a 200 for the request hidden in its trailer.
+
+   Refusing means the boundary for a trailer-bearing request is never
+   computed at all, which is why this is a 400 and not a silently-consumed
+   trailer."
+  (format t "~%Harness: a trailer holding a whole request~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "served=~a" (http-request-path req)))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let* ((stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t
+                             :element-type '(unsigned-byte 8)))
+                    (attack
+                     (concatenate 'string
+                                  "POST /a HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Transfer-Encoding: chunked" *crlf* *crlf*
+                                  "3" *crlf* "abc" *crlf*
+                                  "0" *crlf*
+                                  ;; The trailer section, and a whole
+                                  ;; request inside it.
+                                  "GET /admin HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  *crlf*)))
+               (write-sequence (sb-ext:string-to-octets
+                                attack :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (check "trailer smuggle: server closed the connection"
+                        (read-to-eof-bounded stream buf) t)
+                 (let* ((text (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8))
+                        (first-status (search "HTTP/1.1 " text))
+                        (second-status (and first-status
+                                            (search "HTTP/1.1 " text
+                                                    :start2 (1+ first-status)))))
+                   (check "trailer smuggle: refused with 400"
+                          (not (null (search "HTTP/1.1 400" text))) t)
+                   ;; The assertion the issue exists for: not two responses.
+                   (check "trailer smuggle: exactly one response"
+                          (null second-status) t)
+                   (check "trailer smuggle: /admin was never served"
+                          (null (search "served=/admin" text)) t)
+                   (check "trailer smuggle: /a was not served either"
+                          (null (search "served=/a" text)) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun test-harness-chunked-expect-100-continue-e2e ()
+  "A chunked upload from a client that actually waits for the interim.
+
+   The unit assertions cover the verdict and the queued bytes; this
+   covers the part they cannot, which is that the interim *arrives* and
+   that the chunked frame survives it. Between the two, the connection
+   passes through :SENDING-100-CONTINUE and back — CONNECTION-RESET-WRITE
+   runs on the way out, and if it or anything else cleared BODY-FRAMING,
+   CHUNK-SCAN-POS or HEADER-END, the body read would resume against a
+   frame belonging to no request.
+
+   Written by hand rather than through TEST-HTTP-REQUEST because the
+   waiting is the subject: the headers go out alone, the interim is read
+   back before a single body byte is sent, and only then does the body
+   follow."
+  (format t "~%Harness: a chunked upload that waits for its 100~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "got=~a"
+                               (sb-ext:octets-to-string
+                                (http-request-body req)
+                                :external-format :ascii)))))
+    (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+             (let ((stream (sb-bsd-sockets:socket-make-stream
+                            socket :input t :output t
+                            :element-type '(unsigned-byte 8))))
+               ;; Headers only. No body byte has been written.
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string
+                              "POST /upload HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf*
+                              "Transfer-Encoding: chunked" *crlf*
+                              "Expect: 100-continue" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               ;; The interim, read before anything else is sent. A
+               ;; server that skipped it would leave this read blocking
+               ;; until the harness's bound expires.
+               (check "chunked 100: the interim arrives before the body"
+                      (attempt (read-response-status-head stream)) 100)
+               ;; Now the body, in two chunks, so the walk resumes across
+               ;; a wake-up rather than seeing it all at once.
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string "3" *crlf* "abc" *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string "2" *crlf* "de" *crlf*
+                              "0" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (read-to-eof-bounded stream buf)
+                 (let ((text (sb-ext:octets-to-string
+                              (subseq buf 0 (fill-pointer buf))
+                              :external-format :utf-8)))
+                   (check "chunked 100: the response is 200"
+                          (not (null (search "HTTP/1.1 200" text))) t)
+                   ;; Both chunks, decoded, in order — which is the frame
+                   ;; having survived the interim.
+                   (check "chunked 100: the whole body arrived decoded"
+                          (not (null (search "got=abcde" text))) t)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 (defun read-response-status-head (stream)
   "Read through the CRLFCRLF ending a response's header block and return
    the status. NIL if the peer closed, or the deadline passed, before a
@@ -1958,6 +2462,11 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
+  (test-harness-pipelined-after-body-e2e)
+  (test-harness-chunked-keepalive-e2e)
+  (test-harness-chunked-trailer-smuggle-e2e)
+  (test-harness-chunked-body-cap-e2e)
+  (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
@@ -1975,6 +2484,7 @@
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-write-backlog-minimum-rejected)
   (test-harness-fetch-stream-plain-e2e)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
