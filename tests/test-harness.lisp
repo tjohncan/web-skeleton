@@ -1015,6 +1015,72 @@
                   t))
       (setf *write-stall-timeout* saved))))
 
+(defun test-harness-write-backlog-minimum-rejected ()
+  "start-server must refuse a *max-write-backlog* that cannot carry a
+   maximal WebSocket message.
+
+   The backlog has to clear *max-ws-message-size* by ten bytes — the
+   largest header BUILD-WS-FRAME emits — or the receive path accepts a
+   payload the send path is then refused permission to return. Three
+   places said so and nothing checked it, which is the worst combination:
+   documented as a boundary and reachable anyway. Nobody hits it at the
+   defaults, 2 MiB against 1 MiB, and the deployment that does hit it is
+   the obvious one — someone trimming memory lowers the backlog and the
+   MiB of headroom disappears.
+
+   The error message is asserted rather than merely the fact of an error,
+   so this cannot pass on a rejection that happened for another reason —
+   the probe passes :workers 1 and a valid handler precisely so the other
+   two validations have nothing to say.
+
+   Exactly-at-the-bound is asserted too, because a >= written as > is the
+   plausible slip and refusing a legal configuration is its own defect.
+
+   SETF rather than LET, and restored in an UNWIND-PROTECT: the probe
+   runs in a fresh thread and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: start-server *max-write-backlog* minimum~%")
+  (let ((saved *max-write-backlog*))
+    (unwind-protect
+         (flet ((try-backlog (v)
+                  (setf *max-write-backlog* v)
+                  (let ((msg nil))
+                    (let ((th (sb-thread:make-thread
+                               (lambda ()
+                                 (handler-case
+                                     (progn
+                                       (start-server
+                                        :workers 1
+                                        :handler (lambda (r) (declare (ignore r))))
+                                       nil)
+                                   (error (e) (setf msg (princ-to-string e)))))
+                               :name "write-backlog-validation-probe")))
+                      (handler-case
+                          (sb-thread:join-thread th :timeout 2)
+                        (error ()
+                          (ignore-errors (sb-thread:terminate-thread th))
+                          (ignore-errors (sb-thread:join-thread th)))))
+                    msg)))
+           (check "start-server: a backlog under the message size signals"
+                  (let ((m (try-backlog 1024)))
+                    (and m (not (null (search "*max-write-backlog*" m))) t))
+                  t)
+           ;; One byte short of the ten-byte header allowance: the case
+           ;; the requirement is actually about, and the one a naive
+           ;; "backlog >= message size" check would let through.
+           (check "start-server: nine bytes of headroom is still too few"
+                  (let ((m (try-backlog (+ *max-ws-message-size* 9))))
+                    (and m (not (null (search "*max-write-backlog*" m))) t))
+                  t)
+           ;; And exactly at the bound must start. Asserted by the absence
+           ;; of a message, since this probe's server is torn down by the
+           ;; thread timeout rather than returning.
+           (check "start-server: exactly ten bytes of headroom is accepted"
+                  (let ((m (try-backlog (+ *max-ws-message-size* 10))))
+                    (or (null m)
+                        (null (search "*max-write-backlog*" m))))
+                  t))
+      (setf *max-write-backlog* saved))))
+
 (defun %split-ws (line)
   "LINE split on runs of space and tab. /proc/net/tcp columns are
    space-padded to varying widths, so a fixed-offset read of it is
@@ -2418,6 +2484,7 @@
   (test-harness-connection-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
+  (test-harness-write-backlog-minimum-rejected)
   (test-harness-fetch-stream-plain-e2e)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)

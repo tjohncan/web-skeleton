@@ -7331,6 +7331,76 @@
                                   "Expect: x-foo"))
            :flush-queued)))
 
+
+;;; ---------------------------------------------------------------------------
+;;; A request that can never be finished does not keep its slot
+;;; ---------------------------------------------------------------------------
+
+(defun test-unfinishable-request-closes ()
+  (format t "~%Unfinishable request + peer FIN~%")
+  (labels ((drive (raw eof-verdict)
+             ;; RAW arrives in one read, then the peer's end-of-stream.
+             ;; CONNECTION-READ-AVAILABLE reports :OK-EOF for bytes and
+             ;; FIN together and :EOF for FIN alone, and both mean the
+             ;; same thing to a request still waiting on bytes.
+             (let* ((bytes (sb-ext:string-to-octets raw
+                                                    :external-format :ascii))
+                    (sent (list nil))
+                    (conn (web-skeleton::make-connection
+                           :fd -1
+                           :read-fn
+                           (lambda (buffer start max-bytes)
+                             (cond
+                               ((car sent) eof-verdict)
+                               (t (setf (car sent) t)
+                                  (let ((n (min (length bytes) max-bytes)))
+                                    (replace buffer bytes :start1 start
+                                                          :end2 n)
+                                    n)))))))
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))
+                 (error (e) (princ-to-string e))))))
+
+    ;; Headers that never terminate. Nothing more is coming, so waiting
+    ;; for a CRLFCRLF that cannot arrive holds a connection slot for
+    ;; *IDLE-TIMEOUT* with no peer on the other end — free for whoever
+    ;; sent it and walked away.
+    (check "unfinishable: half a request line with FIN closes"
+           (drive "GET /par" :eof) :close)
+
+    ;; A Content-Length body short of its declared length.
+    (check "unfinishable: a body short of its Content-Length closes"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aContent-Length: 10~a~aabc"
+                          *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :close)
+
+    ;; And chunked, which is the framing that has no declared length to
+    ;; be short of — the terminator is missing and no byte can supply it.
+    ;; Broken state: the check reads BODY-EXPECTED, which is 0 here, and
+    ;; a half-arrived chunked upload is held rather than closed.
+    (check "unfinishable: a chunked body without its terminator closes"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aab"
+                          *crlf* *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :close)
+
+    ;; The other half of the rule, and the one that must not move: a
+    ;; *complete* request arriving with its own FIN is answered, not
+    ;; closed. This is what TEST-HARNESS-PIPELINED-WITH-FIN-E2E covers
+    ;; end to end; asserted here too because it is the failure this
+    ;; change could plausibly cause and a unit check names it directly.
+    (check "unfinishable: a complete request with FIN still dispatches"
+           (drive (format nil "GET / HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*)
+                  :eof)
+           :dispatch)
+    (check "unfinishable: a complete chunked request with FIN dispatches"
+           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aabc~a0~a~a"
+                          *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*)
+                  :eof)
+           :dispatch)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -7344,6 +7414,7 @@
   (test-http-parser-errors)
   (test-transfer-encoding-rules)
   (test-chunked-request-body)
+  (test-unfinishable-request-closes)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)

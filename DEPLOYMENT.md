@@ -934,6 +934,16 @@ progress on the queue and not from the connection's last activity, so a
 peer that keeps sending while refusing to read cannot keep its own
 backlog alive.
 
+Both are checked when the server starts, and `*max-write-backlog*` has a
+floor as well as a meaning: it must clear `*max-ws-message-size*` by at
+least ten bytes, the largest frame header. Below that the receive path
+accepts a payload the send path is then refused permission to return, so
+an echo handler is handed a message it cannot give back. The defaults
+leave a full MiB of room; the configuration that reaches the floor is the
+obvious one, a deployment trimming memory by lowering the backlog and not
+the message size. `start-server` refuses to boot rather than letting it
+surface on the first maximal message.
+
 `*write-stall-timeout*` applies to every connection with a backlog,
 whatever state it is in — WebSocket frames, server-sent streams, ordinary
 responses to a client that stopped reading. It was called

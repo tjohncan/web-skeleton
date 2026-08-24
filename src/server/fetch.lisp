@@ -1942,7 +1942,7 @@
         (te-present
          (multiple-value-bind (complete next)
              (chunked-body-complete-p buf body-start end
-                                      (max body-start chunk-scan)
+                                      chunk-scan
                                       on-data)
            ;; The header parse only runs on the read that actually
            ;; completes — the cheap framing walk gates it.

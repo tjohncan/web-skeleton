@@ -1053,7 +1053,44 @@
 
 (defun connection-on-read (conn)
   "Handle readable event. Reads available data and advances protocol state."
-  (let ((read-result (connection-read-available conn)))
+  (let* ((read-result (connection-read-available conn))
+         ;; The verdict every "not yet" site answers with — named for the
+         ;; situation rather than the action, because when the peer is
+         ;; done the action is not to keep reading. :CONTINUE means
+         ;; more bytes will finish this request — and when the peer's FIN
+         ;; arrived in the same read, no more bytes can, so the request is
+         ;; unfinishable rather than merely incomplete. Holding the slot
+         ;; until *IDLE-TIMEOUT* takes it costs a connection for ten
+         ;; seconds with nobody on the other end, at no cost at all to
+         ;; whoever sent half a request and walked away.
+         ;;
+         ;; Framing-independent on purpose: a Content-Length body short of
+         ;; its declared length and a chunked body without its terminator
+         ;; are unfinishable for the same reason, and the second needs no
+         ;; declared length to compare against. The question is only
+         ;; whether the state machine still wants bytes.
+         ;;
+         ;; One value read at four sites rather than four copies of the
+         ;; test. Distinct from the :EOF arm below, which fires when
+         ;; nothing is buffered at all; this is the case where bytes
+         ;; arrived, were not enough, and no more are coming. :DISPATCH is
+         ;; untouched — a complete request arriving with its own FIN still
+         ;; deserves an answer, and TEST-HARNESS-PIPELINED-WITH-FIN-E2E
+         ;; is what asserts that.
+         ;;
+         ;; The Expect: 100-continue arms sit *above* this in both body
+         ;; conds, so a request whose peer FINs after the headers has an
+         ;; interim queued before the FIN is noticed, and closes on the
+         ;; next read — one wasted write to a peer that is gone. Left that
+         ;; way on purpose: gating the interim on this value would risk
+         ;; withholding it from a live client to save a write to a dead
+         ;; one, and a client that waits the full 1-3s for an interim that
+         ;; never comes is the failure this framework sends interims to
+         ;; avoid. The Content-Length arm has had exactly this shape since
+         ;; the interim existed.
+         (unfinished (if (member read-result '(:eof :ok-eof))
+                         :close
+                         :continue)))
     ;; :OK and :OK-EOF both fall through to the state machine below, and
     ;; deliberately: bytes are bytes, and a fire-and-close client whose
     ;; request arrived with its FIN still deserves an answer. The :EOF arm
@@ -1316,7 +1353,7 @@
                        :flush-queued)
                       (t
                        (setf (connection-state conn) :read-body)
-                       :continue)))
+                       unfinished)))
                    ;; Body present — read it, dispatching when complete.
                    ((and content-length (> content-length 0))
                     ;; Reject oversized bodies before allocating.
@@ -1383,7 +1420,7 @@
                         ;; Plain body wait.
                         (t
                          (setf (connection-state conn) :read-body)
-                         :continue))))
+                         unfinished))))
                    ;; No body — request is complete.
                    (t
                     ;; BODY-EXPECTED is deliberately not set here: it is
@@ -1397,11 +1434,11 @@
                           (connection-request-end conn) (+ header-end 4))
                     :dispatch)))))))
              ;; No CRLFCRLF yet — keep reading
-             :continue)))
+             unfinished)))
       (:read-body
        (if (connection-body-complete-p conn)
            :dispatch
-           :continue))
+           unfinished))
       (:websocket
        :websocket))))
 

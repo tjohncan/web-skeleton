@@ -1559,6 +1559,25 @@
             drain — the idle timeouts are measured on last activity, which ~
             a peer that stops reading keeps fresh by continuing to send."
            *write-stall-timeout*))
+  ;; The docstring and two documents state this as a requirement and
+  ;; nothing enforced it. Both limits are exported and tunable apart —
+  ;; which is what makes it a requirement rather than an identity to lean
+  ;; on — and the shape it protects is the obvious one: a deployment
+  ;; trimming memory lowers the backlog, the default MiB of headroom
+  ;; disappears, and an echo handler is handed a message it is then
+  ;; refused permission to return. Checked at startup rather than at send
+  ;; time because a misconfiguration should not wait for the first
+  ;; maximal message to reveal itself.
+  (unless (and (integerp *max-write-backlog*)
+               (>= *max-write-backlog* (+ *max-ws-message-size* 10)))
+    (error "start-server: *max-write-backlog* is ~s and ~
+            *max-ws-message-size* is ~s. The backlog must clear the ~
+            message size by at least 10 bytes — the largest header ~
+            BUILD-WS-FRAME emits — or a maximal legal WebSocket message ~
+            cannot be sent even onto an empty queue. Raise the backlog to ~
+            at least ~s, or lower *max-ws-message-size*."
+           *max-write-backlog* *max-ws-message-size*
+           (+ *max-ws-message-size* 10)))
   (setf *shutdown* nil)
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an
