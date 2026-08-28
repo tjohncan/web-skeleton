@@ -2942,6 +2942,7 @@
   (test-harness-fetch-into-refusals)
   (test-harness-fetch-into-relay-e2e)
   (test-harness-fetch-into-chained-e2e)
+
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (report-suite "Harness")

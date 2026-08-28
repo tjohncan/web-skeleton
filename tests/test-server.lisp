@@ -7415,6 +7415,106 @@
 ;;; working.
 ;;; ---------------------------------------------------------------------------
 
+(defun test-detached-pause-auto-resumes ()
+  "A paused detached fetch is resumed by its target's backlog draining.
+
+   Sibling to TEST-AUTOMATIC-RESUME-EDGE rather than a replacement for it.
+   That one has covered the mechanism since the resume edge landed, and
+   with a :STREAMING target — what it could not cover is that anything
+   reached it. RESUME-PAUSED-OUTBOUND runs from HANDLE-CLIENT-WRITE's :DONE
+   arm when a connection's backlog empties, and until the detached seam the
+   only connection a fetch could pause against was an :AWAITING inbound,
+   which has nothing queued by construction and so never receives EPOLLOUT.
+   A tested mechanism with no reachable caller, which is the same shape as
+   the relay example this branch deleted.
+
+   So what is new here is the sink, not the edge: a paused outbound whose
+   FETCH-SINK is :DETACHED, resumed by its target draining, with the
+   deadline advanced by the interval spent paused.
+
+   Driven here rather than end to end, and that is a deliberate retreat.
+   The e2e version has to make a real client stop reading until the
+   target's socket refuses a write, and loopback will not cooperate:
+   measured, 768 KiB went through with the target's pending bytes never
+   leaving 0, and 5 MiB made the test slow without making it reliable. A
+   test that cannot provoke the state it names is worse than one that
+   drives the edge directly — it passes for the wrong reason, which is the
+   failure this branch exists to delete.
+
+   So the edge is driven: a target holding a backlog and a paused outbound
+   behind it, flushed until :DONE, with the outbound's interest checked
+   before and after.
+
+   The precondition this pins down, which no document has ever carried:
+   auto-resume needs the target to have *actually backed up*. STREAM-SEND
+   flushes inline through STREAM-FLUSH, which never reaches
+   HANDLE-CLIENT-WRITE, so a pause taken while the target's queue was empty
+   has no wake-up coming and still needs an explicit FETCH-RESUME."
+  (format t "~%Detached fetch: pause resumes when the target drains~%")
+  (multiple-value-bind (out-server out-client) (%loopback-pair)
+    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((out-fd (web-skeleton::socket-fd out-server))
+                    (tgt-fd (web-skeleton::socket-fd tgt-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
+                    ;; leaves one: subscribed to no events at all, so
+                    ;; nothing but a resume can ever wake it.
+                    (out (web-skeleton::make-connection
+                          :fd out-fd :socket out-server :state :out-read
+                          :outbound-p t
+                          :fetch-sink :detached
+                          :fetch-paused t
+                          :fetch-paused-at (get-universal-time)
+                          :fetch-deadline (+ (get-universal-time) 30)
+                          :inbound-fd tgt-fd
+                          :last-active (get-universal-time)))
+                    ;; The target: a streaming connection with the
+                    ;; back-link the pause left on it.
+                    (tgt (web-skeleton::make-connection
+                          :fd tgt-fd :socket tgt-server :state :streaming
+                          :stream-framing :chunked
+                          :paused-outbound-fd out-fd
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking out-fd)
+               (web-skeleton::set-nonblocking tgt-fd)
+               (web-skeleton::register-connection out)
+               (web-skeleton::register-connection tgt)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (web-skeleton::epoll-add epfd tgt-fd
+                                        (logior web-skeleton::+epollout+
+                                                web-skeleton::+epollet+))
+               (check "detached pause: the outbound starts paused"
+                      (web-skeleton::connection-fetch-paused out) t)
+               ;; A backlog on the target, and then the drain that ends it.
+               (web-skeleton::connection-append-write
+                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
+               (check "detached pause: the target has a backlog to drain"
+                      (plusp (web-skeleton::connection-write-pending tgt)) t)
+               (web-skeleton::handle-client-write tgt epfd)
+               (check "detached pause: the target drained"
+                      (web-skeleton::connection-write-pending tgt) 0)
+               ;; The property.
+               (check "detached pause: draining the target resumed the fetch"
+                      (web-skeleton::connection-fetch-paused out) nil)
+               (check "detached pause: and the back-link was cleared with it"
+                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
+               ;; The deadline moved by the time spent paused, so a relay
+               ;; is not killed for applying the backpressure it was told
+               ;; to apply.
+               (check "detached pause: the deadline is not still the original"
+                      (>= (web-skeleton::connection-fetch-deadline out)
+                          (+ (web-skeleton::connection-fetch-started-at out)
+                             30))
+                      t))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close out-server))
+          (ignore-errors (sb-bsd-sockets:socket-close out-client))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -7569,6 +7669,7 @@
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
+  (test-detached-pause-auto-resumes)
   (test-cpu-count-parsers)
   (report-suite "Server")
   (zerop *tests-failed*))
