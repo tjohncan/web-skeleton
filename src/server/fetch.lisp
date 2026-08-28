@@ -1394,10 +1394,14 @@
       ;; Fire the cleanup sentinel so the app's :then closure runs
       ;; exactly once even on pre-connection errors (malformed URL,
       ;; DNS spawn failure, HTTPS not loaded).
-      (handler-case
-          (funcall (http-fetch-continuation-callback fetch-req) nil nil nil)
-        (error (e2)
-          (log-warn "fetch cleanup callback raised: ~a" e2)))
+      ;;
+      ;; Taken from the continuation rather than through
+      ;; CLAIM-FETCH-CALLBACK, because no outbound connection was ever
+      ;; built to hold it — this is the one ending that happens before a
+      ;; fetch has anywhere to live. Nothing reaches FETCH-REQ again: it
+      ;; arrived as this call's argument and is unreachable once the call
+      ;; returns, so there is no second path to claim it away from.
+      (finish-fetch (http-fetch-continuation-callback fetch-req) :aborted)
       (let ((error-response (strip-body-for-head
                              (format-response
                               (make-error-response 502)
@@ -1960,8 +1964,69 @@
          (values nil chunk-scan))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Deliver fetch result to the parked inbound connection
+;;; Ending a fetch
+;;;
+;;; An application's fetch callback fires exactly once per fetch lifetime.
+;;; That was held by four separate invocation sites agreeing with each other
+;;; about when to clear the slot and what a cleanup call looks like — three
+;;; readers of "how does a fetch end", which is the shape this codebase
+;;; refuses everywhere else.
+;;;
+;;; It is now two functions with one job each. CLAIM-FETCH-CALLBACK takes the
+;;; callback off a connection so no later path can find it; FINISH-FETCH is
+;;; the only place an application callback is invoked at all.
+;;;
+;;; They stay separate because on the delivery path the claim and the call
+;;; are not adjacent: COMPLETE-FETCH must claim *before* CLOSE-OUTBOUND, or
+;;; teardown fires the cleanup sentinel on a fetch that succeeded, and it
+;;; must call *after*, which is the order that was already there. Collapsing
+;;; the two into one atomic step would move one of those across the other.
 ;;; ---------------------------------------------------------------------------
+
+(defun claim-fetch-callback (conn)
+  "Take CONN's fetch callback and clear the slot. Returns the callback, or
+   NIL if it had already been claimed.
+
+   Clearing is the whole point: a claimed callback is unreachable from the
+   connection, so every later path that would have fired it — CLOSE-OUTBOUND
+   on the way down, a second completion — finds nothing and cannot deliver
+   it twice."
+  (let ((callback (connection-fetch-callback conn)))
+    (when callback
+      (setf (connection-fetch-callback conn) nil))
+    callback))
+
+(defun finish-fetch (callback outcome &key status headers body)
+  "Invoke CALLBACK once with the result of a fetch, and answer what it
+   returned. The sole site from which an application fetch callback is
+   called; NIL CALLBACK is a no-op, so a caller need not test a claim.
+
+   OUTCOME is :DELIVERED — STATUS, HEADERS and BODY are the upstream's — or
+   :ABORTED, which passes the (NIL NIL NIL) cleanup sentinel and ignores the
+   other three. A NIL status is what tells an application the fetch did not
+   complete, so :ABORTED never carries one.
+
+   The two outcomes treat a raising callback differently, and deliberately.
+   :DELIVERED lets it propagate, because the caller is answering an inbound
+   request and has a 500 to give it. :ABORTED is running on a teardown path
+   with nothing left to answer, so a raise there is logged and swallowed —
+   a failing cleanup hook must not stop the rest of the teardown."
+  (when callback
+    ;; What the callback is given, and what happens if it raises, are two
+    ;; questions. Keeping them apart leaves exactly one expression in this
+    ;; file that calls an application callback at all, which is the property
+    ;; worth being able to grep for.
+    (multiple-value-bind (s h b)
+        (ecase outcome
+          (:delivered (values status headers body))
+          (:aborted   (values nil nil nil)))
+      (flet ((invoke () (funcall callback s h b)))
+        (if (eq outcome :aborted)
+            (handler-case (invoke)
+              (error (e)
+                (log-warn "fetch cleanup callback raised: ~a" e)
+                nil))
+            (invoke))))))
 
 (defun complete-fetch (out-conn epoll-fd)
   "Parse the outbound response and deliver it to the parked inbound connection."
@@ -2069,16 +2134,16 @@
                     (decode-chunked-body raw-body 0 (length raw-body)))
                    (t raw-body)))
            ;; Call the user's callback.
-           (callback (connection-fetch-callback out-conn))
+           ;; Claimed here, which is before CLOSE-OUTBOUND below. That
+           ;; ordering is the guarantee: teardown looks for a callback to
+           ;; fire the cleanup sentinel with, and on a fetch that succeeded
+           ;; it must find none.
+           (callback (claim-fetch-callback out-conn))
            (inbound-fd (connection-inbound-fd out-conn))
            ;; Captured before CLOSE-OUTBOUND nulls it — AWAITING-INBOUND-FOR
            ;; needs it to confirm the inbound it finds is the one that
            ;; parked on this outbound rather than a reuse of its number.
            (out-fd (connection-fd out-conn)))
-      ;; Clear the slot so close-outbound's cleanup-firing path does
-      ;; not re-invoke the callback on the happy path. We already
-      ;; captured the actual callback into the CALLBACK local above.
-      (setf (connection-fetch-callback out-conn) nil)
       (close-outbound out-conn epoll-fd)
       ;; Find and resume inbound connection. If the inbound vanished
       ;; between :awaiting parking and now (drain race, idle reap,
@@ -2089,9 +2154,10 @@
       (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
         (if inbound
             (handler-case
-                (let ((response (funcall callback
-                                         status (or headers nil)
-                                         (or body nil))))
+                (let ((response (finish-fetch callback :delivered
+                                              :status status
+                                              :headers (or headers nil)
+                                              :body (or body nil))))
                   ;; Sync close-after-p from the callback's response BEFORE
                   ;; computing the connection-hint — a handler-set
                   ;; Connection: close flips close-after-p to T so the
@@ -2148,9 +2214,7 @@
             ;; sentinel so app state gets released — we can't deliver
             ;; a response anywhere but the contract is still
             ;; "callback fires once per fetch lifetime".
-            (handler-case (funcall callback nil nil nil)
-              (error (e)
-                (log-warn "fetch cleanup callback raised: ~a" e)))))))))
+            (finish-fetch callback :aborted)))))))
 
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."
@@ -2187,12 +2251,7 @@
    is logged at warn level and must not block teardown."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
-      (let ((callback (connection-fetch-callback conn)))
-        (when callback
-          (setf (connection-fetch-callback conn) nil)
-          (handler-case (funcall callback nil nil nil)
-            (error (e)
-              (log-warn "fetch cleanup callback raised: ~a" e)))))
+      (finish-fetch (claim-fetch-callback conn) :aborted)
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
