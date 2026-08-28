@@ -440,8 +440,11 @@ fires **exactly once per fetch** with one of two argument shapes:
   The closure's return value becomes the response
   delivered to the original inbound client.
 - **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal teardown path:
-  upstream TCP / TLS / DNS failure, short-body truncation,
+  upstream TCP / TLS / DNS failure, a body that stopped early,
   inbound connection closed mid-fetch, drain, worker crash.
+  A body stops early by falling short of a declared `Content-Length`,
+  or by ending without its chunked terminator — and `:on-body` having
+  already delivered chunks does not make a truncated response complete.
   The closure's return value is discarded in this branch
   because there is no inbound to deliver anything to.
 
