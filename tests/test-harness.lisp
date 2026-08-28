@@ -2446,6 +2446,89 @@
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
+(defun census-await (key target &key (seconds 5))
+  "Poll WEB-SKELETON::CONNECTION-CENSUS until KEY reads TARGET, or SECONDS
+   elapse. Returns the last value seen, so a failing check reports what the
+   count actually settled on rather than only that it was wrong.
+
+   Polling rather than reading once, because the census is published on the
+   maintenance tick and is therefore up to a second stale by construction.
+   A single read after a request would be asserting on the tick's timing."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second)))
+        (seen nil))
+    (loop
+      (setf seen (getf (web-skeleton::connection-census) key))
+      (when (eql seen target) (return seen))
+      (when (> (get-internal-real-time) deadline) (return seen))
+      (sleep 0.05))))
+
+(defun test-harness-census-outbound-returns-to-zero-e2e ()
+  "An ordinary fetch leaves no outbound connection behind.
+
+   This is the instrument the rest of the branch is reviewed with. Every
+   connection-lifecycle defect it exists to catch — an outbound never
+   swept, a teardown that misses its pair, a paused connection nothing
+   will wake — strands a connection with no request attached to it, so a
+   request log would show nothing at all and this shows a count that never
+   comes down.
+
+   Asserted in both directions on purpose. That the count returns to zero
+   is the property; that it was non-zero first is what proves the census
+   can see an outbound at all, without which zero would be vacuous and the
+   assertion would hold just as well against a census that counted
+   nothing.
+
+   The first draft of this test read the count from :THEN and measured a
+   peak of 0, because COMPLETE-FETCH tears the outbound down before it
+   invokes the callback. The non-vacuity check is the only reason that was
+   noticed rather than shipped as a passing test of nothing."
+  (format t "~%Harness: census, outbound returns to zero after a fetch~%")
+  (let ((port-box (list nil))
+        (peak 0))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               ;; Chunked, so :ON-BODY fires at all — against a
+               ;; Content-Length upstream there is no chunk walk to hand
+               ;; bytes back from and the callback is never called.
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (sb-ext:string-to-octets
+                                           "one" :external-format :ascii))
+                           (stream-close c)))
+               (http-fetch
+                :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                ;; The only window in which an outbound is observable.
+                ;; :THEN is too late — COMPLETE-FETCH calls CLOSE-OUTBOUND
+                ;; before invoking it, so by then the connection is already
+                ;; unregistered and the count is legitimately back to zero.
+                :on-body (lambda (out chunk)
+                           (declare (ignore out chunk))
+                           (setf peak
+                                 (max peak
+                                      (getf (web-skeleton::census-counts)
+                                            :outbound)))
+                           nil)
+                :then (lambda (status headers body)
+                        (declare (ignore headers body))
+                        (if (eql status 200)
+                            (make-text-response 200 "relayed")
+                            (make-error-response 502)))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (status headers body)
+          (test-http-request :get "/fetch")
+        (declare (ignore headers))
+        (check "census e2e: the fetch completed" status 200)
+        (check "census e2e: and answered from :then" body "relayed"))
+      ;; Non-vacuity: the census counted an outbound while one existed.
+      (check "census e2e: an outbound was visible mid-fetch"
+             (>= peak 1) t)
+      ;; The property.
+      (check "census e2e: outbound returns to 0"
+             (census-await :outbound 0) 0))))
+
 (defun test-harness ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -2494,5 +2577,6 @@
   (test-harness-fetch-on-body-e2e)
   (test-harness-fetch-on-body-content-length-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
+  (test-harness-census-outbound-returns-to-zero-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

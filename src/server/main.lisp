@@ -56,6 +56,91 @@
   (gethash fd *connections*))
 
 ;;; ---------------------------------------------------------------------------
+;;; Connection census
+;;;
+;;; *CONNECTIONS* is bound inside RUN-WORKER's LET, so it exists only on the
+;;; thread that owns it and no other thread can read it — which is the whole
+;;; point of the share-nothing design and also why a test can learn nothing
+;;; about connection lifetime without help.
+;;;
+;;; Each worker publishes a counts plist into its own slot of a global vector
+;;; on the maintenance tick. A worker owns its slot outright, so there is no
+;;; lock, and the reader below sums the slots.
+;;;
+;;; What it answers that a request log cannot: every lifecycle defect on this
+;;; branch — an outbound never swept, a teardown that misses its pair, a paused
+;;; connection nothing will wake — leaks a connection with no request attached
+;;; to it. A log records requests. This counts what is still here.
+;;; ---------------------------------------------------------------------------
+
+(sb-ext:defglobal *connection-census* nil
+  "Vector of per-worker counts plists, indexed by worker id, or NIL before
+   START-SERVER has sized it. DEFGLOBAL rather than DEFVAR for the reason
+   *SHUTDOWN* is: one shared value cell, never a per-thread binding.")
+
+(defvar *worker-id* nil
+  "This worker's index into *CONNECTION-CENSUS*. Bound per-worker by
+   RUN-WORKER beside the other share-nothing slots; NIL off a worker.")
+
+(defun census-counts ()
+  "Count the current worker's connection table: total, the inbound/outbound
+   split, and a plist of state → count.
+
+   Built fresh on every call and never patched in place — see
+   PUBLISH-CONNECTION-CENSUS."
+  (let ((total 0) (outbound 0) (states nil))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (incf total)
+               (when (connection-outbound-p conn) (incf outbound))
+               (incf (getf states (connection-state conn) 0)))
+             *connections*)
+    (list :total total
+          :outbound outbound
+          :inbound (- total outbound)
+          :states states)))
+
+(defun publish-connection-census ()
+  "Store this worker's counts into its own census slot. No-op off a worker.
+
+   One SETF of a freshly built plist, never a mutation of the plist already
+   there. A reader on another thread sees either the previous plist or this
+   one, never a half-updated one — the same discipline *HTTP-DATE-LINE-CACHE*
+   documents for the same reason: patching in place would be cheaper and
+   wrong."
+  (when (and *connection-census* *worker-id*
+             (< *worker-id* (length *connection-census*)))
+    (setf (aref *connection-census* *worker-id*) (census-counts))))
+
+(defun clear-connection-census ()
+  "Drop this worker's published counts. Called as a worker exits, so a torn
+   down server does not leave counts a later reader would sum."
+  (when (and *connection-census* *worker-id*
+             (< *worker-id* (length *connection-census*)))
+    (setf (aref *connection-census* *worker-id*) nil)))
+
+(defun connection-census ()
+  "Sum every worker's most recently published counts. Returns a plist shaped
+   like CENSUS-COUNTS, or NIL before any worker has published.
+
+   Read from any thread. What it reports is up to one maintenance tick old,
+   which is a second by default — a caller asserting that something has gone
+   away polls until it does rather than reading once."
+  (when *connection-census*
+    (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil))
+      (loop for slot across *connection-census*
+            when slot
+            do (setf seen t)
+               (incf total    (getf slot :total 0))
+               (incf outbound (getf slot :outbound 0))
+               (incf inbound  (getf slot :inbound 0))
+               (loop for (state n) on (getf slot :states) by #'cddr
+                     do (incf (getf states state 0) n)))
+      (when seen
+        (list :total total :outbound outbound :inbound inbound
+              :states states)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Connection lifecycle — idle timeout and WebSocket ping/pong
 ;;;
 ;;; Three mechanisms:
@@ -1349,6 +1434,11 @@
           ;; walk of the table per second would be the waste the gate
           ;; above exists to prevent.
           (keepalive-streams epoll-fd now)
+          ;; Rides the same 1 s gate for the same reason KEEPALIVE-STREAMS
+          ;; does — a third timer to walk the table a third time per second
+          ;; is the waste the gate exists to prevent.
+          (publish-connection-census)
+          (log-debug "census ~s" (connection-census))
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
@@ -1387,6 +1477,10 @@
     (handler-case
         (with-worker-urandom
         (let ((*connections* (make-hash-table :test #'eql))
+              ;; This worker's census slot. Bound here beside the other
+              ;; share-nothing slots, because owning the slot outright is
+              ;; what lets the publish be lock-free.
+              (*worker-id* worker-id)
               ;; Per-worker DNS cache. Workers share nothing in the hot
               ;; path, so each keeps its own table and no lock is needed.
               ;; Inert unless the app opts in via *DNS-CACHE-TTL*; a
@@ -1462,6 +1556,10 @@
                                 *connections*)
                        (dolist (conn outbounds)
                          (close-outbound conn epoll-fd)))
+                     ;; Drop this worker's published counts on the way out,
+                     ;; or a torn down server leaves totals a later reader
+                     ;; would sum into a fresh one's.
+                     (clear-connection-census)
                      (%close epoll-fd)))
               ;; Runs whether EPOLL-CREATE succeeded or raised.
               (sb-bsd-sockets:socket-close listener)))
@@ -1579,6 +1677,11 @@
            *max-write-backlog* *max-ws-message-size*
            (+ *max-ws-message-size* 10)))
   (setf *shutdown* nil)
+  ;; Sized here, before any worker exists, because a worker's slot index is
+  ;; its id and the vector has to be there when the first tick publishes.
+  ;; Replaced rather than cleared, so a second START-SERVER in one image
+  ;; cannot inherit a previous run's counts.
+  (setf *connection-census* (make-array workers :initial-element nil))
   ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
   ;; be called from inside a host SBCL image (a REPL, a test runner, an
   ;; orchestrator) without permanently stealing the signals.
