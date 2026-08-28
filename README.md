@@ -247,13 +247,14 @@ tests/
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly with size limits)
-- **Incremental delivery** — `http-fetch` takes `:on-body`, called with each chunk
-  of a chunked upstream response as its framing is proved, so a handler sees the
-  body as it arrives instead of only after the whole of it has been buffered.
-  Return `:pause` to stop reading upstream and let its send window fill; call
-  `fetch-resume` to start again. Same behaviour over `https://` — one path, both
-  schemes. See Limitations: the bytes cannot presently be relayed into a
-  streaming response or a WebSocket, and `:pause` has no automatic resume
+- **Incremental relay** — `fetch-into` starts an outbound request against a
+  connection the app already owns, so a streaming response or a WebSocket can
+  forward an upstream as it arrives instead of buffering it or holding a worker.
+  `:on-body` is called with each chunk as its framing is proved; return `:pause`
+  to stop reading upstream and let its send window fill, and reading resumes when
+  the connection being relayed into drains. `:then` fires once at the end, its
+  return value discarded — there is no parked request for it to answer. Chunked
+  framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
   a response and produces the body over time with `stream-send` / `stream-close`.
   No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.
@@ -409,22 +410,15 @@ read about here.
   serves the whole file rather than a `multipart/byteranges` response.
   RFC 7233 §3.1 permits this, and no media player or download manager
   asks for it; single ranges are fully supported.
-- **A stream cannot initiate its own fetch, so an upstream cannot be
-  relayed onward as it arrives.** `http-fetch` builds a descriptor and
-  only a handler's return value is acted on, so a fetch constructed
-  inside a stream's `:on-open` or inside a `ws-handler` is never dialed —
-  silently, since nothing is there to refuse it. `:on-body` therefore
-  delivers to the handler that returned the continuation and nowhere
-  else. An app that must forward bytes to a client as they arrive has
-  `http-fetch-stream`, which blocks the worker for the duration of the
-  call. Relaying without holding a worker is not available today.
-- **A paused fetch has no automatic resume.** `:pause` from `:on-body`
-  stops reading the upstream, and only an explicit `fetch-resume`
-  restarts it. Since pausing is exactly what stops `:on-body` firing, a
-  callback cannot be what resumes; an app that pauses with nothing else
-  arranged to call `fetch-resume` strands that fetch until
-  `*fetch-timeout*`, and its caller is answered `504` on a healthy
-  upstream.
+- **A paused fetch resumes only when the target's write backlog drains.**
+  `:pause` from `:on-body` stops reading the upstream, and reading
+  restarts by itself when the connection being relayed into empties its
+  queue. That is the backpressure case the mechanism exists for, and it
+  needs the target to have *actually backed up*: `stream-send` and
+  `ws-send` flush inline, never reaching the event loop's write path, so
+  a pause taken while the target's queue was empty has no drain coming
+  and needs an explicit `fetch-resume`. An app that pauses with neither
+  condition arranged strands that fetch until `*fetch-timeout*`.
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing

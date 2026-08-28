@@ -703,13 +703,42 @@ the cleanup sentinel passes `NIL`. Answering `200` with a count from a
 fetch that never completed is the failure this section was rewritten to
 stop describing.
 
-**The bytes cannot be relayed onward as they arrive.** A `:streaming`
-connection or a WebSocket is written by the app, not by the framework,
-and neither can start a fetch of its own: `http-fetch` builds a
-descriptor and only `dispatch-request` acts on one, so a fetch
-constructed anywhere else is never dialed. `:on-body` therefore feeds
-the handler that returned the continuation, and nothing else. See
-Limitations.
+**To forward the bytes onward, use `fetch-into`.** A handler-returned
+continuation feeds the handler that returned it and nothing else. A
+`:streaming` connection or a WebSocket owns its own write path, and
+`fetch-into` starts a fetch against one:
+
+```lisp
+(defun handle-relay (req)
+  (declare (ignore req))
+  (make-stream-response
+   :on-open
+   (lambda (client)
+     (fetch-into
+      client
+      (http-fetch :get "http://upstream.internal/feed"
+                  :on-body (lambda (out chunk)
+                             (declare (ignore out))
+                             (stream-send client chunk)
+                             nil)
+                  :then (lambda (status headers body)
+                          (declare (ignore status headers body))
+                          (stream-close client)
+                          nil))))))
+```
+
+It returns `T`, or signals — a wrong state, a second argument that is not
+a continuation, no event loop, or a fetch already outstanding on that
+connection. A signalling call has done nothing and the callback does not
+fire, so `:then` can never run before `fetch-into` returns. `:then`'s
+return value is discarded here; there is no parked request to answer.
+
+If the callback does not close the connection, the framework does — with a
+terminator on success, and *without* one on failure, so the peer's decoder
+sees truncation rather than being told a failed body was complete. Unless
+`:then` started another fetch, which is how a detached fetch chains: a
+handler-returned one chains by returning a continuation, this one chains
+by calling `fetch-into` again.
 
 **`:then` still fires exactly once, with a NIL body.** The bytes went out
 incrementally; handing them over again would double the memory the
@@ -743,16 +772,35 @@ dropped or buffered. Call `fetch-resume` on the connection `:on-body` was
 handed to start reading again; it is idempotent, so a producer that calls
 it on every pass rather than tracking state is not punished for it.
 
-**Nothing resumes a paused fetch on your behalf, and forgetting is fatal
-to that request.** `:pause` is what stops `:on-body` firing, so the
-callback cannot be what notices — an app whose only route back was a
-callback that is no longer running has no route back. The fetch then sits
-until `*fetch-timeout*` and the parked caller is answered `504 Gateway
+**A relay's pause ends by itself, and the condition is narrower than it
+sounds.** Reading resumes when the connection being relayed into drains
+its write backlog — the event the pause was waiting for. That needs the
+target to have *actually backed up*. `stream-send` and `ws-send` flush
+inline and never reach the event loop's write path, so a pause taken
+while the target's queue was empty has no drain coming, and only an
+explicit `fetch-resume` restarts it.
+
+The deadline runs on unpaused time: `fetch-resume` pushes it out by the
+interval spent paused, so a relay is not killed for applying the
+backpressure it was told to apply.
+
+**Outside a relay, resuming is yours to do, and forgetting is fatal to
+that request.** `:pause` is what stops `:on-body` firing, so the callback
+cannot be what notices — an app whose only route back was a callback that
+is no longer running has no route back. The fetch sits until
+`*fetch-timeout*` and the parked caller is answered `504 Gateway
 Timeout`, on an upstream that was healthy the whole time.
 
-Pause only where something else will call `fetch-resume`: a timer, a
-later request, a drain the app is itself watching. If there is no such
+So pause where a drain or something else will resume it — a timer, a
+later request, a queue the app is itself watching. If there is no such
 thing, do not pause.
+
+**One shape where `:pause` does nothing at all.** A response that arrives
+complete in a single read is delivered before the pause is consulted, so
+the flag is set and never read. Whether that happens is not something an
+app controls — it depends on how the upstream's bytes land — so treat
+`:pause` as advisory about the *next* read rather than as a guarantee that
+one is outstanding.
 
 A value rather than a condition, for the same reason
 `connection-append-write` refuses by return: applying backpressure is
