@@ -117,12 +117,8 @@
   ;; could not tell a partially-counted chunked body from a declared
   ;; Content-Length.
   ;;
-  ;; Part of the request frame, so the reset establishes its 0 and no
-  ;; completing arm writes it — a write there would restate the default
-  ;; and mask it. The reset is its only writer, which makes it a guarantee
-  ;; rather than diagnosability, and
-  ;; TEST-HARNESS-CHUNKED-BODY-CAP-E2E is what holds it: two chunked
-  ;; requests on one connection, each under the cap and over it summed.
+  ;; The reset is its only writer, per the frame rule at REQUEST-END: a
+  ;; completing arm writing it would restate the default and mask it.
   (body-decoded  0 :type fixnum)
   ;; Content-Length tracking (during :read-body state)
   (body-expected 0 :type fixnum)             ; Content-Length value
@@ -132,77 +128,20 @@
   ;; keep-alive reset and the ws-upgrade completion to find where pipelined
   ;; data begins.
   ;;
-  ;; A separate quantity from BODY-EXPECTED, not a convenience. For a
-  ;; Content-Length body the two agree — the wire length is the declared
-  ;; length — and for a chunked one they cannot: the wire carries chunk
-  ;; headers the decoded body does not, and a trailer section sits past
-  ;; both. Computing this end from BODY-EXPECTED was an identity that held
-  ;; only while every body was Content-Length framed. It does not hold now.
+  ;; Not derivable from BODY-EXPECTED. For a Content-Length body the two
+  ;; agree — the wire length is the declared length — and for a chunked one
+  ;; they cannot: the wire carries chunk headers the decoded body does not,
+  ;; and a trailer section sits past both.
   ;;
-  ;; Every path that completes a request states this before dispatch — not
-  ;; "every path that sets HEADER-END", which was true until chunked
-  ;; framing arrived and is now the one reading that leads somewhere
-  ;; impossible: a chunked request sets HEADER-END at :READ-HTTP and cannot
-  ;; know its boundary until the framing walk reaches the terminator in
-  ;; :READ-BODY. Stating it at header-parse time is precisely the thing
-  ;; that cannot be done.
+  ;; So every path that completes a request states this before dispatch,
+  ;; and the chunked path cannot state it before :READ-BODY, because the
+  ;; framing walk is what finds the boundary.
   ;;
-  ;; That is correctness, and it takes one test per completing path,
-  ;; because each only exercises the keep-alive reset for the request shape
-  ;; it pipelines behind. Measured, each setter self-assigned in turn:
-  ;;
-  ;;   the no-body path   TEST-HARNESS-PIPELINED-WITH-FIN-E2E fails on
-  ;;     `server closed the connection`, and the run dies there.
-  ;;     TEST-HARNESS-PIPELINED-AFTER-BODY-E2E prints nothing at all — it
-  ;;     is registered one line later — and could not catch this even if
-  ;;     it ran, because its second request carries Connection: close, so
-  ;;     no bodiless request in it is ever followed by a keep-alive reset.
-  ;;
-  ;;   the Content-Length path   TEST-HARNESS-PIPELINED-AFTER-BODY-E2E
-  ;;     fails while all five of PIPELINED-WITH-FIN pass. With the
-  ;;     boundary merely wrong rather than absent, +3 or -3, it is a
-  ;;     countable two-failure run rather than a dead one.
-  ;;
-  ;;   the chunked path   the boundary is stated by
-  ;;     CONNECTION-BODY-COMPLETE-P, where the framing walk finds it, and
-  ;;     not by any arithmetic a caller could recompute. Five assertions
-  ;;     across both files catch its removal, because a
-  ;;     boundary of 0 there takes the decoded body with it: the decode
-  ;;     runs to REQUEST-END.
-  ;;
-  ;; Both resets clear this alongside BODY-EXPECTED, HEADER-END and
-  ;; BODY-FRAMING — but those four are not one kind of thing, and one
-  ;; justification stretched over all of them told the next reader not to
-  ;; trust two fields that are guarantees. The reset establishes the
-  ;; frame's default; each completing arm writes only what differs from
-  ;; it. Measured, each dropped from the keep-alive reset in turn:
-  ;;
-  ;;   BODY-FRAMING    the reset is its only writer of :LENGTH — the
-  ;;     chunked arm is the sole override. Left stale at :CHUNKED, a
-  ;;     bodiless request after a chunked one is decoded over an empty
-  ;;     range and a good GET earns a 400. Caught by
-  ;;     TEST-HARNESS-CHUNKED-KEEPALIVE-E2E's third request, which is a
-  ;;     plain GET for exactly this reason.
-  ;;
-  ;;   BODY-EXPECTED   likewise for 0; the Content-Length arm is the sole
-  ;;     override. Left stale, a following bodiless request has that many
-  ;;     bytes of the next request attached to it. Caught by
-  ;;     TEST-HARNESS-PIPELINED-AFTER-BODY-E2E.
-  ;;
-  ;;   HEADER-END and REQUEST-END   every completing arm states these, so
-  ;;     the reset cannot be reached with them stale. Those two writes are
-  ;;     diagnosability: no test distinguishes them, and they are not dead
-  ;;     either — they choose what happens if a future arm forgets.
-  ;;     Cleared to 0, a forgotten boundary shifts the next request to
-  ;;     offset 0 and fails unmissably; left over from the request before,
-  ;;     it fails at a plausible offset, quietly.
-  ;;
-  ;; CHUNK-SCAN-POS is deliberately not in that list, and the reason is
-  ;; the mirror of the rule above: the reset would write the same 0 its
-  ;; setter already writes, which changes no failure mode and hides the
-  ;; setter from every test. The same reason keeps BODY-EXPECTED and
-  ;; REQUEST-END out of the chunked arm, where they would restate this
-  ;; reset's default.
+  ;; The reset establishes this frame's defaults and each completing arm
+  ;; writes only what differs from them. Clearing this one to 0 is a choice
+  ;; about failure shape rather than a necessity: a forgotten boundary then
+  ;; shifts the next request to offset 0 and fails unmissably, where one
+  ;; left over from the request before fails at a plausible offset, quietly.
   (request-end   0 :type fixnum)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
@@ -223,30 +162,16 @@
   ;; framing, so each chunk is walked once across the whole transfer
   ;; instead of the body being rescanned on every read.
   ;;
-  ;; Used in both directions now. It used to say "fresh per outbound
-  ;; connection — outbound connections are never reused — so it needs no
-  ;; reset", which was true until a chunked *request* body used the same
-  ;; walk. Inbound connections are reused, and a leftover cursor is the one
-  ;; kind of wrong value nothing downstream can catch: the walk clamps a
-  ;; resume that is too *low* up to START, and a cursor left from the
-  ;; previous request is too *high*, so it passes straight through and the
-  ;; walk begins past framing it never validated.
+  ;; Used in both directions, and inbound connections are reused. A
+  ;; leftover cursor is the one kind of wrong value nothing downstream can
+  ;; catch: the walk clamps a resume that is too *low* up to START, and one
+  ;; left from the previous request is too *high*, so it passes straight
+  ;; through and the walk begins past framing it never validated.
   ;;
   ;; Cleared where the framing is set up — the chunked arm of
-  ;; CONNECTION-ON-READ — and deliberately NOT in the two connection
-  ;; resets, though REQUEST-END beside it is cleared in both. The
-  ;; difference is what the write would say: those resets clear REQUEST-END
-  ;; to 0 where its setters write real boundaries, so they turn a forgotten
-  ;; boundary from a plausible offset into an unmissable one. Here they
-  ;; would write the same 0 the setter already writes, changing nothing and
-  ;; masking the setter from every test — which is exactly what happened:
-  ;; with both in place, neutering either one was silent, because each
-  ;; covered the other.
-  ;;
-  ;; With one mechanism, TEST-HARNESS-CHUNKED-KEEPALIVE-E2E catches it —
-  ;; measured. That test's first body is large on purpose; the
-  ;; clamp hides a leftover cursor that is smaller than the next request's
-  ;; body-start.
+  ;; CONNECTION-ON-READ — and deliberately not in the two connection
+  ;; resets, where it would write the same 0 the setter already writes.
+  ;; That changes no failure mode and hides the setter from every test.
   (chunk-scan-pos  0  :type fixnum)
   ;; (CONN BYTES) per chunk as an outbound response arrives, or NIL to
   ;; buffer the whole body. Set from the continuation by INITIATE-FETCH.
@@ -818,17 +743,12 @@
          (cond
            ;; A bare CR makes this reader see a different value than
            ;; PARSE-HEADERS-BYTES will see, and this is the reader that
-           ;; decides how the body is framed. Measured against each shape's
-           ;; CR-free twin, on the code that had no arm here:
-           ;;
-           ;;   chunked<CR>,gzip   :CHUNKED     vs :INVALID       refuses less
-           ;;   chu<CR>nked        :UNSUPPORTED vs :CHUNKED       refuses more
-           ;;   gzip<CR>           :UNSUPPORTED vs :UNSUPPORTED   neither
-           ;;
-           ;; It moves in both directions and sometimes not at all, so the
-           ;; direction is incidental: the disagreement is the fault. That
-           ;; is the same argument the fold arm rests on, which is why the
-           ;; two sit together.
+           ;; decides how the body is framed. Measured, the disagreement
+           ;; runs both ways depending on where the CR sits — the same value
+           ;; can be refused less or refused more — so the direction is
+           ;; incidental and the disagreement itself is the fault. Same
+           ;; argument the fold arm rests on, which is why the two sit
+           ;; together.
            ;;
            ;; LINE-END < END is exactly "this CR is not the fallback", so
            ;; LINE-END+1 is in bounds whenever the test runs, and a real
@@ -939,20 +859,17 @@
 ;;; Is this request's body finished?
 ;;;
 ;;; One function, because there are two callers and they must not answer
-;;; differently. CONNECTION-ON-READ asks twice per wake-up: once in the
-;;; :FULL arm, deciding whether a buffer at its cap holds a complete
-;;; request or is a 413, and once in the :READ-BODY arm, deciding whether
-;;; to dispatch. Those two disagreeing is not hypothetical — the :FULL arm
-;;; used to be Content-Length arithmetic, and a chunked request, whose
-;;; BODY-EXPECTED is 0 until the decode runs, satisfies
+;;; differently. CONNECTION-ON-READ asks twice per wake-up: in the :FULL
+;;; arm, deciding whether a buffer at its cap holds a complete request or
+;;; is a 413, and in the :READ-BODY arm, deciding whether to dispatch.
 ;;;
-;;;   (>= (- read-pos body-start) body-expected)
-;;;
-;;; unconditionally. A chunked body that filled the buffer would have
-;;; fallen through the :FULL arm as *complete* while :READ-BODY answered
-;;; :CONTINUE, and nothing could read further because the buffer was at
-;;; cap: the connection would sit there until the idle sweeper took it,
-;;; instead of answering 413.
+;;; Not hypothetical. The :FULL arm used to be Content-Length arithmetic,
+;;; and (>= (- read-pos body-start) body-expected) is satisfied
+;;; unconditionally by a chunked request, whose BODY-EXPECTED is 0 until
+;;; the decode runs. A chunked body that filled the buffer read as
+;;; *complete* there while :READ-BODY answered :CONTINUE, and nothing
+;;; could read further — the connection sat until the idle sweeper took
+;;; it, instead of answering 413.
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-body-complete-p (conn)
@@ -1054,40 +971,27 @@
 (defun connection-on-read (conn)
   "Handle readable event. Reads available data and advances protocol state."
   (let* ((read-result (connection-read-available conn))
-         ;; The verdict every "not yet" site answers with — named for the
-         ;; situation rather than the action, because when the peer is
-         ;; done the action is not to keep reading. :CONTINUE means
-         ;; more bytes will finish this request — and when the peer's FIN
-         ;; arrived in the same read, no more bytes can, so the request is
-         ;; unfinishable rather than merely incomplete. Holding the slot
-         ;; until *IDLE-TIMEOUT* takes it costs a connection for ten
-         ;; seconds with nobody on the other end, at no cost at all to
-         ;; whoever sent half a request and walked away.
+         ;; The verdict every "not yet" site answers with. :CONTINUE means
+         ;; more bytes will finish this request; when the peer's FIN arrived
+         ;; in the same read no more bytes can, so the request is
+         ;; unfinishable rather than merely incomplete and the slot is not
+         ;; held until *IDLE-TIMEOUT* for a peer that has gone. Distinct
+         ;; from the :EOF arm below, which fires when nothing is buffered at
+         ;; all; this is the case where bytes arrived and were not enough.
          ;;
          ;; Framing-independent on purpose: a Content-Length body short of
          ;; its declared length and a chunked body without its terminator
-         ;; are unfinishable for the same reason, and the second needs no
-         ;; declared length to compare against. The question is only
-         ;; whether the state machine still wants bytes.
-         ;;
-         ;; One value read at four sites rather than four copies of the
-         ;; test. Distinct from the :EOF arm below, which fires when
-         ;; nothing is buffered at all; this is the case where bytes
-         ;; arrived, were not enough, and no more are coming. :DISPATCH is
-         ;; untouched — a complete request arriving with its own FIN still
-         ;; deserves an answer, and TEST-HARNESS-PIPELINED-WITH-FIN-E2E
-         ;; is what asserts that.
+         ;; are unfinishable for the same reason, and the second has no
+         ;; declared length to compare against. The question is only whether
+         ;; the state machine still wants bytes.
          ;;
          ;; The Expect: 100-continue arms sit *above* this in both body
          ;; conds, so a request whose peer FINs after the headers has an
-         ;; interim queued before the FIN is noticed, and closes on the
-         ;; next read — one wasted write to a peer that is gone. Left that
-         ;; way on purpose: gating the interim on this value would risk
-         ;; withholding it from a live client to save a write to a dead
-         ;; one, and a client that waits the full 1-3s for an interim that
-         ;; never comes is the failure this framework sends interims to
-         ;; avoid. The Content-Length arm has had exactly this shape since
-         ;; the interim existed.
+         ;; interim queued before the FIN is noticed — one wasted write to a
+         ;; peer that is gone. Deliberate: gating the interim on this value
+         ;; would risk withholding it from a live client to save a write to
+         ;; a dead one, and a client waiting the full 1-3s for an interim
+         ;; that never comes is the failure interims exist to avoid.
          (unfinished (if (member read-result '(:eof :ok-eof))
                          :close
                          :continue)))
@@ -1303,18 +1207,11 @@
                    ;; wire.
                    ((eq coding :chunked)
                     ;; Only what differs from the frame the reset already
-                    ;; established. BODY-EXPECTED and REQUEST-END are
-                    ;; deliberately not written here: both would write
-                    ;; back the 0 the reset (and the struct default on a
-                    ;; fresh connection) already holds, and a write that
-                    ;; restates a default masks the default from every
-                    ;; test — measured, dropping either was silent.
-                    ;;
+                    ;; established, per the rule at REQUEST-END. And
                     ;; REQUEST-END staying 0 is meaningful rather than
                     ;; incidental: it is the "not known yet" state, and
-                    ;; CONNECTION-BODY-COMPLETE-P is what states the real
-                    ;; boundary when the framing walk reaches the
-                    ;; terminator.
+                    ;; CONNECTION-BODY-COMPLETE-P states the real boundary
+                    ;; when the framing walk reaches the terminator.
                     (setf (connection-header-end conn) header-end
                           (connection-body-framing conn) :chunked
                           (connection-chunk-scan-pos conn) 0)
