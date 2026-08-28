@@ -727,16 +727,20 @@
       (setf web-skeleton:*fetch-timeout* saved)
       (ignore-errors (sb-bsd-sockets:socket-close silent)))))
 
-(defun %close-delimited-upstream (listener)
-  "Accept once, read the request head, answer with a response framed only
-   by the close, then close. Returns the thread.
+(defun %canned-upstream (listener response &key (name "canned-upstream"))
+  "Accept once, read the request head, write RESPONSE verbatim, close.
+   Returns the thread.
 
-   No Content-Length and no Transfer-Encoding, so end-of-stream is the
-   only framing there is — which is what OUTBOUND-RESPONSE-COMPLETE-P
-   defers to the caller's EOF branch for. Written and closed back to
-   back so the body and the FIN reach the framework in one wake-up, which
-   is the ordinary shape on loopback and the one that produced :OK-EOF
-   instead of :EOF."
+   The write and the close go back to back, so the last bytes and the FIN
+   reach the framework in one wake-up — the ordinary shape on loopback,
+   and the one that produces :OK-EOF rather than :EOF. Every framing that
+   depends on where the response ends is exercised by handing this a
+   different RESPONSE, which is why the string is a parameter and the
+   sequencing is not.
+
+   Reads only to the request's CRLFCRLF, never to EOF. A fetch sends its
+   request and then waits, so no end of stream is coming until this
+   answers: draining to EOF here deadlocks both sides."
   (sb-thread:make-thread
    (lambda ()
      (handler-case
@@ -750,16 +754,19 @@
                  do (vector-push-extend byte b)
                  until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
            (write-sequence
-            (sb-ext:string-to-octets
-             (format nil "HTTP/1.1 200 OK~c~cContent-Type: text/plain~c~c~c~c~a"
-                     #\Return #\Newline #\Return #\Newline
-                     #\Return #\Newline "close-framed-body")
-             :external-format :ascii)
-            st)
+            (sb-ext:string-to-octets response :external-format :ascii) st)
            (force-output st)
            (sb-bsd-sockets:socket-close s))
        (error () nil)))
-   :name "close-delimited-upstream"))
+   :name name))
+
+(defun %crlf (&rest lines)
+  "LINES joined by CRLF, with a trailing CRLF. Hand-written wire bytes: the
+   chunk boundaries a test asserts on have to be the test's choice, not
+   whatever an encoder picked on the day."
+  (with-output-to-string (out)
+    (dolist (line lines)
+      (format out "~a~c~c" line #\Return #\Newline))))
 
 (defun test-harness-close-delimited-fetch-e2e ()
   "A fetch of a close-delimited upstream completes when the close arrives,
@@ -791,7 +798,15 @@
            (multiple-value-bind (host upstream-port)
                (sb-bsd-sockets:socket-name listener)
              (declare (ignore host))
-             (setf thread (%close-delimited-upstream listener))
+             (setf thread
+                   (%canned-upstream
+                    listener
+                    (concatenate 'string
+                                 (%crlf "HTTP/1.1 200 OK"
+                                        "Content-Type: text/plain"
+                                        "")
+                                 "close-framed-body")
+                    :name "close-delimited-upstream"))
              (with-test-server
                  (:handler
                   (lambda (req)
@@ -827,6 +842,129 @@
       (when thread
         (handler-case (sb-thread:join-thread thread :timeout 5)
           (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun %chunked-upstream-fetch (response on-body-out then-out fires-box)
+  "Run one :ON-BODY fetch against a canned upstream sending RESPONSE, and
+   return the relay's own (VALUES STATUS BODY).
+
+   Shared by the two tests below because only RESPONSE differs between
+   them: one ends with the zero-size terminator and one does not, and
+   everything else about the setup is the thing being held constant."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread (%canned-upstream listener response
+                                            :name "chunked-upstream"))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (http-fetch
+                     :get (format nil "http://127.0.0.1:~d/chunked"
+                                  upstream-port)
+                     :on-body (lambda (conn chunk)
+                                (declare (ignore conn))
+                                (push (sb-ext:octets-to-string
+                                       chunk :external-format :ascii)
+                                      (car on-body-out)))
+                     :then (lambda (status headers body)
+                             (declare (ignore headers))
+                             (incf (car fires-box))
+                             (setf (car then-out)
+                                   (list status (if body :present :nil)))
+                             (make-text-response 200 "relayed")))))
+               (multiple-value-bind (status headers body)
+                   (handler-case (test-http-request :get "/relay")
+                     (error (e) (values nil nil (princ-to-string e))))
+                 (declare (ignore headers))
+                 (values status body)))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-fetch-on-body-eof-together-e2e ()
+  "A chunked upstream whose entire response and FIN arrive in one read
+   still delivers every chunk to :ON-BODY.
+
+   :OK-EOF means \"read some bytes, and then hit end of stream\". Sharing
+   an arm with :EOF — read *nothing*, already at end of stream — meant
+   the bytes it carried were never walked, so :ON-BODY never fired; and
+   COMPLETE-FETCH then nulled the buffered body on the strength of an
+   :ON-BODY callback merely being installed. The app got 200 with no body
+   at all. Not truncated, absent.
+
+   TEST-HARNESS-FETCH-ON-BODY-E2E cannot catch this and is not weaker for
+   it: its upstream streams over time, so the FIN reliably arrives as its
+   own event and the coalesced case never occurs. The canned upstream
+   writes and closes back to back, so the two always coalesce.
+
+   Both halves are asserted. The chunks pin :ON-BODY as the route that
+   delivered them, and the NIL in :THEN pins the contract that they are
+   not handed over a second time — a repair that moved the body into
+   :THEN instead would satisfy neither."
+  (format t "~%Harness: fetch :on-body with body and FIN in one read~%")
+  (let ((chunks (list nil))
+        (final (list :never))
+        (fires (list 0)))
+    (multiple-value-bind (status body)
+        (%chunked-upstream-fetch
+         (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+                "2" "aa" "3" "bbb" "4" "cccc" "0" "")
+         chunks final fires)
+      (check "on-body/eof: the relay answered" status 200)
+      (check "on-body/eof: and its own body came through" body "relayed"))
+    ;; The discriminating one: NIL here was the defect.
+    (check "on-body/eof: every chunk reached :on-body, in order"
+           (reverse (car chunks)) '("aa" "bbb" "cccc"))
+    (check "on-body/eof: :then saw the upstream status"
+           (first (car final)) 200)
+    (check "on-body/eof: :then got no body to re-deliver"
+           (second (car final)) :nil)
+    (check "on-body/eof: :then fires exactly once" (car fires) 1)))
+
+(defun test-harness-fetch-on-body-truncated-chunked-e2e ()
+  "A chunked upstream that delivers chunks and then closes without the
+   zero-size terminator fails the fetch, rather than reporting success.
+
+   The truncation guard on this framing is DECODE-CHUNKED-BODY's raise —
+   there is no Content-Length to compare against — and suppressing the
+   buffered body suppressed the guard along with it. Chunks went to
+   :ON-BODY, the upstream vanished mid-body, and :THEN fired 200 with a
+   NIL body: byte-for-byte the report a *whole* response produces. The
+   app cannot tell the two apart, which is the failure the Content-Length
+   guard already refuses to have.
+
+   The chunks arriving first is asserted rather than assumed. Without
+   that, this would also pass against an upstream that failed before
+   sending anything — a different case, and one already covered."
+  (format t "~%Harness: fetch :on-body against a truncated chunked upstream~%")
+  (let ((chunks (list nil))
+        (final (list :never))
+        (fires (list 0)))
+    (multiple-value-bind (status body)
+        (%chunked-upstream-fetch
+         ;; Chunks, then the close. No "0" terminator.
+         (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+                "2" "aa" "3" "bbb")
+         chunks final fires)
+      (declare (ignore body))
+      (check "truncated-chunked: the relay reports failure" status 502))
+    ;; Non-vacuity: this is the truncated-mid-body case, not a fetch that
+    ;; failed before any of it arrived.
+    (check "truncated-chunked: the chunks that did arrive were delivered"
+           (reverse (car chunks)) '("aa" "bbb"))
+    (check "truncated-chunked: :then fired the cleanup sentinel"
+           (first (car final)) nil)
+    (check "truncated-chunked: :then fires exactly once" (car fires) 1)))
 
 (defun test-harness-dns-all-addresses-refused-e2e ()
   "A hostname whose every resolved address the policy refuses fails the
@@ -2937,6 +3075,8 @@
   (test-harness-sse-keepalive-framed-e2e)
   (test-harness-fetch-on-body-e2e)
   (test-harness-fetch-on-body-content-length-e2e)
+  (test-harness-fetch-on-body-eof-together-e2e)
+  (test-harness-fetch-on-body-truncated-chunked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
   (test-harness-fetch-into-refusals)

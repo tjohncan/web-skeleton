@@ -1909,10 +1909,19 @@
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
   (let ((result (connection-read-available conn)))
     (case result
-      ((:eof :ok-eof)
-       ;; Server closed — for a close-delimited response that IS the
-       ;; framing. :OK-EOF is the same event with the last bytes attached;
-       ;; see CONNECTION-READ-AVAILABLE for why they are told apart.
+      (:eof
+       ;; Read nothing, already at end of stream. For a close-delimited
+       ;; response that IS the framing, and no bytes came with it, so
+       ;; there is nothing to walk before completing.
+       ;;
+       ;; :OK-EOF is the same end of stream with the last bytes attached,
+       ;; and it reads below rather than here: those bytes still have to
+       ;; be walked and handed to ON-BODY before the fetch completes.
+       ;; Sharing this arm skipped that walk, and a chunked response whose
+       ;; last bytes and FIN landed in one read reached the app as a 200
+       ;; with no body at all — not truncated, absent. Telling the two
+       ;; verdicts apart is the entire reason CONNECTION-READ-AVAILABLE
+       ;; reports them separately.
        (complete-fetch conn epoll-fd))
       (:full
        ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. Route through
@@ -1931,7 +1940,7 @@
       (:again (restore-interest conn epoll-fd))  ; wait for more data
       ;; Nothing read; the transport wants to send first.
       (:want-write (invert-interest conn epoll-fd))
-      ((:ok :ok-want-write)
+      ((:ok :ok-eof :ok-want-write)
        ;; Got data — is the response framed-complete yet? OUTBOUND-
        ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
        ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
@@ -1946,8 +1955,9 @@
        ;; got an upstream that never closes, and the fetch hung until the
        ;; :awaiting reaper dropped the inbound with no response at all.
        ;;
-       ;; Close-delimited responses (no CL, no TE) still complete via the
-       ;; :eof branch above: for those, EOF genuinely is the framing.
+       ;; Close-delimited responses (no CL, no TE) never satisfy this
+       ;; test: for those, EOF genuinely is the framing, so they complete
+       ;; from the :OK-EOF clause below or the :EOF arm above.
        (let ((pause nil))
          (multiple-value-bind (complete next-scan)
              (outbound-response-complete-p
@@ -1970,7 +1980,15 @@
                             :pause)))))
            (setf (connection-chunk-scan-pos conn) next-scan)
            (cond
-             (complete (complete-fetch conn epoll-fd))
+             (complete (complete-fetch conn epoll-fd :framing-complete t))
+             ;; Bytes walked and delivered, then end of stream.
+             ;;
+             ;; Ahead of PAUSE deliberately. A peer that is gone has
+             ;; nothing left to un-pause, so a pause recorded here would
+             ;; strand the fetch until *FETCH-TIMEOUT* with its body
+             ;; already sitting in the app — the same stranding :OK-EOF
+             ;; was introduced to delete, rebuilt one branch lower.
+             ((eq result :ok-eof) (complete-fetch conn epoll-fd))
              ;; Backpressure: leave the bytes in the kernel and let the
              ;; upstream's window fill, which is the disposition a relay
              ;; wants — the client has not misbehaved, it is on a slower
@@ -2213,8 +2231,13 @@
               (epoll-modify epoll-fd (connection-fd target)
                             (logior +epollout+ +epollet+))))))))))
 
-(defun complete-fetch (out-conn epoll-fd)
-  "Parse the outbound response and deliver it to the parked inbound connection."
+(defun complete-fetch (out-conn epoll-fd &key framing-complete)
+  "Parse the outbound response and deliver it to the parked inbound connection.
+
+   FRAMING-COMPLETE is what OUTBOUND-RESPONSE-COMPLETE-P said: the response
+   ended where its own framing says it ends. NIL means the caller is
+   completing on end of stream instead, which is authoritative for a
+   close-delimited response and truncation for every other framing."
   (let* ((buf (connection-read-buf out-conn))
          (pos (connection-read-pos out-conn))
          ;; Step over any 1xx interim blocks (RFC 7231 §6.2) before
@@ -2303,18 +2326,31 @@
                          body-end))
            (raw-body (when (> body-end body-start)
                        (subseq buf body-start body-end)))
-           ;; NIL only when ON-BODY *actually* delivered the bytes, which
-           ;; is the chunked path and no other — ON-DATA is threaded into
-           ;; CHUNKED-BODY-COMPLETE-P's walk and nowhere else. Keying this
-           ;; on the callback merely being supplied dropped the body of
-           ;; every Content-Length and close-delimited response: no chunks
-           ;; delivered, NIL in :THEN, nothing raised. That is the majority
-           ;; of responses in the wild, and the caller does not choose the
-           ;; framing — the same origin switches by response size or by
-           ;; whatever proxy is in front, so a relay would work against one
-           ;; upstream and come back empty against the next.
+           ;; NIL only when ON-BODY *actually* delivered every byte, which
+           ;; takes all three conjuncts: a callback, chunked framing — the
+           ;; walk ON-DATA is threaded into is CHUNKED-BODY-COMPLETE-P's
+           ;; and no other — and a walk that reached the terminator.
+           ;;
+           ;; Keying this on the callback merely being supplied dropped the
+           ;; body of every Content-Length and close-delimited response: no
+           ;; chunks delivered, NIL in :THEN, nothing raised. That is the
+           ;; majority of responses in the wild, and the caller does not
+           ;; choose the framing — the same origin switches by response
+           ;; size or by whatever proxy sits in front, so a relay would
+           ;; work against one upstream and come back empty against the
+           ;; next.
+           ;;
+           ;; Keying it on callback-and-chunked still suppressed the guard
+           ;; on a body that stopped early: chunks delivered, upstream RSTs
+           ;; before the terminator, and :THEN fires 200 with NIL as though
+           ;; the response were whole. Requiring the walk to have finished
+           ;; falls through to DECODE-CHUNKED-BODY instead, whose missing-
+           ;; terminator raise becomes the same 502 every other truncation
+           ;; on this path already produces.
            (body (cond
-                   ((and (connection-fetch-on-body out-conn) chunked-p) nil)
+                   ((and (connection-fetch-on-body out-conn) chunked-p
+                         framing-complete)
+                    nil)
                    ((and raw-body chunked-p)
                     (decode-chunked-body raw-body 0 (length raw-body)))
                    (t raw-body)))
