@@ -125,14 +125,17 @@
   ;; A handler-registered cleanup should fire on teardown. The isolation
   ;; inside WITH-TEST-SERVER means this hook belongs to this test's
   ;; server only — restored on exit so no leakage to later tests.
-  (let ((fired nil))
+  (let ((fires 0))
     (with-test-server
         (:handler (lambda (req)
                     (declare (ignore req))
-                    (register-cleanup (lambda () (setf fired t)))
+                    (register-cleanup (lambda () (incf fires)))
                     (make-text-response 200 "ok")))
       (test-http-request :get "/"))
-    (check "cleanup fired during teardown" fired t)))
+    ;; A count rather than a flag, so a hook run twice fails here instead
+    ;; of passing. An app releasing a resource twice is worse off than one
+    ;; that never hears.
+    (check "cleanup hook fires exactly once during teardown" fires 1)))
 
 (defun test-harness-expect-100-continue-e2e ()
   (format t "~%Harness: Expect: 100-continue end-to-end~%")
@@ -674,7 +677,7 @@
            (multiple-value-bind (host upstream-port)
                (sb-bsd-sockets:socket-name silent)
              (declare (ignore host))
-             (let ((cleanup-fired nil))
+             (let ((cleanup-fires 0))
                (with-test-server
                    (:handler
                     (lambda (req)
@@ -683,7 +686,7 @@
                         (format nil "http://127.0.0.1:~d/never" upstream-port)
                         :then (lambda (status headers body)
                                 (declare (ignore headers body))
-                                (unless status (setf cleanup-fired t))
+                                (unless status (incf cleanup-fires))
                                 (make-text-response (or status 500)
                                                     "unreached")))))
                  (let ((start (get-internal-real-time)))
@@ -714,8 +717,13 @@
                ;; exactly once — CLOSE-OUTBOUND is what fires it, and
                ;; answering the inbound must not skip tearing the
                ;; outbound down.
-               (check "awaiting timeout: fetch cleanup sentinel fired"
-                      cleanup-fired t))))
+               ;; A count, not a flag. DEPLOYMENT.md promises the callback
+               ;; fires exactly once per fetch lifetime, and that invariant
+               ;; is held by slot-nulling across three functions — a flag
+               ;; here reads T whether it fired once or twice, so the
+               ;; promise was untestable.
+               (check "awaiting timeout: cleanup sentinel fires exactly once"
+                      cleanup-fires 1))))
       (setf web-skeleton:*fetch-timeout* saved)
       (ignore-errors (sb-bsd-sockets:socket-close silent)))))
 
@@ -853,7 +861,7 @@
             (declare (ignore ip family host))
             nil))
     (unwind-protect
-         (let ((sentinel nil))
+         (let ((sentinel-fires 0))
            (with-test-server
                (:handler
                 (lambda (req)
@@ -863,7 +871,7 @@
                   (defer-to-fetch :GET "http://localhost:9/refused"
                     :then (lambda (status headers body)
                             (declare (ignore headers body))
-                            (unless status (setf sentinel t))
+                            (unless status (incf sentinel-fires))
                             (make-text-response (or status 500) "unreached")))))
              (let ((start (get-internal-real-time)))
                (multiple-value-bind (status headers body)
@@ -875,7 +883,8 @@
                    (check "dns all-refused: answers 502" status 502)
                    (check "dns all-refused: promptly, not at the sweep"
                           (< secs 5.0) t)))))
-           (check "dns all-refused: fetch cleanup sentinel fired" sentinel t))
+           (check "dns all-refused: cleanup sentinel fires exactly once"
+                  sentinel-fires 1))
       (setf web-skeleton:*fetch-address-filter* saved))))
 
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
@@ -1542,6 +1551,7 @@
   (format t "~%Harness: fetch :on-body incremental delivery~%")
   (let ((collected nil)
         (final :never)
+        (then-fires 0)
         (port-box (list nil)))
     (with-test-server
         (:handler
@@ -1563,6 +1573,7 @@
                                  collected))
                 :then (lambda (status headers body)
                         (declare (ignore headers))
+                        (incf then-fires)
                         (setf final (list status (if body :present :nil)))
                         (make-text-response 200 "relayed"))))))
       (setf (first port-box) *test-port*)
@@ -1577,7 +1588,14 @@
       ;; because the bytes were already handed over.
       (check "on-body e2e: :then saw the upstream status" (first final) 200)
       (check "on-body e2e: :then got no body to re-deliver"
-             (second final) :nil))))
+             (second final) :nil)
+      ;; Counted, because the other once-ness assertions in this file all
+      ;; increment under (UNLESS STATUS ...) and so watch the cleanup
+      ;; sentinel only. A callback delivered twice with a real status
+      ;; passes every one of them: FINAL is overwritten with the same
+      ;; value and nothing else notices. This is the delivery half of the
+      ;; same contract.
+      (check "on-body e2e: :then fires exactly once" then-fires 1))))
 
 (defun test-harness-fetch-on-body-content-length-e2e ()
   "An :ON-BODY fetch against a Content-Length upstream must still deliver
