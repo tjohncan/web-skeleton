@@ -23,6 +23,7 @@
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
         (test-ssl-read-classification)
+        (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
         (test-https-does-not-hold-the-worker)
@@ -781,6 +782,70 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
+
+(defun test-ssl-eintr-retry ()
+  "EINTR is a retry, not a transport failure, on both classifiers — and
+   the loop that acts on it actually loops.
+
+   An interrupted call moved no bytes and left the connection intact, so
+   reporting it as a transport error fails a fetch that nothing is wrong
+   with. It reached the application as a 502 with the callback's cleanup
+   sentinel.
+
+   Reachable on the blocking fetch path specifically, and not by the
+   route a reader assumes. Those sockets are blocking by BLOCKING-CONNECT's
+   deliberate choice and carry SO_RCVTIMEO so *FETCH-TIMEOUT* bounds them,
+   and per signal(7) a blocking socket call carrying a receive timeout
+   fails with EINTR when interrupted regardless of SA_RESTART. The
+   framework then supplies the signal: a getent child per DNS lookup, on a
+   path that has just resolved a name.
+
+   Asserted directly rather than provoked, for the same reason the
+   ECONNRESET branch above is: arranging a real signal to land inside an
+   in-flight SSL_read is not something this fixture can do reliably, and a
+   test that only sometimes reaches its branch only sometimes catches a
+   regression in it. Stated rather than implied.
+
+   The count in the loop check is the assertion with teeth. A helper that
+   called its thunk once and returned whatever it got would satisfy the
+   value check and none of the purpose."
+  (format t "~%SSL EINTR retry~%")
+  (let ((classify (tls-sym "SSL-READ-EOF-OR-RAISE"))
+        (blocking (tls-sym "SSL-BLOCKING-READ-EOF-OR-RAISE"))
+        (wclass   (tls-sym "SSL-WRITE-RETRY-OR-RAISE"))
+        (retrying (tls-sym "CALL-RETRYING-EINTR"))
+        (syscall  (symbol-value (tls-sym "+SSL-ERROR-SYSCALL+")))
+        (eagain   (symbol-value (find-symbol "+EAGAIN+" :web-skeleton)))
+        (eintr    (symbol-value (find-symbol "+EINTR+" :web-skeleton)))
+        (econnreset 104))
+    ;; Read side, and the blocking wrapper must pass it through rather
+    ;; than convert it into the loud receive-timeout error — reporting a
+    ;; blown 30-second deadline milliseconds into the budget is the
+    ;; misdiagnosis BLOCKING-CONNECT's poll loop already exists to prevent.
+    (check "eintr: SYSCALL with EINTR is a retry, not an error"
+           (attempt (funcall classify nil -1 eintr syscall)) :retry)
+    (check "eintr: the blocking wrapper passes a retry through"
+           (attempt (funcall blocking nil -1 eintr syscall)) :retry)
+    ;; Write side, plus the two neighbours it must not have swallowed.
+    (check "eintr: SSL_write with EINTR is a retry"
+           (attempt (funcall wclass nil -1 eintr syscall)) :retry)
+    (check "eintr: SSL_write with EAGAIN is still the timeout"
+           (and (search "timed out"
+                        (attempt (funcall wclass nil -1 eagain syscall)))
+                t)
+           t)
+    (check "eintr: SSL_write with ECONNRESET still raises"
+           (stringp (attempt (funcall wclass nil -1 econnreset syscall))) t)
+    ;; And the loop.
+    (let ((calls 0))
+      (check "eintr: the retry loop runs until the answer is not :retry"
+             (funcall retrying
+                      (lambda ()
+                        (incf calls)
+                        (if (< calls 3) :retry 7)))
+             7)
+      (check "eintr: and it called through three times to get there"
+             calls 3))))
 
 (defun test-https-fetch-async-e2e ()
   "An https:// fetch through the event loop, end to end, on one worker.
