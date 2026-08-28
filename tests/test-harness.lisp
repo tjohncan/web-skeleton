@@ -843,6 +843,26 @@
         (handler-case (sb-thread:join-thread thread :timeout 5)
           (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
 
+(defparameter *chunked-corpus* '("aa" "bbb" "cccc")
+  "The chunk payloads the :ON-BODY framing tests assert on.
+
+   One definition, because the claim the TLS test makes is that these
+   arrive *identically* over both transports. Written as two literals it
+   would instead be asserting that two literals had not drifted apart,
+   which is a weaker claim about a different thing.")
+
+(defun %chunked-corpus-response ()
+  "*CHUNKED-CORPUS* as a complete chunked HTTP response, terminator
+   included.
+
+   Framed here rather than run through the encoder: a test asserting on
+   chunk boundaries has to choose them, not inherit whatever the encoder
+   picked on the day."
+  (apply #'%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+         (append (loop for payload in *chunked-corpus*
+                       append (list (format nil "~x" (length payload)) payload))
+                 (list "0" ""))))
+
 (defun %chunked-upstream-fetch (response on-body-out then-out fires-box)
   "Run one :ON-BODY fetch against a canned upstream sending RESPONSE, and
    return the relay's own (VALUES STATUS BODY).
@@ -904,8 +924,16 @@
 
    TEST-HARNESS-FETCH-ON-BODY-E2E cannot catch this and is not weaker for
    it: its upstream streams over time, so the FIN reliably arrives as its
-   own event and the coalesced case never occurs. The canned upstream
-   writes and closes back to back, so the two always coalesce.
+   own event and the coalesced case never occurs.
+
+   The canned upstream writes and closes back to back, which makes the
+   coalesced read the usual outcome and not a guaranteed one — the
+   framework can still be scheduled between the write and the close, read
+   the bytes as :OK, and take the ordinary path. Measured: this catches a
+   reintroduced defect on most runs and not all.
+   TEST-FETCH-OK-EOF-WALKS-THE-BYTES pins the branch itself, every run.
+   This test is the end-to-end shape around it, and the pair is the
+   coverage.
 
    Both halves are asserted. The chunks pin :ON-BODY as the route that
    delivered them, and the NIL in :THEN pins the contract that they are
@@ -916,20 +944,86 @@
         (final (list :never))
         (fires (list 0)))
     (multiple-value-bind (status body)
-        (%chunked-upstream-fetch
-         (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
-                "2" "aa" "3" "bbb" "4" "cccc" "0" "")
-         chunks final fires)
+        (%chunked-upstream-fetch (%chunked-corpus-response) chunks final fires)
       (check "on-body/eof: the relay answered" status 200)
       (check "on-body/eof: and its own body came through" body "relayed"))
     ;; The discriminating one: NIL here was the defect.
     (check "on-body/eof: every chunk reached :on-body, in order"
-           (reverse (car chunks)) '("aa" "bbb" "cccc"))
+           (reverse (car chunks)) *chunked-corpus*)
     (check "on-body/eof: :then saw the upstream status"
            (first (car final)) 200)
     (check "on-body/eof: :then got no body to re-deliver"
            (second (car final)) :nil)
     (check "on-body/eof: :then fires exactly once" (car fires) 1)))
+
+(defun test-fetch-ok-eof-walks-the-bytes ()
+  "HANDLE-OUTBOUND-READ walks the bytes that arrived with the FIN.
+
+   The transport here is a stub that hands back the whole response and
+   then reports end of stream, so CONNECTION-READ-AVAILABLE returns
+   :OK-EOF on every run. That is the reason to do it at this seam rather
+   than over a socket: whether a real peer's last bytes and its FIN land
+   in one wake-up is a scheduling question, and a test that only
+   sometimes reaches the branch it covers only sometimes catches a
+   regression in it.
+
+   Chunk delivery is the assertion. Routing :OK-EOF into the :EOF arm
+   skips the walk and :ON-BODY never fires — the defect, deterministic
+   here.
+
+   No inbound is parked, so the fetch ends on its cleanup sentinel rather
+   than a delivery. That is not the shape under test and the end-to-end
+   pair covers it; what matters here is that it ends exactly once."
+  (format t "~%Fetch: :OK-EOF still walks the bytes it carried~%")
+  (let* ((bytes (sb-ext:string-to-octets (%chunked-corpus-response)
+                                         :external-format :ascii))
+         (pos 0)
+         (chunks nil)
+         (fires 0)
+         (socket (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp))
+         (epfd (web-skeleton::epoll-create))
+         ;; RUN-WORKER binds this in its own dynamic scope, and teardown
+         ;; goes through it. Driving one connection outside a worker means
+         ;; supplying the table the worker would have.
+         (web-skeleton::*connections* (make-hash-table)))
+    (unwind-protect
+         (let ((conn (web-skeleton::make-connection
+                      :fd (web-skeleton::socket-fd socket)
+                      :socket socket
+                      :state :out-read
+                      :outbound-p t
+                      :inbound-fd -1
+                      :fetch-method :GET
+                      :last-active (get-universal-time)
+                      :fetch-on-body
+                      (lambda (c chunk)
+                        (declare (ignore c))
+                        (push (sb-ext:octets-to-string
+                               chunk :external-format :ascii)
+                              chunks))
+                      :fetch-callback
+                      (lambda (status headers body)
+                        (declare (ignore status headers body))
+                        (incf fires)
+                        nil)
+                      ;; Bytes until they run out, then :EOF — never
+                      ;; :AGAIN, which is what makes the verdict :OK-EOF
+                      ;; rather than :OK.
+                      :read-fn
+                      (lambda (buf start max)
+                        (if (>= pos (length bytes))
+                            :eof
+                            (let ((n (min max (- (length bytes) pos))))
+                              (replace buf bytes :start1 start
+                                                 :start2 pos :end2 (+ pos n))
+                              (incf pos n)
+                              n))))))
+           (web-skeleton::handle-outbound-read conn epfd)
+           (check "ok-eof: every chunk reached :on-body, in order"
+                  (reverse chunks) *chunked-corpus*)
+           (check "ok-eof: the fetch ended exactly once" fires 1))
+      (ignore-errors (web-skeleton::%close epfd)))))
 
 (defun test-harness-fetch-on-body-truncated-chunked-e2e ()
   "A chunked upstream that delivers chunks and then closes without the
@@ -3075,6 +3169,7 @@
   (test-harness-sse-keepalive-framed-e2e)
   (test-harness-fetch-on-body-e2e)
   (test-harness-fetch-on-body-content-length-e2e)
+  (test-fetch-ok-eof-walks-the-bytes)
   (test-harness-fetch-on-body-eof-together-e2e)
   (test-harness-fetch-on-body-truncated-chunked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
