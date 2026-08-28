@@ -24,6 +24,7 @@
         (test-tls-write-retry-after-gc)
         (test-ssl-read-classification)
         (test-https-fetch-async-e2e)
+        (test-https-fetch-on-body-e2e)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -107,6 +108,58 @@ printf 'TAIL-MARKER\\n' >> body.txt
           (error ()
             (ignore-errors (sb-bsd-sockets:socket-close s))
             (sleep 0.05)))))))
+
+(defun %port-listening-p (port)
+  "T when some socket is in LISTEN state on PORT, per /proc/net/tcp and
+   /proc/net/tcp6.
+
+   Not %LISTEN-SOCKET-COUNT, for two reasons. That one reads IPv4 only,
+   and openssl s_server binds the IPv6 wildcard, so it never appears
+   there. And it counts distinct inodes because its caller is asking how
+   many workers joined an SO_REUSEPORT listen group — a harder question
+   than this one, which needs only whether the port is up yet. The
+   seq_file resume that makes counting delicate is harmless here: a row
+   skipped on one pass is read on the next poll.
+
+   Field 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, field 3 is the state, and
+   0A is TCP_LISTEN."
+  (let ((hex (format nil "~4,'0X" port)))
+    (dolist (path '("/proc/net/tcp" "/proc/net/tcp6") nil)
+      (with-open-file (in path :if-does-not-exist nil)
+        (when in
+          (read-line in nil nil)          ; column header
+          (loop for line = (read-line in nil nil)
+                while line
+                do (let ((fields (%split-ws line)))
+                     (when (>= (length fields) 4)
+                       (let* ((local (second fields))
+                              (colon (position #\: local)))
+                         (when (and colon
+                                    (string= (fourth fields) "0A")
+                                    (string= hex local :start2 (1+ colon)))
+                           (return-from %port-listening-p t)))))))))))
+
+(defun %wait-for-listener (port &key (timeout 10))
+  "Poll the kernel's listen table until PORT has a listening socket.
+   Returns T, or NIL on timeout.
+
+   The readiness check for a peer that must not be probed. %WAIT-FOR-ACCEPT
+   answers the same question by connecting, which relay mode cannot afford:
+   s_server -naccept 1 serves exactly one connection, so the probe spends
+   the connection the test came for.
+
+   Sleeping a fixed interval instead makes the test a race. The framework's
+   own outbound dial does not retry — %TLS-CONNECT-RETRYING is the test
+   client's lever, not the event loop's — so a fetch that beats s_server's
+   bind gets ECONNREFUSED, and it surfaces as a 502 from the relay rather
+   than as anything naming the fixture. Reading /proc/net/tcp asks whether
+   the socket is listening without touching it."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop
+      (when (%port-listening-p port) (return t))
+      (when (> (get-internal-real-time) deadline) (return nil))
+      (sleep 0.05))))
 
 (defvar *tls-peer-process* nil
   "The s_server process, bound inside %CALL-WITH-TLS-PEER. A special rather
@@ -796,6 +849,102 @@ printf 'TAIL-MARKER\\n' >> body.txt
                   ;; client proves the handler ran, not that TLS worked.
                   (check "https async: the upstream answered over TLS"
                          upstream (list 200 :present)))))))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-fetch-on-body-e2e ()
+  "An :ON-BODY relay over https:// sees the chunk boundaries the upstream
+   framed, not the ones TLS records happened to land on.
+
+   The two layers have no reason to agree. OpenSSL emits records on its
+   own schedule and hands back whatever a single SSL_read decrypted, so
+   the byte runs arriving at the walk are cut differently over TLS than
+   over plain TCP — split mid-chunk, or several chunks at once. The
+   framing has to be reconstructed from the stream either way, and the
+   app is promised the same chunks regardless of which transport it
+   named.
+
+   Asserted against *CHUNKED-CORPUS*, which is also what the plain-TCP
+   test asserts and what this upstream is built from. That shared
+   definition is the point: two literals could agree today and drift
+   apart later without either test noticing.
+
+   Measured, this does *not* reach the :OK-EOF branch, and the docstring
+   said it did until the claim was checked. s_server's close_notify
+   arrives as its own wake-up, so the walk completes on :OK while the
+   stream is still open — confirmed by reintroducing the :OK-EOF defect,
+   which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
+   where that branch is pinned. This one covers the boundaries."
+  (format t "~%HTTPS fetch :on-body chunk boundaries~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "https on-body: fixture generated" nil t)
+             (return-from test-https-fetch-on-body-e2e))
+           (with-open-file (out (format nil "~a/chunked.txt" dir)
+                                :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+             (write-sequence (sb-ext:string-to-octets (%chunked-corpus-response)
+                                                      :external-format :ascii)
+                             out))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           ;; SETF globally, not bound: the worker that reads this lives in
+           ;; a thread WITH-TEST-SERVER spawned, and dynamic bindings do not
+           ;; cross MAKE-THREAD. Restored in the UNWIND-PROTECT.
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet)))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (port)
+              (let ((chunks nil)
+                    (final :never)
+                    (fires 0))
+                (check "https on-body: the peer is listening"
+                       (%wait-for-listener port) t)
+                (with-test-server
+                    (:handler
+                     (lambda (req)
+                       (declare (ignore req))
+                       (http-fetch
+                        :get (format nil "https://right.test:~d/" port)
+                        :on-body (lambda (conn chunk)
+                                   (declare (ignore conn))
+                                   (push (sb-ext:octets-to-string
+                                          chunk :external-format :ascii)
+                                         chunks))
+                        :then (lambda (status headers body)
+                                (declare (ignore headers))
+                                (incf fires)
+                                (setf final
+                                      (list status (if body :present :nil)))
+                                (make-text-response 200 "relayed")))))
+                  (multiple-value-bind (status headers body)
+                      (test-http-request :get "/relay")
+                    (declare (ignore headers))
+                    (check "https on-body: the relay answered" status 200)
+                    (check "https on-body: and its own body came through"
+                           body "relayed")))
+                ;; The upstream half, asserted separately: a 200 to the
+                ;; client proves the handler ran, not that TLS worked.
+                (check "https on-body: the upstream answered over TLS"
+                       (first final) 200)
+                ;; The claim.
+                (check "https on-body: chunk boundaries survive TLS framing"
+                       (reverse chunks) *chunked-corpus*)
+                (check "https on-body: :then got no body to re-deliver"
+                       (second final) :nil)
+                (check "https on-body: :then fires exactly once" fires 1)))
+            :relay-file (format nil "~a/chunked.txt" dir)))
       (setf web-skeleton::*dns-lookup-fn* saved-dns)
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
