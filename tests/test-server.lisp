@@ -7405,6 +7405,110 @@
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; cpu-count
+;;;
+;;; Driven with synthetic file contents rather than the live filesystem,
+;;; because a host that exposes cgroup CPU files cannot be relied on. CI does
+;;; not, so without this every branch except the final fall-through would go
+;;; unexercised — and the fall-through is the one path that was already
+;;; working.
+;;; ---------------------------------------------------------------------------
+
+(defun test-cpu-count-parsers ()
+  (format t "~%cpu-count: quota and topology parsing~%")
+
+  ;; cgroup v2. The unlimited form's first field is the literal string
+  ;; `max`, not a number: parsed as an integer it raises, and a parser that
+  ;; guessed would answer with whatever it made of the word. It must decline
+  ;; so the chain moves on.
+  (check "cpu.max: unlimited declines"
+         (web-skeleton::parse-cpu-max "max 100000") nil)
+  (check "cpu.max: one full CPU"
+         (web-skeleton::parse-cpu-max "100000 100000") 1)
+  (check "cpu.max: four CPUs"
+         (web-skeleton::parse-cpu-max "400000 100000") 4)
+  ;; The shape this whole change exists for. FLOOR gives 0 here, and
+  ;; START-SERVER refuses a non-positive :WORKERS — so rounding down turns
+  ;; the fix into a server that will not boot in the deployment it serves.
+  (check "cpu.max: half a CPU still gets one worker"
+         (web-skeleton::parse-cpu-max "50000 100000") 1)
+  (check "cpu.max: 2.5 CPUs rounds up"
+         (web-skeleton::parse-cpu-max "250000 100000") 3)
+  (check "cpu.max: trailing newline tolerated"
+         (web-skeleton::parse-cpu-max (format nil "200000 100000~c" #\Newline)) 2)
+  (check "cpu.max: garbage declines"
+         (web-skeleton::parse-cpu-max "not a quota") nil)
+  (check "cpu.max: single field declines"
+         (web-skeleton::parse-cpu-max "100000") nil)
+  (check "cpu.max: zero period declines"
+         (web-skeleton::parse-cpu-max "100000 0") nil)
+  (check "cpu.max: NIL line declines"
+         (web-skeleton::parse-cpu-max nil) nil)
+
+  ;; cgroup v1. Unlimited is a quota of -1 rather than a word.
+  (check "cfs: unlimited declines"
+         (web-skeleton::parse-cfs-quota "-1" "100000") nil)
+  (check "cfs: two CPUs"
+         (web-skeleton::parse-cfs-quota "200000" "100000") 2)
+  (check "cfs: half a CPU still gets one worker"
+         (web-skeleton::parse-cfs-quota "50000" "100000") 1)
+  (check "cfs: a missing file declines"
+         (web-skeleton::parse-cfs-quota nil "100000") nil)
+
+  ;; Topology, the last answer in the chain and the only one CI reaches.
+  (check "cpu list: simple range"
+         (web-skeleton::parse-cpu-list "0-15") 16)
+  (check "cpu list: single cpu"
+         (web-skeleton::parse-cpu-list "0") 1)
+  (check "cpu list: multi-range with a bare cpu"
+         (web-skeleton::parse-cpu-list "0-3,8,12-13") 7)
+  (check "cpu list: garbage declines"
+         (web-skeleton::parse-cpu-list "nonsense") nil)
+  (check "cpu list: empty declines"
+         (web-skeleton::parse-cpu-list "") nil)
+
+  ;; Affinity is a syscall and cannot be synthesised, so its arithmetic is
+  ;; tested where it lives: the popcount over a filled cpu_set_t.
+  (check "affinity: bits counted across bytes"
+         (web-skeleton::count-set-bits #(#xFF #x0F #x00)) 12)
+  (check "affinity: an empty mask counts nothing"
+         (web-skeleton::count-set-bits #(0 0 0 0)) 0)
+
+  ;; And the live call, which on any Linux host must answer something
+  ;; positive. This is the one arm that runs against the real machine.
+  (let ((n (web-skeleton::affinity-cpu-count)))
+    (check "affinity: the live call answers a positive count"
+           (and (integerp n) (plusp n)) t))
+
+  ;; The least of the sources, not the first. These are the assertions that
+  ;; distinguish the two: no host either of us can test on will disagree
+  ;; with itself, so on every real machine MIN and first-answer-wins return
+  ;; the same number and are indistinguishable.
+  (check "min: a quota of eight against an affinity of two answers two"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "800000 100000") 2)
+         2)
+  (check "min: an affinity of sixteen against a quota of two answers two"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "200000 100000") 16)
+         2)
+  (check "min: a silent quota leaves affinity to answer"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "max 100000") 16)
+         16)
+  (check "min: every source silent declines"
+         (web-skeleton::fewest-cpus nil nil nil) nil)
+  (check "min: a non-positive source is ignored rather than winning"
+         (web-skeleton::fewest-cpus 0 -3 4) 4)
+
+  ;; The whole thing, on whatever this host is. Cannot assert a number —
+  ;; that is the point of the change — but it must always be usable, since
+  ;; START-SERVER refuses anything else.
+  (let ((n (web-skeleton::cpu-count)))
+    (check "cpu-count: answers a positive integer"
+           (and (integerp n) (plusp n)) t)))
+
 (defun test-server ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -7465,5 +7569,6 @@
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
+  (test-cpu-count-parsers)
   (report-suite "Server")
   (zerop *tests-failed*))

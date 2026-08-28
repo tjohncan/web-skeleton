@@ -1580,40 +1580,176 @@
 
 ;;; ---------------------------------------------------------------------------
 ;;; CPU count
+;;;
+;;; How many workers the machine can actually run, which inside a container
+;;; is not how many CPUs the machine has. /sys/devices/system/cpu/online is
+;;; the host's topology and a container sees all of it, so a process limited
+;;; to half a core on a 16-core box read 16 and started sixteen event loops,
+;;; sixteen epoll instances and sixteen listener sockets to time-slice half a
+;;; core between them — each running its own maintenance sweep every second.
+;;;
+;;; The answer nearest the truth is asked for first:
+;;;
+;;;   cgroup v2   /sys/fs/cgroup/cpu.max          "QUOTA PERIOD" or "max PERIOD"
+;;;   cgroup v1   cpu.cfs_quota_us / cfs_period_us   quota -1 means unlimited
+;;;   affinity    sched_getaffinity(2)               cpuset, and nothing else
+;;;   topology    /sys/devices/system/cpu/online     the host's cores
+;;;
+;;; Each source answers NIL when it has nothing to say — no file, an unlimited
+;;; quota, a shape it cannot parse — and the smallest of what remains wins.
+;;;
+;;; The smallest, not the first, because the sources answer different
+;;; questions. A quota says how much CPU time may be consumed; an affinity
+;;; mask says how many CPUs it may be consumed on. Usable parallelism is the
+;;; lesser of the two, and `--cpus=8 --cpuset-cpus=0,1` is reachable: reading
+;;; the quota first spawns eight event loops onto two CPUs, which is a smaller
+;;; instance of the defect this function exists to fix. Taking the first
+;;; answer is correct only when every other source is silent, which makes it
+;;; a special case of taking the least.
+;;;
+;;; One cost, stated rather than discovered: a defective parser can now cap a
+;;; large host where first-answer-wins would have skipped it. That error lands
+;;; on the wasteful side rather than the over-subscribed one, which is the
+;;; direction to fail in, and each parser carries its own assertions.
+;;;
+;;; The parsing is
+;;; split from the reading because a machine that exposes cgroup files cannot
+;;; be relied on to exist: the tests drive the parsers with synthetic contents
+;;; so every branch is exercised deliberately, including the degradation path
+;;; that is all a cgroup-less host would ever reach.
 ;;; ---------------------------------------------------------------------------
 
-(defun cpu-count ()
-  "Return the number of online CPU cores.
-   Parses /sys/devices/system/cpu/online. Handles both the simple
-   '0-N' shape and the multi-range 'A-B,C,D-E' shape produced by
-   hotplugged or heterogeneous topologies (Intel E-cores offline,
-   VMs with non-contiguous CPU masks, etc.). The old one-shot
-   `dash + parse-integer` parser fell back to 1 on any comma,
-   silently wasting cores on exactly the machines where we cared
-   about parallelism most."
+(defun %read-first-line (path)
+  "First line of PATH, or NIL if it cannot be read."
   (handler-case
-      (with-open-file (s "/sys/devices/system/cpu/online")
-        (let ((line (read-line s)))
-          (loop with total = 0
-                with start = 0
-                with len = (length line)
-                while (< start len)
-                do (let* ((comma (or (position #\, line :start start) len))
-                          (dash  (position #\- line :start start :end comma)))
-                     (if dash
-                         (let ((lo (parse-integer line :start start :end dash))
-                               (hi (parse-integer line :start (1+ dash)
-                                                       :end comma)))
-                           (incf total (1+ (- hi lo))))
-                         (progn
-                           ;; Single-CPU token — still parse to validate.
-                           (parse-integer line :start start :end comma)
-                           (incf total)))
-                     (setf start (1+ comma)))
-                finally (return (max 1 total)))))
-    (error ()
-      (log-warn "cpu-count: could not parse topology, defaulting to 1 worker")
-      1)))
+      (with-open-file (s path :if-does-not-exist nil)
+        (when s (read-line s nil nil)))
+    (error () nil)))
+
+(defun quota-to-workers (quota period)
+  "Workers implied by a CPU quota of QUOTA per PERIOD, or NIL if either is
+   unusable.
+
+   CEILING, never FLOOR or ROUND. A 0.5-CPU container — `cpus: '0.5'`, the
+   shape this whole function exists for — floors to 0 workers, and
+   START-SERVER refuses a non-positive :WORKERS, so flooring turns the fix
+   into a server that will not boot in exactly the deployment it was written
+   to serve. A fractional share still needs one worker to run on."
+  (when (and (integerp quota) (integerp period)
+             (plusp quota) (plusp period))
+    (max 1 (ceiling quota period))))
+
+(defun parse-cpu-max (line)
+  "Workers implied by a cgroup v2 cpu.max line, or NIL.
+
+   The format is \"QUOTA PERIOD\". QUOTA is the literal string `max` when no
+   limit is set, which is not a number and must fall through to the next step
+   rather than being parsed — PARSE-INTEGER on it raises, and a parser that
+   guessed would answer with whatever garbage it made of the word."
+  (when line
+    (let* ((line (string-trim '(#\Space #\Tab #\Return) line))
+           (sp (position #\Space line)))
+      (when sp
+        (let ((quota (ignore-errors (parse-integer line :end sp)))
+              (period (ignore-errors (parse-integer line :start (1+ sp)))))
+          (quota-to-workers quota period))))))
+
+(defun parse-cfs-quota (quota-line period-line)
+  "Workers implied by a cgroup v1 cpu.cfs_quota_us / cpu.cfs_period_us pair,
+   or NIL. A quota of -1 means unlimited and falls through; QUOTA-TO-WORKERS
+   refuses it along with every other non-positive value."
+  (when (and quota-line period-line)
+    (quota-to-workers
+     (ignore-errors (parse-integer (string-trim '(#\Space #\Tab #\Return)
+                                                quota-line)))
+     (ignore-errors (parse-integer (string-trim '(#\Space #\Tab #\Return)
+                                                period-line))))))
+
+(defun parse-cpu-list (line)
+  "Count the CPUs named by a kernel CPU-list string, or NIL.
+
+   Handles the simple '0-N' shape and the multi-range 'A-B,C,D-E' shape that
+   hotplugged or heterogeneous topologies produce — Intel E-cores offline, a
+   VM with a non-contiguous mask. A one-shot dash-and-parse-integer parser
+   fell back to 1 on any comma, wasting cores on exactly the machines where
+   parallelism mattered most."
+  (when line
+    (handler-case
+        (loop with total = 0
+              with start = 0
+              with len = (length line)
+              while (< start len)
+              do (let* ((comma (or (position #\, line :start start) len))
+                        (dash  (position #\- line :start start :end comma)))
+                   (if dash
+                       (let ((lo (parse-integer line :start start :end dash))
+                             (hi (parse-integer line :start (1+ dash)
+                                                     :end comma)))
+                         (incf total (1+ (- hi lo))))
+                       (progn
+                         ;; Single-CPU token — still parse to validate.
+                         (parse-integer line :start start :end comma)
+                         (incf total)))
+                   (setf start (1+ comma)))
+              finally (return (when (plusp total) total)))
+      (error () nil))))
+
+(sb-alien:define-alien-routine ("sched_getaffinity" %sched-getaffinity)
+    sb-alien:int
+  (pid sb-alien:int)
+  (cpusetsize sb-alien:unsigned-long)
+  (mask (sb-alien:* t)))
+
+(defconstant +cpu-set-bytes+ 128
+  "sizeof(cpu_set_t) — 1024 bits, the kernel's fixed default.")
+
+(defun count-set-bits (buf)
+  "Number of 1 bits across BUF. The CPUs this process may run on, once
+   sched_getaffinity has filled a cpu_set_t."
+  (loop for b across buf sum (logcount b)))
+
+(defun affinity-cpu-count ()
+  "CPUs this process is permitted to run on, or NIL if the call fails.
+
+   Answers what a cpuset restricts and a quota does not. A container given
+   --cpuset-cpus rather than --cpus has no quota to read, so without this the
+   chain falls all the way through to the host's topology."
+  (handler-case
+      (let ((buf (make-array +cpu-set-bytes+ :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
+        (sb-sys:with-pinned-objects (buf)
+          (when (zerop (%sched-getaffinity 0 +cpu-set-bytes+
+                                           (sb-sys:vector-sap buf)))
+            (let ((n (count-set-bits buf)))
+              (when (plusp n) n)))))
+    (error () nil)))
+
+(defun fewest-cpus (&rest counts)
+  "The smallest positive count among COUNTS, ignoring NILs, or NIL when
+   every source declined.
+
+   Split out from CPU-COUNT because it is the only part of the decision that
+   can be tested without a container: the sources are files and a syscall,
+   and no host either side of this code can be made to disagree with itself
+   on demand."
+  (let ((usable (remove-if-not (lambda (n) (and (integerp n) (plusp n)))
+                               counts)))
+    (when usable (reduce #'min usable))))
+
+(defun cpu-count ()
+  "Workers this process can usefully run. See the section banner for the
+   sources and why the least of them wins."
+  (or (fewest-cpus
+       (parse-cpu-max (%read-first-line "/sys/fs/cgroup/cpu.max"))
+       (parse-cfs-quota
+        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+       (affinity-cpu-count)
+       (parse-cpu-list (%read-first-line "/sys/devices/system/cpu/online")))
+      (progn
+        (log-warn "cpu-count: no CPU information available, ~
+                   defaulting to 1 worker")
+        1)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
