@@ -179,6 +179,10 @@
   ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
   ;; the upstream's send window fills. FETCH-RESUME re-arms.
   (fetch-paused    nil :type boolean)
+  ;; When the current pause began, or 0. Read by FETCH-RESUME to push the
+  ;; deadline out by the interval spent paused, so the total is on unpaused
+  ;; time rather than wall clock.
+  (fetch-paused-at 0 :type integer)
   ;; On an *inbound* connection: the fd of an outbound that paused while
   ;; relaying into it, or -1. The back-link exists because the pause is
   ;; recorded on the outbound and the event that should end it — this
@@ -187,6 +191,34 @@
   ;; only while a pause is outstanding so nothing has to be cleaned up on
   ;; the ordinary path.
   (paused-outbound-fd -1 :type fixnum)
+  ;; On an *outbound* connection: where its result goes.
+  ;;   :INBOUND   the historical path — an inbound is parked in :AWAITING
+  ;;              and the callback's return value becomes its response.
+  ;;   :DETACHED  the caller already owns a connection it is writing to, so
+  ;;              nothing is parked and the callback's return is discarded.
+  ;; INBOUND-FD names the target in both cases: the parked connection, or
+  ;; the one being produced into. A slot rather than a test on the target's
+  ;; state, because the target's state changes underneath a fetch — a
+  ;; stream that closes mid-fetch is no longer :STREAMING, and the delivery
+  ;; step still has to know which kind of fetch it is completing.
+  (fetch-sink      :inbound :type keyword)
+  ;; When a detached fetch began, and the deadline it is measured against.
+  ;; Meaningless under :INBOUND framing, where the parked inbound's own
+  ;; :AWAITING sweep is the bound.
+  ;;
+  ;; DEADLINE moves rather than being recomputed from STARTED-AT, because
+  ;; the total runs on unpaused time: FETCH-RESUME pushes it out by the
+  ;; interval just spent paused. A relay applying backpressure is
+  ;; deliberately not reading, and killing it for that is the failure this
+  ;; whole seam exists to remove.
+  (fetch-started-at 0 :type integer)
+  (fetch-deadline   0 :type integer)
+  ;; T on a *target* connection while a detached fetch it started is still
+  ;; outstanding. Read by FETCH-INTO to refuse a second, and by the
+  ;; delivery step to tell "this callback chained another fetch" from "this
+  ;; stream is finished". Cleared before the callback runs, so a chained
+  ;; FETCH-INTO can set it again from inside :THEN.
+  (fetch-outstanding nil :type boolean)
   ;; Streaming response — set while STATE is :streaming
   (stream-framing   nil :type (or null keyword))  ; :chunked or :close
   ;; (CONN REASON) called exactly once when the stream ends, however it

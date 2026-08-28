@@ -280,10 +280,23 @@
    keeps fresh merely by continuing to send, and they are long by design
    on exactly the long-lived states most likely to build a backlog."
   (let ((idle nil)
-        (stalled nil))
+        (stalled nil)
+        (detached-expired nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
-               ;; Outbound connections are cleaned up via their paired
+               ;; A detached outbound has no parked inbound, so the
+               ;; :AWAITING reap that bounds every other fetch cannot see
+               ;; it. Nothing else would: it is not idle — it is waiting on
+               ;; an upstream — and a paused one is subscribed to no epoll
+               ;; events at all, so no wake-up is coming either. Without
+               ;; this arm a hung upstream strands the outbound socket and
+               ;; the app's callback never fires.
+               (when (and (connection-outbound-p conn)
+                          (eq (connection-fetch-sink conn) :detached)
+                          (plusp (connection-fetch-deadline conn))
+                          (> now (connection-fetch-deadline conn)))
+                 (push conn detached-expired))
+               ;; Every other outbound is cleaned up via its paired
                ;; inbound's :awaiting timeout — see close-connection
                (unless (connection-outbound-p conn)
                  (let* ((state (connection-state conn))
@@ -347,6 +360,19 @@
                            (> (- now since) timeout))
                       (push conn idle))))))
              *connections*)
+    (dolist (conn detached-expired)
+      (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
+                *fetch-timeout* (connection-fd conn))
+      ;; Through DELIVER-FETCH-ERROR so the app's callback fires its abort
+      ;; exactly once and the target gets DELIVER-DETACHED's disposition,
+      ;; rather than a bare close that leaves the stream open and the
+      ;; callback never run.
+      (handler-case
+          (deliver-fetch-error conn epoll-fd "detached fetch timed out")
+        (error (e)
+          (log-warn "detached fetch timeout: could not abort fd ~d: ~a"
+                    (connection-fd conn) e)
+          (close-outbound conn epoll-fd))))
     (dolist (conn stalled)
       (log-info "write stalled ~ds fd ~d (~a, ~d bytes pending) — closing"
                 *write-stall-timeout* (connection-fd conn)
@@ -776,6 +802,34 @@
             (let ((out-conn (lookup-connection out-fd)))
               (when out-conn
                 (close-outbound out-conn epoll-fd))))))
+      ;; A detached fetch's outbound is not reachable through AWAITING-FD —
+      ;; nothing was parked — so it has to be found by walking. Without
+      ;; this the outbound outlives the connection it was fetching into,
+      ;; and a paused one is subscribed to no events, so nothing ever wakes
+      ;; it: a permanent leak rather than a delayed one.
+      ;;
+      ;; The marker is cleared *first*, and that is load-bearing. Teardown
+      ;; runs while this connection is still :STREAMING with a live fd —
+      ;; CONNECTION-CLOSE, which sets the fd to -1, is several lines below.
+      ;; So DELIVER-DETACHED would find it :STREAMING, apply the aborted
+      ;; disposition, and call CLOSE-CONNECTION on the connection already
+      ;; being closed one frame up. Clearing the marker suppresses that,
+      ;; and is correct on its own terms: the disposition answers what a
+      ;; failed upstream does to a connection, and when the connection is
+      ;; what failed, applying it is circular.
+      (when (connection-fetch-outstanding conn)
+        (setf (connection-fetch-outstanding conn) nil)
+        (let ((target-fd fd)
+              (orphans nil))
+          (maphash (lambda (k out)
+                     (declare (ignore k))
+                     (when (and (connection-outbound-p out)
+                                (eq (connection-fetch-sink out) :detached)
+                                (= (connection-inbound-fd out) target-fd))
+                       (push out orphans)))
+                   *connections*)
+          (dolist (out orphans)
+            (close-outbound out epoll-fd))))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)

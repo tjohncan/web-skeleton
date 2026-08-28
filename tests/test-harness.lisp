@@ -2464,6 +2464,349 @@
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
+(defun %ascii (s) (sb-ext:string-to-octets s :external-format :ascii))
+
+(defun %decode-streamed-body (raw)
+  "Chunked body of a complete raw response, or the error's text. Caught
+   rather than raised: a missing terminator ends the run instead of
+   reporting, and a truncated stream is a thing several of these tests
+   assert about."
+  (let ((hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+    (if (null hend)
+        "<no header terminator>"
+        (handler-case
+            (sb-ext:octets-to-string
+             (web-skeleton::decode-chunked-body raw (+ hend 4) (length raw))
+             :external-format :ascii)
+          (error (e) (princ-to-string e))))))
+
+(defun test-harness-fetch-into-relay-e2e ()
+  "The relay DEPLOYMENT.md described, now that it dials.
+
+   A streaming response whose :ON-OPEN starts a fetch, forwards each chunk
+   into its own body as the framing proves it, and closes when the upstream
+   is done. Before FETCH-INTO this built a continuation inside :ON-OPEN and
+   dropped it: the client got a 200 with chunked framing that never
+   terminated, held for *STREAM-IDLE-TIMEOUT*, then a truncated body with
+   no error anywhere.
+
+   Asserted on the decoded body rather than on bytes arriving, because the
+   defect's signature was a body that never terminated — a check that only
+   looked for content would have passed against it."
+  (format t "~%Harness: fetch-into, the documented relay~%")
+  (let ((port-box (list nil))
+        (then-fires 0))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (%ascii "alpha"))
+                           (stream-send c (%ascii "beta"))
+                           (stream-close c)))
+               (make-stream-response
+                :on-open
+                (lambda (client)
+                  (fetch-into
+                   client
+                   (http-fetch
+                    :get (format nil "http://127.0.0.1:~d/up"
+                                 (first port-box))
+                    :on-body (lambda (out chunk)
+                               (declare (ignore out))
+                               (stream-send client chunk)
+                               nil)
+                    :then (lambda (status headers body)
+                            (declare (ignore status headers body))
+                            (incf then-fires)
+                            (stream-close client)
+                            nil))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "fetch-into relay: the upstream body arrived, framed"
+                        (%decode-streamed-body raw) "alphabeta")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "fetch-into relay: :then fired exactly once" then-fires 1)
+      (check "fetch-into relay: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
+(defun test-harness-fetch-into-chained-e2e ()
+  "A :THEN that starts another fetch keeps the stream open.
+
+   A handler-returned fetch chains by returning a continuation. A detached
+   one has no return value anyone reads, so it chains by calling FETCH-INTO
+   again — and the framework's own disposition would otherwise close the
+   stream the new fetch is about to produce into, on the grounds that the
+   first one delivered and the app had not closed it.
+
+   Asserted on the second fetch's content rather than on the connection
+   closing cleanly, because the failure is a truncated first response,
+   which reads like an upstream fault rather than like the framework
+   closing the connection underneath it."
+  (format t "~%Harness: fetch-into, chained from :then~%")
+  (let ((port-box (list nil)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (let ((path (http-request-path req)))
+             (cond
+               ((search "/one" path)
+                (make-stream-response
+                 :on-open (lambda (c) (stream-send c (%ascii "first"))
+                            (stream-close c))))
+               ((search "/two" path)
+                (make-stream-response
+                 :on-open (lambda (c) (stream-send c (%ascii "second"))
+                            (stream-close c))))
+               (t
+                (make-stream-response
+                 :on-open
+                 (lambda (client)
+                   (flet ((leg (where then)
+                            (http-fetch
+                             :get (format nil "http://127.0.0.1:~d~a"
+                                          (first port-box) where)
+                             :on-body (lambda (out chunk)
+                                        (declare (ignore out))
+                                        (stream-send client chunk)
+                                        nil)
+                             :then then)))
+                     (fetch-into
+                      client
+                      (leg "/one"
+                           (lambda (status headers body)
+                             (declare (ignore status headers body))
+                             ;; Chained from inside :THEN. The stream must
+                             ;; survive this call.
+                             (fetch-into
+                              client
+                              (leg "/two"
+                                   (lambda (s h b)
+                                     (declare (ignore s h b))
+                                     (stream-close client)
+                                     nil)))
+                             nil)))))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/chain" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "fetch-into chained: both legs reached the client"
+                        (%decode-streamed-body raw) "firstsecond")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "fetch-into chained: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
+(defun test-harness-fetch-into-refusals ()
+  "The four refusals, each asserted on its own.
+
+   They fail in different directions and a single \"it signals\" check
+   would cover one of them by accident. And a refused call must leave
+   nothing behind — no outbound, and a callback that never fired — which
+   is the one place on this branch where zero is the right answer for a
+   counter."
+  (format t "~%Harness: fetch-into refusals~%")
+  (let ((fires 0))
+    (flet ((cont ()
+             (http-fetch :get "http://127.0.0.1:1/x"
+                         :then (lambda (s h b)
+                                 (declare (ignore s h b))
+                                 (incf fires)
+                                 nil))))
+      ;; Wrong state. A connection that does not own its own write path has
+      ;; nowhere to put a result.
+      (let ((conn (web-skeleton::make-connection :fd 1 :state :read-http)))
+        (check "refusal: a non-producing state signals"
+               (handler-case (progn (fetch-into conn (cont)) :no-signal)
+                 (error () :signalled))
+               :signalled))
+      ;; Not a continuation.
+      (let ((conn (web-skeleton::make-connection :fd 1 :state :streaming)))
+        (check "refusal: a non-continuation signals"
+               (handler-case (progn (fetch-into conn "not a fetch") :no-signal)
+                 (error () :signalled))
+               :signalled))
+      ;; No event loop. Off a worker *EPOLL-FD* is NIL, and the outbound
+      ;; would be opened and never driven — a leaked descriptor plus a
+      ;; callback that never fires.
+      (let ((conn (web-skeleton::make-connection :fd 1 :state :streaming))
+            (web-skeleton::*epoll-fd* nil))
+        (check "refusal: no event loop signals"
+               (handler-case (progn (fetch-into conn (cont)) :no-signal)
+                 (error () :signalled))
+               :signalled))
+      ;; Already outstanding. Two would race to apply the disposition and
+      ;; whichever finished first would close the target under the other.
+      (let ((conn (web-skeleton::make-connection
+                   :fd 1 :state :streaming :fetch-outstanding t))
+            (web-skeleton::*epoll-fd* 99))
+        (check "refusal: a second outstanding fetch signals"
+               (handler-case (progn (fetch-into conn (cont)) :no-signal)
+                 (error () :signalled))
+               :signalled))
+      ;; A refused call did nothing: the callback never ran.
+      (check "refusal: no callback fired on any refusal" fires 0)
+      ;; And left no state on the connection it refused.
+      (let ((conn (web-skeleton::make-connection :fd 1 :state :read-http)))
+        (ignore-errors (fetch-into conn (cont)))
+        (check "refusal: the target is not marked outstanding"
+               (web-skeleton::connection-fetch-outstanding conn) nil)))))
+
+(defun test-harness-fetch-into-upstream-stalls-e2e ()
+  "An upstream that stops mid-body aborts the stream without terminating it.
+
+   Three things at once, because one arrangement produces all of them: the
+   sweeper reaping a detached outbound (nothing else can — it is not idle,
+   it is waiting, and no inbound is parked on it), the aborted disposition,
+   and the rule that an abort must not be delivered as an HTTP response
+   into a body already in flight.
+
+   The client must see its decode *fail*. A stream closed with a
+   terminator after a failed upstream would tell it the body was complete,
+   which is silent truncation — the failure CHUNKED-TERMINATOR is a
+   separate function to prevent."
+  (format t "~%Harness: fetch-into, upstream stalls mid-body~%")
+  (let ((port-box (list nil))
+        (saved web-skeleton:*fetch-timeout*)
+        (aborted nil))
+    (setf web-skeleton:*fetch-timeout* 1)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (if (search "/up" (http-request-path req))
+                    ;; One chunk, then silence. Never closed, so the
+                    ;; detached fetch's own deadline is the only thing
+                    ;; that can end it.
+                    (make-stream-response
+                     :on-open (lambda (c) (stream-send c (%ascii "partial"))))
+                    (make-stream-response
+                     :on-open
+                     (lambda (client)
+                       (fetch-into
+                        client
+                        (http-fetch
+                         :get (format nil "http://127.0.0.1:~d/up"
+                                      (first port-box))
+                         :on-body (lambda (out chunk)
+                                    (declare (ignore out))
+                                    (stream-send client chunk)
+                                    nil)
+                         :then (lambda (status headers body)
+                                 (declare (ignore headers body))
+                                 (setf aborted (null status))
+                                 nil))))))))
+           (setf (first port-box) *test-port*)
+           (multiple-value-bind (socket stream) (%raw-connect)
+             (unwind-protect
+                  (progn
+                    (%send-raw-get stream "/relay" :extra
+                                   (format nil "Connection: close~c~c"
+                                           #\Return #\Newline))
+                    (let* ((buf (read-until-bounded stream :seconds 8))
+                           (raw (subseq buf 0 (fill-pointer buf)))
+                           (decoded (%decode-streamed-body raw)))
+                      (check "upstream stall: the bytes already relayed arrived"
+                             (search "partial"
+                                     (sb-ext:octets-to-string
+                                      raw :external-format :latin-1))
+                             (search "partial"
+                                     (sb-ext:octets-to-string
+                                      raw :external-format :latin-1)))
+                      ;; The property. A terminator here would claim the
+                      ;; body was whole.
+                      (check "upstream stall: the client's decode fails"
+                             (search "chunked" decoded)
+                             (search "chunked" decoded))
+                      (check "upstream stall: decode did not succeed short"
+                             (string= decoded "partial") nil)))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket))))
+           (check "upstream stall: :then saw the abort sentinel" aborted t)
+           (check "upstream stall: no outbound left behind"
+                  (census-await :outbound 0) 0))
+      (setf web-skeleton:*fetch-timeout* saved))))
+
+(defun test-harness-fetch-into-target-closed-e2e ()
+  "A client that leaves mid-relay tears the outbound down, once.
+
+   D5's arm reaches a detached outbound by walking, because nothing was
+   parked and AWAITING-FD names nothing. The subtlety is that it runs while
+   the target is still :STREAMING with a live fd — CONNECTION-CLOSE is
+   several lines below — so a disposition applied here would find it
+   :STREAMING, take the aborted branch, and call CLOSE-CONNECTION on the
+   connection already being closed one frame up.
+
+   It terminates, which is what makes it worth asserting: the outer frame
+   would resume holding a descriptor the inner call already closed. Counted
+   rather than inferred, because every neighbouring assertion — the
+   outbound goes away, the callback fires once — passes with the
+   re-entrancy present."
+  (format t "~%Harness: fetch-into, target closed mid-relay~%")
+  (let ((port-box (list nil))
+        (target-fd nil)
+        (closes 0)
+        (real (symbol-function 'web-skeleton::close-connection)))
+    (setf (symbol-function 'web-skeleton::close-connection)
+          (lambda (conn epoll-fd &optional (reason :closed))
+            (when (and target-fd
+                       (= (web-skeleton::connection-fd conn) target-fd))
+              (incf closes))
+            (funcall real conn epoll-fd reason)))
+    (unwind-protect
+         (progn
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (if (search "/up" (http-request-path req))
+                      ;; Never completes, so the relay is still live when
+                      ;; the client walks away.
+                      (make-stream-response
+                       :on-open (lambda (c) (stream-send c (%ascii "x"))))
+                      (make-stream-response
+                       :on-open
+                       (lambda (client)
+                         (setf target-fd (web-skeleton::connection-fd client))
+                         (fetch-into
+                          client
+                          (http-fetch
+                           :get (format nil "http://127.0.0.1:~d/up"
+                                        (first port-box))
+                           :on-body (lambda (out chunk)
+                                      (declare (ignore out chunk))
+                                      nil)
+                           :then (lambda (s h b)
+                                   (declare (ignore s h b))
+                                   nil))))))))
+             (setf (first port-box) *test-port*)
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               ;; Let the head and first chunk land, then vanish.
+               (sleep 0.4)
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket)))
+             (check "target closed: outbound torn down with it"
+                    (census-await :outbound 0) 0))
+           (check "target closed: close-connection entered exactly once"
+                  closes 1))
+      (setf (symbol-function 'web-skeleton::close-connection) real))))
+
 (defun census-await (key target &key (seconds 5))
   "Poll WEB-SKELETON::CONNECTION-CENSUS until KEY reads TARGET, or SECONDS
    elapse. Returns the last value seen, so a failing check reports what the
@@ -2596,5 +2939,10 @@
   (test-harness-fetch-on-body-content-length-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
+  (test-harness-fetch-into-refusals)
+  (test-harness-fetch-into-relay-e2e)
+  (test-harness-fetch-into-chained-e2e)
+  (test-harness-fetch-into-upstream-stalls-e2e)
+  (test-harness-fetch-into-target-closed-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

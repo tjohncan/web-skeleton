@@ -33,7 +33,14 @@
   ;; resumes several call frames later, carrying this struct and nothing
   ;; else, and a second PARSE-URL there would be a second chance to
   ;; disagree with the first about what the caller asked for.
-  (scheme   :http  :type keyword))
+  (scheme   :http  :type keyword)
+  ;; :INBOUND when a handler returned this and an inbound will be parked on
+  ;; it; :DETACHED when FETCH-INTO started it against a connection the app
+  ;; already owns. Carried here for the same reason SCHEME is — the DNS
+  ;; path resumes several frames later holding this struct and nothing
+  ;; else, and re-deriving it there would be a second chance to disagree
+  ;; with the first answer.
+  (sink     :inbound :type keyword))
 
 (defparameter *fetch-timeout* 30
   "Seconds. A total on the HTTP-FETCH path, both schemes: the inbound
@@ -1372,6 +1379,78 @@
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------
 
+(defun fetch-into (connection continuation)
+  "Start CONTINUATION's outbound request against CONNECTION, a connection
+   the application already owns. Returns T, or signals.
+
+   CONNECTION is what the app's :ON-OPEN received, or what its WS-HANDLER
+   was called with. CONTINUATION is an ordinary HTTP-FETCH continuation;
+   HTTP-FETCH is unchanged and remains a pure constructor.
+
+   T means the fetch is initiated, not completed. Nothing is parked, the
+   connection's state is untouched, and the app goes on writing to it. The
+   callbacks are the ones HTTP-FETCH already takes and mean the same
+   things: :THEN receives (status headers body) with a NIL status as the
+   abort sentinel, and :ON-BODY receives (outbound-connection chunk) and
+   may return :PAUSE. A :THEN moves from a handler-returned fetch to this
+   one unchanged. :THEN's return value is discarded here — there is no
+   parked request for it to answer.
+
+   Signals, rather than returning NIL, in four cases:
+
+     the connection is not :STREAMING or :WEBSOCKET — nothing else owns
+       its own write path, so nothing else can consume a result;
+     CONTINUATION is not an HTTP-FETCH continuation;
+     there is no event loop on this thread to drive the outbound, which is
+       the case off a worker — the REPL, a unit test. FETCH-RESUME can
+       degrade to a no-op there and this cannot: the socket would be
+       opened and never driven, leaking a descriptor and a callback that
+       never fires;
+     a detached fetch is already outstanding on this connection. Two would
+       race to apply the disposition below and whichever finished first
+       would close the target out from under the other.
+
+   Signalling rather than returning NIL because a call from the wrong
+   state is a programming error whose silent failure mode is a connection
+   that produces nothing — which is the defect this function exists to
+   remove, reintroduced by the function removing it.
+
+   A signalling call has done nothing: no socket, no registration, no
+   epoll entry, no state change on CONNECTION, and the callback does not
+   fire. A fetch refused at the door has no lifetime for `exactly once` to
+   apply within, and the caller is on the stack holding the connection and
+   can act on the signal — unlike the parked-inbound path, where the
+   callback fires the sentinel because there is a client owed an answer
+   and nobody left to give it one.
+
+   The corollary is what keeps T honest: :THEN can never run before this
+   returns. Were a setup failure to deliver synchronously, an app that
+   called FETCH-INTO and then wrote to the connection could have its
+   failure frame reach the peer first, and could find the connection
+   already closing on a call that returned T to say the fetch had begun."
+  (unless (typep continuation 'http-fetch-continuation)
+    (error "fetch-into: second argument is ~a, not an http-fetch ~
+            continuation" (type-of continuation)))
+  (unless (member (connection-state connection) '(:streaming :websocket))
+    (error "fetch-into: fd ~d is in state ~a; only :streaming and ~
+            :websocket own their own write path"
+           (connection-fd connection) (connection-state connection)))
+  (unless *epoll-fd*
+    (error "fetch-into: no event loop on this thread. The outbound would ~
+            be opened and never driven."))
+  (when (connection-fetch-outstanding connection)
+    (error "fetch-into: fd ~d already has a detached fetch outstanding"
+           (connection-fd connection)))
+  (setf (http-fetch-continuation-sink continuation) :detached)
+  ;; Marked before dialing and cleared by the setup-failure path below, so
+  ;; a refused call leaves the connection exactly as it found it.
+  (setf (connection-fetch-outstanding connection) t)
+  (handler-case (initiate-fetch connection *epoll-fd* continuation)
+    (error (e)
+      (setf (connection-fetch-outstanding connection) nil)
+      (error e)))
+  t)
+
 (defun initiate-fetch (conn epoll-fd fetch-req)
   "Start an outbound HTTP(S) request.
    CONN is the inbound connection to park.
@@ -1390,6 +1469,14 @@
           (error "HTTPS not available — load web-skeleton-tls"))
         (initiate-http-fetch conn epoll-fd fetch-req host port path))
     (error (e)
+      ;; A detached fetch has no parked caller to answer and its initiator
+      ;; is still on the stack, so the failure goes back to them as a
+      ;; signal and the callback does not fire at all. See FETCH-INTO: a
+      ;; fetch refused before it started has no lifetime for `exactly
+      ;; once` to apply within, and delivering here would also mean :THEN
+      ;; could run before FETCH-INTO returned.
+      (when (eq (http-fetch-continuation-sink fetch-req) :detached)
+        (error e))
       (log-error "fetch setup failed: ~a" e)
       ;; Fire the cleanup sentinel so the app's :then closure runs
       ;; exactly once even on pre-connection errors (malformed URL,
@@ -1479,6 +1566,10 @@
                                  :fetch-callback (http-fetch-continuation-callback fetch-req)
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
+                                 :fetch-sink (http-fetch-continuation-sink fetch-req)
+                                 :fetch-started-at (get-universal-time)
+                                 :fetch-deadline (+ (get-universal-time)
+                                                    *fetch-timeout*)
                                  :last-active (get-universal-time)))
                  ;; Before the request is queued and before epoll is armed:
                  ;; HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN, so no path
@@ -1490,8 +1581,16 @@
                  (setf registered t)
                  (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
                  (setf epoll-added t)
-                 (setf (connection-state conn) :awaiting
-                       (connection-awaiting-fd conn) out-fd)
+                 ;; Only an :INBOUND fetch parks. A detached one leaves its
+                 ;; target exactly as it found it — still :STREAMING or
+                 ;; :WEBSOCKET, still being written to by the app — and is
+                 ;; bounded by the outbound's own deadline instead of by
+                 ;; the :AWAITING sweep.
+                 (ecase (http-fetch-continuation-sink fetch-req)
+                   (:inbound
+                    (setf (connection-state conn) :awaiting
+                          (connection-awaiting-fd conn) out-fd))
+                   (:detached nil))
                  (log-debug "fetch: fd ~d -> ~a :~d~a (outbound fd ~d, ~a)"
                             (connection-fd conn) host port path out-fd family)
                  (setf done t)))
@@ -1755,7 +1854,22 @@
    was never paused, so a producer that calls this on every pass rather
    than tracking state is not punished for it."
   (when (connection-fetch-paused conn)
-    (setf (connection-fetch-paused conn) nil)
+    ;; The total runs on unpaused time. A relay applying backpressure is
+    ;; deliberately not reading, so a deadline that kept running while
+    ;; paused would kill a correct app for taking the framework's own
+    ;; advice — which is the 504-on-a-healthy-upstream this seam removes.
+    ;;
+    ;; It leaves the deadline no longer a bound on wall clock: a target
+    ;; that trickles restarts WRITE-PROGRESS-AT on every byte it accepts,
+    ;; so it never stalls and can extend this indefinitely. Memory stays
+    ;; capped and the connection is visible in the census; the residual is
+    ;; stated in README Limitations rather than papered over here.
+    (when (plusp (connection-fetch-paused-at conn))
+      (incf (connection-fetch-deadline conn)
+            (max 0 (- (get-universal-time)
+                      (connection-fetch-paused-at conn)))))
+    (setf (connection-fetch-paused conn) nil
+          (connection-fetch-paused-at conn) 0)
     ;; Drop the back-link with the pause it belongs to, so an inbound that
     ;; drains later does not resume something that resumed itself.
     (let ((in (lookup-connection (connection-inbound-fd conn))))
@@ -1862,7 +1976,8 @@
              ;; wants — the client has not misbehaved, it is on a slower
              ;; link. FETCH-RESUME has why the re-arm works.
              (pause
-              (setf (connection-fetch-paused conn) t)
+              (setf (connection-fetch-paused conn) t
+                    (connection-fetch-paused-at conn) (get-universal-time))
               (setf (connection-interest-inverted conn) nil)
               (epoll-modify epoll-fd (connection-fd conn) +epollet+)
               ;; The back-link RESUME-PAUSED-OUTBOUND reads; its docstring
@@ -2028,6 +2143,76 @@
                 nil))
             (invoke))))))
 
+(defun deliver-detached (target-fd epoll-fd callback outcome
+                         &key status headers body)
+  "Hand a detached fetch's result to CALLBACK, then decide what becomes of
+   the connection it was fetching into.
+
+   The framework decides rather than trusting the app to, because an app
+   will not handle a path it has never seen fail: a :THEN written for the
+   happy case leaves a failed stream open until *STREAM-IDLE-TIMEOUT*,
+   which is the hang this whole seam exists to remove.
+
+   The disposition is outcome-dependent, because writing a terminator is a
+   claim about completeness. A clean STREAM-CLOSE on a failed upstream
+   tells the client it received the whole body — silent truncation, which
+   is why CHUNKED-TERMINATOR is a separate function in the first place.
+
+     already closed       either      nothing
+     :streaming           delivered   stream-close, terminator written
+     :streaming           aborted     close, no terminator, peer sees truncation
+     :websocket           delivered   nothing; the app owns its framing
+     :websocket           aborted     a 1011 close frame
+
+   A callback that started another fetch suppresses all of it. That is how
+   chaining works here: a handler-returned fetch chains by returning a
+   continuation, and a detached one has no return value anyone reads, so it
+   chains by calling FETCH-INTO again — and closing the stream the new
+   fetch is about to produce into would make chaining impossible. The
+   outstanding marker is cleared before the callback runs precisely so the
+   callback can set it again.
+
+   A raising callback is caught here rather than propagating as
+   FINISH-FETCH's :DELIVERED contract otherwise allows, because that
+   contract's reason — the caller has an inbound request and a 500 to
+   answer it with — does not hold on this path. There is nothing to answer."
+  (let ((target (lookup-connection target-fd)))
+    (when target
+      (setf (connection-fetch-outstanding target) nil))
+    (handler-case
+        (finish-fetch callback outcome
+                      :status status :headers headers :body body)
+      (error (e)
+        (log-warn "detached fetch callback raised for fd ~d: ~a" target-fd e))))
+  ;; Looked up again: the callback may have closed the connection, and on
+  ;; a reused fd number it may not even be the same one.
+  (let ((target (lookup-connection target-fd)))
+    (when (and target (not (connection-fetch-outstanding target)))
+      (case (connection-state target)
+        (:streaming
+         (ecase outcome
+           (:delivered
+            (log-debug "detached fetch: closing stream fd ~d the app left open"
+                       target-fd)
+            (handler-case (stream-close target)
+              (error (e)
+                (log-warn "detached fetch: stream-close failed on fd ~d: ~a"
+                          target-fd e)
+                (close-connection target epoll-fd :upstream-failed))))
+           (:aborted
+            (log-warn "detached fetch failed for fd ~d — closing the stream ~
+                       without a terminator" target-fd)
+            (close-connection target epoll-fd :upstream-failed))))
+        (:websocket
+         (when (eq outcome :aborted)
+           (log-warn "detached fetch failed for ws fd ~d — closing 1011"
+                     target-fd)
+           (when (connection-append-write target (build-ws-close 1011))
+             (setf (connection-state target) :closing)
+             (ignore-errors
+              (epoll-modify epoll-fd (connection-fd target)
+                            (logior +epollout+ +epollet+))))))))))
+
 (defun complete-fetch (out-conn epoll-fd)
   "Parse the outbound response and deliver it to the parked inbound connection."
   (let* ((buf (connection-read-buf out-conn))
@@ -2143,8 +2328,15 @@
            ;; Captured before CLOSE-OUTBOUND nulls it — AWAITING-INBOUND-FOR
            ;; needs it to confirm the inbound it finds is the one that
            ;; parked on this outbound rather than a reuse of its number.
+           ;; Captured before teardown for the same reason as OUT-FD.
+           (sink (connection-fetch-sink out-conn))
            (out-fd (connection-fd out-conn)))
       (close-outbound out-conn epoll-fd)
+      (when (eq sink :detached)
+        (deliver-detached inbound-fd epoll-fd callback :delivered
+                          :status status :headers (or headers nil)
+                          :body (or body nil))
+        (return-from complete-fetch))
       ;; Find and resume inbound connection. If the inbound vanished
       ;; between :awaiting parking and now (drain race, idle reap,
       ;; I/O error on the inbound fd), we can't deliver a response
@@ -2220,7 +2412,18 @@
   "Deliver a 502 error to the inbound connection and clean up."
   (log-warn "fetch error fd ~d: ~a" (connection-fd out-conn) message)
   (let ((inbound-fd (connection-inbound-fd out-conn))
+        (sink (connection-fetch-sink out-conn))
         (out-fd (connection-fd out-conn)))
+    ;; A detached target is mid-response: its head went out long ago and a
+    ;; body is in flight. Serializing a 502 onto it would put a complete
+    ;; HTTP message inside an established chunked body, which is the
+    ;; framing confusion this codebase refuses on principle. It gets the
+    ;; abort outcome and DELIVER-DETACHED's disposition instead.
+    (when (eq sink :detached)
+      (let ((callback (claim-fetch-callback out-conn)))
+        (close-outbound out-conn epoll-fd)
+        (deliver-detached inbound-fd epoll-fd callback :aborted))
+      (return-from deliver-fetch-error))
     (close-outbound out-conn epoll-fd)
     (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
       (when inbound
