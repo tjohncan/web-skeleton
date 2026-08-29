@@ -23,6 +23,7 @@
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
         (test-ssl-read-classification)
+        (test-port-listening-p)
         (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
@@ -783,6 +784,41 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
+(defun test-port-listening-p ()
+  "%PORT-LISTENING-P answers for a socket that is listening, and stops
+   answering once it is not.
+
+   Hand-rolled /proc parsing behind a readiness check, which is the sort
+   of fixture code that gets written once and then trusted forever. A
+   version that always answered NIL would make %WAIT-FOR-LISTENER a ten-
+   second sleep that still raced; one that always answered T would make
+   it no check at all. Both are silent, and neither is visible in a TLS
+   test that passes.
+
+   The pair is what makes it non-vacuous: the same port is asked about
+   twice, and each answer rules out the failure the other cannot see.
+
+   A listener closes with no TIME_WAIT to wait out — that applies to
+   connections, not to the listening socket — so the second question can
+   be asked immediately."
+  (format t "~%/proc listen-table readiness check~%")
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket
+                             :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
+           (sb-bsd-sockets:socket-bind sock #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen sock 5)
+           (multiple-value-bind (host port) (sb-bsd-sockets:socket-name sock)
+             (declare (ignore host))
+             (check "listen-table: sees a socket that is listening"
+                    (%port-listening-p port) t)
+             (sb-bsd-sockets:socket-close sock)
+             (setf sock nil)
+             (check "listen-table: and not one that has gone"
+                    (%port-listening-p port) nil)))
+      (when sock (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
 (defun test-ssl-eintr-retry ()
   "EINTR is a retry, not a transport failure, on both classifiers — and
    the loop that acts on it actually loops.
@@ -845,7 +881,35 @@ printf 'TAIL-MARKER\\n' >> body.txt
                         (if (< calls 3) :retry 7)))
              7)
       (check "eintr: and it called through three times to get there"
-             calls 3))))
+             calls 3))
+    ;; The bound. A retry sequence that outruns *FETCH-TIMEOUT* fails as a
+    ;; timeout, because SO_RCVTIMEO restarts per syscall and so bounds
+    ;; each call rather than the sequence.
+    ;;
+    ;; The thunk gives up after fifty so this test cannot hang: with the
+    ;; deadline removed the loop ends and returns 7, and the check below
+    ;; fails on the value instead of spinning. A revert-check that hangs
+    ;; is not a revert-check.
+    (let ((calls 0)
+          (web-skeleton::*fetch-timeout* 0))
+      ;; Matched on the message, not merely on the fact of a raise: this
+      ;; has to be the deadline arm and not some other error taking the
+      ;; credit for it.
+      ;;
+      ;; STRINGP before SEARCH, and that guard is load-bearing. With the
+      ;; deadline removed the loop returns 7, and SEARCH against a fixnum
+      ;; raises a type error *outside* ATTEMPT — ending the run with no
+      ;; failure list rather than reporting one. Measured: that is exactly
+      ;; what the first version of this check did.
+      (let ((answer (attempt (funcall retrying
+                                      (lambda ()
+                                        (incf calls)
+                                        (if (< calls 50) :retry 7))))))
+        (check "eintr: a retry sequence past the deadline is a timeout"
+               (and (stringp answer) (search "no progress" answer) t)
+               t))
+      (check "eintr: and it entered the loop rather than refusing outright"
+             (plusp calls) t))))
 
 (defun test-https-fetch-async-e2e ()
   "An https:// fetch through the event loop, end to end, on one worker.

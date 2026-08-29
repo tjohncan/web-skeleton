@@ -388,20 +388,42 @@
    the whole of the correction. Nothing was lost and nothing is done
    twice.
 
-   Unbounded on purpose. Every call THUNK makes is itself bounded by
-   SO_RCVTIMEO / SO_SNDTIMEO, so a peer that has gone quiet still fails
-   on time; only an unending stream of signals could extend it, and a
-   counter here would answer that with a different wrong answer rather
-   than a right one.
+   Bounded by *FETCH-TIMEOUT* across the whole sequence, and deliberately
+   not by a count of retries. The difference is the whole of it. A counter
+   turns a *correct* retry into a spurious failure after N signals, so it
+   fails a healthy connection for something that is not its fault. A
+   deadline fails only a fetch that has already outrun the budget the
+   caller set, which is what setting that budget asked for.
+
+   Leaving it unbounded was the first answer, and it was wrong for a
+   reason specific to this framework. SO_RCVTIMEO restarts per syscall,
+   so it bounds each call and never the sequence — and this process
+   generates SIGCHLD by design, one getent child per DNS lookup. That is
+   the same fact the EINTR classification uses to argue the defect is
+   reachable at all, and it cuts both ways.
+
+   The deadline is taken on the first interruption rather than up front:
+   the ordinary path never retries, and should not pay a clock read per
+   call to be told so.
 
    The caller pins across this loop, not inside THUNK. OpenSSL requires a
    repeated call to present the same address and length, and a GC landing
    between the interrupted call and its retry would move the vector out
    from under exactly that requirement."
-  (loop
-    (let ((verdict (funcall thunk)))
-      (unless (eq verdict :retry)
-        (return verdict)))))
+  (let ((deadline nil))
+    (loop
+      (let ((verdict (funcall thunk)))
+        (unless (eq verdict :retry)
+          (return verdict))
+        (unless deadline
+          (setf deadline (+ (get-internal-real-time)
+                            (* *fetch-timeout*
+                               internal-time-units-per-second))))
+        ;; >= not >: at the deadline the budget is spent, and a zero
+        ;; budget therefore means no retries rather than one.
+        (when (>= (get-internal-real-time) deadline)
+          (error "interrupted repeatedly: no progress in ~d seconds"
+                 *fetch-timeout*))))))
 
 (defun ssl-write-retry-or-raise (ssl n &optional
                                        (errno (get-errno))
