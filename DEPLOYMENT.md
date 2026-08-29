@@ -798,6 +798,25 @@ So pause where a drain or something else will resume it — a timer, a
 later request, a queue the app is itself watching. If there is no such
 thing, do not pause.
 
+**A detached fetch cannot be called off while keeping the target alive.**
+Closing the target does end it: `close-connection` walks for detached
+outbounds and reaps them, which is what makes a client going away an
+immediate ending rather than a leak, and is asserted directly — "a client
+that leaves mid-relay tears the outbound down, once."
+
+What has no expression today is the other half of that. An app that
+stops wanting the response while still wanting its connection — an output
+cap reached, a result that arrived from somewhere else first — can stop
+acting on what `:on-body` hands it, but the upstream keeps producing and
+the outbound stays open until the body ends, the fetch fails, or
+`*fetch-timeout*` expires.
+
+Know which primitive you are holding, because they differ exactly here. A
+non-local exit from `http-fetch-stream`'s `:on-line` unwinds through that
+call's `unwind-protect`, closing the socket and stopping the upstream
+while the caller carries on; it is a blocking call, so there is a stack to
+leave. A detached fetch has no call to exit from.
+
 **One shape where `:pause` does nothing at all.** A response that arrives
 complete in a single read is delivered before the pause is consulted, so
 the flag is set and never read. Whether that happens is not something an
