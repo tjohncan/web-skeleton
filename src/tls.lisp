@@ -379,31 +379,77 @@
           (ignore-errors (sb-bsd-sockets:socket-close socket))
           (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
 
-(defun ssl-write-error-raise (ssl n &optional
-                                      (errno (get-errno))
-                                      (err (%ssl-get-error ssl n)))
-  "Classify a non-positive SSL_write return and raise with the same
-   errno discipline as SSL-READ-EOF-OR-RAISE: distinguish a
-   SO_SNDTIMEO expiry (errno = EAGAIN/EWOULDBLOCK) from a real
-   transport failure so operators chasing timeouts can tell them
-   apart in the log. Write has no benign-EOF case — every
-   non-positive return is an error.
+(defun call-retrying-eintr (thunk)
+  "Call THUNK until it answers something other than :RETRY, and return
+   that answer.
+
+   :RETRY is what the classifiers below report for EINTR: the call was
+   interrupted before it moved any bytes, so re-issuing it unchanged is
+   the whole of the correction. Nothing was lost and nothing is done
+   twice.
+
+   Bounded by *FETCH-TIMEOUT* across the whole sequence, and deliberately
+   not by a count of retries. The difference is the whole of it. A counter
+   turns a *correct* retry into a spurious failure after N signals, so it
+   fails a healthy connection for something that is not its fault. A
+   deadline fails only a fetch that has already outrun the budget the
+   caller set, which is what setting that budget asked for.
+
+   Leaving it unbounded was the first answer, and it was wrong for a
+   reason specific to this framework. SO_RCVTIMEO restarts per syscall,
+   so it bounds each call and never the sequence — and this process
+   generates SIGCHLD by design, one getent child per DNS lookup. That is
+   the same fact the EINTR classification uses to argue the defect is
+   reachable at all, and it cuts both ways.
+
+   The deadline is taken on the first interruption rather than up front:
+   the ordinary path never retries, and should not pay a clock read per
+   call to be told so.
+
+   The caller pins across this loop, not inside THUNK. OpenSSL requires a
+   repeated call to present the same address and length, and a GC landing
+   between the interrupted call and its retry would move the vector out
+   from under exactly that requirement."
+  (let ((deadline nil))
+    (loop
+      (let ((verdict (funcall thunk)))
+        (unless (eq verdict :retry)
+          (return verdict))
+        (unless deadline
+          (setf deadline (+ (get-internal-real-time)
+                            (* *fetch-timeout*
+                               internal-time-units-per-second))))
+        ;; >= not >: at the deadline the budget is spent, and a zero
+        ;; budget therefore means no retries rather than one.
+        (when (>= (get-internal-real-time) deadline)
+          (error "interrupted repeatedly: no progress in ~d seconds"
+                 *fetch-timeout*))))))
+
+(defun ssl-write-retry-or-raise (ssl n &optional
+                                       (errno (get-errno))
+                                       (err (%ssl-get-error ssl n)))
+  "Classify a non-positive SSL_write return: :RETRY if the call was
+   interrupted before it moved any bytes, and otherwise raise, with the
+   same errno discipline as SSL-READ-EOF-OR-RAISE — a SO_SNDTIMEO expiry
+   (errno = EAGAIN/EWOULDBLOCK) told apart from a real transport failure
+   so operators chasing timeouts can tell them apart in the log. Write
+   has no benign-EOF case: every non-positive return is an error or a
+   retry.
 
    ERRNO before ERR, and the ordering is load-bearing: &OPTIONAL defaults
    evaluate left to right, so errno is taken before SSL_get_error runs.
    SSL_get_error is a foreign call and can set errno itself, so reading it
    afterwards reports what that call did rather than what SSL_write did --
    and errno is the entire basis of the split below."
-  (progn
-    (cond
-      ((= err +ssl-error-syscall+)
-       (progn
-         (cond
-           ((or (= errno +eagain+) (= errno +ewouldblock+))
-            (error "SSL_write: timed out (~a)" (errno-string errno)))
-           (t
-            (error "SSL_write: transport error ~a" (errno-string errno))))))
-      (t (error "SSL_write failed: error ~d" err)))))
+  (cond
+    ((= err +ssl-error-syscall+)
+     (cond
+       ((= errno +eintr+) :retry)
+       ((or (= errno +eagain+) (= errno +ewouldblock+))
+        (error "SSL_write: timed out (~a)" (errno-string errno)))
+       (t
+        (error "SSL_write: transport error ~a" (errno-string errno)))))
+    (t (error "SSL_write failed: error ~d" err))))
 
 (defun tls-write-all (ssl bytes)
   "Write all BYTES through the SSL connection. Blocks until complete.
@@ -413,13 +459,23 @@
   (let ((pos 0)
         (len (length bytes)))
     (loop while (< pos len)
-          do (sb-sys:with-pinned-objects (bytes)
-               (let ((n (%ssl-write ssl
-                                    (sb-sys:sap+ (sb-sys:vector-sap bytes) pos)
-                                    (- len pos))))
-                 (when (<= n 0)
-                   (ssl-write-error-raise ssl n))
-                 (incf pos n))))))
+          do (incf pos
+                   ;; Pinned across the retry loop rather than across one
+                   ;; call. A retry must present the same address, and a GC
+                   ;; between the interrupted call and its retry would move
+                   ;; BYTES. A *partial* write is not a retry — it advances
+                   ;; POS and issues a fresh call — which is why the pin can
+                   ;; end and restart at that boundary and not inside one.
+                   (sb-sys:with-pinned-objects (bytes)
+                     (call-retrying-eintr
+                      (lambda ()
+                        (let ((n (%ssl-write
+                                  ssl
+                                  (sb-sys:sap+ (sb-sys:vector-sap bytes) pos)
+                                  (- len pos))))
+                          (if (> n 0)
+                              n
+                              (ssl-write-retry-or-raise ssl n))))))))))
 
 (defun ssl-read-eof-or-raise (ssl n &optional
                                       (errno (get-errno))
@@ -469,12 +525,36 @@
                                   framing signal for HTTP/1.0-style
                                   servers that never send one.
      errno = EAGAIN/EWOULDBLOCK — would block. :AGAIN, per above.
+     errno = EINTR              — a signal arrived before the call moved
+                                  any bytes. Nothing is wrong with the
+                                  connection and nothing was lost, so the
+                                  correction is to issue it again:
+                                  :RETRY. CALL-RETRYING-EINTR is the loop,
+                                  and the pin belongs outside it.
      errno = anything else      — real transport failure: ECONNRESET,
                                   EPIPE, ETIMEDOUT. This is the MITM
                                   RST-mid-stream case, where an attacker
                                   truncates a response and a silent EOF
                                   here delivers it as success. Loud
                                   raise, always.
+
+   EINTR IS REACHABLE, and not by the route a reader will assume. It is
+   *un*reachable on the event loop's sockets: those are non-blocking, so
+   a read answers EAGAIN rather than entering the interruptible sleep
+   where EINTR is generated. The blocking fetch path is three things at
+   once. BLOCKING-CONNECT restores blocking mode deliberately, so the
+   call can sleep. SET-SOCKET-TIMEOUT installs SO_RCVTIMEO so
+   *FETCH-TIMEOUT* bounds it, and per signal(7) a blocking socket call
+   carrying a receive timeout fails with EINTR when interrupted
+   *regardless of SA_RESTART* — the handler flag that would otherwise
+   restart it does not apply. And the framework supplies the signal
+   itself: DNS resolution spawns a getent child per lookup, so SIGCHLD is
+   ordinary on a path that has just resolved a name.
+
+   Blocking socket, receive timeout installed, and a signal this process
+   generates for itself. Do not delete this arm on the grounds that
+   non-blocking sockets never see EINTR: that is true, and is not where
+   this one comes from.
 
    WANT_READ and WANT_WRITE reaching here is a caller bug: both are
    continuable and belong to whoever knows how to continue them."
@@ -484,6 +564,7 @@
      (cond
        ((zerop errno) :eof)
        ((or (= errno +eagain+) (= errno +ewouldblock+)) :again)
+       ((= errno +eintr+) :retry)
        (t (error "SSL_read: transport error ~a" (errno-string errno)))))
     ((or (= err +ssl-error-want-read+) (= err +ssl-error-want-write+))
      (error "SSL_read: ~a reached the classifier; it is continuable and ~
@@ -503,6 +584,10 @@
    the loud error DEPLOYMENT.md promises. Silence here made that promise
    a lie once, for close-delimited HTTPS responses and for
    http-fetch-stream over HTTPS.
+
+   :RETRY passes straight through. An interrupted call means the same
+   thing on either kind of socket, and the caller's CALL-RETRYING-EINTR
+   is what acts on it. Only :AGAIN reads differently here.
 
    A wrapper rather than a flag on the classifier: that one answers what
    the transport reported, this one answers what it means on this kind of
@@ -682,23 +767,32 @@
    place and this function cannot drift from the blocking path's idea of
    what a clean end of stream is."
   (lambda (buffer start max-bytes)
+    ;; The retry loop is here to keep a shared classifier's contract
+    ;; total, not because EINTR is expected on this path -- these sockets
+    ;; are non-blocking and answer EAGAIN instead. But
+    ;; SSL-READ-EOF-OR-RAISE can now answer :RETRY, and NB-READ's contract
+    ;; has no such value: leaking it would reach CONNECTION-READ-AVAILABLE
+    ;; as an unrecognised verdict, which is a worse failure than the raise
+    ;; it replaced. Consuming it here costs one loop and cannot be wrong.
     (sb-sys:with-pinned-objects (buffer)
-      (let* ((n (%ssl-read ssl
-                           (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
-                           max-bytes))
-             ;; Before SSL_get_error, which can set errno itself.
-             (errno (if (> n 0) 0 (get-errno))))
-        (if (> n 0)
-            n
-            (let ((err (%ssl-get-error ssl n)))
-              (cond
-                ((= err +ssl-error-want-read+) :again)
-                ;; The state machine can express this now: the caller
-                ;; arms writability and re-issues the read. It must be the
-                ;; read -- retrying as a write is a protocol error that
-                ;; surfaces looking like a broken peer.
-                ((= err +ssl-error-want-write+) :want-write)
-                (t (ssl-read-eof-or-raise ssl n errno err)))))))))
+      (call-retrying-eintr
+       (lambda ()
+         (let* ((n (%ssl-read ssl
+                              (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
+                              max-bytes))
+                ;; Before SSL_get_error, which can set errno itself.
+                (errno (if (> n 0) 0 (get-errno))))
+           (if (> n 0)
+               n
+               (let ((err (%ssl-get-error ssl n)))
+                 (cond
+                   ((= err +ssl-error-want-read+) :again)
+                   ;; The state machine can express this now: the caller
+                   ;; arms writability and re-issues the read. It must be
+                   ;; the read -- retrying as a write is a protocol error
+                   ;; that surfaces looking like a broken peer.
+                   ((= err +ssl-error-want-write+) :want-write)
+                   (t (ssl-read-eof-or-raise ssl n errno err)))))))))))
 
 (defun ssl-byte-reader (ssl)
   "Byte source over SSL for STREAM-READER: fill BUF, answer with the
@@ -713,16 +807,22 @@
    only 0 as end of stream, so answering :EOF for a reset mid-body would
    deliver a truncated response as a clean one."
   (lambda (buf len)
+    ;; Pinned outside the retry loop: a re-issued read must present the
+    ;; same address, and this is the blocking path, which is the one that
+    ;; can be interrupted.
     (sb-sys:with-pinned-objects (buf)
-      (let* ((n (%ssl-read ssl (sb-sys:vector-sap buf) len))
-             ;; Sampled before SSL-READ-EOF-OR-RAISE asks SSL_get_error.
-             (errno (if (> n 0) 0 (get-errno))))
-        (if (> n 0)
-            n
-            ;; Returns :EOF for a benign close, raises for everything
-            ;; else. SSL_ERROR_SYSCALL conflates four conditions and only
-            ;; one of them is an ordinary end of stream.
-            (ssl-blocking-read-eof-or-raise ssl n errno))))))
+      (call-retrying-eintr
+       (lambda ()
+         (let* ((n (%ssl-read ssl (sb-sys:vector-sap buf) len))
+                ;; Sampled before SSL-READ-EOF-OR-RAISE asks SSL_get_error.
+                (errno (if (> n 0) 0 (get-errno))))
+           (if (> n 0)
+               n
+               ;; :EOF for a benign close, :RETRY for an interrupted call,
+               ;; a raise for everything else. SSL_ERROR_SYSCALL conflates
+               ;; several conditions and only one is an ordinary end of
+               ;; stream.
+               (ssl-blocking-read-eof-or-raise ssl n errno))))))))
 
 (sb-alien:define-alien-routine ("EVP_MD_CTX_new" %evp-md-ctx-new) (* t))
 

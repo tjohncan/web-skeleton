@@ -7405,6 +7405,210 @@
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; cpu-count
+;;;
+;;; Driven with synthetic file contents rather than the live filesystem,
+;;; because a host that exposes cgroup CPU files cannot be relied on. CI does
+;;; not, so without this every branch except the final fall-through would go
+;;; unexercised — and the fall-through is the one path that was already
+;;; working.
+;;; ---------------------------------------------------------------------------
+
+(defun test-detached-pause-auto-resumes ()
+  "A paused detached fetch is resumed by its target's backlog draining.
+
+   Sibling to TEST-AUTOMATIC-RESUME-EDGE rather than a replacement for it.
+   That one has covered the mechanism since the resume edge landed, and
+   with a :STREAMING target — what it could not cover is that anything
+   reached it. RESUME-PAUSED-OUTBOUND runs from HANDLE-CLIENT-WRITE's :DONE
+   arm when a connection's backlog empties, and until the detached seam the
+   only connection a fetch could pause against was an :AWAITING inbound,
+   which has nothing queued by construction and so never receives EPOLLOUT.
+   A tested mechanism with no reachable caller, which is the same shape as
+   the relay example this branch deleted.
+
+   So what is new here is the sink, not the edge: a paused outbound whose
+   FETCH-SINK is :DETACHED, resumed by its target draining, with the
+   deadline advanced by the interval spent paused.
+
+   Driven here rather than end to end, and that is a deliberate retreat.
+   The e2e version has to make a real client stop reading until the
+   target's socket refuses a write, and loopback will not cooperate:
+   measured, 768 KiB went through with the target's pending bytes never
+   leaving 0, and 5 MiB made the test slow without making it reliable. A
+   test that cannot provoke the state it names is worse than one that
+   drives the edge directly — it passes for the wrong reason, which is the
+   failure this branch exists to delete.
+
+   So the edge is driven: a target holding a backlog and a paused outbound
+   behind it, flushed until :DONE, with the outbound's interest checked
+   before and after.
+
+   The precondition this pins down, which no document has ever carried:
+   auto-resume needs the target to have *actually backed up*. STREAM-SEND
+   flushes inline through STREAM-FLUSH, which never reaches
+   HANDLE-CLIENT-WRITE, so a pause taken while the target's queue was empty
+   has no wake-up coming and still needs an explicit FETCH-RESUME."
+  (format t "~%Detached fetch: pause resumes when the target drains~%")
+  (multiple-value-bind (out-server out-client) (%loopback-pair)
+    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((out-fd (web-skeleton::socket-fd out-server))
+                    (tgt-fd (web-skeleton::socket-fd tgt-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
+                    ;; leaves one: subscribed to no events at all, so
+                    ;; nothing but a resume can ever wake it.
+                    (out (web-skeleton::make-connection
+                          :fd out-fd :socket out-server :state :out-read
+                          :outbound-p t
+                          :fetch-sink :detached
+                          :fetch-paused t
+                          :fetch-paused-at (get-universal-time)
+                          :fetch-deadline (+ (get-universal-time) 30)
+                          :inbound-fd tgt-fd
+                          :last-active (get-universal-time)))
+                    ;; The target: a streaming connection with the
+                    ;; back-link the pause left on it.
+                    (tgt (web-skeleton::make-connection
+                          :fd tgt-fd :socket tgt-server :state :streaming
+                          :stream-framing :chunked
+                          :paused-outbound-fd out-fd
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking out-fd)
+               (web-skeleton::set-nonblocking tgt-fd)
+               (web-skeleton::register-connection out)
+               (web-skeleton::register-connection tgt)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (web-skeleton::epoll-add epfd tgt-fd
+                                        (logior web-skeleton::+epollout+
+                                                web-skeleton::+epollet+))
+               (check "detached pause: the outbound starts paused"
+                      (web-skeleton::connection-fetch-paused out) t)
+               ;; A backlog on the target, and then the drain that ends it.
+               (web-skeleton::connection-append-write
+                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
+               (check "detached pause: the target has a backlog to drain"
+                      (plusp (web-skeleton::connection-write-pending tgt)) t)
+               (web-skeleton::handle-client-write tgt epfd)
+               (check "detached pause: the target drained"
+                      (web-skeleton::connection-write-pending tgt) 0)
+               ;; The property.
+               (check "detached pause: draining the target resumed the fetch"
+                      (web-skeleton::connection-fetch-paused out) nil)
+               (check "detached pause: and the back-link was cleared with it"
+                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
+               ;; The deadline moved by the time spent paused, so a relay
+               ;; is not killed for applying the backpressure it was told
+               ;; to apply.
+               (check "detached pause: the deadline is not still the original"
+                      (>= (web-skeleton::connection-fetch-deadline out)
+                          (+ (web-skeleton::connection-fetch-started-at out)
+                             30))
+                      t))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close out-server))
+          (ignore-errors (sb-bsd-sockets:socket-close out-client))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+
+(defun test-cpu-count-parsers ()
+  (format t "~%cpu-count: quota and topology parsing~%")
+
+  ;; cgroup v2. The unlimited form's first field is the literal string
+  ;; `max`, not a number: parsed as an integer it raises, and a parser that
+  ;; guessed would answer with whatever it made of the word. It must decline
+  ;; so the chain moves on.
+  (check "cpu.max: unlimited declines"
+         (web-skeleton::parse-cpu-max "max 100000") nil)
+  (check "cpu.max: one full CPU"
+         (web-skeleton::parse-cpu-max "100000 100000") 1)
+  (check "cpu.max: four CPUs"
+         (web-skeleton::parse-cpu-max "400000 100000") 4)
+  ;; The shape this whole change exists for. FLOOR gives 0 here, and
+  ;; START-SERVER refuses a non-positive :WORKERS — so rounding down turns
+  ;; the fix into a server that will not boot in the deployment it serves.
+  (check "cpu.max: half a CPU still gets one worker"
+         (web-skeleton::parse-cpu-max "50000 100000") 1)
+  (check "cpu.max: 2.5 CPUs rounds up"
+         (web-skeleton::parse-cpu-max "250000 100000") 3)
+  (check "cpu.max: trailing newline tolerated"
+         (web-skeleton::parse-cpu-max (format nil "200000 100000~c" #\Newline)) 2)
+  (check "cpu.max: garbage declines"
+         (web-skeleton::parse-cpu-max "not a quota") nil)
+  (check "cpu.max: single field declines"
+         (web-skeleton::parse-cpu-max "100000") nil)
+  (check "cpu.max: zero period declines"
+         (web-skeleton::parse-cpu-max "100000 0") nil)
+  (check "cpu.max: NIL line declines"
+         (web-skeleton::parse-cpu-max nil) nil)
+
+  ;; cgroup v1. Unlimited is a quota of -1 rather than a word.
+  (check "cfs: unlimited declines"
+         (web-skeleton::parse-cfs-quota "-1" "100000") nil)
+  (check "cfs: two CPUs"
+         (web-skeleton::parse-cfs-quota "200000" "100000") 2)
+  (check "cfs: half a CPU still gets one worker"
+         (web-skeleton::parse-cfs-quota "50000" "100000") 1)
+  (check "cfs: a missing file declines"
+         (web-skeleton::parse-cfs-quota nil "100000") nil)
+
+  ;; Topology, the last answer in the chain and the only one CI reaches.
+  (check "cpu list: simple range"
+         (web-skeleton::parse-cpu-list "0-15") 16)
+  (check "cpu list: single cpu"
+         (web-skeleton::parse-cpu-list "0") 1)
+  (check "cpu list: multi-range with a bare cpu"
+         (web-skeleton::parse-cpu-list "0-3,8,12-13") 7)
+  (check "cpu list: garbage declines"
+         (web-skeleton::parse-cpu-list "nonsense") nil)
+  (check "cpu list: empty declines"
+         (web-skeleton::parse-cpu-list "") nil)
+
+  ;; Affinity is a syscall and cannot be synthesised, so its arithmetic is
+  ;; tested where it lives: the popcount over a filled cpu_set_t.
+  (check "affinity: bits counted across bytes"
+         (web-skeleton::count-set-bits #(#xFF #x0F #x00)) 12)
+  (check "affinity: an empty mask counts nothing"
+         (web-skeleton::count-set-bits #(0 0 0 0)) 0)
+
+  ;; And the live call, which on any Linux host must answer something
+  ;; positive. This is the one arm that runs against the real machine.
+  (let ((n (web-skeleton::affinity-cpu-count)))
+    (check "affinity: the live call answers a positive count"
+           (and (integerp n) (plusp n)) t))
+
+  ;; The least of the sources, not the first. These are the assertions that
+  ;; distinguish the two: no host either of us can test on will disagree
+  ;; with itself, so on every real machine MIN and first-answer-wins return
+  ;; the same number and are indistinguishable.
+  (check "min: a quota of eight against an affinity of two answers two"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "800000 100000") 2)
+         2)
+  (check "min: an affinity of sixteen against a quota of two answers two"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "200000 100000") 16)
+         2)
+  (check "min: a silent quota leaves affinity to answer"
+         (web-skeleton::fewest-cpus
+          (web-skeleton::parse-cpu-max "max 100000") 16)
+         16)
+  (check "min: every source silent declines"
+         (web-skeleton::fewest-cpus nil nil nil) nil)
+  (check "min: a non-positive source is ignored rather than winning"
+         (web-skeleton::fewest-cpus 0 -3 4) 4)
+
+  ;; The whole thing, on whatever this host is. Cannot assert a number —
+  ;; that is the point of the change — but it must always be usable, since
+  ;; START-SERVER refuses anything else.
+  (let ((n (web-skeleton::cpu-count)))
+    (check "cpu-count: answers a positive integer"
+           (and (integerp n) (plusp n)) t)))
+
 (defun test-server ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -7465,5 +7669,7 @@
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
+  (test-detached-pause-auto-resumes)
+  (test-cpu-count-parsers)
   (report-suite "Server")
   (zerop *tests-failed*))

@@ -23,7 +23,10 @@
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
         (test-ssl-read-classification)
+        (test-port-listening-p)
+        (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
+        (test-https-fetch-on-body-e2e)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -107,6 +110,58 @@ printf 'TAIL-MARKER\\n' >> body.txt
           (error ()
             (ignore-errors (sb-bsd-sockets:socket-close s))
             (sleep 0.05)))))))
+
+(defun %port-listening-p (port)
+  "T when some socket is in LISTEN state on PORT, per /proc/net/tcp and
+   /proc/net/tcp6.
+
+   Not %LISTEN-SOCKET-COUNT, for two reasons. That one reads IPv4 only,
+   and openssl s_server binds the IPv6 wildcard, so it never appears
+   there. And it counts distinct inodes because its caller is asking how
+   many workers joined an SO_REUSEPORT listen group — a harder question
+   than this one, which needs only whether the port is up yet. The
+   seq_file resume that makes counting delicate is harmless here: a row
+   skipped on one pass is read on the next poll.
+
+   Field 1 is LOCAL_ADDRESS as HEXIP:HEXPORT, field 3 is the state, and
+   0A is TCP_LISTEN."
+  (let ((hex (format nil "~4,'0X" port)))
+    (dolist (path '("/proc/net/tcp" "/proc/net/tcp6") nil)
+      (with-open-file (in path :if-does-not-exist nil)
+        (when in
+          (read-line in nil nil)          ; column header
+          (loop for line = (read-line in nil nil)
+                while line
+                do (let ((fields (%split-ws line)))
+                     (when (>= (length fields) 4)
+                       (let* ((local (second fields))
+                              (colon (position #\: local)))
+                         (when (and colon
+                                    (string= (fourth fields) "0A")
+                                    (string= hex local :start2 (1+ colon)))
+                           (return-from %port-listening-p t)))))))))))
+
+(defun %wait-for-listener (port &key (timeout 10))
+  "Poll the kernel's listen table until PORT has a listening socket.
+   Returns T, or NIL on timeout.
+
+   The readiness check for a peer that must not be probed. %WAIT-FOR-ACCEPT
+   answers the same question by connecting, which relay mode cannot afford:
+   s_server -naccept 1 serves exactly one connection, so the probe spends
+   the connection the test came for.
+
+   Sleeping a fixed interval instead makes the test a race. The framework's
+   own outbound dial does not retry — %TLS-CONNECT-RETRYING is the test
+   client's lever, not the event loop's — so a fetch that beats s_server's
+   bind gets ECONNREFUSED, and it surfaces as a 502 from the relay rather
+   than as anything naming the fixture. Reading /proc/net/tcp asks whether
+   the socket is listening without touching it."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop
+      (when (%port-listening-p port) (return t))
+      (when (> (get-internal-real-time) deadline) (return nil))
+      (sleep 0.05))))
 
 (defvar *tls-peer-process* nil
   "The s_server process, bound inside %CALL-WITH-TLS-PEER. A special rather
@@ -729,6 +784,133 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
+(defun test-port-listening-p ()
+  "%PORT-LISTENING-P answers for a socket that is listening, and stops
+   answering once it is not.
+
+   Hand-rolled /proc parsing behind a readiness check, which is the sort
+   of fixture code that gets written once and then trusted forever. A
+   version that always answered NIL would make %WAIT-FOR-LISTENER a ten-
+   second sleep that still raced; one that always answered T would make
+   it no check at all. Both are silent, and neither is visible in a TLS
+   test that passes.
+
+   The pair is what makes it non-vacuous: the same port is asked about
+   twice, and each answer rules out the failure the other cannot see.
+
+   A listener closes with no TIME_WAIT to wait out — that applies to
+   connections, not to the listening socket — so the second question can
+   be asked immediately."
+  (format t "~%/proc listen-table readiness check~%")
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket
+                             :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
+           (sb-bsd-sockets:socket-bind sock #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen sock 5)
+           (multiple-value-bind (host port) (sb-bsd-sockets:socket-name sock)
+             (declare (ignore host))
+             (check "listen-table: sees a socket that is listening"
+                    (%port-listening-p port) t)
+             (sb-bsd-sockets:socket-close sock)
+             (setf sock nil)
+             (check "listen-table: and not one that has gone"
+                    (%port-listening-p port) nil)))
+      (when sock (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
+(defun test-ssl-eintr-retry ()
+  "EINTR is a retry, not a transport failure, on both classifiers — and
+   the loop that acts on it actually loops.
+
+   An interrupted call moved no bytes and left the connection intact, so
+   reporting it as a transport error fails a fetch that nothing is wrong
+   with. It reached the application as a 502 with the callback's cleanup
+   sentinel.
+
+   Reachable on the blocking fetch path specifically, and not by the
+   route a reader assumes. Those sockets are blocking by BLOCKING-CONNECT's
+   deliberate choice and carry SO_RCVTIMEO so *FETCH-TIMEOUT* bounds them,
+   and per signal(7) a blocking socket call carrying a receive timeout
+   fails with EINTR when interrupted regardless of SA_RESTART. The
+   framework then supplies the signal: a getent child per DNS lookup, on a
+   path that has just resolved a name.
+
+   Asserted directly rather than provoked, for the same reason the
+   ECONNRESET branch above is: arranging a real signal to land inside an
+   in-flight SSL_read is not something this fixture can do reliably, and a
+   test that only sometimes reaches its branch only sometimes catches a
+   regression in it. Stated rather than implied.
+
+   The count in the loop check is the assertion with teeth. A helper that
+   called its thunk once and returned whatever it got would satisfy the
+   value check and none of the purpose."
+  (format t "~%SSL EINTR retry~%")
+  (let ((classify (tls-sym "SSL-READ-EOF-OR-RAISE"))
+        (blocking (tls-sym "SSL-BLOCKING-READ-EOF-OR-RAISE"))
+        (wclass   (tls-sym "SSL-WRITE-RETRY-OR-RAISE"))
+        (retrying (tls-sym "CALL-RETRYING-EINTR"))
+        (syscall  (symbol-value (tls-sym "+SSL-ERROR-SYSCALL+")))
+        (eagain   (symbol-value (find-symbol "+EAGAIN+" :web-skeleton)))
+        (eintr    (symbol-value (find-symbol "+EINTR+" :web-skeleton)))
+        (econnreset 104))
+    ;; Read side, and the blocking wrapper must pass it through rather
+    ;; than convert it into the loud receive-timeout error — reporting a
+    ;; blown 30-second deadline milliseconds into the budget is the
+    ;; misdiagnosis BLOCKING-CONNECT's poll loop already exists to prevent.
+    (check "eintr: SYSCALL with EINTR is a retry, not an error"
+           (attempt (funcall classify nil -1 eintr syscall)) :retry)
+    (check "eintr: the blocking wrapper passes a retry through"
+           (attempt (funcall blocking nil -1 eintr syscall)) :retry)
+    ;; Write side, plus the two neighbours it must not have swallowed.
+    (check "eintr: SSL_write with EINTR is a retry"
+           (attempt (funcall wclass nil -1 eintr syscall)) :retry)
+    (check "eintr: SSL_write with EAGAIN is still the timeout"
+           (and (search "timed out"
+                        (attempt (funcall wclass nil -1 eagain syscall)))
+                t)
+           t)
+    (check "eintr: SSL_write with ECONNRESET still raises"
+           (stringp (attempt (funcall wclass nil -1 econnreset syscall))) t)
+    ;; And the loop.
+    (let ((calls 0))
+      (check "eintr: the retry loop runs until the answer is not :retry"
+             (funcall retrying
+                      (lambda ()
+                        (incf calls)
+                        (if (< calls 3) :retry 7)))
+             7)
+      (check "eintr: and it called through three times to get there"
+             calls 3))
+    ;; The bound. A retry sequence that outruns *FETCH-TIMEOUT* fails as a
+    ;; timeout, because SO_RCVTIMEO restarts per syscall and so bounds
+    ;; each call rather than the sequence.
+    ;;
+    ;; The thunk gives up after fifty so this test cannot hang: with the
+    ;; deadline removed the loop ends and returns 7, and the check below
+    ;; fails on the value instead of spinning. A revert-check that hangs
+    ;; is not a revert-check.
+    (let ((calls 0)
+          (web-skeleton::*fetch-timeout* 0))
+      ;; Matched on the message, not merely on the fact of a raise: this
+      ;; has to be the deadline arm and not some other error taking the
+      ;; credit for it.
+      ;;
+      ;; STRINGP before SEARCH, and that guard is load-bearing. With the
+      ;; deadline removed the loop returns 7, and SEARCH against a fixnum
+      ;; raises a type error *outside* ATTEMPT — ending the run with no
+      ;; failure list rather than reporting one. Measured: that is exactly
+      ;; what the first version of this check did.
+      (let ((answer (attempt (funcall retrying
+                                      (lambda ()
+                                        (incf calls)
+                                        (if (< calls 50) :retry 7))))))
+        (check "eintr: a retry sequence past the deadline is a timeout"
+               (and (stringp answer) (search "no progress" answer) t)
+               t))
+      (check "eintr: and it entered the loop rather than refusing outright"
+             (plusp calls) t))))
+
 (defun test-https-fetch-async-e2e ()
   "An https:// fetch through the event loop, end to end, on one worker.
 
@@ -796,6 +978,102 @@ printf 'TAIL-MARKER\\n' >> body.txt
                   ;; client proves the handler ran, not that TLS worked.
                   (check "https async: the upstream answered over TLS"
                          upstream (list 200 :present)))))))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-fetch-on-body-e2e ()
+  "An :ON-BODY relay over https:// sees the chunk boundaries the upstream
+   framed, not the ones TLS records happened to land on.
+
+   The two layers have no reason to agree. OpenSSL emits records on its
+   own schedule and hands back whatever a single SSL_read decrypted, so
+   the byte runs arriving at the walk are cut differently over TLS than
+   over plain TCP — split mid-chunk, or several chunks at once. The
+   framing has to be reconstructed from the stream either way, and the
+   app is promised the same chunks regardless of which transport it
+   named.
+
+   Asserted against *CHUNKED-CORPUS*, which is also what the plain-TCP
+   test asserts and what this upstream is built from. That shared
+   definition is the point: two literals could agree today and drift
+   apart later without either test noticing.
+
+   Measured, this does *not* reach the :OK-EOF branch, and the docstring
+   said it did until the claim was checked. s_server's close_notify
+   arrives as its own wake-up, so the walk completes on :OK while the
+   stream is still open — confirmed by reintroducing the :OK-EOF defect,
+   which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
+   where that branch is pinned. This one covers the boundaries."
+  (format t "~%HTTPS fetch :on-body chunk boundaries~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "https on-body: fixture generated" nil t)
+             (return-from test-https-fetch-on-body-e2e))
+           (with-open-file (out (format nil "~a/chunked.txt" dir)
+                                :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+             (write-sequence (sb-ext:string-to-octets (%chunked-corpus-response)
+                                                      :external-format :ascii)
+                             out))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           ;; SETF globally, not bound: the worker that reads this lives in
+           ;; a thread WITH-TEST-SERVER spawned, and dynamic bindings do not
+           ;; cross MAKE-THREAD. Restored in the UNWIND-PROTECT.
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet)))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (port)
+              (let ((chunks nil)
+                    (final :never)
+                    (fires 0))
+                (check "https on-body: the peer is listening"
+                       (%wait-for-listener port) t)
+                (with-test-server
+                    (:handler
+                     (lambda (req)
+                       (declare (ignore req))
+                       (http-fetch
+                        :get (format nil "https://right.test:~d/" port)
+                        :on-body (lambda (conn chunk)
+                                   (declare (ignore conn))
+                                   (push (sb-ext:octets-to-string
+                                          chunk :external-format :ascii)
+                                         chunks))
+                        :then (lambda (status headers body)
+                                (declare (ignore headers))
+                                (incf fires)
+                                (setf final
+                                      (list status (if body :present :nil)))
+                                (make-text-response 200 "relayed")))))
+                  (multiple-value-bind (status headers body)
+                      (test-http-request :get "/relay")
+                    (declare (ignore headers))
+                    (check "https on-body: the relay answered" status 200)
+                    (check "https on-body: and its own body came through"
+                           body "relayed")))
+                ;; The upstream half, asserted separately: a 200 to the
+                ;; client proves the handler ran, not that TLS worked.
+                (check "https on-body: the upstream answered over TLS"
+                       (first final) 200)
+                ;; The claim.
+                (check "https on-body: chunk boundaries survive TLS framing"
+                       (reverse chunks) *chunked-corpus*)
+                (check "https on-body: :then got no body to re-deliver"
+                       (second final) :nil)
+                (check "https on-body: :then fires exactly once" fires 1)))
+            :relay-file (format nil "~a/chunked.txt" dir)))
       (setf web-skeleton::*dns-lookup-fn* saved-dns)
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t

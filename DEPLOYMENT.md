@@ -440,8 +440,11 @@ fires **exactly once per fetch** with one of two argument shapes:
   The closure's return value becomes the response
   delivered to the original inbound client.
 - **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal teardown path:
-  upstream TCP / TLS / DNS failure, short-body truncation,
+  upstream TCP / TLS / DNS failure, a body that stopped early,
   inbound connection closed mid-fetch, drain, worker crash.
+  A body stops early by falling short of a declared `Content-Length`,
+  or by ending without its chunked terminator — and `:on-body` having
+  already delivered chunks does not make a truncated response complete.
   The closure's return value is discarded in this branch
   because there is no inbound to deliver anything to.
 
@@ -659,10 +662,12 @@ a short frame is a protocol error on the peer's side, while a refused one
 leaves the stream well-formed and short. What the refusal *means* is the
 caller's to decide, and the two answers differ. An app-generated stream
 should close — a dropped event is invisible to the client, so its view
-diverges from the server's permanently with nothing raised anywhere. A
-relay should stop reading its upstream instead, because the client has
-not misbehaved, and letting the upstream's TCP window fill turns a killed
-download into a slow one.
+diverges from the server's permanently with nothing raised anywhere.
+Something forwarding an upstream should stop reading it instead, because
+the client has not misbehaved, and letting the upstream's TCP window fill
+turns a killed download into a slow one. That second disposition is why
+the bound exposes a state rather than picking an answer — though see
+Limitations for why forwarding onward cannot presently be built.
 
 Per connection, so the ceiling is `*max-write-backlog*` × `*max-connections*`
 × workers — the same shape as the read-buffer arithmetic above, and it takes
@@ -674,12 +679,37 @@ connections and bursty output.
 sends one vector and waits for it, so a plain request/response connection
 never builds a queue.
 
-### Relaying an upstream incrementally
+### Reading a response incrementally
 
 `http-fetch` takes an `:on-body` callback, called `(conn bytes)` with each
-chunk of a chunked upstream response as it arrives on the async `http://`
-path. Pair it with a streaming response and a relay forwards as it reads
-rather than buffering the whole body first.
+chunk of a chunked upstream response as its framing is proved. The handler
+sees the body as it arrives rather than only once the whole of it has been
+buffered, so a large response can be processed without being held:
+
+```lisp
+(defun handle-count (req)
+  (declare (ignore req))
+  (let ((lines 0))
+    (http-fetch :get "http://upstream.internal/feed"
+                :on-body (lambda (out chunk)
+                           (declare (ignore out))
+                           (incf lines (count 10 chunk)))
+                :then (lambda (status headers body)
+                        (declare (ignore headers body))
+                        (if (eql status 200)
+                            (make-text-response 200 (format nil "~d~%" lines))
+                            (make-error-response 502))))))
+```
+
+`status` is tested rather than ignored, and `EQL` rather than `=` because
+the cleanup sentinel passes `NIL`. Answering `200` with a count from a
+fetch that never completed is the failure this section was rewritten to
+stop describing.
+
+**To forward the bytes onward, use `fetch-into`.** A handler-returned
+continuation feeds the handler that returned it and nothing else. A
+`:streaming` connection or a WebSocket owns its own write path, and
+`fetch-into` starts a fetch against one:
 
 ```lisp
 (defun handle-relay (req)
@@ -687,15 +717,31 @@ rather than buffering the whole body first.
   (make-stream-response
    :on-open
    (lambda (client)
-     (http-fetch :get "http://upstream.internal/feed"
-                 :on-body (lambda (out chunk)
-                            (declare (ignore out))
-                            (stream-send client chunk))
-                 :then (lambda (status headers body)
-                         (declare (ignore status headers body))
-                         (stream-close client)
-                         nil)))))
+     (fetch-into
+      client
+      (http-fetch :get "http://upstream.internal/feed"
+                  :on-body (lambda (out chunk)
+                             (declare (ignore out))
+                             (stream-send client chunk)
+                             nil)
+                  :then (lambda (status headers body)
+                          (declare (ignore status headers body))
+                          (stream-close client)
+                          nil))))))
 ```
+
+It returns `T`, or signals — a wrong state, a second argument that is not
+a continuation, no event loop, or a fetch already outstanding on that
+connection. A signalling call has done nothing and the callback does not
+fire, so `:then` can never run before `fetch-into` returns. `:then`'s
+return value is discarded here; there is no parked request to answer.
+
+If the callback does not close the connection, the framework does — with a
+terminator on success, and *without* one on failure, so the peer's decoder
+sees truncation rather than being told a failed body was complete. Unless
+`:then` started another fetch, which is how a detached fetch chains: a
+handler-returned one chains by returning a continuation, this one chains
+by calling `fetch-into` again.
 
 **`:then` still fires exactly once, with a NIL body.** The bytes went out
 incrementally; handing them over again would double the memory the
@@ -706,7 +752,7 @@ callback exists to avoid.
 bytes back from, so `:on-body` is never called and `:then` receives the
 whole body the ordinary way — not incremental, but not lost. You do not
 choose which framing an upstream uses: the same origin will switch by
-response size or by whatever proxy sits in front of it. Write the relay
+response size or by whatever proxy sits in front of it. Write the handler
 to take the bytes from `:on-body` when they arrive there and from
 `:then`'s body when they do not.
 
@@ -722,33 +768,75 @@ would be two readers that could disagree about where a line ends, which
 is the disagreement this codebase treats as its threat model. Split what
 you are given if you want lines.
 
-**Backpressure is a return value, and it undoes itself.** Return `:pause`
-from `:on-body` to stop reading the upstream — its send window fills and
-the pressure propagates back without anything being dropped or buffered.
-Reading resumes on its own when the connection you are relaying *into*
-drains its write backlog, which is the event the pause was waiting for.
+**Backpressure is a return value, and resuming it is yours to do.**
+Return `:pause` from `:on-body` to stop reading the upstream — its send
+window fills and the pressure propagates back without anything being
+dropped or buffered. Call `fetch-resume` on the connection `:on-body` was
+handed to start reading again; it is idempotent, so a producer that calls
+it on every pass rather than tracking state is not punished for it.
 
-You do not have to call anything. `fetch-resume` remains exported for an
-app that knows better than the backlog does — a producer that wants to
-resume early, or one relaying somewhere the framework is not writing —
-and calling it is idempotent. But an app that only ever pauses is no
-longer relying on itself to notice; `:on-body` is its scheduled contact
-with the relay, pausing is what stops `:on-body` firing, and an app whose
-only way back was a callback that is no longer running had removed it.
+**A relay's pause ends by itself, and the condition is narrower than it
+sounds.** Reading resumes when the connection being relayed into drains
+its write backlog — the event the pause was waiting for. That needs the
+target to have *actually backed up*. `stream-send` and `ws-send` flush
+inline and never reach the event loop's write path, so a pause taken
+while the target's queue was empty has no drain coming, and only an
+explicit `fetch-resume` restarts it.
+
+The deadline runs on unpaused time: `fetch-resume` pushes it out by the
+interval spent paused, so a relay is not killed for applying the
+backpressure it was told to apply.
+
+**Outside a relay, resuming is yours to do, and forgetting is fatal to
+that request.** `:pause` is what stops `:on-body` firing, so the callback
+cannot be what notices — an app whose only route back was a callback that
+is no longer running has no route back. The fetch sits until
+`*fetch-timeout*` and the parked caller is answered `504 Gateway
+Timeout`, on an upstream that was healthy the whole time.
+
+So pause where a drain or something else will resume it — a timer, a
+later request, a queue the app is itself watching. If there is no such
+thing, do not pause.
+
+**A detached fetch cannot be called off while keeping the target alive.**
+Closing the target does end it: `close-connection` walks for detached
+outbounds and reaps them, which is what makes a client going away an
+immediate ending rather than a leak, and is asserted directly — "a client
+that leaves mid-relay tears the outbound down, once."
+
+What has no expression today is the other half of that. An app that
+stops wanting the response while still wanting its connection — an output
+cap reached, a result that arrived from somewhere else first — can stop
+acting on what `:on-body` hands it, but the upstream keeps producing and
+the outbound stays open until the body ends, the fetch fails, or
+`*fetch-timeout*` expires.
+
+Know which primitive you are holding, because they differ exactly here. A
+non-local exit from `http-fetch-stream`'s `:on-line` unwinds through that
+call's `unwind-protect`, closing the socket and stopping the upstream
+while the caller carries on; it is a blocking call, so there is a stack to
+leave. A detached fetch has no call to exit from.
+
+**One shape where `:pause` does nothing at all.** A response that arrives
+complete in a single read is delivered before the pause is consulted, so
+the flag is set and never read. Whether that happens is not something an
+app controls — it depends on how the upstream's bytes land — so treat
+`:pause` as advisory about the *next* read rather than as a guarantee that
+one is outstanding.
 
 A value rather than a condition, for the same reason
 `connection-append-write` refuses by return: applying backpressure is
 ordinary control flow and should not unwind through the middle of a read
 loop.
 
-The re-arm works here for a reason worth knowing. Elsewhere the docs warn
-that an `EPOLL_CTL_MOD` will not re-fire for data already sitting in
-user space; the bytes a paused fetch has not read are still in the
-kernel, so the edge does fire.
+`fetch-resume`'s re-arm works for a reason worth knowing. Elsewhere the
+docs warn that an `EPOLL_CTL_MOD` will not re-fire for data already
+sitting in user space; the bytes a paused fetch has not read are still in
+the kernel, so the edge does fire.
 
 `*fetch-timeout*` stays a **total** on this path, not an inactivity
 bound. It is the only end-to-end network deadline the framework has, and
-it is what distinguishes the async path from every blocking one. A relay
+it is what distinguishes the async path from every blocking one. A fetch
 that legitimately runs long wants a larger number, not a different shape
 — converting it to idle would delete the guarantee and add one more
 entry to the trickling-upstream list.

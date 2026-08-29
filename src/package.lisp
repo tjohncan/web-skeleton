@@ -87,6 +87,12 @@
            #:connection
            #:connection-fd
            #:connection-remote-addr
+           ;; The authority CONNECTION-WRITE-FULL-P's docstring names.
+           ;; Exported so an app can run the test CONNECTION-APPEND-WRITE
+           ;; runs internally, rather than an approximation of it: both
+           ;; senders signal when full, and neither return value answers
+           ;; "would this fit" before the fact.
+           #:connection-write-pending
            ;; WebSocket
            #:ws-frame
            #:ws-frame-fin
@@ -104,6 +110,7 @@
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
            #:defer-to-fetch
+           #:fetch-into
            #:http-fetch-stream
            #:parse-url
            #:parse-ipv4-literal

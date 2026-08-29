@@ -1,14 +1,34 @@
 # web-skeleton
 
-SBCL web server framework for Linux.
-Provides the network and protocol layer
-(TCP socket management, 
-HTTP request parsing and response building,
-WebSocket handshake and framing)
-as a reusable foundation for web services and
-real-time applications.
+HTTP/1.1 and WebSocket server for SBCL on Linux, written from the syscalls up.
+One declared dependency: `sb-bsd-sockets`.
 
-Minimal external dependencies beyond SBCL's built-in libraries.
+The epoll event loop, the request parser, the chunked codec, the WebSocket
+framing, SSE, an epoll-integrated outbound HTTP client, async DNS, SHA-1,
+SHA-256, HMAC, base64, ECDSA P-256, JSON and JWT are all implemented here.
+libssl is optional and buys outbound TLS.
+
+Three things distinguish it:
+
+- **Ambiguous framing is refused, never reconciled.** `Transfer-Encoding` with
+  `Content-Length` is a 400 rather than a resolution, a trailer section is
+  refused so a request's boundary is never computed from one, and obsolete line
+  folding is rejected by both readers that look at it. Every request-smuggling
+  CVE in the genre is two hops resolving the same ambiguity differently; a
+  server that never resolves it cannot be the hop that resolves it wrongly.
+- **One worker per core, sharing nothing on the request path.** Each has its own
+  listener (`SO_REUSEPORT`), epoll instance, connection table and scratch
+  buffers. There are no locks on the request path. The only mutex a request can
+  reach is the logger's, which `log.lisp` documents in its own docstring; the
+  other two — shutdown-hook registration and one-time TLS context setup — are
+  never on it.
+- **The boundaries are written down.** Limitations below is not a stub. It says
+  what the framework cannot do, what is verified by review rather than by
+  execution, and which failure modes are deliberate trades.
+
+Not a batteries-included web framework. There is no router, no ORM, no
+templating, no inbound TLS. It is the network and protocol layer, and the
+application supplies the rest.
 
 ## Requirements
 
@@ -227,12 +247,14 @@ tests/
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly with size limits)
-- **Incremental relay** — `http-fetch` takes `:on-body`, called with each chunk
-  of a chunked upstream response as its framing is proved, so a relay forwards
-  as it reads instead of buffering the whole body first. Return `:pause` to stop
-  reading upstream and let its send window fill; reading resumes by itself once
-  the connection being relayed into drains. Same behaviour over `https://` —
-  one path, both schemes
+- **Incremental relay** — `fetch-into` starts an outbound request against a
+  connection the app already owns, so a streaming response or a WebSocket can
+  forward an upstream as it arrives instead of buffering it or holding a worker.
+  `:on-body` is called with each chunk as its framing is proved; return `:pause`
+  to stop reading upstream and let its send window fill, and reading resumes when
+  the connection being relayed into drains. `:then` fires once at the end, its
+  return value discarded — there is no parked request for it to answer. Chunked
+  framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
   a response and produces the body over time with `stream-send` / `stream-close`.
   No `Content-Length`; chunked framing for HTTP/1.1 and close-delimited for 1.0.
@@ -388,6 +410,15 @@ read about here.
   serves the whole file rather than a `multipart/byteranges` response.
   RFC 7233 §3.1 permits this, and no media player or download manager
   asks for it; single ranges are fully supported.
+- **A paused fetch resumes only when the target's write backlog drains.**
+  `:pause` from `:on-body` stops reading the upstream, and reading
+  restarts by itself when the connection being relayed into empties its
+  queue. That is the backpressure case the mechanism exists for, and it
+  needs the target to have *actually backed up*: `stream-send` and
+  `ws-send` flush inline, never reaching the event loop's write path, so
+  a pause taken while the target's queue was empty has no drain coming
+  and needs an explicit `fetch-resume`. An app that pauses with neither
+  condition arranged strands that fetch until `*fetch-timeout*`.
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
