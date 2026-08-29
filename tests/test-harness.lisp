@@ -2892,11 +2892,190 @@
                :signalled))
       ;; A refused call did nothing: the callback never ran.
       (check "refusal: no callback fired on any refusal" fires 0)
-      ;; And left no state on the connection it refused.
-      (let ((conn (web-skeleton::make-connection :fd 1 :state :read-http)))
-        (ignore-errors (fetch-into conn (cont)))
-        (check "refusal: the target is not marked outstanding"
-               (web-skeleton::connection-fetch-outstanding conn) nil)))))
+      ;; Every refusal above returns from the guard block, which is before
+      ;; the outstanding marker is ever written. Asserting the marker here
+      ;; read as coverage of "a refused call left nothing behind" and was
+      ;; coverage of a slot no path on this test touched — it passed with
+      ;; the reset-on-unwind deleted outright. That claim belongs where
+      ;; the marker is set and then cleared, which is the setup-failure
+      ;; path below.
+      ;;
+      ;; What is worth asserting here is the property these four share
+      ;; that the marker cannot show: refusing did not consume the
+      ;; continuation, so the same one still reaches the next refusal
+      ;; rather than having been spent on the last.
+      (let ((conn (web-skeleton::make-connection
+                   :fd 1 :state :streaming :fetch-outstanding t)))
+        (check "refusal: refusing does not consume the continuation"
+               (handler-case (progn (fetch-into conn (cont)) :no-signal)
+                 (error () :signalled))
+               :signalled)
+        (check "refusal: and still fired no callback" fires 0)))))
+
+(defun test-harness-detached-deadline-sweep ()
+  "A paused detached outbound whose upstream never answers is reaped by
+   the sweeper, and the app's callback still fires once.
+
+   The ending with the fewest ways to be reached. Every other fetch is
+   bounded by its parked inbound's :AWAITING reap, and a detached one has
+   no parked inbound. It is not idle either — it is waiting on an
+   upstream — so the idle arm does not want it, and it is skipped by the
+   OUTBOUND-P guard in any case. A *paused* one has been modified down to
+   bare +EPOLLET+, subscribed to no events at all, so no wake-up is
+   coming to notice anything. RESUME-PAUSED-OUTBOUND is the ordinary way
+   out and it is driven by the target draining, which cannot help when
+   the upstream is the half that has stopped.
+
+   That leaves the deadline arm of SWEEP-IDLE-CONNECTIONS as the only
+   thing in the process that can still reach this connection. Without it
+   the socket is held until the process ends and the app's :THEN never
+   fires — the leak the abort sentinel exists to prevent.
+
+   The arm was not uncovered before this, and saying otherwise would be
+   the overstatement this branch keeps deleting:
+   TEST-HARNESS-FETCH-INTO-UPSTREAM-STALLS-E2E fails when it is removed,
+   because the sentinel does not arrive. What that test cannot see is
+   everything after the callback — it has no way to look inside the
+   worker's connection table. So what is new here is the reclamation
+   rather than the notification: the outbound is actually unregistered,
+   the callback fired exactly once rather than merely at least once, and
+   the target got DELIVER-DETACHED's disposition instead of being left
+   open behind a body that stopped.
+
+   **The target is deliberately left alive.** The first version of this
+   test closed it, which proved nothing: CLOSE-CONNECTION walks a dying
+   target's detached outbounds and reaps them itself, so every assertion
+   below passed with the sweeper's arm deleted outright. That walk is
+   real and covered by TEST-HARNESS-FETCH-INTO-TARGET-CLOSED-E2E. A live
+   target is what leaves the sweeper as the only remaining reaper, which
+   is the whole point of the arm.
+
+   Built rather than provoked. Reaching this through a live server means
+   an upstream that stalls mid-body, backpressure applied, and then
+   waiting out *FETCH-TIMEOUT* — two races and a sleep to reach one
+   branch. The state is assembled directly instead: the same shape the
+   sweeper sees, and none of the waiting."
+  (format t "~%Harness: detached outbound past its deadline, swept~%")
+  (let* ((fires 0)
+         (status-seen :never)
+         (target-sock (make-instance 'sb-bsd-sockets:inet-socket
+                                     :type :stream :protocol :tcp))
+         (out-sock (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (epfd (web-skeleton::epoll-create))
+         (web-skeleton::*connections* (make-hash-table)))
+    (unwind-protect
+         (let* ((target (web-skeleton::make-connection
+                         :fd (web-skeleton::socket-fd target-sock)
+                         :socket target-sock
+                         :state :streaming
+                         :last-active (get-universal-time)))
+                (out (web-skeleton::make-connection
+                      :fd (web-skeleton::socket-fd out-sock)
+                      :socket out-sock
+                      :state :out-read
+                      :outbound-p t
+                      :fetch-sink :detached
+                      :fetch-method :GET
+                      ;; Paused, and therefore subscribed to nothing.
+                      :fetch-paused t
+                      :fetch-paused-at (get-universal-time)
+                      ;; Already past its deadline: the sweeper's test is
+                      ;; (> now deadline), so this is the state a real one
+                      ;; reaches after *FETCH-TIMEOUT* of no progress.
+                      :fetch-started-at (- (get-universal-time) 600)
+                      :fetch-deadline (- (get-universal-time) 300)
+                      :inbound-fd (web-skeleton::socket-fd target-sock)
+                      :last-active (get-universal-time)
+                      :fetch-callback
+                      (lambda (status headers body)
+                        (declare (ignore headers body))
+                        (incf fires)
+                        (setf status-seen status)
+                        nil))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::register-connection out)
+           (check "detached sweep: the outbound is registered before the sweep"
+                  (and (web-skeleton::lookup-connection
+                        (web-skeleton::connection-fd out))
+                       t)
+                  t)
+           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           ;; The three the arm exists for.
+           (check "detached sweep: the expired outbound was reaped"
+                  (web-skeleton::lookup-connection
+                   (web-skeleton::connection-fd out))
+                  nil)
+           (check "detached sweep: the callback fired exactly once" fires 1)
+           (check "detached sweep: and fired the cleanup sentinel"
+                  status-seen nil)
+           ;; DELIVER-DETACHED's disposition for a :STREAMING target on an
+           ;; abort: the stream cannot be finished honestly, so it is
+           ;; closed rather than left open behind a body that stopped.
+           (check "detached sweep: and the target stream was closed with it"
+                  (web-skeleton::lookup-connection
+                   (web-skeleton::connection-fd target))
+                  nil))
+      (ignore-errors (web-skeleton::%close epfd))
+      (ignore-errors (sb-bsd-sockets:socket-close target-sock))
+      (ignore-errors (sb-bsd-sockets:socket-close out-sock)))))
+
+(defun test-harness-fetch-into-setup-failure ()
+  "A detached fetch whose setup fails synchronously signals, and leaves the
+   target connection exactly as it found it.
+
+   This is where FETCH-INTO's headline claim — a signalling call has done
+   nothing — is interesting. The four refusals beside it are pre-flight:
+   they return before any state is touched, so the claim is trivially true
+   of them. Setup failure is the only ending that marks the connection
+   first and then fails, so it is the only place the marker can be
+   watched going back.
+
+   Two fixes live on this path and neither had a detector. Both reverts
+   left the suite green.
+
+   Removing INITIATE-FETCH's re-raise for :DETACHED queues a 502 into the
+   application's live stream, flips it to :WRITE-RESPONSE, and fires the
+   abort sentinel — mid-stream corruption of a connection the app owns,
+   answered in a framing the app never chose. Removing FETCH-INTO's reset
+   on unwind leaves that connection unable to start another fetch for the
+   rest of its life: every later FETCH-INTO hits the already-outstanding
+   refusal.
+
+   HTTPS with the TLS hook unbound is one of the three synchronous
+   failures the contract names, and it raises inside INITIATE-FETCH after
+   the marker is set and before any socket exists — which is exactly the
+   window under test. LET rather than SETF is safe for the hook because
+   FETCH-INTO runs on this thread: a synchronous failure is synchronous by
+   definition, so no worker ever reads the binding."
+  (format t "~%Harness: fetch-into setup failure leaves the target alone~%")
+  (let ((fires 0))
+    (let ((conn (web-skeleton::make-connection :fd 1 :state :streaming))
+          (web-skeleton::*epoll-fd* 99)
+          (web-skeleton::*tls-outbound-setup-fn* nil))
+      (check "setup failure: it signals rather than reporting through :then"
+             (handler-case
+                 (progn (fetch-into
+                         conn
+                         (http-fetch :get "https://example.test/"
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (incf fires)
+                                             nil)))
+                        :no-signal)
+               (error () :signalled))
+             :signalled)
+      ;; Written before INITIATE-FETCH ran and cleared on the way out. The
+      ;; refusals cannot assert this: they never write it.
+      (check "setup failure: the target can start another fetch"
+             (web-skeleton::connection-fetch-outstanding conn) nil)
+      ;; The three the re-raise protects, each a separate way the app's
+      ;; own connection would have been corrupted.
+      (check "setup failure: nothing was queued into the app's stream"
+             (web-skeleton::connection-write-pending conn) 0)
+      (check "setup failure: the target is still streaming"
+             (web-skeleton::connection-state conn) :streaming)
+      (check "setup failure: the callback did not fire" fires 0))))
 
 (defun test-harness-fetch-into-upstream-stalls-e2e ()
   "An upstream that stops mid-body aborts the stream without terminating it.
@@ -3175,6 +3354,8 @@
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
   (test-harness-fetch-into-refusals)
+  (test-harness-fetch-into-setup-failure)
+  (test-harness-detached-deadline-sweep)
   (test-harness-fetch-into-relay-e2e)
   (test-harness-fetch-into-chained-e2e)
 
