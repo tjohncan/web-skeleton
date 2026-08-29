@@ -104,6 +104,13 @@
   ;; means "no body" on the Content-Length path and a chunked request whose
   ;; body has not arrived yet would be indistinguishable from one that has
   ;; none. Two states sharing one encoding is how a body gets skipped.
+  ;; Its other writer is conditional — only the chunked arm sets :CHUNKED
+  ;; — so the keep-alive reset is the only unconditional one, and clearing
+  ;; it there is a necessity rather than the choice the frame rule at
+  ;; REQUEST-END describes. A request carrying neither framing writes
+  ;; nothing here and would inherit the last one's. Drop it from the reset
+  ;; and TEST-HARNESS-CHUNKED-KEEPALIVE-E2E fails: a bodiless request after
+  ;; a chunked one is read as chunked.
   (body-framing  :length :type keyword)
   ;; Running total of chunked body data proved whole so far, summed from
   ;; CHUNKED-BODY-COMPLETE-P's DATA-BYTES. Meaningless under :LENGTH
@@ -120,7 +127,14 @@
   ;; The reset is its only writer, per the frame rule at REQUEST-END: a
   ;; completing arm writing it would restate the default and mask it.
   (body-decoded  0 :type fixnum)
-  ;; Content-Length tracking (during :read-body state)
+  ;; Content-Length tracking (during :read-body state).
+  ;;
+  ;; Same shape as BODY-FRAMING above: its writers are the Content-Length
+  ;; arm and the chunked decode, both conditional, so the keep-alive reset
+  ;; is the only unconditional one and clearing it is a necessity. Drop it
+  ;; and a following request inherits the previous body's length —
+  ;; TEST-HARNESS-PIPELINED-AFTER-BODY-E2E fails, which is the sharper of
+  ;; the two: the next request is read out of the tail of its predecessor.
   (body-expected 0 :type fixnum)             ; Content-Length value
   (header-end    0 :type fixnum)             ; byte offset where body starts
   ;; Byte offset one past the whole request on the wire — headers, the
