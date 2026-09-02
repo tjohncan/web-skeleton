@@ -746,7 +746,7 @@ the fetch ended, and the two kinds are not treated alike:
 | `:streaming` | delivered | `stream-close`, terminator written |
 | `:streaming` | failed | closed without a terminator, so the peer's decoder sees truncation rather than being told a failed body was complete |
 | `:websocket` | delivered | nothing; you own your framing |
-| `:websocket` | failed | a `1011` close frame, then the connection goes |
+| `:websocket` | failed | a `1011` close frame, then the connection goes — the one row you can override, with `:failure-disposition :keep` |
 | either | stopped | nothing; you asked for the ending, so what follows is yours |
 
 It decides rather than leaving it to you because a handler written for the
@@ -765,11 +765,44 @@ framing on the delivered row; on the failed one it sends `1011` — RFC
 carries the code and nothing else, so a client sees a bare `1011` with no
 reason string.
 
-There is no way to opt out of that today. An application with its own
-failure frame — an error rendered in the page, a retry the client drives —
-will send it and have its connection closed underneath it anyway. Write
-the client to expect a `1011` it did not ask for, and to reconnect if that
-is what you want to happen.
+**That row, and only that row, has an opt-out.** An application with its
+own failure frame — an error rendered in the page, a retry the client
+drives — would otherwise send it and have the connection closed underneath
+it anyway. Pass `:failure-disposition :keep` and the framework leaves the
+connection alone when the fetch fails:
+
+```lisp
+;; the default, unchanged
+(fetch-into conn continuation :failure-disposition :close)
+
+;; :websocket targets only
+(fetch-into conn continuation :failure-disposition :keep)
+```
+
+The fetch contract does not change: `:then` still fires exactly once with
+the abort sentinel under either setting. `:keep` governs the connection,
+not the delivery.
+
+**It is refused on a `:streaming` target rather than ignored there.** On
+that path the disposition is the framing, and honouring `:keep` would hand
+the client a body with no terminator — the failure the whole rule exists
+to prevent. `fetch-into` signals at the call, where you are on the stack to
+read it, rather than disregarding the argument at a teardown that has
+nothing left to answer.
+
+**What `:keep` transfers is the failure path.** The default exists because
+an application will not handle a case it has never seen fail, and choosing
+`:keep` is asserting that you have. That includes not leaving a dead socket
+parked until `*ws-idle-timeout*`, which defaults to a day. If you are not
+going to close it, do not keep it.
+
+**A stopped fetch is not a failed one, and this parameter does not govern
+it.** Returning `:stop` from `:on-body` leaves the connection alone under
+`:close` as well as `:keep` — it never reaches the disposition at all. The
+inference the other way is reasonable and wrong: the abort sentinel is
+what `:then` receives, `:failure-disposition` is about aborted fetches, so
+a stop under the default should close the connection. It does not, because
+the sentinel and the disposition are separate facts.
 
 **Closing the connection yourself, or chaining, suppresses all of it.** A
 target that is already gone gets nothing. And the outstanding marker is

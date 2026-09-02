@@ -254,7 +254,9 @@ tests/
   to stop reading upstream and let its send window fill, and reading resumes when
   the connection being relayed into drains. Return `:stop` to end the fetch and
   keep the connection — the outbound closes, the target is left untouched, and
-  `:then` gets the abort sentinel. `:then` fires once at the end, its
+  `:then` gets the abort sentinel. A *failed* fetch closes the connection by
+  default; `:failure-disposition :keep` leaves a WebSocket to the app that
+  has its own error frame to send. `:then` fires once at the end, its
   return value discarded — there is no parked request for it to answer. Chunked
   framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
@@ -421,15 +423,13 @@ read about here.
   a pause taken while the target's queue was empty has no drain coming
   and needs an explicit `fetch-resume`. An app that pauses with neither
   condition arranged strands that fetch until `*fetch-timeout*`.
-- **A failed detached fetch takes the connection it was fetching into.**
-  A `:websocket` target gets a `1011` close frame and goes; a `:streaming`
-  one closes without its chunked terminator, so the peer sees truncation
-  rather than a failed body claimed complete. The rule exists because a
-  handler written for the happy path has no failure path, and a connection
-  left open on a failed upstream hangs until its idle timeout. There is no
-  way to opt out, which costs the application that *does* handle the
-  failure: it sends its own error frame and has the connection closed
-  underneath it anyway.
+- **A failed detached fetch takes a `:streaming` target with it, and on
+  that path there is no opt-out.** The connection closes without its
+  chunked terminator, so the peer sees truncation rather than a failed
+  body claimed complete — writing the terminator would be a claim that the
+  body was whole. A `:websocket` target defaults to the same fate, a
+  `1011` close frame, but there the framing is already the application's,
+  and `fetch-into`'s `:failure-disposition :keep` opts out of it.
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
