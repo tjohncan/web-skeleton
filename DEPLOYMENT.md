@@ -736,12 +736,48 @@ connection. A signalling call has done nothing and the callback does not
 fire, so `:then` can never run before `fetch-into` returns. `:then`'s
 return value is discarded here; there is no parked request to answer.
 
-If the callback does not close the connection, the framework does — with a
-terminator on success, and *without* one on failure, so the peer's decoder
-sees truncation rather than being told a failed body was complete. Unless
-`:then` started another fetch, which is how a detached fetch chains: a
-handler-returned one chains by returning a continuation, this one chains
-by calling `fetch-into` again.
+**When the fetch ends, the framework decides what becomes of your
+connection.** What it decides depends on the connection's kind and on how
+the fetch ended, and the two kinds are not treated alike:
+
+| target | ending | what happens to your connection |
+| --- | --- | --- |
+| already closed | any | nothing |
+| `:streaming` | delivered | `stream-close`, terminator written |
+| `:streaming` | failed | closed without a terminator, so the peer's decoder sees truncation rather than being told a failed body was complete |
+| `:websocket` | delivered | nothing; you own your framing |
+| `:websocket` | failed | a `1011` close frame, then the connection goes |
+| either | stopped | nothing; you asked for the ending, so what follows is yours |
+
+It decides rather than leaving it to you because a handler written for the
+happy path will not have a failure path, and a `:then` that only closes on
+success leaves a failed stream open until `*stream-idle-timeout*` — or a
+failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
+
+**On a `:streaming` target this is a protocol obligation.** The framework
+owns the terminator and writing one is a claim that the body is complete,
+so withholding it on failure is the only honest thing it can do.
+
+**On a WebSocket it is a policy, and it is worth knowing before you port
+to `fetch-into` over one.** The framework has already disclaimed your
+framing on the delivered row; on the failed one it sends `1011` — RFC
+6455's "internal error" — and the connection closes behind it. The frame
+carries the code and nothing else, so a client sees a bare `1011` with no
+reason string.
+
+There is no way to opt out of that today. An application with its own
+failure frame — an error rendered in the page, a retry the client drives —
+will send it and have its connection closed underneath it anyway. Write
+the client to expect a `1011` it did not ask for, and to reconnect if that
+is what you want to happen.
+
+**Closing the connection yourself, or chaining, suppresses all of it.** A
+target that is already gone gets nothing. And the outstanding marker is
+cleared before `:then` runs precisely so `:then` can set it again by
+calling `fetch-into`: that is how a detached fetch chains — a
+handler-returned one chains by returning a continuation, this one by
+calling `fetch-into` again — and closing the connection the next fetch is
+about to produce into would make chaining impossible.
 
 **`:then` still fires exactly once, with a NIL body.** The bytes went out
 incrementally; handing them over again would double the memory the

@@ -421,6 +421,15 @@ read about here.
   a pause taken while the target's queue was empty has no drain coming
   and needs an explicit `fetch-resume`. An app that pauses with neither
   condition arranged strands that fetch until `*fetch-timeout*`.
+- **A failed detached fetch takes the connection it was fetching into.**
+  A `:websocket` target gets a `1011` close frame and goes; a `:streaming`
+  one closes without its chunked terminator, so the peer sees truncation
+  rather than a failed body claimed complete. The rule exists because a
+  handler written for the happy path has no failure path, and a connection
+  left open on a failed upstream hangs until its idle timeout. There is no
+  way to opt out, which costs the application that *does* handle the
+  failure: it sends its own error frame and has the connection closed
+  underneath it anyway.
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
