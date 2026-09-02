@@ -863,13 +863,20 @@
                        append (list (format nil "~x" (length payload)) payload))
                  (list "0" ""))))
 
-(defun %chunked-upstream-fetch (response on-body-out then-out fires-box)
+(defun %chunked-upstream-fetch (response on-body-out then-out fires-box
+                                &optional verdict)
   "Run one :ON-BODY fetch against a canned upstream sending RESPONSE, and
    return the relay's own (VALUES STATUS BODY).
 
-   Shared by the two tests below because only RESPONSE differs between
-   them: one ends with the zero-size terminator and one does not, and
-   everything else about the setup is the thing being held constant."
+   Shared by the three tests below because only RESPONSE and VERDICT differ
+   between them: one response ends with the zero-size terminator and one
+   does not, and everything else about the setup is the thing being held
+   constant.
+
+   VERDICT is what :ON-BODY answers — NIL for the two framing tests, :STOP
+   for the one that asks what a stop does on this path. This is the
+   *parked* path, where a client is waiting in :AWAITING, so the fetch is
+   handler-returned rather than detached and the two endings differ."
   (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
                                  :type :stream :protocol :tcp))
         (thread nil))
@@ -894,7 +901,8 @@
                                 (declare (ignore conn))
                                 (push (sb-ext:octets-to-string
                                        chunk :external-format :ascii)
-                                      (car on-body-out)))
+                                      (car on-body-out))
+                                verdict)
                      :then (lambda (status headers body)
                              (declare (ignore headers))
                              (incf (car fires-box))
@@ -1059,6 +1067,50 @@
     (check "truncated-chunked: :then fired the cleanup sentinel"
            (first (car final)) nil)
     (check "truncated-chunked: :then fires exactly once" (car fires) 1)))
+
+(defun test-harness-fetch-on-body-stop-parked-e2e ()
+  "A :STOP from a handler-returned fetch answers the parked client 502.
+
+   :ON-BODY belongs to HTTP-FETCH, not to FETCH-INTO, so the verdict added
+   for detached fetches is reachable on this path too — where there is a
+   client parked in :AWAITING and no response owed to it by anything else.
+   Ending through CLOSE-OUTBOUND alone, which is right for a detached
+   fetch, would leave that client to be reaped having been answered
+   nothing: a request that hangs for *FETCH-TIMEOUT* and then closes.
+
+   So STOP-FETCH routes this path to DELIVER-FETCH-ERROR instead, and the
+   client gets the same 502 every other ending that produces no response
+   here already produces. Defining it was not optional — a verdict on a
+   shared callback cannot have behaviour on half its callers — but it is
+   not what the verdict is for, and the docstring says so.
+
+   The upstream response is *complete*, terminator and all, which is what
+   makes the 502 mean something. Against a truncated one this test would
+   be indistinguishable from its neighbour above, which reaches the same
+   502 by the framing guard rather than by the stop.
+
+   :THEN still fires the cleanup sentinel exactly once, because the stop
+   goes through CLOSE-OUTBOUND on the way and that is where it fires."
+  (format t "~%Harness: fetch :on-body :stop on a parked fetch~%")
+  (let ((chunks (list nil))
+        (final (list :never))
+        (fires (list 0)))
+    (multiple-value-bind (status body)
+        (%chunked-upstream-fetch (%chunked-corpus-response)
+                                 chunks final fires :stop)
+      (declare (ignore body))
+      ;; The discriminating one. Ending at CLOSE-OUTBOUND leaves the client
+      ;; parked with nothing, and this reads NIL after the harness deadline
+      ;; rather than 502.
+      (check "stop parked: the parked client is answered 502" status 502))
+    ;; Non-vacuity: the stop happened mid-delivery, not before anything
+    ;; arrived. Without this the check above would also pass against a
+    ;; fetch that failed at the door.
+    (check "stop parked: the chunk that triggered it was delivered"
+           (first (reverse (car chunks))) (first *chunked-corpus*))
+    (check "stop parked: :then fired the cleanup sentinel"
+           (first (car final)) nil)
+    (check "stop parked: :then fires exactly once" (car fires) 1)))
 
 (defun test-harness-dns-all-addresses-refused-e2e ()
   "A hostname whose every resolved address the policy refuses fails the
@@ -3818,6 +3870,7 @@
   (test-fetch-ok-eof-walks-the-bytes)
   (test-harness-fetch-on-body-eof-together-e2e)
   (test-harness-fetch-on-body-truncated-chunked-e2e)
+  (test-harness-fetch-on-body-stop-parked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
   (test-harness-fetch-into-refusals)
