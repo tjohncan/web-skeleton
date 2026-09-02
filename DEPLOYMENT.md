@@ -798,24 +798,48 @@ So pause where a drain or something else will resume it — a timer, a
 later request, a queue the app is itself watching. If there is no such
 thing, do not pause.
 
-**A detached fetch cannot be called off while keeping the target alive.**
-Closing the target does end it: `close-connection` walks for detached
-outbounds and reaps them, which is what makes a client going away an
-immediate ending rather than a leak, and is asserted directly — "a client
-that leaves mid-relay tears the outbound down, once."
+**Stopping a detached fetch: return `:stop` from `:on-body`.** The
+outbound is closed, the connection you were fetching into is left exactly
+as it was, and `:then` fires with the abort sentinel — a NIL status, the
+same one a failed fetch delivers. There is no resume; a stopped fetch is
+over. This is the answer to an output cap being reached, or to a result
+arriving from somewhere else first: stop paying for a response you have
+stopped wanting, without giving up the connection you were producing
+into.
 
-What has no expression today is the other half of that. An app that
-stops wanting the response while still wanting its connection — an output
-cap reached, a result that arrived from somewhere else first — can stop
-acting on what `:on-body` hands it, but the upstream keeps producing and
-the outbound stays open until the body ends, the fetch fails, or
-`*fetch-timeout*` expires.
+The connection can start another fetch immediately, including from inside
+the stopped fetch's own `:then`, which is where an application usually
+notices it wants to.
 
-Know which primitive you are holding, because they differ exactly here. A
-non-local exit from `http-fetch-stream`'s `:on-line` unwinds through that
-call's `unwind-protect`, closing the socket and stopping the upstream
-while the caller carries on; it is a blocking call, so there is a stack to
-leave. A detached fetch has no call to exit from.
+**The sentinel is deliberate, and it is not ambiguous in practice.** A
+stopped fetch is not a delivered one, and reporting a real status over a
+body the caller cut short is the silent truncation the framework refuses
+everywhere else. Telling a stop from an upstream failure is the
+application's own to do, and it is in a position to: a stop can only
+originate inside a callback of the fetch being stopped, so the code that
+returns `:stop` can set its own flag on the way.
+
+**It ends the fetch, not the pass.** Like `:pause`, the chunks already
+read are still handed to `:on-body` first, and a pass can carry many.
+Unlike `:pause`, it is remembered once given — a later chunk returning
+NIL does not retract it — and it is not advisory about the next read, so
+a response that completed in the same pass does not override it. What
+`:then` is told never depends on where the upstream's bytes happened to
+be split.
+
+**Closing the target is the other way to end one, and it costs the
+connection.** `close-connection` walks for detached outbounds and reaps
+them, which is what makes a client going away an immediate ending rather
+than a leak, and is asserted directly — "a client that leaves mid-relay
+tears the outbound down, once." Before `:stop` existed it was the only
+lever an application had, which is why the difference is worth naming.
+
+**Know which primitive you are holding.** A non-local exit from
+`http-fetch-stream`'s `:on-line` unwinds through that call's
+`unwind-protect`, closing the socket and stopping the upstream while the
+caller carries on; it is a blocking call, so there is a stack to leave. A
+detached fetch has no call to exit from, and `:stop` is what it has
+instead.
 
 **One shape where `:pause` does nothing at all.** A response that arrives
 complete in a single read is delivered before the pause is consulted, so

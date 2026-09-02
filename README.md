@@ -252,7 +252,9 @@ tests/
   forward an upstream as it arrives instead of buffering it or holding a worker.
   `:on-body` is called with each chunk as its framing is proved; return `:pause`
   to stop reading upstream and let its send window fill, and reading resumes when
-  the connection being relayed into drains. `:then` fires once at the end, its
+  the connection being relayed into drains. Return `:stop` to end the fetch and
+  keep the connection — the outbound closes, the target is left untouched, and
+  `:then` gets the abort sentinel. `:then` fires once at the end, its
   return value discarded — there is no parked request for it to answer. Chunked
   framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
