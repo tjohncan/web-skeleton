@@ -1399,7 +1399,7 @@
 ;;; Initiate outbound fetch
 ;;; ---------------------------------------------------------------------------
 
-(defun fetch-into (connection continuation)
+(defun fetch-into (connection continuation &key (failure-disposition :close))
   "Start CONTINUATION's outbound request against CONNECTION, a connection
    the application already owns. Returns T, or signals.
 
@@ -1424,11 +1424,32 @@
    released before :THEN runs, on the same reasoning that lets a delivered
    fetch chain.
 
-   Signals, rather than returning NIL, in four cases:
+   FAILURE-DISPOSITION is what a *failed* fetch does to CONNECTION.
+   :CLOSE, the default, is the framework's own disposition: a :STREAMING
+   target is closed without its terminator and a :WEBSOCKET target gets a
+   1011 close frame. :KEEP suppresses that and leaves the connection to
+   the application, and is accepted on :WEBSOCKET targets only.
+
+   The asymmetry is not an oversight. On :STREAMING the disposition is a
+   protocol obligation — the framework owns the terminator and writing one
+   claims the body is complete — so :KEEP there is refused rather than
+   honoured. On a WebSocket the framework has already disclaimed the
+   framing, so the close is a policy, and its own justification is that an
+   app will not handle a path it has never seen fail. An app that sends its
+   own error frame is handling it, and :KEEP is how it says so.
+
+   What :KEEP transfers is the failure path, including not leaving a dead
+   socket parked until *WS-IDLE-TIMEOUT*, which defaults to a day. That is
+   why :CLOSE stays the default: it is the safe answer for the app that has
+   not thought about it.
+
+   Signals, rather than returning NIL, in six cases:
 
      the connection is not :STREAMING or :WEBSOCKET — nothing else owns
        its own write path, so nothing else can consume a result;
      CONTINUATION is not an HTTP-FETCH continuation;
+     FAILURE-DISPOSITION is neither :CLOSE nor :KEEP;
+     FAILURE-DISPOSITION is :KEEP on a target that is not :WEBSOCKET;
      there is no event loop on this thread to drive the outbound, which is
        the case off a worker — the REPL, a unit test. FETCH-RESUME can
        degrade to a no-op there and this cannot: the socket would be
@@ -1463,6 +1484,25 @@
     (error "fetch-into: fd ~d is in state ~a; only :streaming and ~
             :websocket own their own write path"
            (connection-fd connection) (connection-state connection)))
+  (unless (member failure-disposition '(:close :keep))
+    (error "fetch-into: :failure-disposition is ~s; expected :close or :keep"
+           failure-disposition))
+  ;; Refused here rather than honoured and then ignored at delivery, for
+  ;; two reasons. The caller is on the stack at the call that made the
+  ;; mistake, where an error is readable; DELIVER-DETACHED runs on a
+  ;; teardown path with nothing left to answer. And a keyword that is
+  ;; accepted and silently disregarded is worse than one that is refused —
+  ;; the caller writes a failure path and believes it will run.
+  ;;
+  ;; Sound this early because the state cannot drift into mattering: a
+  ;; :WEBSOCKET connection does not become :STREAMING.
+  (when (and (eq failure-disposition :keep)
+             (not (eq (connection-state connection) :websocket)))
+    (error "fetch-into: fd ~d is ~a; :failure-disposition :keep is for ~
+            :websocket targets only — on a :streaming one the disposition ~
+            is the framing, and keeping it open would hand the client an ~
+            unterminated body"
+           (connection-fd connection) (connection-state connection)))
   (unless *epoll-fd*
     (error "fetch-into: no event loop on this thread. The outbound would ~
             be opened and never driven."))
@@ -1470,12 +1510,17 @@
     (error "fetch-into: fd ~d already has a detached fetch outstanding"
            (connection-fd connection)))
   (setf (http-fetch-continuation-sink continuation) :detached)
-  ;; Marked before dialing and cleared by the setup-failure path below, so
-  ;; a refused call leaves the connection exactly as it found it.
-  (setf (connection-fetch-outstanding connection) t)
+  ;; Both marked before dialing and both cleared by the setup-failure path
+  ;; below, so a refused call leaves the connection exactly as it found it.
+  ;; :CLOSE is the resting value as well as the default, so restoring it is
+  ;; restoring the connection rather than overwriting a choice — and the
+  ;; slot is unread anyway while no fetch is outstanding.
+  (setf (connection-fetch-outstanding connection) t
+        (connection-fetch-failure-disposition connection) failure-disposition)
   (handler-case (initiate-fetch connection *epoll-fd* continuation)
     (error (e)
-      (setf (connection-fetch-outstanding connection) nil)
+      (setf (connection-fetch-outstanding connection) nil
+            (connection-fetch-failure-disposition connection) :close)
       (error e)))
   t)
 
@@ -2244,7 +2289,17 @@
      :streaming           delivered   stream-close, terminator written
      :streaming           aborted     close, no terminator, peer sees truncation
      :websocket           delivered   nothing; the app owns its framing
-     :websocket           aborted     a 1011 close frame
+     :websocket           aborted     a 1011 close frame, unless the caller
+                                      passed :FAILURE-DISPOSITION :KEEP
+
+   That last row is the only one a caller can override, and the asymmetry
+   is the argument. On :STREAMING the disposition is a protocol
+   obligation — the framework owns the terminator — so FETCH-INTO refuses
+   :KEEP there rather than honouring it. On a WebSocket the framing is
+   already the app's, per the row above, so the close is a policy; and the
+   policy's own justification is that an app will not handle a path it has
+   never seen fail, which does not describe an app that asked to keep the
+   connection so it could handle it.
 
    The table covers two of the three ways a detached fetch can end, and
    the third one deliberately never arrives here. A stopped fetch —
@@ -2297,13 +2352,25 @@
             (close-connection target epoll-fd :upstream-failed))))
         (:websocket
          (when (eq outcome :aborted)
-           (log-warn "detached fetch failed for ws fd ~d — closing 1011"
-                     target-fd)
-           (when (connection-append-write target (build-ws-close 1011))
-             (setf (connection-state target) :closing)
-             (ignore-errors
-              (epoll-modify epoll-fd (connection-fd target)
-                            (logior +epollout+ +epollet+))))))))))
+           ;; The one row a caller can override. FETCH-INTO refuses :KEEP
+           ;; on every other target, so reading the slot here needs no
+           ;; second check: on a :STREAMING target it is always :CLOSE.
+           (if (eq (connection-fetch-failure-disposition target) :keep)
+               ;; Debug rather than warn: the failure itself was already
+               ;; logged by DELIVER-FETCH-ERROR, which is the only route to
+               ;; :ABORTED, so this line reports a disposition and not an
+               ;; incident. An app that asked for :KEEP does not want its
+               ;; log filled by being obeyed.
+               (log-debug "detached fetch failed for ws fd ~d — left open ~
+                           at the caller's request" target-fd)
+               (progn
+                 (log-warn "detached fetch failed for ws fd ~d — closing 1011"
+                           target-fd)
+                 (when (connection-append-write target (build-ws-close 1011))
+                   (setf (connection-state target) :closing)
+                   (ignore-errors
+                    (epoll-modify epoll-fd (connection-fd target)
+                                  (logior +epollout+ +epollet+))))))))))))
 
 (defun complete-fetch (out-conn epoll-fd &key framing-complete)
   "Parse the outbound response and deliver it to the parked inbound connection.
