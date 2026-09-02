@@ -3218,6 +3218,231 @@
                   closes 1))
       (setf (symbol-function 'web-skeleton::close-connection) real))))
 
+(defun test-fetch-stop-is-sticky-across-a-pass ()
+  "A :STOP on the first chunk of a pass survives the chunks that follow it.
+
+   :ON-BODY's answer was captured last-answer-wins, which is right for
+   :PAUSE — it describes a write backlog that may have drained by the next
+   chunk — and wrong for :STOP, which describes the fetch and has no
+   verdict that retracts it. Under last-wins an app that stopped on the
+   first of three chunks in one pass had its stop erased by the NIL it
+   returned for the second, and the fetch ran to completion with the
+   cancel silently dropped.
+
+   Driven through a stub transport rather than a socket, for the reason
+   TEST-FETCH-OK-EOF-WALKS-THE-BYTES is: whether several chunks land in one
+   read is a scheduling question over a real peer, and a pass carrying one
+   chunk cannot tell sticky from last-wins apart at all. Here the whole
+   response arrives in one read on every run, so the case is reached on
+   every run.
+
+   The response is *complete*, terminator included, and that is what makes
+   one assertion cover both halves of the verdict. Last-wins loses the stop
+   and COMPLETE-FETCH delivers a 200; so does an implementation that keeps
+   the stop but tests it after COMPLETE in the cond. Only sticky, and ahead
+   of COMPLETE, produces the abort sentinel.
+
+   That completeness does a second job, and it is why this test is not a
+   smaller copy of the end-to-end one. A stop taken mid-body has no chunked
+   terminator yet, so a COMPLETE-FETCH routing raises out of
+   DECODE-CHUNKED-BODY and the fetch ends on the sentinel anyway, by the
+   wrong road — the end-to-end test cannot tell that apart from the right
+   one. Here the accumulated body parses, 200 is what COMPLETE-FETCH
+   actually reports, and this is the only place that reading is refused.
+
+   The chunks are asserted too, and not as decoration: they are what proves
+   the pass carried anything after the stop. Without them this would pass
+   against a single-chunk pass, which is the arrangement that cannot fail."
+  (format t "~%Fetch: :STOP is sticky across a pass~%")
+  (let* ((bytes (sb-ext:string-to-octets (%chunked-corpus-response)
+                                         :external-format :ascii))
+         (pos 0)
+         (chunks nil)
+         (fires 0)
+         (final :never)
+         (socket (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp))
+         (epfd (web-skeleton::epoll-create))
+         ;; RUN-WORKER binds this in its own dynamic scope, and teardown
+         ;; goes through it. Driving one connection outside a worker means
+         ;; supplying the table the worker would have.
+         (web-skeleton::*connections* (make-hash-table)))
+    (unwind-protect
+         (let ((conn (web-skeleton::make-connection
+                      :fd (web-skeleton::socket-fd socket)
+                      :socket socket
+                      :state :out-read
+                      :outbound-p t
+                      ;; :DETACHED is what routes a stop through STOP-FETCH
+                      ;; rather than into the parked path's 502, and -1
+                      ;; exercises the target lookup finding nothing to
+                      ;; unmark.
+                      :fetch-sink :detached
+                      :inbound-fd -1
+                      :fetch-method :GET
+                      :last-active (get-universal-time)
+                      :fetch-on-body
+                      (lambda (c chunk)
+                        (declare (ignore c))
+                        (push (sb-ext:octets-to-string
+                               chunk :external-format :ascii)
+                              chunks)
+                        ;; Stop on the first, NIL for the rest. That
+                        ;; sequence is the one last-wins erases.
+                        (when (= (length chunks) 1) :stop))
+                      :fetch-callback
+                      (lambda (status headers body)
+                        (declare (ignore headers body))
+                        (incf fires)
+                        (setf final status)
+                        nil)
+                      ;; Bytes until they run out, then :EOF — never
+                      ;; :AGAIN, so the whole response is one pass.
+                      :read-fn
+                      (lambda (buf start max)
+                        (if (>= pos (length bytes))
+                            :eof
+                            (let ((n (min max (- (length bytes) pos))))
+                              (replace buf bytes :start1 start
+                                                 :start2 pos :end2 (+ pos n))
+                              (incf pos n)
+                              n))))))
+           ;; Registered so the reclamation check below reads a slot this
+           ;; test actually filled. Unregistered, the count is zero whether
+           ;; or not anything tore the connection down.
+           (web-skeleton::register-connection conn)
+           (web-skeleton::handle-outbound-read conn epfd)
+           ;; The discriminating one.
+           (check "stop sticky: the fetch ended on the abort sentinel"
+                  final nil)
+           (check "stop sticky: the pass carried chunks past the stop"
+                  (reverse chunks) *chunked-corpus*)
+           (check "stop sticky: the fetch ended exactly once" fires 1)
+           (check "stop sticky: the outbound was reclaimed"
+                  (hash-table-count web-skeleton::*connections*) 0))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-harness-fetch-into-stop-e2e ()
+  "A stop ends the upstream and hands back a connection that still works.
+
+   The want this verdict exists for, end to end: stop this upstream, keep
+   this connection. Three claims, and they fail in different directions.
+
+   The upstream never closes, so within the client's read window nothing
+   but the stop can end this fetch — *FETCH-TIMEOUT* is 30 seconds and the
+   window is 8, which is what keeps the deadline sweeper from passing this
+   test on the stop's behalf.
+
+   :THEN must see the abort sentinel, and which wrong implementation that
+   catches was measured rather than reasoned about. COMPLETE-FETCH with
+   :FRAMING-COMPLETE T — a copy of the arm directly above it in the cond,
+   and so the likeliest mistake — suppresses the body decode, delivers a
+   200, and passes every other check here: the disposition leaves the
+   target alone, the stream survives, the second fetch runs. Only this
+   check fails, on exactly the report the verdict exists to prevent.
+
+   Plain COMPLETE-FETCH, without that keyword, is caught elsewhere and not
+   here, which is worth stating rather than leaving to be discovered. A
+   chunked upstream stopped mid-body has no terminator, so
+   DECODE-CHUNKED-BODY raises, HANDLE-OUTBOUND-EVENT's handler routes it
+   to DELIVER-FETCH-ERROR, and :THEN receives the sentinel by the wrong
+   road. TEST-FETCH-STOP-IS-STICKY-ACROSS-A-PASS is the detector for that
+   shape: its upstream response is complete, so COMPLETE-FETCH parses it
+   and reports 200 with or without the keyword.
+
+   The target must survive, asserted through its own body: the client
+   decodes what was relayed plus what was written after the stop,
+   terminator and all. It earns its place against a stop that never
+   happens and against one that leaves the connection unusable, both of
+   which end with no terminator ever written. It is not evidence about
+   *routing*, and reading it that way would overstate it — the second
+   fetch sets the outstanding marker again before DELIVER-DETACHED
+   consults it, which suppresses the disposition, so even a stop routed
+   through the failure path leaves this stream standing.
+
+   And the connection must still be usable, which is the half that is easy
+   to miss. CLOSE-OUTBOUND does not clear the target's outstanding marker —
+   DELIVER-DETACHED does, and a stopped fetch never reaches it — so a stop
+   that skipped that step would hand back a connection FETCH-INTO refuses
+   for the rest of its life. Proven by starting the next fetch from inside
+   the stopped one's :THEN, which is also the earliest moment an
+   application would try."
+  (format t "~%Harness: fetch-into, stopped from :on-body~%")
+  (let ((port-box (list nil))
+        (then-fires 0)
+        (body-fires 0)
+        (stopped nil)
+        (second-start :never))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (let ((path (http-request-path req)))
+             (cond
+               ;; One chunk, then silence, and never closed.
+               ((search "/up" path)
+                (make-stream-response
+                 :on-open (lambda (c) (stream-send c (%ascii "alpha")))))
+               ;; What the surviving connection goes on to fetch.
+               ((search "/second" path)
+                (make-text-response 200 "second"))
+               (t
+                (make-stream-response
+                 :on-open
+                 (lambda (client)
+                   (fetch-into
+                    client
+                    (http-fetch
+                     :get (format nil "http://127.0.0.1:~d/up"
+                                  (first port-box))
+                     :on-body (lambda (out chunk)
+                                (declare (ignore out))
+                                (incf body-fires)
+                                (stream-send client chunk)
+                                :stop)
+                     :then
+                     (lambda (status headers body)
+                       (declare (ignore headers body))
+                       (incf then-fires)
+                       (setf stopped (null status))
+                       (setf second-start
+                             (handler-case
+                                 (progn
+                                   (fetch-into
+                                    client
+                                    (http-fetch
+                                     :get (format nil
+                                                  "http://127.0.0.1:~d/second"
+                                                  (first port-box))
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h))
+                                             (when b (stream-send client b))
+                                             (stream-close client)
+                                             nil)))
+                                   :ok)
+                               (error (e) (princ-to-string e))))
+                       nil))))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream :seconds 8))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "stop: the target survived and kept producing"
+                        (%decode-streamed-body raw) "alphasecond")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; The discriminating one.
+      (check "stop: :then saw the abort sentinel" stopped t)
+      (check "stop: the stopped connection could start another fetch"
+             second-start :ok)
+      (check "stop: :on-body fired before the stop" (> body-fires 0) t)
+      (check "stop: :then fired exactly once" then-fires 1)
+      (check "stop: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
 (defun census-await (key target &key (seconds 5))
   "Poll WEB-SKELETON::CONNECTION-CENSUS until KEY reads TARGET, or SECONDS
    elapse. Returns the last value seen, so a failing check reports what the
@@ -3361,5 +3586,7 @@
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
+  (test-fetch-stop-is-sticky-across-a-pass)
+  (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))
