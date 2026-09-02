@@ -3218,46 +3218,38 @@
                   closes 1))
       (setf (symbol-function 'web-skeleton::close-connection) real))))
 
-(defun test-fetch-stop-is-sticky-across-a-pass ()
-  "A :STOP on the first chunk of a pass survives the chunks that follow it.
+(defun %stop-verdict-pass ()
+  "One HANDLE-OUTBOUND-READ pass over a complete chunked response whose
+   :ON-BODY returns :STOP on the first chunk and NIL on the rest.
 
-   :ON-BODY's answer was captured last-answer-wins, which is right for
-   :PAUSE — it describes a write backlog that may have drained by the next
-   chunk — and wrong for :STOP, which describes the fetch and has no
-   verdict that retracts it. Under last-wins an app that stopped on the
-   first of three chunks in one pass had its stop erased by the NIL it
-   returned for the second, and the fetch ran to completion with the
-   cancel silently dropped.
+   Returns (values FINAL CHUNKS LIVENESS FIRES REMAINING): the status the
+   fetch callback was handed (:NEVER if it never ran), the chunk payloads
+   in delivery order, one liveness reading per delivery taken from inside
+   the callback, how many times the callback fired, and the connections
+   still registered when the pass returned.
 
-   Driven through a stub transport rather than a socket, for the reason
-   TEST-FETCH-OK-EOF-WALKS-THE-BYTES is: whether several chunks land in one
-   read is a scheduling question over a real peer, and a pass carrying one
-   chunk cannot tell sticky from last-wins apart at all. Here the whole
-   response arrives in one read on every run, so the case is reached on
-   every run.
+   Shared by the two tests below because only the assertions differ. The
+   arrangement is the whole fixture — a pass carrying several chunks with a
+   stop partway through — and written twice it would be two fixtures free
+   to drift apart while each claimed to hold everything but its own
+   question constant.
 
-   The response is *complete*, terminator included, and that is what makes
-   one assertion cover both halves of the verdict. Last-wins loses the stop
-   and COMPLETE-FETCH delivers a 200; so does an implementation that keeps
-   the stop but tests it after COMPLETE in the cond. Only sticky, and ahead
-   of COMPLETE, produces the abort sentinel.
+   A stub transport rather than a socket, for the reason
+   TEST-FETCH-OK-EOF-WALKS-THE-BYTES uses one: whether several chunks land
+   in one read is a scheduling question over a real peer, and both claims
+   here need a multi-chunk pass on every run, not on most of them.
 
-   That completeness does a second job, and it is why this test is not a
-   smaller copy of the end-to-end one. A stop taken mid-body has no chunked
-   terminator yet, so a COMPLETE-FETCH routing raises out of
-   DECODE-CHUNKED-BODY and the fetch ends on the sentinel anyway, by the
-   wrong road — the end-to-end test cannot tell that apart from the right
-   one. Here the accumulated body parses, 200 is what COMPLETE-FETCH
-   actually reports, and this is the only place that reading is refused.
-
-   The chunks are asserted too, and not as decoration: they are what proves
-   the pass carried anything after the stop. Without them this would pass
-   against a single-chunk pass, which is the arrangement that cannot fail."
-  (format t "~%Fetch: :STOP is sticky across a pass~%")
+   The response is complete, terminator included. That is what lets the
+   sentinel alone separate a stopped fetch from a delivered one — a
+   COMPLETE-FETCH routing parses this body and reports 200, where against a
+   truncated one it would raise and reach the abort sentinel by the error
+   path instead, which is indistinguishable from the right answer
+   downstream."
   (let* ((bytes (sb-ext:string-to-octets (%chunked-corpus-response)
                                          :external-format :ascii))
          (pos 0)
          (chunks nil)
+         (liveness nil)
          (fires 0)
          (final :never)
          (socket (make-instance 'sb-bsd-sockets:inet-socket
@@ -3283,10 +3275,23 @@
                       :last-active (get-universal-time)
                       :fetch-on-body
                       (lambda (c chunk)
-                        (declare (ignore c))
                         (push (sb-ext:octets-to-string
                                chunk :external-format :ascii)
                               chunks)
+                        ;; Read from inside the callback, because that is
+                        ;; the only frame the claim is about: the walk is
+                        ;; running underneath this one. CONNECTION-CLOSE
+                        ;; sets the fd to -1 and leaves the read buffer
+                        ;; alone, so a torn-down connection goes on being
+                        ;; walked and only these two slots say so.
+                        (let* ((fd (web-skeleton::connection-fd c))
+                               (live (>= fd 0))
+                               (registered
+                                 (and (web-skeleton::lookup-connection fd) t)))
+                          (push (cond ((and live registered) :live)
+                                      ((or live registered) :half-torn-down)
+                                      (t :torn-down))
+                                liveness))
                         ;; Stop on the first, NIL for the rest. That
                         ;; sequence is the one last-wins erases.
                         (when (= (length chunks) 1) :stop))
@@ -3307,20 +3312,89 @@
                                                  :start2 pos :end2 (+ pos n))
                               (incf pos n)
                               n))))))
-           ;; Registered so the reclamation check below reads a slot this
-           ;; test actually filled. Unregistered, the count is zero whether
-           ;; or not anything tore the connection down.
+           ;; Registered so the reclamation reading means something.
+           ;; Unregistered, the count is zero whether or not anything tore
+           ;; the connection down.
            (web-skeleton::register-connection conn)
            (web-skeleton::handle-outbound-read conn epfd)
-           ;; The discriminating one.
-           (check "stop sticky: the fetch ended on the abort sentinel"
-                  final nil)
-           (check "stop sticky: the pass carried chunks past the stop"
-                  (reverse chunks) *chunked-corpus*)
-           (check "stop sticky: the fetch ended exactly once" fires 1)
-           (check "stop sticky: the outbound was reclaimed"
-                  (hash-table-count web-skeleton::*connections*) 0))
+           (values final (reverse chunks) (reverse liveness) fires
+                   (hash-table-count web-skeleton::*connections*)))
       (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-fetch-stop-is-sticky-across-a-pass ()
+  "A :STOP on the first chunk of a pass survives the chunks that follow it.
+
+   :ON-BODY's answer was captured last-answer-wins, which is right for
+   :PAUSE — it describes a write backlog that may have drained by the next
+   chunk — and wrong for :STOP, which describes the fetch and has no
+   verdict that retracts it. Under last-wins an app that stopped on the
+   first of three chunks in one pass had its stop erased by the NIL it
+   returned for the second, and the fetch ran to completion with the cancel
+   silently dropped.
+
+   The sentinel is one assertion covering both halves of the verdict.
+   Last-wins loses the stop and COMPLETE-FETCH delivers a 200; so does an
+   implementation that keeps the stop but tests it after COMPLETE in the
+   cond. Only sticky, and ahead of COMPLETE, produces the abort sentinel.
+
+   %STOP-VERDICT-PASS has why the fixture is shaped as it is, and in
+   particular why its response is complete — which is also why this is not
+   a smaller copy of the end-to-end test. A stop taken mid-body leaves no
+   chunked terminator, so a COMPLETE-FETCH routing raises out of
+   DECODE-CHUNKED-BODY and the fetch ends on the sentinel anyway, by the
+   wrong road. Here the accumulated body parses, 200 is what COMPLETE-FETCH
+   actually reports, and this is the only place that reading is refused.
+
+   The chunks are asserted too, and not as decoration: they are what proves
+   the pass carried anything after the stop. Without them this would pass
+   against a single-chunk pass, which is the arrangement that cannot fail."
+  (format t "~%Fetch: :STOP is sticky across a pass~%")
+  (multiple-value-bind (final chunks liveness fires remaining)
+      (%stop-verdict-pass)
+    (declare (ignore liveness))
+    ;; The discriminating one.
+    (check "stop sticky: the fetch ended on the abort sentinel" final nil)
+    (check "stop sticky: the pass carried chunks past the stop"
+           chunks *chunked-corpus*)
+    (check "stop sticky: the fetch ended exactly once" fires 1)
+    (check "stop sticky: the outbound was reclaimed" remaining 0)))
+
+(defun test-fetch-stop-does-not-tear-down-mid-walk ()
+  "A :STOP is recorded during the walk and acted on after it.
+
+   The verdict is captured into a local and the teardown happens in the
+   cond that runs once OUTBOUND-RESPONSE-COMPLETE-P has returned. Tearing
+   down from inside the callback instead is the obvious shortcut, it is
+   what a synchronous cancel would have to do, and nothing else in this
+   suite can see the difference.
+
+   That is the whole reason this is its own test rather than a claim riding
+   along on its neighbour. Under a synchronous teardown CLOSE-OUTBOUND runs
+   from inside the callback and every other reading comes out identical:
+   CONNECTION-CLOSE sets the fd to -1 without touching the read buffer, so
+   the walk carries on over a closed connection and still delivers every
+   chunk; the callback has already fired exactly once; the connection is
+   already unregistered; and the cond's stop arm, reached afterwards, finds
+   (>= fd 0) false and quietly does nothing. Sentinel, chunks, count and
+   reclamation all pass. The verification claim would have had no detector
+   at all.
+
+   The reading that discriminates is taken from inside the callback, the
+   only frame with the walk still underneath it. Live and registered for
+   every chunk of the pass is the deferred design; :TORN-DOWN from the
+   second chunk on is the shortcut.
+
+   One check, because the list guards itself. Its contents are the claim
+   and its length is the non-vacuity condition — a one-element reading
+   means the pass never carried anything past the stop, which is the
+   arrangement in which this cannot fail, and it reports as a failure
+   rather than as a pass."
+  (format t "~%Fetch: :STOP defers teardown to the cond~%")
+  (multiple-value-bind (final chunks liveness fires remaining)
+      (%stop-verdict-pass)
+    (declare (ignore final chunks fires remaining))
+    (check "stop deferred: the connection was live for every chunk of the pass"
+           liveness '(:live :live :live))))
 
 (defun test-harness-fetch-into-stop-e2e ()
   "A stop ends the upstream and hands back a connection that still works.
@@ -3587,6 +3661,7 @@
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-is-sticky-across-a-pass)
+  (test-fetch-stop-does-not-tear-down-mid-walk)
   (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))
