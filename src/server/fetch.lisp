@@ -193,7 +193,27 @@
    the walk stopped early, the undelivered bytes would sit in user space
    where an EPOLL_CTL_MOD does not re-fire, and FETCH-RESUME could not be
    a simple re-arm. The last answer in a pass is the one that counts, so
-   a caller may pause on one chunk and continue on a later one."
+   a caller may pause on one chunk and continue on a later one.
+
+   Return :STOP from ON-BODY to end the fetch. The outbound is closed,
+   the connection being fetched into is left untouched, and THEN receives
+   the abort sentinel — a NIL status — because a response the caller cut
+   short is not a delivered one, and reporting a real status over it is
+   the silent truncation issue #12 closed. There is no resume; a stopped
+   fetch is over.
+
+   :STOP ends the fetch, not the pass, so like :PAUSE it does not stop
+   the chunks already in hand from reaching ON-BODY. It differs in the
+   two places that matter. It is remembered once given, so a later chunk
+   returning NIL does not retract it. And it outranks a response that
+   completed in the same pass, so what THEN is told does not depend on
+   where the upstream's bytes happened to be split.
+
+   Only useful for a fetch started by FETCH-INTO, which is the one with a
+   connection worth keeping. On the handler-returned path a client is
+   parked with no answer owed by anything else, so a stop there is
+   delivered as the same 502 that path gives every other response which
+   never arrived."
   (unless then
     (error "http-fetch requires :then callback"))
   (make-http-fetch-continuation :method method :url url
@@ -1392,9 +1412,17 @@
    callbacks are the ones HTTP-FETCH already takes and mean the same
    things: :THEN receives (status headers body) with a NIL status as the
    abort sentinel, and :ON-BODY receives (outbound-connection chunk) and
-   may return :PAUSE. A :THEN moves from a handler-returned fetch to this
-   one unchanged. :THEN's return value is discarded here — there is no
-   parked request for it to answer.
+   may return :PAUSE or :STOP. A :THEN moves from a handler-returned fetch
+   to this one unchanged. :THEN's return value is discarded here — there is
+   no parked request for it to answer.
+
+   :STOP is the verdict this path exists for. It closes the outbound,
+   leaves CONNECTION alone, and fires :THEN with the abort sentinel, so an
+   application that has stopped wanting a response can stop paying for it
+   without giving up the connection it was producing into. The connection
+   is free to start another fetch immediately; the outstanding marker is
+   released before :THEN runs, on the same reasoning that lets a delivered
+   fetch chain.
 
    Signals, rather than returning NIL, in four cases:
 
@@ -1958,7 +1986,8 @@
        ;; Close-delimited responses (no CL, no TE) never satisfy this
        ;; test: for those, EOF genuinely is the framing, so they complete
        ;; from the :OK-EOF clause below or the :EOF arm above.
-       (let ((pause nil))
+       (let ((pause nil)
+             (stop nil))
          (multiple-value-bind (complete next-scan)
              (outbound-response-complete-p
               (connection-read-buf conn)
@@ -1970,16 +1999,51 @@
                   ;; SUBSEQ rather than the shared buffer: the app keeps
                   ;; whatever it is handed, and the read buffer is reused
                   ;; on the next wake-up.
-                  ;; Last answer in a pass wins. A caller that pauses on
-                  ;; one chunk and continues on the next ends the pass
-                  ;; reading, which is the useful reading of a producer
-                  ;; that drained its own backlog partway through.
-                  (setf pause
-                        (eq (funcall (connection-fetch-on-body conn)
-                                     conn (subseq buf start end))
-                            :pause)))))
+                  (let ((verdict (funcall (connection-fetch-on-body conn)
+                                          conn (subseq buf start end))))
+                    ;; The two verdicts are captured differently, because
+                    ;; they are different kinds of claim.
+                    ;;
+                    ;; Last answer in a pass wins for :PAUSE. A caller that
+                    ;; pauses on one chunk and continues on the next ends
+                    ;; the pass reading, which is the useful reading of a
+                    ;; producer that drained its own backlog partway
+                    ;; through: :PAUSE describes the backlog now, so the
+                    ;; last chunk's answer is the current one.
+                    ;;
+                    ;; :STOP is sticky, because it describes the fetch
+                    ;; rather than the moment and nothing retracts it —
+                    ;; there is no un-stop verdict for a later chunk to
+                    ;; carry. Under last-wins an app that stopped on the
+                    ;; second of five chunks would have its stop erased by
+                    ;; the NIL it returns for the third, and the fetch
+                    ;; would run to completion with the cancel silently
+                    ;; dropped. A pass carrying one chunk cannot tell the
+                    ;; two rules apart, which is the arrangement a detector
+                    ;; for this has to avoid.
+                    (setf pause (eq verdict :pause))
+                    (when (eq verdict :stop)
+                      (setf stop t))))))
            (setf (connection-chunk-scan-pos conn) next-scan)
            (cond
+             ;; Ahead of COMPLETE, and so ahead of :OK-EOF as well.
+             ;;
+             ;; The opposite precedence from PAUSE below, which loses to
+             ;; both — deliberately, and for a reason that does not carry
+             ;; over. A pause is advisory about the *next* read, so a
+             ;; response that finished in this one has nothing left for it
+             ;; to govern and dropping it costs nothing. A stop governs
+             ;; what the application is told, and that is reported either
+             ;; way.
+             ;;
+             ;; Ordered the other way, the same app against the same
+             ;; upstream would get the abort sentinel or a 200 depending on
+             ;; whether the terminator happened to land in the pass it
+             ;; stopped on — segmentation it cannot see or control,
+             ;; choosing the outcome its :THEN reads. One rule instead: a
+             ;; pass in which :ON-BODY returned :STOP ends the fetch as
+             ;; stopped.
+             (stop (stop-fetch conn epoll-fd))
              (complete (complete-fetch conn epoll-fd :framing-complete t))
              ;; Bytes walked and delivered, then end of stream.
              ;;
@@ -2181,6 +2245,16 @@
      :streaming           aborted     close, no terminator, peer sees truncation
      :websocket           delivered   nothing; the app owns its framing
      :websocket           aborted     a 1011 close frame
+
+   The table covers two of the three ways a detached fetch can end, and
+   the third one deliberately never arrives here. A stopped fetch —
+   :ON-BODY returned :STOP — goes through STOP-FETCH to CLOSE-OUTBOUND,
+   which is neither of this function's two callers, so no disposition is
+   applied to its target at all. That is the whole of what makes stopping
+   coherent: the application asked for the ending, so the application
+   decides what the connection does next. An implementer who read
+   `:aborted closes the connection` and routed a stop through here would
+   rebuild the ending that verdict exists to avoid.
 
    A callback that started another fetch suppresses all of it. That is how
    chaining works here: a handler-returned fetch chains by returning a
@@ -2496,3 +2570,51 @@
       (maybe-reap-dns-process conn)
       (connection-close conn)
       (log-debug "fetch: closed outbound fd ~d" fd))))
+
+(defun stop-fetch (out-conn epoll-fd)
+  "End OUT-CONN because the application asked it to, and leave the
+   connection it was fetching into alone.
+
+   The third way a detached fetch can end, and the only one that both
+   reports the truth and keeps the target. COMPLETE-FETCH reports
+   :DELIVERED — a real status and the partial body, which tells an
+   application that a response it cut short arrived whole, and is the same
+   silent truncation issue #12 closed. DELIVER-FETCH-ERROR reports the
+   truth and then takes the target with it through DELIVER-DETACHED's
+   disposition. Stopping wants the honest report without the disposition,
+   which is neither of them.
+
+   It ends through CLOSE-OUTBOUND rather than around it. The exactly-once
+   contract, the epoll removal, the DNS reap and the abort sentinel are all
+   already there, and (>= fd 0) already makes it idempotent — a stopped
+   fetch reports its ending like every other one, so an app that stops one
+   still gets to release whatever it was holding.
+
+   What CLOSE-OUTBOUND does not do is clear the target's outstanding
+   marker: DELIVER-DETACHED clears it, and a stopped fetch reaches
+   DELIVER-DETACHED by neither of its two callers. Left set, FETCH-INTO
+   would refuse every later fetch on that connection for the rest of its
+   life, and `stop this upstream, keep this connection` would hand back a
+   connection stripped of the one thing the application kept it for.
+
+   Cleared before CLOSE-OUTBOUND rather than after, for the reason
+   DELIVER-DETACHED clears it before its callback runs: the sentinel fires
+   from inside CLOSE-OUTBOUND, and a :THEN that starts the next fetch has
+   to find the slot free.
+
+   A parked fetch is not stopped, it is failed. :ON-BODY is available on
+   the handler-returned path too, where a client is parked in :AWAITING
+   with no response owed to it by anything else — closing the outbound
+   alone would leave that client to be reaped having been answered nothing,
+   so the stop becomes the same 502 every other ending that produces no
+   response on that path already produces. The application still gets the
+   abort sentinel, from CLOSE-OUTBOUND, on the way through."
+  (if (eq (connection-fetch-sink out-conn) :detached)
+      (progn
+        (let ((target (lookup-connection (connection-inbound-fd out-conn))))
+          (when target
+            (setf (connection-fetch-outstanding target) nil)))
+        (log-debug "fetch: stopped by :on-body, fd ~d" (connection-fd out-conn))
+        (close-outbound out-conn epoll-fd))
+      (deliver-fetch-error out-conn epoll-fd
+                           ":on-body returned :stop on a parked fetch")))
