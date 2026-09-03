@@ -754,6 +754,11 @@ happy path will not have a failure path, and a `:then` that only closes on
 success leaves a failed stream open until `*stream-idle-timeout*` — or a
 failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
 
+"Failed" above is the framework's `:aborted` outcome, which is the word the
+source uses and the one you will see in a log line. It is spelled out here
+because the parameter is named `:failure-disposition` and the outcome
+keyword is not, and a reader should not have to make that jump unaided.
+
 **On a `:streaming` target this is a protocol obligation.** The framework
 owns the terminator and writing one is a claim that the body is complete,
 so withholding it on failure is the only honest thing it can do.
@@ -896,12 +901,39 @@ a response that completed in the same pass does not override it. What
 `:then` is told never depends on where the upstream's bytes happened to
 be split.
 
+One consequence of that is worth seeing before you meet it. If you stop on
+chunk three of five and the upstream's terminator happens to land in the
+same read, your `:then` receives the abort sentinel while `:on-body` has
+already handed you every byte of the response. That is correct — you asked
+to stop, and the answer to "did this fetch deliver" is no — but it does
+mean a NIL status is not proof you are missing anything. If you care, count
+what you consumed; the sentinel is about the fetch, not about your data.
+
 **Closing the target is the other way to end one, and it costs the
 connection.** `close-connection` walks for detached outbounds and reaps
 them, which is what makes a client going away an immediate ending rather
 than a leak, and is asserted directly — "a client that leaves mid-relay
 tears the outbound down, once." Before `:stop` existed it was the only
 lever an application had, which is why the difference is worth naming.
+
+**On a handler-returned fetch, `:stop` fails the request.** `:on-body`
+belongs to `http-fetch`, so the verdict is reachable from a fetch a handler
+returned — where there is no connection of yours to keep, only a client
+parked with no answer. There the stop ends the fetch and the parked client
+gets `502`, the same code every other ending that produces no response on
+that path already gives. `:then` still fires once with the abort sentinel;
+its return value is discarded, exactly as it is for any other failed fetch
+on that path.
+
+That is a defined outcome rather than a useful one, and the difference is
+worth being plain about. Closing the outbound and leaving the client parked
+would be worse — a request that hangs to `*fetch-timeout*` and then dies —
+and reporting success would be the truncation the verdict exists to
+prevent. But `502` says the gateway failed, and what happened is that your
+application cancelled. **"Stop the upstream and let me answer the client
+myself" is not expressible today.** If that is what you want, do not stop
+the fetch: let it finish and answer from `:then`, which is the one place a
+handler-returned fetch's response comes from.
 
 **Know which primitive you are holding.** A non-local exit from
 `http-fetch-stream`'s `:on-line` unwinds through that call's

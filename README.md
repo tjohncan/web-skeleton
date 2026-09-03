@@ -430,6 +430,13 @@ read about here.
   body was whole. A `:websocket` target defaults to the same fate, a
   `1011` close frame, but there the framing is already the application's,
   and `fetch-into`'s `:failure-disposition :keep` opts out of it.
+- **`:stop` on a handler-returned fetch fails the request.** The verdict
+  belongs to `:on-body`, which `http-fetch` takes on both paths, but there
+  is only a connection to keep on the detached one. On the parked path a
+  stop answers the waiting client `502` — the same code every other
+  ending that produces no response there already gives. "Stop the upstream
+  and let me answer the client myself" is not expressible; let the fetch
+  finish and answer from `:then` instead.
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
