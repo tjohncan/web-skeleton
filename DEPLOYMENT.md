@@ -736,12 +736,86 @@ connection. A signalling call has done nothing and the callback does not
 fire, so `:then` can never run before `fetch-into` returns. `:then`'s
 return value is discarded here; there is no parked request to answer.
 
-If the callback does not close the connection, the framework does — with a
-terminator on success, and *without* one on failure, so the peer's decoder
-sees truncation rather than being told a failed body was complete. Unless
-`:then` started another fetch, which is how a detached fetch chains: a
-handler-returned one chains by returning a continuation, this one chains
-by calling `fetch-into` again.
+**When the fetch ends, the framework decides what becomes of your
+connection.** What it decides depends on the connection's kind and on how
+the fetch ended, and the two kinds are not treated alike:
+
+| target | ending | what happens to your connection |
+| --- | --- | --- |
+| already closed | any | nothing |
+| `:streaming` | delivered | `stream-close`, terminator written |
+| `:streaming` | failed | closed without a terminator, so the peer's decoder sees truncation rather than being told a failed body was complete |
+| `:websocket` | delivered | nothing; you own your framing |
+| `:websocket` | failed | a `1011` close frame, then the connection goes — the one row you can override, with `:failure-disposition :keep` |
+| either | stopped | nothing; you asked for the ending, so what follows is yours |
+
+It decides rather than leaving it to you because a handler written for the
+happy path will not have a failure path, and a `:then` that only closes on
+success leaves a failed stream open until `*stream-idle-timeout*` — or a
+failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
+
+"Failed" above is the framework's `:aborted` outcome, which is the word the
+source uses and the one you will see in a log line. It is spelled out here
+because the parameter is named `:failure-disposition` and the outcome
+keyword is not, and a reader should not have to make that jump unaided.
+
+**On a `:streaming` target this is a protocol obligation.** The framework
+owns the terminator and writing one is a claim that the body is complete,
+so withholding it on failure is the only honest thing it can do.
+
+**On a WebSocket it is a policy, and it is worth knowing before you port
+to `fetch-into` over one.** The framework has already disclaimed your
+framing on the delivered row; on the failed one it sends `1011` — RFC
+6455's "internal error" — and the connection closes behind it. The frame
+carries the code and nothing else, so a client sees a bare `1011` with no
+reason string.
+
+**That row, and only that row, has an opt-out.** An application with its
+own failure frame — an error rendered in the page, a retry the client
+drives — would otherwise send it and have the connection closed underneath
+it anyway. Pass `:failure-disposition :keep` and the framework leaves the
+connection alone when the fetch fails:
+
+```lisp
+;; the default, unchanged
+(fetch-into conn continuation :failure-disposition :close)
+
+;; :websocket targets only
+(fetch-into conn continuation :failure-disposition :keep)
+```
+
+The fetch contract does not change: `:then` still fires exactly once with
+the abort sentinel under either setting. `:keep` governs the connection,
+not the delivery.
+
+**It is refused on a `:streaming` target rather than ignored there.** On
+that path the disposition is the framing, and honouring `:keep` would hand
+the client a body with no terminator — the failure the whole rule exists
+to prevent. `fetch-into` signals at the call, where you are on the stack to
+read it, rather than disregarding the argument at a teardown that has
+nothing left to answer.
+
+**What `:keep` transfers is the failure path.** The default exists because
+an application will not handle a case it has never seen fail, and choosing
+`:keep` is asserting that you have. That includes not leaving a dead socket
+parked until `*ws-idle-timeout*`, which defaults to a day. If you are not
+going to close it, do not keep it.
+
+**A stopped fetch is not a failed one, and this parameter does not govern
+it.** Returning `:stop` from `:on-body` leaves the connection alone under
+`:close` as well as `:keep` — it never reaches the disposition at all. The
+inference the other way is reasonable and wrong: the abort sentinel is
+what `:then` receives, `:failure-disposition` is about aborted fetches, so
+a stop under the default should close the connection. It does not, because
+the sentinel and the disposition are separate facts.
+
+**Closing the connection yourself, or chaining, suppresses all of it.** A
+target that is already gone gets nothing. And the outstanding marker is
+cleared before `:then` runs precisely so `:then` can set it again by
+calling `fetch-into`: that is how a detached fetch chains — a
+handler-returned one chains by returning a continuation, this one by
+calling `fetch-into` again — and closing the connection the next fetch is
+about to produce into would make chaining impossible.
 
 **`:then` still fires exactly once, with a NIL body.** The bytes went out
 incrementally; handing them over again would double the memory the
@@ -798,24 +872,75 @@ So pause where a drain or something else will resume it — a timer, a
 later request, a queue the app is itself watching. If there is no such
 thing, do not pause.
 
-**A detached fetch cannot be called off while keeping the target alive.**
-Closing the target does end it: `close-connection` walks for detached
-outbounds and reaps them, which is what makes a client going away an
-immediate ending rather than a leak, and is asserted directly — "a client
-that leaves mid-relay tears the outbound down, once."
+**Stopping a detached fetch: return `:stop` from `:on-body`.** The
+outbound is closed, the connection you were fetching into is left exactly
+as it was, and `:then` fires with the abort sentinel — a NIL status, the
+same one a failed fetch delivers. There is no resume; a stopped fetch is
+over. This is the answer to an output cap being reached, or to a result
+arriving from somewhere else first: stop paying for a response you have
+stopped wanting, without giving up the connection you were producing
+into.
 
-What has no expression today is the other half of that. An app that
-stops wanting the response while still wanting its connection — an output
-cap reached, a result that arrived from somewhere else first — can stop
-acting on what `:on-body` hands it, but the upstream keeps producing and
-the outbound stays open until the body ends, the fetch fails, or
-`*fetch-timeout*` expires.
+The connection can start another fetch immediately, including from inside
+the stopped fetch's own `:then`, which is where an application usually
+notices it wants to.
 
-Know which primitive you are holding, because they differ exactly here. A
-non-local exit from `http-fetch-stream`'s `:on-line` unwinds through that
-call's `unwind-protect`, closing the socket and stopping the upstream
-while the caller carries on; it is a blocking call, so there is a stack to
-leave. A detached fetch has no call to exit from.
+**The sentinel is deliberate, and it is not ambiguous in practice.** A
+stopped fetch is not a delivered one, and reporting a real status over a
+body the caller cut short is the silent truncation the framework refuses
+everywhere else. Telling a stop from an upstream failure is the
+application's own to do, and it is in a position to: a stop can only
+originate inside a callback of the fetch being stopped, so the code that
+returns `:stop` can set its own flag on the way.
+
+**It ends the fetch, not the pass.** Like `:pause`, the chunks already
+read are still handed to `:on-body` first, and a pass can carry many.
+Unlike `:pause`, it is remembered once given — a later chunk returning
+NIL does not retract it — and it is not advisory about the next read, so
+a response that completed in the same pass does not override it. What
+`:then` is told never depends on where the upstream's bytes happened to
+be split.
+
+One consequence of that is worth seeing before you meet it. If you stop on
+chunk three of five and the upstream's terminator happens to land in the
+same read, your `:then` receives the abort sentinel while `:on-body` has
+already handed you every byte of the response. That is correct — you asked
+to stop, and the answer to "did this fetch deliver" is no — but it does
+mean a NIL status is not proof you are missing anything. If you care, count
+what you consumed; the sentinel is about the fetch, not about your data.
+
+**Closing the target is the other way to end one, and it costs the
+connection.** `close-connection` walks for detached outbounds and reaps
+them, which is what makes a client going away an immediate ending rather
+than a leak, and is asserted directly — "a client that leaves mid-relay
+tears the outbound down, once." Before `:stop` existed it was the only
+lever an application had, which is why the difference is worth naming.
+
+**On a handler-returned fetch, `:stop` fails the request.** `:on-body`
+belongs to `http-fetch`, so the verdict is reachable from a fetch a handler
+returned — where there is no connection of yours to keep, only a client
+parked with no answer. There the stop ends the fetch and the parked client
+gets `502`, the same code every other ending that produces no response on
+that path already gives. `:then` still fires once with the abort sentinel;
+its return value is discarded, exactly as it is for any other failed fetch
+on that path.
+
+That is a defined outcome rather than a useful one, and the difference is
+worth being plain about. Closing the outbound and leaving the client parked
+would be worse — a request that hangs to `*fetch-timeout*` and then dies —
+and reporting success would be the truncation the verdict exists to
+prevent. But `502` says the gateway failed, and what happened is that your
+application cancelled. **"Stop the upstream and let me answer the client
+myself" is not expressible today.** If that is what you want, do not stop
+the fetch: let it finish and answer from `:then`, which is the one place a
+handler-returned fetch's response comes from.
+
+**Know which primitive you are holding.** A non-local exit from
+`http-fetch-stream`'s `:on-line` unwinds through that call's
+`unwind-protect`, closing the socket and stopping the upstream while the
+caller carries on; it is a blocking call, so there is a stack to leave. A
+detached fetch has no call to exit from, and `:stop` is what it has
+instead.
 
 **One shape where `:pause` does nothing at all.** A response that arrives
 complete in a single read is delivered before the pause is consulted, so

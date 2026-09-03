@@ -863,13 +863,20 @@
                        append (list (format nil "~x" (length payload)) payload))
                  (list "0" ""))))
 
-(defun %chunked-upstream-fetch (response on-body-out then-out fires-box)
+(defun %chunked-upstream-fetch (response on-body-out then-out fires-box
+                                &optional verdict)
   "Run one :ON-BODY fetch against a canned upstream sending RESPONSE, and
    return the relay's own (VALUES STATUS BODY).
 
-   Shared by the two tests below because only RESPONSE differs between
-   them: one ends with the zero-size terminator and one does not, and
-   everything else about the setup is the thing being held constant."
+   Shared by the three tests below because only RESPONSE and VERDICT differ
+   between them: one response ends with the zero-size terminator and one
+   does not, and everything else about the setup is the thing being held
+   constant.
+
+   VERDICT is what :ON-BODY answers — NIL for the two framing tests, :STOP
+   for the one that asks what a stop does on this path. This is the
+   *parked* path, where a client is waiting in :AWAITING, so the fetch is
+   handler-returned rather than detached and the two endings differ."
   (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
                                  :type :stream :protocol :tcp))
         (thread nil))
@@ -894,7 +901,8 @@
                                 (declare (ignore conn))
                                 (push (sb-ext:octets-to-string
                                        chunk :external-format :ascii)
-                                      (car on-body-out)))
+                                      (car on-body-out))
+                                verdict)
                      :then (lambda (status headers body)
                              (declare (ignore headers))
                              (incf (car fires-box))
@@ -1059,6 +1067,50 @@
     (check "truncated-chunked: :then fired the cleanup sentinel"
            (first (car final)) nil)
     (check "truncated-chunked: :then fires exactly once" (car fires) 1)))
+
+(defun test-harness-fetch-on-body-stop-parked-e2e ()
+  "A :STOP from a handler-returned fetch answers the parked client 502.
+
+   :ON-BODY belongs to HTTP-FETCH, not to FETCH-INTO, so the verdict added
+   for detached fetches is reachable on this path too — where there is a
+   client parked in :AWAITING and no response owed to it by anything else.
+   Ending through CLOSE-OUTBOUND alone, which is right for a detached
+   fetch, would leave that client to be reaped having been answered
+   nothing: a request that hangs for *FETCH-TIMEOUT* and then closes.
+
+   So STOP-FETCH routes this path to DELIVER-FETCH-ERROR instead, and the
+   client gets the same 502 every other ending that produces no response
+   here already produces. Defining it was not optional — a verdict on a
+   shared callback cannot have behaviour on half its callers — but it is
+   not what the verdict is for, and the docstring says so.
+
+   The upstream response is *complete*, terminator and all, which is what
+   makes the 502 mean something. Against a truncated one this test would
+   be indistinguishable from its neighbour above, which reaches the same
+   502 by the framing guard rather than by the stop.
+
+   :THEN still fires the cleanup sentinel exactly once, because the stop
+   goes through CLOSE-OUTBOUND on the way and that is where it fires."
+  (format t "~%Harness: fetch :on-body :stop on a parked fetch~%")
+  (let ((chunks (list nil))
+        (final (list :never))
+        (fires (list 0)))
+    (multiple-value-bind (status body)
+        (%chunked-upstream-fetch (%chunked-corpus-response)
+                                 chunks final fires :stop)
+      (declare (ignore body))
+      ;; The discriminating one. Ending at CLOSE-OUTBOUND leaves the client
+      ;; parked with nothing, and this reads NIL after the harness deadline
+      ;; rather than 502.
+      (check "stop parked: the parked client is answered 502" status 502))
+    ;; Non-vacuity: the stop happened mid-delivery, not before anything
+    ;; arrived. Without this the check above would also pass against a
+    ;; fetch that failed at the door.
+    (check "stop parked: the chunk that triggered it was delivered"
+           (first (reverse (car chunks))) (first *chunked-corpus*))
+    (check "stop parked: :then fired the cleanup sentinel"
+           (first (car final)) nil)
+    (check "stop parked: :then fires exactly once" (car fires) 1)))
 
 (defun test-harness-dns-all-addresses-refused-e2e ()
   "A hostname whose every resolved address the policy refuses fails the
@@ -2844,13 +2896,18 @@
              (census-await :outbound 0) 0))))
 
 (defun test-harness-fetch-into-refusals ()
-  "The four refusals, each asserted on its own.
+  "The six refusals, each asserted on its own.
 
    They fail in different directions and a single \"it signals\" check
    would cover one of them by accident. And a refused call must leave
    nothing behind — no outbound, and a callback that never fired — which
    is the one place on this branch where zero is the right answer for a
-   counter."
+   counter.
+
+   The two disposition refusals bring a seventh check that is not a
+   refusal: the same argument on the target it is meant for has to get
+   past them. A guard that refuses everything passes every test written
+   only about what it rejects."
   (format t "~%Harness: fetch-into refusals~%")
   (let ((fires 0))
     (flet ((cont ()
@@ -2890,6 +2947,49 @@
                (handler-case (progn (fetch-into conn (cont)) :no-signal)
                  (error () :signalled))
                :signalled))
+      ;; The three disposition refusals assert on the error's *text* where
+      ;; the four above assert only that something signalled. Not a style
+      ;; difference: these three fail into each other. With no event loop
+      ;; bound, an implementation missing a disposition guard signals
+      ;; anyway — from the guard below it — so ":signalled" would be
+      ;; satisfied by the wrong refusal and the check would pass against
+      ;; the defect. The text names which guard fired.
+      ;;
+      ;; No event loop is also what keeps this cheap: every call here stops
+      ;; at a guard, so nothing dials, registers, or leaks a descriptor.
+      (flet ((refusal-text (disposition state)
+               (let ((conn (web-skeleton::make-connection :fd 1 :state state))
+                     (web-skeleton::*epoll-fd* nil))
+                 (handler-case
+                     (progn (fetch-into conn (cont)
+                                        :failure-disposition disposition)
+                            :no-signal)
+                   (error (e) (princ-to-string e)))))
+             (mentions (text want)
+               ;; STRINGP first. Without it a call that did not signal
+               ;; returns a keyword, SEARCH raises a type error outside any
+               ;; check, and the run ends with no failure list instead of
+               ;; reporting one.
+               (and (stringp text) (search want text) t)))
+        ;; An unrecognized value. Refused rather than defaulted: a caller
+        ;; who wrote :KEPT and got the framework's own disposition asked
+        ;; for an opt-out and silently did not receive one.
+        (check "refusal: an unknown :failure-disposition names itself"
+               (mentions (refusal-text :kept :websocket) "failure-disposition")
+               t)
+        ;; :KEEP on a :STREAMING target. Refused at the call rather than
+        ;; ignored at delivery: there the disposition is the framing, and
+        ;; honouring it would hand the client a body with no terminator.
+        (check "refusal: :keep on a stream names the disposition"
+               (mentions (refusal-text :keep :streaming) "failure-disposition")
+               t)
+        ;; And the same call on the target it is for gets past both guards
+        ;; and stops at the next one. Without this the two checks above
+        ;; would pass against a FETCH-INTO that refused :KEEP everywhere,
+        ;; which is a different function with the same test results.
+        (check "refusal: :keep on a websocket reaches the later guards"
+               (mentions (refusal-text :keep :websocket) "no event loop")
+               t))
       ;; A refused call did nothing: the callback never ran.
       (check "refusal: no callback fired on any refusal" fires 0)
       ;; Every refusal above returns from the guard block, which is before
@@ -3218,6 +3318,505 @@
                   closes 1))
       (setf (symbol-function 'web-skeleton::close-connection) real))))
 
+(defun %stop-verdict-pass (&optional target-disposition)
+  "One HANDLE-OUTBOUND-READ pass over a complete chunked response whose
+   :ON-BODY returns :STOP on the first chunk and NIL on the rest.
+
+   Returns (values FINAL CHUNKS LIVENESS FIRES REMAINING TARGET): the
+   status the fetch callback was handed (:NEVER if it never ran), the chunk
+   payloads in delivery order, one liveness reading per delivery taken from
+   inside the callback, how many times the callback fired, the connections
+   still registered when the pass returned, and the target if one was
+   asked for.
+
+   TARGET-DISPOSITION, when given, puts a registered :WEBSOCKET target
+   carrying it behind the outbound. Without it the outbound's INBOUND-FD is
+   -1, which is the arrangement the first two tests want: no target to
+   survive, and a REMAINING of zero that means the outbound alone.
+
+   Shared by the three tests below because only the assertions differ. The
+   arrangement is the whole fixture — a pass carrying several chunks with a
+   stop partway through — and written twice it would be two fixtures free
+   to drift apart while each claimed to hold everything but its own
+   question constant.
+
+   A stub transport rather than a socket, for the reason
+   TEST-FETCH-OK-EOF-WALKS-THE-BYTES uses one: whether several chunks land
+   in one read is a scheduling question over a real peer, and both claims
+   here need a multi-chunk pass on every run, not on most of them.
+
+   The response is complete, terminator included. That is what lets the
+   sentinel alone separate a stopped fetch from a delivered one — a
+   COMPLETE-FETCH routing parses this body and reports 200, where against a
+   truncated one it would raise and reach the abort sentinel by the error
+   path instead, which is indistinguishable from the right answer
+   downstream."
+  (let* ((bytes (sb-ext:string-to-octets (%chunked-corpus-response)
+                                         :external-format :ascii))
+         (pos 0)
+         (chunks nil)
+         (liveness nil)
+         (fires 0)
+         (final :never)
+         (socket (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp))
+         (epfd (web-skeleton::epoll-create))
+         ;; RUN-WORKER binds this in its own dynamic scope, and teardown
+         ;; goes through it. Driving one connection outside a worker means
+         ;; supplying the table the worker would have.
+         (web-skeleton::*connections* (make-hash-table))
+         ;; With TARGET-DISPOSITION given, a :WEBSOCKET target carrying it
+         ;; is registered and the outbound points at it. Fd 4242 rather
+         ;; than a real socket: nothing here writes to it, and the two
+         ;; things a disposition would do to it — a queued close frame, a
+         ;; state change — are both readable off the struct.
+         (target (when target-disposition
+                   (let ((c (web-skeleton::make-connection
+                             :fd 4242
+                             :state :websocket
+                             :fetch-outstanding t
+                             :fetch-failure-disposition target-disposition
+                             :last-active (get-universal-time))))
+                     (web-skeleton::register-connection c)
+                     c))))
+    (unwind-protect
+         (let ((conn (web-skeleton::make-connection
+                      :fd (web-skeleton::socket-fd socket)
+                      :socket socket
+                      :state :out-read
+                      :outbound-p t
+                      ;; :DETACHED is what routes a stop through STOP-FETCH
+                      ;; rather than into the parked path's 502, and -1
+                      ;; exercises the target lookup finding nothing to
+                      ;; unmark.
+                      :fetch-sink :detached
+                      :inbound-fd (if target (web-skeleton::connection-fd target) -1)
+                      :fetch-method :GET
+                      :last-active (get-universal-time)
+                      :fetch-on-body
+                      (lambda (c chunk)
+                        (push (sb-ext:octets-to-string
+                               chunk :external-format :ascii)
+                              chunks)
+                        ;; Read from inside the callback, because that is
+                        ;; the only frame the claim is about: the walk is
+                        ;; running underneath this one. CONNECTION-CLOSE
+                        ;; sets the fd to -1 and leaves the read buffer
+                        ;; alone, so a torn-down connection goes on being
+                        ;; walked and only these two slots say so.
+                        (let* ((fd (web-skeleton::connection-fd c))
+                               (live (>= fd 0))
+                               (registered
+                                 (and (web-skeleton::lookup-connection fd) t)))
+                          (push (cond ((and live registered) :live)
+                                      ((or live registered) :half-torn-down)
+                                      (t :torn-down))
+                                liveness))
+                        ;; Stop on the first, NIL for the rest. That
+                        ;; sequence is the one last-wins erases.
+                        (when (= (length chunks) 1) :stop))
+                      :fetch-callback
+                      (lambda (status headers body)
+                        (declare (ignore headers body))
+                        (incf fires)
+                        (setf final status)
+                        nil)
+                      ;; Bytes until they run out, then :EOF — never
+                      ;; :AGAIN, so the whole response is one pass.
+                      :read-fn
+                      (lambda (buf start max)
+                        (if (>= pos (length bytes))
+                            :eof
+                            (let ((n (min max (- (length bytes) pos))))
+                              (replace buf bytes :start1 start
+                                                 :start2 pos :end2 (+ pos n))
+                              (incf pos n)
+                              n))))))
+           ;; Registered so the reclamation reading means something.
+           ;; Unregistered, the count is zero whether or not anything tore
+           ;; the connection down.
+           (web-skeleton::register-connection conn)
+           (web-skeleton::handle-outbound-read conn epfd)
+           ;; REMAINING counts the target too when there is one, so the
+           ;; sticky test's "reclaimed" reading is taken without one.
+           (values final (reverse chunks) (reverse liveness) fires
+                   (hash-table-count web-skeleton::*connections*)
+                   target))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-fetch-stop-is-sticky-across-a-pass ()
+  "A :STOP on the first chunk of a pass survives the chunks that follow it.
+
+   :ON-BODY's answer was captured last-answer-wins, which is right for
+   :PAUSE — it describes a write backlog that may have drained by the next
+   chunk — and wrong for :STOP, which describes the fetch and has no
+   verdict that retracts it. Under last-wins an app that stopped on the
+   first of three chunks in one pass had its stop erased by the NIL it
+   returned for the second, and the fetch ran to completion with the cancel
+   silently dropped.
+
+   The sentinel is one assertion covering both halves of the verdict.
+   Last-wins loses the stop and COMPLETE-FETCH delivers a 200; so does an
+   implementation that keeps the stop but tests it after COMPLETE in the
+   cond. Only sticky, and ahead of COMPLETE, produces the abort sentinel.
+
+   %STOP-VERDICT-PASS has why the fixture is shaped as it is, and in
+   particular why its response is complete — which is also why this is not
+   a smaller copy of the end-to-end test. A stop taken mid-body leaves no
+   chunked terminator, so a COMPLETE-FETCH routing raises out of
+   DECODE-CHUNKED-BODY and the fetch ends on the sentinel anyway, by the
+   wrong road. Here the accumulated body parses, 200 is what COMPLETE-FETCH
+   actually reports, and this is the only place that reading is refused.
+
+   The chunks are asserted too, and not as decoration: they are what proves
+   the pass carried anything after the stop. Without them this would pass
+   against a single-chunk pass, which is the arrangement that cannot fail."
+  (format t "~%Fetch: :STOP is sticky across a pass~%")
+  (multiple-value-bind (final chunks liveness fires remaining)
+      (%stop-verdict-pass)
+    (declare (ignore liveness))
+    ;; The discriminating one.
+    (check "stop sticky: the fetch ended on the abort sentinel" final nil)
+    (check "stop sticky: the pass carried chunks past the stop"
+           chunks *chunked-corpus*)
+    (check "stop sticky: the fetch ended exactly once" fires 1)
+    (check "stop sticky: the outbound was reclaimed" remaining 0)))
+
+(defun test-fetch-stop-does-not-tear-down-mid-walk ()
+  "A :STOP is recorded during the walk and acted on after it.
+
+   The verdict is captured into a local and the teardown happens in the
+   cond that runs once OUTBOUND-RESPONSE-COMPLETE-P has returned. Tearing
+   down from inside the callback instead is the obvious shortcut, it is
+   what a synchronous cancel would have to do, and nothing else in this
+   suite can see the difference.
+
+   That is the whole reason this is its own test rather than a claim riding
+   along on its neighbour. Under a synchronous teardown CLOSE-OUTBOUND runs
+   from inside the callback and every other reading comes out identical:
+   CONNECTION-CLOSE sets the fd to -1 without touching the read buffer, so
+   the walk carries on over a closed connection and still delivers every
+   chunk; the callback has already fired exactly once; the connection is
+   already unregistered; and the cond's stop arm, reached afterwards, finds
+   (>= fd 0) false and quietly does nothing. Sentinel, chunks, count and
+   reclamation all pass. The verification claim would have had no detector
+   at all.
+
+   The reading that discriminates is taken from inside the callback, the
+   only frame with the walk still underneath it. Live and registered for
+   every chunk of the pass is the deferred design; :TORN-DOWN from the
+   second chunk on is the shortcut.
+
+   One check, because the list guards itself. Its contents are the claim
+   and its length is the non-vacuity condition — a one-element reading
+   means the pass never carried anything past the stop, which is the
+   arrangement in which this cannot fail, and it reports as a failure
+   rather than as a pass.
+
+   The length is also coupled to the fixture's chunk count, which is worth
+   knowing before changing the fixture. *CHUNKED-CORPUS* has three
+   payloads; give it a fourth and this fails on the count rather than on
+   the claim. That is the price of folding the guard into the assertion,
+   and it is the right trade here — two separate checks could drift apart,
+   where this one goes red loudly and points at the line that moved."
+  (format t "~%Fetch: :STOP defers teardown to the cond~%")
+  (multiple-value-bind (final chunks liveness fires remaining)
+      (%stop-verdict-pass)
+    (declare (ignore final chunks fires remaining))
+    (check "stop deferred: the connection was live for every chunk of the pass"
+           liveness '(:live :live :live))))
+
+(defun %ws-disposition-pass (disposition)
+  "Run DELIVER-DETACHED's aborted arm against a :WEBSOCKET target carrying
+   DISPOSITION, and report what became of it.
+
+   Returns (values STATE QUEUED FIRES) — the target's state afterwards, the
+   bytes sitting on its write path, and the callback count.
+
+   At the seam rather than end to end, because the claim is about one arm
+   of one case statement and an end-to-end WebSocket relay would reach it
+   through a handshake, a frame decoder and an upstream failure, any of
+   which could be what broke. Fd 4242 and no socket: nothing here writes,
+   the epoll arm is already wrapped in IGNORE-ERRORS, and both observable
+   consequences — a queued close frame, a state change — are slots.
+
+   The callback count is returned because it must not move. :KEEP changes
+   what happens to the connection and nothing about the fetch contract, so
+   an implementation that suppressed the delivery along with the close
+   would be a different and worse bug than the one being prevented."
+  (let* ((fires 0)
+         (epfd (web-skeleton::epoll-create))
+         (web-skeleton::*connections* (make-hash-table)))
+    (unwind-protect
+         (let ((target (web-skeleton::make-connection
+                        :fd 4242
+                        :state :websocket
+                        :fetch-outstanding t
+                        :fetch-failure-disposition disposition
+                        :last-active (get-universal-time))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::deliver-detached
+            4242 epfd
+            (lambda (s h b) (declare (ignore s h b)) (incf fires) nil)
+            :aborted)
+           (values (web-skeleton::connection-state target)
+                   (web-skeleton::connection-write-buf target)
+                   fires))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-fetch-failure-disposition-crosses-the-seam ()
+  "FETCH-INTO writes the disposition and DELIVER-DETACHED reads it. This is
+   the wire between them, which nothing was watching.
+
+   Both ends were covered and the wire was not. The refusal tests reach
+   FETCH-INTO's guards and stop there, which is before the write. The two
+   disposition fixtures set the slot themselves through MAKE-CONNECTION's
+   initarg, so they check the read against a value no production code ever
+   put there. Delete the disposition clause from FETCH-INTO's setf and the
+   slot keeps its :CLOSE default — :KEEP accepted, validated, and silently
+   ignored, which is the exact hazard the issue names — and every test on
+   this branch stayed green.
+
+   The mode has a name now: *pre-arranged*. A fixture performs the step
+   production is responsible for performing, then checks the consumer of
+   that step. It is not vacuous, it can fail; not partial, it covers its
+   claim; not confounded, it passes for the right reason. What it cannot do
+   is fail for any defect in the step it performed itself, and both ends
+   read as covered while the middle is not. The rule it produces: when a
+   value crosses a seam, revert the write as well as the read.
+
+   INITIATE-FETCH is stubbed because the write is the last thing FETCH-INTO
+   does before dialing. :KEEP is the only value worth asserting here —
+   :CLOSE is the slot's resting value, so a write that never happened is
+   indistinguishable from one that did.
+
+   Two checks rather than one, and not for redundancy: the first names the
+   write and the second names its effect, so a failure list says whether
+   FETCH-INTO stopped writing or DELIVER-DETACHED stopped reading."
+  (format t "~%Fetch: the disposition survives the trip from fetch-into~%")
+  (let ((real (symbol-function 'web-skeleton::initiate-fetch)))
+    (setf (symbol-function 'web-skeleton::initiate-fetch)
+          (lambda (conn epoll-fd fetch-req)
+            (declare (ignore conn epoll-fd fetch-req))
+            t))
+    (unwind-protect
+         (let* ((epfd (web-skeleton::epoll-create))
+                (web-skeleton::*connections* (make-hash-table))
+                (web-skeleton::*epoll-fd* epfd))
+           (unwind-protect
+                (let ((target (web-skeleton::make-connection
+                               :fd 4242
+                               :state :websocket
+                               :last-active (get-universal-time))))
+                  (web-skeleton::register-connection target)
+                  (fetch-into target
+                              (http-fetch :get "http://127.0.0.1:1/x"
+                                          :then (lambda (s h b)
+                                                  (declare (ignore s h b))
+                                                  nil))
+                              :failure-disposition :keep)
+                  (check "disposition seam: fetch-into wrote it to the target"
+                         (web-skeleton::connection-fetch-failure-disposition
+                          target)
+                         :keep)
+                  (web-skeleton::deliver-detached
+                   4242 epfd
+                   (lambda (s h b) (declare (ignore s h b)) nil)
+                   :aborted)
+                  (check "disposition seam: and the failed fetch left it open"
+                         (web-skeleton::connection-state target) :websocket))
+             (ignore-errors (web-skeleton::%close epfd))))
+      (setf (symbol-function 'web-skeleton::initiate-fetch) real))))
+
+(defun test-fetch-failure-disposition-both-directions ()
+  "A failed detached fetch closes a WebSocket under :CLOSE and does not
+   under :KEEP.
+
+   Both directions, and the second one is not the interesting half. A
+   parameter that is read but never obeyed passes the :KEEP checks alone —
+   the connection survives because nothing was ever going to close it — so
+   the :CLOSE half is what proves the default still applies and that the
+   opt-out is an opt-out rather than a removal.
+
+   The close frame is compared against BUILD-WS-CLOSE's own output rather
+   than against hand-written bytes. What is being asserted is that a 1011
+   close was queued, not what a close frame looks like; the second question
+   has its own tests and one definition."
+  (format t "~%Fetch: :failure-disposition, both directions~%")
+  (multiple-value-bind (state queued fires) (%ws-disposition-pass :close)
+    (check "disposition :close: the target is closing" state :closing)
+    (check "disposition :close: a 1011 close frame was queued"
+           (and queued
+                (equalp queued (web-skeleton::build-ws-close 1011))
+                t)
+           t)
+    (check "disposition :close: the callback still fired once" fires 1))
+  (multiple-value-bind (state queued fires) (%ws-disposition-pass :keep)
+    (check "disposition :keep: the target is still a websocket"
+           state :websocket)
+    (check "disposition :keep: nothing was written to it" queued nil)
+    (check "disposition :keep: the callback still fired once" fires 1)))
+
+(defun test-fetch-stop-ignores-the-failure-disposition ()
+  "A stopped fetch's target survives under :CLOSE as well as :KEEP.
+
+   The interaction, and the inference it refuses is both wrong and
+   reasonable: :STOP delivers the abort sentinel, :FAILURE-DISPOSITION
+   governs what an aborted fetch does to the target, its default is
+   :CLOSE — so returning :STOP must close the connection, which is the
+   opposite of what the verdict is for.
+
+   It does not, because the sentinel and the disposition are separate
+   facts. A stop ends through STOP-FETCH and CLOSE-OUTBOUND, which reach
+   neither of DELIVER-DETACHED's two callers, so no disposition is
+   consulted under either setting.
+
+   :CLOSE is the discriminating half. An implementation that routed a stop
+   through the disposition would pass this at :KEEP and close the target at
+   the default — the wrong answer arriving at the setting nobody changed,
+   which is the shape that ships."
+  (format t "~%Fetch: a stop is not governed by :failure-disposition~%")
+  (dolist (disposition '(:close :keep))
+    (multiple-value-bind (final chunks liveness fires remaining target)
+        (%stop-verdict-pass disposition)
+      (declare (ignore final chunks liveness fires remaining))
+      (check (format nil "stop vs ~a: the target survived" disposition)
+             (web-skeleton::connection-state target) :websocket)
+      (check (format nil "stop vs ~a: nothing was written to it" disposition)
+             (web-skeleton::connection-write-buf target) nil)
+      (check (format nil "stop vs ~a: and it can fetch again" disposition)
+             (web-skeleton::connection-fetch-outstanding target) nil))))
+
+(defun test-harness-fetch-into-stop-e2e ()
+  "A stop ends the upstream and hands back a connection that still works.
+
+   The want this verdict exists for, end to end: stop this upstream, keep
+   this connection. Three claims, and they fail in different directions.
+
+   The upstream never closes, so within the client's read window nothing
+   but the stop can end this fetch — *FETCH-TIMEOUT* is 30 seconds and the
+   window is 8, which is what keeps the deadline sweeper from passing this
+   test on the stop's behalf.
+
+   :THEN must see the abort sentinel, and which wrong implementation that
+   catches was measured rather than reasoned about. COMPLETE-FETCH with
+   :FRAMING-COMPLETE T — a copy of the arm directly above it in the cond,
+   and so the likeliest mistake — suppresses the body decode, delivers a
+   200, and passes every other check here: the disposition leaves the
+   target alone, the stream survives, the second fetch runs. Only this
+   check fails, on exactly the report the verdict exists to prevent.
+
+   Plain COMPLETE-FETCH, without that keyword, is caught elsewhere and not
+   here, which is worth stating rather than leaving to be discovered. A
+   chunked upstream stopped mid-body has no terminator, so
+   DECODE-CHUNKED-BODY raises, HANDLE-OUTBOUND-EVENT's handler routes it
+   to DELIVER-FETCH-ERROR, and :THEN receives the sentinel by the wrong
+   road. TEST-FETCH-STOP-IS-STICKY-ACROSS-A-PASS is the detector for that
+   shape: its upstream response is complete, so COMPLETE-FETCH parses it
+   and reports 200 with or without the keyword.
+
+   The target must survive, asserted through its own body: the client
+   decodes what was relayed plus what was written after the stop,
+   terminator and all. It earns its place against a stop that never
+   happens and against one that leaves the connection unusable, both of
+   which end with no terminator ever written. It is not evidence about
+   *routing*, and reading it that way would overstate it — the second
+   fetch sets the outstanding marker again before DELIVER-DETACHED
+   consults it, which suppresses the disposition, so even a stop routed
+   through the failure path leaves this stream standing.
+
+   A counted :ON-BODY assertion lived here and is gone. The callback
+   increments unconditionally and returns :STOP unconditionally, and a stop
+   can only happen through it, so a check that it fired was true in every
+   run where the sentinel check could pass — green under every revert that
+   leaves the callback wired, which is all of them. Its name claimed an
+   ordering its expression never checked, which is this project's
+   prose-versus-code failure occurring inside the suite. The decode above
+   already proves the callback fired and relayed, so nothing was lost with
+   it. The mode is *entailed*: an assertion that cannot fail in any run
+   where a neighbour passes, because the neighbour's precondition is the
+   thing it checks.
+
+   And the connection must still be usable, which is the half that is easy
+   to miss. CLOSE-OUTBOUND does not clear the target's outstanding marker —
+   DELIVER-DETACHED does, and a stopped fetch never reaches it — so a stop
+   that skipped that step would hand back a connection FETCH-INTO refuses
+   for the rest of its life. Proven by starting the next fetch from inside
+   the stopped one's :THEN, which is also the earliest moment an
+   application would try."
+  (format t "~%Harness: fetch-into, stopped from :on-body~%")
+  (let ((port-box (list nil))
+        (then-fires 0)
+        (stopped nil)
+        (second-start :never))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (let ((path (http-request-path req)))
+             (cond
+               ;; One chunk, then silence, and never closed.
+               ((search "/up" path)
+                (make-stream-response
+                 :on-open (lambda (c) (stream-send c (%ascii "alpha")))))
+               ;; What the surviving connection goes on to fetch.
+               ((search "/second" path)
+                (make-text-response 200 "second"))
+               (t
+                (make-stream-response
+                 :on-open
+                 (lambda (client)
+                   (fetch-into
+                    client
+                    (http-fetch
+                     :get (format nil "http://127.0.0.1:~d/up"
+                                  (first port-box))
+                     :on-body (lambda (out chunk)
+                                (declare (ignore out))
+                                (stream-send client chunk)
+                                :stop)
+                     :then
+                     (lambda (status headers body)
+                       (declare (ignore headers body))
+                       (incf then-fires)
+                       (setf stopped (null status))
+                       (setf second-start
+                             (handler-case
+                                 (progn
+                                   (fetch-into
+                                    client
+                                    (http-fetch
+                                     :get (format nil
+                                                  "http://127.0.0.1:~d/second"
+                                                  (first port-box))
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h))
+                                             (when b (stream-send client b))
+                                             (stream-close client)
+                                             nil)))
+                                   :ok)
+                               (error (e) (princ-to-string e))))
+                       nil))))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream :seconds 8))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "stop: the target survived and kept producing"
+                        (%decode-streamed-body raw) "alphasecond")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; The discriminating one.
+      (check "stop: :then saw the abort sentinel" stopped t)
+      (check "stop: the stopped connection could start another fetch"
+             second-start :ok)
+      (check "stop: :then fired exactly once" then-fires 1)
+      (check "stop: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
 (defun census-await (key target &key (seconds 5))
   "Poll WEB-SKELETON::CONNECTION-CENSUS until KEY reads TARGET, or SECONDS
    elapse. Returns the last value seen, so a failing check reports what the
@@ -3351,6 +3950,7 @@
   (test-fetch-ok-eof-walks-the-bytes)
   (test-harness-fetch-on-body-eof-together-e2e)
   (test-harness-fetch-on-body-truncated-chunked-e2e)
+  (test-harness-fetch-on-body-stop-parked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
   (test-harness-fetch-into-refusals)
@@ -3361,5 +3961,11 @@
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
+  (test-fetch-stop-is-sticky-across-a-pass)
+  (test-fetch-stop-does-not-tear-down-mid-walk)
+  (test-fetch-stop-ignores-the-failure-disposition)
+  (test-fetch-failure-disposition-both-directions)
+  (test-fetch-failure-disposition-crosses-the-seam)
+  (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

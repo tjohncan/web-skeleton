@@ -233,6 +233,19 @@
   ;; stream is finished". Cleared before the callback runs, so a chained
   ;; FETCH-INTO can set it again from inside :THEN.
   (fetch-outstanding nil :type boolean)
+  ;; What a failed detached fetch does to the *target* it was fetching
+  ;; into: :CLOSE, the framework's own disposition and the default, or
+  ;; :KEEP, which suppresses it for a :WEBSOCKET target whose application
+  ;; has its own failure path. Refused on :STREAMING at FETCH-INTO, where
+  ;; the disposition is a framing obligation rather than a policy.
+  ;;
+  ;; Here rather than on the outbound because DELIVER-DETACHED is handed a
+  ;; target fd and no outbound at all — and by the time it runs
+  ;; CLOSE-OUTBOUND already has, which is the same reason SINK, OUT-FD and
+  ;; INBOUND-FD are captured before it. Written on every FETCH-INTO, so a
+  ;; connection starting a second fetch cannot inherit the first one's
+  ;; choice.
+  (fetch-failure-disposition :close :type keyword)
   ;; Streaming response — set while STATE is :streaming
   (stream-framing   nil :type (or null keyword))  ; :chunked or :close
   ;; (CONN REASON) called exactly once when the stream ends, however it
