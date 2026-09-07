@@ -2366,11 +2366,34 @@
                (progn
                  (log-warn "detached fetch failed for ws fd ~d — closing 1011"
                            target-fd)
-                 (when (connection-append-write target (build-ws-close 1011))
-                   (setf (connection-state target) :closing)
-                   (ignore-errors
-                    (epoll-modify epoll-fd (connection-fd target)
-                                  (logior +epollout+ +epollet+))))))))))))
+                 ;; The append is refusable, and the state it is refused in
+                 ;; is not an exotic one here: a target already at
+                 ;; *MAX-WRITE-BACKLOG* is a plausible reason the relay
+                 ;; failed in the first place, and it is the one condition
+                 ;; under which this arm runs and its own guard is false.
+                 ;; Hanging the entire teardown on the frame being accepted
+                 ;; left that connection :WEBSOCKET with a full queue, no
+                 ;; close frame, and nothing marking it for teardown — to be
+                 ;; collected a *WRITE-STALL-TIMEOUT* later by the stall
+                 ;; sweep, which is a timeout standing in for a decision
+                 ;; this arm had already reached.
+                 ;;
+                 ;; So the frame is a courtesy and the close is not.
+                 ;; STREAM-CLOSE decides it the same way when there is no
+                 ;; room for the terminator, and the :STREAMING arm above
+                 ;; closes on :ABORTED without attempting to say anything at
+                 ;; all.
+                 (if (connection-append-write target (build-ws-close 1011))
+                     (progn
+                       (setf (connection-state target) :closing)
+                       (ignore-errors
+                        (epoll-modify epoll-fd (connection-fd target)
+                                      (logior +epollout+ +epollet+))))
+                     (progn
+                       (log-warn "detached fetch: no room for a close frame ~
+                                  on ws fd ~d — closing without one"
+                                 target-fd)
+                       (close-connection target epoll-fd :upstream-failed)))))))))))
 
 (defun complete-fetch (out-conn epoll-fd &key framing-complete)
   "Parse the outbound response and deliver it to the parked inbound connection.
