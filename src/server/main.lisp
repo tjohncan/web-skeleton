@@ -834,7 +834,7 @@
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
       (connection-close conn)
-      (log-debug "closed fd ~d" fd))))
+      (log-debug "closed fd ~d (~a)" fd reason))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Graceful drain — flush in-progress writes, close cleanly
