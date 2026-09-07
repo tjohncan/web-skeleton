@@ -3657,6 +3657,92 @@
     (check "disposition :keep: nothing was written to it" queued nil)
     (check "disposition :keep: the callback still fired once" fires 1)))
 
+(defun %ws-refused-close-pass ()
+  "Run DELIVER-DETACHED's aborted :WEBSOCKET arm against a target already at
+   *MAX-WRITE-BACKLOG*, and report what became of it.
+
+   Returns (values REGISTERED FD PENDING FIRES) — whether the target is
+   still in *CONNECTIONS*, its descriptor, the bytes still queued on it,
+   and the callback count.
+
+   A real descriptor rather than %WS-DISPOSITION-PASS's invented 4242,
+   because this is the one case whose outcome is CLOSE-CONNECTION actually
+   running, and it closes what it is handed. An epoll fd is owned and
+   closeable, which is all this one has to be; the UNWIND-PROTECT's own
+   close of it becomes a harmless EBADF afterwards.
+
+   The bound is lowered rather than two megabytes being queued against it.
+   What the arm sees either way is CONNECTION-APPEND-WRITE answering NIL,
+   and it is reached here through the real refusal — a genuine backlog
+   measured against the real bound — rather than by stubbing the one
+   function whose answer is the entire precondition.
+
+   Filled to exactly the bound, so the refusal does not quietly depend on
+   how long a 1011 frame happens to be. PENDING is returned for the same
+   reason: it is the guard separating \"the close did not happen\" from
+   \"the frame was never refused in the first place\", the second of which
+   would be a green assertion about a path this test is not about."
+  (let* ((fires 0)
+         (epfd (web-skeleton::epoll-create))
+         (targetfd (web-skeleton::epoll-create))
+         (web-skeleton::*connections* (make-hash-table))
+         (web-skeleton::*max-write-backlog* 8))
+    (unwind-protect
+         (let ((target (web-skeleton::make-connection
+                        :fd targetfd
+                        :state :websocket
+                        :fetch-outstanding t
+                        :fetch-failure-disposition :close
+                        :last-active (get-universal-time))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::connection-append-write
+            target (make-array 8 :element-type '(unsigned-byte 8)
+                                 :initial-element 0))
+           (web-skeleton::deliver-detached
+            targetfd epfd
+            (lambda (s h b) (declare (ignore s h b)) (incf fires) nil)
+            :aborted)
+           (values (and (web-skeleton::lookup-connection targetfd) t)
+                   (web-skeleton::connection-fd target)
+                   (web-skeleton::connection-write-pending target)
+                   fires))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-fetch-aborted-ws-at-the-backlog-bound ()
+  "A failed detached fetch tears its WebSocket target down even when there
+   is no room left to say why.
+
+   The aborted :WEBSOCKET arm queues a 1011 close and then, under :CLOSE,
+   has to mark the connection for teardown. Marking it was conditional on
+   the frame being accepted, which reads as caution and is not: a target at
+   *MAX-WRITE-BACKLOG* is the one that most needs ending, and it is also a
+   plausible reason the relay feeding it failed at all. Refused, the
+   connection stayed :WEBSOCKET with a full queue and nothing marking it,
+   and the stall sweep collected it a *WRITE-STALL-TIMEOUT* later — a
+   timeout doing the work of a decision this arm had already reached.
+
+   The descriptor is the assertion and the state is not. CONNECTION-CLOSE
+   sets :CLOSING on its way out and so does the accepted-frame branch, so
+   state alone cannot tell a connection that was torn down from one merely
+   marked. An fd of -1 and an empty *CONNECTIONS* can.
+
+   The callback count is here for the reason it is in
+   %WS-DISPOSITION-PASS: what becomes of the socket must not change what
+   the fetch contract already promised, and a teardown that swallowed the
+   delivery would be a worse bug than the one being fixed."
+  (format t "~%Fetch: an aborted ws target at its backlog bound~%")
+  (multiple-value-bind (registered fd pending fires) (%ws-refused-close-pass)
+    ;; First that the fixture reached the condition at all. Eight bytes
+    ;; against a bound of eight leaves room for nothing, so the close frame
+    ;; was refused whole, and what follows is this arm's guard being false
+    ;; rather than some unrelated path being green.
+    (check "backlog bound: the close frame was refused, not queued"
+           pending 8)
+    (check "backlog bound: the target was unregistered" registered nil)
+    (check "backlog bound: its descriptor was closed" fd -1)
+    (check "backlog bound: the callback still fired once" fires 1)))
+
 (defun test-fetch-stop-ignores-the-failure-disposition ()
   "A stopped fetch's target survives under :CLOSE as well as :KEEP.
 
@@ -3965,6 +4051,7 @@
   (test-fetch-stop-does-not-tear-down-mid-walk)
   (test-fetch-stop-ignores-the-failure-disposition)
   (test-fetch-failure-disposition-both-directions)
+  (test-fetch-aborted-ws-at-the-backlog-bound)
   (test-fetch-failure-disposition-crosses-the-seam)
   (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
