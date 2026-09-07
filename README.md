@@ -419,10 +419,11 @@ read about here.
   restarts by itself when the connection being relayed into empties its
   queue. That is the backpressure case the mechanism exists for, and it
   needs the target to have *actually backed up*: `stream-send` and
-  `ws-send` flush inline, never reaching the event loop's write path, so
-  a pause taken while the target's queue was empty has no drain coming
-  and needs an explicit `fetch-resume`. An app that pauses with neither
-  condition arranged strands that fetch until `*fetch-timeout*`.
+  `ws-send` flush inline, and a flush that completes never reaches the
+  event loop's write path, so a pause taken while the target's queue was
+  empty has no drain coming and needs an explicit `fetch-resume`. An app
+  that pauses with neither condition arranged strands that fetch until
+  `*fetch-timeout*`.
 - **A failed detached fetch takes a `:streaming` target with it, and on
   that path there is no opt-out.** The connection closes without its
   chunked terminator, so the peer sees truncation rather than a failed

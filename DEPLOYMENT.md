@@ -853,9 +853,9 @@ it on every pass rather than tracking state is not punished for it.
 sounds.** Reading resumes when the connection being relayed into drains
 its write backlog — the event the pause was waiting for. That needs the
 target to have *actually backed up*. `stream-send` and `ws-send` flush
-inline and never reach the event loop's write path, so a pause taken
-while the target's queue was empty has no drain coming, and only an
-explicit `fetch-resume` restarts it.
+inline, and a flush that completes never reaches the event loop's write
+path, so a pause taken while the target's queue was empty has no drain
+coming, and only an explicit `fetch-resume` restarts it.
 
 The deadline runs on unpaused time: `fetch-resume` pushes it out by the
 interval spent paused, so a relay is not killed for applying the
@@ -1110,6 +1110,12 @@ loop finishes the remainder.
 Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
+
+It is also callable from a fetch callback on a `:websocket` target, which
+is what a relay does. That runs on the *outbound* connection's read path
+rather than the target's, so nothing downstream is going to arm the
+target's write interest afterwards — `ws-send` arms it itself, and only
+when a flush leaves a remainder behind.
 
 ```lisp
 (defun handle-ws-message (conn frame)
