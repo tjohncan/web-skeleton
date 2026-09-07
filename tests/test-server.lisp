@@ -7624,6 +7624,98 @@
           (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
           (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
 
+;;; ---------------------------------------------------------------------------
+;;; The remainder a fetch callback leaves behind
+;;;
+;;; WS-SEND's second caller is a fetch callback on a :WEBSOCKET target, and
+;;; it runs on the outbound connection's read path. HANDLE-CLIENT-READ —
+;;; the site that did all of a WebSocket's arming — does not run for the
+;;; target there at all, so a remainder was left with nothing subscribed to
+;;; writability, waiting for an event no longer coming.
+;;;
+;;; Driven at the seam: DELIVER-DETACHED with a callback that sends, which
+;;; is what FETCH-INTO's :THEN reduces to. End to end it would reach the
+;;; same two lines through an upgrade handshake and a real upstream
+;;; response, either of which could be what broke instead.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-send-arms-from-a-fetch-callback ()
+  "A frame sent from a fetch callback leaves its remainder armed.
+
+   The target is a real socket with a shrunk send buffer and a peer that
+   never reads — TEST-WS-HANDLER-PUSH-AND-RETURN's arrangement, and the
+   only one that produces a remainder at all. With room to spare WS-SEND
+   flushes completely and there is nothing left to arm for, so the two
+   paths are indistinguishable.
+
+   EPOLL-MODIFY is recorded rather than epoll being polled. A socket whose
+   send buffer is full is not writable, so EPOLL-WAIT reports nothing
+   whether or not EPOLLOUT was armed: the observation that looks the most
+   direct is the one that cannot tell the two cases apart.
+
+   Three checks, and the first two are the precondition. Without a
+   remainder there is no claim to make, and a frame that fits would leave
+   the third vacuous rather than failing — so the flush is asserted to have
+   been incomplete before anything is asserted about arming."
+  (format t "~%ws-send: arming from a fetch callback~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (calls nil)
+          (real (symbol-function 'web-skeleton::epoll-modify)))
+      (unwind-protect
+           (let* ((tgt-fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (target (web-skeleton::make-connection
+                           :fd tgt-fd :socket server :state :websocket
+                           :fetch-outstanding t
+                           :last-active (get-universal-time)))
+                  (frame (web-skeleton::build-ws-frame
+                          web-skeleton::+ws-op-binary+
+                          (make-array (* 512 1024)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 80)))
+                  (flushed :unset))
+             (web-skeleton::set-nonblocking tgt-fd)
+             ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+             (web-skeleton::set-socket-option-int
+              tgt-fd web-skeleton::+sol-socket+ 7 2048)
+             (web-skeleton::register-connection target)
+             (web-skeleton::epoll-add epfd tgt-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (setf (symbol-function 'web-skeleton::epoll-modify)
+                   (lambda (efd fd mask)
+                     (push (cons fd mask) calls)
+                     (funcall real efd fd mask)))
+             ;; What FETCH-INTO's :THEN reduces to, on the path where the
+             ;; outbound is what epoll woke and the target is not.
+             (web-skeleton::deliver-detached
+              tgt-fd epfd
+              (lambda (s h b)
+                (declare (ignore s h b))
+                (setf flushed (web-skeleton::ws-send target frame))
+                nil)
+              :delivered)
+             (setf (symbol-function 'web-skeleton::epoll-modify) real)
+             (check "callback ws-send: the frame did not all fit" flushed nil)
+             (check "callback ws-send: a remainder is queued"
+                    (plusp (web-skeleton::connection-write-pending target)) t)
+             (check "callback ws-send: EPOLLOUT is armed on the target"
+                    (and (find-if
+                          (lambda (c)
+                            (and (= (car c) tgt-fd)
+                                 (plusp (logand (cdr c)
+                                                web-skeleton::+epollout+))))
+                          calls)
+                         t)
+                    t))
+        (setf (symbol-function 'web-skeleton::epoll-modify) real)
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -7780,6 +7872,7 @@
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
+  (test-ws-send-arms-from-a-fetch-callback)
   (test-cpu-count-parsers)
   (report-suite "Server")
   (zerop *tests-failed*))
