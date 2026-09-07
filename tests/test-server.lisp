@@ -6910,6 +6910,68 @@
                (carried r) '(:detached t))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; A name that will not resolve, and the fetch it still has to end
+;;;
+;;; DELIVER-DNS-ERROR held a copy of DELIVER-FETCH-ERROR's body that knew
+;;; only about a parked inbound. Delegating is the fix; this asserts what
+;;; the delegation buys, on the sink the copy had never heard of.
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-error-ends-a-detached-fetch ()
+  "A detached fetch to a name that will not resolve releases its target.
+
+   Three observations, and the first is a control that has to keep
+   passing. The old body called CLOSE-OUTBOUND, which fires an unclaimed
+   callback with the cleanup sentinel — so the application's callback ran
+   either way, and a detector that only counted it would have been green
+   against the defect. That is this branch's *confounded* mode: the right
+   outcome reached by a path that proves nothing.
+
+   What the old body could not do was reach the target. FETCH-OUTSTANDING
+   stayed set for the rest of that connection's life, refusing every later
+   FETCH-INTO on it, and the failure disposition the caller chose was never
+   applied. Those two are the claim.
+
+   No network and no getent: DELIVER-DNS-ERROR is called directly, which
+   is what both of its failure sites do once they have decided the lookup
+   is over."
+  (format t "~%DNS failure: a detached fetch releases its target~%")
+  (let ((fires 0)
+        (epfd (web-skeleton::epoll-create))
+        (targetfd (web-skeleton::epoll-create))
+        (dnsfd (web-skeleton::epoll-create)))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (target (web-skeleton::make-connection
+                         :fd targetfd :state :websocket
+                         :fetch-outstanding t
+                         :fetch-failure-disposition :close
+                         :last-active (get-universal-time)))
+                (dns-conn (web-skeleton::make-connection
+                           :fd dnsfd :state :out-dns
+                           :outbound-p t
+                           :fetch-sink :detached
+                           :inbound-fd targetfd
+                           :fetch-callback (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (incf fires)
+                                             nil)
+                           :last-active (get-universal-time))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::register-connection dns-conn)
+           (web-skeleton::deliver-dns-error dns-conn epfd)
+           ;; The control: unchanged, and the reason the other two are the
+           ;; assertions rather than this one.
+           (check "dns failure: the fetch callback still fired once" fires 1)
+           (check "dns failure: the target's fetch marker was cleared"
+                  (web-skeleton::connection-fetch-outstanding target) nil)
+           (check "dns failure: and the failure disposition was applied"
+                  (web-skeleton::connection-state target) :closing))
+      (ignore-errors (web-skeleton::%close dnsfd))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
 ;;; ---------------------------------------------------------------------------
 
@@ -7831,6 +7893,7 @@
   (test-fetch-address-filter)
   (test-dns-cache)
   (test-dns-lookup-sink)
+  (test-dns-error-ends-a-detached-fetch)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
