@@ -280,8 +280,10 @@
 ;;; Frame send
 ;;;
 ;;; Queues a frame and flushes what the socket will accept right now.
-;;; Intended for use inside ws-handler — the event loop is paused while
-;;; the handler runs, so there is no contention with pings or other writes.
+;;; Two callers: ws-handler, where the event loop is paused while the
+;;; handler runs and there is no contention with pings or other writes; and
+;;; a fetch callback on a :WEBSOCKET target, which runs on the outbound
+;;; connection's read path. The second one is why the arming below exists.
 ;;;
 ;;; The flush is opportunistic: one non-blocking pass, no spin and no
 ;;; deadline. A pure append would have been simpler, and wrong — the
@@ -291,11 +293,35 @@
 ;;; delivery for a peer that is keeping up, and a peer that is not gets
 ;;; its bytes queued instead of freezing the worker.
 ;;;
-;;; Arming EPOLLOUT is deliberately not done here. WS-SEND has no epoll
-;;; fd, and threading one through an exported function to arm it once per
-;;; frame would re-register the same interest repeatedly for a handler
-;;; sending in a loop. HANDLE-CLIENT-READ arms once, after the handler
-;;; returns, only if anything is still pending.
+;;; EPOLLOUT is armed here, and only when the flush did not finish. That
+;;; is STREAM-FLUSH's conditional and it is self-limiting: a peer keeping
+;;; up costs no epoll_ctl at all, so a handler sending in a loop pays
+;;; nothing, which was the whole objection to arming per frame. The fd
+;;; comes from *EPOLL-FD*, the worker's own, bound for exactly this and
+;;; NIL outside a worker — so the check is a check and not an assumption.
+;;;
+;;; Leaving it to HANDLE-CLIENT-READ was correct for one caller and wrong
+;;; for the other. That site arms after a handler returns, and WS-SEND is
+;;; also reachable from a fetch callback on a :WEBSOCKET target, which
+;;; runs on the *outbound* connection's read path — where
+;;; HANDLE-OUTBOUND-READ arms the outbound and nothing arms the target.
+;;; HANDLE-CLIENT-READ does not run for it unless its peer happens to
+;;; send something. Measured on that path: a 512 KiB frame, 444 KiB still
+;;; queued, and not one epoll_ctl against the target. The tail of the last
+;;; frame then waits for an event that is not coming, and
+;;; *WRITE-STALL-TIMEOUT* closes the connection rather than flushing it.
+;;; Every send had reported success and the peer got a truncated message,
+;;; which is the failure this codebase refuses everywhere else.
+;;;
+;;; EPOLLOUT alone, not EPOLLIN with it. That is what HANDLE-CLIENT-READ
+;;; arms for a :WEBSOCKET connection carrying a backlog, and
+;;; HANDLE-CLIENT-WRITE restores EPOLLIN once the queue drains, so this
+;;; enters a loop that already exists rather than adding a third mask
+;;; convention to one state. A peer leaving while the connection is behind
+;;; is still noticed: a closed socket reports writable, the write fails,
+;;; and the connection goes. Adding EPOLLIN here would instead let a
+;;; handler be re-entered against a full queue, which is where WS-SEND
+;;; signals.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
@@ -308,9 +334,12 @@
    slow peer looks, not an error. Failures of the flush itself do surface
    here; failures of the deferred remainder surface on the event loop.
 
-   Call it from within ws-handler. The event loop is paused while the
-   handler runs, so there is no write contention, and this is the only
-   context that owns the connection.
+   Call it from within ws-handler, or from a fetch callback on a
+   :WEBSOCKET target. Inside a handler the event loop is paused, so there
+   is no write contention; from a fetch callback the target is a
+   connection nothing else is writing to for the life of the fetch. A
+   remainder is handed to the event loop the same way in both — see the
+   header comment for why it has to be handed over here.
 
    Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
    is not queued, not truncated, and the peer is far enough behind that
@@ -327,7 +356,11 @@
            (connection-fd conn)
            (connection-write-pending conn)
            (length frame-bytes)))
-  (eq (connection-on-write conn) :done))
+  (let ((done (eq (connection-on-write conn) :done)))
+    (unless (or done (null *epoll-fd*))
+      (epoll-modify *epoll-fd* (connection-fd conn)
+                    (logior +epollout+ +epollet+)))
+    done))
 
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."
