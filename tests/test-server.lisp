@@ -6801,6 +6801,115 @@
              t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The DNS phase and the sink
+;;;
+;;; INITIATE-HTTP-FETCH-TO-ADDRESS parks the target only for an :INBOUND
+;;; fetch; INITIATE-DNS-LOOKUP has to make the same decision, because a
+;;; hostname reaches the TCP phase through it and an IP literal does not.
+;;; It used to park unconditionally, so every FETCH-INTO to a name — the
+;;; shape DEPLOYMENT.md's relay example uses — moved the application's own
+;;; :STREAMING or :WEBSOCKET connection to :AWAITING and nothing ever moved
+;;; it back.
+;;;
+;;; Asserted against the real function rather than a stub, because the stub
+;;; every other detached test installs for *DNS-LOOKUP-FN* is what hid this:
+;;; they all jump straight to INITIATE-HTTP-FETCH-TO-ADDRESS, which was
+;;; already right.
+;;;
+;;; No network. The name is RFC 2606's reserved .invalid, getent is killed
+;;; by CLOSE-OUTBOUND before it can answer, and every assertion is about
+;;; state INITIATE-DNS-LOOKUP has already set by the time it returns.
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-lookup-sink ()
+  (format t "~%DNS lookup: the sink decides whether the target parks~%")
+  (flet ((lookup (sink state)
+           ;; Two epoll fds, as in TEST-AWAITING-SWEEP-504: one to register
+           ;; against, one standing in for the target's descriptor. An
+           ;; epoll fd is pollable and closeable, which is all either needs
+           ;; to be here.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (targetfd (web-skeleton::epoll-create)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections*
+                           (make-hash-table :test #'eql))
+                         (web-skeleton::*dns-cache* nil)
+                         (target (web-skeleton::make-connection
+                                  :fd targetfd :state state :last-active 0))
+                         (cont (web-skeleton::make-http-fetch-continuation
+                                :method :GET
+                                :url "http://nxdomain.invalid/"
+                                :callback (lambda (s h b)
+                                            (declare (ignore s h b))
+                                            nil)
+                                :sink sink))
+                         (dns-conn nil))
+                    (web-skeleton::register-connection target)
+                    (web-skeleton::initiate-dns-lookup
+                     target epfd cont "nxdomain.invalid" 80 "/")
+                    (maphash (lambda (fd c)
+                               (declare (ignore fd))
+                               (when (eq (web-skeleton::connection-state c)
+                                         :out-dns)
+                                 (setf dns-conn c)))
+                             web-skeleton::*connections*)
+                    (unwind-protect
+                         (list (web-skeleton::connection-state target)
+                               (>= (web-skeleton::connection-awaiting-fd
+                                    target)
+                                   0)
+                               (and dns-conn
+                                    (web-skeleton::connection-fetch-sink
+                                     dns-conn))
+                               (and dns-conn
+                                    (plusp
+                                     (web-skeleton::connection-fetch-deadline
+                                      dns-conn))))
+                      (when dns-conn
+                        (ignore-errors
+                         (web-skeleton::close-outbound dns-conn epfd)))))
+               (ignore-errors (web-skeleton::%close targetfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Asserted in halves, one lookup per case. The two claims are
+    ;; independent — parking is a decision about the caller, the sink is a
+    ;; value copied onto the dns-conn — and folded into a single compound
+    ;; check they report under one name, so the failure list this suite is
+    ;; actually read by cannot say which of them broke. Same reason
+    ;; TEST-FETCH-FAILURE-DISPOSITION-CROSSES-THE-SEAM splits its pair.
+    ;;
+    ;; ATTEMPT's error text is handed through whole rather than sliced, so
+    ;; a raise reports the condition instead of a NIL that says nothing.
+    (flet ((parked (r) (if (listp r) (subseq r 0 2) r))
+           (carried (r) (if (listp r) (subseq r 2 4) r)))
+
+      ;; Control. The parked path is unchanged: an inbound waiting on a
+      ;; fetch is exactly what :AWAITING is for, and its awaiting-fd is
+      ;; the pipe.
+      (let ((r (attempt (lookup :inbound :read-http))))
+        (check "dns lookup: an :inbound fetch parks its caller"
+               (parked r) '(:awaiting t))
+        (check "dns lookup: an :inbound lookup carries its sink"
+               (carried r) '(:inbound t)))
+
+      ;; The defect. The application is still writing to this connection,
+      ;; so its state is not the framework's to take — and nothing gives
+      ;; it back, because the :DETACHED arm of
+      ;; INITIATE-HTTP-FETCH-TO-ADDRESS correctly touches no state when
+      ;; the lookup completes.
+      (let ((r (attempt (lookup :detached :streaming))))
+        (check "dns lookup: a detached fetch leaves its target alone"
+               (parked r) '(:streaming nil))
+        ;; The other half of the same defect. Without the sink on the
+        ;; dns-conn, the detached reap, CLOSE-CONNECTION's orphan walk and
+        ;; DELIVER-FETCH-ERROR all look at a detached fetch in flight and
+        ;; see a parked one. The deadline rides along because being
+        ;; visible to a reap that cannot tell your age is not being
+        ;; visible to it.
+        (check "dns lookup: a detached lookup carries its sink and a deadline"
+               (carried r) '(:detached t))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
 ;;; ---------------------------------------------------------------------------
 
@@ -7629,6 +7738,7 @@
   (test-is-public-address)
   (test-fetch-address-filter)
   (test-dns-cache)
+  (test-dns-lookup-sink)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
