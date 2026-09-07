@@ -308,6 +308,30 @@
                     ;; creates a fresh outbound with the same
                     ;; callback attached.
                     :fetch-callback (http-fetch-continuation-callback fetch-req)
+                    ;; The sink travels with the fetch from its first
+                    ;; frame, for the reason SCHEME travels on the
+                    ;; continuation: the DNS phase is the one stretch of a
+                    ;; fetch's life that lives on a connection of its own,
+                    ;; and every path that has to find it again keys on
+                    ;; this slot — SWEEP-IDLE-CONNECTIONS' detached reap,
+                    ;; CLOSE-CONNECTION's orphan walk when the target goes
+                    ;; first, and DELIVER-FETCH-ERROR's choice of ending.
+                    ;; Left at the :INBOUND default, a detached fetch whose
+                    ;; name is still resolving is reachable by none of
+                    ;; them: the getent child and its pipe outlive the
+                    ;; connection they were opened for.
+                    :fetch-sink (http-fetch-continuation-sink fetch-req)
+                    ;; The DNS phase gets its own *FETCH-TIMEOUT*, and the
+                    ;; TCP phase gets another when INITIATE-HTTP-FETCH-TO-
+                    ;; ADDRESS starts one, so a detached fetch to a name is
+                    ;; bounded at twice the parked path's budget rather
+                    ;; than at one. Stated rather than threaded through a
+                    ;; new continuation slot: the parked path has the
+                    ;; :AWAITING sweep over the whole exchange and a
+                    ;; detached one has nothing at all, so what matters
+                    ;; here is that it is bounded.
+                    :fetch-started-at (get-universal-time)
+                    :fetch-deadline (+ (get-universal-time) *fetch-timeout*)
                     ;; Carried so HANDLE-DNS-READY can name the host when
                     ;; it runs the getent output past the address filter.
                     :dns-host host
@@ -319,8 +343,28 @@
              (set-nonblocking out-fd)
              (register-connection dns-conn)
              (epoll-add epoll-fd out-fd (logior +epollin+ +epollet+))
-             (setf (connection-state conn) :awaiting
-                   (connection-awaiting-fd conn) out-fd)
+             ;; Only an :INBOUND fetch parks, exactly as in
+             ;; INITIATE-HTTP-FETCH-TO-ADDRESS — the two are the same
+             ;; decision made at two points on one path, and this one used
+             ;; to make it unconditionally.
+             ;;
+             ;; A detached fetch is dialing on behalf of a connection the
+             ;; application already owns and is still writing to. Moving
+             ;; that connection to :AWAITING takes its state away, and
+             ;; nothing hands it back: DNS resumes through
+             ;; INITIATE-HTTP-FETCH-TO-ADDRESS, whose :DETACHED arm
+             ;; correctly touches no state at all. So the connection stayed
+             ;; :AWAITING for the rest of its life — STREAM-SEND signalling
+             ;; on it, WEBSOCKET-ON-READ never running for it, and the
+             ;; :AWAITING sweep serializing a whole HTTP/1.1 504 into the
+             ;; middle of an established chunked body a *FETCH-TIMEOUT*
+             ;; later. The IP-literal fast path escaped it only because it
+             ;; skips this function.
+             (ecase (http-fetch-continuation-sink fetch-req)
+               (:inbound
+                (setf (connection-state conn) :awaiting
+                      (connection-awaiting-fd conn) out-fd))
+               (:detached nil))
              (log-debug "dns: fd ~d -> getent ahosts ~a (pipe fd ~d)"
                         (connection-fd conn) host out-fd)
              (setf success t))
@@ -343,25 +387,20 @@
 
 (defun deliver-dns-error (dns-conn epoll-fd)
   "DNS lookup failed — no usable address, getent gave up, or a parse
-   error. Reply to the parked inbound with a 502 and tear down the
-   dns-conn through CLOSE-OUTBOUND, which fires the fetch callback
-   with (NIL NIL NIL) so app-level cleanup runs."
-  (let ((inbound-fd (connection-inbound-fd dns-conn))
-        (out-fd (connection-fd dns-conn)))
-    (close-outbound dns-conn epoll-fd)
-    (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
-      (when inbound
-        (let ((err-bytes (strip-body-for-head
-                         (format-response
-                          (make-error-response 502)
-                          :connection-hint (connection-hint-for inbound))
-                         inbound)))
-          (connection-queue-write inbound err-bytes)
-          (setf (connection-state inbound) :write-response
-                (connection-awaiting-fd inbound) -1
-                (connection-last-active inbound) (get-universal-time))
-          (epoll-modify epoll-fd (connection-fd inbound)
-                        (logior +epollout+ +epollet+)))))))
+   error. Ends the fetch the way every other outbound failure ends: the
+   parked inbound is answered 502, a detached one gets its callback's
+   abort sentinel and DELIVER-DETACHED's disposition, and CLOSE-OUTBOUND
+   reaps the getent child either way.
+
+   Delegates rather than restating. The two were the same six lines, and
+   the copy here had drifted: it knew only about a parked inbound, so a
+   FETCH-INTO to a name that would not resolve left the target's
+   FETCH-OUTSTANDING set for the rest of that connection's life — refusing
+   every later fetch on it — and never applied the failure disposition the
+   caller chose. A dns-conn is an outbound connection like any other; what
+   is particular about its failure is only where in the lookup it
+   happened, and all three of its callers already log that."
+  (deliver-fetch-error dns-conn epoll-fd "DNS lookup failed"))
 
 (defun handle-dns-ready (dns-conn epoll-fd)
   "Called from HANDLE-OUTBOUND-EVENT when epoll reports readability
