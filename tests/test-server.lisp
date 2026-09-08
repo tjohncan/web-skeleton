@@ -7729,8 +7729,14 @@
   "Close a stream and report the flush state, the interest armed, and where
    the connection was left.
 
-   Returns (values PENDING MASKS STATE) — bytes still queued afterwards,
-   every mask armed while STREAM-CLOSE ran, in order, and the state it left.
+   Returns (values PENDING MASKS CLOSED-STATE POST-STATE) — bytes still
+   queued afterwards, every mask armed while STREAM-CLOSE ran in order, the
+   state it left, and the state after one turn of the event loop.
+
+   That last turn is driven through epoll rather than by calling
+   HANDLE-CLIENT-WRITE, which is the difference between asserting the
+   consequence and assuming it: the direct call runs whether or not
+   anything armed the fd.
 
    BACK-UP shrinks SO_SNDBUF and pre-queues more than the socket will take,
    which is the branch STREAM-FLUSH used to be the only arming for. Without
@@ -7769,9 +7775,24 @@
                      (funcall real efd f mask)))
              (web-skeleton:stream-close conn)
              (setf (symbol-function 'web-skeleton::epoll-modify) real)
-             (values (web-skeleton::connection-write-pending conn)
-                     (reverse masks)
-                     (web-skeleton::connection-state conn)))
+             (let ((pending (web-skeleton::connection-write-pending conn))
+                   (closed-state (web-skeleton::connection-state conn))
+                   (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                      :element-type '(unsigned-byte 8))))
+               ;; One turn of the event loop, driven the way the loop drives
+               ;; it: ask epoll what is ready, and dispatch only that.
+               ;; Calling HANDLE-CLIENT-WRITE directly would prove nothing —
+               ;; it would run whether or not anything armed it, which is
+               ;; the whole defect. Fifty milliseconds, not a deadline: a
+               ;; writable socket with an armed interest is reported on the
+               ;; first call, and an unarmed one is never reported at all,
+               ;; so neither answer is waited for.
+               (when (plusp (web-skeleton::epoll-wait epfd evbuf 4 50))
+                 (web-skeleton::handle-client-write conn epfd))
+               (values pending
+                       (reverse masks)
+                       closed-state
+                       (web-skeleton::connection-state conn))))
         (setf (symbol-function 'web-skeleton::epoll-modify) real)
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
@@ -7796,6 +7817,20 @@
    STREAM-CLOSE now — so it passes on both sides. Only the case where the
    flush succeeded moves.
 
+   The defect case also asserts what the arming buys: one turn of the loop
+   and the connection is back at :READ-HTTP, reusable. That turn is driven
+   through EPOLL-WAIT and dispatched only if the fd is reported, which is
+   the difference between asserting the consequence and assuming it —
+   calling HANDLE-CLIENT-WRITE directly would run whether or not anything
+   armed the fd. Under the defect the loop is asked, told nothing is ready,
+   and the connection stays :WRITE-RESPONSE. Fifty milliseconds bounds it
+   and neither answer waits for the bound: an armed writable socket is
+   reported on the first call, an unarmed one never.
+
+   The control does not assert that half. Its socket is full, so no
+   EPOLLOUT arrives whether or not the interest is set, and the loop turn
+   is uninformative there rather than wrong.
+
    The first case asserts the whole mask list rather than membership,
    which pins three things at once: that arming happened, that it happened
    exactly once, and that it is EPOLLOUT alone. The last is the decision
@@ -7804,15 +7839,17 @@
    this connection is no longer a stream. The control asserts membership
    only, because its mask is the thing that changed."
   (format t "~%Stream close: the write path gets an event to run on~%")
-  (multiple-value-bind (pending masks state) (%stream-close-pass nil)
+  (multiple-value-bind (pending masks state post) (%stream-close-pass nil)
     (check "stream close: the terminator flushed completely" pending 0)
     (check "stream close: the ordinary write path is in charge"
            state :write-response)
     (check "stream close: EPOLLOUT was armed even so"
            masks
-           (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+))))
-  (multiple-value-bind (pending masks state) (%stream-close-pass t)
-    (declare (ignore state))
+           (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+)))
+    (check "stream close: and one turn of the loop reuses the connection"
+           post :read-http))
+  (multiple-value-bind (pending masks state post) (%stream-close-pass t)
+    (declare (ignore state post))
     (check "stream close: the backed-up control did not flush"
            (plusp pending) t)
     (check "stream close: and the control is armed on both sides"
