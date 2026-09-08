@@ -2996,7 +2996,7 @@
    run that did not execute this says so."
   (format t "~%Harness: the listener binds IPv6~%")
   (if (not (%ipv6-loopback-available-p))
-      (format t "  SKIP  ::1 cannot be bound on this machine~%")
+      (skip "ipv6 listener: ::1 cannot be bound on this machine")
       (with-test-server (:host +v6-loopback+
                          :handler (lambda (req)
                                     (declare (ignore req))

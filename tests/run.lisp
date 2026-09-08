@@ -162,6 +162,27 @@
              name)))
 
 (defvar *tests-passed* 0)
+
+(defvar *tests-skipped* 0
+  "Assertions a run declined to make, across every suite.
+
+   Global rather than per-suite, and reset once by TEST rather than by each
+   suite's entry defun: what it answers is a question about the whole run.
+
+   It exists because a skip is a silent loss of coverage and this tree has
+   already paid for one. TEST-PROPERTIES records the case in its own words —
+   a FIND-SYMBOL miss turned five assertions into SKIPs and the suite stayed
+   green while losing them. A totals line that says `0 skipped` cannot do
+   that; one that omits the number leaves every reader to assume it.")
+
+(defun skip (reason)
+  "Decline an assertion, visibly and countably.
+
+   Prints in CHECK's register so a skip reads like the assertion it replaces
+   rather than like a comment, and counts, so the totals line carries it."
+  (format t "  SKIP  ~a~%" reason)
+  (incf *tests-skipped*))
+
 (defvar *tests-failed* 0)
 (defvar *failed-names* nil
   "Names of failing tests in the currently-running suite.
@@ -243,7 +264,8 @@
   (let ((all-passed t)
         (total-passed 0)
         (total-failed 0))
-    (setf *all-failed-names* nil)
+    (setf *all-failed-names* nil
+          *tests-skipped* 0)
     (dolist (suite '(test-algorithms test-json test-server test-store test-properties
                      test-harness test-tls))
       (unless (funcall suite)
@@ -269,8 +291,8 @@
       (dolist (entry *all-failed-names*)
         (format t "  [~a] ~a~%" (car entry) (cdr entry)))
       (format t "~%"))
-    (format t "~d passed, ~d failed across all suites~%"
-            total-passed total-failed)
+    (format t "~d passed, ~d failed, ~d skipped across all suites~%"
+            total-passed total-failed *tests-skipped*)
     (if all-passed
         (format t "=== ALL TESTS PASSED ===~%~%")
         (format t "=== SOME TESTS FAILED ===~%~%"))
