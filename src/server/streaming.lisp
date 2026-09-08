@@ -469,25 +469,20 @@
         (connection-state conn) :write-response)
   (notify-stream-closed conn :done)
   ;; Flush and arm, rather than STREAM-FLUSH's flush-and-maybe-arm.
-  ;;
-  ;; :WRITE-RESPONSE is transitioned out of by HANDLE-CLIENT-WRITE and by
-  ;; nothing else — it is where a keep-alive connection resets to
-  ;; :READ-HTTP and where a close-delimited one actually closes. So the
-  ;; event has to be armed whether or not the flush completed, and
-  ;; STREAM-FLUSH arms only when it did not. The ordinary case — a
-  ;; five-byte terminator onto a socket with room — therefore left the
-  ;; connection parked in :WRITE-RESPONSE with an empty queue and nothing
-  ;; coming to run the transition. The idle sweep bounds it, so this is
-  ;; liveness rather than a leak: a response complete on the wire whose
-  ;; FIN waits *IDLE-TIMEOUT*, and a keep-alive socket that never reads
-  ;; again because a pipelined follow-up meets HANDLE-CLIENT-READ's
-  ;; permissive arm and is ignored.
+  ;; :WRITE-RESPONSE is left by HANDLE-CLIENT-WRITE and by nothing else —
+  ;; it is where a keep-alive connection resets to :READ-HTTP and where a
+  ;; close-delimited one closes — so the event has to be armed whether or
+  ;; not the flush completed, and STREAM-FLUSH arms only when it did not.
+  ;; The ordinary close is the one that completes. Measured on the wire:
+  ;; the client receives a complete, correctly terminated response, and the
+  ;; connection is then unusable — its next request met by
+  ;; HANDLE-CLIENT-READ's permissive arm and answered with nothing until
+  ;; the idle sweep.
   ;;
   ;; START-STREAM already does this for the one caller it owns: its
-  ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally and says in as
-  ;; many words that the ordinary write path takes it from here. What had
-  ;; no counterpart was every *later* caller — a fetch :THEN, a timer, a
-  ;; second event — which is the relay shape DEPLOYMENT.md documents.
+  ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally, saying the
+  ;; ordinary write path takes it from here. Every *later* caller had no
+  ;; counterpart — a fetch :THEN, a timer, a second event.
   ;;
   ;; EPOLLOUT alone, and not by calling STREAM-FLUSH, because that
   ;; function's mask is argued for a connection that is still streaming:
