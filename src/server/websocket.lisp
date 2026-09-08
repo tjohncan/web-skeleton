@@ -280,10 +280,24 @@
 ;;; Frame send
 ;;;
 ;;; Queues a frame and flushes what the socket will accept right now.
-;;; Two callers: ws-handler, where the event loop is paused while the
-;;; handler runs and there is no contention with pings or other writes; and
-;;; a fetch callback on a :WEBSOCKET target, which runs on the outbound
-;;; connection's read path. The second one is why the arming below exists.
+;;; Three callers, and only the first is served by HANDLE-CLIENT-READ's
+;;; arming:
+;;;
+;;;   1. A ws-handler sending on the connection it was handed. The event
+;;;      loop is paused while it runs, so there is no contention with pings
+;;;      or other writes, and HANDLE-CLIENT-READ arms that connection once
+;;;      the handler returns.
+;;;   2. A ws-handler sending to a *different* connection — fan-out, which
+;;;      DEPLOYMENT.md documents as the shape to prefer over your own queue.
+;;;      HANDLE-CLIENT-READ arms (CONNECTION-FD CONN), the connection it was
+;;;      woken for. Nobody arms the subscriber.
+;;;   3. A fetch callback on a :WEBSOCKET target, which runs on the
+;;;      *outbound* connection's read path. HANDLE-OUTBOUND-READ arms the
+;;;      outbound. Nobody arms the target.
+;;;
+;;; Two and three are why the arming below exists, and they are the same
+;;; defect: an arming site that names one connection, reached from a context
+;;; that wrote to another.
 ;;;
 ;;; The flush is opportunistic: one non-blocking pass, no spin and no
 ;;; deadline. A pure append would have been simpler, and wrong — the
@@ -317,11 +331,24 @@
 ;;; arms for a :WEBSOCKET connection carrying a backlog, and
 ;;; HANDLE-CLIENT-WRITE restores EPOLLIN once the queue drains, so this
 ;;; enters a loop that already exists rather than adding a third mask
-;;; convention to one state. A peer leaving while the connection is behind
-;;; is still noticed: a closed socket reports writable, the write fails,
-;;; and the connection goes. Adding EPOLLIN here would instead let a
-;;; handler be re-entered against a full queue, which is where WS-SEND
-;;; signals.
+;;; convention to one state.
+;;;
+;;; A peer that is *gone* is still noticed, and the reason is stronger than
+;;; writability: EPOLLERR and EPOLLHUP are reported whether or not they were
+;;; requested — epoll_ctl(2) says so — so a full close arrives as
+;;; OUT|ERR|HUP under this mask and the next write raises ECONNRESET.
+;;; Measured, not argued.
+;;;
+;;; A peer that *half-closes* while we are behind is not noticed: measured,
+;;; zero events, and it waits for *WRITE-STALL-TIMEOUT*. That is a real
+;;; exception and it is stated rather than rounded off — but it is not one
+;;; this widens, because HANDLE-CLIENT-READ already arms EPOLLOUT alone for
+;;; a backlogged :WEBSOCKET connection, and a WebSocket peer that half-
+;;; closes without a close frame is violating RFC 6455 5.5.1 already.
+;;;
+;;; Adding EPOLLIN would instead let a handler be re-entered against a full
+;;; queue, which is where WS-SEND signals — turning a slow peer into a dead
+;;; connection.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
