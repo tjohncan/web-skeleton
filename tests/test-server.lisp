@@ -7787,12 +7787,15 @@
                ;; writable socket with an armed interest is reported on the
                ;; first call, and an unarmed one is never reported at all,
                ;; so neither answer is waited for.
-               (when (plusp (web-skeleton::epoll-wait epfd evbuf 4 50))
-                 (web-skeleton::handle-client-write conn epfd))
-               (values pending
-                       (reverse masks)
-                       closed-state
-                       (web-skeleton::connection-state conn))))
+               (let ((answered :not-run))
+                 (when (plusp (web-skeleton::epoll-wait epfd evbuf 4 50))
+                   (setf answered
+                         (web-skeleton::handle-client-write conn epfd)))
+                 (values pending
+                         (reverse masks)
+                         closed-state
+                         (web-skeleton::connection-state conn)
+                         answered))))
         (setf (symbol-function 'web-skeleton::epoll-modify) real)
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
@@ -7839,7 +7842,8 @@
    this connection is no longer a stream. The control asserts membership
    only, because its mask is the thing that changed."
   (format t "~%Stream close: the write path gets an event to run on~%")
-  (multiple-value-bind (pending masks state post) (%stream-close-pass nil)
+  (multiple-value-bind (pending masks state post answered)
+      (%stream-close-pass nil)
     (check "stream close: the terminator flushed completely" pending 0)
     (check "stream close: the ordinary write path is in charge"
            state :write-response)
@@ -7847,9 +7851,17 @@
            masks
            (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+)))
     (check "stream close: and one turn of the loop reuses the connection"
-           post :read-http))
-  (multiple-value-bind (pending masks state post) (%stream-close-pass t)
-    (declare (ignore state post))
+           post :read-http)
+    ;; The loop is told to answer, not merely reset. HANDLE-CLIENT-WRITE's
+    ;; :KEEP-ALIVE is what sends the event loop back into the read path
+    ;; without waiting for another EPOLLIN, and it is the step between a
+    ;; connection that is reusable and a client that is actually answered.
+    ;; Discarding it left that half of the claim untested.
+    (check "stream close: and the loop is told to read the next request"
+           answered :keep-alive))
+  (multiple-value-bind (pending masks state post answered)
+      (%stream-close-pass t)
+    (declare (ignore state post answered))
     (check "stream close: the backed-up control did not flush"
            (plusp pending) t)
     (check "stream close: and the control is armed on both sides"
