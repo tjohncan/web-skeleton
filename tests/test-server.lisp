@@ -7711,6 +7711,118 @@
   (%detached-pause-pass "detached pause (ws)" :websocket))
 
 ;;; ---------------------------------------------------------------------------
+;;; The write path a closed stream is handed to, and the event that runs it
+;;;
+;;; STREAM-CLOSE moves the connection to :WRITE-RESPONSE, which
+;;; HANDLE-CLIENT-WRITE and nothing else transitions out of. It used to
+;;; hand off through STREAM-FLUSH, which arms only when the flush did not
+;;; complete — so the ordinary close, a five-byte terminator onto a socket
+;;; with room, armed nothing and left the connection parked.
+;;;
+;;; TEST-STREAM-LIFECYCLE builds this exact state and asserts both halves
+;;; of its precondition — :WRITE-RESPONSE, and nothing left queued — and
+;;; then never asks whether anything would move it. That is the shape of
+;;; the gap, and the reason it survived a green suite.
+;;; ---------------------------------------------------------------------------
+
+(defun %stream-close-pass (back-up)
+  "Close a stream and report the flush state, the interest armed, and where
+   the connection was left.
+
+   Returns (values PENDING MASKS STATE) — bytes still queued afterwards,
+   every mask armed while STREAM-CLOSE ran, in order, and the state it left.
+
+   BACK-UP shrinks SO_SNDBUF and pre-queues more than the socket will take,
+   which is the branch STREAM-FLUSH used to be the only arming for. Without
+   it the terminator goes out whole, the flush completes, and that is both
+   the ordinary case and the one that armed nothing."
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (masks nil)
+          (real (symbol-function 'web-skeleton::epoll-modify)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :streaming
+                         :stream-framing :chunked
+                         :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking fd)
+             (when back-up
+               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+               (web-skeleton::set-socket-option-int
+                fd web-skeleton::+sol-socket+ 7 2048)
+               (web-skeleton::connection-append-write
+                conn (make-array (* 512 1024)
+                                 :element-type '(unsigned-byte 8)
+                                 :initial-element 80)))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; Recording starts here, so what is counted is STREAM-CLOSE's
+             ;; own arming and not the setup's.
+             (setf (symbol-function 'web-skeleton::epoll-modify)
+                   (lambda (efd f mask)
+                     (push mask masks)
+                     (funcall real efd f mask)))
+             (web-skeleton:stream-close conn)
+             (setf (symbol-function 'web-skeleton::epoll-modify) real)
+             (values (web-skeleton::connection-write-pending conn)
+                     (reverse masks)
+                     (web-skeleton::connection-state conn)))
+        (setf (symbol-function 'web-skeleton::epoll-modify) real)
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-stream-close-arms-the-write-path ()
+  "A closed stream gets an event to finish on, whether or not it needed one
+   to flush.
+
+   The defect case is the ordinary one. With the terminator away and the
+   queue empty there is nothing left to write, which is precisely why
+   STREAM-FLUSH declined to arm — and precisely when the connection still
+   has a transition owed to it: :WRITE-RESPONSE is where a keep-alive
+   connection resets to :READ-HTTP and where a close-delimited one closes,
+   and only HANDLE-CLIENT-WRITE performs it. Bounded by the idle sweep, so
+   the symptom is liveness rather than loss: a FIN that waits
+   *IDLE-TIMEOUT*, and a keep-alive socket that never answers again.
+
+   The backed-up case is the control, and it is what makes the first
+   assertion about STREAM-CLOSE rather than about streams in general. It
+   was armed before this change and still is — by STREAM-FLUSH then, by
+   STREAM-CLOSE now — so it passes on both sides. Only the case where the
+   flush succeeded moves.
+
+   The first case asserts the whole mask list rather than membership,
+   which pins three things at once: that arming happened, that it happened
+   exactly once, and that it is EPOLLOUT alone. The last is the decision
+   worth pinning — STREAM-FLUSH's mask keeps EPOLLIN for a reason its own
+   docstring gives, that a stream has to notice its peer going away, and
+   this connection is no longer a stream. The control asserts membership
+   only, because its mask is the thing that changed."
+  (format t "~%Stream close: the write path gets an event to run on~%")
+  (multiple-value-bind (pending masks state) (%stream-close-pass nil)
+    (check "stream close: the terminator flushed completely" pending 0)
+    (check "stream close: the ordinary write path is in charge"
+           state :write-response)
+    (check "stream close: EPOLLOUT was armed even so"
+           masks
+           (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+))))
+  (multiple-value-bind (pending masks state) (%stream-close-pass t)
+    (declare (ignore state))
+    (check "stream close: the backed-up control did not flush"
+           (plusp pending) t)
+    (check "stream close: and the control is armed on both sides"
+           (and (find-if (lambda (m)
+                           (plusp (logand m web-skeleton::+epollout+)))
+                         masks)
+                t)
+           t)))
+
+;;; ---------------------------------------------------------------------------
 ;;; The remainder a fetch callback leaves behind
 ;;;
 ;;; WS-SEND's second caller is a fetch callback on a :WEBSOCKET target, and
@@ -7960,6 +8072,7 @@
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
   (test-ws-send-arms-from-a-fetch-callback)
+  (test-stream-close-arms-the-write-path)
   (test-cpu-count-parsers)
   (report-suite "Server")
   (zerop *tests-failed*))
