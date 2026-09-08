@@ -344,7 +344,17 @@
    Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
    is not queued, not truncated, and the peer is far enough behind that
    dropping it silently would leave the app's view and the peer's view of
-   the stream permanently different."
+   the stream permanently different.
+
+   Signals also if the arming fails, and that one is not symmetric with the
+   first: the frame has been queued and flushed by then, so the raise
+   reports that the *remainder* has no event coming, not that the send did
+   not happen. On a share-nothing worker the way to provoke it is to call
+   this for a connection that is not on this thread's epoll — an app
+   reaching across workers, which was previously silent and appended to an
+   unsynchronised queue. STREAM-SEND has carried the same behaviour through
+   STREAM-FLUSH all along, so this is a new raise on this function rather
+   than a new one in the API."
   (unless (plusp *write-stall-timeout*)
     (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
             There is no unbounded setting, because it is the only ~
