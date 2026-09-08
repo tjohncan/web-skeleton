@@ -2,6 +2,11 @@
   (:use :cl :web-skeleton)
   (:export #:with-test-server
            #:*test-port*
+           ;; The bound address and a client that follows it. Exported
+           ;; together because using either without the other is the
+           ;; family mismatch they exist to prevent.
+           #:*test-host*
+           #:connect-to-test-server
            #:test-http-request
            #:make-test-request
            #:make-test-ws-frame
@@ -34,6 +39,34 @@
 
 (defvar *test-port* nil
   "Port the live test server is listening on inside WITH-TEST-SERVER.")
+
+(defvar *test-host* #(127 0 0 1)
+  "Address the live test server is bound to inside WITH-TEST-SERVER.
+
+   A 4-byte IPv4 or 16-byte IPv6 vector, the same shape START-SERVER's
+   :HOST takes. Exists so a test that needs the listener on a particular
+   family can move both ends together: MAKE-TCP-LISTENER dispatches the
+   bind on this vector's length, and CONNECT-TO-TEST-SERVER dispatches the
+   client socket on it the same way. Tests that never pass :HOST see the
+   default and can keep using a literal #(127 0 0 1).")
+
+(defun connect-to-test-server (&optional (port *test-port*))
+  "A connected socket to the live test server.
+
+   The socket family is dispatched from *TEST-HOST* exactly as
+   MAKE-TCP-LISTENER dispatches the bind, so a client cannot end up on a
+   different family from the listener it is trying to reach — which is the
+   whole failure this helper exists to make unrepresentable."
+  (let ((socket (make-instance (if (= (length *test-host*) 16)
+                                   'sb-bsd-sockets:inet6-socket
+                                   'sb-bsd-sockets:inet-socket)
+                               :type :stream :protocol :tcp)))
+    (handler-case
+        (progn (sb-bsd-sockets:socket-connect socket *test-host* port)
+               socket)
+      (error (e)
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        (error e)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Readiness and ownership
@@ -103,24 +136,18 @@
                      (* timeout internal-time-units-per-second))))
     (loop
       (when (> (get-internal-real-time) deadline)
-        (error "test server on 127.0.0.1:~d did not become ready within ~ds"
-               port timeout))
-      (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                                   :type :stream :protocol :tcp)))
-        (handler-case
-            (progn
-              (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
-              (sb-bsd-sockets:socket-close socket)
-              (return))
-          (error ()
-            (ignore-errors (sb-bsd-sockets:socket-close socket))
-            (sleep 0.05)))))))
+        (error "test server on ~a:~d did not become ready within ~ds"
+               *test-host* port timeout))
+      (handler-case
+          (progn (sb-bsd-sockets:socket-close (connect-to-test-server port))
+                 (return))
+        (error () (sleep 0.05))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Live test server
 ;;; ---------------------------------------------------------------------------
 
-(defmacro with-test-server ((&key handler ws-handler) &body body)
+(defmacro with-test-server ((&key handler ws-handler host) &body body)
   "Spin a single-worker server on an ephemeral port, bind *TEST-PORT* for
    BODY, tear down on scope exit (signal + bounded join + fallback
    terminate).
@@ -128,12 +155,18 @@
    BODY (directly or via a handler) fire during this server's teardown
    and do not leak into the caller's framework state. The outer
    *SHUTDOWN-HOOKS* list is saved on entry and restored on exit."
-  `(call-with-test-server ,handler ,ws-handler (lambda () ,@body)))
+  `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host))
 
-(defun call-with-test-server (handler ws-handler thunk)
+(defun call-with-test-server (handler ws-handler thunk &optional host)
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
-        (saved-poll  web-skeleton:*shutdown-poll-interval*))
+        (saved-poll  web-skeleton:*shutdown-poll-interval*)
+        ;; Lexical, not the special: START-SERVER spawns workers into
+        ;; threads that inherit nothing from this dynamic environment, so
+        ;; the bind address has to reach the thread closure by capture.
+        ;; *TEST-HOST* is bound below for this thread, where the client
+        ;; helpers read it.
+        (bind-host (or host #(127 0 0 1))))
     ;; Global SETF (not a LET binding) for the shutdown-related specials:
     ;; the workers that read them are spawned by START-SERVER into fresh
     ;; threads that inherit nothing from our dynamic environment, and
@@ -146,7 +179,8 @@
           web-skeleton:*drain-timeout* 1
           web-skeleton:*shutdown-poll-interval* 0.05)
     (unwind-protect
-         (let* ((nonce (format nil "~36r~36r" (random (expt 36 8))
+         (let* ((*test-host* bind-host)
+                (nonce (format nil "~36r~36r" (random (expt 36 8))
                                (get-internal-real-time)))
                 ;; Written by the server thread, read by this one. The
                 ;; semaphore is the happens-before edge, so no lock and no
@@ -158,7 +192,7 @@
                 (server-thread
                   (sb-thread:make-thread
                    (lambda ()
-                     (start-server :host #(127 0 0 1)
+                     (start-server :host bind-host
                                    ;; 0, not a pre-picked number: the port
                                    ;; must not exist as a value anywhere
                                    ;; before a listener is holding it.
@@ -315,11 +349,9 @@
    Content-Length header is appended when BODY is non-nil."
   (unless *test-port*
     (error "test-http-request: must be called inside WITH-TEST-SERVER"))
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream :protocol :tcp)))
+  (let ((socket (connect-to-test-server)))
     (unwind-protect
          (progn
-           (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
            (let* ((stream (sb-bsd-sockets:socket-make-stream
                            socket :input t :output t
                            :element-type '(unsigned-byte 8)))
