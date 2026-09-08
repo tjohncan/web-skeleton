@@ -7586,6 +7586,76 @@
 ;;; working.
 ;;; ---------------------------------------------------------------------------
 
+(defun %detached-pause-pass (label target-state)
+  "Drive RESUME-PAUSED-OUTBOUND's edge against a target in TARGET-STATE.
+
+   LABEL prefixes every assertion, so a failure names which target state
+   broke rather than only that one did."
+  (multiple-value-bind (out-server out-client) (%loopback-pair)
+    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((out-fd (web-skeleton::socket-fd out-server))
+                    (tgt-fd (web-skeleton::socket-fd tgt-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
+                    ;; leaves one: subscribed to no events at all, so
+                    ;; nothing but a resume can ever wake it.
+                    (out (web-skeleton::make-connection
+                          :fd out-fd :socket out-server :state :out-read
+                          :outbound-p t
+                          :fetch-sink :detached
+                          :fetch-paused t
+                          :fetch-paused-at (get-universal-time)
+                          :fetch-deadline (+ (get-universal-time) 30)
+                          :inbound-fd tgt-fd
+                          :last-active (get-universal-time)))
+                    ;; The target: a streaming connection with the
+                    ;; back-link the pause left on it.
+                    (tgt (web-skeleton::make-connection
+                          :fd tgt-fd :socket tgt-server :state target-state
+                          :stream-framing (when (eq target-state :streaming)
+                                            :chunked)
+                          :paused-outbound-fd out-fd
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking out-fd)
+               (web-skeleton::set-nonblocking tgt-fd)
+               (web-skeleton::register-connection out)
+               (web-skeleton::register-connection tgt)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (web-skeleton::epoll-add epfd tgt-fd
+                                        (logior web-skeleton::+epollout+
+                                                web-skeleton::+epollet+))
+               (check (format nil "~a: the outbound starts paused" label)
+                      (web-skeleton::connection-fetch-paused out) t)
+               ;; A backlog on the target, and then the drain that ends it.
+               (web-skeleton::connection-append-write
+                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
+               (check (format nil "~a: the target has a backlog to drain" label)
+                      (plusp (web-skeleton::connection-write-pending tgt)) t)
+               (web-skeleton::handle-client-write tgt epfd)
+               (check (format nil "~a: the target drained" label)
+                      (web-skeleton::connection-write-pending tgt) 0)
+               ;; The property.
+               (check (format nil "~a: draining the target resumed the fetch" label)
+                      (web-skeleton::connection-fetch-paused out) nil)
+               (check (format nil "~a: and the back-link was cleared with it" label)
+                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
+               ;; The deadline moved by the time spent paused, so a relay
+               ;; is not killed for applying the backpressure it was told
+               ;; to apply.
+               (check (format nil "~a: the deadline is not still the original" label)
+                      (>= (web-skeleton::connection-fetch-deadline out)
+                          (+ (web-skeleton::connection-fetch-started-at out)
+                             30))
+                      t))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close out-server))
+          (ignore-errors (sb-bsd-sockets:socket-close out-client))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+
 (defun test-detached-pause-auto-resumes ()
   "A paused detached fetch is resumed by its target's backlog draining.
 
@@ -7618,73 +7688,27 @@
 
    The precondition this pins down, which no document has ever carried:
    auto-resume needs the target to have *actually backed up*. STREAM-SEND
-   flushes inline through STREAM-FLUSH, which never reaches
-   HANDLE-CLIENT-WRITE, so a pause taken while the target's queue was empty
-   has no wake-up coming and still needs an explicit FETCH-RESUME."
+   flushes inline, and a flush that completes arms nothing and so never
+   reaches HANDLE-CLIENT-WRITE — so a pause taken while the target's queue
+   was empty has no wake-up coming and still needs an explicit
+   FETCH-RESUME.
+
+   Run against both target states. RESUME-PAUSED-OUTBOUND sits in
+   HANDLE-CLIENT-WRITE's :DONE arm ahead of the state dispatch, and its own
+   comment says why: every state that can be relayed into reaches that
+   point, and a resume working for only one of them would be the kind of
+   gap nobody finds until a different response shape turns up. Only
+   :STREAMING was ever asserted against it.
+
+   The :WEBSOCKET pass is a regression guard and not a detector for this
+   branch — it passes on both sides, because the edge itself was always
+   state-agnostic. What the branch changes is whether it is reachable:
+   arming the remainder WS-SEND leaves behind is what lets
+   HANDLE-CLIENT-WRITE run for a websocket target at all. This asserts the
+   half of that chain the arming detector cannot see."
   (format t "~%Detached fetch: pause resumes when the target drains~%")
-  (multiple-value-bind (out-server out-client) (%loopback-pair)
-    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
-      (let ((epfd (web-skeleton::epoll-create)))
-        (unwind-protect
-             (let* ((out-fd (web-skeleton::socket-fd out-server))
-                    (tgt-fd (web-skeleton::socket-fd tgt-server))
-                    (web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (web-skeleton::*epoll-fd* epfd)
-                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
-                    ;; leaves one: subscribed to no events at all, so
-                    ;; nothing but a resume can ever wake it.
-                    (out (web-skeleton::make-connection
-                          :fd out-fd :socket out-server :state :out-read
-                          :outbound-p t
-                          :fetch-sink :detached
-                          :fetch-paused t
-                          :fetch-paused-at (get-universal-time)
-                          :fetch-deadline (+ (get-universal-time) 30)
-                          :inbound-fd tgt-fd
-                          :last-active (get-universal-time)))
-                    ;; The target: a streaming connection with the
-                    ;; back-link the pause left on it.
-                    (tgt (web-skeleton::make-connection
-                          :fd tgt-fd :socket tgt-server :state :streaming
-                          :stream-framing :chunked
-                          :paused-outbound-fd out-fd
-                          :last-active (get-universal-time))))
-               (web-skeleton::set-nonblocking out-fd)
-               (web-skeleton::set-nonblocking tgt-fd)
-               (web-skeleton::register-connection out)
-               (web-skeleton::register-connection tgt)
-               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
-               (web-skeleton::epoll-add epfd tgt-fd
-                                        (logior web-skeleton::+epollout+
-                                                web-skeleton::+epollet+))
-               (check "detached pause: the outbound starts paused"
-                      (web-skeleton::connection-fetch-paused out) t)
-               ;; A backlog on the target, and then the drain that ends it.
-               (web-skeleton::connection-append-write
-                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
-               (check "detached pause: the target has a backlog to drain"
-                      (plusp (web-skeleton::connection-write-pending tgt)) t)
-               (web-skeleton::handle-client-write tgt epfd)
-               (check "detached pause: the target drained"
-                      (web-skeleton::connection-write-pending tgt) 0)
-               ;; The property.
-               (check "detached pause: draining the target resumed the fetch"
-                      (web-skeleton::connection-fetch-paused out) nil)
-               (check "detached pause: and the back-link was cleared with it"
-                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
-               ;; The deadline moved by the time spent paused, so a relay
-               ;; is not killed for applying the backpressure it was told
-               ;; to apply.
-               (check "detached pause: the deadline is not still the original"
-                      (>= (web-skeleton::connection-fetch-deadline out)
-                          (+ (web-skeleton::connection-fetch-started-at out)
-                             30))
-                      t))
-          (ignore-errors (web-skeleton::%close epfd))
-          (ignore-errors (sb-bsd-sockets:socket-close out-server))
-          (ignore-errors (sb-bsd-sockets:socket-close out-client))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+  (%detached-pause-pass "detached pause" :streaming)
+  (%detached-pause-pass "detached pause (ws)" :websocket))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The remainder a fetch callback leaves behind
