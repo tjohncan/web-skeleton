@@ -1812,8 +1812,13 @@
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler on-listen)
   "Start the server with WORKERS event loops on HOST:PORT.
-   HOST is a 4-byte vector (default #(127 0 0 1) = localhost only;
-   use #(0 0 0 0) to listen on all interfaces).
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
+   MAKE-TCP-LISTENER dispatches the socket family on its length. Default
+   #(127 0 0 1) is IPv4 loopback only; #(0 0 0 0) is all IPv4 interfaces,
+   and the sixteen-byte forms are the v6 counterparts — README's
+   Configuration section spells all four out. Said here because a reader
+   who stops at this docstring would conclude the framework is IPv4-only,
+   which it is not, and one already did.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
