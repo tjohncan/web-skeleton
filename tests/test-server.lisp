@@ -7950,6 +7950,148 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+;;; ---------------------------------------------------------------------------
+;;; The third caller: a handler that sends to somebody else
+;;;
+;;; HANDLE-CLIENT-READ arms (CONNECTION-FD CONN) — the connection it was
+;;; woken for. A ws-handler that sends to any *other* connection is
+;;; therefore in exactly the position the fetch callback was in, and that
+;;; is not a hypothetical shape: it is the one DEPLOYMENT.md documents
+;;; under fan-out, "calling ws-send in a loop" over a subscriber list.
+;;;
+;;; The fix covers it by construction and the branch said nothing about it,
+;;; which by this suite's own criterion is a claim without a detector.
+;;; ---------------------------------------------------------------------------
+
+(defun %ws-fanout-pass ()
+  "Run the documented fan-out shape and report what got armed.
+
+   A real masked frame arrives on A; A's handler sends a 512 KiB frame to
+   B, whose send buffer is shrunk so a remainder is guaranteed. Returns
+   (values SENT PENDING-B TOUCHED-A ARMED-B) — WS-SEND's answer, the bytes
+   left on B, whether epoll was touched for A at all, and whether EPOLLOUT
+   was armed for B.
+
+   Asymmetric on purpose. A's handler returns NIL, so A has nothing pending
+   and HANDLE-CLIENT-READ arms it EPOLLIN — the question for A is only
+   whether the read path ran and reached its arming at all, which is what
+   separates a B that was missed from a run where nothing armed anything at
+   all.
+
+   Driven through the real HANDLE-CLIENT-READ rather than by calling the
+   handler, because the arming under test is the one HANDLE-CLIENT-READ
+   performs after a handler returns. Calling the handler directly would
+   remove the very code whose scope is the question."
+  (multiple-value-bind (a-server a-client) (%loopback-pair)
+    (multiple-value-bind (b-server b-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create))
+            (calls nil)
+            (real (symbol-function 'web-skeleton::epoll-modify)))
+        (unwind-protect
+             (let* ((a-fd (web-skeleton::socket-fd a-server))
+                    (b-fd (web-skeleton::socket-fd b-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    (conn-a (web-skeleton::make-connection
+                             :fd a-fd :socket a-server :state :websocket
+                             :last-active (get-universal-time)))
+                    (conn-b (web-skeleton::make-connection
+                             :fd b-fd :socket b-server :state :websocket
+                             :last-active (get-universal-time)))
+                    (big (web-skeleton::build-ws-frame
+                          web-skeleton::+ws-op-binary+
+                          (make-array (* 512 1024)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 80)))
+                    (sent :unset))
+               (web-skeleton::set-nonblocking a-fd)
+               (web-skeleton::set-nonblocking b-fd)
+               ;; Only B is shrunk. A has to stay able to take its own
+               ;; handler's return value, or the two fds would both hold
+               ;; remainders and the assertion could not tell them apart.
+               (web-skeleton::set-socket-option-int
+                b-fd web-skeleton::+sol-socket+ 7 2048)
+               (web-skeleton::register-connection conn-a)
+               (web-skeleton::register-connection conn-b)
+               (web-skeleton::epoll-add epfd a-fd
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (web-skeleton::epoll-add epfd b-fd
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (let ((stream (sb-bsd-sockets:socket-make-stream
+                              a-client :input t :output t
+                              :element-type '(unsigned-byte 8))))
+                 (write-sequence (make-test-ws-frame "ping-a") stream)
+                 (force-output stream))
+               (sleep 0.1)
+               ;; Recording starts after the setup so what is counted is the
+               ;; read path's own arming and not EPOLL-ADD's.
+               (setf (symbol-function 'web-skeleton::epoll-modify)
+                     (lambda (efd fd mask)
+                       (push (cons fd mask) calls)
+                       (funcall real efd fd mask)))
+               (web-skeleton::handle-client-read
+                conn-a epfd nil
+                (lambda (c f)
+                  (declare (ignore c f))
+                  (setf sent (web-skeleton:ws-send conn-b big))
+                  nil))
+               (setf (symbol-function 'web-skeleton::epoll-modify) real)
+               (values sent
+                       (web-skeleton::connection-write-pending conn-b)
+                       (and (find a-fd calls :key #'car) t)
+                       (and (find-if (lambda (c)
+                                       (and (= (car c) b-fd)
+                                            (plusp (logand
+                                                    (cdr c)
+                                                    web-skeleton::+epollout+))))
+                                     calls)
+                            t)))
+          (setf (symbol-function 'web-skeleton::epoll-modify) real)
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close a-server))
+          (ignore-errors (sb-bsd-sockets:socket-close a-client))
+          (ignore-errors (sb-bsd-sockets:socket-close b-server))
+          (ignore-errors (sb-bsd-sockets:socket-close b-client)))))))
+
+
+(defun test-ws-send-arms-a-fan-out-target ()
+  "A handler that sends to somebody else arms that somebody else.
+
+   HANDLE-CLIENT-READ arms the connection it was woken for, and only that
+   one. So a ws-handler pushing to a subscriber list is in exactly the
+   position the fetch callback was in — nothing downstream arms the target
+   — and DEPLOYMENT.md documents that shape under fan-out rather than
+   treating it as exotic. The same one-line fix covers both; only one of
+   them was claimed.
+
+   Four assertions, and the first two are the precondition. A frame that
+   fits leaves nothing to strand, so WS-SEND returning NIL and B holding a
+   backlog is what makes the fourth check about the claim rather than about
+   the fixture.
+
+   The third is the control, and it is what makes this test about *B*.
+   Under the defect A is still armed — HANDLE-CLIENT-READ names A's own fd
+   and always did — so a failure list showing A touched and B not is the
+   defect stated precisely: the read path ran, reached its arming, and
+   armed the wrong connection. Were A untouched as well, the fixture would
+   simply not have driven the path, and the fourth check would be failing
+   for a reason that has nothing to do with fan-out.
+
+   EPOLLIN is what A gets, not EPOLLOUT: its handler returned NIL, so A has
+   nothing pending. Hence the asymmetry between the third check and the
+   fourth — for A the question is whether epoll was touched at all, for B
+   it is whether the right interest was set."
+  (format t "~%ws-send: arming a fan-out target~%")
+  (multiple-value-bind (sent pending-b touched-a armed-b) (%ws-fanout-pass)
+    (check "fan-out ws-send: the frame did not all fit" sent nil)
+    (check "fan-out ws-send: a remainder is queued on the target"
+           (plusp pending-b) t)
+    (check "fan-out ws-send: the read path armed its own connection"
+           touched-a t)
+    (check "fan-out ws-send: and EPOLLOUT is armed on the fan-out target"
+           armed-b t)))
 
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
@@ -8109,6 +8251,7 @@
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
   (test-ws-send-arms-from-a-fetch-callback)
+  (test-ws-send-arms-a-fan-out-target)
   (test-stream-close-arms-the-write-path)
   (test-cpu-count-parsers)
   (report-suite "Server")
