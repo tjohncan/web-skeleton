@@ -8071,13 +8071,19 @@
    backlog is what makes the fourth check about the claim rather than about
    the fixture.
 
-   The third is the control, and it is what makes this test about *B*.
-   Under the defect A is still armed — HANDLE-CLIENT-READ names A's own fd
-   and always did — so a failure list showing A touched and B not is the
-   defect stated precisely: the read path ran, reached its arming, and
-   armed the wrong connection. Were A untouched as well, the fixture would
-   simply not have driven the path, and the fourth check would be failing
-   for a reason that has nothing to do with fan-out.
+   The third is the control, and what it guards against is the fourth going
+   vacuous later rather than anything failing now. Under the defect A is
+   still armed — HANDLE-CLIENT-READ names A's own fd and always did — so a
+   failure list reading A touched, B not states the defect precisely.
+
+   The case it really exists for is fixture drift. Simplify this test by
+   calling the handler directly instead of driving HANDLE-CLIENT-READ — the
+   obvious tidy-up, and someone will try it — and the fourth check still
+   passes, because WS-SEND now arms B itself. The seam stops being crossed
+   and nothing says so. That is the *pre-arranged* mode, reachable only
+   because the fix landed, and this check is the thing that catches it:
+   measured, that drift fails check three alone and leaves the other three
+   green.
 
    EPOLLIN is what A gets, not EPOLLOUT: its handler returned NIL, so A has
    nothing pending. Hence the asymmetry between the third check and the
