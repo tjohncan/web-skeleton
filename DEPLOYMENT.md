@@ -1194,6 +1194,16 @@ own connection and nothing else. `ws-send` returns NIL when it leaves a
 remainder, so a broadcast loop that wants to know which subscribers are
 falling behind can see it without tracking anything itself.
 
+That sentence was not true until recently, and the gap is worth naming
+because the shape it broke is the one this section recommends.
+`handle-client-read` arms the connection it was woken for — the one whose
+handler is running. A frame pushed to *another* connection had nothing
+downstream to arm it, so a lagging subscriber did not cost its own
+connection: it got a truncated message, with every `ws-send` reporting
+success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
+connection it wrote to whenever it leaves a remainder, which is what makes
+the paragraph above describe the code.
+
 ### Logging holds the only shared lock
 
 `log-msg` takes a single global mutex and holds it across both the
