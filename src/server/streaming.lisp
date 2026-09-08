@@ -434,7 +434,11 @@
    what enforces the rule that a chunked body cannot be reused as a
    connection without its terminator having been written. Every other
    way a stream can end goes through CLOSE-CONNECTION and takes the
-   socket with it."
+   socket with it.
+
+   Arms EPOLLOUT before returning. The write path this hands to needs an
+   event to run on, and the flush completing is exactly when nothing else
+   would have armed one — see the comment below."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
@@ -464,7 +468,39 @@
         (connection-stream-keepalive conn) nil
         (connection-state conn) :write-response)
   (notify-stream-closed conn :done)
-  (stream-flush conn)
+  ;; Flush and arm, rather than STREAM-FLUSH's flush-and-maybe-arm.
+  ;;
+  ;; :WRITE-RESPONSE is transitioned out of by HANDLE-CLIENT-WRITE and by
+  ;; nothing else — it is where a keep-alive connection resets to
+  ;; :READ-HTTP and where a close-delimited one actually closes. So the
+  ;; event has to be armed whether or not the flush completed, and
+  ;; STREAM-FLUSH arms only when it did not. The ordinary case — a
+  ;; five-byte terminator onto a socket with room — therefore left the
+  ;; connection parked in :WRITE-RESPONSE with an empty queue and nothing
+  ;; coming to run the transition. The idle sweep bounds it, so this is
+  ;; liveness rather than a leak: a response complete on the wire whose
+  ;; FIN waits *IDLE-TIMEOUT*, and a keep-alive socket that never reads
+  ;; again because a pipelined follow-up meets HANDLE-CLIENT-READ's
+  ;; permissive arm and is ignored.
+  ;;
+  ;; START-STREAM already does this for the one caller it owns: its
+  ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally and says in as
+  ;; many words that the ordinary write path takes it from here. What had
+  ;; no counterpart was every *later* caller — a fetch :THEN, a timer, a
+  ;; second event — which is the relay shape DEPLOYMENT.md documents.
+  ;;
+  ;; EPOLLOUT alone, and not by calling STREAM-FLUSH, because that
+  ;; function's mask is argued for a connection that is still streaming:
+  ;; EPOLLIN stays, its docstring says, "because a stream still has to
+  ;; notice its peer going away". This one is not a stream any more. It is
+  ;; not reading, HANDLE-CLIENT-READ ignores a stale EPOLLIN for
+  ;; :WRITE-RESPONSE, and HANDLE-CLIENT-WRITE arms EPOLLIN itself on the
+  ;; keep-alive reset. Borrowing the call would borrow a rationale that is
+  ;; false at this call site.
+  (connection-on-write conn)
+  (when *epoll-fd*
+    (epoll-modify *epoll-fd* (connection-fd conn)
+                  (logior +epollout+ +epollet+)))
   (values))
 
 ;;; ---------------------------------------------------------------------------
