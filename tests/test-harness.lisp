@@ -2950,6 +2950,65 @@
       (check "dns failure e2e: no outbound left behind"
              (census-await :outbound 0) 0))))
 
+(defparameter +v6-loopback+ #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)
+  "IPv6 loopback as START-SERVER's :HOST wants it — sixteen bytes, which is
+   what MAKE-TCP-LISTENER dispatches :INET6 on.")
+
+(defun %ipv6-loopback-available-p ()
+  "Whether ::1 can be bound here at all.
+
+   Asked by binding rather than by reading configuration: a container with
+   IPv6 disabled in the kernel, or with the loopback address absent, fails
+   at the bind and that is the only answer that matters."
+  (handler-case
+      (let ((socket (make-instance 'sb-bsd-sockets:inet6-socket
+                                   :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn (sb-bsd-sockets:socket-bind socket +v6-loopback+ 0) t)
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+    (error () nil)))
+
+(defun test-harness-ipv6-listener-e2e ()
+  "The listener binds IPv6, and the harness can reach it.
+
+   MAKE-TCP-LISTENER has dispatched the socket family on the host vector's
+   length since it was written, and README documents all four forms — and
+   nothing in this suite had ever passed it sixteen bytes. The :HOST
+   plumbing makes that reachable; this is what reaches it.
+
+   Not a detector for a defect in the framework, and it should not be read
+   as one: the v6 bind was correct before this branch and is correct after.
+   It is a detector for the *harness* code the branch added, which is new
+   and untested surface — CONNECT-TO-TEST-SERVER dispatching the client
+   family from the same vector MAKE-TCP-LISTENER dispatches the bind from.
+   Pin that branch to INET-SOCKET and this is the only test that notices.
+
+   The other e2e tests cannot reach it. Their :HOST is either the literal
+   four-byte loopback or whatever RESOLVE-HOST-BLOCKING answers for
+   `localhost`, and that is IPv4 on any machine ordering IPv4 first in
+   /etc/hosts — this one, and the GitHub ubuntu runner. Depending on the
+   resolver to hand us a v6 address is exactly the environment dependence
+   the relay test exists to avoid, so the address is named outright here.
+
+   Skipped, visibly, where ::1 cannot be bound — a kernel with IPv6 off, or
+   a container without the loopback address. Same shape as the TLS suite
+   skipping without libssl: a printed SKIP rather than a silent pass, so a
+   run that did not execute this says so."
+  (format t "~%Harness: the listener binds IPv6~%")
+  (if (not (%ipv6-loopback-available-p))
+      (format t "  SKIP  ::1 cannot be bound on this machine~%")
+      (with-test-server (:host +v6-loopback+
+                         :handler (lambda (req)
+                                    (declare (ignore req))
+                                    (make-text-response 200 "v6-ok")))
+        (multiple-value-bind (status headers body)
+            (test-http-request :get "/v6")
+          (declare (ignore headers))
+          (check "ipv6 listener: the bound address is the v6 one"
+                 (length *test-host*) 16)
+          (check "ipv6 listener: it answered over IPv6" status 200)
+          (check "ipv6 listener: and the body is ours" body "v6-ok")))))
+
 (defun test-harness-fetch-into-chained-e2e ()
   "A :THEN that starts another fetch keeps the stream open.
 
@@ -4172,6 +4231,7 @@
   (test-harness-fetch-into-relay-e2e)
   (test-harness-fetch-into-chained-e2e)
   (test-harness-fetch-into-dns-failure-e2e)
+  (test-harness-ipv6-listener-e2e)
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
