@@ -2823,6 +2823,96 @@
       (check "fetch-into relay: no outbound left behind"
              (census-await :outbound 0) 0))))
 
+(defun test-harness-fetch-into-dns-failure-e2e ()
+  "A detached fetch to a name that will not resolve, end to end, through the
+   real resolver.
+
+   The only test in the suite that reaches INITIATE-DNS-LOOKUP. Every other
+   e2e FETCH-INTO dials an IP literal, which takes INITIATE-HTTP-FETCH's
+   fast path on PARSE-IPV4-LITERAL and never enters the function — which is
+   how three defects lived there behind a green suite. Every unit detector
+   for them drives the seam; this one spawns getent.
+
+   RFC 2606 reserves .invalid, so the lookup fails on every machine and
+   reaches no network. A name that *resolves* would be the other half and is
+   deliberately not used here: the resolver returns whichever family
+   /etc/hosts orders first, PARSE-GETENT-OUTPUT takes the first accepted
+   address with no connect-time fallback, and START-SERVER binds IPv4 only —
+   so a host carrying `::1 localhost` would dial an address nothing is
+   listening on and fail for its configuration rather than for the code.
+
+   The assertion is the *second* fetch. :THEN receives the abort sentinel
+   and immediately starts another FETCH-INTO on the same connection, which
+   FETCH-INTO refuses on either of two guards if the DNS phase mishandled
+   the target: on state, if the lookup parked a :STREAMING connection into
+   :AWAITING and nothing moved it back; and on FETCH-OUTSTANDING, if the
+   failure path never released the marker. So a body arriving at all is
+   both defects not having happened — asserted by their consequence, which
+   is the thing an application would actually hit, rather than by their
+   mechanism, which the unit detectors already cover.
+
+   Chaining from an aborted :THEN is a supported shape, not a trick: the
+   new marker suppresses DELIVER-DETACHED's disposition on the way out, the
+   same interaction TEST-HARNESS-FETCH-INTO-CHAINED-E2E covers from a
+   delivered one."
+  (format t "~%Harness: fetch-into, a name that will not resolve~%")
+  (let ((port-box (list nil))
+        (abort-status :unset)
+        (then-fires 0))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (%ascii "alpha"))
+                           (stream-send c (%ascii "beta"))
+                           (stream-close c)))
+               (make-stream-response
+                :on-open
+                (lambda (client)
+                  (fetch-into
+                   client
+                   (http-fetch
+                    :get "http://nxdomain.invalid/"
+                    :then
+                    (lambda (status headers body)
+                      (declare (ignore headers body))
+                      (incf then-fires)
+                      (setf abort-status status)
+                      (fetch-into
+                       client
+                       (http-fetch
+                        :get (format nil "http://127.0.0.1:~d/up"
+                                     (first port-box))
+                        :on-body (lambda (out chunk)
+                                   (declare (ignore out))
+                                   (stream-send client chunk)
+                                   nil)
+                        :then (lambda (s h b)
+                                (declare (ignore s h b))
+                                (stream-close client)
+                                nil)))
+                      nil))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "dns failure e2e: the chained fetch's body arrived, framed"
+                        (%decode-streamed-body raw) "alphabeta")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "dns failure e2e: :then saw the abort sentinel" abort-status nil)
+      (check "dns failure e2e: :then fired once for the failed lookup"
+             then-fires 1)
+      (check "dns failure e2e: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
 (defun test-harness-fetch-into-chained-e2e ()
   "A :THEN that starts another fetch keeps the stream open.
 
@@ -4044,6 +4134,7 @@
   (test-harness-detached-deadline-sweep)
   (test-harness-fetch-into-relay-e2e)
   (test-harness-fetch-into-chained-e2e)
+  (test-harness-fetch-into-dns-failure-e2e)
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
