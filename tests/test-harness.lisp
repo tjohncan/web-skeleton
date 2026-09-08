@@ -1631,10 +1631,11 @@
                    n workers)))))))
 
 (defun %raw-connect ()
-  "A raw socket to the live test server, plus its byte stream."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream :protocol :tcp)))
-    (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+  "A raw socket to the live test server, plus its byte stream.
+
+   Through CONNECT-TO-TEST-SERVER so the client family follows whatever
+   WITH-TEST-SERVER bound, rather than assuming IPv4."
+  (let ((socket (connect-to-test-server)))
     (values socket
             (sb-bsd-sockets:socket-make-stream
              socket :input t :output t :element-type '(unsigned-byte 8)))))
@@ -2763,9 +2764,9 @@
              (web-skeleton::decode-chunked-body raw (+ hend 4) (length raw))
              :external-format :ascii)
           (error (e) (princ-to-string e))))))
-
 (defun test-harness-fetch-into-relay-e2e ()
-  "The relay DEPLOYMENT.md described, now that it dials.
+  "The relay DEPLOYMENT.md described, now that it dials — and through the
+   real resolver.
 
    A streaming response whose :ON-OPEN starts a fetch, forwards each chunk
    into its own body as the framing proves it, and closes when the upstream
@@ -2776,12 +2777,46 @@
 
    Asserted on the decoded body rather than on bytes arriving, because the
    defect's signature was a body that never terminated — a check that only
-   looked for content would have passed against it."
+   looked for content would have passed against it.
+
+   The upstream is dialled by **name**, which is what makes this the only
+   e2e in the suite to reach INITIATE-DNS-LOOKUP on its success path. Every
+   other FETCH-INTO here dials an IP literal and takes INITIATE-HTTP-FETCH's
+   PARSE-IPV4-LITERAL fast path straight past it — which is how three
+   defects lived in that function behind a green suite.
+
+   Both ends are moved together rather than one end being assumed. The
+   listener binds whatever RESOLVE-HOST-BLOCKING answers for the same name
+   the fetch will dial, and CONNECT-TO-TEST-SERVER dispatches the client
+   socket on that vector's length exactly as MAKE-TCP-LISTENER dispatches
+   the bind. So the family is whatever this machine's resolver prefers, and
+   agreement is by construction rather than by assumption: a host whose
+   /etc/hosts orders `::1 localhost` first binds and dials v6, one that
+   orders IPv4 first binds and dials v4, and neither can reach a listener
+   that is not there. Pinning either end to a literal is what would make
+   this environment-dependent.
+
+   That the name resolves at all is asserted rather than skipped on. A
+   machine without it cannot run the rest, and a test that quietly does not
+   run is worse than one that fails saying why."
   (format t "~%Harness: fetch-into, the documented relay~%")
-  (let ((port-box (list nil))
-        (then-fires 0))
+  (let* ((port-box (list nil))
+         (then-fires 0)
+         ;; The framework's own resolver, so the listener and the fetch
+         ;; cannot disagree about the family: whatever this answers is what
+         ;; INITIATE-DNS-LOOKUP will answer for the same name a moment
+         ;; later, out of the same getent.
+         (host-vec (web-skeleton::resolve-host-blocking "localhost")))
+    ;; Asserted rather than skipped on. A machine where this name does not
+    ;; resolve cannot run the rest, and a test that quietly does not run is
+    ;; the failure mode this suite spends its docstrings avoiding — so it
+    ;; fails here, by name, ahead of the assertions that would fail
+    ;; confusingly.
+    (check "fetch-into relay: the name the fetch will dial resolves"
+           (and host-vec t) t)
     (with-test-server
-        (:handler
+        (:host host-vec
+         :handler
          (lambda (req)
            (if (search "/up" (http-request-path req))
                (make-stream-response
@@ -2795,7 +2830,7 @@
                   (fetch-into
                    client
                    (http-fetch
-                    :get (format nil "http://127.0.0.1:~d/up"
+                    :get (format nil "http://localhost:~d/up"
                                  (first port-box))
                     :on-body (lambda (out chunk)
                                (declare (ignore out))
@@ -2827,19 +2862,21 @@
   "A detached fetch to a name that will not resolve, end to end, through the
    real resolver.
 
-   The only test in the suite that reaches INITIATE-DNS-LOOKUP. Every other
-   e2e FETCH-INTO dials an IP literal, which takes INITIATE-HTTP-FETCH's
-   fast path on PARSE-IPV4-LITERAL and never enters the function — which is
-   how three defects lived there behind a green suite. Every unit detector
-   for them drives the seam; this one spawns getent.
+   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all, and there
+   were none before them. Every other e2e FETCH-INTO dials an IP literal,
+   which takes INITIATE-HTTP-FETCH's fast path on PARSE-IPV4-LITERAL and
+   never enters the function — which is how three defects lived there
+   behind a green suite. Every unit detector for them drives the seam; this
+   one spawns getent.
 
    RFC 2606 reserves .invalid, so the lookup fails on every machine and
-   reaches no network. A name that *resolves* would be the other half and is
-   deliberately not used here: the resolver returns whichever family
-   /etc/hosts orders first, PARSE-GETENT-OUTPUT takes the first accepted
-   address with no connect-time fallback, and START-SERVER binds IPv4 only —
-   so a host carrying `::1 localhost` would dial an address nothing is
-   listening on and fail for its configuration rather than for the code.
+   reaches no network.
+
+   The success half is TEST-HARNESS-FETCH-INTO-RELAY-E2E, which dials a
+   resolvable name against a listener bound to whatever that same name
+   resolves to. Two tests rather than one because the halves want opposite
+   things from the resolver: this one wants a name that fails everywhere,
+   and that one wants a name that succeeds everywhere.
 
    The assertion is the *second* fetch. :THEN receives the abort sentinel
    and immediately starts another FETCH-INTO on the same connection, which
