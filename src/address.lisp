@@ -170,15 +170,26 @@
             (= (aref bytes 2) #x00) (= (aref bytes 3) #x02)
             (= (aref bytes 4) #x00) (= (aref bytes 5) #x00))
        nil)
-      ;; 2001:10::/28 — ORCHID (RFC 4843), non-routable by definition.
+      ;; ORCHID, both allocations. 2001:20::/28 is ORCHIDv2 (RFC 7343) and
+      ;; is the live one — currently allocated and marked not globally
+      ;; reachable in the IANA IPv6 Special-Purpose Address Registry.
+      ;; 2001:10::/28 is RFC 4843's original, whose allocation expired and
+      ;; returned to the free pool when RFC 7343 obsoleted it.
+      ;;
+      ;; Both are refused, and the retired one is refused for the reason
+      ;; the 2002::/16 and 192.88.99.0/24 clauses give above: an expired
+      ;; allocation is a reason to refuse rather than to skip, because a
+      ;; prefix returned to the pool reaches whoever is handed it next.
       ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
-            (= (aref bytes 2) #x00) (= (logand (aref bytes 3) #xf0) #x10))
+            (= (aref bytes 2) #x00)
+            (or (= (logand (aref bytes 3) #xf0) #x10)
+                (= (logand (aref bytes 3) #xf0) #x20)))
        nil)
       ;; 100::/64 — discard-only (RFC 6666). Traffic to it is dropped, so
       ;; nothing is reachable there and a fetch aimed at it can only be a
       ;; mistake or a probe.
       ((and (= (aref bytes 0) #x01) (= (aref bytes 1) #x00)
-            (every #'zerop (subseq bytes 2 8)))
+            (loop for i from 2 below 8 always (zerop (aref bytes i))))
        nil)
       ;; fc00::/7 — unique local (RFC 4193), covers AWS fd00:ec2::254
       ((= (logand b0 #xfe) #xfc) nil)
@@ -207,8 +218,8 @@
    Also on the v6 side: 6to4 (2002::/16, unwrapped), Teredo (2001::/32,
    refused whole — its two embedded IPv4 addresses are a relay and a
    complemented client, so there is no single carried address to unwrap),
-   IPv6 benchmarking (2001:2::/48), ORCHID (2001:10::/28) and discard-only
-   (100::/64).
+   IPv6 benchmarking (2001:2::/48), ORCHID and ORCHIDv2 (2001:10::/28 and
+   2001:20::/28), and discard-only (100::/64).
 
    The list is exhaustive on purpose. This filter's value is that its
    coverage can be read off rather than inferred, so a prefix added to the

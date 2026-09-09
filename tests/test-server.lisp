@@ -1839,9 +1839,15 @@
   (check "v6 2001:2::/48 benchmarking"
          (is-public-address-p
           #(#x20 #x01 0 #x02 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
-  (check "v6 2001:10::/28 orchid"
+  ;; Both ORCHID allocations. 2001:20::/28 is ORCHIDv2 (RFC 7343) and the
+  ;; live one; 2001:10::/28 is RFC 4843's, expired and returned to the pool,
+  ;; refused for the reason the file gives for 2002:: and 192.88.99.0/24.
+  (check "v6 2001:10::/28 orchid v1"
          (is-public-address-p
           #(#x20 #x01 0 #x10 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:20::/28 orchid v2"
+         (is-public-address-p
+          #(#x20 #x01 0 #x20 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
   (check "v6 100::/64 discard"
          (is-public-address-p
           #(#x01 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
@@ -1855,9 +1861,12 @@
   (check "v6 2001:3:: is public"
          (is-public-address-p
           #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
-  (check "v6 2001:20:: is public"
+  ;; A neighbour outside both /28s. 2001:30:: is unallocated space above
+  ;; ORCHIDv2 and is where the too-wide-guard control belongs — the
+  ;; previous control named 2001:20::, which is the reserved prefix itself.
+  (check "v6 2001:30:: is public"
          (is-public-address-p
-          #(#x20 #x01 0 #x20 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
   (check "v6 100::/64 neighbour is public"
          (is-public-address-p
           #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) t)
