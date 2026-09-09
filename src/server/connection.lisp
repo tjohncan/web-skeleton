@@ -576,6 +576,20 @@
         (cond
           ((eq result :eof)   (return (if any-read :ok-eof :eof)))
           ((eq result :again) (return (if any-read :ok :again)))
+          ;; The same arm CONNECTION-READ-AVAILABLE carries, for the reason
+          ;; the docstring above gives: the two are meant to be readable
+          ;; side by side, and they were not. Without it :WANT-WRITE fell
+          ;; into the integer default and this loop spun inside the event
+          ;; loop with no exit. Unreachable today — the only caller is the
+          ;; :STREAMING inbound path and there is no inbound TLS — which is
+          ;; exactly how long a spin like this stays invisible.
+          ((eq result :want-write)
+           (return (if any-read :ok-want-write :want-write)))
+          ;; Defensive, and not redundant with the arm above: a fifth
+          ;; verdict added to CONNECTION-READ-INTO would otherwise
+          ;; reintroduce the spin here rather than fail. Anything that is
+          ;; not a byte count is handed back rather than counted.
+          ((not (integerp result)) (return result))
           (t (setf any-read t)))))))
 
 ;;; ---------------------------------------------------------------------------
