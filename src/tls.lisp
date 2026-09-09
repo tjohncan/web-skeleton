@@ -1005,7 +1005,22 @@
    EVP_PKEY_verify. Cleanup via unwind-protect regardless of path.
    OpenSSL handles r/s range and invalid-curve point rejection
    internally, so those checks are not duplicated here. Both (r, s)
-   and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S."
+   and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S.
+
+   All four length gates are here because the contract line above is
+   load-bearing: TLS.LISP swaps this into ECDSA-VERIFY-P256's function
+   cell at load time, so on a libssl machine this *is* the verifier, and
+   a gate that exists on only one of the two is a gate that most
+   deployments do not have."
+  ;; HASH is gated for the reason the pure-Lisp path gives at length: a
+  ;; digest shorter than 32 bytes is a smaller integer, which is the same
+  ;; thing as left-padding it into a different message. OpenSSL takes it
+  ;; without complaint — EVP_PKEY_verify does not know what length of
+  ;; digest the caller meant — so the refusal has to be here. JWT is the
+  ;; only caller today and always passes 32 bytes; this keeps the two
+  ;; implementations answering alike rather than fixing a live bug.
+  (unless (= (length hash) 32)
+    (return-from ecdsa-verify-p256-libssl nil))
   ;; Length-gate like the pure-Lisp path. DER-ENCODE-ECDSA-SIGNATURE
   ;; reads bytes 0..63 from sig-bytes unconditionally, so anything
   ;; other than a 64-byte input must be rejected here before the
