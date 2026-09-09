@@ -1364,6 +1364,16 @@
                       (connection-header-end conn) 0
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length
+                      ;; Cleared for the same reason the keep-alive reset
+                      ;; two arms up clears it, and it was the one field the
+                      ;; two otherwise-identical resets disagreed on.
+                      ;; WEBSOCKET-UPGRADE-P only looks for the upgrade
+                      ;; token, so `Connection: close, Upgrade` is a legal
+                      ;; upgrade that left the flag set for the life of the
+                      ;; socket. Dead state today — nothing in :WEBSOCKET
+                      ;; reads it — which is precisely why it would be read
+                      ;; wrong the first time something does.
+                      (connection-close-after-p conn) nil
                       (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+))
