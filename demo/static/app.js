@@ -14,7 +14,17 @@ function appendLog(text, cls) {
 }
 
 function connect(onOpen) {
-  if (ws && ws.readyState <= 1) return;
+  // Already open: run the callback now. Already connecting: hand it to the
+  // pending onopen. Returning without doing either dropped the message the
+  // caller was about to send, and left it in the input looking unsent.
+  if (ws && ws.readyState === 1) { if (onOpen) onOpen(); return; }
+  if (ws && ws.readyState === 0) {
+    if (onOpen) {
+      var prev = ws.onopen;
+      ws.onopen = function (e) { if (prev) prev.call(ws, e); onOpen(); };
+    }
+    return;
+  }
   appendLog('[status] connecting...', 'status');
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   ws = new WebSocket(proto + location.host + '/ws');
