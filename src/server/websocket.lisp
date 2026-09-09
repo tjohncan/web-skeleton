@@ -352,7 +352,6 @@
 ;;; writability: EPOLLERR and EPOLLHUP are reported whether or not they were
 ;;; requested — epoll_ctl(2) says so — so a full close arrives as
 ;;; OUT|ERR|HUP under this mask and the next write raises ECONNRESET.
-;;; Measured, not argued.
 ;;;
 ;;; A peer that *half-closes* while we are behind is not noticed: measured,
 ;;; zero events, and it waits for *WRITE-STALL-TIMEOUT*. That is a real

@@ -1826,9 +1826,9 @@
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
    #(127 0 0 1) is IPv4 loopback only; #(0 0 0 0) is all IPv4 interfaces,
    and the sixteen-byte forms are the v6 counterparts — README's
-   Configuration section spells all four out. Said here because a reader
-   who stops at this docstring would conclude the framework is IPv4-only,
-   which it is not, and one already did.
+   Configuration section spells all four out. Said here because a reader who
+   stops at this docstring would otherwise conclude the framework is
+   IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
