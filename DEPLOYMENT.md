@@ -188,8 +188,13 @@ own section below for why pre-built bytes omit it.
 
 `status-reason` covers the codes above plus the ones handlers commonly
 need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx
-set. It is deliberately not exhaustive: for anything else, set the status
-and supply your own reason phrase.
+set. It is deliberately not exhaustive, and there is no way to supply your
+own reason phrase: `format-response` always asks `status-reason`, and a status
+outside the table is emitted as `HTTP/1.1 451 Unknown`. That is deliberate —
+the table's own docstring says `Unknown` is the answer — but the reason phrase
+has no semantic weight in HTTP/1.1, so a client reads the code and ignores it.
+If you need a status the table does not carry, use it; the line is well-formed
+and the code is what is read.
 
 ### WebSocket origin validation
 

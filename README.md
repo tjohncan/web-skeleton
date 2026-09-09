@@ -358,6 +358,20 @@ The boundaries of the list above. Each is a deliberate choice rather than
 an oversight, but a boundary you meet in production is worse than one you
 read about here.
 
+- **Only origin-form request targets.** The request line must start with `/`.
+  RFC 7230 §5.3.2 requires a server to accept absolute-form
+  (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy
+  sends, and §5.3.4 defines asterisk-form (`OPTIONS * HTTP/1.1`), which some
+  health checkers use. Both are answered `400` here. Deliberate — one
+  accepted shape is one shape to get wrong, and behind a reverse proxy
+  neither form arrives — but it is a boundary rather than an oversight, and
+  it was previously written down nowhere.
+- **Percent-decoding assumes UTF-8.** `url-decode` decodes to a string and
+  raises on a byte sequence that is not valid UTF-8, so `?q=%FF` — a legal
+  percent-encoding — becomes a `400` raised from inside the handler at
+  `get-query-param` time, and the log line reads like a parse failure rather
+  than an encoding one. There is no byte-returning sibling for an
+  application that wants the raw octets.
 - **No inbound TLS.** The server cannot serve HTTPS. A reverse proxy
   (nginx, caddy) terminates TLS in front of it. Outbound TLS *is*
   supported — `web-skeleton-tls` gives `https://` fetches — so the
@@ -520,7 +534,7 @@ All configurable via `setf` before calling `start-server`.
 | `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it |
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
-| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed |
+| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing |
 | `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. Validated when the server starts, so a deployment that trims this below the message size is told at boot rather than at the first maximal message. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |
 | `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |

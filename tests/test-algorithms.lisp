@@ -636,9 +636,15 @@
   "Framework-dev entry point: re-run the existing crypto tests against
    the pure-Lisp implementations by temporarily swapping SYMBOL-FUNCTION
    for SHA1 / SHA256 / ECDSA-VERIFY-P256. HMAC-SHA256 is exercised for
-   free because it calls SHA256 through the function cell. Not part of
-   the default TEST runner — invoke manually when editing pure-Lisp
-   algorithm sources."
+   free because it calls SHA256 through the function cell.
+
+   Run by TEST automatically whenever libssl is loaded, which is the only
+   condition under which it has anything to say — without libssl the
+   default function cells already are the pure-Lisp ones and the first
+   TEST-ALGORITHMS pass covered them. This docstring said the opposite for
+   long enough that three other places — RUN.LISP's header, TEST's own
+   comment, and the README — all describe the real behaviour and this one
+   did not."
   (setf *tests-passed* 0
         *tests-failed* 0
         *failed-names* nil)
