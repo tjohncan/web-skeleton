@@ -862,6 +862,26 @@ inline, and a flush that completes never reaches the event loop's write
 path, so a pause taken while the target's queue was empty has no drain
 coming, and only an explicit `fetch-resume` restarts it.
 
+The shape that avoids the question is to ask before pausing. `stream-full-p`
+is exported for exactly this — it runs the same test `connection-append-write`
+runs internally — so a producer can give the verdict only when there is a drain
+that will end it:
+
+```lisp
+:on-body (lambda (out chunk)
+           (declare (ignore out))
+           (stream-send client chunk)
+           ;; :pause only when the target has actually backed up. Pausing
+           ;; on an empty queue has no drain coming and strands the fetch
+           ;; until *fetch-timeout*, on an upstream that was healthy.
+           (when (stream-full-p client) :pause))
+```
+
+The same shape works for a `:websocket` target through
+`connection-write-pending`, which is exported for the same reason. What you
+must not do is return `:pause` unconditionally and rely on something to lift
+it: nothing will, unless the queue was non-empty when you said it.
+
 The deadline runs on unpaused time: `fetch-resume` pushes it out by the
 interval spent paused, so a relay is not killed for applying the
 backpressure it was told to apply.
