@@ -1209,6 +1209,16 @@ success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
 connection it wrote to whenever it leaves a remainder, which is what makes
 the paragraph above describe the code.
 
+One boundary on "nothing else", and it is the sender rather than the
+subscriber. Arming calls `epoll_ctl`, and file descriptors are
+process-wide while each worker's epoll instance is not — so a `ws-send` to
+a connection belonging to a *different worker* gets `ENOENT`, raises, and
+the raise is caught by the handler-case around the handler that made the
+call. That closes the sender's connection, not the subscriber's. Fan out
+only over connections this worker owns; a registry that spans workers needs
+a different mechanism, which the sharing note above says the framework does
+not provide.
+
 ### Logging holds the only shared lock
 
 `log-msg` takes a single global mutex and holds it across both the

@@ -16,6 +16,12 @@ Three things distinguish it:
   folding is rejected by both readers that look at it. Every request-smuggling
   CVE in the genre is two hops resolving the same ambiguity differently; a
   server that never resolves it cannot be the hop that resolves it wrongly.
+  The same refusal runs on the way out: `build-outbound-request` rejects a
+  caller-supplied `Content-Length` or `Transfer-Encoding`, and the serializer
+  rejects control characters against the table the parser uses. **The
+  framework will not emit what it will not accept**, so an application built
+  on it cannot become the upstream hop in someone else's smuggling chain
+  either.
 - **One worker per core, sharing nothing on the request path.** Each has its own
   listener (`SO_REUSEPORT`), epoll instance, connection table and scratch
   buffers. There are no locks on the request path. The only mutex a request can
