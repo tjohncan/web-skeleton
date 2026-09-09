@@ -154,7 +154,15 @@
    Shutdown hooks are isolated: REGISTER-CLEANUP calls made from inside
    BODY (directly or via a handler) fire during this server's teardown
    and do not leak into the caller's framework state. The outer
-   *SHUTDOWN-HOOKS* list is saved on entry and restored on exit."
+   *SHUTDOWN-HOOKS* list is saved on entry and restored on exit.
+
+   HOST is what the listener binds, a 4-byte IPv4 or 16-byte IPv6 vector as
+   START-SERVER takes it, defaulting to IPv4 loopback. *TEST-HOST* carries
+   it so CONNECT-TO-TEST-SERVER can dispatch the client family from the
+   same vector — but it is bound on the calling thread only, since
+   MAKE-THREAD inherits no dynamic environment. A test that spawns its own
+   reader thread has to pass the address and port into that thread rather
+   than read the specials from inside it."
   `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host))
 
 (defun call-with-test-server (handler ws-handler thunk &optional host)
