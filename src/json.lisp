@@ -414,9 +414,19 @@
     ;; array, or whose keys array holds arrays, escaped as a raw type error
     ;; from a function that gives every other malformed shape a clean
     ;; "JWKS: ..." message.
+    ;;
+    ;; The test is STRING-DESIGNATOR rather than STRINGP, and the wider
+    ;; one is the right shape rather than a concession. STRING= is defined
+    ;; on designators, so ASSOC :TEST #'STRING= matched symbol and
+    ;; character keys too — a hand-built alist with symbol keys read
+    ;; through this function, which the docstring above invites. STRINGP
+    ;; would have dropped that silently while fixing the raise. What both
+    ;; tests exclude is identical, and it is the shape that matters: a
+    ;; number or a list in CAR position, which is what the elements of a
+    ;; parsed array look like and exactly what STRING= raises on.
     (loop for entry in alist
           when (and (consp entry)
-                    (stringp (car entry))
+                    (typep (car entry) '(or string symbol character))
                     (string= (car entry) key))
             return (cdr entry))))
 

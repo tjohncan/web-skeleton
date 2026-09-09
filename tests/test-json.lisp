@@ -76,6 +76,17 @@
   (check "json-get through a nested array returns nil, does not raise"
          (attempt (json-get (json-get (json-parse "{\"keys\":[1]}") "keys") "a"))
          nil)
+  ;; The other half of the element test, and the half a narrower one would
+  ;; have cost silently. JSON-GET was ASSOC :TEST #'STRING=, and STRING= is
+  ;; defined on string designators — so a hand-built alist with symbol keys
+  ;; has always read through this function, which the docstring's invitation
+  ;; to pass a bare alist is what makes reachable. Fixing the array raise
+  ;; with STRINGP would have narrowed that away and returned NIL here, which
+  ;; is the shape of regression nothing else in this file would have caught.
+  (check "json-get answers a symbol key, as string= always has"
+         (json-get '((foo . 1)) "FOO") 1)
+  (check "json-get answers a character key too"
+         (json-get '((#\a . 1)) "a") 1)
 
   ;; Whitespace tolerance
   (check "whitespace"
