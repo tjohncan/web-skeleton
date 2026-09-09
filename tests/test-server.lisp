@@ -8173,7 +8173,23 @@
    epoll fd raises from send(2) — which would fail the control for a
    fixture reason and, worse, would give the *foreign* connection a
    second way to raise once the guard is reverted, confounding the
-   detector with an ENOTSOCK it was never about."
+   detector with an ENOTSOCK it was never about.
+
+   Exactly one of the last two assertions is a control. \"a connection
+   this worker owns still closes\" is: registering is the only change and
+   it passes on both sides. \"and that one did tell the app\" is not, and
+   should not be read as one — against main's source the *foreign* close
+   is accepted and fires the callback too, so the counter reaches 2 and
+   this fails as a cascade from the defect rather than independently of
+   it. Four of this test's five assertions fail there and there is one
+   defect behind them; only \"still closes\" survives. The sibling
+   FETCH-INTO ownership test carries the same note for the same reason,
+   which is how this one came to be checked.
+
+   Three is the number under the *mutation* — the guard relocated to just
+   before the arm — where assertion 1 also survives because a five-byte
+   terminator flushes whatever the guard's position. Two measurements,
+   two counts, and this paragraph is about the matrix."
   (format t "~%stream-close: a connection this worker does not own~%")
   (multiple-value-bind (fserver fclient) (%loopback-pair)
     (multiple-value-bind (oserver oclient) (%loopback-pair)
