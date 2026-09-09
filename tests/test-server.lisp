@@ -1828,6 +1828,40 @@
          (is-public-address-p
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
 
+  ;; Teredo, 2001::/32 (RFC 4380). The one of this group with teeth: bytes
+  ;; 4-7 carry the relay's IPv4 address and 12-15 the client's, so it is a
+  ;; wrapper around IPv4 in the same sense ::ffff: and 2002:: are, and the
+  ;; stated policy for those is to refuse whether or not the carrier is
+  ;; live.
+  (check "v6 2001::/32 teredo"
+         (is-public-address-p
+          #(#x20 #x01 0 0 #x0a 0 0 1 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:2::/48 benchmarking"
+         (is-public-address-p
+          #(#x20 #x01 0 #x02 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:10::/28 orchid"
+         (is-public-address-p
+          #(#x20 #x01 0 #x10 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 100::/64 discard"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
+  ;; The neighbours, so each clause is the prefix it claims and not a
+  ;; wider match sitting on top of 2001:: or 100::. Without these a
+  ;; too-broad guard would pass every assertion above it.
+  (check "v6 2001:4860:: is public"
+         (is-public-address-p
+          #(#x20 #x01 #x48 #x60 0 0 0 0 0 0 0 0 0 0 #x88 #x88) :inet6) t)
+  (check "v6 2001:3:: is public"
+         (is-public-address-p
+          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 2001:20:: is public"
+         (is-public-address-p
+          #(#x20 #x01 0 #x20 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 100::/64 neighbour is public"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) t)
+
   ;; IPv4-mapped IPv6 — attacker cannot launder 127.0.0.1
   (check "v6 ::ffff:127.0.0.1 mapped loopback"
          (is-public-address-p
@@ -4251,6 +4285,23 @@
            (jwt-key-kid (first kidless-pair)) "")
     (check "jwks: second kidless key has empty kid"
            (jwt-key-kid (second kidless-pair)) ""))
+
+  ;; A kid that is not a string. The struct slot is typed STRING, so this
+  ;; raised a bare SBCL type error out of a function that answers every
+  ;; other malformed shape with a clean "JWKS: ..." message — and RFC 7517
+  ;; 4.5, which makes kid OPTIONAL, says nothing forbidding a number there.
+  ;; ATTEMPT because the defect is a raise; the assertion is on the message,
+  ;; so a fix that raised something unhelpful would still fail.
+  (check "jwks: a non-string kid is refused by name"
+         (let ((msg (attempt
+                     (parse-jwks
+                      (concatenate
+                       'string
+                       "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":5,"
+                       "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+                       "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}]}")))))
+           (and (stringp msg) (search "JWKS: kid must be a string" msg) t))
+         t)
 
   ;; Explicit duplicate kid still rejects — the dedup discipline
   ;; holds for non-empty kids where an issuer presumably meant
@@ -8111,6 +8162,123 @@
     (check "fan-out ws-send: and EPOLLOUT is armed on the fan-out target"
            armed-b t)))
 
+;;; ---------------------------------------------------------------------------
+;;; The close code for a frame that is too large
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-oversized-frame-close-code ()
+  "An oversized single frame closes 1009, not 1002.
+
+   RFC 6455 7.4.1 has 1009 (Message Too Big) for this, and the oversized
+   fragmented *message* — the same complaint one layer up — already closed
+   1009 in two places. The single frame raised out of TRY-PARSE-WS-FRAME as
+   a generic error, took WEBSOCKET-ON-READ's catch-all, and closed 1002.
+   One file, two answers to one question.
+
+   Driven through WEBSOCKET-ON-READ rather than by asserting the condition
+   type, because the code on the wire is the claim and the condition is
+   only how it gets there. The control is the neighbouring 1002 test, which
+   still passes: an unknown opcode is a protocol error and keeps its code.
+
+   *MAX-WS-PAYLOAD-SIZE* is lowered rather than a real 1 MiB frame built.
+   What the parser compares is the declared length against the bound, and a
+   small bound reaches that comparison with eight bytes instead of a
+   megabyte."
+  (format t "~%ws: the close code for a frame that is too large~%")
+  (let* ((web-skeleton::*max-ws-payload-size* 4)
+         (big  (make-masked-frame t 1 #(104 101 108 108 111 32 119 111)))
+         (conn (web-skeleton::make-connection
+                :fd -1 :state :websocket :last-active 0)))
+    (setf (web-skeleton::connection-read-buf conn) big
+          (web-skeleton::connection-read-pos conn) (length big))
+    (multiple-value-bind (action response)
+        (web-skeleton::websocket-on-read
+         conn (lambda (c f) (declare (ignore c f)) nil))
+      (check "oversized frame: the connection closes" action :close)
+      (check "oversized frame: with 1009, not 1002"
+             (and response
+                  (>= (length response) 4)
+                  (logior (ash (aref response 2) 8) (aref response 3)))
+             1009))))
+
+;;; ---------------------------------------------------------------------------
+;;; The verdict the discard loop used to spin on
+;;; ---------------------------------------------------------------------------
+
+(defun test-discard-available-want-write ()
+  "CONNECTION-DISCARD-AVAILABLE hands back :WANT-WRITE instead of looping.
+
+   CONNECTION-READ-INTO has four non-integer verdicts and this loop handled
+   two, so :WANT-WRITE fell into the integer default, set a flag and went
+   round again — a hot spin inside the event loop with no exit. Its own
+   docstring says the cond is deliberately the same shape as
+   CONNECTION-READ-AVAILABLE's so the two can be read side by side, and it
+   was not.
+
+   Unreachable today: the only caller is the :STREAMING inbound path and
+   there is no inbound TLS. That is how long a spin like this stays
+   invisible, and it is the argument for the assertion rather than against
+   it.
+
+   The stub is bounded on purpose. An unbounded one would hang the run
+   under the defect rather than fail it, which is the *too violent* mode —
+   a detector whose failure is indistinguishable from a machine problem.
+   Bounded, the defect exhausts the budget, falls through to :EOF and
+   answers :OK-EOF, so both assertions fail and the run continues.
+
+   The call count is the second assertion for the same reason: a fix that
+   answered :WANT-WRITE after looping ten times would satisfy the first
+   check and still be the bug."
+  (format t "~%Discard loop: the verdict it used to spin on~%")
+  (let ((calls 0)
+        (real (symbol-function 'web-skeleton::connection-read-into)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'web-skeleton::connection-read-into)
+                 (lambda (conn buffer start max-bytes)
+                   (declare (ignore conn buffer start max-bytes))
+                   (incf calls)
+                   (if (< calls 20) :want-write :eof)))
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :streaming :last-active 0))
+                 (sink (make-array 64 :element-type '(unsigned-byte 8))))
+             (check "discard: :want-write is answered, not swallowed"
+                    (web-skeleton::connection-discard-available conn sink)
+                    :want-write)
+             (check "discard: and it answered on the first read"
+                    calls 1)))
+      (setf (symbol-function 'web-skeleton::connection-read-into) real))))
+
+;;; ---------------------------------------------------------------------------
+;;; The third boot invariant
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-timeout-validated-at-boot ()
+  "START-SERVER refuses a non-positive *FETCH-TIMEOUT* before it binds.
+
+   It already refuses a non-positive *WRITE-STALL-TIMEOUT* and an
+   under-sized *MAX-WRITE-BACKLOG*, with the same reasoning: a
+   misconfiguration should not wait for the shape that reveals it.
+   *FETCH-TIMEOUT* is the floor under every way a fetch can fail to return
+   — the DNS phase, the connect, the read, and the :AWAITING sweep that
+   answers a parked caller 504 — and at zero the sweep never fires.
+
+   The :HOST is deliberately invalid. If the validation is reverted,
+   START-SERVER continues to MAKE-TCP-LISTENER, which refuses a three-byte
+   vector by name — so the revert fails this assertion instead of starting
+   a real server inside the suite. A detector that leaves a listener
+   running when it fails is worse than none.
+
+   Asserted on the message rather than on the fact of a raise, because both
+   paths raise and only one of them is this invariant."
+  (format t "~%start-server: the third boot invariant~%")
+  (let ((web-skeleton:*fetch-timeout* 0))
+    (check "boot: a zero *fetch-timeout* is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*fetch-timeout*" msg) t))
+           t)))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -8272,5 +8440,8 @@
   (test-ws-send-arms-a-fan-out-target)
   (test-stream-close-arms-the-write-path)
   (test-cpu-count-parsers)
+  (test-ws-oversized-frame-close-code)
+  (test-discard-available-want-write)
+  (test-fetch-timeout-validated-at-boot)
   (report-suite "Server")
   (zerop *tests-failed*))
