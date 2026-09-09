@@ -444,10 +444,17 @@
    fails. The second one is new and it is unconditional, where the arming
    it replaced was skipped whenever the flush finished — so a stream
    closed from the wrong worker now raises every time rather than only
-   when the terminator did not fit. That is the same guarantee WS-SEND
-   and FETCH-INTO make, reached by a different route: those two ask the
-   connection table, this one arms on every path anyway and lets
-   epoll_ctl answer with ENOENT."
+   when the terminator did not fit.
+
+   That is detection, not refusal, and the difference is the one WS-SEND
+   draws about its own arming raise. WS-SEND and FETCH-INTO ask the
+   connection table before anything is touched, so a cross-worker call
+   leaves no trace. This one arms last — after the terminator has been
+   appended and flushed with send(2) from the wrong thread, after
+   ON-CLOSE has fired :DONE, and after the state has moved to
+   :WRITE-RESPONSE — so epoll_ctl's ENOENT reports a misuse already
+   committed, under an errno rather than a name. Closing that gap needs
+   the table check WS-SEND has; an unconditional arm is not it."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))

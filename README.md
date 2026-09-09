@@ -376,10 +376,12 @@ read about here.
   background pump — has no table to check against, and `ws-send`,
   `stream-send` and `stream-close` will queue and write from it without
   complaint. `fetch-into` refuses that case too, but for its own reason: it
-  opens an outbound that needs an event loop to drive. Closing it for the rest
-  would take a per-connection owner slot the connection struct does not carry.
-  Fan-out *across* workers is not provided, and building it needs a mechanism
-  this framework deliberately does not have.
+  opens an outbound that needs an event loop to drive. Closing it for the other
+  three would mean refusing every call from outside an event loop — reachable,
+  but a contract change to three functions at once rather than a fix, and one
+  they have to make together or not at all. Fan-out *across* workers is not
+  provided, and building it needs a mechanism this framework deliberately does
+  not have.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy

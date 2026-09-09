@@ -423,8 +423,16 @@
    worker's table takes a worker to ask from, so a call off the event loop
    entirely — an application's own timer or queue consumer — finds no table
    and gets the old behaviour. FETCH-INTO refuses that one as well, but for
-   an unrelated reason: it needs a loop to drive the outbound it opens.
-   Closing it here would take an owner slot on the connection.
+   an unrelated reason: it needs a loop to drive the outbound it opens — a
+   functional precondition this function does not share, since a send off a
+   worker to a connection nothing else is touching works correctly and the
+   harness relies on it.
+
+   Closing it here would mean refusing every call from outside an event
+   loop. That is reachable and it is not this function's decision:
+   STREAM-SEND and STREAM-CLOSE have the identical hole, and narrowing one
+   of the three leaves a boundary that reads as an oversight instead of a
+   rule. Three together or none.
 
    Signals also if the arming fails, and that one is not symmetric with the
    others: the frame has been queued and flushed by then, so the raise
