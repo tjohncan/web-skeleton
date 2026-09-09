@@ -86,7 +86,7 @@
 ;;;   - redefine it in a loaded image and re-run the suite:
 ;;;     (in-package :web-skeleton), defun, then (web-skeleton-tests:test)
 ;;;
-;;; Five things that make the second one lie:
+;;; Six things that make the second one lie:
 ;;;
 ;;;   - IN-PACKAGE only works at top level. It acts when the reader reads
 ;;;     it, so an IN-PACKAGE nested inside a HANDLER-BIND or a LET has
@@ -108,6 +108,13 @@
 ;;;   - If the revert breaks shared infrastructure, assert against the
 ;;;     affected function directly rather than through TEST. A revert
 ;;;     that takes the harness down produces a hang, not a result.
+;;;   - An inlined or block-compiled callee does not follow a redefinition
+;;;     at all: the caller holds the expansion, not the fdefn. Nothing here
+;;;     is declaimed INLINE today, and TEST-DISCARD-AVAILABLE-WANT-WRITE is
+;;;     the first test that depends on that staying true — it stubs
+;;;     CONNECTION-READ-INTO and asserts what its caller does with the
+;;;     answer. Declaim that function INLINE and the test passes against
+;;;     the original code while appearing to drive the stub.
 ;;;
 ;;; The same rule holds outside testing: do not enter a multi-step state
 ;;; change without first confirming every intermediate step passes.
