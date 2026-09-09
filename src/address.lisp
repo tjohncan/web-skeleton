@@ -152,6 +152,34 @@
       ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
             (= (aref bytes 2) #x0d) (= (aref bytes 3) #xb8))
        nil)
+      ;; 2001::/32 — Teredo (RFC 4380). The one with teeth in this group:
+      ;; bytes 4-7 are the Teredo server's IPv4 address and bytes 12-15 are
+      ;; the client's, obfuscated by complement — so a Teredo address is a
+      ;; wrapper around two IPv4 addresses in exactly the sense ::ffff: and
+      ;; 2002:: are, and the stated policy for those is to refuse the
+      ;; private-shaped ones whether or not the carrier is live. Refused
+      ;; whole rather than unwrapped: the client field is complemented and
+      ;; the server field is the relay rather than the destination, so there
+      ;; is no single carried address to hand IPV4-PUBLIC-P.
+      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
+            (= (aref bytes 2) #x00) (= (aref bytes 3) #x00))
+       nil)
+      ;; 2001:2::/48 — benchmarking (RFC 5180), the v6 counterpart of
+      ;; 198.18.0.0/15.
+      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
+            (= (aref bytes 2) #x00) (= (aref bytes 3) #x02)
+            (= (aref bytes 4) #x00) (= (aref bytes 5) #x00))
+       nil)
+      ;; 2001:10::/28 — ORCHID (RFC 4843), non-routable by definition.
+      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
+            (= (aref bytes 2) #x00) (= (logand (aref bytes 3) #xf0) #x10))
+       nil)
+      ;; 100::/64 — discard-only (RFC 6666). Traffic to it is dropped, so
+      ;; nothing is reachable there and a fetch aimed at it can only be a
+      ;; mistake or a probe.
+      ((and (= (aref bytes 0) #x01) (= (aref bytes 1) #x00)
+            (every #'zerop (subseq bytes 2 8)))
+       nil)
       ;; fc00::/7 — unique local (RFC 4193), covers AWS fd00:ec2::254
       ((= (logand b0 #xfe) #xfc) nil)
       ;; fe00::/8 — a conservative superset of link-local (fe80::/10),
