@@ -1881,6 +1881,21 @@
             at least ~s, or lower *max-ws-message-size*."
            *max-write-backlog* *max-ws-message-size*
            (+ *max-ws-message-size* 10)))
+  ;; Third invariant, same place and the same argument. *FETCH-TIMEOUT* is
+  ;; the documented floor under every way a fetch can fail to return — the
+  ;; DNS phase, the connect, the read, and the :AWAITING sweep that answers
+  ;; a parked caller 504 when none of them finish. At zero the sweep never
+  ;; fires, so a parked inbound waits on an upstream that may never speak
+  ;; and the only remaining bound is the idle timeout, which the fetch
+  ;; keeps fresh. Checked at boot rather than at the first parked request,
+  ;; for the reason the two above give: a misconfiguration should not wait
+  ;; for the shape that reveals it.
+  (unless (and (realp *fetch-timeout*) (plusp *fetch-timeout*))
+    (error "start-server: *fetch-timeout* is ~s; it must be positive. It is ~
+            the deadline on every phase of an outbound fetch and the only ~
+            thing that answers a parked caller when an upstream goes quiet ~
+            — there is no setting that disables it."
+           *fetch-timeout*))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is
   ;; its id and the vector has to be there when the first tick publishes.
