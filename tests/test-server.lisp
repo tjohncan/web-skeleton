@@ -5286,6 +5286,77 @@
       ;; open for the rest of the run — the Server suite's one leak.
       (ignore-errors (sb-ext:process-close proc)))))
 
+(defun test-ws-send-refuses-a-foreign-connection ()
+  "WS-SEND refuses a connection this worker does not own.
+
+   The frame here is 100 bytes into a fresh pipe, which is the point. A
+   cross-worker WS-SEND used to be caught by the arming — an fd absent
+   from this worker's epoll gives ENOENT — and arming only happens when
+   the flush leaves a remainder. So the refusal covered the backed-up
+   peer and missed the ordinary one: a frame that fit was appended to an
+   unsynchronised queue, sent from the wrong thread, and reported success.
+   That is the case the README and DEPLOYMENT.md both described as
+   refused, and it is the common one.
+
+   Four assertions, and the middle two are doing different jobs from the
+   first. That nothing was queued is the placement: the guard runs before
+   CONNECTION-APPEND-WRITE, because the queue is the thing being
+   corrupted and refusing after the append would report the misuse having
+   already committed it. The decoy pins EQ rather than a comparison on
+   the fd number — an fd reissued to a different connection on this
+   worker satisfies the number while being the wrong object, and a guard
+   written on the number would pass every other check here.
+
+   The last is a control and a real one: registering the connection is
+   the only change, and it passes on both sides of the revert."
+  (format t "~%ws-send: a connection this worker does not own~%")
+  (let ((proc (sb-ext:run-program "/bin/sleep" '("30")
+                                  :input :stream :output nil :wait nil))
+        (epfd (web-skeleton::epoll-create)))
+    (unwind-protect
+         (let* ((fd (sb-sys:fd-stream-fd (sb-ext:process-input proc)))
+                (small (web-skeleton::build-ws-frame
+                        web-skeleton::+ws-op-binary+
+                        (make-array 100 :element-type '(unsigned-byte 8)
+                                        :initial-element 89))))
+           (web-skeleton::set-nonblocking fd)
+           (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :state :websocket :last-active 0))
+                  (decoy (web-skeleton::make-connection
+                          :fd fd :state :websocket :last-active 0)))
+             ;; Not registered: what a connection owned by another worker
+             ;; looks like from here.
+             (check "ws-send: a connection this worker does not own is refused"
+                    (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                      (error (e)
+                        (not (null (search "not on this worker's connection table"
+                                           (princ-to-string e))))))
+                    t)
+             (check "ws-send: the refused frame queued nothing"
+                    (web-skeleton::connection-write-pending conn) 0)
+             ;; The fd number is now on the table, attached to something
+             ;; else. A guard reading the number would accept this.
+             (web-skeleton::register-connection decoy)
+             (check "ws-send: the right fd on the wrong object is still refused"
+                    (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                      (error (e)
+                        (not (null (search "not on this worker's connection table"
+                                           (princ-to-string e))))))
+                    t)
+             ;; The control. Registering this connection is the only
+             ;; change, and the frame reaches the pipe whole.
+             (web-skeleton::register-connection conn)
+             (check "ws-send: and the same frame is sent once it is owned"
+                    (handler-case (web-skeleton::ws-send conn small)
+                      (error (e) (format nil "signalled: ~a" e)))
+                    t)))
+      (ignore-errors (sb-ext:process-kill proc 9))
+      (ignore-errors (sb-ext:process-wait proc))
+      (ignore-errors (sb-ext:process-close proc))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
 ;;;
@@ -8441,6 +8512,7 @@
   (test-outbound-direction-inversion)
   (test-write-queue-drain)
   (test-ws-send-queues)
+  (test-ws-send-refuses-a-foreign-connection)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)

@@ -1230,14 +1230,22 @@ connection it wrote to whenever it leaves a remainder, which is what makes
 the paragraph above describe the code.
 
 One boundary on "nothing else", and it is the sender rather than the
-subscriber. Arming calls `epoll_ctl`, and file descriptors are
-process-wide while each worker's epoll instance is not — so a `ws-send` to
-a connection belonging to a *different worker* gets `ENOENT`, raises, and
-the raise is caught by the handler-case around the handler that made the
-call. That closes the sender's connection, not the subscriber's. Fan out
-only over connections this worker owns; a registry that spans workers needs
-a different mechanism, which the sharing note above says the framework does
-not provide.
+subscriber. A `ws-send` to a connection belonging to a *different worker*
+raises, and the raise is caught by the handler-case around the handler that
+made the call. That closes the sender's connection, not the subscriber's.
+Fan out only over connections this worker owns; a registry that spans
+workers needs a different mechanism, which the sharing note above says the
+framework does not provide.
+
+The check is an explicit one — is this fd on *this* worker's connection
+table — and it runs before the frame is queued. Arming was doing that job
+by accident for a while, since `epoll_ctl` on an fd this worker's epoll
+instance does not hold gives `ENOENT`, and file descriptors are
+process-wide while epoll instances are not. But arming only happens when
+the flush leaves a remainder, so the accident caught a cross-worker send to
+a *backed-up* peer and waved through the far more common one to a peer that
+was keeping up — appending to the unsynchronised queue, calling `send(2)`
+from the wrong thread, and returning success.
 
 ### Logging holds the only shared lock
 

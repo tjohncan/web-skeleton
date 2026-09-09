@@ -368,10 +368,11 @@ read about here.
   dropped.** A stream or a WebSocket can only be written from the worker that
   owns it — the write queue has no lock precisely because nothing else touches
   it — so an application holding a registry of subscribers must hold one per
-  worker and push from the owning thread. `ws-send` to a connection on another
-  worker raises rather than corrupting the queue, and `fetch-into` refuses one
-  outright; both were silent before. Fan-out *across* workers is not provided,
-  and building it needs a mechanism this framework deliberately does not have.
+  worker and push from the owning thread. `ws-send` and `fetch-into` both
+  refuse a connection this worker does not own, and `ws-send` refuses before
+  anything is queued; both were silent before. Fan-out *across* workers is
+  not provided, and building it needs a mechanism this framework deliberately
+  does not have.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy

@@ -323,11 +323,16 @@
 ;;; its bytes queued instead of freezing the worker.
 ;;;
 ;;; EPOLLOUT is armed here, and only when the flush did not finish. That
-;;; is STREAM-FLUSH's conditional and it is self-limiting: a peer keeping
-;;; up costs no epoll_ctl at all, so a handler sending in a loop pays
-;;; nothing, which was the whole objection to arming per frame. The fd
-;;; comes from *EPOLL-FD*, the worker's own, bound for exactly this and
-;;; NIL outside a worker — so the check is a check and not an assumption.
+;;; is STREAM-FLUSH's conditional, and it costs nothing for a peer that is
+;;; keeping up: the flush finishes, so a handler sending in a loop to a
+;;; draining peer pays no epoll_ctl at all. Against a peer that is *not*
+;;; draining the same loop pays one MOD per frame with an identical mask,
+;;; which is the case the objection to arming per frame was actually
+;;; about. It is the cheaper half of the trade — the alternative is the
+;;; defect below — but the conditional narrows that cost rather than
+;;; removing it. The fd comes from *EPOLL-FD*, the worker's own, bound for
+;;; exactly this and NIL outside a worker — so the check is a check and
+;;; not an assumption.
 ;;;
 ;;; Leaving it to HANDLE-CLIENT-READ was correct for one caller and wrong
 ;;; for the other. That site arms after a handler returns, and WS-SEND is
@@ -397,20 +402,51 @@
    dropping it silently would leave the app's view and the peer's view of
    the stream permanently different.
 
+   Signals if CONN is not on this worker's connection table — an app
+   reaching across workers, which was silent before and appended to an
+   unsynchronised queue. FETCH-INTO refuses the same misuse for the same
+   reason, and the two agree: both refuse every cross-worker call, not
+   only the ones that happen to leave a remainder.
+
    Signals also if the arming fails, and that one is not symmetric with the
-   first: the frame has been queued and flushed by then, so the raise
+   others: the frame has been queued and flushed by then, so the raise
    reports that the *remainder* has no event coming, not that the send did
-   not happen. On a share-nothing worker the way to provoke it is to call
-   this for a connection that is not on this thread's epoll — an app
-   reaching across workers, which was previously silent and appended to an
-   unsynchronised queue. STREAM-SEND has carried the same behaviour through
-   STREAM-FLUSH all along, so this is a new raise on this function rather
-   than a new one in the API."
+   not happen. Arming is what used to catch a cross-worker call, and only
+   incidentally — an fd absent from this worker's epoll gives ENOENT — so
+   it caught one only when the flush left something behind. The check
+   above is what makes that a guarantee; this one is left as the report
+   that a queued remainder has nothing coming."
   (unless (plusp *write-stall-timeout*)
     (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
             There is no unbounded setting, because it is the only ~
             deadline on a queue this connection may never drain."
            *write-stall-timeout*))
+  ;; Ownership before the queue is touched, because the queue is what a
+  ;; cross-worker call corrupts: CONNECTION-APPEND-WRITE mutates a vector
+  ;; and CONNECTION-ON-WRITE calls send(2), both from a thread that owns
+  ;; neither. Refusing after the append would report the misuse and have
+  ;; committed it anyway.
+  ;;
+  ;; Conditional on *EPOLL-FD*, where FETCH-INTO requires it. The two want
+  ;; different things from the same fact: FETCH-INTO opens an outbound that
+  ;; only an event loop can drive, so no loop is itself the error, while
+  ;; WS-SEND is a queue-and-flush that works fine off a worker and the
+  ;; harness calls it that way on bare connections. Here NIL means "not on
+  ;; a worker at all", which is not the misuse being caught. *CONNECTIONS*
+  ;; is bound outside *EPOLL-FD* in RUN-WORKER, so non-NIL guarantees a
+  ;; live table to ask.
+  ;;
+  ;; EQ against the table, not a comparison on the fd number: an fd
+  ;; reissued to a different connection on this worker would satisfy the
+  ;; number while being the wrong object.
+  (when *epoll-fd*
+    (unless (eq (lookup-connection (connection-fd conn)) conn)
+      (error "ws-send: fd ~d is not on this worker's connection table. ~
+              A WebSocket can only be written from the worker that owns ~
+              it — the write queue has no lock precisely because nothing ~
+              else touches it, so appending here would corrupt it and the ~
+              flush would call send(2) from the wrong thread."
+             (connection-fd conn))))
   (unless (connection-append-write conn frame-bytes)
     (error "ws-send: fd ~d is at *max-write-backlog* (~d bytes pending, ~
             frame is ~d); the peer is not draining."
