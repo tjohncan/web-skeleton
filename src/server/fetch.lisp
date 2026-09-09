@@ -1443,7 +1443,7 @@
    why :CLOSE stays the default: it is the safe answer for the app that has
    not thought about it.
 
-   Signals, rather than returning NIL, in six cases:
+   Signals, rather than returning NIL, in seven cases:
 
      the connection is not :STREAMING or :WEBSOCKET — nothing else owns
        its own write path, so nothing else can consume a result;
@@ -1457,7 +1457,12 @@
        never fires;
      a detached fetch is already outstanding on this connection. Two would
        race to apply the disposition below and whichever finished first
-       would close the target out from under the other.
+       would close the target out from under the other;
+     CONNECTION is not on this worker's table. Delivery reaches the target
+       by looking its fd up in *CONNECTIONS*, which is per-worker while fds
+       are unique across the process — so a cross-worker fetch runs, and
+       then finds nothing to deliver into, leaving the marker set for the
+       life of the connection and the disposition unapplied.
 
    Signalling rather than returning NIL because a call from the wrong
    state is a programming error whose silent failure mode is a connection
@@ -1506,6 +1511,35 @@
   (unless *epoll-fd*
     (error "fetch-into: no event loop on this thread. The outbound would ~
             be opened and never driven."))
+  ;; And the right worker, not merely a worker. Placed after the check
+  ;; above because the two are the same question at two resolutions, and
+  ;; the coarser answer is the more useful one when both are true: told
+  ;; "wrong worker" off a worker entirely, a caller would go looking for
+  ;; the right one.
+  ;;
+  ;; This is the only one of the seven that cannot be answered from the
+  ;; connection alone. A cross-worker call satisfies every other check —
+  ;; the state is right, *EPOLL-FD* is bound, nothing is outstanding — so
+  ;; the outbound is created and registered here and runs correctly.
+  ;; Delivery is what fails: DELIVER-DETACHED and STOP-FETCH both reach
+  ;; the target through (LOOKUP-CONNECTION TARGET-FD), and *CONNECTIONS*
+  ;; is per-worker while fds are unique across the process, so that lookup
+  ;; answers NIL. The marker is then set and never cleared, refusing every
+  ;; later fetch on that connection for the rest of its life, and the
+  ;; failure disposition never applies — which is the same defect
+  ;; DELIVER-DNS-ERROR had before it delegated, reached from another
+  ;; direction.
+  ;;
+  ;; EQ against the table, not a comparison on the fd number: an fd
+  ;; reissued to a different connection on this worker would satisfy the
+  ;; number while being the wrong object.
+  (unless (eq (lookup-connection (connection-fd connection)) connection)
+    (error "fetch-into: fd ~d is not on this worker's connection table. ~
+            A connection can only be fetched into from the worker that ~
+            owns it — delivery reaches the target by looking it up in that ~
+            worker's table, so a cross-worker fetch would leave the marker ~
+            set and the disposition unapplied."
+           (connection-fd connection)))
   (when (connection-fetch-outstanding connection)
     (error "fetch-into: fd ~d already has a detached fetch outstanding"
            (connection-fd connection)))

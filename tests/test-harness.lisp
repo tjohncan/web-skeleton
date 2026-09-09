@@ -3814,6 +3814,76 @@
              (ignore-errors (web-skeleton::%close epfd))))
       (setf (symbol-function 'web-skeleton::initiate-fetch) real))))
 
+(defun test-fetch-into-refuses-a-foreign-connection ()
+  "FETCH-INTO refuses a connection this worker does not own.
+
+   The seventh guard, and the only one that cannot be answered from the
+   connection alone. A cross-worker call satisfies every other check — the
+   state is right, *EPOLL-FD* is bound, nothing is outstanding — so the
+   outbound is created and registered here and runs correctly. Delivery is
+   what fails: DELIVER-DETACHED and STOP-FETCH both reach the target
+   through (LOOKUP-CONNECTION TARGET-FD), and *CONNECTIONS* is per-worker
+   while fds are unique across the process, so that lookup answers NIL.
+
+   The consequence is this branch's own thesis from a seventh direction.
+   FETCH-OUTSTANDING is set and never cleared, so every later FETCH-INTO on
+   that connection is refused for the rest of its life — which is exactly
+   what DELIVER-DNS-ERROR did before it delegated — and the failure
+   disposition never applies, so a :STREAMING target sits to
+   *STREAM-IDLE-TIMEOUT* when its upstream fails.
+
+   Two calls differing only in registration. The refused one is the claim;
+   the registered one is the control, and it is what makes the assertion
+   about ownership rather than about anything else in the call — same
+   connection object, same continuation, same worker state.
+
+   INITIATE-FETCH is stubbed because the control has to get *past* the
+   guards without dialing. The assertion is on the message rather than on
+   the fact of a raise, since six other guards also raise and only one of
+   them is this one."
+  (format t "~%Fetch-into: a connection this worker does not own~%")
+  (let ((real (symbol-function 'web-skeleton::initiate-fetch))
+        (epfd (web-skeleton::epoll-create)))
+    (setf (symbol-function 'web-skeleton::initiate-fetch)
+          (lambda (conn epoll-fd fetch-req)
+            (declare (ignore conn epoll-fd fetch-req))
+            t))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table))
+                (web-skeleton::*epoll-fd* epfd)
+                (conn (web-skeleton::make-connection
+                       :fd 4242
+                       :state :streaming
+                       :last-active (get-universal-time))))
+           ;; Not registered: what a connection owned by another worker
+           ;; looks like from here.
+           (check "fetch-into: a connection this worker does not own is refused"
+                  (let ((msg (attempt
+                              (fetch-into conn
+                                          (http-fetch
+                                           :get "http://127.0.0.1:1/x"
+                                           :then (lambda (s h b)
+                                                   (declare (ignore s h b))
+                                                   nil))))))
+                    (and (stringp msg)
+                         (search "not on this worker's connection table" msg)
+                         t))
+                  t)
+           ;; The control. Registering the same connection is the only
+           ;; change, and the call now reaches INITIATE-FETCH.
+           (web-skeleton::register-connection conn)
+           (check "fetch-into: and the same call is accepted once it is owned"
+                  (attempt
+                   (fetch-into conn
+                               (http-fetch
+                                :get "http://127.0.0.1:1/x"
+                                :then (lambda (s h b)
+                                        (declare (ignore s h b))
+                                        nil))))
+                  t))
+      (setf (symbol-function 'web-skeleton::initiate-fetch) real)
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 (defun test-fetch-failure-disposition-both-directions ()
   "A failed detached fetch closes a WebSocket under :CLOSE and does not
    under :KEEP.
@@ -4241,6 +4311,7 @@
   (test-fetch-failure-disposition-both-directions)
   (test-fetch-aborted-ws-at-the-backlog-bound)
   (test-fetch-failure-disposition-crosses-the-seam)
+  (test-fetch-into-refuses-a-foreign-connection)
   (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))
