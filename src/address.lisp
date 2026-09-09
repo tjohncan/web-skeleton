@@ -204,6 +204,16 @@
    reserved / future, unspecified, benchmarking, and cloud metadata
    IPs (169.254.169.254, fd00:ec2::254 via fc00::/7).
 
+   Also on the v6 side: 6to4 (2002::/16, unwrapped), Teredo (2001::/32,
+   refused whole — its two embedded IPv4 addresses are a relay and a
+   complemented client, so there is no single carried address to unwrap),
+   IPv6 benchmarking (2001:2::/48), ORCHID (2001:10::/28) and discard-only
+   (100::/64).
+
+   The list is exhaustive on purpose. This filter's value is that its
+   coverage can be read off rather than inferred, so a prefix added to the
+   code and not to this list costs more than one left out of both.
+
    IPv4-mapped IPv6 (::ffff:0:0/96) and NAT64 (64:ff9b::/96) are
    unwrapped and classified via their embedded IPv4 — an attacker
    cannot bypass the check by rewriting 127.0.0.1 as ::ffff:127.0.0.1.
