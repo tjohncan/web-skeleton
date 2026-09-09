@@ -341,7 +341,25 @@
    Signals if the connection is not streaming, or if it is already at
    *MAX-WRITE-BACKLOG* — the frame is not queued, not truncated, and the
    caller learns the peer is too far behind rather than discovering it
-   as a gap the peer can never detect."
+   as a gap the peer can never detect.
+
+   Does *not* check that CONN belongs to this worker, and that is the one
+   place this function differs from the other three write entry points.
+   WS-SEND, STREAM-CLOSE and FETCH-INTO all ask the connection table and
+   refuse a connection another worker owns; this one does not, so a
+   cross-worker call appends to an unsynchronised queue and calls send(2)
+   from the wrong thread. It is noticed only when the flush leaves a
+   remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
+   — the common case, where the bytes fit, returns T and says nothing.
+
+   That is the shape WS-SEND had before this branch and it is stated here
+   rather than fixed because fixing it is a contract change: today a
+   cross-worker STREAM-SEND mostly succeeds, and applications may be
+   relying on it accidentally. STREAM-CLOSE could be guarded without one,
+   since it already raised on that path every time. The rule for all four
+   is in README.md under Limitations; this paragraph exists so that a
+   reader who has seen the other three enforce it does not infer that
+   this one does."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
   (unless (eq (connection-state conn) :streaming)
     (error "stream-send: fd ~d is in state ~a, not :streaming"

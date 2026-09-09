@@ -369,19 +369,37 @@ read about here.
   written from the worker that owns it — the write queue has no lock precisely
   because nothing else touches it — so an application holding a registry of
   subscribers must hold one per worker and push from the owning thread.
-  `ws-send` and `fetch-into` both refuse a connection *another worker* owns,
-  and `ws-send` refuses before anything is queued; both were silent before.
-  The question they ask is "is this fd on **this worker's** table", and only a
-  worker can ask it. A thread that is not one — a timer, a queue consumer, a
-  background pump — has no table to check against, and `ws-send`,
-  `stream-send` and `stream-close` will queue and write from it without
-  complaint. `fetch-into` refuses that case too, but for its own reason: it
-  opens an outbound that needs an event loop to drive. Closing it for the other
-  three would mean refusing every call from outside an event loop — reachable,
-  but a contract change to three functions at once rather than a fix, and one
-  they have to make together or not at all. Fan-out *across* workers is not
-  provided, and building it needs a mechanism this framework deliberately does
-  not have.
+  There are four write entry points an application can reach, and **three of
+  the four refuse a connection another worker owns**: `ws-send`,
+  `stream-close` and `fetch-into` each ask the connection table and raise
+  before anything is queued. None of the three did before this branch:
+  `fetch-into` accepted the call outright, and `ws-send` and `stream-close`
+  raised only when the write left a remainder — after appending it, and in
+  `stream-close`'s case after telling the application the stream had closed
+  normally.
+
+  **`stream-send` is the exception and does not check.** A cross-worker
+  `stream-send` appends to the unsynchronised queue and calls `send(2)` from
+  the wrong thread; it is noticed only when the write leaves a remainder,
+  because the arm that follows gets `ENOENT` — so the common case, where the
+  bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
+  had before this branch. It is left alone because closing it is a contract
+  change rather than a fix: a cross-worker `stream-send` mostly succeeds today
+  and code may lean on that accidentally, where a cross-worker `stream-close`
+  already raised every time.
+
+  A second boundary, and it applies to all four: the question they ask is
+  "is this fd on **this worker's** table", and only a worker can ask it. A
+  thread that is not one — a timer, a queue consumer, a background pump — has
+  no table to check against, so all three checks are skipped and the writes go
+  through silently. `fetch-into` refuses that case too, but for its own
+  reason: it opens an outbound that needs an event loop to drive. Closing it
+  for the rest would mean refusing every call from outside an event loop —
+  reachable, but a change to three functions at once, and one they have to
+  make together or not at all.
+
+  Fan-out *across* workers is not provided, and building it needs a mechanism
+  this framework deliberately does not have.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy

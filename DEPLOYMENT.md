@@ -1018,6 +1018,13 @@ a worker. Nothing here is synchronized, though — `stream-send` is safe
 from the worker that owns the connection and nowhere else, so an app
 doing fan-out holds its own registry and pushes from the owning worker.
 
+`stream-send` will not tell you when you get that wrong. `ws-send`,
+`stream-close` and `fetch-into` all check the connection table and raise;
+`stream-send` does not, so a cross-worker call returns `T` unless the
+write happens to leave a remainder. Treat the rule above as the whole
+enforcement for this one function — see README.md's Limitations for why
+it is the exception.
+
 Framing follows the client. HTTP/1.1 gets `Transfer-Encoding: chunked`;
 HTTP/1.0 cannot read chunked at all, so it gets close-delimited framing
 with `Connection: close` and the socket goes when the stream ends. Both
