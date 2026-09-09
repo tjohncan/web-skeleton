@@ -438,7 +438,16 @@
 
    Arms EPOLLOUT before returning. The write path this hands to needs an
    event to run on, and the flush completing is exactly when nothing else
-   would have armed one — see the comment below."
+   would have armed one — see the comment below.
+
+   Signals if the state is not :STREAMING, and signals if that arming
+   fails. The second one is new and it is unconditional, where the arming
+   it replaced was skipped whenever the flush finished — so a stream
+   closed from the wrong worker now raises every time rather than only
+   when the terminator did not fit. That is the same guarantee WS-SEND
+   and FETCH-INTO make, reached by a different route: those two ask the
+   connection table, this one arms on every path anyway and lets
+   epoll_ctl answer with ENOENT."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))

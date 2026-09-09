@@ -555,10 +555,16 @@
   "Drain everything readable on CONN's fd into SINK and throw it away.
 
    Returns the same verdicts as CONNECTION-READ-AVAILABLE, and the cond
-   below is deliberately the same shape so the two can be read side by
+   below answers them in the same order so the two can be read side by
    side. The caller needs to tell 'the peer said something' from 'the
    peer is gone', and those two arrive in one wake-up often enough that
    collapsing them cost this framework two bugs already.
+
+   One arm more than its sibling, and deliberately. Both end with a
+   default that assumes a byte count; the sibling's ADDs that count to
+   READ-POS, so a verdict neither of them knows raises a type error
+   there, while this one only sets a flag and would spin. The extra arm
+   buys this function the noisy failure the other gets for free.
 
    Separate from CONNECTION-READ-AVAILABLE because that one accumulates
    into the connection's own read buffer — where, on a :STREAMING

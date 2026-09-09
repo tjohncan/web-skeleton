@@ -269,6 +269,7 @@
         ;; work in SBCL, and every other accumulator in this tree passes
         ;; :ADJUSTABLE T. REPLACE makes the question moot instead of
         ;; answering it.
+        ;;
         ;; Fill pointer first, then copy. REPLACE treats the fill pointer
         ;; as the vector's active end, so copying to :START1 (FILL-POINTER
         ;; OUT) before moving it writes into no active region at all and

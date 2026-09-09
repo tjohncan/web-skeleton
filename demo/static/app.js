@@ -20,7 +20,7 @@ function connect(onOpen) {
   if (ws && ws.readyState === 1) { if (onOpen) onOpen(); return; }
   if (ws && ws.readyState === 0) {
     if (onOpen) {
-      var prev = ws.onopen;
+      const prev = ws.onopen;
       ws.onopen = function (e) { if (prev) prev.call(ws, e); onOpen(); };
     }
     return;
