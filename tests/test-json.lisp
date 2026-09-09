@@ -62,6 +62,20 @@
          (json-get '(("a" . 1)) "a") 1)
   (check "json-get on a non-object returns nil, does not raise"
          (json-get "not-an-object" "a") nil)
+  ;; The array case, which the check above does not reach: a string takes
+  ;; JSON-GET's (T NIL) arm, so that assertion passed with or without the
+  ;; element test — the docstring names an array explicitly and nothing
+  ;; exercised one. ATTEMPT rather than a bare call because the defect is a
+  ;; raise, and an uncaught raise ends the run instead of failing a check.
+  (check "json-get on an array returns nil, does not raise"
+         (attempt (json-get (json-parse "[1,2]") "a")) nil)
+  (check "json-get on an array of objects returns nil, does not raise"
+         (attempt (json-get (json-parse "[{\"a\":1}]") "a")) nil)
+  ;; And the mixed shape PARSE-JWKS actually meets — an object whose value
+  ;; is an array — walked one level down.
+  (check "json-get through a nested array returns nil, does not raise"
+         (attempt (json-get (json-get (json-parse "{\"keys\":[1]}") "keys") "a"))
+         nil)
 
   ;; Whitespace tolerance
   (check "whitespace"
