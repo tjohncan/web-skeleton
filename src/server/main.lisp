@@ -1216,11 +1216,19 @@
              ;; is marked not to be reused. A client that gets a clean
              ;; close retries; one whose request vanished silently
              ;; waits forever.
-             (:ok
+             ;;
+             ;; Both verdicts mean the same thing here: the peer sent
+             ;; something. :OK-WANT-WRITE adds only that the transport wants
+             ;; writability before it will read again, which is the write
+             ;; path's business and not this one's — the bytes have already
+             ;; been discarded either way.
+             ((:ok :ok-want-write)
               (log-debug "stream peer sent data mid-stream fd ~d — ~
                           will not reuse" (connection-fd conn))
               (setf (connection-close-after-p conn) t))
-             ;; :again — spurious wake-up, nothing to do.
+             ;; :AGAIN and :WANT-WRITE, neither of which read anything: a
+             ;; spurious wake-up, or a transport that wants to write before
+             ;; it can read. Nothing to do for either.
              (t nil))))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
