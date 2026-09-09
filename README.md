@@ -364,15 +364,22 @@ The boundaries of the list above. Each is a deliberate choice rather than
 an oversight, but a boundary you meet in production is worse than one you
 read about here.
 
-- **Fan-out is per worker, and a cross-worker send is refused rather than
-  dropped.** A stream or a WebSocket can only be written from the worker that
-  owns it — the write queue has no lock precisely because nothing else touches
-  it — so an application holding a registry of subscribers must hold one per
-  worker and push from the owning thread. `ws-send` and `fetch-into` both
-  refuse a connection this worker does not own, and `ws-send` refuses before
-  anything is queued; both were silent before. Fan-out *across* workers is
-  not provided, and building it needs a mechanism this framework deliberately
-  does not have.
+- **Fan-out is per worker, and a send from the wrong worker is refused rather
+  than dropped — but only from a worker.** A stream or a WebSocket can only be
+  written from the worker that owns it — the write queue has no lock precisely
+  because nothing else touches it — so an application holding a registry of
+  subscribers must hold one per worker and push from the owning thread.
+  `ws-send` and `fetch-into` both refuse a connection *another worker* owns,
+  and `ws-send` refuses before anything is queued; both were silent before.
+  The question they ask is "is this fd on **this worker's** table", and only a
+  worker can ask it. A thread that is not one — a timer, a queue consumer, a
+  background pump — has no table to check against, and `ws-send`,
+  `stream-send` and `stream-close` will queue and write from it without
+  complaint. `fetch-into` refuses that case too, but for its own reason: it
+  opens an outbound that needs an event loop to drive. Closing it for the rest
+  would take a per-connection owner slot the connection struct does not carry.
+  Fan-out *across* workers is not provided, and building it needs a mechanism
+  this framework deliberately does not have.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy

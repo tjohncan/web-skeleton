@@ -1247,6 +1247,15 @@ a *backed-up* peer and waved through the far more common one to a peer that
 was keeping up — appending to the unsynchronised queue, calling `send(2)`
 from the wrong thread, and returning success.
 
+**It catches the wrong worker, not the wrong thread.** Asking whether an fd is
+on *this worker's* table requires being on a worker, so a thread that is not
+one — an application's own timer, a queue consumer, a background pump feeding a
+subscriber registry — finds no table, skips the check, and gets the old
+behaviour in full. `stream-send` and `stream-close` are the same. The rule that
+actually holds is the one at the top of this section: write to a connection
+only from the callback the framework handed it to you in. The refusal narrows
+what a mistake inside that rule costs; it does not replace the rule.
+
 ### Logging holds the only shared lock
 
 `log-msg` takes a single global mutex and holds it across both the

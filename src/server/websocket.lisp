@@ -419,6 +419,13 @@
    reason, and the two agree: both refuse every cross-worker call, not
    only the ones that happen to leave a remainder.
 
+   The wrong worker, not the wrong thread. Asking whether an fd is on this
+   worker's table takes a worker to ask from, so a call off the event loop
+   entirely — an application's own timer or queue consumer — finds no table
+   and gets the old behaviour. FETCH-INTO refuses that one as well, but for
+   an unrelated reason: it needs a loop to drive the outbound it opens.
+   Closing it here would take an owner slot on the connection.
+
    Signals also if the arming fails, and that one is not symmetric with the
    others: the frame has been queued and flushed by then, so the raise
    reports that the *remainder* has no event coming, not that the send did
