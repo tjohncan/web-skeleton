@@ -3832,10 +3832,18 @@
    disposition never applies, so a :STREAMING target sits to
    *STREAM-IDLE-TIMEOUT* when its upstream fails.
 
-   Two calls differing only in registration. The refused one is the claim;
-   the registered one is the control, and it is what makes the assertion
-   about ownership rather than about anything else in the call — same
-   connection object, same continuation, same worker state.
+   Two calls differing only in registration. The refused one is the claim.
+   The registered one guards against over-refusal — a guard that refuses
+   everything passes every test written only about what it rejects, which
+   is the trap the sibling refusal test names in its own docstring.
+
+   It is not a control in this suite's usual sense and should not be read
+   as one: it does not pass on both sides. Against main's source the first
+   call is accepted, which sets FETCH-OUTSTANDING, so the second is refused
+   by the sixth guard and this assertion fails too — as a cascade from the
+   defect rather than independently of it. Both failing is the correct
+   result there, and the reason is worth knowing before someone reads two
+   failures as two defects.
 
    INITIATE-FETCH is stubbed because the control has to get *past* the
    guards without dialing. The assertion is on the message rather than on
