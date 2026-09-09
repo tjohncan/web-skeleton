@@ -23,6 +23,20 @@
 
 ;;; *max-ws-payload-size* is defined in http.lisp alongside the other limits.
 
+(define-condition ws-frame-too-large (error)
+  ((message :initarg :message :reader ws-frame-too-large-message))
+  (:report (lambda (c s) (write-string (ws-frame-too-large-message c) s)))
+  (:documentation
+   "A single frame declaring more than *MAX-WS-PAYLOAD-SIZE* bytes.
+
+    Its own condition because RFC 6455 7.4.1 has 1009 (Message Too Big) for
+    it, and every other parse failure in TRY-PARSE-WS-FRAME is a protocol
+    error answered 1002. Without the distinction the oversized *frame* took
+    WEBSOCKET-ON-READ's catch-all and closed 1002, while the oversized
+    fragmented *message* — the same complaint one layer up — correctly
+    closed 1009 in two places. One file, two answers to one question,
+    which is the disagreement this codebase is organised against."))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Handshake
 ;;; ---------------------------------------------------------------------------
@@ -179,8 +193,9 @@
         (error "WebSocket: invalid payload length (MSB set)"))
       ;; Reject oversized frames early
       (when (> payload-length *max-ws-payload-size*)
-        (error "WebSocket: frame too large (~d bytes, max ~d)"
-               payload-length *max-ws-payload-size*))
+        (error 'ws-frame-too-large
+               :message (format nil "WebSocket: frame too large (~d bytes, max ~d)"
+                                payload-length *max-ws-payload-size*)))
       ;; Control frames (opcode >= 8): must have payload <= 125 and FIN=1
       ;; (RFC 6455 §5.5)
       (when (>= opcode 8)
@@ -446,9 +461,17 @@
       (multiple-value-bind (frame consumed)
           (handler-case
               (try-parse-ws-frame buf pos end)
+            ;; Ahead of the catch-all, and the only reason it is a separate
+            ;; clause: RFC 6455 7.4.1 answers an oversized frame 1009, the
+            ;; same code the oversized fragmented message already used two
+            ;; branches below. A client keying a retry policy on 1009 was
+            ;; told 1002 for one of the two shapes.
+            (ws-frame-too-large (e)
+              (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
+              (return-from websocket-on-read (close-with 1009)))
             (error (e)
-              ;; Protocol errors (RSV bits, oversized, unmasked, etc.)
-              ;; → close with 1002 per RFC 6455 §7.1.7
+              ;; Protocol errors (RSV bits, unmasked, bad opcode, etc.)
+              ;; → close with 1002 per RFC 6455 7.1.7
               (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
               (return-from websocket-on-read (close-with 1002))))
         (unless frame
