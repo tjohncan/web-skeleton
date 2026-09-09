@@ -80,9 +80,19 @@
                                 (y (%jwks-decode-coordinate y-b64 "y")))
                             (unless (and (= (length x) 32) (= (length y) 32))
                               (error "JWKS: EC P-256 key coordinates must be 32 bytes"))
-                            (make-jwt-key
-                             :kid (or (json-get key-obj "kid") "")
-                             :x x :y y))))))
+                            ;; Typed STRING in the struct, so a non-string kid
+                            ;; would raise a bare SBCL type error out of a
+                            ;; function that gives every other malformed
+                            ;; shape a clean "JWKS: ..." message. RFC 7517
+                            ;; 4.5 makes kid OPTIONAL and says nothing that
+                            ;; forbids a document from carrying a number
+                            ;; there.
+                            (let ((kid (json-get key-obj "kid")))
+                              (when (and kid (not (stringp kid)))
+                                (error "JWKS: kid must be a string when present"))
+                              (make-jwt-key
+                               :kid (or kid "")
+                               :x x :y y)))))))
     ;; Only dedup explicit (non-empty) kids. RFC 7517 §4.5 says kid
     ;; is OPTIONAL; a minimal static JWKS or a rotation-window set
     ;; with two kidless keys is spec-legal. Treating the "" default
