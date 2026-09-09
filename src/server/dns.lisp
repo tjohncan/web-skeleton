@@ -416,7 +416,20 @@
                       (connection-dns-host dns-conn))))
          (cond
            (parsed
-            (let ((dns-then (connection-dns-then dns-conn)))
+            (let ((dns-then (connection-dns-then dns-conn))
+                  (chained nil))
+              ;; CHAINED is what separates "the lookup failed" from "the
+              ;; lookup succeeded and tidying up after it did not", and the
+              ;; two stopped being the same question when DELIVER-DNS-ERROR
+              ;; started delegating. It used to know only about a parked
+              ;; inbound, so a raise from the cleanup below found no
+              ;; :AWAITING match and did nothing. Now it reaches
+              ;; DELIVER-DETACHED with :ABORTED — which would apply the
+              ;; target's failure disposition, closing a WebSocket or
+              ;; abandoning a stream, while the outbound DNS-THEN just
+              ;; opened is alive and still running the fetch it was asked
+              ;; for. Delegation is what made a failure to close a pipe
+              ;; into a failure of the fetch.
               (handler-case
                   (destructuring-bind (ip . family) parsed
                     ;; Remember the resolution before chaining to TCP: the
@@ -426,16 +439,26 @@
                     ;; filter, so nothing refused ever enters the cache.
                     (dns-cache-store (connection-dns-host dns-conn) ip family)
                     (funcall dns-then ip family)
-                    ;; dns-then succeeded — the new outbound now carries the
-                    ;; callback. Clear it on dns-conn so close-outbound
-                    ;; doesn't double-fire.
-                    (setf (connection-fetch-callback dns-conn) nil)
-                    (close-outbound dns-conn epoll-fd))
+                    (setf chained t))
                 (error (e)
                   ;; dns-then failed — callback still on dns-conn, so
                   ;; close-outbound fires the cleanup sentinel.
                   (log-warn "dns: chain to TCP failed: ~a" e)
-                  (deliver-dns-error dns-conn epoll-fd)))))
+                  (deliver-dns-error dns-conn epoll-fd)))
+              (when chained
+                ;; The new outbound carries the callback now. Clear it here
+                ;; so close-outbound doesn't double-fire.
+                (setf (connection-fetch-callback dns-conn) nil)
+                ;; Logged, not delivered. Everything this fetch needs has
+                ;; already moved to the new outbound; what is left is a
+                ;; resolved pipe and its child. Failing to reap them leaks
+                ;; an fd, which is worth a line in the log and is not worth
+                ;; ending a live fetch over.
+                (handler-case (close-outbound dns-conn epoll-fd)
+                  (error (e)
+                    (log-warn "dns: closing the resolved pipe on fd ~d ~
+                               failed: ~a"
+                              (connection-fd dns-conn) e))))))
            ((member result '(:eof :ok-eof))
             ;; No parseable STREAM row, or every address the name
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both

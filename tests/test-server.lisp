@@ -7102,6 +7102,105 @@
       (ignore-errors (web-skeleton::%close targetfd))
       (ignore-errors (web-skeleton::%close epfd)))))
 
+(defun test-dns-chain-success-survives-a-failed-teardown ()
+  "A resolution that succeeded is not undone by a failure to clean up
+   after it.
+
+   The other side of the delegation the test above covers. HANDLE-DNS-
+   READY's HANDLER-CASE used to span two steps that run *after* DNS-THEN
+   has already returned — clearing the callback and closing the resolved
+   pipe. A raise there was harmless while DELIVER-DNS-ERROR knew only
+   about a parked inbound: the inbound's AWAITING-FD had already moved,
+   so the lookup matched nothing and the failure went nowhere. Delegating
+   to DELIVER-FETCH-ERROR is what made it consequential — the same raise
+   now reaches DELIVER-DETACHED with :ABORTED and applies the target's
+   failure disposition, closing a WebSocket whose fetch is alive and
+   running on the outbound DNS-THEN just opened.
+
+   CLOSE-OUTBOUND raises once and then works, which is the shape that
+   makes this a detector rather than a vacuous pass. A stub that always
+   raised would raise a second time inside DELIVER-FETCH-ERROR — before
+   it reaches DELIVER-DETACHED — so the target would come out untouched
+   against the old code too, and the assertions would agree for the wrong
+   reason.
+
+   DNS-THEN only sets a flag. Its contract here is that it returned
+   normally; what it built is the next test's subject, not this one's."
+  (format t "~%DNS: a succeeded chain survives a failed teardown~%")
+  (let ((real (symbol-function 'web-skeleton::close-outbound)))
+    (flet ((run (raise-once)
+             (let ((calls 0)
+                   (chained nil)
+                   (epfd (web-skeleton::epoll-create))
+                   (targetfd (web-skeleton::epoll-create))
+                   (proc (sb-ext:run-program "/bin/true" nil
+                                             :output :stream :wait t)))
+               (unwind-protect
+                    (let* ((dnsfd (sb-sys:fd-stream-fd
+                                   (sb-ext:process-output proc)))
+                           (web-skeleton::*connections*
+                             (make-hash-table :test #'eql))
+                           (line (sb-ext:string-to-octets
+                                  (format nil "127.0.0.1       STREAM localhost~%")
+                                  :external-format :ascii))
+                           (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                           (target (web-skeleton::make-connection
+                                    :fd targetfd :state :websocket
+                                    :fetch-outstanding t
+                                    :fetch-failure-disposition :close
+                                    :last-active (get-universal-time)))
+                           (dns-conn (web-skeleton::make-connection
+                                      :fd dnsfd :state :out-dns
+                                      :outbound-p t
+                                      :fetch-sink :detached
+                                      :inbound-fd targetfd
+                                      :dns-host "localhost"
+                                      :dns-then (lambda (ip family)
+                                                  (declare (ignore ip family))
+                                                  (setf chained t))
+                                      :fetch-callback
+                                      (lambda (s h b)
+                                        (declare (ignore s h b))
+                                        nil)
+                                      :last-active (get-universal-time))))
+                      (replace buf line)
+                      (setf (web-skeleton::connection-read-buf dns-conn) buf
+                            (web-skeleton::connection-read-pos dns-conn)
+                            (length line))
+                      (web-skeleton::register-connection target)
+                      (web-skeleton::register-connection dns-conn)
+                      ;; Raises on the first call only. The second — the one
+                      ;; DELIVER-FETCH-ERROR makes on the old path — has to
+                      ;; succeed, or the disposition is never reached and the
+                      ;; two sides of the revert look alike.
+                      (setf (symbol-function 'web-skeleton::close-outbound)
+                            (lambda (c e)
+                              (incf calls)
+                              (if (and raise-once (= calls 1))
+                                  (error "close-outbound: simulated teardown failure")
+                                  (funcall real c e))))
+                      (web-skeleton::handle-dns-ready dns-conn epfd)
+                      (list chained
+                            (web-skeleton::connection-state target)
+                            (web-skeleton::connection-fetch-outstanding target)))
+                 (setf (symbol-function 'web-skeleton::close-outbound) real)
+                 (ignore-errors (sb-ext:process-close proc))
+                 (ignore-errors (web-skeleton::%close targetfd))
+                 (ignore-errors (web-skeleton::%close epfd))))))
+      ;; The control. Nothing raises, so nothing about the target should
+      ;; move — and nothing does on either side of the revert.
+      (let ((clean (run nil)))
+        (check "dns teardown control: the chain ran" (first clean) t)
+        (check "dns teardown control: the target is untouched"
+               (rest clean) '(:websocket t)))
+      ;; The claim.
+      (let ((failed (run t)))
+        (check "dns teardown: the chain still ran" (first failed) t)
+        (check "dns teardown: a failed close does not close the target"
+               (second failed) :websocket)
+        (check "dns teardown: nor clear the marker on a live fetch"
+               (third failed) t)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
 ;;; ---------------------------------------------------------------------------
@@ -8497,6 +8596,7 @@
   (test-dns-cache)
   (test-dns-lookup-sink)
   (test-dns-error-ends-a-detached-fetch)
+  (test-dns-chain-success-survives-a-failed-teardown)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
