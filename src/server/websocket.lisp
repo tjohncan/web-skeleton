@@ -363,6 +363,16 @@
 ;;; Adding EPOLLIN would instead let a handler be re-entered against a full
 ;;; queue, which is where WS-SEND signals — turning a slow peer into a dead
 ;;; connection.
+;;;
+;;; And it bounds per-connection memory, which is what makes the exclusive
+;;; convention a design rather than an accident. While EPOLLIN is dropped
+;;; HANDLE-CLIENT-READ does not run, so WS-FRAG-BUF cannot grow: a peer
+;;; cannot keep pushing fragments into reassembly while its write side is
+;;; stuck. Under the combined mask the worst case per connection becomes
+;;; *MAX-WRITE-BACKLOG* and *MAX-WS-MESSAGE-SIZE* and the read buffer all at
+;;; once, rather than in alternation. The kernel receive buffer filling and
+;;; the peer's send window closing is the correct backpressure for a peer
+;;; that will not drain, and this mask is what produces it.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
