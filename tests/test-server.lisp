@@ -8247,39 +8247,61 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-oversized-frame-close-code ()
-  "An oversized single frame closes 1009, not 1002.
+  "An oversized data frame closes 1009; an oversized control frame closes 1002.
 
-   RFC 6455 7.4.1 has 1009 (Message Too Big) for this, and the oversized
-   fragmented *message* — the same complaint one layer up — already closed
-   1009 in two places. The single frame raised out of TRY-PARSE-WS-FRAME as
-   a generic error, took WEBSOCKET-ON-READ's catch-all, and closed 1002.
-   One file, two answers to one question.
+   RFC 6455 7.4.1 has 1009 (Message Too Big) for the data case, and the
+   oversized fragmented *message* — the same complaint one layer up —
+   already closed 1009 in two places. The single frame raised out of
+   TRY-PARSE-WS-FRAME as a generic error, took WEBSOCKET-ON-READ's
+   catch-all, and closed 1002. One file, two answers to one question.
+
+   The control frame is the other half, and it wants the other code.
+   *MAX-WS-PAYLOAD-SIZE* is a limit this endpoint chose, so exceeding it
+   is 1009 — 'too big for me'. §5.5 caps every control frame at 125 bytes
+   for everyone, so exceeding *that* is malformed rather than inconvenient
+   and earns 1002. Introducing WS-FRAME-TOO-LARGE above the §5.5 check
+   meant a ping declaring more than 64 KiB took the size check first and
+   was told its message was too big for us, when what was wrong with it is
+   that no endpoint may send it.
 
    Driven through WEBSOCKET-ON-READ rather than by asserting the condition
    type, because the code on the wire is the claim and the condition is
-   only how it gets there. The control is the neighbouring 1002 test, which
+   only how it gets there. The neighbouring 1002 test is a control that
    still passes: an unknown opcode is a protocol error and keeps its code.
 
    *MAX-WS-PAYLOAD-SIZE* is lowered rather than a real 1 MiB frame built.
    What the parser compares is the declared length against the bound, and a
    small bound reaches that comparison with eight bytes instead of a
-   megabyte."
+   megabyte. The ping needs 200 — over §5.5's 125 *and* over the lowered
+   bound, since a frame that trips only one of them cannot tell which
+   check ran first."
   (format t "~%ws: the close code for a frame that is too large~%")
-  (let* ((web-skeleton::*max-ws-payload-size* 4)
-         (big  (make-masked-frame t 1 #(104 101 108 108 111 32 119 111)))
-         (conn (web-skeleton::make-connection
-                :fd -1 :state :websocket :last-active 0)))
-    (setf (web-skeleton::connection-read-buf conn) big
-          (web-skeleton::connection-read-pos conn) (length big))
-    (multiple-value-bind (action response)
-        (web-skeleton::websocket-on-read
-         conn (lambda (c f) (declare (ignore c f)) nil))
-      (check "oversized frame: the connection closes" action :close)
-      (check "oversized frame: with 1009, not 1002"
-             (and response
-                  (>= (length response) 4)
-                  (logior (ash (aref response 2) 8) (aref response 3)))
-             1009))))
+  (flet ((close-code-for (frame)
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :websocket :last-active 0)))
+             (setf (web-skeleton::connection-read-buf conn) frame
+                   (web-skeleton::connection-read-pos conn) (length frame))
+             (multiple-value-bind (action response)
+                 (web-skeleton::websocket-on-read
+                  conn (lambda (c f) (declare (ignore c f)) nil))
+               (values action
+                       (and response
+                            (>= (length response) 4)
+                            (logior (ash (aref response 2) 8)
+                                    (aref response 3))))))))
+    (let ((web-skeleton::*max-ws-payload-size* 4))
+      (multiple-value-bind (action code)
+          (close-code-for (make-masked-frame t 1 #(104 101 108 108 111 32 119 111)))
+        (check "oversized frame: the connection closes" action :close)
+        (check "oversized frame: with 1009, not 1002" code 1009))
+      ;; Opcode 9 is ping. 200 bytes is over both bounds, so the code that
+      ;; comes back names which check the parser reached first.
+      (multiple-value-bind (action code)
+          (close-code-for
+           (make-masked-frame t 9 (make-array 200 :element-type '(unsigned-byte 8)
+                                                  :initial-element 65)))
+        (check "oversized control frame: the connection closes" action :close)
+        (check "oversized control frame: with 1002, not 1009" code 1002)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The verdict the discard loop used to spin on

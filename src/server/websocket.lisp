@@ -191,19 +191,30 @@
       ;; RFC 6455 §5.2: 64-bit length MSB must be 0
       (when (logbitp 63 payload-length)
         (error "WebSocket: invalid payload length (MSB set)"))
-      ;; Reject oversized frames early
-      (when (> payload-length *max-ws-payload-size*)
-        (error 'ws-frame-too-large
-               :message (format nil "WebSocket: frame too large (~d bytes, max ~d)"
-                                payload-length *max-ws-payload-size*)))
       ;; Control frames (opcode >= 8): must have payload <= 125 and FIN=1
       ;; (RFC 6455 §5.5)
+      ;;
+      ;; Ahead of the size check below, and the order is the close code.
+      ;; WS-FRAME-TOO-LARGE closes 1009, which is the right answer for a
+      ;; data frame this endpoint will not buffer — a limit we chose. A
+      ;; control frame over 125 bytes is not a limit we chose: §5.5 makes
+      ;; it malformed for anyone, so 1002 is what it earns. Below the size
+      ;; check, a ping declaring a megabyte got 1009 and told the peer its
+      ;; message was too big for us rather than that its frame was
+      ;; illegal. Both checks read the declared length out of the header,
+      ;; so nothing is buffered either way and the early reject survives
+      ;; the reordering.
       (when (>= opcode 8)
         (when (> payload-length 125)
           (error "WebSocket: control frame payload too large (~d bytes, max 125)"
                  payload-length))
         (unless fin
           (error "WebSocket: fragmented control frame")))
+      ;; Reject oversized frames early
+      (when (> payload-length *max-ws-payload-size*)
+        (error 'ws-frame-too-large
+               :message (format nil "WebSocket: frame too large (~d bytes, max ~d)"
+                                payload-length *max-ws-payload-size*)))
       ;; Account for mask key
       (when masked (incf header-size 4))
       ;; Check if we have the full frame
