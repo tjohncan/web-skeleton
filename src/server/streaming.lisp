@@ -441,23 +441,42 @@
    would have armed one — see the comment below.
 
    Signals if the state is not :STREAMING, and signals if that arming
-   fails. The second one is new and it is unconditional, where the arming
-   it replaced was skipped whenever the flush finished — so a stream
-   closed from the wrong worker now raises every time rather than only
-   when the terminator did not fit.
+   fails. The second is unconditional, where the arming it replaced was
+   skipped whenever the flush finished — so a failure to arm is reported
+   every time rather than only when the terminator did not fit.
 
-   That is detection, not refusal, and the difference is the one WS-SEND
-   draws about its own arming raise. WS-SEND and FETCH-INTO ask the
-   connection table before anything is touched, so a cross-worker call
-   leaves no trace. This one arms last — after the terminator has been
-   appended and flushed with send(2) from the wrong thread, after
-   ON-CLOSE has fired :DONE, and after the state has moved to
-   :WRITE-RESPONSE — so epoll_ctl's ENOENT reports a misuse already
-   committed, under an errno rather than a name. Closing that gap needs
-   the table check WS-SEND has; an unconditional arm is not it."
+   Signals, before either of those has a chance to matter, if CONN is not
+   on this worker's connection table — the same check WS-SEND and
+   FETCH-INTO make, before anything is touched.
+
+   The arm was the only thing that noticed a cross-worker close, and it
+   arms last: by then the terminator has been appended to another
+   worker's unlocked queue and put on the wire with send(2) from the
+   wrong thread, the state has moved to :WRITE-RESPONSE, and ON-CLOSE
+   has fired :DONE. That last one is why this is a guard rather than a
+   documented limitation. NOTIFY-STREAM-CLOSED nulls the slot before
+   calling so the callback fires exactly once, so the owning worker's own
+   teardown notification is afterwards a no-op — the application's first
+   and last word about that stream is :DONE, it is false, and nothing can
+   correct it. A corrupted queue is at least a thing the framework knows
+   about; telling an app its stream ended normally when it did not is not."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
+  ;; Before the terminator, the state change and the notification, for the
+  ;; reason the docstring gives: each of those is a commitment, and the
+  ;; notification cannot be taken back. Conditional on *EPOLL-FD* exactly
+  ;; as WS-SEND's is — off a worker there is no table to ask, which is the
+  ;; harness's case and not the misuse being caught.
+  (when (and *epoll-fd*
+             (not (eq (lookup-connection (connection-fd conn)) conn)))
+    (error "stream-close: fd ~d is not on this worker's connection table. ~
+            A stream can only be closed from the worker that owns it — the ~
+            write queue has no lock precisely because nothing else touches ~
+            it, and ON-CLOSE fires exactly once, so closing from here would ~
+            tell the application :DONE about a stream this thread cannot ~
+            finish."
+           (connection-fd conn)))
   (when (eq (connection-stream-framing conn) :chunked)
     (unless (connection-append-write conn (chunked-terminator))
       ;; No room for five bytes means the peer is hopelessly behind. The

@@ -8144,6 +8144,90 @@
                 t)
            t)))
 
+(defun test-stream-close-refuses-a-foreign-connection ()
+  "STREAM-CLOSE refuses a connection this worker does not own.
+
+   The witness is the ON-CLOSE counter, not the write queue, and that is
+   the whole design of this test. Copying WS-SEND's fixture would be the
+   natural instinct and would pin nothing: a five-byte terminator flushes
+   completely on any socket with room, so WRITE-PENDING is 0 wherever the
+   guard sits. That is the vacuous shape the WS-SEND fixture had to be
+   rebuilt to escape, and it would be rebuilt here for the same reason.
+
+   What cannot be undone is the notification. NOTIFY-STREAM-CLOSED nulls
+   the slot before calling so the callback fires exactly once — so a
+   cross-worker close tells the application :DONE, and the owning
+   worker's own teardown notification afterwards is a no-op. The app's
+   first and last word about that stream is a false one. A counter that
+   stays at 0 is the assertion that no such word was said.
+
+   CONNECTION-STATE is the second witness and it pins the placement
+   directly. Moved to just before the arm — the natural wrong spot, since
+   that mirrors where the only previous check lived — the raise still
+   carries the right message and PENDING is still 0, but the counter is 1
+   and the state has moved to :WRITE-RESPONSE. Both go red there and
+   neither depends on socket-buffer behaviour.
+
+   Real sockets on both sides, not epoll descriptors. The control has to
+   reach CONNECTION-ON-WRITE and put the terminator on a wire, and an
+   epoll fd raises from send(2) — which would fail the control for a
+   fixture reason and, worse, would give the *foreign* connection a
+   second way to raise once the guard is reverted, confounding the
+   detector with an ENOTSOCK it was never about."
+  (format t "~%stream-close: a connection this worker does not own~%")
+  (multiple-value-bind (fserver fclient) (%loopback-pair)
+    (multiple-value-bind (oserver oclient) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((fires 0)
+                    (ffd (web-skeleton::socket-fd fserver))
+                    (ofd (web-skeleton::socket-fd oserver))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    (on-close (lambda (c reason)
+                                (declare (ignore c reason))
+                                (incf fires)))
+                    (foreign (web-skeleton::make-connection
+                              :fd ffd :socket fserver :state :streaming
+                              :stream-framing :chunked
+                              :stream-on-close on-close
+                              :last-active (get-universal-time)))
+                    (owned (web-skeleton::make-connection
+                            :fd ofd :socket oserver :state :streaming
+                            :stream-framing :chunked
+                            :stream-on-close on-close
+                            :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking ffd)
+               (web-skeleton::set-nonblocking ofd)
+               ;; On neither the table nor the epoll set.
+               (check "stream close: a connection this worker does not own is refused"
+                      (handler-case (progn (web-skeleton:stream-close foreign) nil)
+                        (error (e)
+                          (not (null (search "not on this worker's connection table"
+                                             (princ-to-string e))))))
+                      t)
+               (check "stream close: the refusal told the app nothing"
+                      fires 0)
+               (check "stream close: nor moved the connection out of :streaming"
+                      (web-skeleton::connection-state foreign) :streaming)
+               ;; The control. Registered and armed, so the terminator has a
+               ;; write path to be handed to.
+               (web-skeleton::register-connection owned)
+               (web-skeleton::epoll-add epfd ofd
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (check "stream close: a connection this worker owns still closes"
+                      (handler-case (progn (web-skeleton:stream-close owned) :closed)
+                        (error (e) (format nil "signalled: ~a" e)))
+                      :closed)
+               (check "stream close: and that one did tell the app"
+                      fires 1))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close fserver))
+          (ignore-errors (sb-bsd-sockets:socket-close fclient))
+          (ignore-errors (sb-bsd-sockets:socket-close oserver))
+          (ignore-errors (sb-bsd-sockets:socket-close oclient)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The remainder a fetch callback leaves behind
 ;;;
@@ -8685,6 +8769,7 @@
   (test-ws-send-arms-from-a-fetch-callback)
   (test-ws-send-arms-a-fan-out-target)
   (test-stream-close-arms-the-write-path)
+  (test-stream-close-refuses-a-foreign-connection)
   (test-cpu-count-parsers)
   (test-ws-oversized-frame-close-code)
   (test-discard-available-want-write)
