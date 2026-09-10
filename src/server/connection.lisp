@@ -555,10 +555,16 @@
   "Drain everything readable on CONN's fd into SINK and throw it away.
 
    Returns the same verdicts as CONNECTION-READ-AVAILABLE, and the cond
-   below is deliberately the same shape so the two can be read side by
+   below answers them in the same order so the two can be read side by
    side. The caller needs to tell 'the peer said something' from 'the
    peer is gone', and those two arrive in one wake-up often enough that
    collapsing them cost this framework two bugs already.
+
+   One arm more than its sibling, and deliberately. Both end with a
+   default that assumes a byte count; the sibling's ADDs that count to
+   READ-POS, so a verdict neither of them knows raises a type error
+   there, while this one only sets a flag and would spin. The extra arm
+   buys this function the noisy failure the other gets for free.
 
    Separate from CONNECTION-READ-AVAILABLE because that one accumulates
    into the connection's own read buffer — where, on a :STREAMING
@@ -576,6 +582,20 @@
         (cond
           ((eq result :eof)   (return (if any-read :ok-eof :eof)))
           ((eq result :again) (return (if any-read :ok :again)))
+          ;; The same arm CONNECTION-READ-AVAILABLE carries, for the reason
+          ;; the docstring above gives: the two are meant to be readable
+          ;; side by side, and they were not. Without it :WANT-WRITE fell
+          ;; into the integer default and this loop spun inside the event
+          ;; loop with no exit. Unreachable today — the only caller is the
+          ;; :STREAMING inbound path and there is no inbound TLS — which is
+          ;; exactly how long a spin like this stays invisible.
+          ((eq result :want-write)
+           (return (if any-read :ok-want-write :want-write)))
+          ;; Defensive, and not redundant with the arm above: a fifth
+          ;; verdict added to CONNECTION-READ-INTO would otherwise
+          ;; reintroduce the spin here rather than fail. Anything that is
+          ;; not a byte count is handed back rather than counted.
+          ((not (integerp result)) (return result))
           (t (setf any-read t)))))))
 
 ;;; ---------------------------------------------------------------------------

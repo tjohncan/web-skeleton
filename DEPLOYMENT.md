@@ -188,8 +188,13 @@ own section below for why pre-built bytes omit it.
 
 `status-reason` covers the codes above plus the ones handlers commonly
 need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx
-set. It is deliberately not exhaustive: for anything else, set the status
-and supply your own reason phrase.
+set. It is deliberately not exhaustive, and there is no way to supply your
+own reason phrase: `format-response` always asks `status-reason`, and a status
+outside the table is emitted as `HTTP/1.1 451 Unknown`. That is deliberate —
+the table's own docstring says `Unknown` is the answer — but the reason phrase
+has no semantic weight in HTTP/1.1, so a client reads the code and ignores it.
+If you need a status the table does not carry, use it; the line is well-formed
+and the code is what is read.
 
 ### WebSocket origin validation
 
@@ -853,9 +858,29 @@ it on every pass rather than tracking state is not punished for it.
 sounds.** Reading resumes when the connection being relayed into drains
 its write backlog — the event the pause was waiting for. That needs the
 target to have *actually backed up*. `stream-send` and `ws-send` flush
-inline and never reach the event loop's write path, so a pause taken
-while the target's queue was empty has no drain coming, and only an
-explicit `fetch-resume` restarts it.
+inline, and a flush that completes never reaches the event loop's write
+path, so a pause taken while the target's queue was empty has no drain
+coming, and only an explicit `fetch-resume` restarts it.
+
+The shape that avoids the question is to ask before pausing. `stream-full-p`
+is exported for exactly this — it runs the same test `connection-append-write`
+runs internally — so a producer can give the verdict only when there is a drain
+that will end it:
+
+```lisp
+:on-body (lambda (out chunk)
+           (declare (ignore out))
+           (stream-send client chunk)
+           ;; :pause only when the target has actually backed up. Pausing
+           ;; on an empty queue has no drain coming and strands the fetch
+           ;; until *fetch-timeout*, on an upstream that was healthy.
+           (when (stream-full-p client) :pause))
+```
+
+The same shape works for a `:websocket` target through
+`connection-write-pending`, which is exported for the same reason. What you
+must not do is return `:pause` unconditionally and rely on something to lift
+it: nothing will, unless the queue was non-empty when you said it.
 
 The deadline runs on unpaused time: `fetch-resume` pushes it out by the
 interval spent paused, so a relay is not killed for applying the
@@ -993,6 +1018,13 @@ a worker. Nothing here is synchronized, though — `stream-send` is safe
 from the worker that owns the connection and nowhere else, so an app
 doing fan-out holds its own registry and pushes from the owning worker.
 
+`stream-send` will not tell you when you get that wrong. `ws-send`,
+`stream-close` and `fetch-into` all check the connection table and raise;
+`stream-send` does not, so a cross-worker call returns `T` unless the
+write happens to leave a remainder. Treat the rule above as the whole
+enforcement for this one function — see README.md's Limitations for why
+it is the exception.
+
 Framing follows the client. HTTP/1.1 gets `Transfer-Encoding: chunked`;
 HTTP/1.0 cannot read chunked at all, so it gets close-delimited framing
 with `Connection: close` and the socket goes when the stream ends. Both
@@ -1111,6 +1143,12 @@ Call it from within `ws-handler` to send multiple frames
 during a single handler invocation — the event loop is paused while the handler runs,
 so there is no write contention.
 
+It is also callable from a fetch callback on a `:websocket` target, which
+is what a relay does. That runs on the *outbound* connection's read path
+rather than the target's, so nothing downstream is going to arm the
+target's write interest afterwards — `ws-send` arms it itself, and only
+when a flush leaves a remainder behind.
+
 ```lisp
 (defun handle-ws-message (conn frame)
   (when (= (ws-frame-opcode frame) +ws-op-text+)
@@ -1187,6 +1225,43 @@ queue over calling `ws-send` in a loop. It now costs that subscriber its
 own connection and nothing else. `ws-send` returns NIL when it leaves a
 remainder, so a broadcast loop that wants to know which subscribers are
 falling behind can see it without tracking anything itself.
+
+That sentence was not true until recently, and the gap is worth naming
+because the shape it broke is the one this section recommends.
+`handle-client-read` arms the connection it was woken for — the one whose
+handler is running. A frame pushed to *another* connection had nothing
+downstream to arm it, so a lagging subscriber did not cost its own
+connection: it got a truncated message, with every `ws-send` reporting
+success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
+connection it wrote to whenever it leaves a remainder, which is what makes
+the paragraph above describe the code.
+
+One boundary on "nothing else", and it is the sender rather than the
+subscriber. A `ws-send` to a connection belonging to a *different worker*
+raises, and the raise is caught by the handler-case around the handler that
+made the call. That closes the sender's connection, not the subscriber's.
+Fan out only over connections this worker owns; a registry that spans
+workers needs a different mechanism, which the sharing note above says the
+framework does not provide.
+
+The check is an explicit one — is this fd on *this* worker's connection
+table — and it runs before the frame is queued. Arming was doing that job
+by accident for a while, since `epoll_ctl` on an fd this worker's epoll
+instance does not hold gives `ENOENT`, and file descriptors are
+process-wide while epoll instances are not. But arming only happens when
+the flush leaves a remainder, so the accident caught a cross-worker send to
+a *backed-up* peer and waved through the far more common one to a peer that
+was keeping up — appending to the unsynchronised queue, calling `send(2)`
+from the wrong thread, and returning success.
+
+**It catches the wrong worker, not the wrong thread.** Asking whether an fd is
+on *this worker's* table requires being on a worker, so a thread that is not
+one — an application's own timer, a queue consumer, a background pump feeding a
+subscriber registry — finds no table, skips the check, and gets the old
+behaviour in full. `stream-send` and `stream-close` are the same. The rule that
+actually holds is the one at the top of this section: write to a connection
+only from the callback the framework handed it to you in. The refusal narrows
+what a mistake inside that rule costs; it does not replace the rule.
 
 ### Logging holds the only shared lock
 

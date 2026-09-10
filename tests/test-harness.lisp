@@ -1631,10 +1631,11 @@
                    n workers)))))))
 
 (defun %raw-connect ()
-  "A raw socket to the live test server, plus its byte stream."
-  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
-                               :type :stream :protocol :tcp)))
-    (sb-bsd-sockets:socket-connect socket #(127 0 0 1) *test-port*)
+  "A raw socket to the live test server, plus its byte stream.
+
+   Through CONNECT-TO-TEST-SERVER so the client family follows whatever
+   WITH-TEST-SERVER bound, rather than assuming IPv4."
+  (let ((socket (connect-to-test-server)))
     (values socket
             (sb-bsd-sockets:socket-make-stream
              socket :input t :output t :element-type '(unsigned-byte 8)))))
@@ -2763,9 +2764,9 @@
              (web-skeleton::decode-chunked-body raw (+ hend 4) (length raw))
              :external-format :ascii)
           (error (e) (princ-to-string e))))))
-
 (defun test-harness-fetch-into-relay-e2e ()
-  "The relay DEPLOYMENT.md described, now that it dials.
+  "The relay DEPLOYMENT.md described, now that it dials — and through the
+   real resolver.
 
    A streaming response whose :ON-OPEN starts a fetch, forwards each chunk
    into its own body as the framing proves it, and closes when the upstream
@@ -2776,12 +2777,46 @@
 
    Asserted on the decoded body rather than on bytes arriving, because the
    defect's signature was a body that never terminated — a check that only
-   looked for content would have passed against it."
+   looked for content would have passed against it.
+
+   The upstream is dialled by **name**, which is what makes this the only
+   e2e in the suite to reach INITIATE-DNS-LOOKUP on its success path. Every
+   other FETCH-INTO here dials an IP literal and takes INITIATE-HTTP-FETCH's
+   PARSE-IPV4-LITERAL fast path straight past it — which is how three
+   defects lived in that function behind a green suite.
+
+   Both ends are moved together rather than one end being assumed. The
+   listener binds whatever RESOLVE-HOST-BLOCKING answers for the same name
+   the fetch will dial, and CONNECT-TO-TEST-SERVER dispatches the client
+   socket on that vector's length exactly as MAKE-TCP-LISTENER dispatches
+   the bind. So the family is whatever this machine's resolver prefers, and
+   agreement is by construction rather than by assumption: a host whose
+   /etc/hosts orders `::1 localhost` first binds and dials v6, one that
+   orders IPv4 first binds and dials v4, and neither can reach a listener
+   that is not there. Pinning either end to a literal is what would make
+   this environment-dependent.
+
+   That the name resolves at all is asserted rather than skipped on. A
+   machine without it cannot run the rest, and a test that quietly does not
+   run is worse than one that fails saying why."
   (format t "~%Harness: fetch-into, the documented relay~%")
-  (let ((port-box (list nil))
-        (then-fires 0))
+  (let* ((port-box (list nil))
+         (then-fires 0)
+         ;; The framework's own resolver, so the listener and the fetch
+         ;; cannot disagree about the family: whatever this answers is what
+         ;; INITIATE-DNS-LOOKUP will answer for the same name a moment
+         ;; later, out of the same getent.
+         (host-vec (web-skeleton::resolve-host-blocking "localhost")))
+    ;; Asserted rather than skipped on. A machine where this name does not
+    ;; resolve cannot run the rest, and a test that quietly does not run is
+    ;; the failure mode this suite spends its docstrings avoiding — so it
+    ;; fails here, by name, ahead of the assertions that would fail
+    ;; confusingly.
+    (check "fetch-into relay: the name the fetch will dial resolves"
+           (and host-vec t) t)
     (with-test-server
-        (:handler
+        (:host host-vec
+         :handler
          (lambda (req)
            (if (search "/up" (http-request-path req))
                (make-stream-response
@@ -2795,7 +2830,7 @@
                   (fetch-into
                    client
                    (http-fetch
-                    :get (format nil "http://127.0.0.1:~d/up"
+                    :get (format nil "http://localhost:~d/up"
                                  (first port-box))
                     :on-body (lambda (out chunk)
                                (declare (ignore out))
@@ -2822,6 +2857,157 @@
       (check "fetch-into relay: :then fired exactly once" then-fires 1)
       (check "fetch-into relay: no outbound left behind"
              (census-await :outbound 0) 0))))
+
+(defun test-harness-fetch-into-dns-failure-e2e ()
+  "A detached fetch to a name that will not resolve, end to end, through the
+   real resolver.
+
+   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all, and there
+   were none before them. Every other e2e FETCH-INTO dials an IP literal,
+   which takes INITIATE-HTTP-FETCH's fast path on PARSE-IPV4-LITERAL and
+   never enters the function — which is how three defects lived there
+   behind a green suite. Every unit detector for them drives the seam; this
+   one spawns getent.
+
+   RFC 2606 reserves .invalid, so the lookup fails on every machine and
+   reaches no network.
+
+   The success half is TEST-HARNESS-FETCH-INTO-RELAY-E2E, which dials a
+   resolvable name against a listener bound to whatever that same name
+   resolves to. Two tests rather than one because the halves want opposite
+   things from the resolver: this one wants a name that fails everywhere,
+   and that one wants a name that succeeds everywhere.
+
+   The assertion is the *second* fetch. :THEN receives the abort sentinel
+   and immediately starts another FETCH-INTO on the same connection, which
+   FETCH-INTO refuses on either of two guards if the DNS phase mishandled
+   the target: on state, if the lookup parked a :STREAMING connection into
+   :AWAITING and nothing moved it back; and on FETCH-OUTSTANDING, if the
+   failure path never released the marker. So a body arriving at all is
+   both defects not having happened — asserted by their consequence, which
+   is the thing an application would actually hit, rather than by their
+   mechanism, which the unit detectors already cover.
+
+   Chaining from an aborted :THEN is a supported shape, not a trick: the
+   new marker suppresses DELIVER-DETACHED's disposition on the way out, the
+   same interaction TEST-HARNESS-FETCH-INTO-CHAINED-E2E covers from a
+   delivered one."
+  (format t "~%Harness: fetch-into, a name that will not resolve~%")
+  (let ((port-box (list nil))
+        (abort-status :unset)
+        (then-fires 0))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (stream-send c (%ascii "alpha"))
+                           (stream-send c (%ascii "beta"))
+                           (stream-close c)))
+               (make-stream-response
+                :on-open
+                (lambda (client)
+                  (fetch-into
+                   client
+                   (http-fetch
+                    :get "http://nxdomain.invalid/"
+                    :then
+                    (lambda (status headers body)
+                      (declare (ignore headers body))
+                      (incf then-fires)
+                      (setf abort-status status)
+                      (fetch-into
+                       client
+                       (http-fetch
+                        :get (format nil "http://127.0.0.1:~d/up"
+                                     (first port-box))
+                        :on-body (lambda (out chunk)
+                                   (declare (ignore out))
+                                   (stream-send client chunk)
+                                   nil)
+                        :then (lambda (s h b)
+                                (declare (ignore s h b))
+                                (stream-close client)
+                                nil)))
+                      nil))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~c~c"
+                                      #\Return #\Newline))
+               (let* ((buf (read-until-bounded stream))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "dns failure e2e: the chained fetch's body arrived, framed"
+                        (%decode-streamed-body raw) "alphabeta")))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "dns failure e2e: :then saw the abort sentinel" abort-status nil)
+      (check "dns failure e2e: :then fired once for the failed lookup"
+             then-fires 1)
+      (check "dns failure e2e: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
+(defparameter +v6-loopback+ #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)
+  "IPv6 loopback as START-SERVER's :HOST wants it — sixteen bytes, which is
+   what MAKE-TCP-LISTENER dispatches :INET6 on.")
+
+(defun %ipv6-loopback-available-p ()
+  "Whether ::1 can be bound here at all.
+
+   Asked by binding rather than by reading configuration: a container with
+   IPv6 disabled in the kernel, or with the loopback address absent, fails
+   at the bind and that is the only answer that matters."
+  (handler-case
+      (let ((socket (make-instance 'sb-bsd-sockets:inet6-socket
+                                   :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn (sb-bsd-sockets:socket-bind socket +v6-loopback+ 0) t)
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+    (error () nil)))
+
+(defun test-harness-ipv6-listener-e2e ()
+  "The listener binds IPv6, and the harness can reach it.
+
+   MAKE-TCP-LISTENER has dispatched the socket family on the host vector's
+   length since it was written, and README documents all four forms — and
+   nothing in this suite had ever passed it sixteen bytes. The :HOST
+   plumbing makes that reachable; this is what reaches it.
+
+   Not a detector for a defect in the framework, and it should not be read
+   as one: the v6 bind was correct before this branch and is correct after.
+   It is a detector for the *harness* code the branch added, which is new
+   and untested surface — CONNECT-TO-TEST-SERVER dispatching the client
+   family from the same vector MAKE-TCP-LISTENER dispatches the bind from.
+   Pin that branch to INET-SOCKET and this is the only test that notices.
+
+   The other e2e tests cannot reach it. Their :HOST is either the literal
+   four-byte loopback or whatever RESOLVE-HOST-BLOCKING answers for
+   `localhost`, and that is IPv4 on any machine ordering IPv4 first in
+   /etc/hosts — this one, and the GitHub ubuntu runner. Depending on the
+   resolver to hand us a v6 address is exactly the environment dependence
+   the relay test exists to avoid, so the address is named outright here.
+
+   Skipped, visibly, where ::1 cannot be bound — a kernel with IPv6 off, or
+   a container without the loopback address. Same shape as the TLS suite
+   skipping without libssl: a printed SKIP rather than a silent pass, so a
+   run that did not execute this says so."
+  (format t "~%Harness: the listener binds IPv6~%")
+  (if (not (%ipv6-loopback-available-p))
+      (skip "ipv6 listener: ::1 cannot be bound on this machine")
+      (with-test-server (:host +v6-loopback+
+                         :handler (lambda (req)
+                                    (declare (ignore req))
+                                    (make-text-response 200 "v6-ok")))
+        (multiple-value-bind (status headers body)
+            (test-http-request :get "/v6")
+          (declare (ignore headers))
+          (check "ipv6 listener: the bound address is the v6 one"
+                 (length *test-host*) 16)
+          (check "ipv6 listener: it answered over IPv6" status 200)
+          (check "ipv6 listener: and the body is ours" body "v6-ok")))))
 
 (defun test-harness-fetch-into-chained-e2e ()
   "A :THEN that starts another fetch keeps the stream open.
@@ -3628,6 +3814,84 @@
              (ignore-errors (web-skeleton::%close epfd))))
       (setf (symbol-function 'web-skeleton::initiate-fetch) real))))
 
+(defun test-fetch-into-refuses-a-foreign-connection ()
+  "FETCH-INTO refuses a connection this worker does not own.
+
+   The seventh guard, and the only one that cannot be answered from the
+   connection alone. A cross-worker call satisfies every other check — the
+   state is right, *EPOLL-FD* is bound, nothing is outstanding — so the
+   outbound is created and registered here and runs correctly. Delivery is
+   what fails: DELIVER-DETACHED and STOP-FETCH both reach the target
+   through (LOOKUP-CONNECTION TARGET-FD), and *CONNECTIONS* is per-worker
+   while fds are unique across the process, so that lookup answers NIL.
+
+   The consequence is this branch's own thesis from a seventh direction.
+   FETCH-OUTSTANDING is set and never cleared, so every later FETCH-INTO on
+   that connection is refused for the rest of its life — which is exactly
+   what DELIVER-DNS-ERROR did before it delegated — and the failure
+   disposition never applies, so a :STREAMING target sits to
+   *STREAM-IDLE-TIMEOUT* when its upstream fails.
+
+   Two calls differing only in registration. The refused one is the claim.
+   The registered one guards against over-refusal — a guard that refuses
+   everything passes every test written only about what it rejects, which
+   is the trap the sibling refusal test names in its own docstring.
+
+   It is not a control in this suite's usual sense and should not be read
+   as one: it does not pass on both sides. Against main's source the first
+   call is accepted, which sets FETCH-OUTSTANDING, so the second is refused
+   by the sixth guard and this assertion fails too — as a cascade from the
+   defect rather than independently of it. Both failing is the correct
+   result there, and the reason is worth knowing before someone reads two
+   failures as two defects.
+
+   INITIATE-FETCH is stubbed because the control has to get *past* the
+   guards without dialing. The assertion is on the message rather than on
+   the fact of a raise, since six other guards also raise and only one of
+   them is this one."
+  (format t "~%Fetch-into: a connection this worker does not own~%")
+  (let ((real (symbol-function 'web-skeleton::initiate-fetch))
+        (epfd (web-skeleton::epoll-create)))
+    (setf (symbol-function 'web-skeleton::initiate-fetch)
+          (lambda (conn epoll-fd fetch-req)
+            (declare (ignore conn epoll-fd fetch-req))
+            t))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table))
+                (web-skeleton::*epoll-fd* epfd)
+                (conn (web-skeleton::make-connection
+                       :fd 4242
+                       :state :streaming
+                       :last-active (get-universal-time))))
+           ;; Not registered: what a connection owned by another worker
+           ;; looks like from here.
+           (check "fetch-into: a connection this worker does not own is refused"
+                  (let ((msg (attempt
+                              (fetch-into conn
+                                          (http-fetch
+                                           :get "http://127.0.0.1:1/x"
+                                           :then (lambda (s h b)
+                                                   (declare (ignore s h b))
+                                                   nil))))))
+                    (and (stringp msg)
+                         (search "not on this worker's connection table" msg)
+                         t))
+                  t)
+           ;; The control. Registering the same connection is the only
+           ;; change, and the call now reaches INITIATE-FETCH.
+           (web-skeleton::register-connection conn)
+           (check "fetch-into: and the same call is accepted once it is owned"
+                  (attempt
+                   (fetch-into conn
+                               (http-fetch
+                                :get "http://127.0.0.1:1/x"
+                                :then (lambda (s h b)
+                                        (declare (ignore s h b))
+                                        nil))))
+                  t))
+      (setf (symbol-function 'web-skeleton::initiate-fetch) real)
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 (defun test-fetch-failure-disposition-both-directions ()
   "A failed detached fetch closes a WebSocket under :CLOSE and does not
    under :KEEP.
@@ -3656,6 +3920,92 @@
            state :websocket)
     (check "disposition :keep: nothing was written to it" queued nil)
     (check "disposition :keep: the callback still fired once" fires 1)))
+
+(defun %ws-refused-close-pass ()
+  "Run DELIVER-DETACHED's aborted :WEBSOCKET arm against a target already at
+   *MAX-WRITE-BACKLOG*, and report what became of it.
+
+   Returns (values REGISTERED FD PENDING FIRES) — whether the target is
+   still in *CONNECTIONS*, its descriptor, the bytes still queued on it,
+   and the callback count.
+
+   A real descriptor rather than %WS-DISPOSITION-PASS's invented 4242,
+   because this is the one case whose outcome is CLOSE-CONNECTION actually
+   running, and it closes what it is handed. An epoll fd is owned and
+   closeable, which is all this one has to be; the UNWIND-PROTECT's own
+   close of it becomes a harmless EBADF afterwards.
+
+   The bound is lowered rather than two megabytes being queued against it.
+   What the arm sees either way is CONNECTION-APPEND-WRITE answering NIL,
+   and it is reached here through the real refusal — a genuine backlog
+   measured against the real bound — rather than by stubbing the one
+   function whose answer is the entire precondition.
+
+   Filled to exactly the bound, so the refusal does not quietly depend on
+   how long a 1011 frame happens to be. PENDING is returned for the same
+   reason: it is the guard separating \"the close did not happen\" from
+   \"the frame was never refused in the first place\", the second of which
+   would be a green assertion about a path this test is not about."
+  (let* ((fires 0)
+         (epfd (web-skeleton::epoll-create))
+         (targetfd (web-skeleton::epoll-create))
+         (web-skeleton::*connections* (make-hash-table))
+         (web-skeleton::*max-write-backlog* 8))
+    (unwind-protect
+         (let ((target (web-skeleton::make-connection
+                        :fd targetfd
+                        :state :websocket
+                        :fetch-outstanding t
+                        :fetch-failure-disposition :close
+                        :last-active (get-universal-time))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::connection-append-write
+            target (make-array 8 :element-type '(unsigned-byte 8)
+                                 :initial-element 0))
+           (web-skeleton::deliver-detached
+            targetfd epfd
+            (lambda (s h b) (declare (ignore s h b)) (incf fires) nil)
+            :aborted)
+           (values (and (web-skeleton::lookup-connection targetfd) t)
+                   (web-skeleton::connection-fd target)
+                   (web-skeleton::connection-write-pending target)
+                   fires))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-fetch-aborted-ws-at-the-backlog-bound ()
+  "A failed detached fetch tears its WebSocket target down even when there
+   is no room left to say why.
+
+   The aborted :WEBSOCKET arm queues a 1011 close and then, under :CLOSE,
+   has to mark the connection for teardown. Marking it was conditional on
+   the frame being accepted, which reads as caution and is not: a target at
+   *MAX-WRITE-BACKLOG* is the one that most needs ending, and it is also a
+   plausible reason the relay feeding it failed at all. Refused, the
+   connection stayed :WEBSOCKET with a full queue and nothing marking it,
+   and the stall sweep collected it a *WRITE-STALL-TIMEOUT* later — a
+   timeout doing the work of a decision this arm had already reached.
+
+   The descriptor is the assertion and the state is not. CONNECTION-CLOSE
+   sets :CLOSING on its way out and so does the accepted-frame branch, so
+   state alone cannot tell a connection that was torn down from one merely
+   marked. An fd of -1 and an empty *CONNECTIONS* can.
+
+   The callback count is here for the reason it is in
+   %WS-DISPOSITION-PASS: what becomes of the socket must not change what
+   the fetch contract already promised, and a teardown that swallowed the
+   delivery would be a worse bug than the one being fixed."
+  (format t "~%Fetch: an aborted ws target at its backlog bound~%")
+  (multiple-value-bind (registered fd pending fires) (%ws-refused-close-pass)
+    ;; First that the fixture reached the condition at all. Eight bytes
+    ;; against a bound of eight leaves room for nothing, so the close frame
+    ;; was refused whole, and what follows is this arm's guard being false
+    ;; rather than some unrelated path being green.
+    (check "backlog bound: the close frame was refused, not queued"
+           pending 8)
+    (check "backlog bound: the target was unregistered" registered nil)
+    (check "backlog bound: its descriptor was closed" fd -1)
+    (check "backlog bound: the callback still fired once" fires 1)))
 
 (defun test-fetch-stop-ignores-the-failure-disposition ()
   "A stopped fetch's target survives under :CLOSE as well as :KEEP.
@@ -3958,6 +4308,8 @@
   (test-harness-detached-deadline-sweep)
   (test-harness-fetch-into-relay-e2e)
   (test-harness-fetch-into-chained-e2e)
+  (test-harness-fetch-into-dns-failure-e2e)
+  (test-harness-ipv6-listener-e2e)
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-target-closed-e2e)
@@ -3965,7 +4317,9 @@
   (test-fetch-stop-does-not-tear-down-mid-walk)
   (test-fetch-stop-ignores-the-failure-disposition)
   (test-fetch-failure-disposition-both-directions)
+  (test-fetch-aborted-ws-at-the-backlog-bound)
   (test-fetch-failure-disposition-crosses-the-seam)
+  (test-fetch-into-refuses-a-foreign-connection)
   (test-harness-fetch-into-stop-e2e)
   (report-suite "Harness")
   (zerop *tests-failed*))

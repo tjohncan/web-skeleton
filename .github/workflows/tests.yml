@@ -48,6 +48,19 @@ jobs:
           set -o pipefail
           rm -rf ~/.cache/common-lisp
           sbcl --non-interactive --load run-tests.lisp 2>&1 | tee /tmp/build.log
+          # Assert the suite ran before believing anything it did not say.
+          # Every other leg of this gate — the exit code, the warnings grep,
+          # the totals — is downstream of RUN-TESTS.LISP actually executing,
+          # and nothing here checked that it did. SBCL stops option parsing
+          # at the first token it does not recognise and hands the rest to
+          # the toplevel, so a mistyped flag prints a banner, loads nothing,
+          # emits no warnings and exits 0. That is a green build with zero
+          # tests run, and it would look exactly like a clean one.
+          if ! grep -qE '=== (ALL TESTS PASSED|SOME TESTS FAILED) ===' /tmp/build.log; then
+            echo "::error::the suite did not run — no totals line in the log"
+            tail -20 /tmp/build.log
+            exit 1
+          fi
           if grep -qiE 'caught (warning|style-warning)' /tmp/build.log; then
             echo "::error::compile emitted warnings"
             grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/build.log

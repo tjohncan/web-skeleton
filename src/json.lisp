@@ -405,7 +405,30 @@
   (let ((alist (cond ((json-object-p obj) (json-object-alist obj))
                      ((listp obj) obj)
                      (t nil))))
-    (cdr (assoc key alist :test #'string=))))
+    ;; Scanned rather than ASSOC'd, and the element test is what makes the
+    ;; promise above true rather than aspirational. A JSON array parses to a
+    ;; plain list, so the (LISTP OBJ) arm accepts one — and ASSOC on a list
+    ;; whose elements are not conses is undefined per CLHS, which in SBCL
+    ;; means a TYPE-ERROR raised out of the very call this docstring says
+    ;; will answer NIL. PARSE-JWKS reaches it: a JWKS document that is an
+    ;; array, or whose keys array holds arrays, escaped as a raw type error
+    ;; from a function that gives every other malformed shape a clean
+    ;; "JWKS: ..." message.
+    ;;
+    ;; The test is STRING-DESIGNATOR rather than STRINGP, and the wider
+    ;; one is the right shape rather than a concession. STRING= is defined
+    ;; on designators, so ASSOC :TEST #'STRING= matched symbol and
+    ;; character keys too — a hand-built alist with symbol keys read
+    ;; through this function, which the docstring above invites. STRINGP
+    ;; would have dropped that silently while fixing the raise. What both
+    ;; tests exclude is identical, and it is the shape that matters: a
+    ;; number or a list in CAR position, which is what the elements of a
+    ;; parsed array look like and exactly what STRING= raises on.
+    (loop for entry in alist
+          when (and (consp entry)
+                    (typep (car entry) '(or string symbol character))
+                    (string= (car entry) key))
+            return (cdr entry))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Serializer

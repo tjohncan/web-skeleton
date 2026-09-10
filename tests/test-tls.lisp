@@ -11,7 +11,7 @@
   (format t "~%=== TLS Tests ===~%")
   (if (not (tls-loaded-p))
       (progn
-        (format t "~%  SKIP  TLS not loaded (libssl not found)~%")
+        (skip "TLS not loaded (libssl not found)")
         (format t "~%0 passed, 0 failed (skipped)~%~%")
         t)
       (progn

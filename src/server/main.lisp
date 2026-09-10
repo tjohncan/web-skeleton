@@ -834,7 +834,7 @@
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
       (connection-close conn)
-      (log-debug "closed fd ~d" fd))))
+      (log-debug "closed fd ~d (~a)" fd reason))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Graceful drain — flush in-progress writes, close cleanly
@@ -1216,11 +1216,19 @@
              ;; is marked not to be reused. A client that gets a clean
              ;; close retries; one whose request vanished silently
              ;; waits forever.
-             (:ok
+             ;;
+             ;; Both verdicts mean the same thing here: the peer sent
+             ;; something. :OK-WANT-WRITE adds only that the transport wants
+             ;; writability before it will read again, which is the write
+             ;; path's business and not this one's — the bytes have already
+             ;; been discarded either way.
+             ((:ok :ok-want-write)
               (log-debug "stream peer sent data mid-stream fd ~d — ~
                           will not reuse" (connection-fd conn))
               (setf (connection-close-after-p conn) t))
-             ;; :again — spurious wake-up, nothing to do.
+             ;; :AGAIN and :WANT-WRITE, neither of which read anything: a
+             ;; spurious wake-up, or a transport that wants to write before
+             ;; it can read. Nothing to do for either.
              (t nil))))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
@@ -1364,6 +1372,16 @@
                       (connection-header-end conn) 0
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length
+                      ;; Cleared for the same reason the keep-alive reset
+                      ;; two arms up clears it, and it was the one field the
+                      ;; two otherwise-identical resets disagreed on.
+                      ;; WEBSOCKET-UPGRADE-P only looks for the upgrade
+                      ;; token, so `Connection: close, Upgrade` is a legal
+                      ;; upgrade that left the flag set for the life of the
+                      ;; socket. Dead state today — nothing in :WEBSOCKET
+                      ;; reads it — which is precisely why it would be read
+                      ;; wrong the first time something does.
+                      (connection-close-after-p conn) nil
                       (connection-state conn) :websocket))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+))
@@ -1812,8 +1830,13 @@
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler on-listen)
   "Start the server with WORKERS event loops on HOST:PORT.
-   HOST is a 4-byte vector (default #(127 0 0 1) = localhost only;
-   use #(0 0 0 0) to listen on all interfaces).
+   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
+   MAKE-TCP-LISTENER dispatches the socket family on its length. Default
+   #(127 0 0 1) is IPv4 loopback only; #(0 0 0 0) is all IPv4 interfaces,
+   and the sixteen-byte forms are the v6 counterparts — README's
+   Configuration section spells all four out. Said here because a reader who
+   stops at this docstring would otherwise conclude the framework is
+   IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
@@ -1866,6 +1889,21 @@
             at least ~s, or lower *max-ws-message-size*."
            *max-write-backlog* *max-ws-message-size*
            (+ *max-ws-message-size* 10)))
+  ;; Third invariant, same place and the same argument. *FETCH-TIMEOUT* is
+  ;; the documented floor under every way a fetch can fail to return — the
+  ;; DNS phase, the connect, the read, and the :AWAITING sweep that answers
+  ;; a parked caller 504 when none of them finish. At zero the sweep never
+  ;; fires, so a parked inbound waits on an upstream that may never speak
+  ;; and the only remaining bound is the idle timeout, which the fetch
+  ;; keeps fresh. Checked at boot rather than at the first parked request,
+  ;; for the reason the two above give: a misconfiguration should not wait
+  ;; for the shape that reveals it.
+  (unless (and (realp *fetch-timeout*) (plusp *fetch-timeout*))
+    (error "start-server: *fetch-timeout* is ~s; it must be positive. It is ~
+            the deadline on every phase of an outbound fetch and the only ~
+            thing that answers a parked caller when an upstream goes quiet ~
+            — there is no setting that disables it."
+           *fetch-timeout*))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is
   ;; its id and the vector has to be there when the first tick publishes.

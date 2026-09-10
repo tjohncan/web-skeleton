@@ -1828,6 +1828,49 @@
          (is-public-address-p
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
 
+  ;; Teredo, 2001::/32 (RFC 4380). The one of this group with teeth: bytes
+  ;; 4-7 carry the relay's IPv4 address and 12-15 the client's, so it is a
+  ;; wrapper around IPv4 in the same sense ::ffff: and 2002:: are, and the
+  ;; stated policy for those is to refuse whether or not the carrier is
+  ;; live.
+  (check "v6 2001::/32 teredo"
+         (is-public-address-p
+          #(#x20 #x01 0 0 #x0a 0 0 1 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:2::/48 benchmarking"
+         (is-public-address-p
+          #(#x20 #x01 0 #x02 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  ;; Both ORCHID allocations. 2001:20::/28 is ORCHIDv2 (RFC 7343) and the
+  ;; live one; 2001:10::/28 is RFC 4843's, expired and returned to the pool,
+  ;; refused for the reason the file gives for 2002:: and 192.88.99.0/24.
+  (check "v6 2001:10::/28 orchid v1"
+         (is-public-address-p
+          #(#x20 #x01 0 #x10 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:20::/28 orchid v2"
+         (is-public-address-p
+          #(#x20 #x01 0 #x20 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 100::/64 discard"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
+  ;; The neighbours, so each clause is the prefix it claims and not a
+  ;; wider match sitting on top of 2001:: or 100::. Without these a
+  ;; too-broad guard would pass every assertion above it.
+  (check "v6 2001:4860:: is public"
+         (is-public-address-p
+          #(#x20 #x01 #x48 #x60 0 0 0 0 0 0 0 0 0 0 #x88 #x88) :inet6) t)
+  (check "v6 2001:3:: is public"
+         (is-public-address-p
+          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  ;; A neighbour outside both /28s. 2001:30:: is unallocated space above
+  ;; ORCHIDv2 and is where the too-wide-guard control belongs — the
+  ;; previous control named 2001:20::, which is the reserved prefix itself.
+  (check "v6 2001:30:: is public"
+         (is-public-address-p
+          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 100::/64 neighbour is public"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) t)
+
   ;; IPv4-mapped IPv6 — attacker cannot launder 127.0.0.1
   (check "v6 ::ffff:127.0.0.1 mapped loopback"
          (is-public-address-p
@@ -4252,6 +4295,23 @@
     (check "jwks: second kidless key has empty kid"
            (jwt-key-kid (second kidless-pair)) ""))
 
+  ;; A kid that is not a string. The struct slot is typed STRING, so this
+  ;; raised a bare SBCL type error out of a function that answers every
+  ;; other malformed shape with a clean "JWKS: ..." message — and RFC 7517
+  ;; 4.5, which makes kid OPTIONAL, says nothing forbidding a number there.
+  ;; ATTEMPT because the defect is a raise; the assertion is on the message,
+  ;; so a fix that raised something unhelpful would still fail.
+  (check "jwks: a non-string kid is refused by name"
+         (let ((msg (attempt
+                     (parse-jwks
+                      (concatenate
+                       'string
+                       "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":5,"
+                       "\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\","
+                       "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}]}")))))
+           (and (stringp msg) (search "JWKS: kid must be a string" msg) t))
+         t)
+
   ;; Explicit duplicate kid still rejects — the dedup discipline
   ;; holds for non-empty kids where an issuer presumably meant
   ;; each kid to be unique.
@@ -5225,6 +5285,120 @@
       ;; pipe SBCL opened for :INPUT :STREAM. Without this the fd stays
       ;; open for the rest of the run — the Server suite's one leak.
       (ignore-errors (sb-ext:process-close proc)))))
+
+(defun test-ws-send-refuses-a-foreign-connection ()
+  "WS-SEND refuses a connection this worker does not own.
+
+   The small frame is the point of the first assertion. A cross-worker
+   WS-SEND used to be caught by the arming — an fd absent from this
+   worker's epoll gives ENOENT — and arming only happens when the flush
+   leaves a remainder. So the refusal covered the backed-up peer and
+   missed the ordinary one: a frame that fit was appended to an
+   unsynchronised queue, sent from the wrong thread, and reported success.
+   That is the case the README and DEPLOYMENT.md both described as
+   refused, and it is the common one.
+
+   The big frame against a shrunk SO_SNDBUF is what makes the placement
+   assertion mean anything, and it is the fixture rather than the
+   assertion that does the work. PENDING = 0 after a refusal is supposed
+   to say the guard ran before CONNECTION-APPEND-WRITE. Over a socket
+   that takes everything it is offered, PENDING is 0 however late the
+   guard sits — including at the very end of the function, which is
+   exactly where the old incidental refusal lived and so the regression
+   worth guarding against. Backed up, an appended frame cannot flush
+   away, so 0 means the append never happened and nothing else.
+
+   Two socket pairs rather than one, because the foreign connection has
+   to be absent from this worker's epoll as well as from its table — that
+   is what a connection on another worker is. Sharing a pair with the
+   control would put the foreign fd in the epoll set and model something
+   that does not occur.
+
+   The decoy pins EQ rather than a comparison on the fd number: an fd
+   reissued to a different connection on this worker satisfies the number
+   while being the wrong object, and a guard written on the number would
+   pass every other assertion here.
+
+   The last two are controls and real ones. Registering the connection is
+   the only change, and both pass on both sides of the revert."
+  (format t "~%ws-send: a connection this worker does not own~%")
+  (multiple-value-bind (fserver fclient) (%loopback-pair)
+    (multiple-value-bind (oserver oclient) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((ffd (web-skeleton::socket-fd fserver))
+                    (ofd (web-skeleton::socket-fd oserver))
+                    (small (web-skeleton::build-ws-frame
+                            web-skeleton::+ws-op-binary+
+                            (make-array 100 :element-type '(unsigned-byte 8)
+                                            :initial-element 89)))
+                    (big (web-skeleton::build-ws-frame
+                          web-skeleton::+ws-op-binary+
+                          (make-array (* 512 1024)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 88))))
+               (web-skeleton::set-nonblocking ffd)
+               (web-skeleton::set-nonblocking ofd)
+               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+               ;; Both sides shrunk so neither can swallow the big frame whole.
+               (web-skeleton::set-socket-option-int
+                ffd web-skeleton::+sol-socket+ 7 2048)
+               (web-skeleton::set-socket-option-int
+                ofd web-skeleton::+sol-socket+ 7 2048)
+               (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                      (web-skeleton::*epoll-fd* epfd)
+                      (conn (web-skeleton::make-connection
+                             :fd ffd :socket fserver :state :websocket
+                             :last-active 0))
+                      (decoy (web-skeleton::make-connection
+                              :fd ffd :socket fserver :state :websocket
+                              :last-active 0))
+                      (owned (web-skeleton::make-connection
+                              :fd ofd :socket oserver :state :websocket
+                              :last-active 0)))
+                 ;; On neither the table nor the epoll set: what a
+                 ;; connection owned by another worker looks like.
+                 (check "ws-send: a connection this worker does not own is refused"
+                        (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                          (error (e)
+                            (not (null (search "not on this worker's connection table"
+                                               (princ-to-string e))))))
+                        t)
+                 (check "ws-send: and a frame too big to flush is refused as well"
+                        (handler-case (progn (web-skeleton::ws-send conn big) nil)
+                          (error (e)
+                            (not (null (search "not on this worker's connection table"
+                                               (princ-to-string e))))))
+                        t)
+                 (check "ws-send: neither refusal put a byte on the queue"
+                        (web-skeleton::connection-write-pending conn) 0)
+                 ;; The fd number is now on the table, attached to something
+                 ;; else. A guard reading the number would accept this.
+                 (web-skeleton::register-connection decoy)
+                 (check "ws-send: the right fd on the wrong object is still refused"
+                        (handler-case (progn (web-skeleton::ws-send conn small) nil)
+                          (error (e)
+                            (not (null (search "not on this worker's connection table"
+                                               (princ-to-string e))))))
+                        t)
+                 ;; The controls. Registered and armed, so the remainder the
+                 ;; big frame leaves has somewhere to go.
+                 (web-skeleton::register-connection owned)
+                 (web-skeleton::epoll-add epfd ofd
+                                          (logior web-skeleton::+epollin+
+                                                  web-skeleton::+epollet+))
+                 (check "ws-send: a connection this worker owns is accepted"
+                        (handler-case (progn (web-skeleton::ws-send owned big) :sent)
+                          (error (e) (format nil "signalled: ~a" e)))
+                        :sent)
+                 (check "ws-send: and its frame is on the queue, not refused"
+                        (plusp (web-skeleton::connection-write-pending owned))
+                        t)))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close fserver))
+          (ignore-errors (sb-bsd-sockets:socket-close fclient))
+          (ignore-errors (sb-bsd-sockets:socket-close oserver))
+          (ignore-errors (sb-bsd-sockets:socket-close oclient)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
@@ -6801,6 +6975,276 @@
              t))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The DNS phase and the sink
+;;;
+;;; INITIATE-HTTP-FETCH-TO-ADDRESS parks the target only for an :INBOUND
+;;; fetch; INITIATE-DNS-LOOKUP has to make the same decision, because a
+;;; hostname reaches the TCP phase through it and an IP literal does not.
+;;; It used to park unconditionally, so every FETCH-INTO to a name — the
+;;; shape DEPLOYMENT.md's relay example uses — moved the application's own
+;;; :STREAMING or :WEBSOCKET connection to :AWAITING and nothing ever moved
+;;; it back.
+;;;
+;;; Asserted against the real function rather than a stub, because the stub
+;;; every other detached test installs for *DNS-LOOKUP-FN* is what hid this:
+;;; they all jump straight to INITIATE-HTTP-FETCH-TO-ADDRESS, which was
+;;; already right.
+;;;
+;;; No network. The name is RFC 2606's reserved .invalid, getent is killed
+;;; by CLOSE-OUTBOUND before it can answer, and every assertion is about
+;;; state INITIATE-DNS-LOOKUP has already set by the time it returns.
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-lookup-sink ()
+  (format t "~%DNS lookup: the sink decides whether the target parks~%")
+  (flet ((lookup (sink state)
+           ;; Two epoll fds, as in TEST-AWAITING-SWEEP-504: one to register
+           ;; against, one standing in for the target's descriptor. An
+           ;; epoll fd is pollable and closeable, which is all either needs
+           ;; to be here.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (targetfd (web-skeleton::epoll-create)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections*
+                           (make-hash-table :test #'eql))
+                         (web-skeleton::*dns-cache* nil)
+                         (target (web-skeleton::make-connection
+                                  :fd targetfd :state state :last-active 0))
+                         (cont (web-skeleton::make-http-fetch-continuation
+                                :method :GET
+                                :url "http://nxdomain.invalid/"
+                                :callback (lambda (s h b)
+                                            (declare (ignore s h b))
+                                            nil)
+                                :sink sink))
+                         (dns-conn nil))
+                    (web-skeleton::register-connection target)
+                    (web-skeleton::initiate-dns-lookup
+                     target epfd cont "nxdomain.invalid" 80 "/")
+                    (maphash (lambda (fd c)
+                               (declare (ignore fd))
+                               (when (eq (web-skeleton::connection-state c)
+                                         :out-dns)
+                                 (setf dns-conn c)))
+                             web-skeleton::*connections*)
+                    (unwind-protect
+                         (list (web-skeleton::connection-state target)
+                               (>= (web-skeleton::connection-awaiting-fd
+                                    target)
+                                   0)
+                               (and dns-conn
+                                    (web-skeleton::connection-fetch-sink
+                                     dns-conn))
+                               (and dns-conn
+                                    (plusp
+                                     (web-skeleton::connection-fetch-deadline
+                                      dns-conn))))
+                      (when dns-conn
+                        (ignore-errors
+                         (web-skeleton::close-outbound dns-conn epfd)))))
+               (ignore-errors (web-skeleton::%close targetfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+
+    ;; Asserted in halves, one lookup per case. The two claims are
+    ;; independent — parking is a decision about the caller, the sink is a
+    ;; value copied onto the dns-conn — and folded into a single compound
+    ;; check they report under one name, so the failure list this suite is
+    ;; actually read by cannot say which of them broke. Same reason
+    ;; TEST-FETCH-FAILURE-DISPOSITION-CROSSES-THE-SEAM splits its pair.
+    ;;
+    ;; ATTEMPT's error text is handed through whole rather than sliced, so
+    ;; a raise reports the condition instead of a NIL that says nothing.
+    (flet ((parked (r) (if (listp r) (subseq r 0 2) r))
+           (carried (r) (if (listp r) (subseq r 2 4) r)))
+
+      ;; Control. The parked path is unchanged: an inbound waiting on a
+      ;; fetch is exactly what :AWAITING is for, and its awaiting-fd is
+      ;; the pipe.
+      (let ((r (attempt (lookup :inbound :read-http))))
+        (check "dns lookup: an :inbound fetch parks its caller"
+               (parked r) '(:awaiting t))
+        (check "dns lookup: an :inbound lookup carries its sink"
+               (carried r) '(:inbound t)))
+
+      ;; The defect. The application is still writing to this connection,
+      ;; so its state is not the framework's to take — and nothing gives
+      ;; it back, because the :DETACHED arm of
+      ;; INITIATE-HTTP-FETCH-TO-ADDRESS correctly touches no state when
+      ;; the lookup completes.
+      (let ((r (attempt (lookup :detached :streaming))))
+        (check "dns lookup: a detached fetch leaves its target alone"
+               (parked r) '(:streaming nil))
+        ;; The other half of the same defect. Without the sink on the
+        ;; dns-conn, the detached reap, CLOSE-CONNECTION's orphan walk and
+        ;; DELIVER-FETCH-ERROR all look at a detached fetch in flight and
+        ;; see a parked one. The deadline rides along because being
+        ;; visible to a reap that cannot tell your age is not being
+        ;; visible to it.
+        (check "dns lookup: a detached lookup carries its sink and a deadline"
+               (carried r) '(:detached t))))))
+
+;;; ---------------------------------------------------------------------------
+;;; A name that will not resolve, and the fetch it still has to end
+;;;
+;;; DELIVER-DNS-ERROR held a copy of DELIVER-FETCH-ERROR's body that knew
+;;; only about a parked inbound. Delegating is the fix; this asserts what
+;;; the delegation buys, on the sink the copy had never heard of.
+;;; ---------------------------------------------------------------------------
+
+(defun test-dns-error-ends-a-detached-fetch ()
+  "A detached fetch to a name that will not resolve releases its target.
+
+   Three observations, and the first is a control that has to keep
+   passing. The old body called CLOSE-OUTBOUND, which fires an unclaimed
+   callback with the cleanup sentinel — so the application's callback ran
+   either way, and a detector that only counted it would have been green
+   against the defect. That is this branch's *confounded* mode: the right
+   outcome reached by a path that proves nothing.
+
+   What the old body could not do was reach the target. FETCH-OUTSTANDING
+   stayed set for the rest of that connection's life, refusing every later
+   FETCH-INTO on it, and the failure disposition the caller chose was never
+   applied. Those two are the claim.
+
+   No network and no getent: DELIVER-DNS-ERROR is called directly, which
+   is what both of its failure sites do once they have decided the lookup
+   is over."
+  (format t "~%DNS failure: a detached fetch releases its target~%")
+  (let ((fires 0)
+        (epfd (web-skeleton::epoll-create))
+        (targetfd (web-skeleton::epoll-create))
+        (dnsfd (web-skeleton::epoll-create)))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (target (web-skeleton::make-connection
+                         :fd targetfd :state :websocket
+                         :fetch-outstanding t
+                         :fetch-failure-disposition :close
+                         :last-active (get-universal-time)))
+                (dns-conn (web-skeleton::make-connection
+                           :fd dnsfd :state :out-dns
+                           :outbound-p t
+                           :fetch-sink :detached
+                           :inbound-fd targetfd
+                           :fetch-callback (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (incf fires)
+                                             nil)
+                           :last-active (get-universal-time))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::register-connection dns-conn)
+           (web-skeleton::deliver-dns-error dns-conn epfd)
+           ;; The control: unchanged, and the reason the other two are the
+           ;; assertions rather than this one.
+           (check "dns failure: the fetch callback still fired once" fires 1)
+           (check "dns failure: the target's fetch marker was cleared"
+                  (web-skeleton::connection-fetch-outstanding target) nil)
+           (check "dns failure: and the failure disposition was applied"
+                  (web-skeleton::connection-state target) :closing))
+      (ignore-errors (web-skeleton::%close dnsfd))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun test-dns-chain-success-survives-a-failed-teardown ()
+  "A resolution that succeeded is not undone by a failure to clean up
+   after it.
+
+   The other side of the delegation the test above covers. HANDLE-DNS-
+   READY's HANDLER-CASE used to span two steps that run *after* DNS-THEN
+   has already returned — clearing the callback and closing the resolved
+   pipe. A raise there was harmless while DELIVER-DNS-ERROR knew only
+   about a parked inbound: the inbound's AWAITING-FD had already moved,
+   so the lookup matched nothing and the failure went nowhere. Delegating
+   to DELIVER-FETCH-ERROR is what made it consequential — the same raise
+   now reaches DELIVER-DETACHED with :ABORTED and applies the target's
+   failure disposition, closing a WebSocket whose fetch is alive and
+   running on the outbound DNS-THEN just opened.
+
+   CLOSE-OUTBOUND raises once and then works, which is the shape that
+   makes this a detector rather than a vacuous pass. A stub that always
+   raised would raise a second time inside DELIVER-FETCH-ERROR — before
+   it reaches DELIVER-DETACHED — so the target would come out untouched
+   against the old code too, and the assertions would agree for the wrong
+   reason.
+
+   DNS-THEN only sets a flag. Its contract here is that it returned
+   normally; what it built is the next test's subject, not this one's."
+  (format t "~%DNS: a succeeded chain survives a failed teardown~%")
+  (let ((real (symbol-function 'web-skeleton::close-outbound)))
+    (flet ((run (raise-once)
+             (let ((calls 0)
+                   (chained nil)
+                   (epfd (web-skeleton::epoll-create))
+                   (targetfd (web-skeleton::epoll-create))
+                   (proc (sb-ext:run-program "/bin/true" nil
+                                             :output :stream :wait t)))
+               (unwind-protect
+                    (let* ((dnsfd (sb-sys:fd-stream-fd
+                                   (sb-ext:process-output proc)))
+                           (web-skeleton::*connections*
+                             (make-hash-table :test #'eql))
+                           (line (sb-ext:string-to-octets
+                                  (format nil "127.0.0.1       STREAM localhost~%")
+                                  :external-format :ascii))
+                           (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                           (target (web-skeleton::make-connection
+                                    :fd targetfd :state :websocket
+                                    :fetch-outstanding t
+                                    :fetch-failure-disposition :close
+                                    :last-active (get-universal-time)))
+                           (dns-conn (web-skeleton::make-connection
+                                      :fd dnsfd :state :out-dns
+                                      :outbound-p t
+                                      :fetch-sink :detached
+                                      :inbound-fd targetfd
+                                      :dns-host "localhost"
+                                      :dns-then (lambda (ip family)
+                                                  (declare (ignore ip family))
+                                                  (setf chained t))
+                                      :fetch-callback
+                                      (lambda (s h b)
+                                        (declare (ignore s h b))
+                                        nil)
+                                      :last-active (get-universal-time))))
+                      (replace buf line)
+                      (setf (web-skeleton::connection-read-buf dns-conn) buf
+                            (web-skeleton::connection-read-pos dns-conn)
+                            (length line))
+                      (web-skeleton::register-connection target)
+                      (web-skeleton::register-connection dns-conn)
+                      ;; Raises on the first call only. The second — the one
+                      ;; DELIVER-FETCH-ERROR makes on the old path — has to
+                      ;; succeed, or the disposition is never reached and the
+                      ;; two sides of the revert look alike.
+                      (setf (symbol-function 'web-skeleton::close-outbound)
+                            (lambda (c e)
+                              (incf calls)
+                              (if (and raise-once (= calls 1))
+                                  (error "close-outbound: simulated teardown failure")
+                                  (funcall real c e))))
+                      (web-skeleton::handle-dns-ready dns-conn epfd)
+                      (list chained
+                            (web-skeleton::connection-state target)
+                            (web-skeleton::connection-fetch-outstanding target)))
+                 (setf (symbol-function 'web-skeleton::close-outbound) real)
+                 (ignore-errors (sb-ext:process-close proc))
+                 (ignore-errors (web-skeleton::%close targetfd))
+                 (ignore-errors (web-skeleton::%close epfd))))))
+      ;; The control. Nothing raises, so nothing about the target should
+      ;; move — and nothing does on either side of the revert.
+      (let ((clean (run nil)))
+        (check "dns teardown control: the chain ran" (first clean) t)
+        (check "dns teardown control: the target is untouched"
+               (rest clean) '(:websocket t)))
+      ;; The claim.
+      (let ((failed (run t)))
+        (check "dns teardown: the chain still ran" (first failed) t)
+        (check "dns teardown: a failed close does not close the target"
+               (second failed) :websocket)
+        (check "dns teardown: nor clear the marker on a live fetch"
+               (third failed) t)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
 ;;; ---------------------------------------------------------------------------
 
@@ -7415,6 +7859,76 @@
 ;;; working.
 ;;; ---------------------------------------------------------------------------
 
+(defun %detached-pause-pass (label target-state)
+  "Drive RESUME-PAUSED-OUTBOUND's edge against a target in TARGET-STATE.
+
+   LABEL prefixes every assertion, so a failure names which target state
+   broke rather than only that one did."
+  (multiple-value-bind (out-server out-client) (%loopback-pair)
+    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create)))
+        (unwind-protect
+             (let* ((out-fd (web-skeleton::socket-fd out-server))
+                    (tgt-fd (web-skeleton::socket-fd tgt-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
+                    ;; leaves one: subscribed to no events at all, so
+                    ;; nothing but a resume can ever wake it.
+                    (out (web-skeleton::make-connection
+                          :fd out-fd :socket out-server :state :out-read
+                          :outbound-p t
+                          :fetch-sink :detached
+                          :fetch-paused t
+                          :fetch-paused-at (get-universal-time)
+                          :fetch-deadline (+ (get-universal-time) 30)
+                          :inbound-fd tgt-fd
+                          :last-active (get-universal-time)))
+                    ;; The target: a streaming connection with the
+                    ;; back-link the pause left on it.
+                    (tgt (web-skeleton::make-connection
+                          :fd tgt-fd :socket tgt-server :state target-state
+                          :stream-framing (when (eq target-state :streaming)
+                                            :chunked)
+                          :paused-outbound-fd out-fd
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking out-fd)
+               (web-skeleton::set-nonblocking tgt-fd)
+               (web-skeleton::register-connection out)
+               (web-skeleton::register-connection tgt)
+               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
+               (web-skeleton::epoll-add epfd tgt-fd
+                                        (logior web-skeleton::+epollout+
+                                                web-skeleton::+epollet+))
+               (check (format nil "~a: the outbound starts paused" label)
+                      (web-skeleton::connection-fetch-paused out) t)
+               ;; A backlog on the target, and then the drain that ends it.
+               (web-skeleton::connection-append-write
+                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
+               (check (format nil "~a: the target has a backlog to drain" label)
+                      (plusp (web-skeleton::connection-write-pending tgt)) t)
+               (web-skeleton::handle-client-write tgt epfd)
+               (check (format nil "~a: the target drained" label)
+                      (web-skeleton::connection-write-pending tgt) 0)
+               ;; The property.
+               (check (format nil "~a: draining the target resumed the fetch" label)
+                      (web-skeleton::connection-fetch-paused out) nil)
+               (check (format nil "~a: and the back-link was cleared with it" label)
+                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
+               ;; The deadline moved by the time spent paused, so a relay
+               ;; is not killed for applying the backpressure it was told
+               ;; to apply.
+               (check (format nil "~a: the deadline is not still the original" label)
+                      (>= (web-skeleton::connection-fetch-deadline out)
+                          (+ (web-skeleton::connection-fetch-started-at out)
+                             30))
+                      t))
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close out-server))
+          (ignore-errors (sb-bsd-sockets:socket-close out-client))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
+          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+
 (defun test-detached-pause-auto-resumes ()
   "A paused detached fetch is resumed by its target's backlog draining.
 
@@ -7447,73 +7961,667 @@
 
    The precondition this pins down, which no document has ever carried:
    auto-resume needs the target to have *actually backed up*. STREAM-SEND
-   flushes inline through STREAM-FLUSH, which never reaches
-   HANDLE-CLIENT-WRITE, so a pause taken while the target's queue was empty
-   has no wake-up coming and still needs an explicit FETCH-RESUME."
+   flushes inline, and a flush that completes arms nothing and so never
+   reaches HANDLE-CLIENT-WRITE — so a pause taken while the target's queue
+   was empty has no wake-up coming and still needs an explicit
+   FETCH-RESUME.
+
+   Run against both target states. RESUME-PAUSED-OUTBOUND sits in
+   HANDLE-CLIENT-WRITE's :DONE arm ahead of the state dispatch, and its own
+   comment says why: every state that can be relayed into reaches that
+   point, and a resume working for only one of them would be the kind of
+   gap nobody finds until a different response shape turns up. Only
+   :STREAMING was ever asserted against it.
+
+   The :WEBSOCKET pass is a regression guard and not a detector for this
+   branch — it passes on both sides, because the edge itself was always
+   state-agnostic. What the branch changes is whether it is reachable:
+   arming the remainder WS-SEND leaves behind is what lets
+   HANDLE-CLIENT-WRITE run for a websocket target at all. This asserts the
+   half of that chain the arming detector cannot see."
   (format t "~%Detached fetch: pause resumes when the target drains~%")
-  (multiple-value-bind (out-server out-client) (%loopback-pair)
-    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
+  (%detached-pause-pass "detached pause" :streaming)
+  (%detached-pause-pass "detached pause (ws)" :websocket))
+
+;;; ---------------------------------------------------------------------------
+;;; The write path a closed stream is handed to, and the event that runs it
+;;;
+;;; STREAM-CLOSE moves the connection to :WRITE-RESPONSE, which
+;;; HANDLE-CLIENT-WRITE and nothing else transitions out of. It used to
+;;; hand off through STREAM-FLUSH, which arms only when the flush did not
+;;; complete — so the ordinary close, a five-byte terminator onto a socket
+;;; with room, armed nothing and left the connection parked.
+;;;
+;;; TEST-STREAM-LIFECYCLE builds this exact state and asserts both halves
+;;; of its precondition — :WRITE-RESPONSE, and nothing left queued — and
+;;; then never asks whether anything would move it. That is the shape of
+;;; the gap, and the reason it survived a green suite.
+;;; ---------------------------------------------------------------------------
+
+(defun %stream-close-pass (back-up)
+  "Close a stream and report the flush state, the interest armed, and where
+   the connection was left.
+
+   Returns (values PENDING MASKS CLOSED-STATE POST-STATE) — bytes still
+   queued afterwards, every mask armed while STREAM-CLOSE ran in order, the
+   state it left, and the state after one turn of the event loop.
+
+   That last turn is driven through epoll rather than by calling
+   HANDLE-CLIENT-WRITE, which is the difference between asserting the
+   consequence and assuming it: the direct call runs whether or not
+   anything armed the fd.
+
+   BACK-UP shrinks SO_SNDBUF and pre-queues more than the socket will take,
+   which is the branch STREAM-FLUSH used to be the only arming for. Without
+   it the terminator goes out whole, the flush completes, and that is both
+   the ordinary case and the one that armed nothing."
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (masks nil)
+          (real (symbol-function 'web-skeleton::epoll-modify)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :streaming
+                         :stream-framing :chunked
+                         :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking fd)
+             (when back-up
+               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+               (web-skeleton::set-socket-option-int
+                fd web-skeleton::+sol-socket+ 7 2048)
+               (web-skeleton::connection-append-write
+                conn (make-array (* 512 1024)
+                                 :element-type '(unsigned-byte 8)
+                                 :initial-element 80)))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             ;; Recording starts here, so what is counted is STREAM-CLOSE's
+             ;; own arming and not the setup's.
+             (setf (symbol-function 'web-skeleton::epoll-modify)
+                   (lambda (efd f mask)
+                     (push mask masks)
+                     (funcall real efd f mask)))
+             (web-skeleton:stream-close conn)
+             (setf (symbol-function 'web-skeleton::epoll-modify) real)
+             (let ((pending (web-skeleton::connection-write-pending conn))
+                   (closed-state (web-skeleton::connection-state conn))
+                   (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
+                                      :element-type '(unsigned-byte 8))))
+               ;; One turn of the event loop, driven the way the loop drives
+               ;; it: ask epoll what is ready, and dispatch only that.
+               ;; Calling HANDLE-CLIENT-WRITE directly would prove nothing —
+               ;; it would run whether or not anything armed it, which is
+               ;; the whole defect. Fifty milliseconds, not a deadline: a
+               ;; writable socket with an armed interest is reported on the
+               ;; first call, and an unarmed one is never reported at all,
+               ;; so neither answer is waited for.
+               (let ((answered :not-run))
+                 (when (plusp (web-skeleton::epoll-wait epfd evbuf 4 50))
+                   (setf answered
+                         (web-skeleton::handle-client-write conn epfd)))
+                 (values pending
+                         (reverse masks)
+                         closed-state
+                         (web-skeleton::connection-state conn)
+                         answered))))
+        (setf (symbol-function 'web-skeleton::epoll-modify) real)
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-stream-close-arms-the-write-path ()
+  "A closed stream gets an event to finish on, whether or not it needed one
+   to flush.
+
+   The defect case is the ordinary one. With the terminator away and the
+   queue empty there is nothing left to write, which is precisely why
+   STREAM-FLUSH declined to arm — and precisely when the connection still
+   has a transition owed to it: :WRITE-RESPONSE is where a keep-alive
+   connection resets to :READ-HTTP and where a close-delimited one closes,
+   and only HANDLE-CLIENT-WRITE performs it. Bounded by the idle sweep, so
+   the symptom is liveness rather than loss: a FIN that waits
+   *IDLE-TIMEOUT*, and a keep-alive socket that never answers again.
+
+   The backed-up case is the control, and it is what makes the first
+   assertion about STREAM-CLOSE rather than about streams in general. It
+   was armed before this change and still is — by STREAM-FLUSH then, by
+   STREAM-CLOSE now — so it passes on both sides. Only the case where the
+   flush succeeded moves.
+
+   The defect case also asserts what the arming buys: one turn of the loop
+   and the connection is back at :READ-HTTP, reusable. That turn is driven
+   through EPOLL-WAIT and dispatched only if the fd is reported, which is
+   the difference between asserting the consequence and assuming it —
+   calling HANDLE-CLIENT-WRITE directly would run whether or not anything
+   armed the fd. Under the defect the loop is asked, told nothing is ready,
+   and the connection stays :WRITE-RESPONSE. Fifty milliseconds bounds it
+   and neither answer waits for the bound: an armed writable socket is
+   reported on the first call, an unarmed one never.
+
+   The control does not assert that half. Its socket is full, so no
+   EPOLLOUT arrives whether or not the interest is set, and the loop turn
+   is uninformative there rather than wrong.
+
+   The first case asserts the whole mask list rather than membership,
+   which pins three things at once: that arming happened, that it happened
+   exactly once, and that it is EPOLLOUT alone. The last is the decision
+   worth pinning — STREAM-FLUSH's mask keeps EPOLLIN for a reason its own
+   docstring gives, that a stream has to notice its peer going away, and
+   this connection is no longer a stream. The control asserts membership
+   only, because its mask is the thing that changed."
+  (format t "~%Stream close: the write path gets an event to run on~%")
+  (multiple-value-bind (pending masks state post answered)
+      (%stream-close-pass nil)
+    (check "stream close: the terminator flushed completely" pending 0)
+    (check "stream close: the ordinary write path is in charge"
+           state :write-response)
+    (check "stream close: EPOLLOUT was armed even so"
+           masks
+           (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+)))
+    (check "stream close: and one turn of the loop reuses the connection"
+           post :read-http)
+    ;; The loop is told to answer, not merely reset. HANDLE-CLIENT-WRITE's
+    ;; :KEEP-ALIVE is what sends the event loop back into the read path
+    ;; without waiting for another EPOLLIN, and it is the step between a
+    ;; connection that is reusable and a client that is actually answered.
+    ;; Discarding it left that half of the claim untested.
+    (check "stream close: and the loop is told to read the next request"
+           answered :keep-alive))
+  (multiple-value-bind (pending masks state post answered)
+      (%stream-close-pass t)
+    (declare (ignore state post answered))
+    (check "stream close: the backed-up control did not flush"
+           (plusp pending) t)
+    (check "stream close: and the control is armed on both sides"
+           (and (find-if (lambda (m)
+                           (plusp (logand m web-skeleton::+epollout+)))
+                         masks)
+                t)
+           t)))
+
+(defun test-stream-close-refuses-a-foreign-connection ()
+  "STREAM-CLOSE refuses a connection this worker does not own.
+
+   The witness is the ON-CLOSE counter, not the write queue, and that is
+   the whole design of this test. Copying WS-SEND's fixture would be the
+   natural instinct and would pin nothing: a five-byte terminator flushes
+   completely on any socket with room, so WRITE-PENDING is 0 wherever the
+   guard sits. That is the vacuous shape the WS-SEND fixture had to be
+   rebuilt to escape, and it would be rebuilt here for the same reason.
+
+   What cannot be undone is the notification. NOTIFY-STREAM-CLOSED nulls
+   the slot before calling so the callback fires exactly once — so a
+   cross-worker close tells the application :DONE, and the owning
+   worker's own teardown notification afterwards is a no-op. The app's
+   first and last word about that stream is a false one. A counter that
+   stays at 0 is the assertion that no such word was said.
+
+   CONNECTION-STATE is the second witness and it pins the placement
+   directly. Moved to just before the arm — the natural wrong spot, since
+   that mirrors where the only previous check lived — the raise still
+   carries the right message and PENDING is still 0, but the counter is 1
+   and the state has moved to :WRITE-RESPONSE. Both go red there and
+   neither depends on socket-buffer behaviour.
+
+   Real sockets on both sides, not epoll descriptors. The control has to
+   reach CONNECTION-ON-WRITE and put the terminator on a wire, and an
+   epoll fd raises from send(2) — which would fail the control for a
+   fixture reason and, worse, would give the *foreign* connection a
+   second way to raise once the guard is reverted, confounding the
+   detector with an ENOTSOCK it was never about.
+
+   Exactly one of the last two assertions is a control. \"a connection
+   this worker owns still closes\" is: registering is the only change and
+   it passes on both sides. \"and that one did tell the app\" is not, and
+   should not be read as one — against main's source the *foreign* close
+   is accepted and fires the callback too, so the counter reaches 2 and
+   this fails as a cascade from the defect rather than independently of
+   it. Four of this test's five assertions fail there and there is one
+   defect behind them; only \"still closes\" survives. The sibling
+   FETCH-INTO ownership test carries the same note for the same reason,
+   which is how this one came to be checked.
+
+   Three is the number under the *mutation* — the guard relocated to just
+   before the arm — where assertion 1 also survives because a five-byte
+   terminator flushes whatever the guard's position. Two measurements,
+   two counts, and this paragraph is about the matrix."
+  (format t "~%stream-close: a connection this worker does not own~%")
+  (multiple-value-bind (fserver fclient) (%loopback-pair)
+    (multiple-value-bind (oserver oclient) (%loopback-pair)
       (let ((epfd (web-skeleton::epoll-create)))
         (unwind-protect
-             (let* ((out-fd (web-skeleton::socket-fd out-server))
-                    (tgt-fd (web-skeleton::socket-fd tgt-server))
+             (let* ((fires 0)
+                    (ffd (web-skeleton::socket-fd fserver))
+                    (ofd (web-skeleton::socket-fd oserver))
                     (web-skeleton::*connections* (make-hash-table :test #'eql))
                     (web-skeleton::*epoll-fd* epfd)
-                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
-                    ;; leaves one: subscribed to no events at all, so
-                    ;; nothing but a resume can ever wake it.
-                    (out (web-skeleton::make-connection
-                          :fd out-fd :socket out-server :state :out-read
-                          :outbound-p t
-                          :fetch-sink :detached
-                          :fetch-paused t
-                          :fetch-paused-at (get-universal-time)
-                          :fetch-deadline (+ (get-universal-time) 30)
-                          :inbound-fd tgt-fd
-                          :last-active (get-universal-time)))
-                    ;; The target: a streaming connection with the
-                    ;; back-link the pause left on it.
-                    (tgt (web-skeleton::make-connection
-                          :fd tgt-fd :socket tgt-server :state :streaming
-                          :stream-framing :chunked
-                          :paused-outbound-fd out-fd
-                          :last-active (get-universal-time))))
-               (web-skeleton::set-nonblocking out-fd)
-               (web-skeleton::set-nonblocking tgt-fd)
-               (web-skeleton::register-connection out)
-               (web-skeleton::register-connection tgt)
-               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
-               (web-skeleton::epoll-add epfd tgt-fd
-                                        (logior web-skeleton::+epollout+
+                    (on-close (lambda (c reason)
+                                (declare (ignore c reason))
+                                (incf fires)))
+                    (foreign (web-skeleton::make-connection
+                              :fd ffd :socket fserver :state :streaming
+                              :stream-framing :chunked
+                              :stream-on-close on-close
+                              :last-active (get-universal-time)))
+                    (owned (web-skeleton::make-connection
+                            :fd ofd :socket oserver :state :streaming
+                            :stream-framing :chunked
+                            :stream-on-close on-close
+                            :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking ffd)
+               (web-skeleton::set-nonblocking ofd)
+               ;; On neither the table nor the epoll set.
+               (check "stream close: a connection this worker does not own is refused"
+                      (handler-case (progn (web-skeleton:stream-close foreign) nil)
+                        (error (e)
+                          (not (null (search "not on this worker's connection table"
+                                             (princ-to-string e))))))
+                      t)
+               (check "stream close: the refusal told the app nothing"
+                      fires 0)
+               (check "stream close: nor moved the connection out of :streaming"
+                      (web-skeleton::connection-state foreign) :streaming)
+               ;; The control. Registered and armed, so the terminator has a
+               ;; write path to be handed to.
+               (web-skeleton::register-connection owned)
+               (web-skeleton::epoll-add epfd ofd
+                                        (logior web-skeleton::+epollin+
                                                 web-skeleton::+epollet+))
-               (check "detached pause: the outbound starts paused"
-                      (web-skeleton::connection-fetch-paused out) t)
-               ;; A backlog on the target, and then the drain that ends it.
-               (web-skeleton::connection-append-write
-                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
-               (check "detached pause: the target has a backlog to drain"
-                      (plusp (web-skeleton::connection-write-pending tgt)) t)
-               (web-skeleton::handle-client-write tgt epfd)
-               (check "detached pause: the target drained"
-                      (web-skeleton::connection-write-pending tgt) 0)
-               ;; The property.
-               (check "detached pause: draining the target resumed the fetch"
-                      (web-skeleton::connection-fetch-paused out) nil)
-               (check "detached pause: and the back-link was cleared with it"
-                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
-               ;; The deadline moved by the time spent paused, so a relay
-               ;; is not killed for applying the backpressure it was told
-               ;; to apply.
-               (check "detached pause: the deadline is not still the original"
-                      (>= (web-skeleton::connection-fetch-deadline out)
-                          (+ (web-skeleton::connection-fetch-started-at out)
-                             30))
-                      t))
+               (check "stream close: a connection this worker owns still closes"
+                      (handler-case (progn (web-skeleton:stream-close owned) :closed)
+                        (error (e) (format nil "signalled: ~a" e)))
+                      :closed)
+               (check "stream close: and that one did tell the app"
+                      fires 1))
           (ignore-errors (web-skeleton::%close epfd))
-          (ignore-errors (sb-bsd-sockets:socket-close out-server))
-          (ignore-errors (sb-bsd-sockets:socket-close out-client))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
+          (ignore-errors (sb-bsd-sockets:socket-close fserver))
+          (ignore-errors (sb-bsd-sockets:socket-close fclient))
+          (ignore-errors (sb-bsd-sockets:socket-close oserver))
+          (ignore-errors (sb-bsd-sockets:socket-close oclient)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The remainder a fetch callback leaves behind
+;;;
+;;; WS-SEND's second caller is a fetch callback on a :WEBSOCKET target, and
+;;; it runs on the outbound connection's read path. HANDLE-CLIENT-READ —
+;;; the site that did all of a WebSocket's arming — does not run for the
+;;; target there at all, so a remainder was left with nothing subscribed to
+;;; writability, waiting for an event no longer coming.
+;;;
+;;; Driven at the seam: DELIVER-DETACHED with a callback that sends, which
+;;; is what FETCH-INTO's :THEN reduces to. End to end it would reach the
+;;; same two lines through an upgrade handshake and a real upstream
+;;; response, either of which could be what broke instead.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-send-arms-from-a-fetch-callback ()
+  "A frame sent from a fetch callback leaves its remainder armed.
+
+   The target is a real socket with a shrunk send buffer and a peer that
+   never reads — TEST-WS-HANDLER-PUSH-AND-RETURN's arrangement, and the
+   only one that produces a remainder at all. With room to spare WS-SEND
+   flushes completely and there is nothing left to arm for, so the two
+   paths are indistinguishable.
+
+   EPOLL-MODIFY is recorded rather than epoll being polled. A socket whose
+   send buffer is full is not writable, so EPOLL-WAIT reports nothing
+   whether or not EPOLLOUT was armed: the observation that looks the most
+   direct is the one that cannot tell the two cases apart.
+
+   Three checks, and the first two are the precondition. Without a
+   remainder there is no claim to make, and a frame that fits would leave
+   the third vacuous rather than failing — so the flush is asserted to have
+   been incomplete before anything is asserted about arming."
+  (format t "~%ws-send: arming from a fetch callback~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (calls nil)
+          (real (symbol-function 'web-skeleton::epoll-modify)))
+      (unwind-protect
+           (let* ((tgt-fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (target (web-skeleton::make-connection
+                           :fd tgt-fd :socket server :state :websocket
+                           :fetch-outstanding t
+                           :last-active (get-universal-time)))
+                  (frame (web-skeleton::build-ws-frame
+                          web-skeleton::+ws-op-binary+
+                          (make-array (* 512 1024)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 80)))
+                  (flushed :unset))
+             (web-skeleton::set-nonblocking tgt-fd)
+             ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+             (web-skeleton::set-socket-option-int
+              tgt-fd web-skeleton::+sol-socket+ 7 2048)
+             (web-skeleton::register-connection target)
+             (web-skeleton::epoll-add epfd tgt-fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (setf (symbol-function 'web-skeleton::epoll-modify)
+                   (lambda (efd fd mask)
+                     (push (cons fd mask) calls)
+                     (funcall real efd fd mask)))
+             ;; What FETCH-INTO's :THEN reduces to, on the path where the
+             ;; outbound is what epoll woke and the target is not.
+             (web-skeleton::deliver-detached
+              tgt-fd epfd
+              (lambda (s h b)
+                (declare (ignore s h b))
+                (setf flushed (web-skeleton::ws-send target frame))
+                nil)
+              :delivered)
+             (setf (symbol-function 'web-skeleton::epoll-modify) real)
+             (check "callback ws-send: the frame did not all fit" flushed nil)
+             (check "callback ws-send: a remainder is queued"
+                    (plusp (web-skeleton::connection-write-pending target)) t)
+             (check "callback ws-send: EPOLLOUT is armed on the target"
+                    (and (find-if
+                          (lambda (c)
+                            (and (= (car c) tgt-fd)
+                                 (plusp (logand (cdr c)
+                                                web-skeleton::+epollout+))))
+                          calls)
+                         t)
+                    t))
+        (setf (symbol-function 'web-skeleton::epoll-modify) real)
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The third caller: a handler that sends to somebody else
+;;;
+;;; HANDLE-CLIENT-READ arms (CONNECTION-FD CONN) — the connection it was
+;;; woken for. A ws-handler that sends to any *other* connection is
+;;; therefore in exactly the position the fetch callback was in, and that
+;;; is not a hypothetical shape: it is the one DEPLOYMENT.md documents
+;;; under fan-out, "calling ws-send in a loop" over a subscriber list.
+;;;
+;;; The fix covers it by construction and the branch said nothing about it,
+;;; which by this suite's own criterion is a claim without a detector.
+;;; ---------------------------------------------------------------------------
+
+(defun %ws-fanout-pass ()
+  "Run the documented fan-out shape and report what got armed.
+
+   A real masked frame arrives on A; A's handler sends a 512 KiB frame to
+   B, whose send buffer is shrunk so a remainder is guaranteed. Returns
+   (values SENT PENDING-B TOUCHED-A ARMED-B) — WS-SEND's answer, the bytes
+   left on B, whether epoll was touched for A at all, and whether EPOLLOUT
+   was armed for B.
+
+   Asymmetric on purpose. A's handler returns NIL, so A has nothing pending
+   and HANDLE-CLIENT-READ arms it EPOLLIN — the question for A is only
+   whether the read path ran and reached its arming at all, which is what
+   separates a B that was missed from a run where nothing armed anything at
+   all.
+
+   Driven through the real HANDLE-CLIENT-READ rather than by calling the
+   handler, because the arming under test is the one HANDLE-CLIENT-READ
+   performs after a handler returns. Calling the handler directly would
+   remove the very code whose scope is the question."
+  (multiple-value-bind (a-server a-client) (%loopback-pair)
+    (multiple-value-bind (b-server b-client) (%loopback-pair)
+      (let ((epfd (web-skeleton::epoll-create))
+            (calls nil)
+            (real (symbol-function 'web-skeleton::epoll-modify)))
+        (unwind-protect
+             (let* ((a-fd (web-skeleton::socket-fd a-server))
+                    (b-fd (web-skeleton::socket-fd b-server))
+                    (web-skeleton::*connections* (make-hash-table :test #'eql))
+                    (web-skeleton::*epoll-fd* epfd)
+                    (conn-a (web-skeleton::make-connection
+                             :fd a-fd :socket a-server :state :websocket
+                             :last-active (get-universal-time)))
+                    (conn-b (web-skeleton::make-connection
+                             :fd b-fd :socket b-server :state :websocket
+                             :last-active (get-universal-time)))
+                    (big (web-skeleton::build-ws-frame
+                          web-skeleton::+ws-op-binary+
+                          (make-array (* 512 1024)
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 80)))
+                    (sent :unset))
+               (web-skeleton::set-nonblocking a-fd)
+               (web-skeleton::set-nonblocking b-fd)
+               ;; Only B is shrunk. A has to stay able to take its own
+               ;; handler's return value, or the two fds would both hold
+               ;; remainders and the assertion could not tell them apart.
+               (web-skeleton::set-socket-option-int
+                b-fd web-skeleton::+sol-socket+ 7 2048)
+               (web-skeleton::register-connection conn-a)
+               (web-skeleton::register-connection conn-b)
+               (web-skeleton::epoll-add epfd a-fd
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (web-skeleton::epoll-add epfd b-fd
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (let ((stream (sb-bsd-sockets:socket-make-stream
+                              a-client :input t :output t
+                              :element-type '(unsigned-byte 8))))
+                 (write-sequence (make-test-ws-frame "ping-a") stream)
+                 (force-output stream))
+               (sleep 0.1)
+               ;; Recording starts after the setup so what is counted is the
+               ;; read path's own arming and not EPOLL-ADD's.
+               (setf (symbol-function 'web-skeleton::epoll-modify)
+                     (lambda (efd fd mask)
+                       (push (cons fd mask) calls)
+                       (funcall real efd fd mask)))
+               (web-skeleton::handle-client-read
+                conn-a epfd nil
+                (lambda (c f)
+                  (declare (ignore c f))
+                  (setf sent (web-skeleton:ws-send conn-b big))
+                  nil))
+               (setf (symbol-function 'web-skeleton::epoll-modify) real)
+               (values sent
+                       (web-skeleton::connection-write-pending conn-b)
+                       (and (find a-fd calls :key #'car) t)
+                       (and (find-if (lambda (c)
+                                       (and (= (car c) b-fd)
+                                            (plusp (logand
+                                                    (cdr c)
+                                                    web-skeleton::+epollout+))))
+                                     calls)
+                            t)))
+          (setf (symbol-function 'web-skeleton::epoll-modify) real)
+          (ignore-errors (web-skeleton::%close epfd))
+          (ignore-errors (sb-bsd-sockets:socket-close a-server))
+          (ignore-errors (sb-bsd-sockets:socket-close a-client))
+          (ignore-errors (sb-bsd-sockets:socket-close b-server))
+          (ignore-errors (sb-bsd-sockets:socket-close b-client)))))))
+
+
+(defun test-ws-send-arms-a-fan-out-target ()
+  "A handler that sends to somebody else arms that somebody else.
+
+   HANDLE-CLIENT-READ arms the connection it was woken for, and only that
+   one. So a ws-handler pushing to a subscriber list is in exactly the
+   position the fetch callback was in — nothing downstream arms the target
+   — and DEPLOYMENT.md documents that shape under fan-out rather than
+   treating it as exotic. The same one-line fix covers both; only one of
+   them was claimed.
+
+   Four assertions, and the first two are the precondition. A frame that
+   fits leaves nothing to strand, so WS-SEND returning NIL and B holding a
+   backlog is what makes the fourth check about the claim rather than about
+   the fixture.
+
+   The third is the control, and what it guards against is the fourth going
+   vacuous later rather than anything failing now. Under the defect A is
+   still armed — HANDLE-CLIENT-READ names A's own fd and always did — so a
+   failure list reading A touched, B not states the defect precisely.
+
+   The case it really exists for is fixture drift. Simplify this test by
+   calling the handler directly instead of driving HANDLE-CLIENT-READ — the
+   obvious tidy-up, and someone will try it — and the fourth check still
+   passes, because WS-SEND now arms B itself. The seam stops being crossed
+   and nothing says so. That is the *pre-arranged* mode, reachable only
+   because the fix landed, and this check is the thing that catches it:
+   measured, that drift fails check three alone and leaves the other three
+   green.
+
+   EPOLLIN is what A gets, not EPOLLOUT: its handler returned NIL, so A has
+   nothing pending. Hence the asymmetry between the third check and the
+   fourth — for A the question is whether epoll was touched at all, for B
+   it is whether the right interest was set."
+  (format t "~%ws-send: arming a fan-out target~%")
+  (multiple-value-bind (sent pending-b touched-a armed-b) (%ws-fanout-pass)
+    (check "fan-out ws-send: the frame did not all fit" sent nil)
+    (check "fan-out ws-send: a remainder is queued on the target"
+           (plusp pending-b) t)
+    (check "fan-out ws-send: the read path armed its own connection"
+           touched-a t)
+    (check "fan-out ws-send: and EPOLLOUT is armed on the fan-out target"
+           armed-b t)))
+
+;;; ---------------------------------------------------------------------------
+;;; The close code for a frame that is too large
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-oversized-frame-close-code ()
+  "An oversized data frame closes 1009; an oversized control frame closes 1002.
+
+   RFC 6455 7.4.1 has 1009 (Message Too Big) for the data case, and the
+   oversized fragmented *message* — the same complaint one layer up —
+   already closed 1009 in two places. The single frame raised out of
+   TRY-PARSE-WS-FRAME as a generic error, took WEBSOCKET-ON-READ's
+   catch-all, and closed 1002. One file, two answers to one question.
+
+   The control frame is the other half, and it wants the other code.
+   *MAX-WS-PAYLOAD-SIZE* is a limit this endpoint chose, so exceeding it
+   is 1009 — 'too big for me'. §5.5 caps every control frame at 125 bytes
+   for everyone, so exceeding *that* is malformed rather than inconvenient
+   and earns 1002. Introducing WS-FRAME-TOO-LARGE above the §5.5 check
+   meant a ping declaring more than 64 KiB took the size check first and
+   was told its message was too big for us, when what was wrong with it is
+   that no endpoint may send it.
+
+   Driven through WEBSOCKET-ON-READ rather than by asserting the condition
+   type, because the code on the wire is the claim and the condition is
+   only how it gets there. The neighbouring 1002 test is a control that
+   still passes: an unknown opcode is a protocol error and keeps its code.
+
+   *MAX-WS-PAYLOAD-SIZE* is lowered rather than a real 1 MiB frame built.
+   What the parser compares is the declared length against the bound, and a
+   small bound reaches that comparison with eight bytes instead of a
+   megabyte. The ping needs 200 — over §5.5's 125 *and* over the lowered
+   bound, since a frame that trips only one of them cannot tell which
+   check ran first."
+  (format t "~%ws: the close code for a frame that is too large~%")
+  (flet ((close-code-for (frame)
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :websocket :last-active 0)))
+             (setf (web-skeleton::connection-read-buf conn) frame
+                   (web-skeleton::connection-read-pos conn) (length frame))
+             (multiple-value-bind (action response)
+                 (web-skeleton::websocket-on-read
+                  conn (lambda (c f) (declare (ignore c f)) nil))
+               (values action
+                       (and response
+                            (>= (length response) 4)
+                            (logior (ash (aref response 2) 8)
+                                    (aref response 3))))))))
+    (let ((web-skeleton::*max-ws-payload-size* 4))
+      (multiple-value-bind (action code)
+          (close-code-for (make-masked-frame t 1 #(104 101 108 108 111 32 119 111)))
+        (check "oversized frame: the connection closes" action :close)
+        (check "oversized frame: with 1009, not 1002" code 1009))
+      ;; Opcode 9 is ping. 200 bytes is over both bounds, so the code that
+      ;; comes back names which check the parser reached first.
+      (multiple-value-bind (action code)
+          (close-code-for
+           (make-masked-frame t 9 (make-array 200 :element-type '(unsigned-byte 8)
+                                                  :initial-element 65)))
+        (check "oversized control frame: the connection closes" action :close)
+        (check "oversized control frame: with 1002, not 1009" code 1002)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The verdict the discard loop used to spin on
+;;; ---------------------------------------------------------------------------
+
+(defun test-discard-available-want-write ()
+  "CONNECTION-DISCARD-AVAILABLE hands back :WANT-WRITE instead of looping.
+
+   CONNECTION-READ-INTO has four non-integer verdicts and this loop handled
+   two, so :WANT-WRITE fell into the integer default, set a flag and went
+   round again — a hot spin inside the event loop with no exit. Its own
+   docstring says the cond is deliberately the same shape as
+   CONNECTION-READ-AVAILABLE's so the two can be read side by side, and it
+   was not.
+
+   Unreachable today: the only caller is the :STREAMING inbound path and
+   there is no inbound TLS. That is how long a spin like this stays
+   invisible, and it is the argument for the assertion rather than against
+   it.
+
+   The stub is bounded on purpose. An unbounded one would hang the run
+   under the defect rather than fail it, which is the *too violent* mode —
+   a detector whose failure is indistinguishable from a machine problem.
+   Bounded, the defect exhausts the budget, falls through to :EOF and
+   answers :OK-EOF, so both assertions fail and the run continues.
+
+   The call count is the second assertion for the same reason: a fix that
+   answered :WANT-WRITE after looping ten times would satisfy the first
+   check and still be the bug."
+  (format t "~%Discard loop: the verdict it used to spin on~%")
+  (let ((calls 0)
+        (real (symbol-function 'web-skeleton::connection-read-into)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'web-skeleton::connection-read-into)
+                 (lambda (conn buffer start max-bytes)
+                   (declare (ignore conn buffer start max-bytes))
+                   (incf calls)
+                   (if (< calls 20) :want-write :eof)))
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :streaming :last-active 0))
+                 (sink (make-array 64 :element-type '(unsigned-byte 8))))
+             (check "discard: :want-write is answered, not swallowed"
+                    (web-skeleton::connection-discard-available conn sink)
+                    :want-write)
+             (check "discard: and it answered on the first read"
+                    calls 1)))
+      (setf (symbol-function 'web-skeleton::connection-read-into) real))))
+
+;;; ---------------------------------------------------------------------------
+;;; The third boot invariant
+;;; ---------------------------------------------------------------------------
+
+(defun test-fetch-timeout-validated-at-boot ()
+  "START-SERVER refuses a non-positive *FETCH-TIMEOUT* before it binds.
+
+   It already refuses a non-positive *WRITE-STALL-TIMEOUT* and an
+   under-sized *MAX-WRITE-BACKLOG*, with the same reasoning: a
+   misconfiguration should not wait for the shape that reveals it.
+   *FETCH-TIMEOUT* is the floor under every way a fetch can fail to return
+   — the DNS phase, the connect, the read, and the :AWAITING sweep that
+   answers a parked caller 504 — and at zero the sweep never fires.
+
+   The :HOST is deliberately invalid. If the validation is reverted,
+   START-SERVER continues to MAKE-TCP-LISTENER, which refuses a three-byte
+   vector by name — so the revert fails this assertion instead of starting
+   a real server inside the suite. A detector that leaves a listener
+   running when it fails is worse than none.
+
+   Asserted on the message rather than on the fact of a raise, because both
+   paths raise and only one of them is this invariant."
+  (format t "~%start-server: the third boot invariant~%")
+  (let ((web-skeleton:*fetch-timeout* 0))
+    (check "boot: a zero *fetch-timeout* is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*fetch-timeout*" msg) t))
+           t)))
 
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
@@ -7629,6 +8737,9 @@
   (test-is-public-address)
   (test-fetch-address-filter)
   (test-dns-cache)
+  (test-dns-lookup-sink)
+  (test-dns-error-ends-a-detached-fetch)
+  (test-dns-chain-success-survives-a-failed-teardown)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
@@ -7666,10 +8777,18 @@
   (test-outbound-direction-inversion)
   (test-write-queue-drain)
   (test-ws-send-queues)
+  (test-ws-send-refuses-a-foreign-connection)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
+  (test-ws-send-arms-from-a-fetch-callback)
+  (test-ws-send-arms-a-fan-out-target)
+  (test-stream-close-arms-the-write-path)
+  (test-stream-close-refuses-a-foreign-connection)
   (test-cpu-count-parsers)
+  (test-ws-oversized-frame-close-code)
+  (test-discard-available-want-write)
+  (test-fetch-timeout-validated-at-boot)
   (report-suite "Server")
   (zerop *tests-failed*))

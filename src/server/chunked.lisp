@@ -256,8 +256,27 @@
         (when (> (+ pos size) end)
           (chunked-error "chunked: short chunk-data (~d of ~d bytes)"
                  (- end pos) size))
-        (loop for i from pos below (+ pos size)
-              do (vector-push-extend (aref buf i) out))
+        ;; REPLACE rather than a byte at a time. OUT is pre-sized to the
+        ;; whole input span above and a decoded body is never larger than
+        ;; its encoding, so it can never need to extend — which made
+        ;; VECTOR-PUSH-EXTEND a per-byte function call buying nothing, and
+        ;; roughly a million of them for a 1 MiB body on the inbound
+        ;; request path.
+        ;;
+        ;; It also retires a latent portability question: OUT is created
+        ;; with a fill pointer and no :ADJUSTABLE T, and VECTOR-PUSH-EXTEND
+        ;; on a non-adjustable vector is undefined per CLHS. It happens to
+        ;; work in SBCL, and every other accumulator in this tree passes
+        ;; :ADJUSTABLE T. REPLACE makes the question moot instead of
+        ;; answering it.
+        ;;
+        ;; Fill pointer first, then copy. REPLACE treats the fill pointer
+        ;; as the vector's active end, so copying to :START1 (FILL-POINTER
+        ;; OUT) before moving it writes into no active region at all and
+        ;; silently does nothing.
+        (let ((dest (fill-pointer out)))
+          (setf (fill-pointer out) (+ dest size))
+          (replace out buf :start1 dest :start2 pos :end2 (+ pos size)))
         (incf pos size)
         ;; Require strict CRLF after chunk-data (RFC 7230 §4.1).
         ;; The lax \r-or-\n-or-nothing accept-anything behaviour was

@@ -172,6 +172,17 @@
   ;; below would silently accept a 65-byte signature by ignoring
   ;; the trailing byte, and a shorter input would crash with a
   ;; subseq error instead of returning NIL.
+  ;; HASH is gated with the other three rather than trusted. The argument
+  ;; the comment above makes for gating SIG-BYTES and the coordinates is
+  ;; an argument about this primitive's callers in general, and it did not
+  ;; stop at the first parameter for any reason anyone wrote down. JWT is
+  ;; the only caller today and always passes a 32-byte SHA-256 digest, so
+  ;; this is hygiene rather than a fix — but a short HASH would otherwise
+  ;; be silently left-padded by BYTES-TO-INTEGER into a different message,
+  ;; and verification against the wrong message is exactly the answer a
+  ;; verifier must never give quietly.
+  (unless (= (length hash) 32)
+    (return-from ecdsa-verify-p256-lisp nil))
   (unless (= (length sig-bytes) 64)
     (return-from ecdsa-verify-p256-lisp nil))
   (unless (and (= (length pubkey-x) 32) (= (length pubkey-y) 32))

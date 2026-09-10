@@ -16,6 +16,12 @@ Three things distinguish it:
   folding is rejected by both readers that look at it. Every request-smuggling
   CVE in the genre is two hops resolving the same ambiguity differently; a
   server that never resolves it cannot be the hop that resolves it wrongly.
+  The same refusal runs on the way out: `build-outbound-request` rejects a
+  caller-supplied `Content-Length` or `Transfer-Encoding`, and the serializer
+  rejects control characters against the table the parser uses. **The
+  framework will not emit what it will not accept**, so an application built
+  on it cannot become the upstream hop in someone else's smuggling chain
+  either.
 - **One worker per core, sharing nothing on the request path.** Each has its own
   listener (`SO_REUSEPORT`), epoll instance, connection table and scratch
   buffers. There are no locks on the request path. The only mutex a request can
@@ -358,6 +364,56 @@ The boundaries of the list above. Each is a deliberate choice rather than
 an oversight, but a boundary you meet in production is worse than one you
 read about here.
 
+- **Fan-out is per worker, and a send from the wrong worker is refused rather
+  than dropped — but only from a worker.** A stream or a WebSocket can only be
+  written from the worker that owns it — the write queue has no lock precisely
+  because nothing else touches it — so an application holding a registry of
+  subscribers must hold one per worker and push from the owning thread.
+  There are four write entry points an application can reach, and **three of
+  the four refuse a connection another worker owns**: `ws-send`,
+  `stream-close` and `fetch-into` each ask the connection table and raise
+  before anything is queued. None of the three did before this branch:
+  `fetch-into` accepted the call outright, and `ws-send` and `stream-close`
+  raised only when the write left a remainder — after appending it, and in
+  `stream-close`'s case after telling the application the stream had closed
+  normally.
+
+  **`stream-send` is the exception and does not check.** A cross-worker
+  `stream-send` appends to the unsynchronised queue and calls `send(2)` from
+  the wrong thread; it is noticed only when the write leaves a remainder,
+  because the arm that follows gets `ENOENT` — so the common case, where the
+  bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
+  had before this branch. It is left alone because closing it is a contract
+  change rather than a fix: a cross-worker `stream-send` mostly succeeds today
+  and code may lean on that accidentally, where a cross-worker `stream-close`
+  already raised every time.
+
+  A second boundary, and it applies to all four: the question they ask is
+  "is this fd on **this worker's** table", and only a worker can ask it. A
+  thread that is not one — a timer, a queue consumer, a background pump — has
+  no table to check against, so all three checks are skipped and the writes go
+  through silently. `fetch-into` refuses that case too, but for its own
+  reason: it opens an outbound that needs an event loop to drive. Closing it
+  for the rest would mean refusing every call from outside an event loop —
+  reachable, but a change to three functions at once, and one they have to
+  make together or not at all.
+
+  Fan-out *across* workers is not provided, and building it needs a mechanism
+  this framework deliberately does not have.
+- **Only origin-form request targets.** The request line must start with `/`.
+  RFC 7230 §5.3.2 requires a server to accept absolute-form
+  (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy
+  sends, and §5.3.4 defines asterisk-form (`OPTIONS * HTTP/1.1`), which some
+  health checkers use. Both are answered `400` here. Deliberate — one
+  accepted shape is one shape to get wrong, and behind a reverse proxy
+  neither form arrives — but it is a boundary rather than an oversight, and
+  it was previously written down nowhere.
+- **Percent-decoding assumes UTF-8.** `url-decode` decodes to a string and
+  raises on a byte sequence that is not valid UTF-8, so `?q=%FF` — a legal
+  percent-encoding — becomes a `400` raised from inside the handler at
+  `get-query-param` time, and the log line reads like a parse failure rather
+  than an encoding one. There is no byte-returning sibling for an
+  application that wants the raw octets.
 - **No inbound TLS.** The server cannot serve HTTPS. A reverse proxy
   (nginx, caddy) terminates TLS in front of it. Outbound TLS *is*
   supported — `web-skeleton-tls` gives `https://` fetches — so the
@@ -419,10 +475,11 @@ read about here.
   restarts by itself when the connection being relayed into empties its
   queue. That is the backpressure case the mechanism exists for, and it
   needs the target to have *actually backed up*: `stream-send` and
-  `ws-send` flush inline, never reaching the event loop's write path, so
-  a pause taken while the target's queue was empty has no drain coming
-  and needs an explicit `fetch-resume`. An app that pauses with neither
-  condition arranged strands that fetch until `*fetch-timeout*`.
+  `ws-send` flush inline, and a flush that completes never reaches the
+  event loop's write path, so a pause taken while the target's queue was
+  empty has no drain coming and needs an explicit `fetch-resume`. An app
+  that pauses with neither condition arranged strands that fetch until
+  `*fetch-timeout*`.
 - **A failed detached fetch takes a `:streaming` target with it, and on
   that path there is no opt-out.** The connection closes without its
   chunked terminator, so the peer sees truncation rather than a failed
@@ -519,7 +576,7 @@ All configurable via `setf` before calling `start-server`.
 | `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it |
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
-| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed |
+| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing |
 | `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. Validated when the server starts, so a deployment that trims this below the message size is told at boot rather than at the first maximal message. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |
 | `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |
@@ -529,7 +586,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
-| `*fetch-timeout*`              | `30`      | A **total** on the `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations                |
+| `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |

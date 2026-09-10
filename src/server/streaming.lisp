@@ -341,7 +341,25 @@
    Signals if the connection is not streaming, or if it is already at
    *MAX-WRITE-BACKLOG* — the frame is not queued, not truncated, and the
    caller learns the peer is too far behind rather than discovering it
-   as a gap the peer can never detect."
+   as a gap the peer can never detect.
+
+   Does *not* check that CONN belongs to this worker, and that is the one
+   place this function differs from the other three write entry points.
+   WS-SEND, STREAM-CLOSE and FETCH-INTO all ask the connection table and
+   refuse a connection another worker owns; this one does not, so a
+   cross-worker call appends to an unsynchronised queue and calls send(2)
+   from the wrong thread. It is noticed only when the flush leaves a
+   remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
+   — the common case, where the bytes fit, returns T and says nothing.
+
+   That is the shape WS-SEND had before this branch and it is stated here
+   rather than fixed because fixing it is a contract change: today a
+   cross-worker STREAM-SEND mostly succeeds, and applications may be
+   relying on it accidentally. STREAM-CLOSE could be guarded without one,
+   since it already raised on that path every time. The rule for all four
+   is in README.md under Limitations; this paragraph exists so that a
+   reader who has seen the other three enforce it does not infer that
+   this one does."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
   (unless (eq (connection-state conn) :streaming)
     (error "stream-send: fd ~d is in state ~a, not :streaming"
@@ -434,10 +452,49 @@
    what enforces the rule that a chunked body cannot be reused as a
    connection without its terminator having been written. Every other
    way a stream can end goes through CLOSE-CONNECTION and takes the
-   socket with it."
+   socket with it.
+
+   Arms EPOLLOUT before returning. The write path this hands to needs an
+   event to run on, and the flush completing is exactly when nothing else
+   would have armed one — see the comment below.
+
+   Signals if the state is not :STREAMING, and signals if that arming
+   fails. The second is unconditional, where the arming it replaced was
+   skipped whenever the flush finished — so a failure to arm is reported
+   every time rather than only when the terminator did not fit.
+
+   Signals, before either of those has a chance to matter, if CONN is not
+   on this worker's connection table — the same check WS-SEND and
+   FETCH-INTO make, before anything is touched.
+
+   The arm was the only thing that noticed a cross-worker close, and it
+   arms last: by then the terminator has been appended to another
+   worker's unlocked queue and put on the wire with send(2) from the
+   wrong thread, the state has moved to :WRITE-RESPONSE, and ON-CLOSE
+   has fired :DONE. That last one is why this is a guard rather than a
+   documented limitation. NOTIFY-STREAM-CLOSED nulls the slot before
+   calling so the callback fires exactly once, so the owning worker's own
+   teardown notification is afterwards a no-op — the application's first
+   and last word about that stream is :DONE, it is false, and nothing can
+   correct it. A corrupted queue is at least a thing the framework knows
+   about; telling an app its stream ended normally when it did not is not."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
+  ;; Before the terminator, the state change and the notification, for the
+  ;; reason the docstring gives: each of those is a commitment, and the
+  ;; notification cannot be taken back. Conditional on *EPOLL-FD* exactly
+  ;; as WS-SEND's is — off a worker there is no table to ask, which is the
+  ;; harness's case and not the misuse being caught.
+  (when (and *epoll-fd*
+             (not (eq (lookup-connection (connection-fd conn)) conn)))
+    (error "stream-close: fd ~d is not on this worker's connection table. ~
+            A stream can only be closed from the worker that owns it — the ~
+            write queue has no lock precisely because nothing else touches ~
+            it, and ON-CLOSE fires exactly once, so closing from here would ~
+            tell the application :DONE about a stream this thread cannot ~
+            finish."
+           (connection-fd conn)))
   (when (eq (connection-stream-framing conn) :chunked)
     (unless (connection-append-write conn (chunked-terminator))
       ;; No room for five bytes means the peer is hopelessly behind. The
@@ -464,7 +521,34 @@
         (connection-stream-keepalive conn) nil
         (connection-state conn) :write-response)
   (notify-stream-closed conn :done)
-  (stream-flush conn)
+  ;; Flush and arm, rather than STREAM-FLUSH's flush-and-maybe-arm.
+  ;; :WRITE-RESPONSE is left by HANDLE-CLIENT-WRITE and by nothing else —
+  ;; it is where a keep-alive connection resets to :READ-HTTP and where a
+  ;; close-delimited one closes — so the event has to be armed whether or
+  ;; not the flush completed, and STREAM-FLUSH arms only when it did not.
+  ;; The ordinary close is the one that completes. Measured on the wire:
+  ;; the client receives a complete, correctly terminated response, and the
+  ;; connection is then unusable — its next request met by
+  ;; HANDLE-CLIENT-READ's permissive arm and answered with nothing until
+  ;; the idle sweep.
+  ;;
+  ;; START-STREAM already does this for the one caller it owns: its
+  ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally, saying the
+  ;; ordinary write path takes it from here. Every *later* caller had no
+  ;; counterpart — a fetch :THEN, a timer, a second event.
+  ;;
+  ;; EPOLLOUT alone, and not by calling STREAM-FLUSH, because that
+  ;; function's mask is argued for a connection that is still streaming:
+  ;; EPOLLIN stays, its docstring says, "because a stream still has to
+  ;; notice its peer going away". This one is not a stream any more. It is
+  ;; not reading, HANDLE-CLIENT-READ ignores a stale EPOLLIN for
+  ;; :WRITE-RESPONSE, and HANDLE-CLIENT-WRITE arms EPOLLIN itself on the
+  ;; keep-alive reset. Borrowing the call would borrow a rationale that is
+  ;; false at this call site.
+  (connection-on-write conn)
+  (when *epoll-fd*
+    (epoll-modify *epoll-fd* (connection-fd conn)
+                  (logior +epollout+ +epollet+)))
   (values))
 
 ;;; ---------------------------------------------------------------------------

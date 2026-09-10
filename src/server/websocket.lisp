@@ -23,6 +23,20 @@
 
 ;;; *max-ws-payload-size* is defined in http.lisp alongside the other limits.
 
+(define-condition ws-frame-too-large (error)
+  ((message :initarg :message :reader ws-frame-too-large-message))
+  (:report (lambda (c s) (write-string (ws-frame-too-large-message c) s)))
+  (:documentation
+   "A single frame declaring more than *MAX-WS-PAYLOAD-SIZE* bytes.
+
+    Its own condition because RFC 6455 7.4.1 has 1009 (Message Too Big) for
+    it, and every other parse failure in TRY-PARSE-WS-FRAME is a protocol
+    error answered 1002. Without the distinction the oversized *frame* took
+    WEBSOCKET-ON-READ's catch-all and closed 1002, while the oversized
+    fragmented *message* — the same complaint one layer up — correctly
+    closed 1009 in two places. One file, two answers to one question,
+    which is the disagreement this codebase is organised against."))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Handshake
 ;;; ---------------------------------------------------------------------------
@@ -177,18 +191,30 @@
       ;; RFC 6455 §5.2: 64-bit length MSB must be 0
       (when (logbitp 63 payload-length)
         (error "WebSocket: invalid payload length (MSB set)"))
-      ;; Reject oversized frames early
-      (when (> payload-length *max-ws-payload-size*)
-        (error "WebSocket: frame too large (~d bytes, max ~d)"
-               payload-length *max-ws-payload-size*))
       ;; Control frames (opcode >= 8): must have payload <= 125 and FIN=1
       ;; (RFC 6455 §5.5)
+      ;;
+      ;; Ahead of the size check below, and the order is the close code.
+      ;; WS-FRAME-TOO-LARGE closes 1009, which is the right answer for a
+      ;; data frame this endpoint will not buffer — a limit we chose. A
+      ;; control frame over 125 bytes is not a limit we chose: §5.5 makes
+      ;; it malformed for anyone, so 1002 is what it earns. Below the size
+      ;; check, a ping declaring a megabyte got 1009 and told the peer its
+      ;; message was too big for us rather than that its frame was
+      ;; illegal. Both checks read the declared length out of the header,
+      ;; so nothing is buffered either way and the early reject survives
+      ;; the reordering.
       (when (>= opcode 8)
         (when (> payload-length 125)
           (error "WebSocket: control frame payload too large (~d bytes, max 125)"
                  payload-length))
         (unless fin
           (error "WebSocket: fragmented control frame")))
+      ;; Reject oversized frames early
+      (when (> payload-length *max-ws-payload-size*)
+        (error 'ws-frame-too-large
+               :message (format nil "WebSocket: frame too large (~d bytes, max ~d)"
+                                payload-length *max-ws-payload-size*)))
       ;; Account for mask key
       (when masked (incf header-size 4))
       ;; Check if we have the full frame
@@ -280,8 +306,24 @@
 ;;; Frame send
 ;;;
 ;;; Queues a frame and flushes what the socket will accept right now.
-;;; Intended for use inside ws-handler — the event loop is paused while
-;;; the handler runs, so there is no contention with pings or other writes.
+;;; Three callers, and only the first is served by HANDLE-CLIENT-READ's
+;;; arming:
+;;;
+;;;   1. A ws-handler sending on the connection it was handed. The event
+;;;      loop is paused while it runs, so there is no contention with pings
+;;;      or other writes, and HANDLE-CLIENT-READ arms that connection once
+;;;      the handler returns.
+;;;   2. A ws-handler sending to a *different* connection — fan-out, which
+;;;      DEPLOYMENT.md documents as the shape to prefer over your own queue.
+;;;      HANDLE-CLIENT-READ arms (CONNECTION-FD CONN), the connection it was
+;;;      woken for. Nobody arms the subscriber.
+;;;   3. A fetch callback on a :WEBSOCKET target, which runs on the
+;;;      *outbound* connection's read path. HANDLE-OUTBOUND-READ arms the
+;;;      outbound. Nobody arms the target.
+;;;
+;;; Two and three are why the arming below exists, and they are the same
+;;; defect: an arming site that names one connection, reached from a context
+;;; that wrote to another.
 ;;;
 ;;; The flush is opportunistic: one non-blocking pass, no spin and no
 ;;; deadline. A pure append would have been simpler, and wrong — the
@@ -291,11 +333,62 @@
 ;;; delivery for a peer that is keeping up, and a peer that is not gets
 ;;; its bytes queued instead of freezing the worker.
 ;;;
-;;; Arming EPOLLOUT is deliberately not done here. WS-SEND has no epoll
-;;; fd, and threading one through an exported function to arm it once per
-;;; frame would re-register the same interest repeatedly for a handler
-;;; sending in a loop. HANDLE-CLIENT-READ arms once, after the handler
-;;; returns, only if anything is still pending.
+;;; EPOLLOUT is armed here, and only when the flush did not finish. That
+;;; is STREAM-FLUSH's conditional, and it costs nothing for a peer that is
+;;; keeping up: the flush finishes, so a handler sending in a loop to a
+;;; draining peer pays no epoll_ctl at all. Against a peer that is *not*
+;;; draining the same loop pays one MOD per frame with an identical mask,
+;;; which is the case the objection to arming per frame was actually
+;;; about. It is the cheaper half of the trade — the alternative is the
+;;; defect below — but the conditional narrows that cost rather than
+;;; removing it. The fd comes from *EPOLL-FD*, the worker's own, bound for
+;;; exactly this and NIL outside a worker — so the check is a check and
+;;; not an assumption.
+;;;
+;;; Leaving it to HANDLE-CLIENT-READ was correct for one caller and wrong
+;;; for the other. That site arms after a handler returns, and WS-SEND is
+;;; also reachable from a fetch callback on a :WEBSOCKET target, which
+;;; runs on the *outbound* connection's read path — where
+;;; HANDLE-OUTBOUND-READ arms the outbound and nothing arms the target.
+;;; HANDLE-CLIENT-READ does not run for it unless its peer happens to
+;;; send something. Measured on that path: a 512 KiB frame, 444 KiB still
+;;; queued, and not one epoll_ctl against the target. The tail of the last
+;;; frame then waits for an event that is not coming, and
+;;; *WRITE-STALL-TIMEOUT* closes the connection rather than flushing it.
+;;; Every send had reported success and the peer got a truncated message,
+;;; which is the failure this codebase refuses everywhere else.
+;;;
+;;; EPOLLOUT alone, not EPOLLIN with it. That is what HANDLE-CLIENT-READ
+;;; arms for a :WEBSOCKET connection carrying a backlog, and
+;;; HANDLE-CLIENT-WRITE restores EPOLLIN once the queue drains, so this
+;;; enters a loop that already exists rather than adding a third mask
+;;; convention to one state.
+;;;
+;;; A peer that is *gone* is still noticed, and the reason is stronger than
+;;; writability: EPOLLERR and EPOLLHUP are reported whether or not they were
+;;; requested — epoll_ctl(2) says so — so a full close arrives as
+;;; OUT|ERR|HUP under this mask and the next write raises ECONNRESET.
+;;;
+;;; A peer that *half-closes* while we are behind is not noticed: measured,
+;;; zero events, and it waits for *WRITE-STALL-TIMEOUT*. That is a real
+;;; exception and it is stated rather than rounded off — but it is not one
+;;; this widens, because HANDLE-CLIENT-READ already arms EPOLLOUT alone for
+;;; a backlogged :WEBSOCKET connection, and a WebSocket peer that half-
+;;; closes without a close frame is violating RFC 6455 5.5.1 already.
+;;;
+;;; Adding EPOLLIN would instead let a handler be re-entered against a full
+;;; queue, which is where WS-SEND signals — turning a slow peer into a dead
+;;; connection.
+;;;
+;;; And it bounds per-connection memory, which is what makes the exclusive
+;;; convention a design rather than an accident. While EPOLLIN is dropped
+;;; HANDLE-CLIENT-READ does not run, so WS-FRAG-BUF cannot grow: a peer
+;;; cannot keep pushing fragments into reassembly while its write side is
+;;; stuck. Under the combined mask the worst case per connection becomes
+;;; *MAX-WRITE-BACKLOG* and *MAX-WS-MESSAGE-SIZE* and the read buffer all at
+;;; once, rather than in alternation. The kernel receive buffer filling and
+;;; the peer's send window closing is the correct backpressure for a peer
+;;; that will not drain, and this mask is what produces it.
 ;;; ---------------------------------------------------------------------------
 
 (defun ws-send (conn frame-bytes)
@@ -308,26 +401,89 @@
    slow peer looks, not an error. Failures of the flush itself do surface
    here; failures of the deferred remainder surface on the event loop.
 
-   Call it from within ws-handler. The event loop is paused while the
-   handler runs, so there is no write contention, and this is the only
-   context that owns the connection.
+   Call it from within ws-handler, or from a fetch callback on a
+   :WEBSOCKET target. Inside a handler the event loop is paused, so there
+   is no write contention; from a fetch callback the target is a
+   connection nothing else is writing to for the life of the fetch. A
+   remainder is handed to the event loop the same way in both — see the
+   header comment for why it has to be handed over here.
 
    Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
    is not queued, not truncated, and the peer is far enough behind that
    dropping it silently would leave the app's view and the peer's view of
-   the stream permanently different."
+   the stream permanently different.
+
+   Signals if CONN is not on this worker's connection table — an app
+   reaching across workers, which was silent before and appended to an
+   unsynchronised queue. FETCH-INTO refuses the same misuse for the same
+   reason, and the two agree: both refuse every cross-worker call, not
+   only the ones that happen to leave a remainder.
+
+   The wrong worker, not the wrong thread. Asking whether an fd is on this
+   worker's table takes a worker to ask from, so a call off the event loop
+   entirely — an application's own timer or queue consumer — finds no table
+   and gets the old behaviour. FETCH-INTO refuses that one as well, but for
+   an unrelated reason: it needs a loop to drive the outbound it opens — a
+   functional precondition this function does not share, since a send off a
+   worker to a connection nothing else is touching works correctly and the
+   harness relies on it.
+
+   Closing it here would mean refusing every call from outside an event
+   loop. That is reachable and it is not this function's decision:
+   STREAM-SEND and STREAM-CLOSE have the identical hole, and narrowing one
+   of the three leaves a boundary that reads as an oversight instead of a
+   rule. Three together or none.
+
+   Signals also if the arming fails, and that one is not symmetric with the
+   others: the frame has been queued and flushed by then, so the raise
+   reports that the *remainder* has no event coming, not that the send did
+   not happen. Arming is what used to catch a cross-worker call, and only
+   incidentally — an fd absent from this worker's epoll gives ENOENT — so
+   it caught one only when the flush left something behind. The check
+   above is what makes that a guarantee; this one is left as the report
+   that a queued remainder has nothing coming."
   (unless (plusp *write-stall-timeout*)
     (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
             There is no unbounded setting, because it is the only ~
             deadline on a queue this connection may never drain."
            *write-stall-timeout*))
+  ;; Ownership before the queue is touched, because the queue is what a
+  ;; cross-worker call corrupts: CONNECTION-APPEND-WRITE mutates a vector
+  ;; and CONNECTION-ON-WRITE calls send(2), both from a thread that owns
+  ;; neither. Refusing after the append would report the misuse and have
+  ;; committed it anyway.
+  ;;
+  ;; Conditional on *EPOLL-FD*, where FETCH-INTO requires it. The two want
+  ;; different things from the same fact: FETCH-INTO opens an outbound that
+  ;; only an event loop can drive, so no loop is itself the error, while
+  ;; WS-SEND is a queue-and-flush that works fine off a worker and the
+  ;; harness calls it that way on bare connections. Here NIL means "not on
+  ;; a worker at all", which is not the misuse being caught. *CONNECTIONS*
+  ;; is bound outside *EPOLL-FD* in RUN-WORKER, so non-NIL guarantees a
+  ;; live table to ask.
+  ;;
+  ;; EQ against the table, not a comparison on the fd number: an fd
+  ;; reissued to a different connection on this worker would satisfy the
+  ;; number while being the wrong object.
+  (when *epoll-fd*
+    (unless (eq (lookup-connection (connection-fd conn)) conn)
+      (error "ws-send: fd ~d is not on this worker's connection table. ~
+              A WebSocket can only be written from the worker that owns ~
+              it — the write queue has no lock precisely because nothing ~
+              else touches it, so appending here would corrupt it and the ~
+              flush would call send(2) from the wrong thread."
+             (connection-fd conn))))
   (unless (connection-append-write conn frame-bytes)
     (error "ws-send: fd ~d is at *max-write-backlog* (~d bytes pending, ~
             frame is ~d); the peer is not draining."
            (connection-fd conn)
            (connection-write-pending conn)
            (length frame-bytes)))
-  (eq (connection-on-write conn) :done))
+  (let ((done (eq (connection-on-write conn) :done)))
+    (unless (or done (null *epoll-fd*))
+      (epoll-modify *epoll-fd* (connection-fd conn)
+                    (logior +epollout+ +epollet+)))
+    done))
 
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."
@@ -376,9 +532,17 @@
       (multiple-value-bind (frame consumed)
           (handler-case
               (try-parse-ws-frame buf pos end)
+            ;; Ahead of the catch-all, and the only reason it is a separate
+            ;; clause: RFC 6455 7.4.1 answers an oversized frame 1009, the
+            ;; same code the oversized fragmented message already used two
+            ;; branches below. A client keying a retry policy on 1009 was
+            ;; told 1002 for one of the two shapes.
+            (ws-frame-too-large (e)
+              (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
+              (return-from websocket-on-read (close-with 1009)))
             (error (e)
-              ;; Protocol errors (RSV bits, oversized, unmasked, etc.)
-              ;; → close with 1002 per RFC 6455 §7.1.7
+              ;; Protocol errors (RSV bits, unmasked, bad opcode, etc.)
+              ;; → close with 1002 per RFC 6455 7.1.7
               (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
               (return-from websocket-on-read (close-with 1002))))
         (unless frame
