@@ -1,40 +1,17 @@
 # web-skeleton
 
-HTTP/1.1 and WebSocket server for SBCL on Linux, written from the syscalls up.
+HTTP/1.1 and WebSocket server for SBCL on Linux,
+written from the syscalls up.
 One declared dependency: `sb-bsd-sockets`.
 
-The epoll event loop, the request parser, the chunked codec, the WebSocket
-framing, SSE, an epoll-integrated outbound HTTP client, async DNS, SHA-1,
-SHA-256, HMAC, base64, ECDSA P-256, JSON and JWT are all implemented here.
-libssl is optional and buys outbound TLS.
+The epoll event loop, the request parser, the chunked codec,
+the WebSocket framing, SSE, an epoll-integrated outbound HTTP client,
+async DNS, SHA-1, SHA-256, HMAC, base64, ECDSA P-256, JSON and JWT
+are all implemented here. libssl is optional and buys outbound TLS.
 
-Three things distinguish it:
-
-- **Ambiguous framing is refused, never reconciled.** `Transfer-Encoding` with
-  `Content-Length` is a 400 rather than a resolution, a trailer section is
-  refused so a request's boundary is never computed from one, and obsolete line
-  folding is rejected by both readers that look at it. Every request-smuggling
-  CVE in the genre is two hops resolving the same ambiguity differently; a
-  server that never resolves it cannot be the hop that resolves it wrongly.
-  The same refusal runs on the way out: `build-outbound-request` rejects a
-  caller-supplied `Content-Length` or `Transfer-Encoding`, and the serializer
-  rejects control characters against the table the parser uses. **The
-  framework will not emit what it will not accept**, so an application built
-  on it cannot become the upstream hop in someone else's smuggling chain
-  either.
-- **One worker per core, sharing nothing on the request path.** Each has its own
-  listener (`SO_REUSEPORT`), epoll instance, connection table and scratch
-  buffers. There are no locks on the request path. The only mutex a request can
-  reach is the logger's, which `log.lisp` documents in its own docstring; the
-  other two — shutdown-hook registration and one-time TLS context setup — are
-  never on it.
-- **The boundaries are written down.** Limitations below is not a stub. It says
-  what the framework cannot do, what is verified by review rather than by
-  execution, and which failure modes are deliberate trades.
-
-Not a batteries-included web framework. There is no router, no ORM, no
-templating, no inbound TLS. It is the network and protocol layer, and the
-application supplies the rest.
+Meant to make development easier for deployer projects, but it's bones only!
+There is no router, no ORM, no templating, and no inbound TLS.
+It is the network and protocol layer; applications must bring their own flesh.
 
 ## Requirements
 
@@ -306,7 +283,10 @@ tests/
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
-  makes the outbound call, and resumes with the callback result
+  makes the outbound call, and resumes with the callback result.
+  `build-outbound-request` refuses a caller-supplied `Content-Length` or
+  `Transfer-Encoding`, and the header serializer rejects control bytes —
+  the framework will not emit what it will not accept
 - **Async DNS resolution** — non-numeric hostnames are resolved via a `getent ahosts`
   subprocess whose stdout pipe is registered with the worker's epoll;
   the parked inbound resumes when the address lands.
