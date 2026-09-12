@@ -374,12 +374,16 @@
   nil)
 
 (defun %sanitize-line (text)
-  "Cap the length and strip control characters. The client renders with
-   textContent, so this is belt-and-braces rather than the only guard."
-  (let ((clean (remove-if (lambda (c)
-                            (and (< (char-code c) 32)
-                                 (not (char= c #\Space))))
-                          text)))
+  "Cap the length and strip control characters.
+
+   The cap is because this is a public box and the text is strangers'. The
+   control strip is not about rendering — the client uses textContent, so
+   nothing here can become markup — it is about the wire format: a TAB
+   separates the sequence number from the line, and a posted TAB would split
+   a line into a sequence number the client would then believe.
+
+   Space is 32, so the test below never catches it and needs no exception."
+  (let ((clean (remove-if (lambda (c) (< (char-code c) 32)) text)))
     (if (> (length clean) *bulletin-line-max*)
         (subseq clean 0 *bulletin-line-max*)
         clean)))
