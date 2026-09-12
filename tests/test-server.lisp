@@ -8868,6 +8868,41 @@
                     t))
         (ignore-errors (close held))))))
 
+(defun test-a-log-line-is-one-line ()
+  "One LOG-MSG call emits exactly one line, whatever it was handed.
+
+   ~S on a nested structure pretty-prints by default, wrapping at
+   *PRINT-RIGHT-MARGIN* and turning one call into a dozen lines. That is
+   not cosmetic on this logger: it holds *LOG-LOCK* — the one lock every
+   worker contends for — across the format and the FORCE-OUTPUT, and it
+   makes a line unfindable, because a grep matching the message returns the
+   first fragment and silently hides the rest.
+
+   Found by tripping on it: a census logged at :DEBUG came out eleven lines
+   wide, and reading one back needed grep -A6 and a guess at the number.
+
+   Also asserts the bound. A value large enough to fill a disk from inside
+   the mutex should truncate instead."
+  (format t "~%log: one call, one line~%")
+  (let ((deep (loop for i from 0 below 40
+                    collect (list :k i :v (list :a i :b (list :c i))))))
+    (let ((out (with-output-to-string (capture)
+                 (let ((web-skeleton:*log-stream* capture)
+                       (web-skeleton:*log-level* :debug))
+                   (web-skeleton::log-debug "structure ~s" deep)))))
+      ;; Control: it logged at all, and logged the thing it was given.
+      (check "control: the message reached the stream"
+             (and (search "structure" out) (search ":K" out) t) t)
+      (check "one call is one line" (count #\Newline out) 1))
+    (let ((out (with-output-to-string (capture)
+                 (let ((web-skeleton:*log-stream* capture)
+                       (web-skeleton:*log-level* :debug))
+                   (web-skeleton::log-debug "wide ~s"
+                                            (loop for i from 0 below 5000
+                                                  collect i))))))
+      (check "a runaway structure is truncated, not printed whole"
+             (< (length out) 2000) t))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -9043,5 +9078,6 @@
   (test-map-worker-websockets-refuses-off-a-worker)
   (test-map-worker-websockets-is-callable-from-on-tick)
   (test-connection-census-is-exported-with-a-split-contract)
+  (test-a-log-line-is-one-line)
   (report-suite "Server")
   (zerop *tests-failed*))

@@ -1599,7 +1599,6 @@
           ;; does — a third timer to walk the table a third time per second
           ;; is the waste the gate exists to prevent.
           (publish-connection-census)
-          (log-debug "census ~s" (connection-census))
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
