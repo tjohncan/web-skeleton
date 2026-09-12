@@ -2,6 +2,7 @@
   (:use :cl)
   (:export ;; Server
            #:start-server
+           #:map-worker-websockets
            ;; HTTP request
            #:http-request
            #:http-request-method

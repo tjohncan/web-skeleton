@@ -380,13 +380,18 @@ read about here.
 
   Fan-out *across* workers is still not provided, but it is now buildable:
   `:on-tick` runs application code on each worker's own event loop with that
-  worker's connection table and epoll fd bound, which is the one place
-  `ws-send` to those connections is legal. What the framework does not supply
-  is the registry — deciding who receives an event stays the application's,
-  because a framework owning that would own per-process state and become the
-  horizontal-scaling limit. An application still has no notification when a
-  WebSocket closes, so a registry it keeps itself goes stale and has to prune
-  on the refusal.
+  worker's connection table and epoll fd bound, and `map-worker-websockets`
+  walks the connections that loop owns. Together they are the one place a
+  `ws-send` to those connections is legal, and a broadcast to everyone needs
+  nothing else — it is one pass per worker over that worker's share.
+
+  What the framework still does not supply is the registry. Deciding *who*
+  receives an event stays the application's, because a framework owning that
+  would own per-process state and become the horizontal-scaling limit. An
+  application addressing a subset therefore keeps its own set, and there is
+  no notification when a WebSocket closes, so that set goes stale and has to
+  prune on the refusal. Broadcasting to all of them avoids the problem by
+  keeping no set at all.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy

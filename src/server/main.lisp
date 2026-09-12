@@ -55,6 +55,59 @@
 (defun lookup-connection (fd)
   (gethash fd *connections*))
 
+(defun map-worker-websockets (function)
+  "Call FUNCTION on each open WebSocket this worker owns. Returns the count.
+
+   The companion to :ON-TICK, and the supported way to reach a set of
+   connections at once. Fan-out is per worker because the write queue has no
+   lock: a connection belongs to exactly one event loop and WS-SEND refuses
+   one that belongs to another. An application broadcasting to everyone
+   broadcasts once per worker, to that worker's share, from inside that
+   worker — which is what this walks.
+
+   Named for the worker and not for the set, because the set is the point.
+   This is never every connection on the server, only the ones on this loop.
+   Whether that is all of them or a sixteenth is a fact about the deployment.
+
+   Only the :WEBSOCKET state is visited. A connection still upgrading,
+   already closing, or driving an outbound fetch is not something an
+   application can hand a frame to.
+
+   Two properties make it safe to call without ceremony. The table is
+   collected before anything runs, so FUNCTION may close what it was handed —
+   or send on it and have the send close it — without the walk stepping on a
+   table that moved underneath it; this is the discipline the idle sweep and
+   worker teardown already use for the same reason. And liveness is
+   re-checked immediately before each call, so a connection an earlier call
+   closed is skipped rather than handed over dead.
+
+   It does not catch. If FUNCTION raises, the walk stops and the condition
+   propagates — into :ON-TICK's handler, when called from there. The
+   framework has no basis for ruling that a partial fan-out is fine, and
+   WS-SEND raising at *MAX-WRITE-BACKLOG* is the ordinary fate of one slow
+   peer in a broadcast, so it is worth an application deciding rather than
+   hoping about. Continuing past a refusing connection is three lines in the
+   callback.
+
+   Signals off a worker rather than returning zero, which would be
+   indistinguishable from a server with no clients."
+  (unless *connections*
+    (error "map-worker-websockets: no connection table on this thread. It ~
+            walks the connections one worker owns, so it has to run on that ~
+            worker — from :on-tick, from a handler, or from a fetch ~
+            callback. A background thread owns none."))
+  (let ((live nil))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (when (eq (connection-state conn) :websocket)
+                 (push conn live)))
+             *connections*)
+    (let ((visited 0))
+      (dolist (conn live visited)
+        (when (eq (lookup-connection (connection-fd conn)) conn)
+          (incf visited)
+          (funcall function conn))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Connection census
 ;;;

@@ -8725,6 +8725,102 @@
            (and (stringp msg) (not (search ":on-tick" msg)) t))
          t))
 
+(defun %ws-conn (fd state)
+  "Register a bare connection in the current *CONNECTIONS* with STATE."
+  (let ((c (web-skeleton::make-connection :fd fd :last-active 0)))
+    (setf (web-skeleton::connection-state c) state)
+    (web-skeleton::register-connection c)
+    c))
+
+(defun test-map-worker-websockets-visits-only-websockets ()
+  "The walk visits :WEBSOCKET and nothing else.
+
+   The states it must skip are not hypothetical: a connection mid-upgrade,
+   one already closing, and one writing a plain HTTP response all live in the
+   same table, and handing any of them to an application that is about to
+   call WS-SEND would produce a frame on a socket that is not speaking that
+   protocol yet, or at all."
+  (format t "~%map-worker-websockets: only websockets, only this worker~%")
+  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
+    (%ws-conn 101 :websocket)
+    (%ws-conn 102 :websocket)
+    (%ws-conn 103 :read-http)
+    (%ws-conn 104 :closing)
+    (%ws-conn 105 :write-response)
+    ;; Control: every state really is in the table, so a walk finding two is
+    ;; selecting rather than failing to see the other three.
+    (check "control: all five states are registered"
+           (hash-table-count web-skeleton::*connections*) 5)
+    (let ((seen nil))
+      (let ((n (web-skeleton:map-worker-websockets
+                (lambda (c) (push (web-skeleton::connection-fd c) seen)))))
+        (check "visits exactly the websockets" (sort seen #'<) (list 101 102))
+        (check "and returns how many it called" n 2)))))
+
+(defun test-map-worker-websockets-skips-what-a-callback-closed ()
+  "A connection an earlier callback closed is skipped, not handed over dead.
+
+   This is what lets a broadcast call WS-SEND without asking first. One slow
+   peer's send can close its connection, and on a table collected up front
+   the entry behind it would otherwise still be walked — WS-SEND would then
+   refuse it for not being in the table, turning one dead peer into a raise
+   that stops the fan-out to everyone after it."
+  (format t "~%map-worker-websockets: the liveness re-check~%")
+  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
+    (let* ((a (%ws-conn 201 :websocket))
+           (b (%ws-conn 202 :websocket))
+           (calls 0))
+      (let ((n (web-skeleton:map-worker-websockets
+                (lambda (c)
+                  (incf calls)
+                  ;; Whichever one we were handed, close the other.
+                  (web-skeleton::unregister-connection (if (eq c a) b a))))))
+        (check "the closed one is not visited" calls 1)
+        (check "the count reflects only what was called" n 1)))))
+
+(defun test-map-worker-websockets-refuses-off-a-worker ()
+  "Off a worker there is no table, and zero would be a lie.
+
+   Returning zero would be indistinguishable from a server with no clients,
+   which is the shape a background thread would see every time — the same
+   silence that makes writing from off a worker dangerous in the first
+   place, since the ownership guards are (WHEN *EPOLL-FD* ...) and skip."
+  (format t "~%map-worker-websockets: refuses off a worker~%")
+  (let ((web-skeleton::*connections* nil))
+    (check "refuses by name rather than answering zero"
+           (let ((msg (attempt (web-skeleton:map-worker-websockets #'identity))))
+             (and (stringp msg) (search "connection table" msg) t))
+           t)))
+
+(defun test-map-worker-websockets-is-callable-from-on-tick ()
+  "The two halves compose: the walk works inside :ON-TICK on a live server.
+
+   :ON-TICK's own test asserts *CONNECTIONS* is non-NIL inside the hook.
+   This asserts the stronger thing that matters — that the table there is
+   real enough to walk — on a server that was actually started rather than
+   on a binding a test made itself.
+
+   What it does not assert is delivery to a client, which would need a real
+   handshake the suite has no helper for. That claim rests on two proven
+   halves instead: WS-SEND works when the table and epoll fd are right, and
+   the hook's test shows they are."
+  (format t "~%map-worker-websockets: composes with on-tick~%")
+  (let ((ran 0) (errs 0)
+        (lock (sb-thread:make-mutex :name "map-in-tick")))
+    (with-test-server
+        (:on-tick (lambda (id)
+                    (declare (ignore id))
+                    (handler-case
+                        (progn
+                          (web-skeleton:map-worker-websockets
+                           (lambda (c) (declare (ignore c)) nil))
+                          (sb-thread:with-mutex (lock) (incf ran)))
+                      (error () (sb-thread:with-mutex (lock) (incf errs))))))
+      (sleep 0.4)
+      (sb-thread:with-mutex (lock)
+        (check "the walk runs inside on-tick" (> ran 0) t)
+        (check "and never signals there" errs 0)))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -8895,5 +8991,9 @@
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-on-tick-validated-at-boot)
+  (test-map-worker-websockets-visits-only-websockets)
+  (test-map-worker-websockets-skips-what-a-callback-closed)
+  (test-map-worker-websockets-refuses-off-a-worker)
+  (test-map-worker-websockets-is-callable-from-on-tick)
   (report-suite "Server")
   (zerop *tests-failed*))
