@@ -8821,6 +8821,53 @@
         (check "the walk runs inside on-tick" (> ran 0) t)
         (check "and never signals there" errs 0)))))
 
+(defun test-connection-census-is-exported-with-a-split-contract ()
+  "CONNECTION-CENSUS is reachable without :: and reports per worker.
+
+   Two workers, and a connection held open for the duration, so the sums are
+   over something rather than over nothing — a census of an empty server
+   agrees with almost any mistake.
+
+   Polled rather than slept: the census publishes on the maintenance gate at
+   1 Hz, and each worker publishes its own slot on its own tick, so there is
+   no single interval that is both long enough and not wasteful.
+
+   :STATES and :PER-WORKER are asserted to exist and to be consistent with
+   the sums, never on their exact contents, which is what the docstring
+   calls diagnostic. A test pinning the state keywords would be a test of
+   the state machine wearing a census costume."
+  (format t "~%connection-census: exported, per worker, split contract~%")
+  (with-test-server (:workers 2)
+    (let ((held (connect-to-test-server)))
+      (unwind-protect
+           (let ((census nil)
+                 (deadline (+ (get-universal-time) 6)))
+             (loop until (or (let ((pw (getf census :per-worker)))
+                               (and pw (= (length pw) 2) (every #'identity pw)))
+                             (> (get-universal-time) deadline))
+                   do (setf census (web-skeleton:connection-census))
+                      (sleep 0.05))
+             (check "every worker published a slot"
+                    (let ((pw (getf census :per-worker)))
+                      (and (= (length pw) 2) (every #'identity pw) t))
+                    t)
+             (check ":workers is the configured count"
+                    (getf census :workers) 2)
+             (check "the held connection is counted"
+                    (>= (getf census :total 0) 1) t)
+             (check "the sums are computed from the per-worker entries"
+                    (= (getf census :total)
+                       (reduce #'+ (getf census :per-worker)
+                               :key (lambda (slot) (getf slot :total 0))))
+                    t)
+             (check ":states accounts for as many connections as :total"
+                    (= (getf census :total)
+                       (loop for (state n) on (getf census :states) by #'cddr
+                             do (progn state)
+                             sum n))
+                    t))
+        (ignore-errors (close held))))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -8995,5 +9042,6 @@
   (test-map-worker-websockets-skips-what-a-callback-closed)
   (test-map-worker-websockets-refuses-off-a-worker)
   (test-map-worker-websockets-is-callable-from-on-tick)
+  (test-connection-census-is-exported-with-a-split-contract)
   (report-suite "Server")
   (zerop *tests-failed*))

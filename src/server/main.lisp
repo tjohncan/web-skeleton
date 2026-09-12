@@ -173,25 +173,51 @@
     (setf (aref *connection-census* *worker-id*) nil)))
 
 (defun connection-census ()
-  "Sum every worker's most recently published counts. Returns a plist shaped
-   like CENSUS-COUNTS, or NIL before any worker has published.
+  "A snapshot of every worker's connections. NIL before any has published.
 
-   Read from any thread. What it reports is up to one maintenance tick old,
-   which is a second by default — a caller asserting that something has gone
-   away polls until it does rather than reading once."
+   Readable from any thread, including one that is no worker — it reads the
+   published slots, never a connection table. What it reports is up to one
+   maintenance tick old, a second by default, so a caller asserting that
+   something has gone away polls until it does rather than reading once.
+
+   The contract is split, and the split is the part to read.
+
+   Stable — :WORKERS, :TOTAL, :INBOUND, :OUTBOUND. Counts of things an
+   application already has names for. Safe to render, alert on, and compare
+   across versions.
+
+   Diagnostic — :STATES and :PER-WORKER. :STATES is keyed by the connection
+   state machine's own keywords, which are internals and will change when it
+   does. :PER-WORKER is one entry per worker, indexed by worker id, each the
+   same shape as the sums above or NIL for a worker that has not published
+   yet. Both are for looking at. Neither is worth depending on.
+
+   A consumer must render unknown keys generically rather than matching an
+   exhaustive set — counters are the next ones to appear here, and a panel
+   that switches on a closed list silently stops showing whatever was added.
+
+   The sums are consistent with :PER-WORKER because they are computed from
+   it. They are not simultaneous: worker 3 may have published a tick after
+   worker 0, so this is a picture of a server rather than an instant. The
+   distinction matters exactly once — when the totals have to add up against
+   something counted elsewhere, and do not."
   (when *connection-census*
-    (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil))
+    (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil)
+          (per-worker nil))
       (loop for slot across *connection-census*
-            when slot
-            do (setf seen t)
-               (incf total    (getf slot :total 0))
-               (incf outbound (getf slot :outbound 0))
-               (incf inbound  (getf slot :inbound 0))
-               (loop for (state n) on (getf slot :states) by #'cddr
-                     do (incf (getf states state 0) n)))
+            do (push slot per-worker)
+               (when slot
+                 (setf seen t)
+                 (incf total    (getf slot :total 0))
+                 (incf outbound (getf slot :outbound 0))
+                 (incf inbound  (getf slot :inbound 0))
+                 (loop for (state n) on (getf slot :states) by #'cddr
+                       do (incf (getf states state 0) n))))
       (when seen
-        (list :total total :outbound outbound :inbound inbound
-              :states states)))))
+        (list :workers (length *connection-census*)
+              :total total :outbound outbound :inbound inbound
+              :states states
+              :per-worker (nreverse per-worker))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Connection lifecycle — idle timeout and WebSocket ping/pong

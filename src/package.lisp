@@ -3,6 +3,7 @@
   (:export ;; Server
            #:start-server
            #:map-worker-websockets
+           #:connection-census
            ;; HTTP request
            #:http-request
            #:http-request-method
