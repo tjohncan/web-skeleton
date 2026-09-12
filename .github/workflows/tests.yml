@@ -25,6 +25,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The Lisp suite cannot see a JavaScript syntax error, and the demo page
+      # is served from this repo. A corrupt app.js is a dead page — no socket,
+      # no census, no tab switching — behind a totals line reading ALL TESTS
+      # PASSED, because none of those tests are in the browser. That happened:
+      # escape sequences were eaten out of a regex literal, the file stopped
+      # parsing, and the whole demo went inert with a green gate.
+      #
+      # node --check is a real parse, not a lint, and the runner already has
+      # node, so this costs a second and installs nothing.
+      - name: Parse the demo's JavaScript
+        run: |
+          set -o pipefail
+          found=0
+          for f in demo/static/*.js; do
+            [ -e "$f" ] || continue
+            found=$((found + 1))
+            echo "checking $f"
+            node --check "$f"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no .js found under demo/static — this check is now vacuous"
+            exit 1
+          fi
+
       # Ubuntu runners already carry libssl3 and glibc's getent, so the
       # optional web-skeleton-tls system loads: the suite exercises the
       # libssl crypto swap AND re-verifies the pure-Lisp originals against it.

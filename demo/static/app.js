@@ -34,10 +34,10 @@ function connect(onOpen) {
     if (onOpen) onOpen();
   };
   ws.onmessage = function(e) {
-    // Wire form is "<seq>	<text>". The sequence is shown because it is the
+    // Wire form is "<seq>\t<text>". The sequence is shown because it is the
     // mechanism: it is what each worker compares against to know what it has
     // not yet handed to the connections it owns.
-    const tab = e.data.indexOf('	');
+    const tab = e.data.indexOf('\t');
     const seq = tab < 0 ? '' : e.data.slice(0, tab);
     const text = tab < 0 ? e.data : e.data.slice(tab + 1);
     appendLog((seq ? '#' + seq + '  ' : '') + text, 'recv');
@@ -200,10 +200,7 @@ function benchCard(c) {
 
   const pre = document.createElement('pre');
   pre.className = 'case-bytes';
-  pre.textContent = c.bytes.replace(/
-/g, '
-').replace(/
-+$/, '');
+  pre.textContent = c.bytes.replace(/\r\n/g, '\n').replace(/\n+$/, '');
   card.appendChild(pre);
 
   const row = document.createElement('div');
