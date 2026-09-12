@@ -1439,11 +1439,13 @@
 ;;; Event loop
 ;;; ---------------------------------------------------------------------------
 
-(defun run-event-loop (listener-socket epoll-fd handler ws-handler)
+(defun run-event-loop (listener-socket epoll-fd handler ws-handler on-tick)
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd    (socket-fd listener-socket))
         (last-ping-time  (get-universal-time))
         (last-sweep-time (get-universal-time))
+        (tick-errors     0)
+        (tick-error-at   0)
         (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when *shutdown*
@@ -1522,13 +1524,39 @@
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
-          (setf last-ping-time now))))))
+          (setf last-ping-time now)))
+      ;; ON-TICK runs last: after this pass's I/O, and after the sweep
+      ;; above, so a hook sees a table the sweeper has already walked and
+      ;; a census it has already published. Nothing runs it during
+      ;; shutdown — the *SHUTDOWN* check at the top of the loop returns
+      ;; through DRAIN-CONNECTIONS before reaching here, so an application
+      ;; cannot queue new work onto connections that are draining.
+      (when on-tick
+        (handler-case (funcall on-tick *worker-id*)
+          (error (e)
+            ;; A hook that raises every pass would log at the wake rate —
+            ;; twenty lines a second per worker at the cadence a fan-out
+            ;; demo wants — and every one of them takes *LOG-LOCK*, which
+            ;; log.lisp documents as the one lock every worker contends
+            ;; for. Silence would be worse: a hook that never runs looks
+            ;; exactly like a hook that was never installed. So report the
+            ;; first immediately, then at most once a minute with a count
+            ;; of what was suppressed.
+            (incf tick-errors)
+            (let ((now (get-universal-time)))
+              (when (>= (- now tick-error-at) 60)
+                (log-error ":on-tick raised on worker ~d: ~a ~
+                            (~d occurrence~:p since last reported)"
+                           *worker-id* e tick-errors)
+                (setf tick-errors 0
+                      tick-error-at now)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Worker
 ;;; ---------------------------------------------------------------------------
 
-(defun run-worker (host port worker-id handler ws-handler &optional listener)
+(defun run-worker (host port worker-id handler ws-handler on-tick
+                   &optional listener)
   "Run a single worker: own listener, own epoll fd, own connections.
    Automatically restarts on unhandled errors (with backoff).
 
@@ -1612,7 +1640,7 @@
                    (epoll-add epoll-fd (socket-fd listener)
                               (logior +epollin+ +epollet+))
                    (unwind-protect
-                       (run-event-loop listener epoll-fd handler ws-handler)
+                       (run-event-loop listener epoll-fd handler ws-handler on-tick)
                      ;; Cleanup on worker crash or normal exit. Split the
                      ;; table into outbounds and everything else — outbounds
                      ;; go through CLOSE-OUTBOUND so their fetch callbacks
@@ -1836,7 +1864,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler on-listen)
+                          handler ws-handler on-listen on-tick)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -1847,8 +1875,38 @@
    IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
+   ON-TICK: function (worker-id), or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
+
+   ON-TICK runs on every pass of every worker's event loop, on that
+   worker's own thread, with that worker's connection table and epoll fd
+   bound. The bindings are the point: they are what makes WS-SEND and
+   STREAM-SEND legal from inside it, and what makes their ownership
+   guards effective rather than skipped. It is how an application does
+   periodic per-worker work — rotating counters it keeps itself, or
+   writing to the connections this worker owns, which is the only way to
+   reach them, since no worker may touch another's table.
+
+   Three things a hook has to be.
+
+   Cheap. It runs inside the loop, so one that blocks stops that worker
+   for every connection on it. There is no timeout and no watchdog: the
+   loop cannot preempt it, and a hook that hangs is indistinguishable
+   from a worker that died.
+
+   Ready to run often. The interval is bounded below by
+   *WORKER-WAKE-INTERVAL* only while the worker is idle, and by nothing
+   at all while it is busy — a loaded worker may tick thousands of times
+   a second. Work that should happen on a schedule needs its own gate,
+   the way the idle sweep gates itself at one second.
+
+   Allowed to raise. A raise is caught, the worker continues, and the
+   error is logged once and then at most once a minute with a count —
+   enough that a broken hook is never silent, bounded so that one
+   raising every pass cannot flood *LOG-LOCK*.
+
+   It does not run during shutdown.
 
    PORT may be 0, in which case the kernel assigns one and ON-LISTEN —
    a function of one argument, called once, on the calling thread, after
@@ -1912,6 +1970,19 @@
             thing that answers a parked caller when an upstream goes quiet ~
             — there is no setting that disables it."
            *fetch-timeout*))
+  ;; Fourth invariant, same place and the same argument as the three
+  ;; above. A non-function :ON-TICK raises on the first pass of every
+  ;; worker's loop and on every pass after it — which is precisely the
+  ;; shape the rate limit in RUN-EVENT-LOOP exists to survive, arrived at
+  ;; through a typo rather than a bug. Refusing at boot costs one check
+  ;; and turns a log full of suppressed occurrences into one clear error
+  ;; before a socket is ever bound.
+  (unless (or (null on-tick) (functionp on-tick))
+    (error "start-server: :on-tick is ~s; it must be a function of one ~
+            argument (the worker id) or NIL. It runs on every pass of ~
+            every worker's event loop, so a value that cannot be funcalled ~
+            fails on every pass rather than once."
+           on-tick))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is
   ;; its id and the vector has to be there when the first tick publishes.
@@ -1972,7 +2043,7 @@
                                       (lambda ()
                                         (run-worker host port id
                                                     handler ws-handler
-                                                    adopted))
+                                                    on-tick adopted))
                                       :name (format nil "web-skeleton-~d" i))
                                      threads)
                                ;; Ownership passes to the thread only once

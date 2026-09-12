@@ -378,8 +378,15 @@ read about here.
   reachable, but a change to three functions at once, and one they have to
   make together or not at all.
 
-  Fan-out *across* workers is not provided, and building it needs a mechanism
-  this framework deliberately does not have.
+  Fan-out *across* workers is still not provided, but it is now buildable:
+  `:on-tick` runs application code on each worker's own event loop with that
+  worker's connection table and epoll fd bound, which is the one place
+  `ws-send` to those connections is legal. What the framework does not supply
+  is the registry — deciding who receives an event stays the application's,
+  because a framework owning that would own per-process state and become the
+  horizontal-scaling limit. An application still has no notification when a
+  WebSocket closes, so a registry it keeps itself goes stale and has to prune
+  on the refusal.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy
@@ -574,8 +581,8 @@ All configurable via `setf` before calling `start-server`.
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Does not change the maintenance cadence, which is gated separately at 1 Hz |
 
-The `host`, `port`, `workers`, `handler`, `ws-handler`, and `on-listen` are
-passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, `on-listen`, and
+`on-tick` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)

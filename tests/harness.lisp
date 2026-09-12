@@ -147,10 +147,17 @@
 ;;; Live test server
 ;;; ---------------------------------------------------------------------------
 
-(defmacro with-test-server ((&key handler ws-handler host) &body body)
-  "Spin a single-worker server on an ephemeral port, bind *TEST-PORT* for
-   BODY, tear down on scope exit (signal + bounded join + fallback
-   terminate).
+(defmacro with-test-server ((&key handler ws-handler host on-tick (workers 1))
+                            &body body)
+  "Spin a server on an ephemeral port, bind *TEST-PORT* for BODY, tear down
+   on scope exit (signal + bounded join + fallback terminate).
+
+   WORKERS defaults to 1, which is what nearly every test wants: one worker
+   means one connection table, so a test can reason about what is in it.
+   Raise it only for a property that is about workers rather than about
+   connections — ON-TICK firing on each of them, say.
+
+   ON-TICK is passed through to START-SERVER unchanged, including NIL.
    Shutdown hooks are isolated: REGISTER-CLEANUP calls made from inside
    BODY (directly or via a handler) fire during this server's teardown
    and do not leak into the caller's framework state. The outer
@@ -163,9 +170,11 @@
    MAKE-THREAD inherits no dynamic environment. A test that spawns its own
    reader thread has to pass the address and port into that thread rather
    than read the specials from inside it."
-  `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host))
+  `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host
+                          ,on-tick ,workers))
 
-(defun call-with-test-server (handler ws-handler thunk &optional host)
+(defun call-with-test-server (handler ws-handler thunk &optional host
+                                                        on-tick (workers 1))
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
         (saved-poll  web-skeleton:*worker-wake-interval*)
@@ -205,7 +214,8 @@
                                    ;; must not exist as a value anywhere
                                    ;; before a listener is holding it.
                                    :port 0
-                                   :workers 1
+                                   :workers workers
+                                   :on-tick on-tick
                                    :on-listen
                                    (lambda (p)
                                      (setf bound-port p)

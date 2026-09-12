@@ -8623,6 +8623,108 @@
              (and (stringp msg) (search "*fetch-timeout*" msg) t))
            t)))
 
+(defun test-on-tick-runs-with-the-workers-bindings ()
+  "ON-TICK runs on each worker's own thread with that worker's epoll fd
+   and connection table bound.
+
+   The bindings are the entire primitive. Fanning a message out to the
+   connections a worker owns has to happen from that worker, and WS-SEND's
+   ownership guard is (WHEN *EPOLL-FD* ...) — so a hook running anywhere
+   else would not merely fail, it would skip the guard and append to an
+   unlocked queue while reporting success. Asserting the hook was called
+   proves almost nothing; asserting the bindings are live inside it is what
+   makes the call worth making.
+
+   Two workers, so `every worker ticks` is measured rather than inferred
+   from where the call sits in RUN-EVENT-LOOP."
+  (format t "~%on-tick: runs on every worker with its bindings live~%")
+  ;; Counted, not flagged. A boolean initialised to T and only cleared on
+  ;; failure passes when the hook never runs at all, which is the one
+  ;; outcome this test exists to catch.
+  (let ((ticks 0) (ids nil) (epoll-live 0) (table-live 0)
+        (lock (sb-thread:make-mutex :name "on-tick-bindings")))
+    (with-test-server (:workers 2
+                       :on-tick (lambda (id)
+                                  (sb-thread:with-mutex (lock)
+                                    (incf ticks)
+                                    (pushnew id ids)
+                                    (when web-skeleton::*epoll-fd*
+                                      (incf epoll-live))
+                                    (when web-skeleton::*connections*
+                                      (incf table-live)))))
+      ;; Control. Passes whether or not ON-TICK exists, so a failure here
+      ;; says the fixture broke rather than the feature.
+      (check "control: the server is up and answering"
+             (multiple-value-bind (status) (test-http-request :get "/__nonce")
+               (eql status 200))
+             t)
+      (sleep 0.6)
+      (sb-thread:with-mutex (lock)
+        (check "on-tick ran" (> ticks 0) t)
+        (check "*epoll-fd* was bound on every tick"
+               (and (> ticks 0) (= epoll-live ticks)) t)
+        (check "*connections* was bound on every tick"
+               (and (> ticks 0) (= table-live ticks)) t)
+        (check "both workers ticked"
+               (and (member 0 ids) (member 1 ids) t)
+               t)))))
+
+(defun test-on-tick-survives-a-raising-hook ()
+  "A raising hook is caught and the loop keeps turning.
+
+   A per-pass hook runs thousands of times a second under load, so any
+   raise it can produce it will produce. Letting one out would take down a
+   worker and every connection on it.
+
+   Asserted on the tick COUNT rather than on the server still answering,
+   because RUN-WORKER restarts a crashed worker with backoff — so a server
+   that answers proves nothing here. Eight-odd ticks in 0.4s at the
+   harness's 0.05s wake interval means the same loop kept running; a crash
+   and restart cycle would show one or two. The counter also makes a revert
+   visible: with no ON-TICK support it stays 0 rather than passing because
+   nothing ever ran."
+  (format t "~%on-tick: a raising hook does not take the worker down~%")
+  (let ((entered 0)
+        (lock (sb-thread:make-mutex :name "on-tick-raise")))
+    (with-test-server (:on-tick (lambda (id)
+                                  (declare (ignore id))
+                                  (sb-thread:with-mutex (lock) (incf entered))
+                                  (error "deliberate: on-tick raised")))
+      (sleep 0.4)
+      (let ((n (sb-thread:with-mutex (lock) entered)))
+        (check "the hook ran and raised" (> n 0) t)
+        (check "the loop kept turning rather than crashing and backing off"
+               (> n 3) t))
+      (check "the server still answers after all that"
+             (multiple-value-bind (status) (test-http-request :get "/__nonce")
+               (eql status 200))
+             t))))
+
+(defun test-on-tick-validated-at-boot ()
+  "START-SERVER refuses a non-function :ON-TICK before it binds.
+
+   Same argument as the three boot invariants above it: a misconfiguration
+   should not wait for the shape that reveals it. This one is worse than
+   most if it waits — a value that cannot be funcalled raises on the first
+   pass of every worker's loop and on every pass after, which is exactly
+   the flood the rate limit in RUN-EVENT-LOOP exists to survive, reached
+   through a typo instead of a bug.
+
+   :HOST is deliberately invalid, so a revert fails this assertion at
+   MAKE-TCP-LISTENER instead of starting a real server inside the suite."
+  (format t "~%start-server: the fourth boot invariant~%")
+  (check "boot: a non-function :on-tick is refused by name"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 42))))
+           (and (stringp msg) (search ":on-tick" msg) t))
+         t)
+  (check "control: the same call without :on-tick fails elsewhere"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1))))
+           (and (stringp msg) (not (search ":on-tick" msg)) t))
+         t))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -8790,5 +8892,8 @@
   (test-ws-oversized-frame-close-code)
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
+  (test-on-tick-runs-with-the-workers-bindings)
+  (test-on-tick-survives-a-raising-hook)
+  (test-on-tick-validated-at-boot)
   (report-suite "Server")
   (zerop *tests-failed*))
