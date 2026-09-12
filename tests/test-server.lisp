@@ -8982,6 +8982,46 @@
         (check "and both are in the total"
                (>= (getf k :responses 0) 2) t)))))
 
+(defun test-getent-parse-separates-policy-from-resolution ()
+  "A name whose addresses policy refused is distinguishable from one that
+   did not resolve.
+
+   Both still return NIL, and both still answer the client 502: which of the
+   two happened is not the client's business, and the docstring has said so
+   for longer than this second value has existed. An operator is a different
+   audience. Told `DNS lookup failed` when getent answered perfectly well and
+   their own filter said no, they go and debug a resolver — which is what
+   happened, and is why this exists.
+
+   The two controls are the point of the test. Without them a second value
+   that always returned zero, or always returned one, would pass whichever
+   single case was asserted."
+  (format t "~%dns: a refusal is not a resolution failure~%")
+  (let ((line (sb-ext:string-to-octets
+               (format nil "127.0.0.1 STREAM localhost~%")
+               :external-format :ascii))
+        (web-skeleton:*log-stream* (make-broadcast-stream)))
+    (let ((web-skeleton:*fetch-address-filter* nil))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output line (length line) "localhost")
+        (check "control: with no filter the address is chosen"
+               (and (consp parsed) (equalp (car parsed) #(127 0 0 1)) t) t)
+        (check "control: and nothing was refused" refused 0)))
+    (let ((web-skeleton:*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              nil)))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output line (length line) "localhost")
+        (check "a refused address still yields no answer" parsed nil)
+        (check "but the caller can see policy refused one" refused 1)))
+    (let ((nothing (sb-ext:string-to-octets (format nil "~%")
+                                            :external-format :ascii)))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output nothing (length nothing) "nowhere")
+        (check "control: nothing to refuse when nothing resolved"
+               (list parsed refused) (list nil 0))))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -9160,5 +9200,6 @@
   (test-a-log-line-is-one-line)
   (test-counters-count-responses-by-class)
   (test-counters-see-a-response-no-handler-produced)
+  (test-getent-parse-separates-policy-from-resolution)
   (report-suite "Server")
   (zerop *tests-failed*))
