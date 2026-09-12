@@ -157,7 +157,7 @@
            #:*dns-cache-max-entries*
            ;; Shutdown
            #:*drain-timeout*
-           #:*shutdown-poll-interval*
+           #:*worker-wake-interval*
            #:register-cleanup
            ;; Concurrent store
            #:storep

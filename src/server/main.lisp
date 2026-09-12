@@ -522,9 +522,17 @@
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
 
-(defparameter *shutdown-poll-interval* 1
-  "Seconds between shutdown-signal checks in the main thread's wait loop
-   and each worker's event-loop epoll timeout.
+(defparameter *worker-wake-interval* 1
+  "Seconds a worker's event loop may sleep in epoll_wait before waking to
+   do periodic work, and the interval between shutdown-signal checks in
+   the main thread's wait loop.
+
+   This is the floor under everything periodic. A worker with no I/O is
+   asleep in the kernel, so nothing that rides the event loop can happen
+   more often than this — lowering it is the only way to make periodic
+   work prompt, and the cost is one syscall return per worker per
+   interval.
+
    Default 1 second balances wake-up overhead against shutdown
    responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
    so teardown doesn't wait a full second per call. Float accepted —
@@ -1442,7 +1450,7 @@
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
       (let ((n (epoll-wait epoll-fd event-buf +max-events+
-                           (max 10 (round (* *shutdown-poll-interval* 1000))))))
+                           (max 10 (round (* *worker-wake-interval* 1000))))))
         (loop for i from 0 below n
               do (block handle-event
                    (let ((fd    (epoll-event-fd event-buf i))
@@ -1640,14 +1648,14 @@
           (return)))
       (error (e)
         (log-error "worker ~d crashed: ~a — restarting" worker-id e)
-        ;; 1-second backoff, sliced into *shutdown-poll-interval*
+        ;; 1-second backoff, sliced into *worker-wake-interval*
         ;; chunks so a SIGTERM arriving during the backoff is noticed
         ;; within one slice rather than after the full second.
         (let ((until (+ (get-internal-real-time)
                         internal-time-units-per-second)))
           (loop until (or *shutdown*
                           (>= (get-internal-real-time) until))
-                do (sleep *shutdown-poll-interval*)))
+                do (sleep *worker-wake-interval*)))
         (when *shutdown* (return))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1982,7 +1990,7 @@
                            (when on-listen (funcall on-listen port))
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
-                               (loop (sleep *shutdown-poll-interval*)
+                               (loop (sleep *worker-wake-interval*)
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))

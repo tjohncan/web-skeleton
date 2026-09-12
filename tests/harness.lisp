@@ -168,7 +168,7 @@
 (defun call-with-test-server (handler ws-handler thunk &optional host)
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
-        (saved-poll  web-skeleton:*shutdown-poll-interval*)
+        (saved-poll  web-skeleton:*worker-wake-interval*)
         ;; Lexical, not the special: START-SERVER spawns workers into
         ;; threads that inherit nothing from this dynamic environment, so
         ;; the bind address has to reach the thread closure by capture.
@@ -180,12 +180,12 @@
     ;; threads that inherit nothing from our dynamic environment, and
     ;; SB-THREAD:MAKE-THREAD has no :initial-bindings shortcut in modern
     ;; SBCL. A serial test runner makes the global mutation safe.
-    ;; *SHUTDOWN-POLL-INTERVAL* shrinks the main-loop sleep and worker
+    ;; *WORKER-WAKE-INTERVAL* shrinks the main-loop sleep and worker
     ;; epoll_wait timeout so teardown takes ~50ms instead of ~1s per test.
     (setf web-skeleton::*shutdown-hooks* nil
           web-skeleton::*shutdown* nil
           web-skeleton:*drain-timeout* 1
-          web-skeleton:*shutdown-poll-interval* 0.05)
+          web-skeleton:*worker-wake-interval* 0.05)
     (unwind-protect
          (let* ((*test-host* bind-host)
                 (nonce (format nil "~36r~36r" (random (expt 36 8))
@@ -248,7 +248,7 @@
                   (sb-thread:join-thread server-thread))))))
       (setf web-skeleton::*shutdown-hooks* saved-hooks
             web-skeleton:*drain-timeout* saved-drain
-            web-skeleton:*shutdown-poll-interval* saved-poll))))
+            web-skeleton:*worker-wake-interval* saved-poll))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Bounded reads

@@ -1461,13 +1461,13 @@
    MAKE-THREAD."
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain *drain-timeout*)
-        (saved-poll *shutdown-poll-interval*)
+        (saved-poll *worker-wake-interval*)
         (bound nil)
         (sem (sb-thread:make-semaphore :name "bare-server-port")))
     (setf web-skeleton::*shutdown-hooks* nil
           web-skeleton::*shutdown* nil
           *drain-timeout* 1
-          *shutdown-poll-interval* 0.05)
+          *worker-wake-interval* 0.05)
     (unwind-protect
          (let ((th (sb-thread:make-thread
                     (lambda ()
@@ -1490,7 +1490,7 @@
                  (ignore-errors (sb-thread:join-thread th))))))
       (setf web-skeleton::*shutdown-hooks* saved-hooks
             *drain-timeout* saved-drain
-            *shutdown-poll-interval* saved-poll))))
+            *worker-wake-interval* saved-poll))))
 
 (defun %port-answers-with-p (port marker)
   "T if a plain GET / on PORT comes back containing MARKER.
