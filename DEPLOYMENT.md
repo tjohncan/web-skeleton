@@ -117,6 +117,25 @@ tighten it for known-small line protocols or raise it for unusual schemas.
 
 ## Deployment notes
 
+### Runnable artifacts
+
+`demo/deploy/` holds a working set for the demo, and they exist because this
+document is long and none of it was executable: a Dockerfile and an nginx
+server block can be run and can therefore be wrong in a way a paragraph
+cannot.
+
+| file | what it settles |
+|---|---|
+| `Dockerfile` | Debian rather than Alpine, because resolution shells out to glibc's `getent ahosts`; compiles at build time so a compile error fails the build rather than the container; healthchecks on `/census`, which a wedged event loop fails and a TCP connect would not |
+| `compose.yml` | publishes on `127.0.0.1` only, so the proxy is the only way in |
+| `nginx.conf.sample` | the `Upgrade`/`Connection` pair via a `map`, buffering off, a read timeout longer than the server's own ping interval, and `limit_req` — which is the real defence, not anything in the application |
+| `run.lisp` | the container entry point: binds `0.0.0.0` rather than loopback, because a socket bound to a container's own loopback is reachable from nothing outside it |
+
+They deploy the demo and name no other project. Adapt rather than adopt: the
+`server_name` and certificate paths are yours — which is why the proxy config
+ships as `.sample`. `.gitignore` excludes `*.conf` so a real one, with real
+hostnames in it, cannot be committed by reflex.
+
 ### Reverse proxy
 
 web-skeleton has no inbound TLS. In production, put it behind

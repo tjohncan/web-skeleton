@@ -1,0 +1,63 @@
+# Reverse proxy for the web-skeleton demo. A sample, not a drop-in: the
+# server_name and certificate paths are yours.
+#
+# TLS terminates here because the framework has no inbound TLS and is not
+# going to grow any — it is the network and protocol layer, and a TLS
+# implementation is neither. What it does have is an outbound client, which
+# is why libssl is optional in the image rather than absent.
+
+# The upgrade pair, hoisted because it has to live in the http block.
+# "Connection: upgrade" must be sent only for requests that asked to upgrade;
+# sending it on every request breaks keep-alive for ordinary ones.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# This is the actual defence. Every control on the page is O(1) per click by
+# design, but that is a property of the page, and the page is not what
+# arrives here — a script is.
+limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name demo.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/demo.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/demo.example.com/privkey.pem;
+
+    limit_req zone=ws_demo burst=20 nodelay;
+
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Without these the handshake is answered 101 and then the proxy
+        # closes the socket, which reads as the server refusing the
+        # WebSocket. It is the single most common way this goes wrong.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # The bulletin pushes unprompted, so buffering would hold frames until
+        # a buffer filled and turn a 50ms fan-out into whatever nginx felt
+        # like. Also the right setting if SSE is ever added.
+        proxy_buffering off;
+
+        # Comfortably longer than the server's own WebSocket ping interval, so
+        # nginx is never the thing that reaps a socket the server considers
+        # alive. Shorter than this and idle tabs drop for no visible reason.
+        proxy_read_timeout 300s;
+    }
+}
+
+server {
+    listen 80;
+    server_name demo.example.com;
+    return 301 https://$host$request_uri;
+}

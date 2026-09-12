@@ -1,0 +1,26 @@
+# docker compose -f demo/deploy/compose.yml up -d --build
+#
+# The published port is bound to loopback on purpose. nginx is the only thing
+# that should reach this, and "8081:8081" would publish the demo on every
+# interface — beside the reverse proxy rather than behind it, with no TLS and
+# none of the rate limiting that is the actual defence.
+
+services:
+  demo:
+    build:
+      context: ../..
+      dockerfile: demo/deploy/Dockerfile
+    image: web-skeleton-demo
+    container_name: web-skeleton-demo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      # 0.0.0.0 inside the container, which is not the same as on the host:
+      # the published port above is what decides who can arrive.
+      WS_HOST: "0.0.0.0"
+      WS_PORT: "8081"
+      # Pinned rather than left to CPU count. The page's subject is fan-out
+      # across workers, and a small instance reporting two of them is a dull
+      # exhibit; a fixed number also makes the census reproducible.
+      WS_WORKERS: "4"

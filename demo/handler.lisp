@@ -388,8 +388,13 @@
 ;;; Entry points
 ;;; ---------------------------------------------------------------------------
 
-(defun start-demo (&key (port 8081) (workers 4))
+(defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4))
   "Start the demo server.
+
+   HOST defaults to loopback, which is what you want on a laptop and wrong
+   inside a container: nothing outside the container can reach a socket bound
+   to its own loopback, so demo/deploy passes #(0 0 0 0) and lets the
+   published port and the reverse proxy decide who may actually arrive.
 
    WORKERS is pinned rather than left to CPU-COUNT. The page's subject is
    fan-out across workers, and a small box reporting two of them is a dull
@@ -417,7 +422,8 @@
   (load-static-files "demo/static/"
                      :substitutions
                      '(("robots.txt" ("are smart" . "robots are cool and smart"))))
-  (start-server :port port
+  (start-server :host host
+                :port port
                 :workers workers
                 :handler #'handle-request
                 :ws-handler #'handle-ws-message
