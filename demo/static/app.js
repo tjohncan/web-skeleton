@@ -150,3 +150,97 @@ function pollCensus() {
 
 pollCensus();
 setInterval(pollCensus, 2000);
+
+
+// ---------------------------------------------------------------------------
+// Tabs
+//
+// Panels are shown and hidden, never unloaded, and nothing here touches the
+// WebSocket. That is the point: the socket opened on x-ray stays open while
+// you are reading x-periments, so this visit keeps being counted by the
+// worker that owns it. Tearing it down on a tab switch would make the census
+// a report on which tab you happened to be looking at.
+
+const tabs = document.getElementById('tabs');
+
+function showPanel(name) {
+  Array.prototype.forEach.call(tabs.querySelectorAll('.tab'), function (t) {
+    const on = t.getAttribute('data-panel') === name;
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  ['x-ray', 'x-periments'].forEach(function (id) {
+    document.getElementById(id).hidden = (id !== name);
+  });
+}
+
+tabs.addEventListener('click', function (e) {
+  const t = e.target.closest('.tab');
+  if (t) showPanel(t.getAttribute('data-panel'));
+});
+
+
+// ---------------------------------------------------------------------------
+// x-periments: the refusal bench
+//
+// The bytes rendered here come from /bench, not from this file. What the page
+// shows and what the server parses are then the same string by construction —
+// a panel holding its own copy could display one thing and run another, which
+// is the failure the whole page argues against.
+
+const bench = document.getElementById('bench');
+
+function benchCard(c) {
+  const card = document.createElement('div');
+  card.className = 'case';
+
+  const title = document.createElement('div');
+  title.className = 'case-title';
+  title.textContent = c.title;
+  card.appendChild(title);
+
+  const pre = document.createElement('pre');
+  pre.className = 'case-bytes';
+  pre.textContent = c.bytes.replace(/
+/g, '
+').replace(/
++$/, '');
+  card.appendChild(pre);
+
+  const row = document.createElement('div');
+  row.className = 'case-row';
+  const button = document.createElement('button');
+  button.textContent = 'send';
+  const out = document.createElement('span');
+  out.className = 'case-out';
+  out.textContent = '';
+  button.addEventListener('click', function () {
+    button.disabled = true;
+    out.textContent = '...';
+    fetch('/bench?case=' + encodeURIComponent(c.id))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        out.textContent = d.result;
+        out.className = 'case-out ' +
+          (d.result.indexOf('accepted') === 0 ? 'accepted' : 'refused');
+      })
+      .catch(function () { out.textContent = 'no answer'; })
+      .then(function () { button.disabled = false; });
+  });
+  row.appendChild(button);
+  row.appendChild(out);
+  card.appendChild(row);
+
+  const why = document.createElement('div');
+  why.className = 'case-why';
+  why.textContent = c.why;
+  card.appendChild(why);
+  return card;
+}
+
+fetch('/bench')
+  .then(function (r) { return r.json(); })
+  .then(function (cases) {
+    bench.textContent = '';
+    cases.forEach(function (c) { bench.appendChild(benchCard(c)); });
+  })
+  .catch(function () { bench.textContent = 'bench unavailable'; });

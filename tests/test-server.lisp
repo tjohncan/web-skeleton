@@ -9022,6 +9022,41 @@
         (check "control: nothing to refuse when nothing resolved"
                (list parsed refused) (list nil 0))))))
 
+(defun test-parse-error-carries-its-status-to-a-caller ()
+  "An application that catches HTTP-PARSE-ERROR can ask what it carries.
+
+   The condition was exported and its readers were not, which gives a caller
+   something it can catch and cannot interrogate. A handler wanting to log
+   that a request was refused with 505 rather than 400 had to re-derive the
+   status by reading the printed message, which is a parser of a parser.
+
+   Reached through the WEB-SKELETON package rather than WEB-SKELETON:: on
+   purpose: the whole assertion is that these are public."
+  (format t "~%http-parse-error: status and message reach a caller~%")
+  (flet ((bad (version)
+           (format nil "GET /x HTTP/~a~c~cHost: h~c~c~c~c"
+                   version #\Return #\Newline #\Return #\Newline
+                   #\Return #\Newline)))
+    (check "the status is readable"
+           (handler-case (web-skeleton:parse-request (bad "9.9"))
+             (web-skeleton:http-parse-error (e)
+               (web-skeleton:http-parse-error-status e)))
+           505)
+    (check "the message is readable without parsing the printed form"
+           (handler-case (web-skeleton:parse-request (bad "9.9"))
+             (web-skeleton:http-parse-error (e)
+               (and (stringp (web-skeleton:http-parse-error-message e))
+                    (search "version" (web-skeleton:http-parse-error-message e))
+                    t)))
+           t)
+    ;; Control: a well-formed request does not signal, so the two assertions
+    ;; above are reading a condition that was raised rather than one the test
+    ;; manufactured.
+    (check "control: a well-formed request parses"
+           (handler-case (progn (web-skeleton:parse-request (bad "1.1")) :parsed)
+             (web-skeleton:http-parse-error () :refused))
+           :parsed)))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -9201,5 +9236,6 @@
   (test-counters-count-responses-by-class)
   (test-counters-see-a-response-no-handler-produced)
   (test-getent-parse-separates-policy-from-resolution)
+  (test-parse-error-carries-its-status-to-a-caller)
   (report-suite "Server")
   (zerop *tests-failed*))

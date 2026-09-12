@@ -39,6 +39,8 @@
        (handle-demo-fetch request))
       ((and (eq method :GET) (string= path "/census"))
        (handle-census request))
+      ((and (eq method :GET) (string= path "/bench"))
+       (handle-bench request))
       (t
        (or (serve-static request)
            (make-error-response 404))))))
@@ -106,6 +108,108 @@
                     t)
           (ignore-errors (sb-bsd-sockets:socket-close probe))))
     (error () nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; The bench — refusals, run against the real parser
+;;;
+;;; A browser physically cannot send a malformed request: fetch() normalises
+;;; everything, and XMLHttpRequest refuses the header names that would matter.
+;;; So the framing argument is the one part of the README a reader has to take
+;;; entirely on faith, and the point of this panel is that they do not have to.
+;;;
+;;; The server hands each case's exact bytes to PARSE-REQUEST — the same
+;;; exported entry point an application would use — and reports what it
+;;; actually said. Nothing is described, simulated, or remembered: change the
+;;; parser and the panel changes on the next click.
+;;;
+;;; No socket, no thread, no subprocess. One parse per click, on bytes fixed
+;;; at compile time, which is what keeps a public page from being a button
+;;; marked "load the server".
+;;;
+;;; Scope worth stating: PARSE-REQUEST validates a header block. The framing
+;;; rules that refuse Transfer-Encoding alongside Content-Length live in the
+;;; connection read path, because they are about a body arriving on a live
+;;; socket rather than about a block of headers — so this panel exhibits the
+;;; refusals reachable from outside the framework, not every refusal there is.
+
+(defun %crlf (&rest lines)
+  (format nil "~{~a~c~c~}~c~c"
+          (loop for l in lines append (list l #\Return #\Newline))
+          #\Return #\Newline))
+
+(defparameter *bench-cases*
+  (list
+   (list :id "fold"
+         :title "obsolete line folding"
+         :bytes (%crlf "GET /x HTTP/1.1" "Host: h" "X-Note: one" "  two")
+         :why "RFC 7230 deprecated folding because two readers disagree about
+               where a value ends. Refused by both readers here rather than
+               unfolded by one of them.")
+   (list :id "version"
+         :title "a version token that is not HTTP/1.0 or 1.1"
+         :bytes (%crlf "GET /x HTTP/9.9" "Host: h")
+         :why "505 rather than a guess. A server that treats an unknown
+               version as 1.1 is deciding on the client's behalf what
+               framing rules apply to the bytes after it.")
+   (list :id "absolute"
+         :title "absolute-form request target"
+         :bytes (%crlf "GET http://elsewhere/x HTTP/1.1" "Host: h")
+         :why "Only origin-form is accepted. One accepted shape is one shape
+               to get wrong, and behind a reverse proxy this form does not
+               arrive. A boundary, written down in Limitations.")
+   (list :id "ctl"
+         :title "a control byte in a header value"
+         :bytes (format nil "GET /x HTTP/1.1~c~cHost: h~c~cX-Note: a~cb~c~c~c~c"
+                        #\Return #\Newline #\Return #\Newline
+                        (code-char 7) #\Return #\Newline #\Return #\Newline)
+         :why "Checked against the same table the serializer uses on the way
+               out, so the framework will not accept a byte it would refuse
+               to emit.")
+   (list :id "ok"
+         :title "a well-formed request, for contrast"
+         :bytes (%crlf "GET /x HTTP/1.1" "Host: h" "Accept: */*")
+         :why "The control. A panel where everything is refused proves only
+               that something is refusing.")))
+
+(defun %bench-case-json (c)
+  (make-json-object
+   (list (cons "id"    (getf c :id))
+         (cons "title" (getf c :title))
+         (cons "bytes" (getf c :bytes))
+         (cons "why"   (substitute #\Space #\Newline (getf c :why))))))
+
+(defun %run-bench-case (c)
+  "Hand the bytes to the real parser and report what it said, verbatim."
+  (handler-case
+      (progn (parse-request (getf c :bytes))
+             "accepted")
+    (http-parse-error (e)
+      (format nil "~d  ~a" (or (http-parse-error-status e) 400)
+              (http-parse-error-message e)))
+    (error (e) (format nil "~a" e))))
+
+(defun handle-bench (request)
+  "With no :case, the catalogue. With one, that case run against the parser.
+
+   The catalogue carries the bytes, so what the page displays and what the
+   server parses are the same string — a panel that held its own copy could
+   show one thing and run another, which is the failure this whole page is
+   an argument against."
+  (let ((wanted (get-query-param request "case")))
+    (if wanted
+        (let ((c (find wanted *bench-cases* :key (lambda (x) (getf x :id))
+                                            :test #'string=)))
+          (if c
+              (make-text-response
+               200 (json-serialize
+                    (make-json-object
+                     (list (cons "id" (getf c :id))
+                           (cons "result" (%run-bench-case c)))))
+               :content-type "application/json")
+              (make-error-response 404)))
+        (make-text-response
+         200 (json-serialize (mapcar #'%bench-case-json *bench-cases*))
+         :content-type "application/json"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Vitals — what the server can say about itself

@@ -132,3 +132,73 @@ h2 {
   padding: 0.3em 2em 0.3em 0;
   color: var(--bone);
 }
+
+/* Tabs */
+
+.tabs {
+  display: flex;
+  gap: 0.5em;
+  margin-bottom: 2em;
+  border-bottom: 1px solid var(--bg-glow);
+}
+
+.tab {
+  font-family: inherit;
+  font-size: 1em;
+  letter-spacing: 0.12em;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--bone-dim);
+  padding: 0.4em 0.9em;
+  cursor: pointer;
+}
+
+.tab:hover { color: var(--bone); }
+
+.tab[aria-selected="true"] {
+  color: var(--bone-bright);
+  border-bottom-color: var(--purple);
+}
+
+/* The refusal bench */
+
+.case {
+  background: var(--bg-mid);
+  border-radius: 4px;
+  padding: 1em;
+  margin-bottom: 1.2em;
+  max-width: 46em;
+}
+
+.case-title {
+  color: var(--bone-bright);
+  margin-bottom: 0.6em;
+}
+
+.case-bytes {
+  color: var(--bone-dim);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: pre;
+  margin-bottom: 0.8em;
+}
+
+.case-row {
+  display: flex;
+  align-items: center;
+  gap: 1em;
+  margin-bottom: 0.8em;
+}
+
+.case-out { color: var(--bone-dim); }
+.case-out.refused { color: var(--spark-blue); }
+.case-out.accepted { color: var(--electric); }
+
+.case-why {
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  line-height: 1.5;
+}

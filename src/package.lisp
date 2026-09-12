@@ -120,6 +120,8 @@
            #:*https-stream-fn*
            ;; Conditions
            #:http-parse-error
+           #:http-parse-error-status
+           #:http-parse-error-message
            ;; Limits
            #:*max-request-line-length*
            #:*max-header-count*
