@@ -34,9 +34,17 @@ ASDF ships with SBCL.
 sbcl --non-interactive --load run-server.lisp
 ```
 
-Starts the demo server on port 8081.
-The demo page (load `http://localhost:8081/` in a browser)
-opens a WebSocket connection and echoes messages back.
+Starts the demo server on port 8081 with four workers.
+Load `http://localhost:8081/` in a browser, and in a second tab too.
+
+**x-ray** is a live bulletin, the connections each worker owns, and the
+server's own counters. Anything posted reaches every open connection,
+including your own, by way of the worker that owns it — which is the only
+worker allowed to write to it.
+
+**x-periments** hands malformed requests to the real parser and shows you
+what it said. A browser cannot send those itself; `fetch()` normalises them.
+
 Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
 ## Building
@@ -135,8 +143,9 @@ src/
     main.lisp          epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp     Demo package declaration
-  handler.lisp     WebSocket echo handler, demo entry point
+  handler.lisp     Bulletin fan-out, census endpoint, refusal bench
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
+  deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/
   package.lisp           Test package declaration
   run.lisp               Test utilities and combined runner
@@ -336,7 +345,16 @@ tests/
   `make-test-request` and `make-test-ws-frame` build structs for
   unit-style handler tests. Downstream apps can depend on it in their test build
   without pulling in the framework's own test suite
-- **Demo application** — separate ASDF system with static demo page and echo server
+- **Demo application** — a separate ASDF system, and the only thing in this
+  repository that reaches the framework the way an application would. It
+  broadcasts to every connected WebSocket across every worker using nothing
+  but the exported surface — `:on-tick`, `map-worker-websockets`, `ws-send`
+  and `make-store` — which is the one check that the exported surface
+  composes, since the test suite reaches `::` internals wherever convenient.
+  It also serves its own census, and hands malformed requests to the real
+  parser so the framing claims above can be performed rather than read.
+  `demo/deploy/` holds a Dockerfile and an nginx sample, so the deployment
+  notes are runnable rather than only written down
 
 ## Limitations
 
