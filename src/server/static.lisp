@@ -669,6 +669,11 @@
    This is where the Date that a pre-built response could not carry comes
    from, and appending it costs an entry on the queue rather than a
    rebuild of anything."
+  ;; The prefixes were serialized at startup, so nothing downstream of here
+  ;; passes through FORMAT-RESPONSE and nothing counted these. Static files
+  ;; are most of a page's requests: uncounted, the census reported one
+  ;; response for a page load that made a dozen.
+  (note-response (if (eq kind :not-modified) 304 200))
   (let ((prefix (ecase kind
                   ((:get :head) (static-entry-head-prefix entry))
                   (:not-modified (static-entry-not-modified-prefix entry)))))
@@ -695,6 +700,7 @@
                    (list (cons "content-length" (write-to-string len))
                          (cons "content-range"
                                (format nil "bytes ~d-~d/~d" first last total))))))
+    (note-response 206)
     (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)))
 
 (defun range-not-satisfiable-response (entry)
@@ -705,6 +711,7 @@
    Built per request rather than cached on the entry: 416 answers
    malformed client input, so it is a rare path and not worth a slot on
    every static file in memory."
+  (note-response 416)
   (let ((etag (static-entry-etag entry)))
     (serialize-http-message
      "HTTP/1.1 416 Range Not Satisfiable"

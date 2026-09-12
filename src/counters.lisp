@@ -50,9 +50,21 @@
 (defun note-response (status)
   "Record one response of STATUS, by class as well as in total.
 
-   Counted where the bytes are serialized rather than where a handler
-   returned, because most of what is worth counting never passes through a
-   handler: a parse error becomes a response without one ever running."
+   Counted where a response is handed to a connection rather than where a
+   handler returned, because most of what is worth counting never passes
+   through a handler: a parse error becomes a response without one ever
+   running.
+
+   Not where the bytes are serialized, which is what this said first and is
+   why static files went uncounted for a release. A cached file's bytes are
+   serialized once at startup and sent thousands of times; serialization is
+   where a response is BUILT, and the two coincide everywhere except the one
+   path that carries most of a page's requests.
+
+   So every path that emits a response calls this with its own status, and a
+   new one has to remember: FORMAT-RESPONSE for anything built per request,
+   STATIC-SEGMENTS and the two range builders for cached files, and
+   FORMAT-STREAMING-HEAD for a streamed body."
   (when *counters*
     (incf (counters-responses *counters*))
     (case (floor status 100)

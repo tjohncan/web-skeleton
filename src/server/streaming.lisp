@@ -219,6 +219,9 @@
            (headers (if (assoc "date" headers :test #'string-equal)
                         headers
                         (cons (cons "date" (http-date)) headers))))
+      ;; A streamed response is one response, counted at its head. The chunks
+      ;; that follow are not responses and STREAM-SEND does not count them.
+      (note-response status)
       (serialize-http-message
        (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
        headers

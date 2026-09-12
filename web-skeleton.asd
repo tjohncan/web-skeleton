@@ -40,7 +40,7 @@
                                                            "src/server/connection"
                                                            "src/algorithms/sha1"
                                                            "src/algorithms/base64"))
-               (:file "src/server/static" :depends-on ("src/package"
+               (:file "src/server/static" :depends-on ("src/counters" "src/package"
                                                          "src/log"
                                                          "src/server/http"))
                (:file "src/json" :depends-on ("src/package"))
@@ -69,7 +69,7 @@
                                                       "src/server/http"
                                                       "src/server/connection"
                                                       "src/server/fetch"))
-               (:file "src/server/streaming" :depends-on ("src/package"
+               (:file "src/server/streaming" :depends-on ("src/counters" "src/package"
                                                            "src/log"
                                                            "src/epoll"
                                                            "src/server/http"

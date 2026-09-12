@@ -8982,6 +8982,89 @@
         (check "and both are in the total"
                (>= (getf k :responses 0) 2) t)))))
 
+(defun test-counters-count-a-response-the-serializer-never-built ()
+  "A cached file is a response, and it was not being counted.
+
+   FORMAT-RESPONSE is where a per-request response is built, so counting
+   there caught everything that passes through it. Static files do not pass
+   through it: their bytes are serialized once at startup and sent from the
+   cache thereafter. Static files are also most of what a page load asks
+   for, so the census reported one response for a page that made a dozen —
+   wrong by an order of magnitude, in the one number a reader would check.
+
+   The first assertion is a control. A per-request response counted before
+   this fix and counts after it, so a run where the cached paths also count
+   is telling us about the cache rather than about the harness."
+  (format t "~%counters: a cached file is a response~%")
+  (let* ((content (sb-ext:string-to-octets
+                   "0123456789abcdefghijklmnopqrstuvwxyz"
+                   :external-format :ascii))   ; 36 bytes
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (flet ((counted (thunk)
+                    ;; A fresh set per case, so each number below is that
+                    ;; case's own and not a running total someone has to
+                    ;; subtract in their head to read.
+                    (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+                      (funcall thunk)
+                      (web-skeleton::counters-snapshot)))
+                  (get* (&rest headers)
+                    (serve-static (make-test-request :method :GET
+                                                     :path "/data.txt"
+                                                     :headers headers))))
+             (let ((snap (counted
+                          (lambda ()
+                            (web-skeleton::format-response
+                             (web-skeleton::make-http-response :status 200))))))
+               (check "control: a per-request response counts"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get*)))))
+               (check "a cached 200 is one response"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted
+                          (lambda ()
+                            (serve-static (make-test-request :method :HEAD
+                                                             :path "/data.txt"))))))
+               (check "a cached HEAD is one response"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             ;; 304 and 416 are the two a reader is most likely to want and
+             ;; least likely to generate on purpose: a browser revalidating,
+             ;; and a client asking for bytes that are not there.
+             (let ((snap (counted
+                          (lambda ()
+                            (get* (cons "if-none-match"
+                                        (web-skeleton::static-entry-etag entry)))))))
+               (check "a cached 304 is one response, counted 3xx"
+                      (list (getf snap :responses) (getf snap :redirected))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get* (cons "range" "bytes=10-19"))))))
+               (check "a 206 is one response, counted 2xx"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get* (cons "range" "bytes=900-999"))))))
+               (check "a 416 is one response, counted 4xx"
+                      (list (getf snap :responses) (getf snap :client-error))
+                      '(1 1)))))
+      (setf web-skeleton::*static-cache* saved)))
+  ;; The streamed head is the fourth path that never reaches FORMAT-RESPONSE.
+  ;; One response, counted once, at the head — the chunks after it are not
+  ;; responses and STREAM-SEND does not count them.
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (web-skeleton::format-streaming-head
+     (web-skeleton::make-http-response :status 200) :chunked)
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "a streamed response is counted once, at its head"
+             (list (getf snap :responses) (getf snap :successful))
+             '(1 1)))))
+
 (defun test-getent-parse-separates-policy-from-resolution ()
   "A name whose addresses policy refused is distinguishable from one that
    did not resolve.
@@ -9235,6 +9318,7 @@
   (test-a-log-line-is-one-line)
   (test-counters-count-responses-by-class)
   (test-counters-see-a-response-no-handler-produced)
+  (test-counters-count-a-response-the-serializer-never-built)
   (test-getent-parse-separates-policy-from-resolution)
   (test-parse-error-carries-its-status-to-a-caller)
   (report-suite "Server")
