@@ -74,3 +74,58 @@ form.onsubmit = function(e) {
 };
 
 connect();
+
+
+// ---------------------------------------------------------------------------
+// sternum and limbs — server-derived, polled
+//
+// Everything here comes from /census, which is CONNECTION-CENSUS plus two
+// application facts (uptime, and the wake interval the fan-out rides on).
+// Aggregate only: counts and states, nothing about any one visitor.
+
+const sternum = document.getElementById('sternum');
+const limbs = document.getElementById('limbs');
+
+function duration(secs) {
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+function renderCensus(c) {
+  sternum.textContent =
+    'up ' + duration(c.uptime) +
+    '  \u00b7  ' + c.total + (c.total === 1 ? ' connection' : ' connections') +
+    '  \u00b7  ' + c.workers + ' workers' +
+    '  \u00b7  fan-out every ' + c.cadence_ms + 'ms';
+
+  limbs.textContent = '';
+  c.per_worker.forEach(function (w, i) {
+    // The state keys are read off the object rather than matched against a
+    // known list. The census contract calls them diagnostic and says they
+    // change with the state machine; a panel that named them would go quietly
+    // blank on the first one that was added.
+    const states = Object.keys(w.states)
+      .map(function (k) { return k + ' ' + w.states[k]; })
+      .join(', ');
+    const row = document.createElement('div');
+    row.className = 'limb';
+    row.textContent = i + '   ' + w.total + (states ? '   ' + states : '');
+    limbs.appendChild(row);
+  });
+}
+
+function pollCensus() {
+  fetch('/census')
+    .then(function (r) { return r.json(); })
+    .then(renderCensus)
+    .catch(function () { sternum.textContent = 'census unavailable'; });
+}
+
+pollCensus();
+setInterval(pollCensus, 2000);

@@ -37,6 +37,8 @@
        :upgrade)
       ((and (eq method :GET) (string= path "/demo-fetch"))
        (handle-demo-fetch request))
+      ((and (eq method :GET) (string= path "/census"))
+       (handle-census request))
       (t
        (or (serve-static request)
            (make-error-response 404))))))
@@ -79,6 +81,53 @@
 ;;; WebSocket handler
 ;;; ---------------------------------------------------------------------------
 
+;;; Vitals — what the server can say about itself
+;;;
+;;; Aggregate only. Counts and states, never anything about one visitor: no
+;;; paths, no addresses, no headers, no message contents. The page is public.
+
+(defvar *started-at* nil
+  "Universal time START-DEMO ran. An application fact, not a framework one —
+   the framework has no opinion about when this app began.")
+
+(defun %states-json (states)
+  "A :STATES plist into a JSON object with string keys.
+
+   Walks the plist rather than naming the states it expects. CONNECTION-CENSUS
+   calls :STATES diagnostic and keys it by the connection state machine's own
+   keywords, and asks consumers to render unknown keys generically — a panel
+   matching a closed list would silently stop showing whatever was added."
+  (make-json-object
+   (loop for (state n) on states by #'cddr
+         collect (cons (string-downcase (symbol-name state)) n))))
+
+(defun %worker-json (slot)
+  "One census slot, or an empty one for a worker that has not published yet."
+  (make-json-object
+   (list (cons "total"  (if slot (getf slot :total 0) 0))
+         (cons "states" (%states-json (and slot (getf slot :states)))))))
+
+(defun handle-census (request)
+  "Server-derived vitals as JSON, for the sternum and limbs panels."
+  (declare (ignore request))
+  (let* ((c (connection-census))
+         (json (json-serialize
+                (make-json-object
+                 (list (cons "uptime" (if *started-at*
+                                          (- (get-universal-time) *started-at*)
+                                          0))
+                       (cons "workers" (or (getf c :workers) 0))
+                       (cons "total"   (or (getf c :total) 0))
+                       ;; The floor under fan-out, shown because it is the
+                       ;; cost of sharing nothing and the page may as well
+                       ;; say what it is rather than apologise for it.
+                       (cons "cadence_ms"
+                             (round (* *worker-wake-interval* 1000)))
+                       (cons "per_worker"
+                             (mapcar #'%worker-json (getf c :per-worker))))))))
+    (make-text-response 200 json :content-type "application/json")))
+
+;;; ---------------------------------------------------------------------------
 ;;; The bulletin — a live broadcast with no history
 ;;;
 ;;; Everyone connected sees what is posted while they are connected. Nothing
@@ -203,7 +252,18 @@
    fan-out across workers, and a small box reporting two of them is a dull
    exhibit; a fixed number also makes what the census shows reproducible."
   (setf *demo-port* port)
-  (setf *bulletin* (make-store :test #'eql)
+  ;; The fan-out can only be as prompt as the workers wake: a worker with no
+  ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
+  ;; returns. The default second is fine for a server and far too slow for a
+  ;; bulletin — at 0.05 a posted line lands in about 50ms, and the cost is
+  ;; twenty syscall returns per worker per second doing a sequence compare.
+  ;;
+  ;; Set here rather than left alone because the page displays it: the cadence
+  ;; is what sharing nothing costs, and the number belongs on screen rather
+  ;; than in an apology.
+  (setf *worker-wake-interval* 0.05)
+  (setf *started-at* (get-universal-time)
+        *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0))
   (load-static-files "demo/static/"
                      :substitutions

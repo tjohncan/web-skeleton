@@ -27,7 +27,7 @@ body {
 }
 
 h1 {
-  margin-bottom: 1em;
+  margin-bottom: 1.2em;
   color: var(--bone-bright);
   text-shadow: 0 0 20px rgba(96, 128, 224, 0.3);
 }
@@ -44,7 +44,6 @@ h1 {
 }
 
 .status { color: var(--electric); }
-.sent { color: var(--bone-dim); }
 .recv { color: var(--spark-blue); }
 .err { color: var(--err); }
 
@@ -81,3 +80,41 @@ button {
 button:hover {
   background: var(--purple);
 }
+
+/* Sections. Sparse on purpose: the page should read as things the server
+   said, not as prose about a server. */
+
+section { margin-bottom: 2.5em; }
+
+h2 {
+  font-size: 1em;
+  font-weight: normal;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--purple);
+  margin-bottom: 0.5em;
+}
+
+.sub {
+  color: var(--bone-dim);
+  margin-bottom: 1em;
+  max-width: 54em;
+}
+
+.vitals {
+  background: var(--bg-mid);
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  color: var(--electric-bright);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.limbs {
+  background: var(--bg-mid);
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  color: var(--bone-dim);
+}
+
+.limb { white-space: pre; }

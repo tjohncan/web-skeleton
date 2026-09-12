@@ -20,14 +20,27 @@
     <script src="/app.js" defer></script>
 </head>
 <body>
-    <h1>web-skeleton</h1>
-    <p class="lede">A live bulletin. Everyone connected right now sees what is
-    posted right now &mdash; there is no history, and nothing is replayed when
-    you arrive. Your own line comes back the same way everyone else's does.</p>
-    <div id="log"></div>
-    <form id="form">
-        <input id="msg" type="text" placeholder="type a message..." autofocus>
-        <button type="submit">send</button>
-    </form>
+    <h1>web-skeleton demo page</h1>
+
+    <section>
+        <h2>teeth</h2>
+        <p class="sub">live bulletin &mdash; posted messages reach every open
+        connection, including yours. no auth, no history</p>
+        <div id="log"></div>
+        <form id="form">
+            <input id="msg" type="text" placeholder="type a message..." autofocus>
+            <button type="submit">send</button>
+        </form>
+    </section>
+
+    <section>
+        <h2>arms and legs</h2>
+        <div id="limbs" class="limbs">&hellip;</div>
+    </section>
+
+    <section>
+        <h2>sternum</h2>
+        <div id="sternum" class="vitals">&hellip;</div>
+    </section>
 </body>
 </html>
