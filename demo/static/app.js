@@ -34,7 +34,13 @@ function connect(onOpen) {
     if (onOpen) onOpen();
   };
   ws.onmessage = function(e) {
-    appendLog('[recv] ' + e.data, 'recv');
+    // Wire form is "<seq>	<text>". The sequence is shown because it is the
+    // mechanism: it is what each worker compares against to know what it has
+    // not yet handed to the connections it owns.
+    const tab = e.data.indexOf('	');
+    const seq = tab < 0 ? '' : e.data.slice(0, tab);
+    const text = tab < 0 ? e.data : e.data.slice(tab + 1);
+    appendLog((seq ? '#' + seq + '  ' : '') + text, 'recv');
   };
   ws.onclose = function() {
     if (reconnectAttempts < maxReconnectAttempts) {
@@ -50,20 +56,20 @@ function connect(onOpen) {
   };
 }
 
+// No local echo. Your own line arrives the way everyone else's does — posted
+// to the shared buffer, then handed out by each worker on its own next tick.
+// Painting it here immediately would feel faster and would show you an
+// ordering nobody else sees. The pause before it appears is the fan-out, and
+// it is the thing worth watching.
 form.onsubmit = function(e) {
   e.preventDefault();
   const text = msg.value;
   if (!text) return;
   if (!ws || ws.readyState !== 1) {
-    connect(function() {
-      ws.send(text);
-      appendLog('[sent] ' + text, 'sent');
-      msg.value = '';
-    });
+    connect(function() { ws.send(text); msg.value = ''; });
     return;
   }
   ws.send(text);
-  appendLog('[sent] ' + text, 'sent');
   msg.value = '';
 };
 
