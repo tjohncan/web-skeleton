@@ -479,6 +479,12 @@
            (connection-fd conn)
            (connection-write-pending conn)
            (length frame-bytes)))
+  ;; After the append succeeded, so a frame refused at the backlog is not
+  ;; counted as one sent. This counts frames handed to the queue, not bytes
+  ;; that reached a peer — the queue is where this function's responsibility
+  ;; ends, and a count that claimed delivery would be claiming something no
+  ;; write path here can know.
+  (note-ws-frame)
   (let ((done (eq (connection-on-write conn) :done)))
     (unless (or done (null *epoll-fd*))
       (epoll-modify *epoll-fd* (connection-fd conn)

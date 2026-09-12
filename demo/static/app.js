@@ -97,11 +97,28 @@ function duration(secs) {
   return s + 's';
 }
 
+function n(x) { return (x || 0).toLocaleString(); }
+
+// Counters are read off the object rather than named, the same way the
+// states are. The census contract says new keys land here and asks a
+// consumer not to match against a closed list.
+function work(counters) {
+  if (!counters) return '\u2014';
+  const parts = [];
+  if (counters.responses) parts.push(n(counters.responses) + ' responses');
+  if (counters.ws_frames) parts.push(n(counters.ws_frames) + ' frames');
+  if (counters.client_error) parts.push(n(counters.client_error) + ' refused');
+  return parts.length ? parts.join('  \u00b7  ') : '\u2014';
+}
+
 function renderCensus(c) {
+  const k = c.counters || {};
   sternum.textContent =
     'up ' + duration(c.uptime) +
     '  \u00b7  ' + c.total + (c.total === 1 ? ' connection' : ' connections') +
     '  \u00b7  ' + c.workers + ' workers' +
+    '  \u00b7  ' + n(k.responses) + ' responses' +
+    '  \u00b7  ' + n(k.ws_frames) + ' frames out' +
     '  \u00b7  fan-out every ' + c.cadence_ms + 'ms';
 
   limbRows.textContent = '';
@@ -114,7 +131,8 @@ function renderCensus(c) {
       .map(function (k) { return k + ' ' + w.states[k]; })
       .join(', ');
     const row = document.createElement('tr');
-    [String(i), String(w.total), states || '—'].forEach(function (v) {
+    const conns = String(w.total) + (states ? '   (' + states + ')' : '');
+    [String(i), conns, work(w.counters)].forEach(function (v) {
       const cell = document.createElement('td');
       cell.textContent = v;
       row.appendChild(cell);

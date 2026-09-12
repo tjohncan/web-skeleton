@@ -1079,6 +1079,11 @@
     ;; circuits before the body encode + header build below.
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
+    ;; Counted here rather than where a handler returned, because most of
+    ;; what is worth counting never passes through one: a parse error is a
+    ;; response nobody's handler produced. After the range check, so a
+    ;; rejected status is not also a counted one.
+    (note-response status)
     (let* ((body   (http-response-body response))
            ;; String bodies encode to UTF-8; byte bodies pass through
            ;; untouched. Everything downstream (Content-Length, the

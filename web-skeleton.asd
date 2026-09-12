@@ -6,6 +6,7 @@
   :depends-on ("sb-bsd-sockets")
   :components ((:file "src/package")
                (:file "src/log" :depends-on ("src/package"))
+               (:file "src/counters" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
                (:file "src/address" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
@@ -22,7 +23,7 @@
                (:file "src/algorithms/base64" :depends-on ("src/package"))
                (:file "src/random" :depends-on ("src/package"
                                                  "src/algorithms/base64"))
-               (:file "src/server/http"  :depends-on ("src/package"
+               (:file "src/server/http"  :depends-on ("src/counters" "src/package"
                                                        "src/algorithms/hex"))
                (:file "src/server/chunked" :depends-on ("src/package"
                                                           "src/algorithms/hex"))
@@ -32,7 +33,7 @@
                                                             "src/address"
                                                             "src/server/http"
                                                             "src/server/chunked"))
-               (:file "src/server/websocket" :depends-on ("src/package"
+               (:file "src/server/websocket" :depends-on ("src/counters" "src/package"
                                                            "src/log"
                                                            "src/epoll"
                                                            "src/server/http"
@@ -73,7 +74,7 @@
                                                            "src/epoll"
                                                            "src/server/http"
                                                            "src/server/connection"))
-               (:file "src/server/main"  :depends-on ("src/package"
+               (:file "src/server/main"  :depends-on ("src/counters" "src/package"
                                                        "src/log"
                                                        "src/epoll"
                                                        ;; WITH-WORKER-URANDOM is a macro, so this

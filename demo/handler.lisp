@@ -128,11 +128,22 @@
    (loop for (state n) on states by #'cddr
          collect (cons (string-downcase (symbol-name state)) n))))
 
+;; :COUNTERS is a plist like :STATES, so it is rendered the same way — walked
+;; rather than named. The census docstring says new keys will appear here and
+;; asks consumers not to match a closed list; a panel that named the counters
+;; it knew about would go quietly blank on the first one that was added.
+(defun %plist-json (plist)
+  (make-json-object
+   (loop for (k v) on plist by #'cddr
+         collect (cons (substitute #\_ #\- (string-downcase (symbol-name k)))
+                       v))))
+
 (defun %worker-json (slot)
   "One census slot, or an empty one for a worker that has not published yet."
   (make-json-object
-   (list (cons "total"  (if slot (getf slot :total 0) 0))
-         (cons "states" (%states-json (and slot (getf slot :states)))))))
+   (list (cons "total"    (if slot (getf slot :total 0) 0))
+         (cons "states"   (%states-json (and slot (getf slot :states))))
+         (cons "counters" (%plist-json (and slot (getf slot :counters)))))))
 
 (defun handle-census (request)
   "Server-derived vitals as JSON, for the sternum and limbs panels."
@@ -150,6 +161,7 @@
                        ;; say what it is rather than apologise for it.
                        (cons "cadence_ms"
                              (round (* *worker-wake-interval* 1000)))
+                       (cons "counters" (%plist-json (getf c :counters)))
                        (cons "per_worker"
                              (mapcar #'%worker-json (getf c :per-worker))))))))
     (make-text-response 200 json :content-type "application/json")))

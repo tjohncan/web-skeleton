@@ -151,7 +151,8 @@
     (list :total total
           :outbound outbound
           :inbound (- total outbound)
-          :states states)))
+          :states states
+          :counters (counters-snapshot))))
 
 (defun publish-connection-census ()
   "Store this worker's counts into its own census slot. No-op off a worker.
@@ -182,9 +183,15 @@
 
    The contract is split, and the split is the part to read.
 
-   Stable — :WORKERS, :TOTAL, :INBOUND, :OUTBOUND. Counts of things an
-   application already has names for. Safe to render, alert on, and compare
-   across versions.
+   Stable — :WORKERS, :TOTAL, :INBOUND, :OUTBOUND, and :COUNTERS. Counts of
+   things an application already has names for. Safe to render, alert on, and
+   compare across versions.
+
+   :COUNTERS is cumulative since each worker started, never windowed: a caller
+   wanting a rate samples twice and subtracts. It counts what only the
+   framework sees — responses by class including every refusal no handler ever
+   ran for, accepts taken and refused, and WebSocket frames queued. A worker
+   that crashes and restarts begins a fresh set, so these can go down.
 
    Diagnostic — :STATES and :PER-WORKER. :STATES is keyed by the connection
    state machine's own keywords, which are internals and will change when it
@@ -203,7 +210,7 @@
    something counted elsewhere, and do not."
   (when *connection-census*
     (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil)
-          (per-worker nil))
+          (counters nil) (per-worker nil))
       (loop for slot across *connection-census*
             do (push slot per-worker)
                (when slot
@@ -212,11 +219,14 @@
                  (incf outbound (getf slot :outbound 0))
                  (incf inbound  (getf slot :inbound 0))
                  (loop for (state n) on (getf slot :states) by #'cddr
-                       do (incf (getf states state 0) n))))
+                       do (incf (getf states state 0) n))
+                 (loop for (name n) on (getf slot :counters) by #'cddr
+                       do (incf (getf counters name 0) n))))
       (when seen
         (list :workers (length *connection-census*)
               :total total :outbound outbound :inbound inbound
               :states states
+              :counters counters
               :per-worker (nreverse per-worker))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -828,6 +838,7 @@
                (>= (hash-table-count *connections*) *max-connections*))
       (log-warn "connection limit reached (~d), refusing new accept"
                 *max-connections*)
+      (note-refused)
       (refuse-connection client-socket)
       (return-from accept-connection t))
     (handler-case
@@ -837,6 +848,7 @@
           (unwind-protect
                (progn
                  (register-connection conn)
+                 (note-accepted)
                  (setf registered t)
                  (epoll-add epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+))
@@ -1712,7 +1724,14 @@
                         ;; never returns through, and a remainder left queued
                         ;; with nothing armed waits for an event that is not
                         ;; coming.
-                        (*epoll-fd* epoll-fd))
+                        (*epoll-fd* epoll-fd)
+                        ;; Same reasoning, one slot over: counted on this
+                        ;; thread only, so an increment needs no lock and
+                        ;; cannot contend. A restart after a crash starts a
+                        ;; fresh set rather than resuming the dead worker's,
+                        ;; which is honest — the counts describe a worker, and
+                        ;; this is a new one.
+                        (*counters* (make-counters)))
                    (log-info "worker ~d started (epoll fd ~d)"
                              worker-id epoll-fd)
                    (epoll-add epoll-fd (socket-fd listener)

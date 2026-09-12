@@ -8903,6 +8903,85 @@
       (check "a runaway structure is truncated, not printed whole"
              (< (length out) 2000) t))))
 
+(defun test-counters-count-responses-by-class ()
+  "Every response is counted once in total and once in its class.
+
+   The class split is the point. A total alone cannot tell a server answering
+   a thousand requests from one refusing a thousand, and the refusals are the
+   half an application cannot see for itself."
+  (format t "~%counters: responses by class~%")
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (mapc #'web-skeleton::note-response (list 100 200 201 301 400 404 500))
+    (web-skeleton::note-accepted)
+    (web-skeleton::note-refused)
+    (web-skeleton::note-ws-frame)
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "counted in total"  (getf snap :responses) 7)
+      (check "1xx informational" (getf snap :informational) 1)
+      (check "2xx successful"    (getf snap :successful) 2)
+      (check "3xx redirected"    (getf snap :redirected) 1)
+      (check "4xx client-error"  (getf snap :client-error) 2)
+      (check "5xx server-error"  (getf snap :server-error) 1)
+      (check "accepts taken"     (getf snap :accepted) 1)
+      (check "accepts refused"   (getf snap :refused) 1)
+      (check "ws frames queued"  (getf snap :ws-frames) 1)))
+  (check "off a worker: nothing to snapshot, and no raise getting there"
+         (let ((web-skeleton::*counters* nil))
+           (web-skeleton::note-response 200)
+           (web-skeleton::note-accepted)
+           (web-skeleton::counters-snapshot))
+         nil))
+
+(defun test-counters-see-a-response-no-handler-produced ()
+  "A request refused by the parser is counted, and the handler never runs.
+
+   This is the argument for counting in the framework rather than in the
+   application. Transfer-Encoding alongside Content-Length is refused before
+   dispatch, so the caller gets a 400 no handler produced — and an
+   application counting its own calls would report that request as never
+   having happened at all.
+
+   Polled rather than slept: the census publishes on the maintenance gate at
+   1 Hz, which is slower than this test would care to guess at."
+  (format t "~%counters: the refusals an application cannot see~%")
+  (let ((calls 0))
+    (with-test-server (:workers 1
+                       :handler (lambda (req)
+                                  (declare (ignore req))
+                                  (incf calls)
+                                  (web-skeleton:make-text-response 200 "ok")))
+      (test-http-request :get "/")
+      (let ((calls-before calls))
+        (let* ((sock (connect-to-test-server))
+               (stream (sb-bsd-sockets:socket-make-stream
+                        sock :input t :output t
+                        :element-type '(unsigned-byte 8))))
+          (unwind-protect
+               (progn
+                 (write-sequence
+                  (sb-ext:string-to-octets
+                   (crlf "POST /x HTTP/1.1" "Host: h"
+                         "Content-Length: 5" "Transfer-Encoding: chunked")
+                   :external-format :utf-8)
+                  stream)
+                 (force-output stream)
+                 (sleep 0.3))
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close sock))))
+        (check "the handler never ran for the refused request"
+               calls calls-before))
+      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+        (loop until (or (and k (plusp (getf k :responses 0)))
+                        (> (get-universal-time) deadline))
+              do (setf k (getf (web-skeleton:connection-census) :counters))
+                 (sleep 0.05))
+        (check "control: the handled request was counted successful"
+               (>= (getf k :successful 0) 1) t)
+        (check "the refusal was counted as a client error"
+               (>= (getf k :client-error 0) 1) t)
+        (check "and both are in the total"
+               (>= (getf k :responses 0) 2) t)))))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -9079,5 +9158,7 @@
   (test-map-worker-websockets-is-callable-from-on-tick)
   (test-connection-census-is-exported-with-a-split-contract)
   (test-a-log-line-is-one-line)
+  (test-counters-count-responses-by-class)
+  (test-counters-see-a-response-no-handler-produced)
   (report-suite "Server")
   (zerop *tests-failed*))
