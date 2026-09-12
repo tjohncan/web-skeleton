@@ -6,6 +6,22 @@
 # implementation is neither. What it does have is an outbound client, which
 # is why libssl is optional in the image rather than absent.
 
+# ---------------------------------------------------------------------------
+# Sharing a box with another site
+#
+# The two directives below are http-block directives, not server-block ones,
+# and nginx refuses to start if either is declared twice. If this box already
+# proxies something else that speaks WebSocket, its config almost certainly
+# has its own `map $http_upgrade`, and dropping this file in beside it fails
+# with "duplicate map" or "duplicate zone" — at reload, taking the site that
+# was already working down with it.
+#
+# So on a shared box, move the map and the limit_req_zone into the http block
+# of nginx.conf (or a snippet included once from it), and keep only the two
+# server blocks here. One nginx, one map, one server block per subdomain, each
+# proxying to its own loopback port — not one nginx per application.
+# ---------------------------------------------------------------------------
+
 # The upgrade pair, hoisted because it has to live in the http block.
 # "Connection: upgrade" must be sent only for requests that asked to upgrade;
 # sending it on every request breaks keep-alive for ordinary ones.
