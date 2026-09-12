@@ -25,7 +25,7 @@
     <section>
         <h2>teeth</h2>
         <p class="sub">live bulletin - posted messages reach every open
-        connection, including yours - no auth and no history</p>
+        connection, including yours - no auth or history</p>
         <div id="log"></div>
         <form id="form">
             <input id="msg" type="text" placeholder="type a message..." autofocus>
@@ -35,7 +35,12 @@
 
     <section>
         <h2>arms and legs</h2>
-        <div id="limbs" class="limbs">&hellip;</div>
+        <table id="limbs" class="limbs">
+            <thead>
+                <tr><th>worker</th><th>live connections</th><th>connection states</th></tr>
+            </thead>
+            <tbody id="limb-rows"></tbody>
+        </table>
     </section>
 
     <section>

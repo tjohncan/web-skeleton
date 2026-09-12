@@ -84,7 +84,7 @@ connect();
 // Aggregate only: counts and states, nothing about any one visitor.
 
 const sternum = document.getElementById('sternum');
-const limbs = document.getElementById('limbs');
+const limbRows = document.getElementById('limb-rows');
 
 function duration(secs) {
   const d = Math.floor(secs / 86400);
@@ -104,7 +104,7 @@ function renderCensus(c) {
     '  \u00b7  ' + c.workers + ' workers' +
     '  \u00b7  fan-out every ' + c.cadence_ms + 'ms';
 
-  limbs.textContent = '';
+  limbRows.textContent = '';
   c.per_worker.forEach(function (w, i) {
     // The state keys are read off the object rather than matched against a
     // known list. The census contract calls them diagnostic and says they
@@ -113,10 +113,13 @@ function renderCensus(c) {
     const states = Object.keys(w.states)
       .map(function (k) { return k + ' ' + w.states[k]; })
       .join(', ');
-    const row = document.createElement('div');
-    row.className = 'limb';
-    row.textContent = i + '   ' + w.total + (states ? '   ' + states : '');
-    limbs.appendChild(row);
+    const row = document.createElement('tr');
+    [String(i), String(w.total), states || '—'].forEach(function (v) {
+      const cell = document.createElement('td');
+      cell.textContent = v;
+      row.appendChild(cell);
+    });
+    limbRows.appendChild(row);
   });
 }
 

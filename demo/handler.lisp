@@ -81,6 +81,33 @@
 ;;; WebSocket handler
 ;;; ---------------------------------------------------------------------------
 
+(defun %port-already-served-p (port)
+  "T if something already answers on PORT of the loopback interface.
+
+   Every listener this framework opens sets SO_REUSEPORT, which is what lets
+   one worker per core hold the same port. The cost is that a *second server
+   process* binding it does not fail either — it joins. Both then serve, the
+   kernel splits arriving connections between them by 4-tuple hash, and
+   nothing anywhere reports it: no error, no warning, no log line on either
+   side.
+
+   For this demo that surfaces as the room quietly dividing. Each process has
+   its own bulletin, so a tab only ever hears the tabs the kernel hashed the
+   same way, and which group a tab lands in is invisible from inside it. It
+   costs an afternoon to diagnose and one connect() to prevent.
+
+   The check races anything started in the gap before the bind, which is
+   fine: the case that actually happens is a previous run that did not die."
+  (handler-case
+      (let ((probe (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp)))
+        (unwind-protect
+             (progn (sb-bsd-sockets:socket-connect probe #(127 0 0 1) port)
+                    t)
+          (ignore-errors (sb-bsd-sockets:socket-close probe))))
+    (error () nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Vitals — what the server can say about itself
 ;;;
 ;;; Aggregate only. Counts and states, never anything about one visitor: no
@@ -251,6 +278,12 @@
    WORKERS is pinned rather than left to CPU-COUNT. The page's subject is
    fan-out across workers, and a small box reporting two of them is a dull
    exhibit; a fixed number also makes what the census shows reproducible."
+  (when (%port-already-served-p port)
+    (error "start-demo: something is already answering on port ~d.~%~
+            SO_REUSEPORT means a second server binds it rather than failing, ~
+            and both would serve — the kernel splitting connections between ~
+            them, each with its own bulletin, so the room divides in two with ~
+            no error anywhere. Stop the other one first." port))
   (setf *demo-port* port)
   ;; The fan-out can only be as prompt as the workers wake: a worker with no
   ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it

@@ -115,6 +115,20 @@ h2 {
   padding: 0.8em 1em;
   border-radius: 4px;
   color: var(--bone-dim);
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 40em;
 }
 
-.limb { white-space: pre; }
+.limbs th {
+  text-align: left;
+  font-weight: normal;
+  color: var(--purple);
+  padding: 0 2em 0.4em 0;
+  border-bottom: 1px solid var(--bg-glow);
+}
+
+.limbs td {
+  padding: 0.3em 2em 0.3em 0;
+  color: var(--bone);
+}
