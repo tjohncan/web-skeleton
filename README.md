@@ -167,6 +167,27 @@ tests/
 - **Worker thread pool** — one event loop per CPU core, each with its own
   listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
   Kernel distributes accepts across workers. Zero shared state in the hot path
+- **Periodic work on a worker's own loop** — `:on-tick` runs an application
+  function on every pass of every worker's event loop, on that worker's
+  thread, with that worker's connection table and epoll fd bound. Those
+  bindings are the point: they are what makes `ws-send` legal from inside it
+  and its ownership guard effective rather than skipped. `map-worker-websockets`
+  walks the connections that loop owns, so a broadcast to everyone is one pass
+  per worker over that worker's share and the application keeps no registry.
+  A hook runs inside the loop, so one that blocks stops that worker for every
+  connection on it; one that raises is caught, reported once and then at most
+  once a minute, and the loop continues
+- **Census and counters** — `connection-census` reports connections per worker
+  with their states, and cumulative counts of what only the framework sees:
+  accepts taken and refused, responses by status class, WebSocket frames
+  queued. Each worker publishes its own slot on the maintenance tick and a
+  reader on any thread sums them, so nothing is locked and what you read is up
+  to a tick old. Counted where responses are serialized, which is why the
+  refusals no handler ever ran for are in there. Monotonic and never windowed
+  — five minutes and an hour are presentation, and a caller wanting a rate
+  samples twice and subtracts. Its docstring splits the contract: some keys
+  are stable, the state breakdown is diagnostic, and a consumer must render
+  unknown keys generically
 - **epoll event loop** — edge-triggered, non-blocking I/O via `sb-alien`
   FFI to Linux epoll, fcntl, read, write
 - **Connection state machine** — per-connection read/write buffers, tracks
@@ -410,6 +431,11 @@ read about here.
   no notification when a WebSocket closes, so that set goes stale and has to
   prune on the refusal. Broadcasting to all of them avoids the problem by
   keeping no set at all.
+
+  `demo/handler.lisp` is the worked example: a shared store holding recent
+  lines, one integer per worker recording how far that worker has got, and a
+  tick that sends the difference to the connections it owns. No registry, no
+  membership, and no worker aware that another exists.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy
