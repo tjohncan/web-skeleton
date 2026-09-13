@@ -322,3 +322,24 @@ h2 {
   .tabs { gap: 0.2em; }
   .tab { padding: 0.4em 0.6em; }
 }
+
+/* The way back to wherever this is hung off, when there is one. */
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6em 1.5em;
+  flex-wrap: wrap;
+  margin-bottom: 1.2em;
+}
+
+.topbar h1 { margin-bottom: 0; }
+
+.backlink {
+  color: var(--bone-dim);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.backlink:hover { color: var(--electric-bright); }

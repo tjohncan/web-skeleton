@@ -31,6 +31,19 @@
    names. That is also why a start time is not in the handle below — it would
    be answering a question this already answers.")
 
+(defvar *backlink-url* nil
+  "An absolute URL to whatever this demo hangs off, or NIL for nothing.
+
+   NIL is the default and the honest one: this repository has no parent, and
+   a framework that shipped a link to its author's site would be shipping an
+   opinion about where it runs. A deployer who has a hub says so, and the
+   page grows a way back to it; a deployer who does not gets a page with no
+   dangling link on it.
+
+   Rendered once into the static cache at startup rather than per request.
+   It is fixed for the life of the process, and the page it lands on is a
+   cached file.")
+
 (defvar *demo-host* "127.0.0.1"
   "Host the /demo-fetch endpoint uses to self-fetch over HTTP.")
 
@@ -175,6 +188,64 @@
           (or *instance* "????")
           (or *worker-id* "?")
           (connection-serial conn)))
+
+(defun %escape-html-attr (s)
+  "The five characters that can end an attribute or start a tag.
+
+   The URL is the operator's, not a visitor's, so this is not defending
+   against an attacker — it is defending against a URL with an ampersand in
+   its query string, which is ordinary, and against the stray quote that
+   would otherwise end the attribute and put the rest of the URL into the
+   markup as attributes of its own."
+  (with-output-to-string (out)
+    (loop for c across s do
+      (case c
+        (#\& (write-string "&amp;"  out))
+        (#\< (write-string "&lt;"   out))
+        (#\> (write-string "&gt;"   out))
+        (#\" (write-string "&quot;" out))
+        (#\' (write-string "&#39;"  out))
+        (t    (write-char c out))))))
+
+(defun %backlink-display (url)
+  "URL without its scheme or its trailing slash.
+
+   What someone wants to read on a link is where it goes, and https:// is
+   not where anything goes. Display only: the href keeps the whole URL."
+  (let* ((s (cond ((and (> (length url) 8) (string= "https://" url :end2 8))
+                   (subseq url 8))
+                  ((and (> (length url) 7) (string= "http://" url :end2 7))
+                   (subseq url 7))
+                  (t url)))
+         (n (length s)))
+    (if (and (plusp n) (char= (char s (1- n)) #\/))
+        (subseq s 0 (1- n))
+        s)))
+
+(defun %backlink-html ()
+  "The anchor, or the empty string when there is nowhere to go.
+
+   Empty rather than absent-by-template: the placeholder has to be replaced
+   either way, or a page with no backlink configured would display the word
+   __BACKLINK__ to everyone who visited it.
+
+   Anything that is not an http or https URL is refused and said out loud.
+   The value is the operator's own, so this is not an attack surface — but
+   a javascript: URL in an href is a foot-gun regardless of who loaded it,
+   and refusing the shape costs one comparison."
+  (cond
+    ((null *backlink-url*) "")
+    ((not (or (and (> (length *backlink-url*) 8)
+                   (string= "https://" *backlink-url* :end2 8))
+              (and (> (length *backlink-url*) 7)
+                   (string= "http://" *backlink-url* :end2 7))))
+     (log-warn "backlink ignored: ~s is not an http or https URL"
+               *backlink-url*)
+     "")
+    (t
+     (format nil "<a class=\"backlink\" href=\"~a\">&#8627; ~a</a>"
+             (%escape-html-attr *backlink-url*)
+             (%escape-html-attr (%backlink-display *backlink-url*))))))
 
 (defun %crlf (&rest lines)
   (format nil "~{~a~c~c~}~c~c"
@@ -792,7 +863,8 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
-                        (instance (bytes-to-hex (random-bytes 2))))
+                        (instance (bytes-to-hex (random-bytes 2)))
+                        backlink)
   "Start the demo server.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
@@ -806,7 +878,12 @@
 
    INSTANCE names this process in the handles the bulletin shows. Random by
    default so two runs are two names; pass the one your deployment already
-   uses if it has one."
+   uses if it has one.
+
+   BACKLINK is an absolute URL to whatever this demo hangs off, or NIL. A
+   page served from somebody's collection of things should offer a way back
+   to the collection; a page served from nowhere in particular should not
+   invent one."
   (when (%port-already-served-p port)
     (error "start-demo: something is already answering on port ~d.~%~
             SO_REUSEPORT means a second server binds it rather than failing, ~
@@ -824,13 +901,17 @@
   ;; is what sharing nothing costs, and the number belongs on screen rather
   ;; than in an apology.
   (setf *worker-wake-interval* 0.05)
-  (setf *instance* instance)
+  (setf *instance* instance
+        *backlink-url* backlink)
   (setf *started-at* (get-universal-time)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0))
+  ;; Backquoted rather than quoted now: the backlink is not known until
+  ;; this call, and the cache is built once from what it says here.
   (load-static-files "demo/static/"
                      :substitutions
-                     '(("robots.txt" ("are smart" . "robots are cool and smart"))))
+                     `(("robots.txt" ("are smart" . "robots are cool and smart"))
+                       ("index.html" ("__BACKLINK__" . ,(%backlink-html)))))
   (start-server :host host
                 :port port
                 :workers workers

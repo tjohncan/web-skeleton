@@ -44,10 +44,17 @@
 ;; would override the default with nothing and every process would be "????".
 ;; Set it to whatever the deployment already calls this box, and the handles
 ;; the bulletin shows will agree with the logs somebody reads next to them.
-(let ((instance (sb-ext:posix-getenv "WS_INSTANCE")))
+;; WS_ prefixed like the rest of this file's variables, and the same idea as
+;; the BACKLINK_URL an operator may already be setting elsewhere. Absent means
+;; absent: no link is rendered, rather than a link to nowhere.
+(defun env-string (name)
+  (let ((v (sb-ext:posix-getenv name)))
+    (and v (plusp (length v)) v)))
+
+(let ((instance (env-string "WS_INSTANCE")))
   (apply #'web-skeleton-demo:start-demo
-         :host    (env-host "WS_HOST" #(0 0 0 0))
-         :port    (env-int  "WS_PORT" 8081)
-         :workers (env-int  "WS_WORKERS" 4)
-         (when (and instance (plusp (length instance)))
-           (list :instance instance))))
+         :host     (env-host "WS_HOST" #(0 0 0 0))
+         :port     (env-int  "WS_PORT" 8081)
+         :workers  (env-int  "WS_WORKERS" 4)
+         :backlink (env-string "WS_BACKLINK_URL")
+         (when instance (list :instance instance))))
