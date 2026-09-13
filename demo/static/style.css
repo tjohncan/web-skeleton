@@ -202,3 +202,88 @@ h2 {
   font-size: 0.92em;
   line-height: 1.5;
 }
+
+/* The lab */
+
+.tool {
+  background: var(--bg-mid);
+  border-radius: 4px;
+  padding: 1em;
+  margin-bottom: 1.2em;
+  max-width: 60em;
+}
+
+.tool-title {
+  color: var(--bone-bright);
+  margin-bottom: 0.6em;
+}
+
+.tool-note {
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  margin-bottom: 0.8em;
+}
+
+.tool-form { flex-wrap: wrap; align-items: center; }
+
+.tool-form input { flex: 0 1 14em; min-width: 8em; }
+.tool-form input.wide { flex: 1 1 24em; }
+
+.tool-form select {
+  padding: 0.5em;
+  font-family: monospace;
+  font-size: 1em;
+  background: var(--bg-mid);
+  color: var(--bone);
+  border: 1px solid var(--purple-deep);
+  border-radius: 4px;
+  outline: none;
+}
+
+.tool-out { margin-top: 1em; }
+
+.tool-answer {
+  color: var(--electric-bright);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-bottom: 0.8em;
+}
+
+.tool-answer.bad { color: var(--err); }
+
+.tool-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em 1.4em;
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  margin-bottom: 1em;
+}
+
+.tool-worker { color: var(--purple); }
+
+.tool-label {
+  color: var(--purple);
+  font-size: 0.92em;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.3em;
+}
+
+.tool-wire {
+  color: var(--bone-dim);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 22em;
+  white-space: pre;
+  margin-bottom: 1em;
+}
+
+/* The worker holding this page's socket. */
+.limbs tr.mine td { color: var(--electric-bright); }

@@ -41,6 +41,12 @@
        (handle-census request))
       ((and (eq method :GET) (string= path "/bench"))
        (handle-bench request))
+      ((and (eq method :GET) (string= path "/lab/base64"))
+       (handle-lab-base64 request))
+      ((and (eq method :GET) (string= path "/lab/hash"))
+       (handle-lab-hash request))
+      ((and (eq method :GET) (string= path "/lab/jwt"))
+       (handle-lab-jwt request))
       (t
        (or (serve-static request)
            (make-error-response 404))))))
@@ -212,6 +218,251 @@
          :content-type "application/json"))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The lab — ordinary requests, shown whole
+;;;
+;;; Three GETs a visitor might actually want done: base64 either way, a
+;;; digest, and a JWT taken apart. Useful on their own, which is the point —
+;;; a demo page gets opened a second time if one of its tabs does a job. All
+;;; three already live in src/algorithms, so the demo reaches for the
+;;; framework rather than carrying a copy of anything.
+;;;
+;;; Every answer carries the same envelope: which worker ran it, how long the
+;;; server spent inside it, and the request as the server parsed it.
+;;;
+;;; The echo is the part worth explaining. fetch() does not expose the bytes
+;;; the browser put on the wire, so a panel drawing its own picture of the
+;;; request would be showing a reconstruction and calling it the thing —
+;;; which is the failure the rest of this page is an argument against. The
+;;; server writes back what it received. It goes to the caller who sent it
+;;; and to nobody else, which is why this may carry headers when /census
+;;; deliberately carries nothing about anyone.
+
+(defparameter *lab-input-max* 2048
+  "Longest accepted lab input. The framework bounds the request line well
+   below this already; the cap is here so an over-long value is answered with
+   a sentence the page can show rather than a connection-level refusal it
+   cannot explain.")
+
+(defparameter *unix-epoch* (encode-universal-time 0 0 0 1 1 1970 0)
+  "2208988800. Unix seconds plus this is a Lisp universal time.")
+
+(defun %monotonic-us ()
+  "Microseconds off CLOCK_MONOTONIC.
+
+   Not GET-INTERNAL-REAL-TIME: on SBCL 2.6 it does not advance between
+   adjacent calls, and two hundred FORMATs between two reads still measured
+   zero. Every lab request reported itself as instantaneous, which is a
+   number that looks like a broken field rather than a fast server.
+
+   Not GET-TIME-OF-DAY either, which has the resolution and is the wrong
+   clock: it is wall time, and an interval measured across an NTP step is
+   not an interval."
+  (multiple-value-bind (sec nsec)
+      (sb-unix:clock-gettime sb-unix:clock-monotonic)
+    (+ (* sec 1000000) (floor nsec 1000))))
+
+(defun %lab-request-echo (request)
+  "The request as the parser holds it, written back in the form it arrived.
+
+   Rebuilt from the struct rather than kept as raw bytes, deliberately: what
+   this shows is the request that was actually dispatched. A header the
+   parser dropped is absent here, which is the honest answer to the question
+   the panel is asking."
+  (with-output-to-string (s)
+    (format s "~a ~a~@[?~a~] HTTP/~a~c~c"
+            (symbol-name (http-request-method request))
+            (http-request-path request)
+            (http-request-query request)
+            (http-request-version request)
+            #\Return #\Newline)
+    (loop for (name . value) in (http-request-headers request)
+          do (format s "~a: ~a~c~c" name value #\Return #\Newline))
+    (format s "~c~c" #\Return #\Newline)))
+
+(defun %lab-json (request started pairs &key error (status 200))
+  "The envelope every lab endpoint answers with.
+
+   STARTED is a %MONOTONIC-US taken at the top of the handler, so
+   SERVER_US is the server's own time inside the request and the page can
+   subtract it from the round trip it measured to see what was network and
+   browser. Two clocks, each reported by the side that owns it, rather than
+   one number asked to mean both."
+  (let ((us (- (%monotonic-us) started))
+        (resp nil))
+    (setf resp
+          (make-text-response
+           status
+           (json-serialize
+            (make-json-object
+             (append
+              (list (cons "worker" (or *worker-id* :null))
+                    (cons "server_us" us)
+                    (cons "request" (%lab-request-echo request)))
+              (if error
+                  (list (cons "error" error))
+                  (list (cons "result" (make-json-object pairs)))))))
+           :content-type "application/json"))
+    ;; Also a header, so the worker appears in the raw response the page
+    ;; renders rather than only in a body it had to parse to find it.
+    (set-response-header resp "x-worker"
+                         (if *worker-id* (princ-to-string *worker-id*) "none"))
+    resp))
+
+(defun %lab-input (request name &key (required t))
+  "A query parameter, length-checked. The second value is a message when the
+   first is unusable, so a caller tests one thing and reports the other."
+  (let ((v (get-query-param request name)))
+    (cond ((null v)
+           (if required
+               (values nil (format nil "missing query parameter ~a" name))
+               (values nil nil)))
+          ((> (length v) *lab-input-max*)
+           (values nil (format nil "~a is ~:d characters and the cap is ~:d"
+                               name (length v) *lab-input-max*)))
+          (t (values v nil)))))
+
+(defun %lab-b64 (op s)
+  "Run OP over S. The second value is a note when the answer needs one."
+  (flet ((in () (sb-ext:string-to-octets s :external-format :utf-8))
+         (out (bytes)
+           ;; A decode can produce bytes that are not text in any encoding.
+           ;; Hex beats replacement characters presented as the answer.
+           (handler-case
+               (values (sb-ext:octets-to-string bytes :external-format :utf-8)
+                       nil)
+             (error ()
+               (values (bytes-to-hex bytes)
+                       "the decoded bytes are not valid UTF-8, shown as hex")))))
+    (cond ((string= op "encode")     (values (base64-encode (in)) nil))
+          ((string= op "encode-url") (values (base64url-encode (in)) nil))
+          ((string= op "decode")     (out (base64-decode s)))
+          ((string= op "decode-url") (out (base64url-decode s)))
+          (t (error "op must be encode, decode, encode-url or decode-url, not ~s"
+                    op)))))
+
+(defun handle-lab-base64 (request)
+  "base64 and base64url, both directions."
+  (let ((started (%monotonic-us)))
+    (multiple-value-bind (s err) (%lab-input request "s")
+      (if err
+          (%lab-json request started nil :error err :status 400)
+          (let ((op (or (get-query-param request "op") "encode")))
+            (handler-case
+                (multiple-value-bind (out note) (%lab-b64 op s)
+                  (%lab-json request started
+                             (append (list (cons "op" op)
+                                           (cons "in" s)
+                                           (cons "out" out))
+                                     (when note (list (cons "note" note))))))
+              (error (e)
+                (%lab-json request started nil
+                           :error (format nil "~a" e) :status 400))))))))
+
+(defun %lab-hash (alg s key)
+  (let ((bytes (sb-ext:string-to-octets s :external-format :utf-8)))
+    (cond ((string= alg "sha256") (sha256-hex bytes))
+          ((string= alg "sha1")   (sha1-hex bytes))
+          ((string= alg "hmac-sha256")
+           (unless (and key (plusp (length key)))
+             (error "hmac-sha256 needs a key; give one in the key field"))
+           (bytes-to-hex
+            (hmac-sha256 (sb-ext:string-to-octets key :external-format :utf-8)
+                         bytes)))
+          (t (error "alg must be sha256, sha1 or hmac-sha256, not ~s" alg)))))
+
+(defun handle-lab-hash (request)
+  "SHA-256, SHA-1, or HMAC-SHA256 over the text given."
+  (let ((started (%monotonic-us)))
+    (multiple-value-bind (s err) (%lab-input request "s")
+      (if err
+          (%lab-json request started nil :error err :status 400)
+          (multiple-value-bind (key key-err)
+              (%lab-input request "key" :required nil)
+            (if key-err
+                (%lab-json request started nil :error key-err :status 400)
+                (let ((alg (or (get-query-param request "alg") "sha256")))
+                  (handler-case
+                      (%lab-json request started
+                                 (list (cons "alg" alg)
+                                       (cons "in" s)
+                                       (cons "bytes_in"
+                                             (length (sb-ext:string-to-octets
+                                                      s :external-format :utf-8)))
+                                       (cons "hex" (%lab-hash alg s key))))
+                    (error (e)
+                      (%lab-json request started nil
+                                 :error (format nil "~a" e) :status 400))))))))))
+
+(defun %utc-string (unix)
+  (multiple-value-bind (sec min hour date month year)
+      (decode-universal-time (+ unix *unix-epoch*) 0)
+    (format nil "~d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ"
+            year month date hour min sec)))
+
+(defun %relative (unix now)
+  "How far UNIX is from NOW, in the largest unit that is not silly."
+  (let* ((d (- unix now))
+         (a (abs d)))
+    (multiple-value-bind (n unit)
+        (cond ((< a 60)    (values a "second"))
+              ((< a 3600)  (values (round a 60) "minute"))
+              ((< a 86400) (values (round a 3600) "hour"))
+              (t           (values (round a 86400) "day")))
+      (format nil "~d ~a~p ~a" n unit n (if (minusp d) "ago" "from now")))))
+
+(defun %jwt-segments (token)
+  "Split TOKEN on dots, keeping empty segments — a JWS whose signature is
+   empty still has three parts, and collapsing that would report it as
+   malformed for the wrong reason."
+  (let ((out nil) (start 0))
+    (loop
+      (let ((dot (position #\. token :start start)))
+        (push (subseq token start (or dot (length token))) out)
+        (if dot (setf start (1+ dot)) (return))))
+    (nreverse out)))
+
+(defun %jwt-claim-times (payload now)
+  "The three registered time claims, decoded. Absent ones stay absent."
+  (loop for name in '("iat" "nbf" "exp")
+        for v = (json-get payload name)
+        when (integerp v)
+          collect (cons name (format nil "~a  (~a)"
+                                     (%utc-string v) (%relative v now)))))
+
+(defun handle-lab-jwt (request)
+  "Take a JWT apart. Decoded, never verified, and the answer says so."
+  (let ((started (%monotonic-us)))
+    (multiple-value-bind (token err) (%lab-input request "token")
+      (if err
+          (%lab-json request started nil :error err :status 400)
+          (handler-case
+              (let ((parts (%jwt-segments token)))
+                (unless (= (length parts) 3)
+                  (error "a JWS has three dot-separated parts and this has ~d"
+                         (length parts)))
+                (flet ((seg (i)
+                         (json-parse (sb-ext:octets-to-string
+                                      (base64url-decode (nth i parts))
+                                      :external-format :utf-8))))
+                  (let* ((header (seg 0))
+                         (payload (seg 1))
+                         (sig (base64url-decode (third parts)))
+                         (now (- (get-universal-time) *unix-epoch*))
+                         (times (%jwt-claim-times payload now)))
+                    (%lab-json
+                     request started
+                     (list (cons "header" header)
+                           (cons "payload" payload)
+                           (cons "signature_bytes" (length sig))
+                           (cons "times" (make-json-object times))
+                           (cons "verified" :false)
+                           (cons "note"
+                                 "decoded, not verified. Verifying needs the issuer's key, which a public box has no business being handed."))))))
+            (error (e)
+              (%lab-json request started nil
+                         :error (format nil "~a" e) :status 400)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Vitals — what the server can say about itself
 ;;;
 ;;; Aggregate only. Counts and states, never anything about one visitor: no
@@ -367,11 +618,38 @@
    sender would see an ordering nobody else sees. The demo is here to show
    the mechanism, latency included."
   (declare (ignore conn))
-  (when (= (ws-frame-opcode frame) +ws-op-text+)
-    (let ((text (sb-ext:octets-to-string (ws-frame-payload frame)
-                                         :external-format :utf-8)))
-      (bulletin-post (%sanitize-line text))))
-  nil)
+  (cond
+    ((= (ws-frame-opcode frame) +ws-op-binary+)
+     (%ws-command frame))
+    ((= (ws-frame-opcode frame) +ws-op-text+)
+     (let ((text (sb-ext:octets-to-string (ws-frame-payload frame)
+                                          :external-format :utf-8)))
+       (bulletin-post (%sanitize-line text)))
+     nil)
+    (t nil)))
+
+(defun %ws-command (frame)
+  "Answer a control frame, on the asking connection only.
+
+   Binary rather than text, and that is what keeps the two channels apart.
+   The bulletin box sends text and only text, so nothing a visitor can type
+   reaches this, and nothing answered here can be mistaken for a posted line.
+
+   The answer is text with no TAB in it. A bulletin line always has exactly
+   one, put there by %BULLETIN-PAYLOAD and impossible to post because
+   %SANITIZE-LINE strips it — so the client tells the two apart by
+   construction rather than by sniffing a prefix that a line could imitate.
+
+   Which worker is the only thing to ask so far. It is worth asking because
+   the answer is stable for the life of the socket and different from the
+   worker that will serve the next request from the same browser: one
+   connection, one worker, for as long as it is open."
+  (let ((cmd (sb-ext:octets-to-string (ws-frame-payload frame)
+                                      :external-format :utf-8)))
+    (build-ws-text
+     (if (string= cmd "worker")
+         (format nil "worker ~a" (or *worker-id* "none"))
+         (format nil "unknown command ~a" (%sanitize-line cmd))))))
 
 (defun %sanitize-line (text)
   "Cap the length and strip control characters.

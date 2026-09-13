@@ -3,6 +3,11 @@ const form = document.getElementById('form');
 const msg = document.getElementById('msg');
 let ws = null;
 let reconnectAttempts = 0;
+// Which worker owns this socket, once it has said so. Constant for the life
+// of the connection, and not the worker that will serve the next request
+// from this same browser — which is the reason it is worth showing.
+let myWorker = null;
+let lastCensus = null;
 const maxReconnectAttempts = 3;
 
 function appendLog(text, cls) {
@@ -31,16 +36,33 @@ function connect(onOpen) {
   ws.onopen = function() {
     reconnectAttempts = 0;
     appendLog('[status] connected', 'status');
+    // Ask which worker owns this socket. Binary, because the bulletin box
+    // sends text and only text — so a control frame cannot collide with
+    // anything a visitor is able to type, in either direction.
+    ws.send(new TextEncoder().encode('worker'));
     if (onOpen) onOpen();
   };
   ws.onmessage = function(e) {
     // Wire form is "<seq>\t<text>". The sequence is shown because it is the
     // mechanism: it is what each worker compares against to know what it has
     // not yet handed to the connections it owns.
+    //
+    // A frame with no TAB in it is the server answering a control frame
+    // rather than a line somebody posted. %BULLETIN-PAYLOAD always writes
+    // one and %SANITIZE-LINE strips any that were typed, so neither can be
+    // mistaken for the other.
     const tab = e.data.indexOf('\t');
-    const seq = tab < 0 ? '' : e.data.slice(0, tab);
-    const text = tab < 0 ? e.data : e.data.slice(tab + 1);
-    appendLog((seq ? '#' + seq + '  ' : '') + text, 'recv');
+    if (tab < 0) {
+      const m = /^worker (\d+)$/.exec(e.data);
+      if (m) {
+        myWorker = Number(m[1]);
+        if (lastCensus) renderCensus(lastCensus);
+      } else {
+        appendLog('[status] ' + e.data, 'status');
+      }
+      return;
+    }
+    appendLog('#' + e.data.slice(0, tab) + '  ' + e.data.slice(tab + 1), 'recv');
   };
   ws.onclose = function() {
     if (reconnectAttempts < maxReconnectAttempts) {
@@ -131,8 +153,13 @@ function renderCensus(c) {
       .map(function (k) { return k + ' ' + w.states[k]; })
       .join(', ');
     const row = document.createElement('tr');
+    // The row for the worker holding this page's WebSocket. One socket, one
+    // worker, for as long as it stays open — while the requests the lab tab
+    // makes land wherever the kernel chooses to put them.
+    if (i === myWorker) row.className = 'mine';
     const conns = String(w.total) + (states ? '   (' + states + ')' : '');
-    [String(i), conns, work(w.counters)].forEach(function (v) {
+    const who = String(i) + (i === myWorker ? '   \u2190 your socket' : '');
+    [who, conns, work(w.counters)].forEach(function (v) {
       const cell = document.createElement('td');
       cell.textContent = v;
       row.appendChild(cell);
@@ -144,7 +171,7 @@ function renderCensus(c) {
 function pollCensus() {
   fetch('/census')
     .then(function (r) { return r.json(); })
-    .then(renderCensus)
+    .then(function (c) { lastCensus = c; renderCensus(c); })
     .catch(function () { sternum.textContent = 'census unavailable'; });
 }
 
@@ -180,7 +207,203 @@ tabs.addEventListener('click', function (e) {
 
 
 // ---------------------------------------------------------------------------
-// x-periments: the refusal bench
+// x-periments: the lab
+//
+// Three ordinary GETs, each shown whole — the request as the server parsed
+// it, the response as the browser received it, and both clocks.
+//
+// The request block is the server's account of what arrived, not this file's
+// account of what it sent. fetch() does not expose the bytes the browser put
+// on the wire: it adds headers of its own and normalises what it is handed.
+// A panel drawing its own version would be showing a reconstruction and
+// calling it the request, and the server is the only witness that was there.
+//
+// The response block claims no HTTP version, because this side cannot see
+// one. A proxy in front may be speaking h2 to the browser while speaking 1.1
+// to the server, and printing "HTTP/1.1" here would be a guess dressed as a
+// reading. The request block can print a version because the server reported
+// the one it parsed.
+
+const lab = document.getElementById('lab');
+
+// iat a year back, exp in 2030, so both relative forms are on screen at once.
+// The signature is text rather than a signature: this endpoint decodes and
+// says out loud that it does not verify.
+const SAMPLE_JWT =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' +
+  '.eyJzdWIiOiJkZW1vIiwibmFtZSI6IndlYi1za2VsZXRvbiIsImlhdCI6MTc1NzYzNTIwMCwi' +
+  'ZXhwIjoxODkzNDU2MDAwfQ' +
+  '.bm90IGEgcmVhbCBzaWduYXR1cmUsIHRoaXMgZW5kcG9pbnQgZG9lcyBub3QgdmVyaWZ5';
+
+const LAB_TOOLS = [
+  {
+    id: 'base64',
+    title: 'base64',
+    path: '/lab/base64',
+    fields: [
+      { name: 'op', type: 'select', options: ['encode', 'decode',
+                                              'encode-url', 'decode-url'] },
+      { name: 's', type: 'text', wide: true, value: 'web-skeleton',
+        placeholder: 'text' }
+    ],
+    answer: function (r) { return r.out; }
+  },
+  {
+    id: 'hash',
+    title: 'digest',
+    path: '/lab/hash',
+    fields: [
+      { name: 'alg', type: 'select', options: ['sha256', 'sha1',
+                                               'hmac-sha256'] },
+      { name: 's', type: 'text', wide: true, value: 'web-skeleton',
+        placeholder: 'text' },
+      { name: 'key', type: 'text', placeholder: 'key (hmac only)' }
+    ],
+    answer: function (r) { return r.hex; }
+  },
+  {
+    id: 'jwt',
+    title: 'jwt',
+    note: 'decoded, never verified — do not paste a token you care about',
+    path: '/lab/jwt',
+    fields: [
+      { name: 'token', type: 'text', wide: true, value: SAMPLE_JWT,
+        placeholder: 'eyJhbGciOi...' }
+    ],
+    answer: function (r) {
+      return JSON.stringify({ header: r.header, payload: r.payload,
+                              times: r.times,
+                              signature_bytes: r.signature_bytes }, null, 2);
+    }
+  }
+];
+
+function clockOf(d) {
+  function p(n, w) { return String(n).padStart(w, '0'); }
+  return p(d.getHours(), 2) + ':' + p(d.getMinutes(), 2) + ':' +
+         p(d.getSeconds(), 2) + '.' + p(d.getMilliseconds(), 3);
+}
+
+function headerBlock(headers) {
+  const out = [];
+  headers.forEach(function (v, k) { out.push(k + ': ' + v); });
+  return out.sort().join('\n');
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function labCard(tool) {
+  const card = el('div', 'tool');
+  card.appendChild(el('div', 'tool-title', tool.title));
+  if (tool.note) card.appendChild(el('div', 'tool-note', tool.note));
+
+  const form = el('form', 'tool-form');
+  const inputs = {};
+  tool.fields.forEach(function (f) {
+    let input;
+    if (f.type === 'select') {
+      input = el('select');
+      f.options.forEach(function (o) {
+        const opt = el('option', null, o);
+        opt.value = o;
+        input.appendChild(opt);
+      });
+    } else {
+      input = el('input');
+      input.type = 'text';
+      if (f.placeholder) input.placeholder = f.placeholder;
+      if (f.value) input.value = f.value;
+      if (f.wide) input.className = 'wide';
+    }
+    input.setAttribute('aria-label', f.name);
+    inputs[f.name] = input;
+    form.appendChild(input);
+  });
+  const run = el('button', null, 'run');
+  run.type = 'submit';
+  form.appendChild(run);
+  card.appendChild(form);
+
+  const out = el('div', 'tool-out');
+  out.hidden = true;
+  card.appendChild(out);
+
+  function show(sentAt, ms, res, body) {
+    out.hidden = false;
+    out.textContent = '';
+
+    // The answer first, because it is what someone came for. Everything
+    // below it is the evidence for it.
+    if (body && body.result) {
+      const a = el('pre', 'tool-answer', tool.answer(body.result));
+      out.appendChild(a);
+      if (body.result.note) {
+        out.appendChild(el('div', 'tool-note', body.result.note));
+      }
+    } else if (body && body.error) {
+      out.appendChild(el('pre', 'tool-answer bad', body.error));
+    }
+
+    const t = el('div', 'tool-times');
+    t.appendChild(el('span', null, 'sent ' + clockOf(sentAt)));
+    t.appendChild(el('span', null, 'finished ' + clockOf(new Date())));
+    t.appendChild(el('span', null, 'round trip ' + ms.toFixed(1) + ' ms'));
+    if (body && typeof body.server_us === 'number') {
+      t.appendChild(el('span', null, 'server ' + body.server_us + ' µs'));
+    }
+    if (body && body.worker !== null && body.worker !== undefined) {
+      t.appendChild(el('span', 'tool-worker', 'worker ' + body.worker));
+    }
+    out.appendChild(t);
+
+    if (body && body.request) {
+      out.appendChild(el('div', 'tool-label', 'request, as the server parsed it'));
+      out.appendChild(el('pre', 'tool-wire',
+                         body.request.replace(/\r\n/g, '\n').replace(/\n+$/, '')));
+    }
+
+    out.appendChild(el('div', 'tool-label', 'response, as your browser received it'));
+    const status = res.status + (res.statusText ? ' ' + res.statusText : '');
+    out.appendChild(el('pre', 'tool-wire',
+                       status + '\n' + headerBlock(res.headers) + '\n\n' +
+                       JSON.stringify(body, null, 2)));
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    const params = new URLSearchParams();
+    tool.fields.forEach(function (f) {
+      const v = inputs[f.name].value;
+      // An empty optional field is left out rather than sent empty: the
+      // request shown below should be the one that was made.
+      if (v !== '') params.set(f.name, v);
+    });
+    run.disabled = true;
+    const sentAt = new Date();
+    const t0 = performance.now();
+    let res = null;
+    fetch(tool.path + '?' + params.toString())
+      .then(function (r) { res = r; return r.json(); })
+      .then(function (body) { show(sentAt, performance.now() - t0, res, body); })
+      .catch(function (err) {
+        out.hidden = false;
+        out.textContent = 'no answer: ' + err;
+      })
+      .then(function () { run.disabled = false; });
+  });
+
+  return card;
+}
+
+LAB_TOOLS.forEach(function (t) { lab.appendChild(labCard(t)); });
+
+// ---------------------------------------------------------------------------
+// x-periments: the appendix, a bench of refusals
 //
 // The bytes rendered here come from /bench, not from this file. What the page
 // shows and what the server parses are then the same string by construction —
