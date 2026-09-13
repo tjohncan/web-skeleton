@@ -89,6 +89,7 @@
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd
+           #:connection-serial
            #:connection-remote-addr
            ;; The authority CONNECTION-WRITE-FULL-P's docstring names.
            ;; Exported so an app can run the test CONNECTION-APPEND-WRITE

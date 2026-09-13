@@ -2177,6 +2177,83 @@
              (and pairs (every (lambda (p) (eql (car p) (cdr p))) pairs))
              t))))
 
+(defun test-connection-serial-does-not-repeat-when-an-fd-does ()
+  "Every accepted connection gets a number this worker will not hand out
+   again, which is the thing a file descriptor cannot promise.
+
+   An fd is unique among the sockets open at this instant and no longer than
+   that. The kernel gives the next accept the lowest free descriptor, so the
+   fd of a connection that closed a moment ago belongs to a stranger now, and
+   anything that labelled a peer by fd would label two peers the same. The
+   demo puts a name on every line of a public broadcast; a name that silently
+   changes hands is worse than no name.
+
+   Three connections are opened and closed one after another below, which is
+   precisely the shape that reuses an fd. Whether a given run actually reuses
+   one is the kernel's business and is reported rather than asserted — what
+   is asserted is that the serials did not repeat regardless, because that is
+   the claim the field makes.
+
+   Collected from :ON-TICK rather than from a handler: an HTTP handler is
+   given a request and never sees the connection it arrived on, so the tick,
+   which runs with this worker's table bound, is the only place an
+   application can look at one."
+  (format t "~%server: a connection number that is not an fd~%")
+  (let ((seen nil)
+        (lock (sb-thread:make-mutex))
+        (saved *worker-wake-interval*))
+    (unwind-protect
+         (progn
+           ;; Set before the workers start so they pick it up on their first
+           ;; pass rather than after one second of the old value.
+           (setf *worker-wake-interval* 0.05)
+           (with-test-server
+               (:workers 1
+                :on-tick
+                (lambda (id)
+                  (declare (ignore id))
+                  (maphash
+                   (lambda (fd conn)
+                     (declare (ignore fd))
+                     (sb-thread:with-mutex (lock)
+                       (pushnew (cons (connection-fd conn)
+                                      (connection-serial conn))
+                                seen :test #'equal)))
+                   web-skeleton::*connections*))
+                :handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             ;; Connecting is enough: a connection is registered at accept,
+             ;; and no request has to be made for it to exist. Held open for
+             ;; a few ticks so the hook above is certain to have seen it.
+             (dotimes (i 3)
+               (multiple-value-bind (socket stream) (%raw-connect)
+                 (declare (ignore stream))
+                 (sleep 0.25)
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))
+                 ;; And closed before the next one opens, so the fd it was
+                 ;; using is free when the next accept asks for one.
+                 (sleep 0.15)))))
+      (setf *worker-wake-interval* saved))
+    (let* ((pairs (sb-thread:with-mutex (lock) (copy-list seen)))
+           (serials (sort (mapcar #'cdr pairs) #'<))
+           (fds (mapcar #'car pairs)))
+      (format t "  (observed ~d connection~:p across ~d distinct fd~:p)~%"
+              (length pairs) (length (remove-duplicates fds)))
+      ;; The control. Every assertion below is true of an empty list, so
+      ;; without this the test passes on a server that accepted nothing and
+      ;; a hook that never ran. At least three rather than exactly three:
+      ;; WITH-TEST-SERVER probes the port to know it is up, and those are
+      ;; accepted connections like any other.
+      (check "at least the three opened here were seen"
+             (>= (length pairs) 3) t)
+      (check "no serial was handed out twice"
+             (length (remove-duplicates serials)) (length serials))
+      (check "they only ever go up"
+             (equal serials (sort (copy-list serials) #'<)) t)
+      (check "and they count accepts, so the highest is at least the count"
+             (and serials (>= (car (last serials)) (length serials))) t))))
+
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
    pipelined behind it.
@@ -4388,6 +4465,7 @@
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
+  (test-connection-serial-does-not-repeat-when-an-fd-does)
   (test-harness-pipelined-after-body-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)

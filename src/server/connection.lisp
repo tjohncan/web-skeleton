@@ -20,9 +20,31 @@
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
 
+(defvar *connection-serial* 0
+  "Accepted connections on this worker so far. Bound per worker by
+   RUN-WORKER beside the other share-nothing slots, so the increment needs
+   no lock and two workers cannot contend for it.
+
+   Per worker rather than global on purpose: a global would be the one
+   counter every accept on every core had to agree about, which is the
+   contention this design exists to avoid. The consequence is that a serial
+   is unique within a worker and not across them, so anything naming a
+   connection has to carry the worker id too.")
+
 (defstruct connection
   ;; Identity
   (fd        -1  :type fixnum)               ; raw file descriptor
+  ;; This worker's count of accepted connections at the time this one was
+  ;; accepted. Together with the worker id it names a connection for as long
+  ;; as the process lives, which FD alone cannot do: an fd is unique only
+  ;; among the connections open right now, and the kernel hands the lowest
+  ;; free one to the next accept. A closed connection's fd belongs to a
+  ;; stranger within milliseconds, so anything that labels a peer by fd
+  ;; labels two different peers the same.
+  ;;
+  ;; 0 for a connection this worker did not accept — an outbound fetch is a
+  ;; connection too, and it is nobody's peer.
+  (serial    0   :type unsigned-byte)
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
   (remote-addr nil)                           ; peer IP as string, or NIL for outbound
   ;; Byte source and sink. NIL means the raw fd, via NB-READ / NB-WRITE.
@@ -310,6 +332,7 @@
     (set-nonblocking fd)
     (make-connection :fd fd
                      :socket client-socket
+                     :serial (incf *connection-serial*)
                      :remote-addr addr
                      :last-active (get-universal-time))))
 

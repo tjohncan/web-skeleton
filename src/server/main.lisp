@@ -1691,6 +1691,9 @@
               ;; share-nothing slots, because owning the slot outright is
               ;; what lets the publish be lock-free.
               (*worker-id* worker-id)
+              ;; Restarts at zero with the worker, which is why anything
+              ;; naming a connection across a restart needs more than this.
+              (*connection-serial* 0)
               ;; Per-worker DNS cache. Workers share nothing in the hot
               ;; path, so each keeps its own table and no lock is needed.
               ;; Inert unless the app opts in via *DNS-CACHE-TTL*; a
