@@ -317,20 +317,30 @@
 (defparameter *unix-epoch* (encode-universal-time 0 0 0 1 1 1970 0)
   "2208988800. Unix seconds plus this is a Lisp universal time.")
 
-(defun %monotonic-us ()
-  "Microseconds off CLOCK_MONOTONIC.
+(defun %now-us ()
+  "Microseconds, for timing one handler.
 
    Not GET-INTERNAL-REAL-TIME: on SBCL 2.6 it does not advance between
    adjacent calls, and two hundred FORMATs between two reads still measured
-   zero. Every lab request reported itself as instantaneous, which is a
-   number that looks like a broken field rather than a fast server.
+   zero. Every lab request reported itself as instantaneous, which reads as
+   a broken field rather than as a fast server.
 
-   Not GET-TIME-OF-DAY either, which has the resolution and is the wrong
-   clock: it is wall time, and an interval measured across an NTP step is
-   not an interval."
-  (multiple-value-bind (sec nsec)
-      (sb-unix:clock-gettime sb-unix:clock-monotonic)
-    (+ (* sec 1000000) (floor nsec 1000))))
+   This was CLOCK_MONOTONIC, which is the right clock and was the wrong
+   call. SB-UNIX:CLOCK-GETTIME is external on some SBCLs and internal on
+   others, so the demo compiled on the machine it was written on and failed
+   to READ on a Debian image — not a worse number, a build that stopped
+   before it started. Reaching into another package's internals to measure
+   microseconds on a demo page was not a trade worth making.
+
+   GET-TIME-OF-DAY is external, has been for over a decade, and has the
+   resolution. What it costs is that it is wall time, so an interval
+   measured across a clock step is not an interval; the subtraction that
+   uses this clamps at zero, so a backward step reports nothing rather than
+   a negative count of microseconds. For a handler that runs in tens of
+   microseconds, beside a round trip this page does not control, that is the
+   cheaper of the two wrongs."
+  (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
+    (+ (* sec 1000000) usec)))
 
 (defun %lab-request-echo (request)
   "The request as the parser holds it, written back in the form it arrived.
@@ -353,12 +363,12 @@
 (defun %lab-json (request started pairs &key error (status 200))
   "The envelope every lab endpoint answers with.
 
-   STARTED is a %MONOTONIC-US taken at the top of the handler, so
+   STARTED is a %NOW-US taken at the top of the handler, so
    SERVER_US is the server's own time inside the request and the page can
    subtract it from the round trip it measured to see what was network and
    browser. Two clocks, each reported by the side that owns it, rather than
    one number asked to mean both."
-  (let ((us (- (%monotonic-us) started))
+  (let ((us (max 0 (- (%now-us) started)))
         (resp nil))
     (setf resp
           (make-text-response
@@ -413,7 +423,7 @@
 
 (defun handle-lab-base64 (request)
   "base64 and base64url, both directions."
-  (let ((started (%monotonic-us)))
+  (let ((started (%now-us)))
     (multiple-value-bind (s err) (%lab-input request "s")
       (if err
           (%lab-json request started nil :error err :status 400)
@@ -443,7 +453,7 @@
 
 (defun handle-lab-hash (request)
   "SHA-256, SHA-1, or HMAC-SHA256 over the text given."
-  (let ((started (%monotonic-us)))
+  (let ((started (%now-us)))
     (multiple-value-bind (s err) (%lab-input request "s")
       (if err
           (%lab-json request started nil :error err :status 400)
@@ -502,7 +512,7 @@
 
 (defun handle-lab-jwt (request)
   "Take a JWT apart. Decoded, never verified, and the answer says so."
-  (let ((started (%monotonic-us)))
+  (let ((started (%now-us)))
     (multiple-value-bind (token err) (%lab-input request "token")
       (if err
           (%lab-json request started nil :error err :status 400)
