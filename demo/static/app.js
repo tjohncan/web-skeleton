@@ -26,13 +26,18 @@ function appendLog(text, cls) {
 // through a conversation, and nothing about who they are. Built as elements
 // rather than one string so the parts can be styled apart and so nothing
 // here is ever parsed as markup.
-function appendBulletin(seq, who, text) {
+function appendBulletin(seq, when, who, text) {
   const line = document.createElement('div');
   line.className = 'recv' + (who === myHandle ? ' own' : '');
+  // The sequence is on the line, not in it. It is the mechanism and worth
+  // being able to find, but it counts from server start and only goes up,
+  // so printing it in front of every sentence is seven digits of noise on
+  // a process that has been up for a month.
+  line.title = 'post #' + seq;
 
   const s = document.createElement('span');
-  s.className = 'seq';
-  s.textContent = '#' + seq;
+  s.className = 'when';
+  s.textContent = when;
   line.appendChild(s);
 
   const w = document.createElement('span');
@@ -91,14 +96,26 @@ function connect(onOpen) {
       }
       return;
     }
-    // <seq> TAB <handle> TAB <text>. Split on the first two only. The text
-    // cannot contain a tab — the server strips every byte below 32 before
-    // posting — but splitting on all of them would be trusting that rather
-    // than only needing the two the format puts there.
-    const tab2 = e.data.indexOf('\t', tab + 1);
-    appendBulletin(e.data.slice(0, tab),
-                   tab2 < 0 ? '?' : e.data.slice(tab + 1, tab2),
-                   tab2 < 0 ? e.data.slice(tab + 1) : e.data.slice(tab2 + 1));
+    // <seq> TAB <utc> TAB <handle> TAB <text>. Split on the first three
+    // only. The text cannot contain a tab — the server strips every byte
+    // below 32 before posting — but splitting on all of them would be
+    // trusting that rather than needing only the three the format puts there.
+    const parts = [];
+    let from = 0;
+    for (let i = 0; i < 3; i++) {
+      const at = e.data.indexOf('\t', from);
+      if (at < 0) break;
+      parts.push(e.data.slice(from, at));
+      from = at + 1;
+    }
+    parts.push(e.data.slice(from));
+    // A frame that is not the shape above is shown rather than dropped: a
+    // line nobody can read beats a line nobody knows arrived.
+    if (parts.length === 4) {
+      appendBulletin(parts[0], parts[1], parts[2], parts[3]);
+    } else {
+      appendLog(e.data, 'recv');
+    }
   };
   ws.onclose = function() {
     if (reconnectAttempts < maxReconnectAttempts) {

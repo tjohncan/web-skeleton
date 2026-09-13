@@ -671,15 +671,40 @@
            while (> (first entry) seq)
            collect entry))))
 
-(defun %bulletin-payload (entry)
-  "Wire form: sequence, TAB, sender handle, TAB, the line.
+(defun %utc-clock (universal)
+  "HH:MM:SSZ, in UTC.
 
-   Two tabs now rather than one, and the line itself still cannot contain
-   either — %SANITIZE-LINE strips every byte below 32, TAB among them. So a
-   client splits on the first two and whatever is left is the text, however
-   many tabs somebody tried to type into it."
-  (build-ws-text (format nil "~d~a~a~a~a"
+   Stamped by the server that took the line rather than by each browser when
+   it arrives, so everyone reading the bulletin sees one time for a post
+   instead of their own. UTC rather than anywhere's local time for the same
+   reason: a shared broadcast wants a shared clock, and a page that guessed
+   at a visitor's zone would print a different time to each of them for the
+   same event.
+
+   Seconds and no date. Nothing here outlives the window by more than a
+   handful of seconds, so a date would be the same on every line."
+  (multiple-value-bind (sec min hour) (decode-universal-time universal 0)
+    (format nil "~2,'0d:~2,'0d:~2,'0dZ" hour min sec)))
+
+(defun %bulletin-payload (entry)
+  "Wire form: sequence, TAB, UTC clock, TAB, sender handle, TAB, the line.
+
+   Three tabs now, and the line itself still cannot contain one —
+   %SANITIZE-LINE strips every byte below 32, TAB among them. So a client
+   splits on the first three and whatever is left is the text, however many
+   tabs somebody tried to type into it.
+
+   The sequence stays on the wire even though the page stopped printing it
+   in every line. It is the mechanism — the number each worker compares
+   against to know what it has not handed out yet — it costs nothing to
+   send, and somebody reading the socket should be able to see the thing the
+   workers actually compare. What it is not is something to read a thousand
+   times: it counts from server start and only goes up, so on a process that
+   stays up for months it becomes seven digits of noise in front of every
+   sentence."
+  (build-ws-text (format nil "~d~a~a~a~a~a~a"
                          (first entry) #\Tab
+                         (%utc-clock (third entry)) #\Tab
                          (or (fourth entry) "?") #\Tab
                          (second entry))))
 
