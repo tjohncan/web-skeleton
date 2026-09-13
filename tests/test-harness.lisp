@@ -2197,7 +2197,24 @@
    Collected from :ON-TICK rather than from a handler: an HTTP handler is
    given a request and never sees the connection it arrived on, so the tick,
    which runs with this worker's table bound, is the only place an
-   application can look at one."
+   application can look at one.
+
+   Keyed on the connection object, and that is load-bearing. The first
+   version recorded (fd . serial) pairs deduplicated by EQUAL, so a server
+   handing every connection the same serial collapsed them to one pair per fd
+   — and the control counting observations went red with the property it was
+   meant to be independent of. A mutation that turns the control red cannot
+   be read: it says the observation broke, not that the property did. Here
+   the count of connections seen does not depend on the serials at all.
+
+   The fd is captured when the connection is seen rather than read back
+   later, because CONNECTION-CLOSE sets it to -1. The serial it leaves alone.
+
+   There is no assertion that the serials increase. There was one, and it
+   compared a sorted list with a sorted copy of itself, which is true of any
+   list whatever. Distinct serials, and a highest serial no lower than the
+   number of connections, are the claims a repeating or constant counter
+   actually fails."
   (format t "~%server: a connection number that is not an fd~%")
   (let ((seen nil)
         (lock (sb-thread:make-mutex))
@@ -2214,11 +2231,9 @@
                   (declare (ignore id))
                   (maphash
                    (lambda (fd conn)
-                     (declare (ignore fd))
                      (sb-thread:with-mutex (lock)
-                       (pushnew (cons (connection-fd conn)
-                                      (connection-serial conn))
-                                seen :test #'equal)))
+                       (unless (assoc conn seen :test #'eq)
+                         (push (cons conn fd) seen))))
                    web-skeleton::*connections*))
                 :handler (lambda (req)
                            (declare (ignore req))
@@ -2236,23 +2251,22 @@
                  (sleep 0.15)))))
       (setf *worker-wake-interval* saved))
     (let* ((pairs (sb-thread:with-mutex (lock) (copy-list seen)))
-           (serials (sort (mapcar #'cdr pairs) #'<))
-           (fds (mapcar #'car pairs)))
+           (serials (mapcar (lambda (p) (connection-serial (car p))) pairs))
+           (fds (mapcar #'cdr pairs)))
       (format t "  (observed ~d connection~:p across ~d distinct fd~:p)~%"
               (length pairs) (length (remove-duplicates fds)))
-      ;; The control. Every assertion below is true of an empty list, so
-      ;; without this the test passes on a server that accepted nothing and
-      ;; a hook that never ran. At least three rather than exactly three:
-      ;; WITH-TEST-SERVER probes the port to know it is up, and those are
-      ;; accepted connections like any other.
+      ;; The control, and it counts connection objects, so nothing about the
+      ;; serials can move it. Every assertion after it is true of an empty
+      ;; list, so without it the test passes on a server that accepted
+      ;; nothing and a hook that never ran. At least three rather than
+      ;; exactly three: WITH-TEST-SERVER probes the port to know it is up,
+      ;; and those are accepted connections like any other.
       (check "at least the three opened here were seen"
              (>= (length pairs) 3) t)
       (check "no serial was handed out twice"
              (length (remove-duplicates serials)) (length serials))
-      (check "they only ever go up"
-             (equal serials (sort (copy-list serials) #'<)) t)
       (check "and they count accepts, so the highest is at least the count"
-             (and serials (>= (car (last serials)) (length serials))) t))))
+             (and serials (>= (reduce #'max serials) (length serials))) t))))
 
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
