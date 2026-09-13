@@ -712,10 +712,14 @@
 
 (defun %bulletin-trim (ring now)
   "Drop what is older than the window or past the cap. RING is newest first,
-   so both bounds are a prefix take."
+   so both bounds are a prefix take.
+
+   NOW and the entry times are microseconds; *BULLETIN-WINDOW* is seconds,
+   because it is a knob somebody sets and nobody sets a hand-off window in
+   microseconds. The conversion lives here, at the one comparison."
   (loop for entry in ring
         for kept from 0 below *bulletin-max*
-        while (<= (- now (third entry)) *bulletin-window*)
+        while (<= (- now (third entry)) (* *bulletin-window* 1000000))
         collect entry))
 
 (defun bulletin-post (text handle)
@@ -724,8 +728,14 @@
 
    HANDLE is carried rather than looked up later because by the time a line
    is fanned out the connection that sent it may be gone, and the worker
-   doing the fanning is usually not the worker that took it in."
-  (let ((now (get-universal-time)))
+   doing the fanning is usually not the worker that took it in.
+
+   The time stored is microseconds, not universal time. Whole seconds were
+   enough while the page showed only a clock, and are not enough for a stamp
+   with a fraction in it — every line posted in one second would claim the
+   same instant, which for a page about the order things happen in is the
+   one thing the stamp must not do."
+  (let ((now (%now-us)))
     (store-update *bulletin* :ring
                   (lambda (ring)
                     (let ((next (1+ (if ring (first (first ring)) 0))))
@@ -742,23 +752,30 @@
            while (> (first entry) seq)
            collect entry))))
 
-(defun %utc-clock (universal)
-  "HH:MM:SSZ, in UTC.
+(defun %utc-stamp (us)
+  "US, a microsecond count since the Unix epoch, as
+   yyyy-MM-dd HH:MM:SS.ffffff in UTC.
 
    Stamped by the server that took the line rather than by each browser when
    it arrives, so everyone reading the bulletin sees one time for a post
    instead of their own. UTC rather than anywhere's local time for the same
    reason: a shared broadcast wants a shared clock, and a page that guessed
-   at a visitor's zone would print a different time to each of them for the
-   same event.
+   at a visitor's zone would print a different time to each of them for one
+   event.
 
-   Seconds and no date. Nothing here outlives the window by more than a
-   handful of seconds, so a date would be the same on every line."
-  (multiple-value-bind (sec min hour) (decode-universal-time universal 0)
-    (format nil "~2,'0d:~2,'0d:~2,'0dZ" hour min sec)))
+   No zone marker. Every stamp here is UTC and nothing else ever will be, so
+   a Z on the end of every line is a column of Zs.
+
+   The fraction is why the ring stores microseconds rather than universal
+   time: GET-UNIVERSAL-TIME counts whole seconds, so a stamp built from one
+   can carry six digits after the point and every one of them is a zero."
+  (multiple-value-bind (sec min hour date month year)
+      (decode-universal-time (+ (floor us 1000000) *unix-epoch*) 0)
+    (format nil "~d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d.~6,'0d"
+            year month date hour min sec (mod us 1000000))))
 
 (defun %bulletin-payload (entry)
-  "Wire form: sequence, TAB, UTC clock, TAB, sender handle, TAB, the line.
+  "Wire form: sequence, TAB, UTC stamp, TAB, sender handle, TAB, the line.
 
    Three tabs now, and the line itself still cannot contain one —
    %SANITIZE-LINE strips every byte below 32, TAB among them. So a client
@@ -775,7 +792,7 @@
    sentence."
   (build-ws-text (format nil "~d~a~a~a~a~a~a"
                          (first entry) #\Tab
-                         (%utc-clock (third entry)) #\Tab
+                         (%utc-stamp (third entry)) #\Tab
                          (or (fourth entry) "?") #\Tab
                          (second entry))))
 
