@@ -4,6 +4,7 @@
            #:start-server
            #:map-worker-websockets
            #:connection-census
+           #:*worker-id*
            ;; HTTP request
            #:http-request
            #:http-request-method

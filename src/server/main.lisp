@@ -133,7 +133,19 @@
 
 (defvar *worker-id* nil
   "This worker's index into *CONNECTION-CENSUS*. Bound per-worker by
-   RUN-WORKER beside the other share-nothing slots; NIL off a worker.")
+   RUN-WORKER beside the other share-nothing slots; NIL off a worker.
+
+   Exported to be read, never set. An application that wants to attribute
+   work to the worker that did it — a log line, a per-worker accumulator,
+   telling a socket which of the four it is talking to — has no other way to
+   ask, and the census already publishes per-worker data without offering a
+   way to know which entry is yours. NIL off a worker is the answer to that
+   question rather than an absence: a REPL or a test thread is on no worker
+   and a caller that prints it should say so.
+
+   Constant for the life of a thread. It is not a handle to anything: it
+   indexes the census and it names a thread, and nothing keyed on it may be
+   touched by another worker.")
 
 (defun census-counts ()
   "Count the current worker's connection table: total, the inbound/outbound

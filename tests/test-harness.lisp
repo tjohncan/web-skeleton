@@ -2056,6 +2056,127 @@
                           (not (null (search "path=/b" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
+(defun %worker-ids-in (text)
+  "Every worker= value in TEXT, in the order they appear.
+
+   Collected as strings rather than parsed, so an id that came back NIL is
+   captured as \"NIL\" and fails the assertion below. Parsing here would raise
+   instead, and a raise ends a run rather than reporting one.
+
+   The semicolon is why the handler writes one. These responses are
+   pipelined, so the first body is followed immediately by the second
+   response's status line with nothing in between: a scan for the end of the
+   value ran off \"worker=0\" straight into \"HTTP\" and collected 0HTTP."
+  (let ((out nil) (start 0))
+    (loop
+      (let ((i (search "worker=" text :start2 start)))
+        (unless i (return (nreverse out)))
+        (let* ((from (+ i 7))
+               (to (or (position #\; text :start from) (length text))))
+          (push (subseq text from to) out)
+          (setf start from))))))
+
+(defun test-worker-id-is-public-and-holds-still-per-connection ()
+  "*WORKER-ID* is readable by an application, it differs between workers, and
+   one connection sees one worker for its whole life.
+
+   It is exported for a single job: attributing work to the worker that did
+   it. Three claims have to hold for that to be worth anything, and they fail
+   in different ways, so each is asserted separately.
+
+   That it is readable at all. That the three workers do not all report the
+   same number — asserted through :ON-TICK rather than through requests,
+   because every worker ticks whether or not it has a connection, while which
+   worker accepts a connection is the kernel's business and a test that
+   waited for three different ones to answer would be a coin flip dressed as
+   an assertion.
+
+   And that it holds still. Two requests go down one socket below and must
+   come back carrying one id. A server that migrated a connection between
+   workers would answer twice and differently, and every per-connection thing
+   an application hung off the id would be quietly wrong.
+
+   The pair recorded in the tick is the fourth claim, and the cheapest one to
+   get wrong: the id :ON-TICK is handed and the id bound on the thread it
+   runs on must be the same number. The demo indexes one array by the
+   argument and reads the special in a handler, so a disagreement would show
+   up as a fan-out writing one worker's slot from another worker's thread.
+
+   NIL off a worker is the other half of the contract, and it is an answer
+   rather than an absence: the thread running this test is on no worker, and
+   a caller that prints the id should say so instead of guessing zero."
+  (format t "~%server: the worker a connection is on~%")
+  (check "off a worker it is NIL, not 0" *worker-id* nil)
+  (let ((seen nil)
+        (lock (sb-thread:make-mutex)))
+    (with-test-server
+        (:workers 3
+         :on-tick (lambda (id)
+                    (sb-thread:with-mutex (lock)
+                      (pushnew (cons id *worker-id*) seen :test #'equal)))
+         :handler (lambda (req)
+                    (declare (ignore req))
+                    (make-text-response
+                     200 (format nil "worker=~a;" *worker-id*))))
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string
+                              "GET /one HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf* *crlf*
+                              "GET /two HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf*
+                              "Connection: close" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (read-to-eof-bounded stream buf)
+                 (let* ((text (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8))
+                        (ids (%worker-ids-in text)))
+                   ;; The control. Without it the two assertions after it
+                   ;; pass on a server that answered nothing at all: one
+                   ;; empty list equals another, and every id in it is a
+                   ;; digit for the reason that there are none.
+                   (check "both requests were answered" (length ids) 2)
+                   (check "an application can read it at all"
+                          (and ids (every (lambda (s)
+                                            (and (plusp (length s))
+                                                 (every #'digit-char-p s)))
+                                          ids))
+                          t)
+                   (check "one socket, one worker, both times"
+                          (and (= (length ids) 2)
+                               (string= (first ids) (second ids)))
+                          t)
+                   (check "and it indexes a worker this server actually has"
+                          (and ids
+                               (every (lambda (s)
+                                        (and (every #'digit-char-p s)
+                                             (< -1 (parse-integer s) 3)))
+                                      ids))
+                          t))))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; Polled rather than slept: the tick rides *WORKER-WAKE-INTERVAL* and
+      ;; this test has no business guessing what a reader set it to.
+      (let ((deadline (+ (get-universal-time) 8)))
+        (loop until (or (>= (length (sb-thread:with-mutex (lock) seen)) 3)
+                        (> (get-universal-time) deadline))
+              do (sleep 0.05))))
+    (let ((pairs (sb-thread:with-mutex (lock) (copy-list seen))))
+      (check "three workers, three different ids"
+             (sort (mapcar #'cdr pairs) #'<) '(0 1 2))
+      (check "the id :ON-TICK is handed is the one bound on its thread"
+             (and pairs (every (lambda (p) (eql (car p) (cdr p))) pairs))
+             t))))
+
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
    pipelined behind it.
@@ -4266,6 +4387,7 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
+  (test-worker-id-is-public-and-holds-still-per-connection)
   (test-harness-pipelined-after-body-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
