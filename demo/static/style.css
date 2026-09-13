@@ -287,3 +287,38 @@ h2 {
 
 /* The worker holding this page's socket. */
 .limbs tr.mine td { color: var(--electric-bright); }
+
+/* Who said it */
+
+.seq { color: var(--bone-dim); }
+.who { color: var(--purple); }
+
+/* Your own lines. The handle is the page's own, answered by the server over
+   the control channel, so this marks what you sent without the page having
+   to guess from timing. */
+.recv.own .who { color: var(--electric-bright); }
+
+/* Arms and legs, with room to stretch. The first two columns are short and
+   fixed-width, so the slack lands in the third, which is the one that grows. */
+.scroll-x { overflow-x: auto; }
+
+.limbs { max-width: 64em; }
+.limbs th:nth-child(1), .limbs td:nth-child(1),
+.limbs th:nth-child(2), .limbs td:nth-child(2) { white-space: nowrap; }
+.limbs th:nth-child(1), .limbs td:nth-child(1) { width: 5em; }
+.limbs th:nth-child(2), .limbs td:nth-child(2) { width: 20em; }
+.limbs th:nth-child(3), .limbs td:nth-child(3) { width: auto; }
+
+/* Narrow screens. The page is monospace and full of wire bytes, which no
+   amount of stacking makes narrow — so the blocks that cannot shrink scroll
+   inside themselves, and everything else gives back the padding. */
+@media (max-width: 720px) {
+  body { padding: 1em 0.9em; }
+  h1 { font-size: 1.3em; }
+  #log { height: 55vh; max-height: 400px; }
+  .limbs th, .limbs td { padding-right: 1em; }
+  .tool-form input.wide { flex-basis: 100%; }
+  .tool-wire { max-height: 16em; }
+  .tabs { gap: 0.2em; }
+  .tab { padding: 0.4em 0.6em; }
+}

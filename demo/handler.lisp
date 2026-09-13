@@ -14,6 +14,23 @@
 ;;; Self-address for the /demo-fetch example
 ;;; ---------------------------------------------------------------------------
 
+(defvar *instance* nil
+  "This process, named. Four hex characters, minted at START-DEMO or handed
+   in by a deployer.
+
+   The framework has no such thing and should not grow one. A deployer
+   already has an identity for a process — a container id, a hostname, a task
+   name — and a second one minted underneath it would be an identity
+   competing with the real one, which is the same argument that keeps a
+   metrics format out of the framework. So the application mints it, and
+   demo/deploy lets WS_INSTANCE override it with whatever the deployment
+   already calls this box.
+
+   Fresh on every start when it is random, which is what makes it useful
+   across a restart: the codes differ, so two runs of the same box are two
+   names. That is also why a start time is not in the handle below — it would
+   be answering a question this already answers.")
+
 (defvar *demo-host* "127.0.0.1"
   "Host the /demo-fetch endpoint uses to self-fetch over HTTP.")
 
@@ -138,6 +155,27 @@
 ;;; socket rather than about a block of headers — so this panel exhibits the
 ;;; refusals reachable from outside the framework, not every refusal there is.
 
+(defun %peer-handle (conn)
+  "A name for the connection CONN, for one public line of chatter.
+
+   Three parts, and it takes all three. The instance says which process, so
+   two servers behind one proxy do not both call somebody 1:38. The worker
+   says which loop, because the serial only counts within a worker and two
+   of them reach 38 independently. The serial says which connection, and it
+   has to be the serial rather than the fd: an fd is unique only among the
+   sockets open at this instant, and the kernel hands the lowest free one to
+   the next accept, so a peer labelled by fd inherits the label of whoever
+   held it a moment ago.
+
+   Not the address. This is a public broadcast to strangers, and the source
+   IP of a stranger is not the page's to publish. What this does reveal is
+   which worker someone landed on and roughly how many connections that
+   worker has taken, both of which the census already shows everyone."
+  (format nil "~a:~a:~d"
+          (or *instance* "????")
+          (or *worker-id* "?")
+          (connection-serial conn)))
+
 (defun %crlf (&rest lines)
   (format nil "~{~a~c~c~}~c~c"
           (loop for l in lines append (list l #\Return #\Newline))
@@ -177,12 +215,45 @@
          :why "The control. A panel where everything is refused proves only
                that something is refusing.")))
 
+(defun %bench-response (c)
+  "The response the server builds for this case, or NIL if it is accepted.
+
+   The same three calls CONNECTION-ON-READ makes on its parse-error path —
+   MAKE-ERROR-RESPONSE, a Connection: close header, FORMAT-RESPONSE — so
+   these are the framework's own bytes rather than the page's drawing of
+   them. Drawing them is what the lab panel next door refuses to do, and the
+   appendix has no business doing it either.
+
+   Built once at load time rather than per click, and that is load-bearing
+   rather than thrift. FORMAT-RESPONSE counts what it serializes, and
+   *COUNTERS* is NIL off a worker: at load there are no workers, so a
+   response nobody will ever receive stays out of the census. Per click it
+   would add a 4xx to the numbers on the other tab for traffic that never
+   happened, which is the page disagreeing with the server about what the
+   server did."
+  (let ((status (handler-case (progn (parse-request (getf c :bytes)) nil)
+                  (http-parse-error (e) (or (http-parse-error-status e) 400))
+                  (error () 400))))
+    (when status
+      (let ((resp (make-error-response status)))
+        (set-response-header resp "connection" "close")
+        (sb-ext:octets-to-string (format-response resp)
+                                 :external-format :latin-1)))))
+
+(defparameter *bench-responses*
+  (mapcar (lambda (c) (cons (getf c :id) (%bench-response c))) *bench-cases*)
+  "Case id to the response bytes for it, as a string. NIL for a case the
+   parser accepts, where what happens next is the application's business and
+   not this panel's to invent.")
+
 (defun %bench-case-json (c)
-  (make-json-object
-   (list (cons "id"    (getf c :id))
-         (cons "title" (getf c :title))
-         (cons "bytes" (getf c :bytes))
-         (cons "why"   (substitute #\Space #\Newline (getf c :why))))))
+  (let ((resp (cdr (assoc (getf c :id) *bench-responses* :test #'string=))))
+    (make-json-object
+     (list (cons "id"    (getf c :id))
+           (cons "title" (getf c :title))
+           (cons "bytes" (getf c :bytes))
+           (cons "response" (or resp ""))
+           (cons "why"   (substitute #\Space #\Newline (getf c :why)))))))
 
 (defun %run-bench-case (c)
   "Hand the bytes to the real parser and report what it said, verbatim."
@@ -566,14 +637,18 @@
         while (<= (- now (third entry)) *bulletin-window*)
         collect entry))
 
-(defun bulletin-post (text)
-  "Append TEXT under a fresh sequence number. Atomic: the read of the last
-   sequence, the increment, the insert and the trim are one update."
+(defun bulletin-post (text handle)
+  "Append TEXT from HANDLE under a fresh sequence number. Atomic: the read of
+   the last sequence, the increment, the insert and the trim are one update.
+
+   HANDLE is carried rather than looked up later because by the time a line
+   is fanned out the connection that sent it may be gone, and the worker
+   doing the fanning is usually not the worker that took it in."
   (let ((now (get-universal-time)))
     (store-update *bulletin* :ring
                   (lambda (ring)
                     (let ((next (1+ (if ring (first (first ring)) 0))))
-                      (cons (list next text now)
+                      (cons (list next text now handle)
                             (%bulletin-trim ring now)))))
     nil))
 
@@ -587,7 +662,16 @@
            collect entry))))
 
 (defun %bulletin-payload (entry)
-  (build-ws-text (format nil "~d~a~a" (first entry) #\Tab (second entry))))
+  "Wire form: sequence, TAB, sender handle, TAB, the line.
+
+   Two tabs now rather than one, and the line itself still cannot contain
+   either — %SANITIZE-LINE strips every byte below 32, TAB among them. So a
+   client splits on the first two and whatever is left is the text, however
+   many tabs somebody tried to type into it."
+  (build-ws-text (format nil "~d~a~a~a~a"
+                         (first entry) #\Tab
+                         (or (fourth entry) "?") #\Tab
+                         (second entry))))
 
 (defun bulletin-tick (worker-id)
   "Fan out to the connections THIS worker owns. Runs on that worker's event
@@ -617,18 +701,17 @@
    Echoing it back immediately would feel faster and would be a lie — the
    sender would see an ordering nobody else sees. The demo is here to show
    the mechanism, latency included."
-  (declare (ignore conn))
   (cond
     ((= (ws-frame-opcode frame) +ws-op-binary+)
-     (%ws-command frame))
+     (%ws-command conn frame))
     ((= (ws-frame-opcode frame) +ws-op-text+)
      (let ((text (sb-ext:octets-to-string (ws-frame-payload frame)
                                           :external-format :utf-8)))
-       (bulletin-post (%sanitize-line text)))
+       (bulletin-post (%sanitize-line text) (%peer-handle conn)))
      nil)
     (t nil)))
 
-(defun %ws-command (frame)
+(defun %ws-command (conn frame)
   "Answer a control frame, on the asking connection only.
 
    Binary rather than text, and that is what keeps the two channels apart.
@@ -640,15 +723,18 @@
    %SANITIZE-LINE strips it — so the client tells the two apart by
    construction rather than by sniffing a prefix that a line could imitate.
 
-   Which worker is the only thing to ask so far. It is worth asking because
-   the answer is stable for the life of the socket and different from the
-   worker that will serve the next request from the same browser: one
-   connection, one worker, for as long as it is open."
+   Which worker, and who this connection is, are the only things to ask so
+   far. Both are worth asking because both hold still for the life of the
+   socket, and because the worker is not the one that will serve the next
+   request from the same browser: one connection, one worker, for as long as
+   it is open. The handle comes back so a page can recognise its own lines
+   in a broadcast it shares with strangers."
   (let ((cmd (sb-ext:octets-to-string (ws-frame-payload frame)
                                       :external-format :utf-8)))
     (build-ws-text
      (if (string= cmd "worker")
-         (format nil "worker ~a" (or *worker-id* "none"))
+         (format nil "worker ~a ~a" (or *worker-id* "none")
+                 (%peer-handle conn))
          (format nil "unknown command ~a" (%sanitize-line cmd))))))
 
 (defun %sanitize-line (text)
@@ -670,7 +756,8 @@
 ;;; Entry points
 ;;; ---------------------------------------------------------------------------
 
-(defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4))
+(defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
+                        (instance (bytes-to-hex (random-bytes 2))))
   "Start the demo server.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
@@ -680,7 +767,11 @@
 
    WORKERS is pinned rather than left to CPU-COUNT. The page's subject is
    fan-out across workers, and a small box reporting two of them is a dull
-   exhibit; a fixed number also makes what the census shows reproducible."
+   exhibit; a fixed number also makes what the census shows reproducible.
+
+   INSTANCE names this process in the handles the bulletin shows. Random by
+   default so two runs are two names; pass the one your deployment already
+   uses if it has one."
   (when (%port-already-served-p port)
     (error "start-demo: something is already answering on port ~d.~%~
             SO_REUSEPORT means a second server binds it rather than failing, ~
@@ -698,6 +789,7 @@
   ;; is what sharing nothing costs, and the number belongs on screen rather
   ;; than in an apology.
   (setf *worker-wake-interval* 0.05)
+  (setf *instance* instance)
   (setf *started-at* (get-universal-time)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0))

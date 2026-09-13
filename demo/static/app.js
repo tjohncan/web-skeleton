@@ -7,6 +7,9 @@ let reconnectAttempts = 0;
 // of the connection, and not the worker that will serve the next request
 // from this same browser — which is the reason it is worth showing.
 let myWorker = null;
+// This connection's handle, as the server names it. Used to pick our own
+// lines out of a broadcast we share with strangers.
+let myHandle = null;
 let lastCensus = null;
 const maxReconnectAttempts = 3;
 
@@ -14,6 +17,31 @@ function appendLog(text, cls) {
   const line = document.createElement('div');
   line.className = cls;
   line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// A posted line, with the sequence it was given and the handle that sent it.
+// The handle is instance:worker:connection — enough to follow one stranger
+// through a conversation, and nothing about who they are. Built as elements
+// rather than one string so the parts can be styled apart and so nothing
+// here is ever parsed as markup.
+function appendBulletin(seq, who, text) {
+  const line = document.createElement('div');
+  line.className = 'recv' + (who === myHandle ? ' own' : '');
+
+  const s = document.createElement('span');
+  s.className = 'seq';
+  s.textContent = '#' + seq;
+  line.appendChild(s);
+
+  const w = document.createElement('span');
+  w.className = 'who';
+  w.textContent = who;
+  line.appendChild(document.createTextNode('  '));
+  line.appendChild(w);
+
+  line.appendChild(document.createTextNode('  ' + text));
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
@@ -53,16 +81,24 @@ function connect(onOpen) {
     // mistaken for the other.
     const tab = e.data.indexOf('\t');
     if (tab < 0) {
-      const m = /^worker (\d+)$/.exec(e.data);
+      const m = /^worker (\d+) (\S+)$/.exec(e.data);
       if (m) {
         myWorker = Number(m[1]);
+        myHandle = m[2];
         if (lastCensus) renderCensus(lastCensus);
       } else {
         appendLog('[status] ' + e.data, 'status');
       }
       return;
     }
-    appendLog('#' + e.data.slice(0, tab) + '  ' + e.data.slice(tab + 1), 'recv');
+    // <seq> TAB <handle> TAB <text>. Split on the first two only. The text
+    // cannot contain a tab — the server strips every byte below 32 before
+    // posting — but splitting on all of them would be trusting that rather
+    // than only needing the two the format puts there.
+    const tab2 = e.data.indexOf('\t', tab + 1);
+    appendBulletin(e.data.slice(0, tab),
+                   tab2 < 0 ? '?' : e.data.slice(tab + 1, tab2),
+                   tab2 < 0 ? e.data.slice(tab + 1) : e.data.slice(tab2 + 1));
   };
   ws.onclose = function() {
     if (reconnectAttempts < maxReconnectAttempts) {
@@ -421,10 +457,32 @@ function benchCard(c) {
   title.textContent = c.title;
   card.appendChild(title);
 
+  const req = document.createElement('div');
+  req.className = 'tool-label';
+  req.textContent = 'request, the exact bytes handed to the parser';
+  card.appendChild(req);
+
   const pre = document.createElement('pre');
   pre.className = 'case-bytes';
   pre.textContent = c.bytes.replace(/\r\n/g, '\n').replace(/\n+$/, '');
   card.appendChild(pre);
+
+  // The response the server builds for this case, serialized by the
+  // framework at startup rather than drawn here. Nothing sent it: a browser
+  // cannot put the request above on the wire, which is the whole reason this
+  // panel exists, so there is no round trip to time and no response headers
+  // this page could honestly claim to have received.
+  if (c.response) {
+    const rl = document.createElement('div');
+    rl.className = 'tool-label';
+    rl.textContent = 'response the server builds for it, never sent';
+    card.appendChild(rl);
+
+    const rp = document.createElement('pre');
+    rp.className = 'case-bytes';
+    rp.textContent = c.response.replace(/\r\n/g, '\n').replace(/\n+$/, '');
+    card.appendChild(rp);
+  }
 
   const row = document.createElement('div');
   row.className = 'case-row';

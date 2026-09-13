@@ -39,7 +39,15 @@
               default))
         default)))
 
-(web-skeleton-demo:start-demo
- :host    (env-host "WS_HOST" #(0 0 0 0))
- :port    (env-int  "WS_PORT" 8081)
- :workers (env-int  "WS_WORKERS" 4))
+;; WS_INSTANCE only when it is set, so START-DEMO's own default — a fresh
+;; random code per process — stays the thing that decides. Passing NIL through
+;; would override the default with nothing and every process would be "????".
+;; Set it to whatever the deployment already calls this box, and the handles
+;; the bulletin shows will agree with the logs somebody reads next to them.
+(let ((instance (sb-ext:posix-getenv "WS_INSTANCE")))
+  (apply #'web-skeleton-demo:start-demo
+         :host    (env-host "WS_HOST" #(0 0 0 0))
+         :port    (env-int  "WS_PORT" 8081)
+         :workers (env-int  "WS_WORKERS" 4)
+         (when (and instance (plusp (length instance)))
+           (list :instance instance))))
