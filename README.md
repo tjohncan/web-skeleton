@@ -143,7 +143,7 @@ src/
     main.lisp          epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp     Demo package declaration
-  handler.lisp     Bulletin fan-out, census endpoint, refusal bench
+  handler.lisp     Bulletin fan-out, census endpoint, request lab, refusal bench
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
   deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/
@@ -182,8 +182,12 @@ tests/
   accepts taken and refused, responses by status class, WebSocket frames
   queued. Each worker publishes its own slot on the maintenance tick and a
   reader on any thread sums them, so nothing is locked and what you read is up
-  to a tick old. Counted where responses are serialized, which is why the
-  refusals no handler ever ran for are in there. Monotonic and never windowed
+  to a tick old. Counted where a response is handed to a connection, which is
+  why the refusals no handler ever ran for are in there — and not where it is
+  serialized, which is what this said until a cached file, serialized once at
+  startup and sent thousands of times, turned out to be counted once.
+  `*worker-id*` says which slot is the one you are running on. Monotonic and
+  never windowed
   — five minutes and an hour are presentation, and a caller wanting a rate
   samples twice and subtracts. Its docstring splits the contract: some keys
   are stable, the state breakdown is diagnostic, and a consumer must render
@@ -372,8 +376,10 @@ tests/
   but the exported surface — `:on-tick`, `map-worker-websockets`, `ws-send`
   and `make-store` — which is the one check that the exported surface
   composes, since the test suite reaches `::` internals wherever convenient.
-  It also serves its own census, and hands malformed requests to the real
-  parser so the framing claims above can be performed rather than read.
+  It also serves its own census, runs a small lab of ordinary GETs that report
+  the request as the server parsed it alongside both sides' clocks, and hands
+  malformed requests to the real parser so the framing claims above can be
+  performed rather than read.
   `demo/deploy/` holds a Dockerfile and an nginx sample, so the deployment
   notes are runnable rather than only written down
 
