@@ -30,9 +30,14 @@ map $http_upgrade $connection_upgrade {
     ''      close;
 }
 
-# This is the actual defence. Every control on the page is O(1) per click by
-# design, but that is a property of the page, and the page is not what
-# arrives here — a script is.
+# This bounds HTTP requests: page loads, lab GETs, upgrade attempts. Every
+# control on the page is O(1) per click by design, but that is a property of
+# the page, and the page is not what arrives here — a script is.
+#
+# It does not bound what happens on a WebSocket. An upgraded connection is one
+# request, so every frame after the handshake goes past limit_req uncounted.
+# The bulletin's defence against a socket posting as fast as it can write is
+# the per-connection post budget in the application, not this.
 limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
 
 server {

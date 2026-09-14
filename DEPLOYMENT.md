@@ -128,7 +128,7 @@ cannot.
 |---|---|
 | `Dockerfile` | Debian rather than Alpine, because resolution shells out to glibc's `getent ahosts`; compiles at build time so a compile error fails the build rather than the container; healthchecks on `/healthz`, which fails when any worker stops passing its loop — whichever worker takes the probe, since it reads every worker's last pass — where a TCP connect, or a probe that lands on one worker of four, would not |
 | `compose.yml` | publishes on `127.0.0.1` only, so the proxy is the only way in |
-| `nginx.conf.sample` | the `Upgrade`/`Connection` pair via a `map`, buffering off, a read timeout longer than the server's own ping interval, and `limit_req` — which is the real defence, not anything in the application |
+| `nginx.conf.sample` | the `Upgrade`/`Connection` pair via a `map`, buffering off, a read timeout longer than the server's own ping interval, and `limit_req`, which bounds HTTP requests but not the frames on an upgraded WebSocket — one request, however many frames follow — so the bulletin budgets posts per connection in the application |
 | `run.lisp` | the container entry point: binds `0.0.0.0` rather than loopback, because a socket bound to a container's own loopback is reachable from nothing outside it |
 
 They deploy the demo and name no other project. Adapt rather than adopt: the

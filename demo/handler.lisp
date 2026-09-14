@@ -924,21 +924,84 @@
 ;;; WebSocket handler
 ;;; ---------------------------------------------------------------------------
 
+(defparameter *post-burst* 5
+  "Posts one connection may make back to back before the budget applies.")
+
+(defparameter *post-refill-per-second* 1
+  "Posts a connection earns back per second, up to *POST-BURST*.")
+
+(defstruct (post-budget (:conc-name budget-))
+  (tokens 0)
+  (at 0)
+  (warned nil))
+
+(defvar *post-budgets* nil
+  "Per-worker vector of weak EQ hash tables, connection to POST-BUDGET.
+
+   Per worker because a connection is only ever handled by the worker that
+   owns it, so each table has one reader and one writer and no lock. Weak on
+   the key because nothing tells an application a WebSocket closed: an entry
+   for a connection that has gone is dropped when the connection is
+   collected, so the table needs neither a registry nor a close notification
+   to stay the size of the live population.")
+
+(defun %post-allowed-p (conn)
+  "Spend one post from CONN's budget, or refuse. A token bucket: *POST-BURST*
+   posts at once, then *POST-REFILL-PER-SECOND*.
+
+   Second value is T the first time a refusal lands after an allowed post, so
+   the sender is told once per run of refusals rather than once per frame —
+   an answer to every dropped frame would be a write for every write, handed
+   to the one client already sending faster than it should."
+  (let ((table (and *worker-id* (aref *post-budgets* *worker-id*))))
+    (if (null table)
+        (values t nil)
+        (let* ((now (%now-us))
+               (b (or (gethash conn table)
+                      (setf (gethash conn table)
+                            (make-post-budget :tokens *post-burst* :at now))))
+               (tokens (min *post-burst*
+                            (+ (budget-tokens b)
+                               (* (/ (- now (budget-at b)) 1000000)
+                                  *post-refill-per-second*)))))
+          (setf (budget-at b) now)
+          (if (>= tokens 1)
+              (progn (setf (budget-tokens b) (- tokens 1)
+                           (budget-warned b) nil)
+                     (values t nil))
+              (let ((first-refusal (not (budget-warned b))))
+                (setf (budget-tokens b) tokens
+                      (budget-warned b) t)
+                (values nil first-refusal)))))))
+
 (defun handle-ws-message (conn frame)
   "Post to the bulletin. Returns NIL: the sender sees their own line through
    the same fan-out as everyone else, one tick later.
 
    Echoing it back immediately would feel faster and would be a lie — the
    sender would see an ordering nobody else sees. The demo is here to show
-   the mechanism, latency included."
+   the mechanism, latency included.
+
+   Posts are budgeted per connection, and the budget is the defence rather
+   than the proxy's rate limit. A proxy's limit counts HTTP requests, and a
+   WebSocket is one request: every frame after the upgrade goes past it
+   uncounted. Unbudgeted, one socket could post as fast as it could write,
+   and each post takes the store's lock and goes out to every socket on every
+   worker — one sender multiplied by the whole room."
   (cond
     ((= (ws-frame-opcode frame) +ws-op-binary+)
      (%ws-command conn frame))
     ((= (ws-frame-opcode frame) +ws-op-text+)
-     (let ((text (sb-ext:octets-to-string (ws-frame-payload frame)
-                                          :external-format :utf-8)))
-       (bulletin-post (%sanitize-line text) (%peer-handle conn)))
-     nil)
+     (multiple-value-bind (allowed tell) (%post-allowed-p conn)
+       (cond (allowed
+              (let ((text (sb-ext:octets-to-string (ws-frame-payload frame)
+                                                   :external-format :utf-8)))
+                (bulletin-post (%sanitize-line text) (%peer-handle conn)))
+              nil)
+             ;; No TAB, so the page reads this as the server talking rather
+             ;; than as a posted line, same as a control answer.
+             (tell (build-ws-text "posting too fast; lines are being dropped"))
+             (t nil))))
     (t nil)))
 
 (defun %ws-command (conn frame)
@@ -1033,7 +1096,11 @@
         ;; Zero, not now: a worker that never starts should read as wedged
         ;; from the first probe, and the image's start period covers the
         ;; milliseconds before a healthy one passes its loop.
-        *last-tick* (make-array workers :initial-element 0))
+        *last-tick* (make-array workers :initial-element 0)
+        *post-budgets* (let ((v (make-array workers)))
+                         (dotimes (i workers v)
+                           (setf (aref v i)
+                                 (make-hash-table :test 'eq :weakness :key)))))
   (setf *bulletin-latest* 0)
   ;; Backquoted rather than quoted now: the backlink is not known until
   ;; this call, and the cache is built once from what it says here.
