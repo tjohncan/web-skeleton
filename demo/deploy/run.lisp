@@ -12,8 +12,13 @@
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton-demo")
 
+;; TLS is optional here — the demo makes no outbound HTTPS calls, so the image
+;; can run without libssl. Report the actual condition rather than assuming
+;; libssl is missing: a read or compile error inside the TLS system (a symbol
+;; external on one SBCL and not another, say) is a different failure, and
+;; calling it "libssl not found" sends the reader off to debug the wrong thing.
 (handler-case (asdf:load-system "web-skeleton-tls")
-  (error () (format t "note: TLS not available (libssl not found)~%")))
+  (error (e) (format t "note: TLS not loaded (~a)~%" e)))
 
 (defun env-int (name default)
   (let ((v (sb-ext:posix-getenv name)))
@@ -24,7 +29,12 @@
 (defun env-host (name default)
   "Parse a dotted-quad, or return DEFAULT. Only IPv4 literals: a container
    gets told an address, never a name, because resolving one here would make
-   startup depend on a resolver that may not be up yet."
+   startup depend on a resolver that may not be up yet.
+
+   A value that is set but does not parse warns and then falls back, rather
+   than falling back in silence. A typo in WS_HOST would otherwise bind
+   0.0.0.0 without a word — which is more exposed than whatever was meant, not
+   less — and the operator would have no hint their address was ignored."
   (let ((v (sb-ext:posix-getenv name)))
     (if (and v (plusp (length v)))
         (let ((parts (loop with start = 0
@@ -36,7 +46,10 @@
                    (every (lambda (n) (<= 0 n 255)) parts))
               (make-array 4 :element-type '(unsigned-byte 8)
                             :initial-contents parts)
-              default))
+              (progn
+                (format t "note: ~a=~s is not a dotted-quad IPv4 literal; ~
+                           falling back to the default bind address~%" name v)
+                default)))
         default)))
 
 ;; WS_INSTANCE only when it is set, so START-DEMO's own default — a fresh

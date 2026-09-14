@@ -1,0 +1,24 @@
+# What `COPY . /app` must not bake into the image. `.gitignore` governs what
+# reaches a commit; it does not reach the image. So this file is the guard
+# DEPLOYMENT.md meant when it said a real `*.conf` "cannot be committed by
+# reflex": that keeps one out of git, this keeps one out of the layer.
+
+# Version control and CI: not runtime, and .git is large.
+.git
+.github
+
+# Editor state.
+.idea
+.vscode
+
+# Local compile output. The image compiles its own; a stale host .fasl must
+# not shadow a fresh build.
+**/*.fasl
+
+# Secrets and real proxy configs carrying live hostnames. The sample ships as
+# `nginx.conf.sample`, which ends in .sample and so is not matched by *.conf.
+*.conf
+**/*.conf
+.env
+.env.*
+**/.env
