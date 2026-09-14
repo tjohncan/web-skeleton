@@ -900,11 +900,17 @@
   ;; The sequence is what orders posts; the stamp says when.
   (store-update *bulletin* :ring
                 (lambda (ring)
-                  (let ((now (%now-us))
-                        (next (1+ (if ring (first (first ring)) 0))))
+                  (let* ((now (%now-us))
+                         (next (1+ (if ring (first (first ring)) 0)))
+                         (new-ring (cons (list next text now handle)
+                                         (%bulletin-trim ring now))))
+                    ;; Published last, once the ring that holds NEXT exists.
+                    ;; Published first, an update that raised after it would
+                    ;; leave LATEST naming a line no ring holds, and the next
+                    ;; post would reuse that number behind a watermark that
+                    ;; had already passed it.
                     (setf *bulletin-latest* next)
-                    (cons (list next text now handle)
-                          (%bulletin-trim ring now)))))
+                    new-ring)))
   nil)
 
 (defun bulletin-since (seq)
@@ -974,29 +980,24 @@
   (setf (aref *last-tick* worker-id) (get-universal-time))
   (let ((latest *bulletin-latest*))
     (when (> latest (aref *fanned* worker-id))
-      (let ((new (bulletin-since (aref *fanned* worker-id))))
-        (cond
-          (new
-           (let ((payloads (mapcar #'%bulletin-payload new)))
-             (map-worker-websockets
-              (lambda (conn)
-                ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone
-                ;; behind it the batch. MAP-WORKER-WEBSOCKETS deliberately
-                ;; does not decide this; an application that broadcasts does.
-                (handler-case
-                    (dolist (p payloads) (ws-send conn p))
-                  (error () nil)))))
-           (setf (aref *fanned* worker-id)
-                 (reduce #'max new :key #'first)))
-          ;; Newer lines existed and are already gone: this worker went
-          ;; longer than the window without a pass, and the trim took what
-          ;; it had not yet sent. Nothing to send — but left behind, the
-          ;; watermark stays under LATEST, and every tick after this takes the
-          ;; lock to find the ring empty, until somebody posts again. Catching
-          ;; up to what was read is safe: a post landing after that read has a
-          ;; higher sequence and is caught on the next pass.
-          (t
-           (setf (aref *fanned* worker-id) latest)))))))
+      ;; NEW always holds the line LATEST names. BULLETIN-POST publishes LATEST
+      ;; only once the ring holding it exists, STORE-GET waits on the update
+      ;; that built it, and a trim never takes the line just added: a worker
+      ;; slow enough to lose lines to the trim loses older ones, and still
+      ;; finds this. So there is no branch for an empty NEW. Were one ever
+      ;; reached, the REDUCE below would signal rather than skip a line.
+      (let* ((new (bulletin-since (aref *fanned* worker-id)))
+             (payloads (mapcar #'%bulletin-payload new)))
+        (map-worker-websockets
+         (lambda (conn)
+           ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone
+           ;; behind it the batch. MAP-WORKER-WEBSOCKETS deliberately
+           ;; does not decide this; an application that broadcasts does.
+           (handler-case
+               (dolist (p payloads) (ws-send conn p))
+             (error () nil))))
+        (setf (aref *fanned* worker-id)
+              (reduce #'max new :key #'first))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler
