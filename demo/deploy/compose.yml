@@ -3,7 +3,7 @@
 # The published port is bound to loopback on purpose. nginx is the only thing
 # that should reach this, and "8081:8081" would publish the demo on every
 # interface — beside the reverse proxy rather than behind it, with no TLS and
-# none of the rate limiting that is the actual defence.
+# none of the proxy's rate or connection limits.
 
 services:
   demo:

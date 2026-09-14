@@ -315,7 +315,11 @@
    response nobody will ever receive stays out of the census. Per click it
    would add a 4xx to the numbers on the other tab for traffic that never
    happened, which is the page disagreeing with the server about what the
-   server did."
+   server did.
+
+   One consequence shows in the bytes: their Date header is the load time,
+   not the time of a click, and the panel's label says so. A live refusal
+   carries the moment it was sent."
   (let ((status (handler-case (progn (parse-request (getf c :bytes)) nil)
                   (http-parse-error (e) (or (http-parse-error-status e) 400))
                   (error () 400))))

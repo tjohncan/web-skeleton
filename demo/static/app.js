@@ -117,6 +117,13 @@ function connect(onOpen) {
     }
   };
   ws.onclose = function() {
+    // The worker and handle belonged to that socket. A reconnect may land on
+    // another worker under a new serial, and asks again when it opens; until
+    // then — and for good, once reconnecting gives up — no row is this page's
+    // socket, and marking one would be showing a socket the page no longer has.
+    myWorker = null;
+    myHandle = null;
+    if (lastCensus) renderCensus(lastCensus);
     if (reconnectAttempts < maxReconnectAttempts) {
       reconnectAttempts++;
       appendLog('[status] disconnected — reconnecting (' + reconnectAttempts + '/' + maxReconnectAttempts + ')...', 'status');
@@ -316,6 +323,10 @@ const LAB_TOOLS = [
   {
     id: 'hash',
     title: 'digest',
+    // Every lab input is a GET parameter, so it is in the URL, and a URL is
+    // what a proxy writes to its access log. For a digest that only matters
+    // for the key, which is the one input here that could be a secret.
+    note: 'the hmac key travels in the URL and lands in proxy logs — use a throwaway key',
     path: '/lab/hash',
     fields: [
       { name: 'alg', type: 'select', options: ['sha256', 'sha1',
@@ -510,7 +521,8 @@ function benchCard(c) {
   if (c.response) {
     const rl = document.createElement('div');
     rl.className = 'tool-label';
-    rl.textContent = 'response the server builds for it, never sent';
+    rl.textContent = 'response the server builds for it: built once at startup, ' +
+                     'so its date is then, and never sent';
     card.appendChild(rl);
 
     const rp = document.createElement('pre');
