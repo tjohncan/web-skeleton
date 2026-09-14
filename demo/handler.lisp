@@ -402,10 +402,13 @@
   "Headers whose value the echo replaces. The ones that carry a credential.")
 
 (defparameter *lab-input-max* 2048
-  "Longest accepted lab input. The framework bounds the request line well
-   below this already; the cap is here so an over-long value is answered with
-   a sentence the page can show rather than a connection-level refusal it
-   cannot explain.")
+  "Longest accepted lab input, in characters. The framework's own request-line
+   cap is higher — *MAX-REQUEST-LINE-LENGTH*, 8 KB — and it is a connection-
+   level 414 the page cannot explain to a visitor, so this lower cap catches an
+   over-long value first with a sentence the page can show. It is a soft guard,
+   not the boundary: a value whose percent-encoded or multi-byte form is long
+   enough still meets the framework's 414 first, and that is fine — the 414 is
+   correct, just wordless.")
 
 (defparameter *unix-epoch* (encode-universal-time 0 0 0 1 1 1970 0)
   "2208988800. Unix seconds plus this is a Lisp universal time.")
@@ -951,8 +954,10 @@
   "Per-worker vector of weak EQ hash tables, connection to POST-BUDGET.
 
    Per worker because a connection is only ever handled by the worker that
-   owns it, so each table has one reader and one writer and no lock. Weak on
-   the key because nothing tells an application a WebSocket closed: an entry
+   owns it, so each table has one reader and one writer, and the lock SBCL
+   puts on a weak table — it synchronizes them for the collector's sake — is
+   never contended. Weak on the key because nothing tells an application a
+   WebSocket closed: an entry
    for a connection that has gone is dropped when the connection is
    collected, so the table needs neither a registry nor a close notification
    to stay the size of the live population.")
@@ -1063,9 +1068,10 @@
 
    The cap is because this is a public box and the text is strangers'. The
    control strip is not about rendering — the client uses textContent, so
-   nothing here can become markup — it is about the wire format: a TAB
-   separates the sequence number from the line, and a posted TAB would split
-   a line into a sequence number the client would then believe.
+   nothing here can become markup — it is about the wire format: TABs separate
+   the sequence, the stamp, the handle and the line, and a posted TAB would add
+   a field boundary the client parses as one of those, shifting the handle or
+   the stamp onto whatever the sender typed.
 
    Space is 32, so the test below never catches it and needs no exception."
   (let ((clean (remove-if (lambda (c) (< (char-code c) 32)) text)))

@@ -42,8 +42,11 @@ server's own counters. Anything posted reaches every open connection,
 including your own, by way of the worker that owns it — which is the only
 worker allowed to write to it.
 
-**x-periments** hands malformed requests to the real parser and shows you
-what it said. A browser cannot send those itself; `fetch()` normalises them.
+**x-periments** leads with lab samples — base64 both ways, a digest, a JWT
+taken apart — each run as a real request that shows the request as the server
+parsed it and the response as it came back. An appendix hands malformed
+requests to the real parser and shows what it said, which a browser cannot
+send itself because `fetch()` normalises them.
 
 Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
