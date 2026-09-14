@@ -2952,7 +2952,24 @@
                                (and body
                                     (search "connection limit" body)
                                     t)
-                               t))))
+                               t))
+                      ;; The same refusal from an operator's side. One event,
+                      ;; two call sites — the accept turned away and the 503
+                      ;; sent for it — and either can be deleted without the
+                      ;; other noticing, so each gets its own line. Polled for
+                      ;; both at once, so the wait cannot end on half.
+                      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+                        (loop until (or (and k
+                                             (>= (getf k :refused 0) 1)
+                                             (>= (getf k :server-error 0) 1))
+                                        (> (get-universal-time) deadline))
+                              do (setf k (getf (web-skeleton:connection-census)
+                                               :counters))
+                                 (sleep 0.05))
+                        (check "the census counts the accept it refused"
+                               (>= (getf k :refused 0) 1) t)
+                        (check "and the 503 as a response, though no handler ran"
+                               (>= (getf k :server-error 0) 1) t))))
                (when holder
                  (ignore-errors (sb-bsd-sockets:socket-close holder))))))
       (setf web-skeleton::*max-connections* saved))))
