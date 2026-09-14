@@ -20,21 +20,26 @@
 (handler-case (asdf:load-system "web-skeleton-tls")
   (error (e) (format t "note: TLS not loaded (~a)~%" e)))
 
-(defun env-int (name default)
-  "Parse a whole integer, or return DEFAULT.
+(defun %digits-p (string start end)
+  "T if STRING from START to END is one or more ASCII digits and nothing else."
+  (and (< start end)
+       (loop for i from start below end
+             always (char<= #\0 (char string i) #\9))))
 
-   Set but not an integer warns and falls back, as ENV-HOST does. With
-   :JUNK-ALLOWED this read WS_PORT=80a as 80 without a word, while the image's
-   healthcheck curls the variable as written, :80a, and marks the container
-   unhealthy with nothing in the log to say why."
+(defun env-int (name default)
+  "Parse a number written in digits and nothing else, or return DEFAULT.
+
+   Set but anything else — a sign, a space, a trailing letter — warns and
+   falls back, as ENV-HOST does. With :JUNK-ALLOWED this read WS_PORT=80a as
+   80 without a word, while the image's healthcheck curls the variable as
+   written, :80a, and marks the container unhealthy with nothing in the log
+   to say why."
   (let ((v (sb-ext:posix-getenv name)))
-    (if (and v (plusp (length v)))
-        (handler-case (parse-integer v)
-          (parse-error ()
-            (format t "note: ~a=~s is not an integer; falling back to ~d~%"
-                    name v default)
-            default))
-        default)))
+    (cond ((or (null v) (zerop (length v))) default)
+          ((%digits-p v 0 (length v)) (parse-integer v))
+          (t (format t "note: ~a=~s is not a plain decimal number; ~
+                        falling back to ~d~%" name v default)
+             default))))
 
 (defun env-host (name default)
   "Parse a dotted-quad, or return DEFAULT. Only IPv4 literals: a container
@@ -44,16 +49,22 @@
    A value that is set but does not parse warns and then falls back, rather
    than falling back in silence. A typo in WS_HOST would otherwise bind
    0.0.0.0 without a word — which is more exposed than whatever was meant, not
-   less — and the operator would have no hint their address was ignored."
+   less — and the operator would have no hint their address was ignored.
+
+   Each of the four parts is one to three digits and nothing else. Parsed
+   with :JUNK-ALLOWED, 10.0.0.1x and \"10.0.0.1 junk\" both read as 10.0.0.1
+   and bound it without a note."
   (let ((v (sb-ext:posix-getenv name)))
     (if (and v (plusp (length v)))
         (let ((parts (loop with start = 0
                            for dot = (position #\. v :start start)
-                           collect (parse-integer v :start start :end dot
-                                                    :junk-allowed t)
+                           for end = (or dot (length v))
+                           collect (and (<= (- end start) 3)
+                                        (%digits-p v start end)
+                                        (parse-integer v :start start :end end))
                            while dot do (setf start (1+ dot)))))
-          (if (and (= (length parts) 4) (every #'integerp parts)
-                   (every (lambda (n) (<= 0 n 255)) parts))
+          (if (and (= (length parts) 4)
+                   (every (lambda (n) (and n (<= n 255))) parts))
               (make-array 4 :element-type '(unsigned-byte 8)
                             :initial-contents parts)
               (progn
