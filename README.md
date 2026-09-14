@@ -193,16 +193,20 @@ tests/
   `format-response` and `serve-static` count on the worker that calls them,
   whether or not the bytes are then sent; off a worker they count nothing. A
   response the serializer refuses is never counted, so the 500 that replaces
-  it is the only one that is. Not counted either: a byte vector a handler
-  builds and returns itself, and the interim `100 Continue`. WebSocket frames count those an application hands over, by
-  `ws-send` or as a ws-handler's reply, and not the pings, pongs and closes
-  the framework sends itself.
-  `*worker-id*` says which slot is the one you are running on. Cumulative for
-  the life of each worker and never windowed — five minutes and an hour are
-  presentation, and a caller wanting a rate samples twice and subtracts, which
-  goes negative across a worker restart. Its docstring splits the contract: some keys
-  are stable, the state breakdown is diagnostic, and a consumer must render
-  unknown keys generically
+  it is the only one that is, and a client that resets its connection is
+  closed without one. Not counted either: a byte vector a handler builds and
+  returns itself, and the interim `100 Continue`. WebSocket frames count those
+  an application hands over, by `ws-send` or as a ws-handler's reply, and not
+  the pings, pongs and closes the framework sends itself. The counts are
+  cumulative for the life of each worker and never windowed — five minutes
+  and an hour are presentation, and a caller wanting a rate samples twice and
+  subtracts, which can go negative across a worker restart. Its docstring
+  splits the contract: some keys are stable, the state breakdown is
+  diagnostic, and a consumer must render unknown keys generically.
+  `*worker-id*` says which slot is the one you are running on, and
+  `connection-serial` names a connection within its worker: a count of that
+  worker's accepts that goes on counting across a restart, so unlike an fd
+  number it never names two connections on one worker
 - **epoll event loop** — edge-triggered, non-blocking I/O via `sb-alien`
   FFI to Linux epoll, fcntl, read, write
 - **Connection state machine** — per-connection read/write buffers, tracks

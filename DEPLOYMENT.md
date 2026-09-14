@@ -1650,6 +1650,9 @@ binds `*test-port*` for the body, and tears it down on scope exit
 (signal shutdown, bounded join, fallback to `terminate-thread`).
 Shutdown hooks registered inside the body are isolated to that server's teardown —
 they do not leak into the caller's state.
+Besides `:handler` it takes `:ws-handler` and `:host`, as `start-server` does;
+`:workers`, which defaults to one, so a test can reason about a single connection table;
+and `:on-tick`, passed to `start-server` unchanged, for a test of work that runs on a worker's own loop.
 
 For unit-style tests that bypass the network entirely,
 `make-test-request` constructs an `http-request` struct directly:

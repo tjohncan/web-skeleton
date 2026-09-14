@@ -401,11 +401,12 @@
    slow peer looks, not an error. Failures of the flush itself do surface
    here; failures of the deferred remainder surface on the event loop.
 
-   Call it from within ws-handler, or from a fetch callback on a
-   :WEBSOCKET target. Inside a handler the event loop is paused, so there
-   is no write contention; from a fetch callback the target is a
+   Call it from within ws-handler, from :ON-TICK on a WebSocket this worker
+   owns — MAP-WORKER-WEBSOCKETS walks them — or from a fetch callback on a
+   :WEBSOCKET target. Inside a handler or the hook the event loop is paused,
+   so there is no write contention; from a fetch callback the target is a
    connection nothing else is writing to for the life of the fetch. A
-   remainder is handed to the event loop the same way in both — see the
+   remainder is handed to the event loop the same way in all three — see the
    header comment for why it has to be handed over here.
 
    Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
