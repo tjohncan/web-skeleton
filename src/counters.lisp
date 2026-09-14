@@ -85,17 +85,20 @@
    telling a head from all of that. The producer already knows the status it
    wrote.
 
-   The producers, and a new one has to call this too: FORMAT-RESPONSE for
-   anything built per request, STATIC-SEGMENTS and the two range builders for
-   cached files, FORMAT-STREAMING-HEAD for a streamed body, and
-   ACCEPT-CONNECTION for the 503 a worker at its limit sends.
+   The producers, and a new one has to call this too, once its bytes exist:
+   FORMAT-RESPONSE for anything built per request, STATIC-SEGMENTS and the two
+   range builders for cached files, FORMAT-STREAMING-HEAD for a streamed body,
+   and ACCEPT-CONNECTION for the 503 a worker at its limit sends.
 
    Two of those an application can call itself, FORMAT-RESPONSE and
-   SERVE-STATIC, and both count when called — on whatever worker calls them,
-   whether or not the bytes are then sent. An application that calls
-   SERVE-STATIC, discards the result and answers 403 instead has counted two
-   responses. Off a worker neither counts anything, which is how a response
-   can be built only to be inspected.
+   SERVE-STATIC, and both count once the bytes exist — on whatever worker
+   calls them, whether or not those bytes are then sent. An application that
+   calls SERVE-STATIC, discards the result and answers 403 instead has counted
+   two responses. A response the serializer refuses never has bytes, so it is
+   not counted: FORMAT-RESPONSE raises for a CTL in a header before counting,
+   and the 500 that replaces it is the only response counted. Off a worker
+   neither counts anything, which is how a response can be built only to be
+   inspected.
 
    Two responses are not counted at all. One a handler returns as a byte
    vector it built itself: the framework queues it as given and never learns

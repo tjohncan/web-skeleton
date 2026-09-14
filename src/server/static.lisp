@@ -700,8 +700,11 @@
                    (list (cons "content-length" (write-to-string len))
                          (cons "content-range"
                                (format nil "bytes ~d-~d/~d" first last total))))))
-    (note-response 206)
-    (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)))
+    ;; Counted once the bytes exist, the order every producer keeps. Nothing
+    ;; in these headers can be refused today, but a response counted before
+    ;; its serialize is the shape FORMAT-RESPONSE's phantom had.
+    (prog1 (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)
+      (note-response 206))))
 
 (defun range-not-satisfiable-response (entry)
   "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4). The
@@ -711,22 +714,24 @@
    Built per request rather than cached on the entry: 416 answers
    malformed client input, so it is a rare path and not worth a slot on
    every static file in memory."
-  (note-response 416)
   (let ((etag (static-entry-etag entry)))
-    (serialize-http-message
-     "HTTP/1.1 416 Range Not Satisfiable"
-     (append
-      (list (cons "date" (http-date))
-            (cons "content-range"
-                  (format nil "bytes */~d" (static-entry-content-length entry)))
-            (cons "content-length" "0")
-            (cons "accept-ranges" "bytes"))
-      ;; Omit the validator rather than emit an empty one: ETag's grammar
-      ;; has no empty form, so `etag: ""` would be malformed. Unreachable
-      ;; today (every entry is built with one) but a header that can only
-      ;; ever be well-formed is better than one that depends on that.
-      (when etag (list (cons "etag" etag))))
-     nil)))
+    ;; Counted once the bytes exist, as in RANGE-RESPONSE above.
+    (prog1
+        (serialize-http-message
+         "HTTP/1.1 416 Range Not Satisfiable"
+         (append
+          (list (cons "date" (http-date))
+                (cons "content-range"
+                      (format nil "bytes */~d" (static-entry-content-length entry)))
+                (cons "content-length" "0")
+                (cons "accept-ranges" "bytes"))
+          ;; Omit the validator rather than emit an empty one: ETag's grammar
+          ;; has no empty form, so `etag: ""` would be malformed. Unreachable
+          ;; today (every entry is built with one) but a header that can only
+          ;; ever be well-formed is better than one that depends on that.
+          (when etag (list (cons "etag" etag))))
+         nil)
+      (note-response 416))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request serving

@@ -185,14 +185,15 @@ tests/
   accepts taken and refused, responses by status class, WebSocket frames
   handed over. Each worker publishes its own slot on the maintenance tick and
   a reader on any thread sums them, so nothing is locked and what you read is
-  up to a tick old. A response is counted where the framework produces it —
-  `format-response` for anything built per request, and the static, range,
-  streaming and connection-limit paths for the rest — which is why the
-  refusals no handler ever ran for are in there. `format-response` and
-  `serve-static` count when called, on the worker that calls them, whether
-  or not the bytes are sent; off a worker they count nothing. Not counted: a
-  byte vector a handler builds and returns itself, and the interim
-  `100 Continue`. WebSocket frames count those an application hands over, by
+  up to a tick old. A response is counted where the framework produces it,
+  once its bytes exist — `format-response` for anything built per request,
+  and the static, range, streaming and connection-limit paths for the rest —
+  which is why the refusals no handler ever ran for are in there.
+  `format-response` and `serve-static` count on the worker that calls them,
+  whether or not the bytes are then sent; off a worker they count nothing. A
+  response the serializer refuses is never counted, so the 500 that replaces
+  it is the only one that is. Not counted either: a byte vector a handler
+  builds and returns itself, and the interim `100 Continue`. WebSocket frames count those an application hands over, by
   `ws-send` or as a ws-handler's reply, and not the pings, pongs and closes
   the framework sends itself.
   `*worker-id*` says which slot is the one you are running on. Cumulative for
