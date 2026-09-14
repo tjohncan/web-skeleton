@@ -591,17 +591,6 @@
               (t           (values (round a 86400) "day")))
       (format nil "~d ~a~p ~a" n unit n (if (minusp d) "ago" "from now")))))
 
-(defun %jwt-segments (token)
-  "Split TOKEN on dots, keeping empty segments — a JWS whose signature is
-   empty still has three parts, and collapsing that would report it as
-   malformed for the wrong reason."
-  (let ((out nil) (start 0))
-    (loop
-      (let ((dot (position #\. token :start start)))
-        (push (subseq token start (or dot (length token))) out)
-        (if dot (setf start (1+ dot)) (return))))
-    (nreverse out)))
-
 (defun %jwt-claim-times (payload now)
   "The three registered time claims, decoded. Absent ones stay absent."
   (loop for name in '("iat" "nbf" "exp")
@@ -617,10 +606,16 @@
       (if err
           (%lab-json request started nil :error err :status 400)
           (handler-case
-              (let ((parts (%jwt-segments token)))
-                (unless (= (length parts) 3)
-                  (error "a JWS has three dot-separated parts and this has ~d"
-                         (length parts)))
+              ;; The framework's splitter, not one of the demo's own. This
+              ;; used to carry its own, which accepted a token with base64
+              ;; padding that JWT-SPLIT refuses — two readers of one token
+              ;; disagreeing about whether it was one, on a page whose
+              ;; subject is that disagreement. RFC 7515 omits the padding, so
+              ;; JWT-SPLIT is the one that is right.
+              (let ((parts (jwt-split token)))
+                (unless parts
+                  (error "not a JWS compact serialization: it needs exactly ~
+                          three base64url segments, with no = padding"))
                 (flet ((seg (i)
                          (json-parse (sb-ext:octets-to-string
                                       (base64url-decode (nth i parts))
