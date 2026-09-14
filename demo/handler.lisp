@@ -1,17 +1,17 @@
 (in-package :web-skeleton-demo)
 
 ;;; ===========================================================================
-;;; Demo application — test page + WebSocket echo + async fetch demo
+;;; Demo application — a live bulletin, a census, a request lab, a bench
 ;;;
-;;; Shows how to use the web-skeleton framework:
-;;;   - Define an HTTP handler that routes requests
-;;;   - Define a WebSocket handler that processes messages
-;;;   - Return a DEFER-TO-FETCH continuation for async outbound calls
-;;;   - Pass handler and ws-handler to start-server
+;;; Shows how to use the web-skeleton framework, on the exported surface only:
+;;;   - An HTTP handler that routes requests and upgrades /ws
+;;;   - A WebSocket handler that posts, answers control frames, and budgets
+;;;   - :ON-TICK and MAP-WORKER-WEBSOCKETS to fan out across workers
+;;;   - A DEFER-TO-FETCH continuation for an async outbound call
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
-;;; Self-address for the /demo-fetch example
+;;; What this process is called, and what it hangs off
 ;;; ---------------------------------------------------------------------------
 
 (defvar *instance* nil
@@ -43,6 +43,10 @@
    Rendered once into the static cache at startup rather than per request.
    It is fixed for the life of the process, and the page it lands on is a
    cached file.")
+
+;;; ---------------------------------------------------------------------------
+;;; Self-address for the /demo-fetch example
+;;; ---------------------------------------------------------------------------
 
 (defvar *demo-host* "127.0.0.1"
   "Host the /demo-fetch endpoint uses to self-fetch over HTTP.")
@@ -116,7 +120,7 @@
                nil))))
 
 ;;; ---------------------------------------------------------------------------
-;;; WebSocket handler
+;;; The port guard
 ;;; ---------------------------------------------------------------------------
 
 (defun %port-already-served-p (port)
@@ -146,27 +150,8 @@
     (error () nil)))
 
 ;;; ---------------------------------------------------------------------------
-;;; The bench — refusals, run against the real parser
-;;;
-;;; A browser physically cannot send a malformed request: fetch() normalises
-;;; everything, and XMLHttpRequest refuses the header names that would matter.
-;;; So the framing argument is the one part of the README a reader has to take
-;;; entirely on faith, and the point of this panel is that they do not have to.
-;;;
-;;; The server hands each case's exact bytes to PARSE-REQUEST — the same
-;;; exported entry point an application would use — and reports what it
-;;; actually said. Nothing is described, simulated, or remembered: change the
-;;; parser and the panel changes on the next click.
-;;;
-;;; No socket, no thread, no subprocess. One parse per click, on bytes fixed
-;;; at compile time, which is what keeps a public page from being a button
-;;; marked "load the server".
-;;;
-;;; Scope worth stating: PARSE-REQUEST validates a header block. The framing
-;;; rules that refuse Transfer-Encoding alongside Content-Length live in the
-;;; connection read path, because they are about a body arriving on a live
-;;; socket rather than about a block of headers — so this panel exhibits the
-;;; refusals reachable from outside the framework, not every refusal there is.
+;;; Peer handles
+;;; ---------------------------------------------------------------------------
 
 (defun %peer-handle (conn)
   "A name for the connection CONN, for one public line of chatter.
@@ -188,6 +173,10 @@
           (or *instance* "????")
           (or *worker-id* "?")
           (connection-serial conn)))
+
+;;; ---------------------------------------------------------------------------
+;;; The backlink
+;;; ---------------------------------------------------------------------------
 
 (defun %escape-html-attr (s)
   "The five characters that can end an attribute or start a tag.
@@ -246,6 +235,29 @@
      (format nil "<a class=\"backlink\" href=\"~a\">&#8627; ~a</a>"
              (%escape-html-attr *backlink-url*)
              (%escape-html-attr (%backlink-display *backlink-url*))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The bench — refusals, run against the real parser
+;;;
+;;; A browser physically cannot send a malformed request: fetch() normalises
+;;; everything, and XMLHttpRequest refuses the header names that would matter.
+;;; So the framing argument is the one part of the README a reader has to take
+;;; entirely on faith, and the point of this panel is that they do not have to.
+;;;
+;;; The server hands each case's exact bytes to PARSE-REQUEST — the same
+;;; exported entry point an application would use — and reports what it
+;;; actually said. Nothing is described, simulated, or remembered: change the
+;;; parser and the panel changes on the next click.
+;;;
+;;; No socket, no thread, no subprocess. One parse per click, on bytes fixed
+;;; at compile time, which is what keeps a public page from being a button
+;;; marked "load the server".
+;;;
+;;; Scope worth stating: PARSE-REQUEST validates a header block. The framing
+;;; rules that refuse Transfer-Encoding alongside Content-Length live in the
+;;; connection read path, because they are about a body arriving on a live
+;;; socket rather than about a block of headers — so this panel exhibits the
+;;; refusals reachable from outside the framework, not every refusal there is.
 
 (defun %crlf (&rest lines)
   (format nil "~{~a~c~c~}~c~c"
@@ -841,9 +853,9 @@
    The bulletin box sends text and only text, so nothing a visitor can type
    reaches this, and nothing answered here can be mistaken for a posted line.
 
-   The answer is text with no TAB in it. A bulletin line always has exactly
-   one, put there by %BULLETIN-PAYLOAD and impossible to post because
-   %SANITIZE-LINE strips it — so the client tells the two apart by
+   The answer is text with no TAB in it. A bulletin line always has three,
+   put there by %BULLETIN-PAYLOAD and impossible to post because
+   %SANITIZE-LINE strips them — so the client tells the two apart by
    construction rather than by sniffing a prefix that a line could imitate.
 
    Which worker, and who this connection is, are the only things to ask so

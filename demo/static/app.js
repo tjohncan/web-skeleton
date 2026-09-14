@@ -76,14 +76,13 @@ function connect(onOpen) {
     if (onOpen) onOpen();
   };
   ws.onmessage = function(e) {
-    // Wire form is "<seq>\t<text>". The sequence is shown because it is the
-    // mechanism: it is what each worker compares against to know what it has
-    // not yet handed to the connections it owns.
+    // A posted line is four fields on three TABs — sequence, stamp, sender,
+    // text — parsed below.
     //
-    // A frame with no TAB in it is the server answering a control frame
-    // rather than a line somebody posted. %BULLETIN-PAYLOAD always writes
-    // one and %SANITIZE-LINE strips any that were typed, so neither can be
-    // mistaken for the other.
+    // A frame with no TAB in it is the server talking rather than a line
+    // somebody posted: a control answer, or word that posts are being
+    // dropped. %BULLETIN-PAYLOAD always writes three and %SANITIZE-LINE
+    // strips any that were typed, so neither can be mistaken for the other.
     const tab = e.data.indexOf('\t');
     if (tab < 0) {
       const m = /^worker (\d+) (\S+)$/.exec(e.data);
@@ -174,15 +173,22 @@ function duration(secs) {
 
 function n(x) { return (x || 0).toLocaleString(); }
 
-// Counters are read off the object rather than named, the same way the
-// states are. The census contract says new keys land here and asks a
-// consumer not to match against a closed list.
+// A few counters, by name, for a narrow cell. That is the closed list the
+// census contract warns a consumer against, taken on purpose: this cell is a
+// summary of a worker's day, not a rendering of the census, so a counter
+// added later not appearing here is the intent rather than a silent loss.
+// The whole set is one request away at /census.
+//
+// Labels say which counter they are. client_error is every 4xx — a lab 400,
+// a 404, a parser refusal — and "refused" belongs to a different counter
+// entirely, the accepts a worker at its limit turned away.
 function work(counters) {
   if (!counters) return '\u2014';
   const parts = [];
   if (counters.responses) parts.push(n(counters.responses) + ' responses');
   if (counters.ws_frames) parts.push(n(counters.ws_frames) + ' frames');
-  if (counters.client_error) parts.push(n(counters.client_error) + ' refused');
+  if (counters.client_error) parts.push(n(counters.client_error) + ' 4xx');
+  if (counters.refused) parts.push(n(counters.refused) + ' refused');
   return parts.length ? parts.join('  \u00b7  ') : '\u2014';
 }
 
@@ -276,6 +282,12 @@ tabs.addEventListener('click', function (e) {
 // to the server, and printing "HTTP/1.1" here would be a guess dressed as a
 // reading. The request block can print a version because the server reported
 // the one it parsed.
+//
+// Its body is the text that arrived, not the JSON parsed and printed again,
+// which would be this page's formatting presented as the server's. Its
+// headers are as fetch() exposes them — lowercased and in fetch's order, not
+// the wire's — and the label says so, because that much this side cannot
+// get back.
 
 const lab = document.getElementById('lab');
 
@@ -340,7 +352,7 @@ function clockOf(d) {
 function headerBlock(headers) {
   const out = [];
   headers.forEach(function (v, k) { out.push(k + ': ' + v); });
-  return out.sort().join('\n');
+  return out.join('\n');
 }
 
 function el(tag, cls, text) {
@@ -386,7 +398,7 @@ function labCard(tool) {
   out.hidden = true;
   card.appendChild(out);
 
-  function show(sentAt, ms, res, body) {
+  function show(sentAt, ms, res, body, raw) {
     out.hidden = false;
     out.textContent = '';
 
@@ -420,11 +432,11 @@ function labCard(tool) {
                          body.request.replace(/\r\n/g, '\n').replace(/\n+$/, '')));
     }
 
-    out.appendChild(el('div', 'tool-label', 'response, as your browser received it'));
+    out.appendChild(el('div', 'tool-label',
+                       'response: body as received, headers as fetch() exposes them'));
     const status = res.status + (res.statusText ? ' ' + res.statusText : '');
     out.appendChild(el('pre', 'tool-wire',
-                       status + '\n' + headerBlock(res.headers) + '\n\n' +
-                       JSON.stringify(body, null, 2)));
+                       status + '\n' + headerBlock(res.headers) + '\n\n' + raw));
   }
 
   form.addEventListener('submit', function (e) {
@@ -441,8 +453,14 @@ function labCard(tool) {
     const t0 = performance.now();
     let res = null;
     fetch(tool.path + '?' + params.toString())
-      .then(function (r) { res = r; return r.json(); })
-      .then(function (body) { show(sentAt, performance.now() - t0, res, body); })
+      .then(function (r) { res = r; return r.text(); })
+      .then(function (raw) {
+        // Parsed for the answer and the timings; shown as it came for the
+        // response block. A body that is not JSON still gets shown.
+        let body = null;
+        try { body = JSON.parse(raw); } catch (e) { body = null; }
+        show(sentAt, performance.now() - t0, res, body, raw);
+      })
       .catch(function (err) {
         out.hidden = false;
         out.textContent = 'no answer: ' + err;
