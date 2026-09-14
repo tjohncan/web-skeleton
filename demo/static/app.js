@@ -241,8 +241,21 @@ function pollCensus() {
     .catch(function () { sternum.textContent = 'census unavailable'; });
 }
 
+// Polled only while someone can see the result. The numbers render on x-ray
+// alone, so a page in a background tab, or open on x-periments, would be
+// asking every two seconds for a picture nobody is looking at. Coming back
+// into view asks at once rather than waiting out the interval.
+function censusInView() {
+  return !document.hidden && !document.getElementById('x-ray').hidden;
+}
+
+function pollIfInView() {
+  if (censusInView()) pollCensus();
+}
+
 pollCensus();
-setInterval(pollCensus, 2000);
+setInterval(pollIfInView, 2000);
+document.addEventListener('visibilitychange', pollIfInView);
 
 
 // ---------------------------------------------------------------------------
@@ -264,6 +277,7 @@ function showPanel(name) {
   ['x-ray', 'x-periments'].forEach(function (id) {
     document.getElementById(id).hidden = (id !== name);
   });
+  pollIfInView();
 }
 
 tabs.addEventListener('click', function (e) {

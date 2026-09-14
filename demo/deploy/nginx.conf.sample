@@ -120,9 +120,9 @@ server {
     # counts open sockets, of which a real visitor holds one per tab. Sixteen
     # leaves room for a household or a small office behind one address; a
     # deployment expecting a large NAT in front of it should raise it, and
-    # limit_req with it: every tab holds one socket and polls /census every
-    # two seconds, so sixteen tabs reach this cap and twenty reach limit_req's
-    # rate.
+    # limit_req with it: every tab holds one socket, and one in view polls
+    # /census every two seconds, so sixteen tabs reach this cap before twenty
+    # in view reach limit_req's rate.
     location = /ws {
         limit_conn ws_demo_conns 16;
         proxy_pass http://127.0.0.1:8081;
