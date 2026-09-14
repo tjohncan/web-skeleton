@@ -8833,34 +8833,65 @@
              (and (stringp msg) (search "connection table" msg) t))
            t)))
 
-(defun test-map-worker-websockets-is-callable-from-on-tick ()
-  "The two halves compose: the walk works inside :ON-TICK on a live server.
+(defun test-map-worker-websockets-delivers-from-on-tick ()
+  "A frame sent to every WebSocket from inside :ON-TICK reaches the client.
 
-   :ON-TICK's own test asserts *CONNECTIONS* is non-NIL inside the hook.
-   This asserts the stronger thing that matters — that the table there is
-   real enough to walk — on a server that was actually started rather than
-   on a binding a test made itself.
+   The fan-out the demo is built on, end to end on a live server: a real
+   handshake, a hook that walks the worker's WebSockets and sends each a
+   frame, and that frame read back off the client's own socket. This replaces
+   a test that showed only that the walk could run inside the hook — over an
+   empty table — and left delivery resting on two halves proven apart,
+   because the suite had no handshake helper then. %WS-CLIENT-UPGRADE is one.
 
-   What it does not assert is delivery to a client, which would need a real
-   handshake the suite has no helper for. That claim rests on two proven
-   halves instead: WS-SEND works when the table and epoll fd are right, and
-   the hook's test shows they are."
-  (format t "~%map-worker-websockets: composes with on-tick~%")
-  (let ((ran 0) (errs 0)
-        (lock (sb-thread:make-mutex :name "map-in-tick")))
+   The hook sends once, when the test arms it, after the client has read its
+   101. An upgrade the client has seen is one the worker has recorded: the
+   state changes in the pass that writes the response, before any hook runs.
+   The walk counts what it visits, and that count is the control — a frame
+   from a hook whose walk found nothing did not come from the walk."
+  (format t "~%map-worker-websockets: a frame from on-tick reaches the client~%")
+  (let ((armed nil) (visited 0) (errs 0)
+        (lock (sb-thread:make-mutex :name "fan-out")))
     (with-test-server
-        (:on-tick (lambda (id)
+        (:handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil)
+         :on-tick (lambda (id)
                     (declare (ignore id))
-                    (handler-case
-                        (progn
+                    (when (sb-thread:with-mutex (lock) (shiftf armed nil))
+                      (handler-case
                           (web-skeleton:map-worker-websockets
-                           (lambda (c) (declare (ignore c)) nil))
-                          (sb-thread:with-mutex (lock) (incf ran)))
-                      (error () (sb-thread:with-mutex (lock) (incf errs))))))
-      (sleep 0.4)
-      (sb-thread:with-mutex (lock)
-        (check "the walk runs inside on-tick" (> ran 0) t)
-        (check "and never signals there" errs 0)))))
+                           (lambda (c)
+                             (sb-thread:with-mutex (lock) (incf visited))
+                             (web-skeleton:ws-send
+                              c (web-skeleton:build-ws-text "from the tick"))))
+                        (error () (sb-thread:with-mutex (lock) (incf errs)))))))
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (check "control: the upgrade was accepted"
+                      (not (null (search "101" (%ws-client-upgrade stream))))
+                      t)
+               (sb-thread:with-mutex (lock) (setf armed t))
+               ;; A server frame is unmasked: a first byte, a length under 126
+               ;; for a payload this short, and the payload.
+               (let ((frame (read-until-bounded
+                             stream :seconds 3
+                             :until (lambda (buf fill)
+                                      (and (>= fill 2)
+                                           (>= fill (+ 2 (logand (aref buf 1)
+                                                                 #x7f))))))))
+                 (sb-thread:with-mutex (lock)
+                   (check "control: the walk visited the one WebSocket" visited 1)
+                   (check "and nothing in it signalled" errs 0))
+                 (check "the frame the hook sent is the frame the client read"
+                        (and (>= (length frame) 2)
+                             (= (aref frame 0) #x81)
+                             (string= (sb-ext:octets-to-string
+                                       (subseq frame 2) :external-format :utf-8)
+                                      "from the tick"))
+                        t)))
+          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
 
 (defun test-connection-census-is-exported-with-a-split-contract ()
   "CONNECTION-CENSUS is reachable without :: and reports per worker.
@@ -9032,6 +9063,30 @@
         (check "every connection taken is counted as an accept"
                (>= (getf k :accepted 0) 2) t)))))
 
+(defun %ws-client-upgrade (stream)
+  "Send an RFC 6455 handshake for /ws on STREAM and read the response head,
+   to its blank line and no further, so a frame the server sends next is left
+   on the stream for the caller. Returns the head as a string, for the caller
+   to find its 101 in."
+  (write-sequence (sb-ext:string-to-octets
+                   (crlf "GET /ws HTTP/1.1" "Host: localhost"
+                         "Upgrade: websocket" "Connection: Upgrade"
+                         "Sec-WebSocket-Version: 13"
+                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")
+                   :external-format :ascii)
+                  stream)
+  (force-output stream)
+  (sb-ext:octets-to-string
+   (read-until-bounded stream
+                       :seconds 3
+                       :until (lambda (buf fill)
+                                (and (>= fill 4)
+                                     (= (aref buf (- fill 4)) 13)
+                                     (= (aref buf (- fill 3)) 10)
+                                     (= (aref buf (- fill 2)) 13)
+                                     (= (aref buf (- fill 1)) 10))))
+   :external-format :latin-1))
+
 (defun %ws-client-frame (opcode payload &key (fin t))
   "A client-to-server frame: masked, as RFC 6455 requires of a client.
    PAYLOAD is under 126 bytes, which is all these tests send."
@@ -9100,27 +9155,11 @@
                                         (> (get-universal-time) deadline))
                               do (sleep 0.05) (setf n (frames)))
                         n)))
-               (put (sb-ext:string-to-octets
-                     (crlf "GET /ws HTTP/1.1" "Host: localhost"
-                           "Upgrade: websocket" "Connection: Upgrade"
-                           "Sec-WebSocket-Version: 13"
-                           "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")
-                     :external-format :ascii))
-               (let ((head (read-until-bounded
-                            stream :seconds 3
-                            :until (lambda (buf fill)
-                                     (and (>= fill 4)
-                                          (= (aref buf (- fill 4)) 13)
-                                          (= (aref buf (- fill 3)) 10)
-                                          (= (aref buf (- fill 2)) 13)
-                                          (= (aref buf (- fill 1)) 10))))))
-                 ;; The control for all of it: without an upgrade there are
-                 ;; no frames, and every delta below would read as a revert.
-                 (check "control: the upgrade was accepted"
-                        (not (null (search "101"
-                                           (sb-ext:octets-to-string
-                                            head :external-format :latin-1))))
-                        t))
+               ;; The control for all of it: without an upgrade there are
+               ;; no frames, and every delta below would read as a revert.
+               (check "control: the upgrade was accepted"
+                      (not (null (search "101" (%ws-client-upgrade stream))))
+                      t)
                (let ((deadline (+ (get-universal-time) 4)))
                  (loop until (or (web-skeleton:connection-census)
                                  (> (get-universal-time) deadline))
@@ -9521,7 +9560,7 @@
   (test-map-worker-websockets-visits-only-websockets)
   (test-map-worker-websockets-skips-what-a-callback-closed)
   (test-map-worker-websockets-refuses-off-a-worker)
-  (test-map-worker-websockets-is-callable-from-on-tick)
+  (test-map-worker-websockets-delivers-from-on-tick)
   (test-connection-census-is-exported-with-a-split-contract)
   (test-a-log-line-is-one-line)
   (test-counters-count-responses-by-class)
