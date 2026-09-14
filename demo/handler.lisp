@@ -56,6 +56,43 @@
    /demo-fetch endpoint can build a self-referential URL.")
 
 ;;; ---------------------------------------------------------------------------
+;;; Same-origin check for the /ws upgrade
+;;; ---------------------------------------------------------------------------
+
+(defun %origin-host (origin)
+  "The host of an Origin header value, or NIL if it carries none. An Origin is
+   scheme://host[:port] with no path (RFC 6454); anything else — the literal
+   \"null\" a sandboxed or file:// browser sends, or junk — has no host here
+   and returns NIL, which the caller treats as not same-origin."
+  (let ((sep (search "://" origin)))
+    (when sep
+      (let* ((rest (subseq origin (+ sep 3)))
+             (end  (position-if (lambda (c) (or (char= c #\:) (char= c #\/)))
+                                rest)))
+        (if end (subseq rest 0 end) rest)))))
+
+(defun %host-only (host-header)
+  "HOST-HEADER without its :port, for comparison against an Origin's host."
+  (let ((colon (position #\: host-header)))
+    (if colon (subseq host-header 0 colon) host-header)))
+
+(defun %ws-origin-allowed-p (request)
+  "T if the /ws upgrade may proceed. A same-origin check against cross-site
+   WebSocket hijacking (DEPLOYMENT.md, \"WebSocket origin validation\"): a
+   browser sends an Origin its page's script cannot forge, so a socket opened
+   from another site carries that site's Origin and is refused. A request with
+   no Origin — curl, wscat, a probe — is not a browser and not the attack this
+   stops; it is allowed, and the proxy's per-address limits are what bound it.
+   A present-but-foreign or malformed Origin, the literal \"null\" included,
+   is refused. Host is what the proxy forwards, so the comparison holds behind
+   it and on a laptop alike."
+  (let ((origin (get-header request "origin")))
+    (or (null origin)
+        (let ((oh (%origin-host origin))
+              (hh (get-header request "host")))
+          (and oh hh (string-equal oh (%host-only hh)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; HTTP handler
 ;;; ---------------------------------------------------------------------------
 
@@ -66,9 +103,15 @@
         (path   (http-request-path request)))
     (cond
       ((and (eq method :GET) (string= path "/ws"))
-       ;; Production apps must validate the Origin header before upgrading.
-       ;; See DEPLOYMENT.md "WebSocket origin validation".
-       :upgrade)
+       ;; Same-origin check before the upgrade. A socket opened from another
+       ;; site carries that site's Origin and is refused, which is what stops
+       ;; a page using its visitors' browsers to post into the room from
+       ;; addresses the proxy's per-address limits count as many clients. A
+       ;; request with no Origin is allowed and left to those limits. See
+       ;; DEPLOYMENT.md, "WebSocket origin validation".
+       (if (%ws-origin-allowed-p request)
+           :upgrade
+           (make-error-response 403 "cross-origin WebSocket upgrade refused")))
       ((and (eq method :GET) (string= path "/demo-fetch"))
        (handle-demo-fetch request))
       ((and (eq method :GET) (string= path "/healthz"))
