@@ -21,11 +21,16 @@ WORKDIR /app
 COPY . /app
 
 # Compile at build time. The first visitor should not pay for it, and a
-# compile error should fail the build rather than the container.
+# compile error should fail the build rather than the container — in either
+# system the container loads. TLS is compiled here but not loaded: it loads
+# libssl only at load time, so this step never needs libssl, and a container
+# without it still starts and says TLS is absent. CI compiles on its runner's
+# SBCL, so this is the one compile that runs on the SBCL the container does.
 RUN sbcl --non-interactive \
       --eval '(require :asdf)' \
       --eval '(push #p"/app/" asdf:*central-registry*)' \
-      --eval '(asdf:load-system "web-skeleton-demo")'
+      --eval '(asdf:load-system "web-skeleton-demo")' \
+      --eval '(asdf:compile-system "web-skeleton-tls")'
 
 # /healthz, which fails if any worker has stopped passing its loop — whichever
 # worker answers the probe, because it reads every worker's last pass rather
