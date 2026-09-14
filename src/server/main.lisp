@@ -1998,7 +1998,7 @@
    IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
-   ON-TICK: function (worker-id), or NIL.
+   ON-TICK: function (worker-id), a symbol naming one, or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
 
@@ -2100,11 +2100,22 @@
   ;; through a typo rather than a bug. Refusing at boot costs one check
   ;; and turns a log full of suppressed occurrences into one clear error
   ;; before a socket is ever bound.
-  (unless (or (null on-tick) (functionp on-tick))
+  ;;
+  ;; A symbol naming a function is accepted, as :HANDLER accepts one: FUNCALL
+  ;; looks it up on every call, which is what lets a running server pick up a
+  ;; hook redefined at the REPL. A symbol naming nothing is still refused, and
+  ;; so is one naming a macro or a special operator, since neither can be
+  ;; funcalled and each would fail every pass exactly as a typo would.
+  (unless (or (null on-tick)
+              (functionp on-tick)
+              (and (symbolp on-tick)
+                   (fboundp on-tick)
+                   (not (macro-function on-tick))
+                   (not (special-operator-p on-tick))))
     (error "start-server: :on-tick is ~s; it must be a function of one ~
-            argument (the worker id) or NIL. It runs on every pass of ~
-            every worker's event loop, so a value that cannot be funcalled ~
-            fails on every pass rather than once."
+            argument (the worker id), a symbol naming one, or NIL. It runs ~
+            on every pass of every worker's event loop, so a value that ~
+            cannot be funcalled fails on every pass rather than once."
            on-tick))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is

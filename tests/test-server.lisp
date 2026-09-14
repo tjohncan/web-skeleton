@@ -8741,6 +8741,29 @@
          (let ((msg (attempt (web-skeleton:start-server
                               :host #(1 2 3) :port 0 :workers 1))))
            (and (stringp msg) (not (search ":on-tick" msg)) t))
+         t)
+  ;; A symbol naming a function is accepted, as :HANDLER accepts one, so a
+  ;; hook redefined at the REPL reaches a running server. Accepted here means
+  ;; the call gets past the check and fails on the bad host instead.
+  (check "boot: a symbol naming a function is accepted"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'identity))))
+           (and (stringp msg) (not (search ":on-tick" msg)) t))
+         t)
+  ;; And the two a symbol could still get wrong. Without these, accepting
+  ;; every symbol would pass the assertion above.
+  (check "boot: a symbol naming no function is still refused"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'no-function-is-named-this))))
+           (and (stringp msg) (search ":on-tick" msg) t))
+         t)
+  (check "boot: a symbol naming a macro is refused, since it cannot be funcalled"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'when))))
+           (and (stringp msg) (search ":on-tick" msg) t))
          t))
 
 (defun %ws-conn (fd state)
