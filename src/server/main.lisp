@@ -2013,12 +2013,15 @@
 
    ON-TICK runs on every pass of every worker's event loop, on that
    worker's own thread, with that worker's connection table and epoll fd
-   bound. The bindings are the point: they are what makes WS-SEND and
-   STREAM-SEND legal from inside it, and what makes their ownership
-   guards effective rather than skipped. It is how an application does
-   periodic per-worker work — rotating counters it keeps itself, or
-   writing to the connections this worker owns, which is the only way to
-   reach them, since no worker may touch another's table.
+   bound. The bindings are the point: the hook runs on the thread that
+   owns the connections, so writing to them from it is legal. WS-SEND,
+   STREAM-CLOSE and FETCH-INTO check that ownership and find it satisfied
+   here rather than refusing; STREAM-SEND is the one that does not check
+   (README, under Limitations), and called from here it does not need to.
+   It is how an application does periodic per-worker work — rotating
+   counters it keeps itself, or writing to the connections this worker
+   owns, which is the only way to reach them, since no worker may touch
+   another's table.
 
    Three things a hook has to be.
 
