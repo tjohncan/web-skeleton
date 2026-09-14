@@ -1118,9 +1118,22 @@
    socket, and because the worker is not the one that will serve the next
    request from the same browser: one connection, one worker, for as long as
    it is open. The handle comes back so a page can recognise its own lines
-   in a broadcast it shares with strangers."
+   in a broadcast it shares with strangers.
+
+   Not budgeted, and not by oversight. The post budget exists because a post
+   is multiplied: one frame in, a line out to every socket on every worker,
+   through the store's lock. A command is answered on the asking connection
+   and nowhere else, one frame for one frame, and a peer that asks without
+   reading its answers meets the write backlog's bound and is closed. Nothing
+   here is multiplied, so there is nothing for a budget to divide.
+
+   Decoded with a replacement character. A binary frame makes no promise to
+   be UTF-8 — the framework validates text frames, not these — and a strict
+   decode of one that was not raised out of the ws-handler and took the
+   connection down without a close frame. A replaced byte cannot spell
+   \"worker\", so the match stays exact."
   (let ((cmd (sb-ext:octets-to-string (ws-frame-payload frame)
-                                      :external-format :utf-8)))
+                                      :external-format '(:utf-8 :replacement #\?))))
     (build-ws-text
      (if (string= cmd "worker")
          (format nil "worker ~a ~a" (or *worker-id* "none")
