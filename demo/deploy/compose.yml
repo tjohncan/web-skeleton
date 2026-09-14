@@ -12,7 +12,19 @@ services:
       dockerfile: demo/deploy/Dockerfile
     image: web-skeleton-demo
     container_name: web-skeleton-demo
+    # Restarts when the process exits, and only then. The image's healthcheck
+    # marks a stuck worker unhealthy, and plain Docker reports that and does
+    # nothing else: no restart policy acts on health. Watch the status, or run
+    # something that does act on it.
     restart: unless-stopped
+    # Capped, because the default json-file driver never rotates. Every
+    # WebSocket upgrade logs a line at INFO, and on a box shared with another
+    # site an unbounded log is a slow way to fill its disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:8081:8081"
     environment:
