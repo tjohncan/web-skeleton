@@ -1051,10 +1051,15 @@
 
    Counts one response on the calling worker's counters, because for a
    response built per request this is the last place the framework sees it
-   before it is queued. The count does not wait for the bytes to be sent: an
-   application that calls this on a worker for a response it never writes has
-   counted a response nobody received. Called off a worker — at load time, or
-   from a thread of the application's own — it counts nothing.
+   before it is queued. The count lands after serialization, not before: a
+   response whose headers the serializer rejects — a CTL smuggled into a
+   value, say — raises here and is not counted, the same way an out-of-range
+   status is refused before counting, so one rejected response is not also a
+   counted one, and the 500 that replaces it is the only response counted.
+   The count still does not wait for the bytes to be sent: an application that
+   serializes a response on a worker and never writes it has counted a
+   response nobody received. Called off a worker — at load time, or from a
+   thread of the application's own — it counts nothing.
 
    CONNECTION-HINT stamps a Connection header at serialize time:
      :CLOSE      — stamps 'Connection: close' when the server has
@@ -1086,11 +1091,6 @@
     ;; circuits before the body encode + header build below.
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
-    ;; Counted here rather than where a handler returned, because most of
-    ;; what is worth counting never passes through one: a parse error is a
-    ;; response nobody's handler produced. After the range check, so a
-    ;; rejected status is not also a counted one.
-    (note-response status)
     (let* ((body   (http-response-body response))
            ;; String bodies encode to UTF-8; byte bodies pass through
            ;; untouched. Everything downstream (Content-Length, the
@@ -1142,15 +1142,23 @@
            (headers (if (assoc "date" headers :test #'string-equal)
                         headers
                         (cons (cons "date" (http-date)) headers))))
-      (serialize-http-message
-       (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-       headers
-       ;; HEAD short-circuit: keep the computed Content-Length in the
-       ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
-       ;; response's CL) but omit the body bytes from the emitted
-       ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
-       ;; without the large subseq allocation.
-       (if head-only-p nil body-bytes)))))
+      ;; Counted where the framework produces the response, not where a
+      ;; handler returned, because most of what is worth counting — a parse
+      ;; error's 400, say — never passes through a handler at all. PROG1 so
+      ;; the count lands only once the bytes exist: a value the serializer
+      ;; refuses raises out of here uncounted, and the 500 built to replace
+      ;; it is counted once, in its own call.
+      (prog1
+          (serialize-http-message
+           (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+           headers
+           ;; HEAD short-circuit: keep the computed Content-Length in the
+           ;; headers alist (RFC 7231 §4.3.2 requires matching the GET
+           ;; response's CL) but omit the body bytes from the emitted
+           ;; serialization. Equivalent to STRIP-BODY-FOR-HEAD post-pass
+           ;; without the large subseq allocation.
+           (if head-only-p nil body-bytes))
+        (note-response status)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Convenience constructors

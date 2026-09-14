@@ -9219,6 +9219,49 @@
                       (list (getf snap :responses) (getf snap :client-error))
                       '(1 1)))))
       (setf web-skeleton::*static-cache* saved)))
+  ;; A response the serializer refuses is not counted — and neither the
+  ;; original nor the 500 that replaces it is counted twice. The count used
+  ;; to be taken before the serialize that can reject the headers, so a 302
+  ;; whose Location carried a CRLF counted a phantom redirect the client never
+  ;; saw, on top of the 500 it did. The three assertions pin it: the
+  ;; serializer refuses, the refused response counts nothing, and the same
+  ;; 302 without the CRLF still counts once — so the fix cannot be reverted
+  ;; (the refused one would count) or over-applied (the good one would not).
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (flet ((crlf-302 ()
+             (let ((r (web-skeleton::make-http-response :status 302)))
+               (web-skeleton::set-response-header
+                r "location" (format nil "/a~c~c/b" #\Return #\Linefeed))
+               r)))
+      (check "the serializer refuses a CRLF smuggled into a header value"
+             (handler-case (progn (web-skeleton::format-response (crlf-302))
+                                  :built)
+               (error () :refused))
+             :refused)
+      (let ((snap (web-skeleton::counters-snapshot)))
+        (check "a response the serializer refused is counted nowhere"
+               (list (getf snap :responses)
+                     (getf snap :redirected)
+                     (getf snap :server-error))
+               '(0 0 0)))))
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (web-skeleton::format-response
+     (web-skeleton::make-http-response :status 302))
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "control: the same 302, serialized, counts once as a redirect"
+             (list (getf snap :responses) (getf snap :redirected))
+             '(1 1))))
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (flet ((crlf-head ()
+             (let ((r (web-skeleton::make-http-response :status 200)))
+               (web-skeleton::set-response-header
+                r "x-note" (format nil "a~cb" #\Return))
+               r)))
+      (ignore-errors
+       (web-skeleton::format-streaming-head (crlf-head) :chunked))
+      (check "a streamed head the serializer refused is not counted"
+             (getf (web-skeleton::counters-snapshot) :responses)
+             0)))
   ;; The streamed head is the fourth path that never reaches FORMAT-RESPONSE.
   ;; One response, counted once, at the head — the chunks after it are not
   ;; responses and STREAM-SEND does not count them.

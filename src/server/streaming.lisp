@@ -221,11 +221,15 @@
                         (cons (cons "date" (http-date)) headers))))
       ;; A streamed response is one response, counted at its head. The chunks
       ;; that follow are not responses and STREAM-SEND does not count them.
-      (note-response status)
-      (serialize-http-message
-       (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-       headers
-       nil))))
+      ;; PROG1 so the count lands after serialization, not before: a head the
+      ;; serializer refuses raises out of here uncounted, matching
+      ;; FORMAT-RESPONSE, so the 500 that replaces it is the only one counted.
+      (prog1
+          (serialize-http-message
+           (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+           headers
+           nil)
+        (note-response status)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The app-facing stream
