@@ -45,6 +45,20 @@
   (when *counters* (incf (counters-refused *counters*))))
 
 (defun note-ws-frame ()
+  "Record one WebSocket frame an application handed to a connection.
+
+   Two ways to hand one over, and both call this: WS-SEND, and returning the
+   frame from a ws-handler. The second is the documented reply path and it
+   never passes through WS-SEND, so counting only there would miss the
+   commonest way an application answers.
+
+   Not the frames the framework sends on its own behalf — a pong answering a
+   ping, the pings that keep a socket alive, a close. Those are the
+   framework's traffic rather than the application's, and a count mixing the
+   two could not be read as either.
+
+   One per call or return, not one per frame on the wire: bytes handed over
+   in one piece count once, however many frames they hold."
   (when *counters* (incf (counters-ws-frames *counters*))))
 
 (defun note-response (status)
@@ -55,16 +69,21 @@
    through a handler: a parse error becomes a response without one ever
    running.
 
-   Not where the bytes are serialized, which is what this said first and is
-   why static files went uncounted for a release. A cached file's bytes are
-   serialized once at startup and sent thousands of times; serialization is
-   where a response is BUILT, and the two coincide everywhere except the one
-   path that carries most of a page's requests.
+   Not where the bytes are serialized in general. A cached file's bytes are
+   serialized once at startup and sent thousands of times, and a refusal at
+   the connection limit is pre-built bytes written straight to a socket; in
+   both, serialization and emission are different moments.
 
    So every path that emits a response calls this with its own status, and a
    new one has to remember: FORMAT-RESPONSE for anything built per request,
-   STATIC-SEGMENTS and the two range builders for cached files, and
-   FORMAT-STREAMING-HEAD for a streamed body."
+   STATIC-SEGMENTS and the two range builders for cached files,
+   FORMAT-STREAMING-HEAD for a streamed body, and ACCEPT-CONNECTION for the
+   503 a worker at its limit sends.
+
+   FORMAT-RESPONSE is the one of those an application can call, and it counts
+   on whatever worker calls it — whether or not the bytes are then sent. Off a
+   worker it counts nothing, which is how an application builds responses it
+   means only to inspect."
   (when *counters*
     (incf (counters-responses *counters*))
     (case (floor status 100)

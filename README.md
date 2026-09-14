@@ -182,10 +182,14 @@ tests/
   accepts taken and refused, responses by status class, WebSocket frames
   queued. Each worker publishes its own slot on the maintenance tick and a
   reader on any thread sums them, so nothing is locked and what you read is up
-  to a tick old. Counted where a response is handed to a connection, which is
-  why the refusals no handler ever ran for are in there — and not where it is
-  serialized, which is what this said until a cached file, serialized once at
-  startup and sent thousands of times, turned out to be counted once.
+  to a tick old. Counted where a response is handed to a connection —
+  `format-response` for anything built per request, and the static, range,
+  streaming and connection-limit paths for the rest — which is why the
+  refusals no handler ever ran for are in there. `format-response` counts
+  on the worker that calls it whether or not the bytes are sent; off a worker
+  it counts nothing. WebSocket frames count those an application hands over,
+  by `ws-send` or as a ws-handler's reply, and not the pings, pongs and
+  closes the framework sends itself.
   `*worker-id*` says which slot is the one you are running on. Monotonic and
   never windowed
   — five minutes and an hour are presentation, and a caller wanting a rate

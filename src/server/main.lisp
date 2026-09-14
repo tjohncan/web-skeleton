@@ -202,7 +202,9 @@
    :COUNTERS is cumulative since each worker started, never windowed: a caller
    wanting a rate samples twice and subtracts. It counts what only the
    framework sees — responses by class including every refusal no handler ever
-   ran for, accepts taken and refused, and WebSocket frames queued. A worker
+   ran for, accepts taken and refused, and the WebSocket frames an application
+   handed to a connection, by WS-SEND or as a ws-handler's return value. Not
+   the pings, pongs and closes the framework sends on its own behalf. A worker
    that crashes and restarts begins a fresh set, so these can go down.
 
    Diagnostic — :STATES and :PER-WORKER. :STATES is keyed by the connection
@@ -851,6 +853,11 @@
       (log-warn "connection limit reached (~d), refusing new accept"
                 *max-connections*)
       (note-refused)
+      ;; And a response: REFUSE-CONNECTION writes a pre-built 503 straight to
+      ;; the socket, so nothing downstream of here would count it. It is the
+      ;; plainest case of a refusal no handler ran for, which is what the
+      ;; census promises to count.
+      (note-response 503)
       (refuse-connection client-socket)
       (return-from accept-connection t))
     (handler-case

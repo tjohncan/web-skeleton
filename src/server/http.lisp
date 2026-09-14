@@ -1049,6 +1049,13 @@
 (defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
 
+   Counts one response on the calling worker's counters, because for a
+   response built per request this is the last place the framework sees it
+   before it is queued. The count does not wait for the bytes to be sent: an
+   application that calls this on a worker for a response it never writes has
+   counted a response nobody received. Called off a worker — at load time, or
+   from a thread of the application's own — it counts nothing.
+
    CONNECTION-HINT stamps a Connection header at serialize time:
      :CLOSE      — stamps 'Connection: close' when the server has
                    decided to close the socket after this response.

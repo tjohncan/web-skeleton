@@ -589,7 +589,12 @@
                    (setf (connection-last-active conn) (get-universal-time))
                    (when ws-handler
                      (let ((response (funcall ws-handler conn frame)))
-                       (when response (push response responses)))))
+                       ;; A reply is a frame handed to this connection as
+                       ;; surely as one from WS-SEND, and it does not pass
+                       ;; through WS-SEND, so it is counted here.
+                       (when response
+                         (note-ws-frame)
+                         (push response responses)))))
                  ;; First fragment — start accumulating. Enforce the
                  ;; message-size cap on the starting size too, not
                  ;; only on continuation accumulation, so apps that
@@ -654,7 +659,9 @@
                                   :payload payload)))
                    (when ws-handler
                      (let ((response (funcall ws-handler conn complete)))
-                       (when response (push response responses))))))))
+                       (when response
+                         (note-ws-frame)
+                         (push response responses))))))))
             ;; Control frames (can arrive between fragments per RFC 6455 §5.4)
             ((= opcode +ws-op-ping+)
              (log-debug "ws ping from client fd ~d" (connection-fd conn))
