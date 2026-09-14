@@ -2276,12 +2276,19 @@
    line. Bound beside the other per-worker slots, it began again at one on
    every restart, so a crashed worker's next peer took the name of its first.
 
-   The crash is real rather than simulated. The hook closes the worker's own
-   epoll fd once; the next pass's epoll_wait fails with EBADF, which nothing in
-   RUN-EVENT-LOOP catches, and RUN-WORKER takes the restart path it takes for
-   any error that escapes — the failure its docstring records seeing on a
-   shipping server. So this is also the first test that watches a worker come
+   The crash is real rather than simulated. The hook duplicates /dev/null over
+   the worker's own epoll fd, once; the next pass's epoll_wait fails with
+   EINVAL, because that number no longer names an epoll instance, nothing in
+   RUN-EVENT-LOOP catches it, and RUN-WORKER takes the restart path it takes
+   for any error that escapes — the path its docstring records a shipping
+   server taking. So this is also the first test that watches a worker come
    back at all.
+
+   Duplicated over, not closed. RUN-WORKER's cleanup closes the epoll fd
+   itself, so closing it here first would free the number for whatever opens
+   a descriptor next and leave the cleanup to close that instead — the reuse
+   race any close by number runs. dup2 keeps the number owned until the
+   cleanup's own close.
 
    The restart is detected by the connection table, not assumed from the
    close. RUN-WORKER binds a fresh table on every pass, so the hook seeing a
@@ -2314,7 +2321,15 @@
                              table))
                   (when crash
                     (setf crash nil)
-                    (web-skeleton::%close web-skeleton::*epoll-fd*))))
+                    (with-open-file (devnull "/dev/null")
+                      (unless (= (sb-alien:alien-funcall
+                                  (sb-alien:extern-alien
+                                   "dup2" (function sb-alien:int sb-alien:int
+                                                    sb-alien:int))
+                                  (sb-sys:fd-stream-fd devnull)
+                                  web-skeleton::*epoll-fd*)
+                                 web-skeleton::*epoll-fd*)
+                        (error "dup2 over the epoll fd failed"))))))
               :handler (lambda (req)
                          (declare (ignore req))
                          (make-text-response 200 "ok")))
