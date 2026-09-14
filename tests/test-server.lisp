@@ -9087,6 +9087,29 @@
                                      (= (aref buf (- fill 1)) 10))))
    :external-format :latin-1))
 
+(defun %reset-socket (socket)
+  "Close SOCKET with a reset rather than a FIN.
+
+   SO_LINGER on with a zero timeout makes close(2) drop anything unsent and
+   send RST, which is how a client looks when it crashes or its network drops
+   it. Signals if the option does not take: a close that quietly sent a FIN
+   instead would pass any test built on this, whether the server handled a
+   reset or not. SOL_SOCKET is 1 and SO_LINGER is 13 on Linux, the one
+   platform the framework runs on."
+  (let ((fd (sb-bsd-sockets:socket-file-descriptor socket)))
+    (sb-alien:with-alien ((linger (array sb-alien:int 2)))
+      (setf (sb-alien:deref linger 0) 1
+            (sb-alien:deref linger 1) 0)
+      (unless (zerop (sb-alien:alien-funcall
+                      (sb-alien:extern-alien
+                       "setsockopt"
+                       (function sb-alien:int sb-alien:int sb-alien:int
+                                 sb-alien:int sb-alien:system-area-pointer
+                                 sb-alien:unsigned))
+                      fd 1 13 (sb-alien:alien-sap linger) 8))
+        (error "setsockopt SO_LINGER failed on fd ~d" fd)))
+    (sb-bsd-sockets:socket-close socket)))
+
 (defun %ws-client-frame (opcode payload &key (fin t))
   "A client-to-server frame: masked, as RFC 6455 requires of a client.
    PAYLOAD is under 126 bytes, which is all these tests send."
@@ -9185,6 +9208,104 @@
                         (- n4 n3) 1))))
         (ignore-errors (close stream))
         (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
+(defun test-counters-a-client-reset-is-not-a-server-error ()
+  "A client that resets its connection is closed, not answered with a 500 that
+   is then counted against the server.
+
+   A read of a reset socket fails with ECONNRESET, and HANDLE-CLIENT-READ
+   answered anything that escaped its dispatch with a 500 built through
+   FORMAT-RESPONSE. The 500 was always addressed to nobody. Counting it made a
+   client's disconnect a :SERVER-ERROR, in the block the census calls safe to
+   alert on, and clients reset all the time.
+
+   Three resets, from the three places a client can be when it goes: idle
+   before sending a byte, part way through a request, and upgraded to a
+   WebSocket.
+
+   Two controls. The log shows the server read each reset as ECONNRESET, not
+   as an end of stream; without that, a close that sent a FIN would pass here
+   on code that still counts resets. And a handler that raises still gets its
+   500, counted, so the fix reaches the client's own descriptor and not every
+   error."
+  (format t "~%counters: a client's reset is not a server error~%")
+  (let ((log (make-string-output-stream))
+        (so-far "")
+        (saved-stream web-skeleton:*log-stream*)
+        (saved-level web-skeleton:*log-level*))
+    ;; Global SETF, as the restart test does: the worker thread reads the
+    ;; global values, so a binding here would capture nothing.
+    (setf web-skeleton:*log-stream* log
+          web-skeleton:*log-level* :debug)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (let ((path (web-skeleton:http-request-path req)))
+                           (cond ((string= path "/ws") :upgrade)
+                                 ((string= path "/boom")
+                                  (error "the handler failed on purpose"))
+                                 (t (make-text-response 200 "ok")))))
+              :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil))
+           (flet ((resets-read ()
+                    ;; Drained under the lock the worker holds while writing,
+                    ;; and kept, because draining a string stream empties it.
+                    (setf so-far
+                          (concatenate 'string so-far
+                                       (sb-thread:with-mutex
+                                           (web-skeleton::*log-lock*)
+                                         (get-output-stream-string log))))
+                    (loop with start = 0
+                          for at = (search "ECONNRESET" so-far :start2 start)
+                          while at
+                          count t
+                          do (setf start (1+ at)))))
+             (let* ((idle (connect-to-test-server))
+                    (partial (connect-to-test-server))
+                    (ws (connect-to-test-server))
+                    (partial-stream (sb-bsd-sockets:socket-make-stream
+                                     partial :output t
+                                     :element-type '(unsigned-byte 8)))
+                    (ws-stream (sb-bsd-sockets:socket-make-stream
+                                ws :input t :output t
+                                :element-type '(unsigned-byte 8))))
+               ;; A request line and one header, and no blank line to end them.
+               (write-sequence (sb-ext:string-to-octets
+                                (format nil "GET / HTTP/1.1~c~cHost: localhost~c~c"
+                                        #\Return #\Linefeed #\Return #\Linefeed)
+                                :external-format :ascii)
+                               partial-stream)
+               (force-output partial-stream)
+               (check "control: the WebSocket was upgraded before it reset"
+                      (not (null (search "101" (%ws-client-upgrade ws-stream))))
+                      t)
+               ;; Long enough for the worker to accept the other two and take
+               ;; the partial request into its buffer before anything resets.
+               (sleep 0.3)
+               (mapc #'%reset-socket (list idle partial ws)))
+             (let ((deadline (+ (get-universal-time) 6)))
+               (loop until (or (>= (resets-read) 3)
+                               (> (get-universal-time) deadline))
+                     do (sleep 0.05)))
+             (check "control: the server read all three resets as ECONNRESET"
+                    (>= (resets-read) 3) t)
+             (check "control: a handler that raises still answers 500"
+                    (test-http-request :get "/boom") 500)
+             ;; Polled until that 500 is published and every connection has
+             ;; gone, so the count read is one taken after all four were seen.
+             (let ((census nil) (deadline (+ (get-universal-time) 6)))
+               (loop until (or (and census
+                                    (>= (getf (getf census :counters)
+                                              :server-error 0)
+                                        1)
+                                    (zerop (getf census :total 1)))
+                               (> (get-universal-time) deadline))
+                     do (sleep 0.05)
+                        (setf census (web-skeleton:connection-census)))
+               (let ((errors (getf (getf census :counters) :server-error 0)))
+                 (check "control: that 500 is counted" (>= errors 1) t)
+                 (check "and the three resets added nothing to it" errors 1)))))
+      (setf web-skeleton:*log-stream* saved-stream
+            web-skeleton:*log-level* saved-level))))
 
 (defun test-counters-count-a-response-the-serializer-never-built ()
   "A cached file is a response, and it was not being counted.
@@ -9567,6 +9688,7 @@
   (test-counters-see-a-response-no-handler-produced)
   (test-counters-count-every-way-a-frame-is-handed-over)
   (test-counters-count-a-response-the-serializer-never-built)
+  (test-counters-a-client-reset-is-not-a-server-error)
   (test-getent-parse-separates-policy-from-resolution)
   (test-parse-error-carries-its-status-to-a-caller)
   (report-suite "Server")

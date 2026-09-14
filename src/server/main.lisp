@@ -1385,6 +1385,20 @@
         (error ()
           (close-connection conn epoll-fd))))
     (error (e)
+      ;; This connection's own descriptor failed under a read or a write: the
+      ;; peer reset, or the network between us did. Answered the way an end of
+      ;; stream is, by closing and nothing else. A 500 would be addressed to
+      ;; nobody — the write carrying it fails the same way — and counting it
+      ;; would put a client's disconnect into :SERVER-ERROR, a count the
+      ;; census calls safe to alert on. Only this connection's descriptor: a
+      ;; handler whose own I/O failed on another one has failed a request,
+      ;; and the 500 below is owed to it.
+      (when (and (typep e 'fd-io-error)
+                 (eql (fd-io-error-fd e) (connection-fd conn)))
+        (log-debug "fd ~d: ~a — the peer is gone, closing"
+                   (connection-fd conn) e)
+        (close-connection conn epoll-fd :disconnected)
+        (return-from handle-client-read nil))
       (log-warn "error fd ~d: ~a" (connection-fd conn) e)
       ;; Send 500 before closing so the client gets a proper HTTP response
       (handler-case
