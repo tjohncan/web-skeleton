@@ -37,6 +37,9 @@ limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
 
 server {
     listen 443 ssl;
+    # The standalone directive needs nginx 1.25.1 or later. Older builds —
+    # Ubuntu 24.04 ships 1.24, Debian bookworm 1.22 — refuse to start on it;
+    # for those, drop this line and write `listen 443 ssl http2;` above.
     http2 on;
     server_name demo.example.com;
 

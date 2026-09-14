@@ -391,6 +391,10 @@
 ;;; and to nobody else, which is why this may carry headers when /census
 ;;; deliberately carries nothing about anyone.
 
+(defparameter *lab-redacted-headers*
+  '("cookie" "authorization" "proxy-authorization")
+  "Headers whose value the echo replaces. The ones that carry a credential.")
+
 (defparameter *lab-input-max* 2048
   "Longest accepted lab input. The framework bounds the request line well
    below this already; the cap is here so an over-long value is answered with
@@ -431,7 +435,14 @@
    Rebuilt from the struct rather than kept as raw bytes, deliberately: what
    this shows is the request that was actually dispatched. A header the
    parser dropped is absent here, which is the honest answer to the question
-   the panel is asking."
+   the panel is asking.
+
+   One exception, and it is stated rather than hidden: the value of a header
+   that carries a credential is replaced, its name kept. The echo goes only to
+   the caller who sent it, so this is not guarding one visitor from another —
+   it is guarding a cookie scoped to a parent domain, which a browser sends
+   here without being asked, from turning up in a screenshot, a copied bug
+   report, or anything else on the page that can read the response."
   (with-output-to-string (s)
     (format s "~a ~a~@[?~a~] HTTP/~a~c~c"
             (symbol-name (http-request-method request))
@@ -440,7 +451,11 @@
             (http-request-version request)
             #\Return #\Newline)
     (loop for (name . value) in (http-request-headers request)
-          do (format s "~a: ~a~c~c" name value #\Return #\Newline))
+          do (format s "~a: ~a~c~c" name
+                     (if (member name *lab-redacted-headers* :test #'string-equal)
+                         "(redacted)"
+                         value)
+                     #\Return #\Newline))
     (format s "~c~c" #\Return #\Newline)))
 
 (defun %lab-json (request started pairs &key error (status 200))
