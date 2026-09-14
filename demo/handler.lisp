@@ -1003,11 +1003,18 @@
    could write, and each post takes the store's lock and goes out to every
    socket on every worker — one sender multiplied by the whole room.
 
-   The budget limits a socket and nothing more. A client that opens many
-   sockets gets a budget on each, and nothing in the application can see that
-   they are one client: behind a proxy every peer arrives from the proxy's
-   address. Limiting a client is the proxy's, with limit_conn on the
-   WebSocket location, which demo/deploy's nginx sample sets."
+   The budget limits a socket, and a new socket gets a new one — right for a
+   real client whose connection dropped and came back, and also a way past the
+   budget for one that closes and reopens on purpose. Either way the
+   application cannot tell them apart: behind a proxy every peer arrives from
+   the proxy's address, so \"the same client\" is not a question it can answer.
+
+   Bounding a client is the proxy's, and takes both its limits, not one.
+   limit_conn caps the sockets one address holds at once. limit_req caps how
+   fast it opens new ones — which is what bounds the reopen-for-a-fresh-budget
+   path, since that path never holds enough at once for limit_conn to see. The
+   ceiling is then limit_req's rate times its burst, not unbounded, and each
+   post only makes the bulletin scroll. demo/deploy's nginx sample sets both."
   (cond
     ((= (ws-frame-opcode frame) +ws-op-binary+)
      (%ws-command conn frame))

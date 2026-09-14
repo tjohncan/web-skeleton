@@ -40,12 +40,15 @@ map $http_upgrade $connection_upgrade {
 # the per-connection post budget in the application, not this.
 limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
 
-# And the budget is per socket, so on its own it does not bound a client that
-# opens many. limit_req slows how fast sockets open, not how many stay open: a
-# script at ten upgrades a second holds six hundred within a minute, which is
-# three thousand posts of opening burst and six hundred a second after, each
-# sent to every socket on every worker. This caps open sockets per client —
-# the budget limits a socket, this limits a client.
+# The budget is per socket, so bounding a client takes both proxy limits, and
+# they cover two different floods. A client can HOLD many sockets at once —
+# this zone caps that, sixteen per address (limit_conn, below on /ws). Or it
+# can CHURN them: close and reopen, since each new socket gets a fresh budget
+# of five. limit_req (above, at server level) bounds churn by capping how fast
+# new sockets open — ten a second, burst twenty — so the ceiling is that rate
+# times the burst rather than unbounded. Neither flood is the application's to
+# stop: behind a proxy it cannot tell one client's many sockets from many
+# clients.
 limit_conn_zone $binary_remote_addr zone=ws_demo_conns:10m;
 
 server {
