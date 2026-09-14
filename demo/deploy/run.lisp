@@ -21,9 +21,19 @@
   (error (e) (format t "note: TLS not loaded (~a)~%" e)))
 
 (defun env-int (name default)
+  "Parse a whole integer, or return DEFAULT.
+
+   Set but not an integer warns and falls back, as ENV-HOST does. With
+   :JUNK-ALLOWED this read WS_PORT=80a as 80 without a word, while the image's
+   healthcheck curls the variable as written, :80a, and marks the container
+   unhealthy with nothing in the log to say why."
   (let ((v (sb-ext:posix-getenv name)))
     (if (and v (plusp (length v)))
-        (or (parse-integer v :junk-allowed t) default)
+        (handler-case (parse-integer v)
+          (parse-error ()
+            (format t "note: ~a=~s is not an integer; falling back to ~d~%"
+                    name v default)
+            default))
         default)))
 
 (defun env-host (name default)
