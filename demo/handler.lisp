@@ -71,6 +71,8 @@
        :upgrade)
       ((and (eq method :GET) (string= path "/demo-fetch"))
        (handle-demo-fetch request))
+      ((and (eq method :GET) (string= path "/healthz"))
+       (handle-healthz request))
       ((and (eq method :GET) (string= path "/census"))
        (handle-census request))
       ((and (eq method :GET) (string= path "/bench"))
@@ -679,6 +681,41 @@
          (cons "states"   (%states-json (and slot (getf slot :states))))
          (cons "counters" (%plist-json (and slot (getf slot :counters)))))))
 
+(defparameter *healthz-stale-after* 5
+  "Seconds a worker may go without a loop pass before /healthz calls it
+   wedged. At a 0.05 wake interval a healthy worker passes a hundred times in
+   that; one that has not passed at all is stuck in something.")
+
+(defvar *last-tick* nil
+  "Per-worker vector of the universal time each worker last passed its loop.
+   Written only by its own worker, from BULLETIN-TICK; read by whichever
+   worker answers /healthz. The same shape as *FANNED*, and for the same
+   reason needs no lock: one writer per slot, and a read that is a tick
+   stale costs nothing.")
+
+(defun handle-healthz (request)
+  "200 when every worker has passed its loop recently, 503 naming the ones
+   that have not.
+
+   This is what makes the container healthcheck mean something. The census
+   used to be the healthcheck, and a probe lands on one of four workers: a
+   wedged worker failed about one probe in four, and a check that wants three
+   failures in a row almost never saw it. Here any live worker answers for
+   all of them, because the ticks it reads are every worker's own, so one
+   stuck loop fails every probe, whichever worker takes it."
+  (declare (ignore request))
+  (let* ((now (get-universal-time))
+         (stale (loop for at across *last-tick*
+                      for i from 0
+                      when (> (- now at) *healthz-stale-after*)
+                        collect i)))
+    (if stale
+        (make-text-response
+         503 (format nil "wedged worker~p: ~{~d~^, ~}~%" (length stale) stale))
+        (make-text-response
+         200 (format nil "ok: ~d workers passing their loops~%"
+                     (length *last-tick*))))))
+
 (defun handle-census (request)
   "Server-derived vitals as JSON, for the sternum and limbs panels."
   (declare (ignore request))
@@ -825,7 +862,11 @@
 
 (defun bulletin-tick (worker-id)
   "Fan out to the connections THIS worker owns. Runs on that worker's event
-   loop, which is the only place WS-SEND to them is legal."
+   loop, which is the only place WS-SEND to them is legal.
+
+   Also records that this worker passed its loop, for /healthz, and does it
+   first so a tick with nothing to send still counts as a pass."
+  (setf (aref *last-tick* worker-id) (get-universal-time))
   (let ((new (bulletin-since (aref *fanned* worker-id))))
     (when new
       (let ((payloads (mapcar #'%bulletin-payload new)))
@@ -949,7 +990,11 @@
         *backlink-url* backlink)
   (setf *started-at* (get-universal-time)
         *bulletin* (make-store :test #'eql)
-        *fanned* (make-array workers :initial-element 0))
+        *fanned* (make-array workers :initial-element 0)
+        ;; Zero, not now: a worker that never starts should read as wedged
+        ;; from the first probe, and the image's start period covers the
+        ;; milliseconds before a healthy one passes its loop.
+        *last-tick* (make-array workers :initial-element 0))
   ;; Backquoted rather than quoted now: the backlink is not known until
   ;; this call, and the cache is built once from what it says here.
   (load-static-files "demo/static/"

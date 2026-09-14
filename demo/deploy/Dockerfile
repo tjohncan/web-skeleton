@@ -27,11 +27,14 @@ RUN sbcl --non-interactive \
       --eval '(push #p"/app/" asdf:*central-registry*)' \
       --eval '(asdf:load-system "web-skeleton-demo")'
 
-# The census is the healthcheck. It answers from the same workers that serve
-# everything else, so a wedged event loop fails it — which a TCP connect
-# would not, since the listener survives a worker that has stopped looping.
+# /healthz, which fails if any worker has stopped passing its loop — whichever
+# worker answers the probe, because it reads every worker's last pass rather
+# than only its own. A TCP connect would not catch a stuck worker, since the
+# listener outlives a loop that has stopped; and a probe of an ordinary page
+# lands on one worker of four, so a wedged one would fail about one probe in
+# four and almost never three in a row.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${WS_PORT:-8081}/census" > /dev/null || exit 1
+  CMD curl -fsS "http://127.0.0.1:${WS_PORT:-8081}/healthz" > /dev/null || exit 1
 
 EXPOSE 8081
 CMD ["sbcl", "--non-interactive", "--load", "demo/deploy/run.lisp"]
