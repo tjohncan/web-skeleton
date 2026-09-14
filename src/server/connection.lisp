@@ -21,9 +21,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defvar *connection-serial* 0
-  "Accepted connections on this worker so far. Bound per worker by
-   RUN-WORKER beside the other share-nothing slots, so the increment needs
-   no lock and two workers cannot contend for it.
+  "Accepted connections on this worker so far. Bound once per worker thread,
+   so the increment needs no lock and two workers cannot contend for it —
+   and bound by the thread START-SERVER spawns rather than inside RUN-WORKER
+   beside the other per-worker slots, because RUN-WORKER rebinds those on
+   every restart. A worker that crashes and restarts keeps counting instead
+   of beginning again at one.
 
    Per worker rather than global on purpose: a global would be the one
    counter every accept on every core had to agree about, which is the
@@ -36,7 +39,8 @@
   (fd        -1  :type fixnum)               ; raw file descriptor
   ;; This worker's count of accepted connections at the time this one was
   ;; accepted. Together with the worker id it names a connection for as long
-  ;; as the process lives, which FD alone cannot do: an fd is unique only
+  ;; as the server runs, a crashed worker's restart included, which FD alone
+  ;; cannot do: an fd is unique only
   ;; among the connections open right now, and the kernel hands the lowest
   ;; free one to the next accept. A closed connection's fd belongs to a
   ;; stranger within milliseconds, so anything that labels a peer by fd

@@ -1698,9 +1698,10 @@
               ;; share-nothing slots, because owning the slot outright is
               ;; what lets the publish be lock-free.
               (*worker-id* worker-id)
-              ;; Restarts at zero with the worker, which is why anything
-              ;; naming a connection across a restart needs more than this.
-              (*connection-serial* 0)
+              ;; *CONNECTION-SERIAL* is not bound here. Everything in this
+              ;; LET a crash may throw away and begin again; a serial may
+              ;; not, so it is bound by the thread START-SERVER spawns,
+              ;; outside this loop. See the comment there.
               ;; Per-worker DNS cache. Workers share nothing in the hot
               ;; path, so each keeps its own table and no lock is needed.
               ;; Inert unless the app opts in via *DNS-CACHE-TTL*; a
@@ -2160,9 +2161,18 @@
                                    (adopted (when (zerop i) listener0)))
                                (push (sb-thread:make-thread
                                       (lambda ()
-                                        (run-worker host port id
-                                                    handler ws-handler
-                                                    on-tick adopted))
+                                        ;; Bound here, around RUN-WORKER and
+                                        ;; so outside its restart loop, where
+                                        ;; every other per-worker slot is
+                                        ;; bound fresh on each pass. A serial
+                                        ;; names a connection, and a worker
+                                        ;; that crashed and counted from one
+                                        ;; again would hand a second peer the
+                                        ;; first one's name.
+                                        (let ((*connection-serial* 0))
+                                          (run-worker host port id
+                                                      handler ws-handler
+                                                      on-tick adopted)))
                                       :name (format nil "web-skeleton-~d" i))
                                      threads)
                                ;; Ownership passes to the thread only once

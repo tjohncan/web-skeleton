@@ -2268,6 +2268,108 @@
       (check "and they count accepts, so the highest is at least the count"
              (and serials (>= (reduce #'max serials) (length serials))) t))))
 
+(defun test-connection-serial-survives-a-worker-restart ()
+  "A worker that crashes and restarts keeps counting its accepts, so no two
+   connections the server accepts share a name.
+
+   The serial names a connection, and the demo prints that name on a public
+   line. Bound beside the other per-worker slots, it began again at one on
+   every restart, so a crashed worker's next peer took the name of its first.
+
+   The crash is real rather than simulated. The hook closes the worker's own
+   epoll fd once; the next pass's epoll_wait fails with EBADF, which nothing in
+   RUN-EVENT-LOOP catches, and RUN-WORKER takes the restart path it takes for
+   any error that escapes — the failure its docstring records seeing on a
+   shipping server. So this is also the first test that watches a worker come
+   back at all.
+
+   The restart is detected by the connection table, not assumed from the
+   close. RUN-WORKER binds a fresh table on every pass, so the hook seeing a
+   second distinct table is proof a restart happened; counting ticks after the
+   close would not be, because a worker that somehow survived the close would
+   go on ticking too. The log line is a second, independent witness."
+  (format t "~%server: a serial survives the worker restarting~%")
+  (let ((seen nil)
+        (tables nil)
+        (lock (sb-thread:make-mutex))
+        (crash nil)
+        (log (make-string-output-stream))
+        (saved-stream web-skeleton::*log-stream*))
+    ;; Global SETF: the worker is a thread START-SERVER spawns and reads the
+    ;; global value, so a binding here would capture nothing.
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:workers 1
+              :on-tick
+              (lambda (id)
+                (declare (ignore id))
+                (sb-thread:with-mutex (lock)
+                  (let ((table web-skeleton::*connections*))
+                    (unless (member table tables :test #'eq)
+                      (push table tables))
+                    (maphash (lambda (fd conn)
+                               (unless (assoc conn seen :test #'eq)
+                                 (push (cons conn fd) seen)))
+                             table))
+                  (when crash
+                    (setf crash nil)
+                    (web-skeleton::%close web-skeleton::*epoll-fd*))))
+              :handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "ok")))
+           (flet ((hold-one ()
+                    ;; Retried, because across the restart there is a second
+                    ;; with no listener and a refused connect is expected.
+                    ;; Held open for a few ticks so the hook is certain to
+                    ;; see it, then closed.
+                    (let ((deadline (+ (get-universal-time) 8)))
+                      (loop
+                        (let ((socket (ignore-errors (%raw-connect))))
+                          (when socket
+                            (sleep 0.25)
+                            (ignore-errors (sb-bsd-sockets:socket-close socket))
+                            (sleep 0.15)
+                            (return t)))
+                        (when (> (get-universal-time) deadline) (return nil))
+                        (sleep 0.1))))
+                  (tables-seen ()
+                    (sb-thread:with-mutex (lock) (length tables))))
+             (check "control: a connection was accepted before the crash"
+                    (hold-one) t)
+             (let ((before (sb-thread:with-mutex (lock) (copy-list seen))))
+               (sb-thread:with-mutex (lock) (setf crash t))
+               ;; The restart backs off a second before rebinding; wait for
+               ;; the second table rather than guessing at the second.
+               (let ((deadline (+ (get-universal-time) 8)))
+                 (loop until (or (>= (tables-seen) 2)
+                                 (> (get-universal-time) deadline))
+                       do (sleep 0.05)))
+               (check "control: the worker crashed and came back"
+                      (tables-seen) 2)
+               (check "control: a connection was accepted after the restart"
+                      (hold-one) t)
+               (let* ((after (sb-thread:with-mutex (lock)
+                               (remove-if (lambda (p)
+                                            (assoc (car p) before :test #'eq))
+                                          seen)))
+                      (before-serials
+                        (mapcar (lambda (p) (connection-serial (car p))) before))
+                      (after-serials
+                        (mapcar (lambda (p) (connection-serial (car p))) after)))
+                 (format t "  (serials before the crash ~a, after ~a)~%"
+                         (sort (copy-list before-serials) #'<)
+                         (sort (copy-list after-serials) #'<))
+                 (check "every serial after the restart is above every one before"
+                        (and before-serials after-serials
+                             (> (reduce #'min after-serials)
+                                (reduce #'max before-serials)))
+                        t)))))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (check "control: the log names the crash"
+           (not (null (search "crashed" (get-output-stream-string log))))
+           t)))
+
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
    pipelined behind it.
@@ -4497,6 +4599,7 @@
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
   (test-connection-serial-does-not-repeat-when-an-fd-does)
+  (test-connection-serial-survives-a-worker-restart)
   (test-harness-pipelined-after-body-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
