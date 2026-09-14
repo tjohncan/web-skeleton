@@ -977,12 +977,17 @@
    sender would see an ordering nobody else sees. The demo is here to show
    the mechanism, latency included.
 
-   Posts are budgeted per connection, and the budget is the defence rather
-   than the proxy's rate limit. A proxy's limit counts HTTP requests, and a
-   WebSocket is one request: every frame after the upgrade goes past it
-   uncounted. Unbudgeted, one socket could post as fast as it could write,
-   and each post takes the store's lock and goes out to every socket on every
-   worker — one sender multiplied by the whole room."
+   Posts are budgeted per connection. A proxy's rate limit counts HTTP
+   requests, and a WebSocket is one request: every frame after the upgrade
+   goes past it uncounted. Unbudgeted, one socket could post as fast as it
+   could write, and each post takes the store's lock and goes out to every
+   socket on every worker — one sender multiplied by the whole room.
+
+   The budget limits a socket and nothing more. A client that opens many
+   sockets gets a budget on each, and nothing in the application can see that
+   they are one client: behind a proxy every peer arrives from the proxy's
+   address. Limiting a client is the proxy's, with limit_conn on the
+   WebSocket location, which demo/deploy's nginx sample sets."
   (cond
     ((= (ws-frame-opcode frame) +ws-op-binary+)
      (%ws-command conn frame))
