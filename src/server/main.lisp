@@ -199,8 +199,11 @@
    things an application already has names for. Safe to render, alert on, and
    compare across versions.
 
-   :COUNTERS is cumulative since each worker started, never windowed: a caller
-   wanting a rate samples twice and subtracts. It counts what only the
+   :COUNTERS is cumulative for the life of each worker, never windowed: a
+   caller wanting a rate samples twice and subtracts, and a negative
+   difference means a worker restarted in between. Exactly where each count is
+   taken — and the two responses no count sees — is NOTE-RESPONSE's docstring,
+   and it is worth reading before alerting on these. It counts what only the
    framework sees — responses by class including every refusal no handler ever
    ran for, accepts taken and refused, and the WebSocket frames an application
    handed to a connection, by WS-SEND or as a ws-handler's return value. Not
@@ -214,8 +217,8 @@
    yet. Both are for looking at. Neither is worth depending on.
 
    A consumer must render unknown keys generically rather than matching an
-   exhaustive set — counters are the next ones to appear here, and a panel
-   that switches on a closed list silently stops showing whatever was added.
+   exhaustive set. Keys will be added — :COUNTERS was — and a panel that
+   switches on a closed list silently stops showing whatever arrives next.
 
    The sums are consistent with :PER-WORKER because they are computed from
    it. They are not simultaneous: worker 3 may have published a tick after

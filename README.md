@@ -180,20 +180,22 @@ tests/
 - **Census and counters** — `connection-census` reports connections per worker
   with their states, and cumulative counts of what only the framework sees:
   accepts taken and refused, responses by status class, WebSocket frames
-  queued. Each worker publishes its own slot on the maintenance tick and a
-  reader on any thread sums them, so nothing is locked and what you read is up
-  to a tick old. Counted where a response is handed to a connection —
+  handed over. Each worker publishes its own slot on the maintenance tick and
+  a reader on any thread sums them, so nothing is locked and what you read is
+  up to a tick old. A response is counted where the framework produces it —
   `format-response` for anything built per request, and the static, range,
   streaming and connection-limit paths for the rest — which is why the
-  refusals no handler ever ran for are in there. `format-response` counts
-  on the worker that calls it whether or not the bytes are sent; off a worker
-  it counts nothing. WebSocket frames count those an application hands over,
-  by `ws-send` or as a ws-handler's reply, and not the pings, pongs and
-  closes the framework sends itself.
-  `*worker-id*` says which slot is the one you are running on. Monotonic and
-  never windowed
-  — five minutes and an hour are presentation, and a caller wanting a rate
-  samples twice and subtracts. Its docstring splits the contract: some keys
+  refusals no handler ever ran for are in there. `format-response` and
+  `serve-static` count when called, on the worker that calls them, whether
+  or not the bytes are sent; off a worker they count nothing. Not counted: a
+  byte vector a handler builds and returns itself, and the interim
+  `100 Continue`. WebSocket frames count those an application hands over, by
+  `ws-send` or as a ws-handler's reply, and not the pings, pongs and closes
+  the framework sends itself.
+  `*worker-id*` says which slot is the one you are running on. Cumulative for
+  the life of each worker and never windowed — five minutes and an hour are
+  presentation, and a caller wanting a rate samples twice and subtracts, which
+  goes negative across a worker restart. Its docstring splits the contract: some keys
   are stable, the state breakdown is diagnostic, and a consumer must render
   unknown keys generically
 - **epoll event loop** — edge-triggered, non-blocking I/O via `sb-alien`
@@ -401,7 +403,7 @@ read about here.
   There are four write entry points an application can reach, and **three of
   the four refuse a connection another worker owns**: `ws-send`,
   `stream-close` and `fetch-into` each ask the connection table and raise
-  before anything is queued. None of the three did before this branch:
+  before anything is queued. None of the three did before #16:
   `fetch-into` accepted the call outright, and `ws-send` and `stream-close`
   raised only when the write left a remainder — after appending it, and in
   `stream-close`'s case after telling the application the stream had closed
@@ -412,7 +414,7 @@ read about here.
   the wrong thread; it is noticed only when the write leaves a remainder,
   because the arm that follows gets `ENOENT` — so the common case, where the
   bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
-  had before this branch. It is left alone because closing it is a contract
+  had before #16. It is left alone because closing it is a contract
   change rather than a fix: a cross-worker `stream-send` mostly succeeds today
   and code may lean on that accidentally, where a cross-worker `stream-close`
   already raised every time.
@@ -598,9 +600,11 @@ read about here.
   bytes; deciding *who* receives an event is the app's, and its registry
   has to push from the owning worker. Delivering to a connection this
   thread does not own is a designed-for next step and not a thing you can
-  do today. Fan-out across workers is not provided at all, deliberately —
-  a framework that owned the subscriber registry would own per-process
-  state and become the horizontal-scaling limit.
+  do today. Fan-out is per worker, as the top of this list says: each
+  worker delivers to the connections it owns, from `:on-tick` with
+  `map-worker-websockets`. What the framework does not provide is the
+  subscriber registry, deliberately — a framework that owned it would own
+  per-process state and become the horizontal-scaling limit.
 
 ## Configuration
 
