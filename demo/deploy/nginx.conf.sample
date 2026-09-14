@@ -45,10 +45,11 @@ limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
 # this zone caps that, sixteen per address (limit_conn, below on /ws). Or it
 # can CHURN them: close and reopen, since each new socket gets a fresh budget
 # of five. limit_req (above, at server level) bounds churn by capping how fast
-# new sockets open — ten a second, burst twenty — so the ceiling is that rate
-# times the burst rather than unbounded. Neither flood is the application's to
-# stop: behind a proxy it cannot tell one client's many sockets from many
-# clients.
+# new sockets open — ten a second, burst twenty — so the ceiling is about
+# fifty posts a second (ten new sockets, five posts each) after a one-time
+# burst of twenty sockets, rather than unbounded. Neither flood is the
+# application's to stop: behind a proxy it cannot tell one client's many
+# sockets from many clients.
 limit_conn_zone $binary_remote_addr zone=ws_demo_conns:10m;
 
 server {
@@ -63,6 +64,12 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/demo.example.com/privkey.pem;
 
     limit_req zone=ws_demo burst=20 nodelay;
+    # Both limits answer 503 by default, which makes them indistinguishable in
+    # a log or a probe. 429 is the honest code for a rate limit (limit_conn
+    # keeps 503, the honest one for "too many at once"), and telling them apart
+    # is how you know which flood you are seeing — the rate of new sockets, or
+    # the count held open.
+    limit_req_status 429;
 
     # frame-ancestors is the one CSP directive a <meta> tag cannot carry —
     # browsers parse it there and then ignore it, with a console warning and
@@ -106,7 +113,10 @@ server {
     # people behind one NAT would start getting 503s on stylesheets. Here it
     # counts open sockets, of which a real visitor holds one per tab. Sixteen
     # leaves room for a household or a small office behind one address; a
-    # deployment expecting a large NAT in front of it should raise it.
+    # deployment expecting a large NAT in front of it should raise it — and
+    # raise limit_req with it, which bites first there: every open tab polls
+    # /census every couple of seconds, so a few dozen tabs behind one address
+    # reach the ten-a-second rate before they reach sixteen held sockets.
     location = /ws {
         limit_conn ws_demo_conns 16;
         proxy_pass http://127.0.0.1:8081;

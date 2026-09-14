@@ -1013,8 +1013,9 @@
    limit_conn caps the sockets one address holds at once. limit_req caps how
    fast it opens new ones — which is what bounds the reopen-for-a-fresh-budget
    path, since that path never holds enough at once for limit_conn to see. The
-   ceiling is then limit_req's rate times its burst, not unbounded, and each
-   post only makes the bulletin scroll. demo/deploy's nginx sample sets both."
+   ceiling is then limit_req's rate times a socket's five posts — about fifty
+   a second, after a one-time burst — not unbounded, and each post only makes
+   the bulletin scroll. demo/deploy's nginx sample sets both."
   (cond
     ((= (ws-frame-opcode frame) +ws-op-binary+)
      (%ws-command conn frame))
