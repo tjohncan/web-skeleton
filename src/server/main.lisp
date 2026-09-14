@@ -1639,10 +1639,19 @@
           (setf last-ping-time now)))
       ;; ON-TICK runs last: after this pass's I/O, and after the sweep
       ;; above, so a hook sees a table the sweeper has already walked and
-      ;; a census it has already published. Nothing runs it during
-      ;; shutdown — the *SHUTDOWN* check at the top of the loop returns
-      ;; through DRAIN-CONNECTIONS before reaching here, so an application
-      ;; cannot queue new work onto connections that are draining.
+      ;; a census it has already published. It never runs on connections
+      ;; that are draining — the *SHUTDOWN* check at the top of the loop
+      ;; returns through DRAIN-CONNECTIONS before reaching here — so an
+      ;; application cannot queue new work onto them. A pass that was
+      ;; already under way when shutdown was requested still gets here
+      ;; once, before that check sees the flag; the drain comes after it.
+      ;;
+      ;; Neither ordering is asserted by a test. Nothing a hook can observe
+      ;; says when the loop noticed *SHUTDOWN*, and the flag is set from
+      ;; another thread, so a test of "not after shutdown" would fail on the
+      ;; in-flight pass above whenever the timing landed there. They hold by
+      ;; the order of the forms in this loop, and this comment is where that
+      ;; order is written down.
       (when on-tick
         (handler-case (funcall on-tick *worker-id*)
           (error (e)
@@ -2029,7 +2038,12 @@
    enough that a broken hook is never silent, bounded so that one
    raising every pass cannot flood *LOG-LOCK*.
 
-   It does not run during shutdown.
+   It does not run while a worker drains for shutdown. That is the precise
+   claim, and it is narrower than never running after shutdown: shutdown is requested
+   from another thread and a worker notices at the top of its next pass, so a
+   pass already under way — waiting in epoll_wait, say — finishes, hook
+   included, before the drain begins. The hook can run once after shutdown is
+   requested; it never runs on connections that are draining.
 
    PORT may be 0, in which case the kernel assigns one and ON-LISTEN —
    a function of one argument, called once, on the calling thread, after
