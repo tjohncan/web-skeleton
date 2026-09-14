@@ -309,17 +309,19 @@
    them. Drawing them is what the lab panel next door refuses to do, and the
    appendix has no business doing it either.
 
-   Built once at load time rather than per click, and that is load-bearing
-   rather than thrift. FORMAT-RESPONSE counts what it serializes, and
-   *COUNTERS* is NIL off a worker: at load there are no workers, so a
-   response nobody will ever receive stays out of the census. Per click it
-   would add a 4xx to the numbers on the other tab for traffic that never
-   happened, which is the page disagreeing with the server about what the
-   server did.
+   Built once by START-DEMO, before START-SERVER, rather than per click, and
+   that is load-bearing rather than thrift. FORMAT-RESPONSE counts what it
+   serializes, and *COUNTERS* is NIL off a worker: START-DEMO runs before any
+   worker exists, so a response nobody will ever receive stays out of the
+   census. Per click it would add a 4xx to the numbers on the other tab for
+   traffic that never happened, which is the page disagreeing with the server
+   about what the server did.
 
-   One consequence shows in the bytes: their Date header is the load time,
-   not the time of a click, and the panel's label says so. A live refusal
-   carries the moment it was sent."
+   One consequence shows in the bytes: their Date header is this process's
+   start, not the time of a click, and the panel's label says so. Building
+   them at load instead would freeze that Date at a compiled image's build
+   time, days stale by the time it runs; doing it in START-DEMO makes 'at
+   startup' true. A live refusal carries the moment it was sent."
   (let ((status (handler-case (progn (parse-request (getf c :bytes)) nil)
                   (http-parse-error (e) (or (http-parse-error-status e) 400))
                   (error () 400))))
@@ -329,11 +331,18 @@
         (sb-ext:octets-to-string (format-response resp)
                                  :external-format :latin-1)))))
 
-(defparameter *bench-responses*
-  (mapcar (lambda (c) (cons (getf c :id) (%bench-response c))) *bench-cases*)
+(defvar *bench-responses* nil
   "Case id to the response bytes for it, as a string. NIL for a case the
    parser accepts, where what happens next is the application's business and
-   not this panel's to invent.")
+   not this panel's to invent. Populated by START-DEMO — see %BENCH-RESPONSE
+   for why there and not at load.")
+
+(defun %build-bench-responses ()
+  "Serialize each refusal's response once, off any worker. START-DEMO calls
+   this before START-SERVER, so *COUNTERS* is unbound and these stay out of
+   the census, and the Date they carry is this process's start rather than a
+   compiled image's build date."
+  (mapcar (lambda (c) (cons (getf c :id) (%bench-response c))) *bench-cases*))
 
 (defun %bench-case-json (c)
   (let ((resp (cdr (assoc (getf c :id) *bench-responses* :test #'string=))))
@@ -1136,6 +1145,11 @@
                            (setf (aref v i)
                                  (make-hash-table :test 'eq :weakness :key)))))
   (setf *bulletin-latest* 0)
+  ;; The appendix's refusal responses, serialized here rather than at load so
+  ;; their Date is this process's start and not a compiled image's build date,
+  ;; and still off any worker so they stay out of the census. See
+  ;; %BENCH-RESPONSE.
+  (setf *bench-responses* (%build-bench-responses))
   ;; Backquoted rather than quoted now: the backlink is not known until
   ;; this call, and the cache is built once from what it says here.
   (load-static-files "demo/static/"
