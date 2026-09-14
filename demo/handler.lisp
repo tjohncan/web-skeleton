@@ -179,8 +179,9 @@
 ;;; The port guard
 ;;; ---------------------------------------------------------------------------
 
-(defun %port-already-served-p (port)
-  "T if something already answers on PORT of the loopback interface.
+(defun %port-already-served-p (host port)
+  "T if something already answers on PORT at HOST, the address about to be
+   bound, or on loopback when HOST is a wildcard.
 
    Every listener this framework opens sets SO_REUSEPORT, which is what lets
    one worker per core hold the same port. The cost is that a *second server
@@ -195,15 +196,26 @@
    costs an afternoon to diagnose and one connect() to prevent.
 
    The check races anything started in the gap before the bind, which is
-   fine: the case that actually happens is a previous run that did not die."
-  (handler-case
-      (let ((probe (make-instance 'sb-bsd-sockets:inet-socket
-                                  :type :stream :protocol :tcp)))
-        (unwind-protect
-             (progn (sb-bsd-sockets:socket-connect probe #(127 0 0 1) port)
-                    t)
-          (ignore-errors (sb-bsd-sockets:socket-close probe))))
-    (error () nil)))
+   fine: the case that actually happens is a previous run that did not die.
+
+   Probed at HOST because that is the address a second server has to share
+   for the kernel to pool the two, and a server bound to one address does not
+   answer on loopback. A wildcard is probed on loopback, which every wildcard
+   listener answers on."
+  (let* ((v6 (= (length host) 16))
+         (target (cond ((notevery #'zerop host) host)
+                       (v6 #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))
+                       (t #(127 0 0 1)))))
+    (handler-case
+        (let ((probe (make-instance (if v6
+                                        'sb-bsd-sockets:inet6-socket
+                                        'sb-bsd-sockets:inet-socket)
+                                    :type :stream :protocol :tcp)))
+          (unwind-protect
+               (progn (sb-bsd-sockets:socket-connect probe target port)
+                      t)
+            (ignore-errors (sb-bsd-sockets:socket-close probe))))
+      (error () nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Peer handles
@@ -1192,7 +1204,7 @@
    page served from somebody's collection of things should offer a way back
    to the collection; a page served from nowhere in particular should not
    invent one."
-  (when (%port-already-served-p port)
+  (when (%port-already-served-p host port)
     (error "start-demo: something is already answering on port ~d.~%~
             SO_REUSEPORT means a second server binds it rather than failing, ~
             and both would serve — the kernel splitting connections between ~
