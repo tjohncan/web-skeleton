@@ -407,7 +407,8 @@
   "2208988800. Unix seconds plus this is a Lisp universal time.")
 
 (defun %now-us ()
-  "Microseconds, for timing one handler.
+  "Microseconds of wall time: for timing a handler, refilling a post budget,
+   and stamping a bulletin line.
 
    Not GET-INTERNAL-REAL-TIME: on SBCL 2.6 it does not advance between
    adjacent calls, and two hundred FORMATs between two reads still measured
@@ -423,11 +424,19 @@
 
    GET-TIME-OF-DAY is external, has been for over a decade, and has the
    resolution. What it costs is that it is wall time, so an interval
-   measured across a clock step is not an interval; the subtraction that
-   uses this clamps at zero, so a backward step reports nothing rather than
-   a negative count of microseconds. For a handler that runs in tens of
-   microseconds, beside a round trip this page does not control, that is the
-   cheaper of the two wrongs."
+   measured across a clock step is not an interval.
+
+   So every subtraction of two of these clamps at zero: the lab's handler
+   timer, and the post budget's refill. A backward step then reads as no
+   time having passed, never as negative time. Unclamped, the budget turned
+   a one-hour backward step into minus three thousand six hundred posts,
+   and a connection that had posted before the step stayed locked out for
+   the hour it took to earn them back.
+
+   The bulletin's stamps are not clamped, and say so where they are taken:
+   a stamp is the time the server believed it was, and a clock that stepped
+   back is something a stamp should show rather than paper over. The
+   sequence number is what orders posts."
   (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
     (+ (* sec 1000000) usec)))
 
@@ -813,8 +822,12 @@
    one thing the stamp must not do."
   ;; The stamp is taken inside the update, under the lock, and not before
   ;; it. Taken before, two posts racing on different workers could be stamped
-  ;; in one order and sequenced in the other — a page about the order things
-  ;; happen in, printing times that run backwards.
+  ;; in one order and sequenced in the other. Taken here, a race cannot do
+  ;; that — but the stamp is wall time, so the clock stepping backward still
+  ;; can, and a stamp is left to show it rather than clamped to the one
+  ;; before. Clamping would print a time that never happened, and after a
+  ;; bogus jump forward would pin every stamp there until real time caught up.
+  ;; The sequence is what orders posts; the stamp says when.
   (store-update *bulletin* :ring
                 (lambda (ring)
                   (let ((now (%now-us))
@@ -955,9 +968,12 @@
                (b (or (gethash conn table)
                       (setf (gethash conn table)
                             (make-post-budget :tokens *post-burst* :at now))))
+               ;; Clamped: see %NOW-US. A clock stepped backward makes this
+               ;; negative, and a negative refill is a lockout.
+               (elapsed (max 0 (- now (budget-at b))))
                (tokens (min *post-burst*
                             (+ (budget-tokens b)
-                               (* (/ (- now (budget-at b)) 1000000)
+                               (* (/ elapsed 1000000)
                                   *post-refill-per-second*)))))
           (setf (budget-at b) now)
           (if (>= tokens 1)
