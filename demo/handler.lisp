@@ -769,6 +769,23 @@
 (defvar *bulletin* nil
   "Shared store holding the ring under :RING, newest first.")
 
+(sb-ext:defglobal *bulletin-latest* 0
+  "The newest sequence posted, written under the store's lock by BULLETIN-POST
+   and read without it by every worker's tick.
+
+   It is what lets an idle tick cost nothing. Every worker passes its loop
+   twenty times a second, and reading the ring means taking the store's lock
+   — eighty acquisitions a second on four workers, for a bulletin nobody has
+   posted to. The tick compares this against its own watermark first and
+   takes the lock only when there is something newer.
+
+   Unlocked, and safe to be: a fixnum read is one word, so a reader sees the
+   old value or the new one and never half of each. Old by one post means one
+   tick late, which the next tick corrects.
+
+   DEFGLOBAL rather than DEFVAR for the reason the framework's census is: one
+   shared value cell, never a per-thread binding a worker could shadow.")
+
 (defvar *fanned* nil
   "Per-worker vector of the last sequence that worker has fanned out. Each
    worker writes only its own slot, so no lock — the same share-nothing
@@ -799,13 +816,18 @@
    with a fraction in it — every line posted in one second would claim the
    same instant, which for a page about the order things happen in is the
    one thing the stamp must not do."
-  (let ((now (%now-us)))
-    (store-update *bulletin* :ring
-                  (lambda (ring)
-                    (let ((next (1+ (if ring (first (first ring)) 0))))
-                      (cons (list next text now handle)
-                            (%bulletin-trim ring now)))))
-    nil))
+  ;; The stamp is taken inside the update, under the lock, and not before
+  ;; it. Taken before, two posts racing on different workers could be stamped
+  ;; in one order and sequenced in the other — a page about the order things
+  ;; happen in, printing times that run backwards.
+  (store-update *bulletin* :ring
+                (lambda (ring)
+                  (let ((now (%now-us))
+                        (next (1+ (if ring (first (first ring)) 0))))
+                    (setf *bulletin-latest* next)
+                    (cons (list next text now handle)
+                          (%bulletin-trim ring now)))))
+  nil)
 
 (defun bulletin-since (seq)
   "Lines newer than SEQ, oldest first. The ring descends by sequence, so the
@@ -865,21 +887,38 @@
    loop, which is the only place WS-SEND to them is legal.
 
    Also records that this worker passed its loop, for /healthz, and does it
-   first so a tick with nothing to send still counts as a pass."
+   first so a tick with nothing to send still counts as a pass.
+
+   Takes the store's lock only when *BULLETIN-LATEST* says there is something
+   newer than this worker has sent — the :ON-TICK docstring asks a hook not to
+   block the loop it runs on, and a lock taken twenty times a second for
+   nothing is the slow version of doing exactly that."
   (setf (aref *last-tick* worker-id) (get-universal-time))
-  (let ((new (bulletin-since (aref *fanned* worker-id))))
-    (when new
-      (let ((payloads (mapcar #'%bulletin-payload new)))
-        (map-worker-websockets
-         (lambda (conn)
-           ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone behind
-           ;; it the batch. MAP-WORKER-WEBSOCKETS deliberately does not
-           ;; decide this; an application that broadcasts does.
-           (handler-case
-               (dolist (p payloads) (ws-send conn p))
-             (error () nil)))))
-      (setf (aref *fanned* worker-id)
-            (reduce #'max new :key #'first)))))
+  (let ((latest *bulletin-latest*))
+    (when (> latest (aref *fanned* worker-id))
+      (let ((new (bulletin-since (aref *fanned* worker-id))))
+        (cond
+          (new
+           (let ((payloads (mapcar #'%bulletin-payload new)))
+             (map-worker-websockets
+              (lambda (conn)
+                ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone
+                ;; behind it the batch. MAP-WORKER-WEBSOCKETS deliberately
+                ;; does not decide this; an application that broadcasts does.
+                (handler-case
+                    (dolist (p payloads) (ws-send conn p))
+                  (error () nil)))))
+           (setf (aref *fanned* worker-id)
+                 (reduce #'max new :key #'first)))
+          ;; Newer lines existed and are already gone: this worker went
+          ;; longer than the window without a pass, and the trim took what
+          ;; it had not yet sent. Nothing to send — but left behind, the
+          ;; watermark stays under LATEST, and every tick after this takes the
+          ;; lock to find the ring empty, until somebody posts again. Catching
+          ;; up to what was read is safe: a post landing after that read has a
+          ;; higher sequence and is caught on the next pass.
+          (t
+           (setf (aref *fanned* worker-id) latest)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler
@@ -995,6 +1034,7 @@
         ;; from the first probe, and the image's start period covers the
         ;; milliseconds before a healthy one passes its loop.
         *last-tick* (make-array workers :initial-element 0))
+  (setf *bulletin-latest* 0)
   ;; Backquoted rather than quoted now: the backlink is not known until
   ;; this call, and the cache is built once from what it says here.
   (load-static-files "demo/static/"
