@@ -44,7 +44,8 @@ worker allowed to write to it.
 
 **x-periments** leads with lab samples — base64 both ways, a digest, a JWT
 taken apart — each run as a real request that shows the request as the server
-parsed it and the response as it came back. An appendix hands malformed
+parsed it, and the response's body as received with its headers as `fetch()`
+exposes them. An appendix hands malformed
 requests to the real parser and shows what it said, which a browser cannot
 send itself because `fetch()` normalises them.
 

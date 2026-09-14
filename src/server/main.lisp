@@ -2014,10 +2014,12 @@
    ON-TICK runs on every pass of every worker's event loop, on that
    worker's own thread, with that worker's connection table and epoll fd
    bound. The bindings are the point: the hook runs on the thread that
-   owns the connections, so writing to them from it is legal. WS-SEND,
-   STREAM-CLOSE and FETCH-INTO check that ownership and find it satisfied
-   here rather than refusing; STREAM-SEND is the one that does not check
-   (README, under Limitations), and called from here it does not need to.
+   owns this worker's connections, so writing to those from it is legal.
+   It does not make another worker's connections writable. WS-SEND,
+   STREAM-CLOSE and FETCH-INTO check, and refuse a connection this worker
+   does not own; STREAM-SEND does not check (README, under Limitations), so
+   a hook that walks a registry shared across workers and calls it on each
+   entry is exactly where a cross-worker write goes through without a word.
    It is how an application does periodic per-worker work — rotating
    counters it keeps itself, or writing to the connections this worker
    owns, which is the only way to reach them, since no worker may touch

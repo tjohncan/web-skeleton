@@ -393,7 +393,7 @@
 
 (defun %build-bench-responses ()
   "Serialize each refusal's response once, off any worker. START-DEMO calls
-   this before START-SERVER, so *COUNTERS* is unbound and these stay out of
+   this before START-SERVER, so *COUNTERS* is NIL and these stay out of
    the census, and the Date they carry is this process's start rather than a
    compiled image's build date."
   (mapcar (lambda (c) (cons (getf c :id) (%bench-response c))) *bench-cases*))
@@ -1130,11 +1130,21 @@
   "Cap the length and strip control characters.
 
    The cap is because this is a public box and the text is strangers'. The
-   control strip is not about rendering — the client uses textContent, so
-   nothing here can become markup — it is about the wire format: TABs separate
-   the sequence, the stamp, the handle and the line, and a posted TAB would add
-   a field boundary the client parses as one of those, shifting the handle or
-   the stamp onto whatever the sender typed.
+   strip is not about markup — the page sets textContent, so nothing here can
+   become an element. What it buys is three narrower guarantees.
+
+   A posted line holds no TAB, so its four wire fields survive any reader.
+   This page splits on the first three TABs only and would keep a typed one in
+   the text; a reader that splits on every TAB would not.
+
+   A server notice holds no TAB, which is how the page tells one from a posted
+   line. The reply to an unknown binary command echoes the command through
+   here, so a typed TAB cannot turn that echo into a line with a stamp and a
+   handle the server never assigned.
+
+   A post is one row. The log renders with white-space: pre-wrap, so a newline
+   in the text would draw a second row that its sender could dress up as
+   somebody else's line.
 
    Space is 32, so the test below never catches it and needs no exception."
   (let ((clean (remove-if (lambda (c) (< (char-code c) 32)) text)))

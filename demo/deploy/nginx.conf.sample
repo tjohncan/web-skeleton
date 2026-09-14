@@ -119,10 +119,10 @@ server {
     # people behind one NAT would start getting 503s on stylesheets. Here it
     # counts open sockets, of which a real visitor holds one per tab. Sixteen
     # leaves room for a household or a small office behind one address; a
-    # deployment expecting a large NAT in front of it should raise it — and
-    # raise limit_req with it, which bites first there: every open tab polls
-    # /census every couple of seconds, so a few dozen tabs behind one address
-    # reach the ten-a-second rate before they reach sixteen held sockets.
+    # deployment expecting a large NAT in front of it should raise it, and
+    # limit_req with it: every tab holds one socket and polls /census every
+    # two seconds, so sixteen tabs reach this cap and twenty reach limit_req's
+    # rate.
     location = /ws {
         limit_conn ws_demo_conns 16;
         proxy_pass http://127.0.0.1:8081;
