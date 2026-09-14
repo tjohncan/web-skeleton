@@ -25,12 +25,12 @@
         __BACKLINK__
     </header>
 
-    <nav class="tabs" id="tabs">
-        <button class="tab" data-panel="x-ray" aria-selected="true">x-ray</button>
-        <button class="tab" data-panel="x-periments" aria-selected="false">x-periments</button>
+    <nav class="tabs" id="tabs" role="tablist">
+        <button class="tab" role="tab" data-panel="x-ray" aria-controls="x-ray" aria-selected="true">x-ray</button>
+        <button class="tab" role="tab" data-panel="x-periments" aria-controls="x-periments" aria-selected="false">x-periments</button>
     </nav>
 
-    <div id="x-ray" class="panel">
+    <div id="x-ray" class="panel" role="tabpanel">
 
     <section>
         <h2>teeth</h2>
@@ -62,7 +62,7 @@
 
     </div><!-- x-ray -->
 
-    <div id="x-periments" class="panel" hidden>
+    <div id="x-periments" class="panel" role="tabpanel" hidden>
         <section>
             <h2>lab samples</h2>
             <p class="sub">three ordinary GETs, shown whole - the request is
