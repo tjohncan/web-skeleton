@@ -122,6 +122,7 @@ run-pure-lisp-tests.lisp   Entry point — verify pure-Lisp crypto paths
 src/
   package.lisp     Package (namespace) declaration
   log.lisp         Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
+  counters.lisp    Per-worker counts only the framework sees: accepts, responses, frames
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
   json.lisp        JSON parser and serializer (RFC 8259)
   random.lisp      Crypto random bytes and tokens (/dev/urandom)
@@ -139,15 +140,18 @@ src/
   server/
     connection.lisp    Connection state machine, read/write buffers
     http.lisp          HTTP request parser, response builder, URL/query/routing
+    chunked.lisp       Chunked transfer coding decoders, shared by both directions
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
     fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch)
     dns.lisp           Async DNS via getent ahosts subprocess
+    streaming.lisp     Streamed responses, chunked or close-delimited, produced over time
     main.lisp          epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp     Demo package declaration
   handler.lisp     Bulletin fan-out, census endpoint, request lab, refusal bench
+  test-origin.lisp The /ws Origin check's cases, as a table CI runs
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
   deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/
