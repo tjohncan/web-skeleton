@@ -45,9 +45,9 @@ worker allowed to write to it.
 **x-periments** leads with lab samples — base64 both ways, a digest, a JWT
 taken apart — each run as a real request that shows the request as the server
 parsed it, and the response's body as received with its headers as `fetch()`
-exposes them. An appendix hands malformed
-requests to the real parser and shows what it said, which a browser cannot
-send itself because `fetch()` normalises them.
+exposes them. An appendix hands malformed requests to the real parser and
+shows what it said, which a browser cannot send itself because `fetch()`
+normalises them.
 
 Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
@@ -196,9 +196,9 @@ tests/
   it is the only one that is, and a client that resets its connection is
   closed without one. Not counted either: a byte vector a handler builds and
   returns itself, and the interim `100 Continue` — so `informational` counts
-  the 101 of each WebSocket upgrade. WebSocket frames count those
-  an application hands over, by `ws-send` or as a ws-handler's reply, and not
-  the pings, pongs and closes the framework sends itself. The counts are
+  the 101 of each WebSocket upgrade. WebSocket frames count those an
+  application hands over, by `ws-send` or as a ws-handler's reply, and not the
+  pings, pongs and closes the framework sends itself. The counts are
   cumulative for the life of each worker and never windowed — five minutes
   and an hour are presentation, and a caller wanting a rate samples twice and
   subtracts, which can go negative across a worker restart. Its docstring
