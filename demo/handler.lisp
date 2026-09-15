@@ -95,7 +95,10 @@
 
    Host has to be the one the browser sent, and behind nginx that takes
    proxy_set_header Host $host — the sample's comment on that line says what
-   happens without it."
+   happens without it.
+
+   demo/test-origin.lisp holds the cases, as a table of what the route owes
+   each pair of headers."
   (let ((origin (get-header request "origin")))
     (or (null origin)
         (let ((authority (%origin-authority origin))

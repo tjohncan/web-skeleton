@@ -98,8 +98,12 @@ jobs:
       # one SBCL and internal in another: a READ error, not a warning, so the
       # build ended before it began.
       #
-      # Loading the system is the whole check, and it needs no test to earn
-      # its place: a demo that does not compile has no behaviour to test.
+      # Loading the system is most of the check: a demo that does not compile
+      # has no behaviour to test. The one behaviour checked here is the Origin
+      # check on /ws, the page's only security control and the part of it most
+      # likely to be copied into something else. demo/test-origin.lisp runs
+      # between the load and the sentinel, so a wrong answer leaves no
+      # sentinel either.
       #
       # Success is a file, not a word in the log, and that is not fussiness.
       # The first version of this printed DEMO COMPILED and grepped for it —
@@ -111,7 +115,7 @@ jobs:
       # The suite's own totals-line check above is safe from this for the
       # reason this one was not: run-tests.lisp arrives through --load, so
       # the string it prints is nowhere on the command line.
-      - name: Compile the demo system
+      - name: Compile the demo system, and check its Origin table
         run: |
           set -o pipefail
           rm -f /tmp/demo.ok
@@ -119,10 +123,11 @@ jobs:
                --eval '(require :asdf)' \
                --eval '(push *default-pathname-defaults* asdf:*central-registry*)' \
                --eval '(asdf:load-system "web-skeleton-demo")' \
+               --load demo/test-origin.lisp \
                --eval '(with-open-file (f "/tmp/demo.ok" :direction :output) (write-line "ok" f))' \
                2>&1 | tee /tmp/demo.log
           if [ ! -f /tmp/demo.ok ]; then
-            echo "::error::the demo system did not load"
+            echo "::error::the demo system did not load, or its Origin table failed"
             tail -40 /tmp/demo.log
             exit 1
           fi
