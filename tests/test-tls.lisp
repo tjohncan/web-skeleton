@@ -27,6 +27,7 @@
         (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
+        (test-https-close-without-close-notify-ends-the-body)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -1079,6 +1080,133 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
+
+(defun %call-with-https-fixture (label fn)
+  "Generate the certificate fixture, trust its CA on the shared context, and
+   send every fetch to loopback for the length of FN, which gets the
+   fixture's directory. LABEL names the check that fails if the fixture
+   could not be generated.
+
+   The DNS hook is set globally rather than bound: the worker that reads it
+   is a thread WITH-TEST-SERVER spawned, and a binding would not reach it."
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (if (not (probe-file (format nil "~a/right.pem" dir)))
+               (check (format nil "~a: fixture generated" label) nil t)
+               (progn
+                 (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                          (funcall (tls-sym "ENSURE-SSL-CTX"))
+                          (format nil "~a/ca.pem" dir) nil)
+                 (setf web-skeleton::*dns-lookup-fn*
+                       (lambda (conn epoll-fd fetch-req host port path)
+                         (web-skeleton::initiate-http-fetch-to-address
+                          conn epoll-fd fetch-req host port path #(127 0 0 1) :inet)))
+                 (funcall fn dir))))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun %call-with-held-tls-peer (dir leaf fn)
+  "Run openssl s_server presenting LEAF, relaying its stdin, and keep that
+   stdin open. FN gets the port, or NIL if the peer never listened, and the
+   process. The response goes to (PROCESS-INPUT PROCESS) when FN chooses,
+   and what the client sent comes back on (PROCESS-OUTPUT PROCESS), where
+   s_server copies it.
+
+   Held open because a relay whose input runs out ends with close_notify.
+   With the input still open, s_server sends what it has been given and
+   waits, so the connection ends only the way a test ends it: by sending the
+   rest, or by killing the process, whose socket then closes with no TLS
+   alert at all."
+  (let* ((port (%pick-free-port))
+         (proc (sb-ext:run-program
+                "openssl"
+                (list "s_server" "-accept" (princ-to-string port)
+                      "-cert" (format nil "~a/~a.pem" dir leaf)
+                      "-key"  (format nil "~a/~a.key" dir leaf)
+                      "-quiet" "-naccept" "1")
+                :wait nil :input :stream :output :stream :error nil
+                :directory dir :search t)))
+    (unwind-protect
+         (funcall fn (and (%wait-for-listener port) port) proc)
+      (ignore-errors (sb-ext:process-kill proc 9))
+      (ignore-errors (sb-ext:process-wait proc))
+      (ignore-errors (sb-ext:process-close proc)))))
+
+(defun test-https-close-without-close-notify-ends-the-body ()
+  "A peer that closes without close_notify ends a close-delimited body, on
+   OpenSSL 3 as on 1.1.1.
+
+   An HTTP/1.0-style response with no Content-Length ends when the
+   connection does, and servers close without the TLS alert often enough.
+   OpenSSL 1.1.1 reported that as SSL_ERROR_SYSCALL with errno 0, which the
+   read classifier takes as the end of the body. OpenSSL 3 reports it as a
+   fatal SSL_ERROR_SSL unless SSL_OP_IGNORE_UNEXPECTED_EOF is set, and until
+   it was, every such response failed there.
+
+   Every other fixture here ends with s_server's close_notify, which is how
+   that went unseen. This peer is held open and then killed, so its socket
+   closes with a FIN and no alert. s_server says when. Each pass of its loop
+   writes out what it read from stdin before it reads the socket, and it
+   copies what it reads there to stdout. Once the request line appears, the
+   response that was waiting on stdin is with the kernel and the request is
+   out of the socket, so the kill loses none of the body and leaves nothing
+   unread to turn the close into a reset.
+
+   Control: the peer was killed, not closed with an alert of its own."
+  (format t "~%HTTPS: a close with no close_notify ends the body~%")
+  (%call-with-https-fixture
+   "https unexpected eof"
+   (lambda (dir)
+     (%call-with-held-tls-peer
+      dir "right"
+      (lambda (port peer)
+        (check "https unexpected eof: the peer is listening" (not (null port)) t)
+        (when port
+          (let ((input (sb-ext:process-input peer))
+                (final :never))
+            ;; HTTP/1.0 and no Content-Length: the close is the framing.
+            (format input "HTTP/1.0 200 OK~c~c~c~c~
+                           a body that ends with its connection~%TAIL-MARKER~%"
+                    #\Return #\Linefeed #\Return #\Linefeed)
+            (finish-output input)
+            (let ((killer
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (when (loop for line = (read-line (sb-ext:process-output peer)
+                                                         nil nil)
+                                   while line
+                                   thereis (search "GET /" line))
+                         (sb-ext:process-kill peer 9)
+                         (sb-ext:process-wait peer)))
+                     :name "peer killer")))
+              (with-test-server
+                  (:handler
+                   (lambda (req)
+                     (declare (ignore req))
+                     (http-fetch
+                      :get (format nil "https://right.test:~d/" port)
+                      :then (lambda (status headers body)
+                              (declare (ignore headers))
+                              (setf final
+                                    (list status
+                                          (and body
+                                               (search "TAIL-MARKER"
+                                                       (sb-ext:octets-to-string
+                                                        body :external-format :ascii))
+                                               t)))
+                              (make-text-response 200 "relayed")))))
+                (test-http-request :get "/relay"))
+              (sb-thread:join-thread killer :default nil :timeout 5))
+            (check "https unexpected eof: the close ended the body, all of it"
+                   final (list 200 t))
+            (check "control: the peer was killed, with no alert of its own"
+                   (sb-ext:process-status peer) :signaled))))))))
 
 (defun test-ssl-read-classification ()
   "Every branch of the SSL_read classifier, and the blocking wrapper's one

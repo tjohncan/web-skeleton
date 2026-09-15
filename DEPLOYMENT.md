@@ -420,7 +420,10 @@ that tells you which knob to turn.
 **`SSL_ERROR_SYSCALL` discipline.** OpenSSL returns `SSL_ERROR_SYSCALL` for
 several distinct conditions and they must not be collapsed. `errno = 0` is
 end-of-stream without `close_notify` — benign, and load-bearing, because it
-is the framing signal HTTP/1.0-style servers actually use. `errno = EAGAIN`
+is the framing signal HTTP/1.0-style servers actually use. That is OpenSSL
+1.1.1's shape. OpenSSL 3 reports the same close as a fatal error unless told
+otherwise, so the shared context sets `SSL_OP_IGNORE_UNEXPECTED_EOF`, under
+which 3.x reports it as a clean end instead and the two agree. `errno = EAGAIN`
 is would-block. Everything else (`ECONNRESET`, `EPIPE`, `ETIMEDOUT`) is a
 real transport failure and raises loudly, because that is the
 MITM-RST-mid-stream case: an attacker truncates a response, and a silent

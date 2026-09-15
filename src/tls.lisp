@@ -155,6 +155,18 @@
   (larg sb-alien:long)
   (parg (* t)))
 
+;;; Options, and the library version that decides which ones exist. Both are
+;;; functions in 1.1.0 and later; the option bit set below means what it says
+;;; only from 3.0, so it is gated on the version rather than on the symbol,
+;;; and the options are bound as 3.0 declares them, uint64_t.
+(sb-alien:define-alien-routine ("OpenSSL_version_num" %openssl-version-num)
+    sb-alien:unsigned-long)
+
+(sb-alien:define-alien-routine ("SSL_CTX_set_options" %ssl-ctx-set-options)
+    (sb-alien:unsigned 64)
+  (ctx (* t))
+  (options (sb-alien:unsigned 64)))
+
 ;;; Hostname verification (OpenSSL 1.1.0+)
 (sb-alien:define-alien-routine ("SSL_set1_host" %ssl-set1-host) sb-alien:int
   (ssl (* t))
@@ -180,6 +192,10 @@
    SSL_CTX_ctrl mixup) can return 1 while writing to a garbage offset,
    and only the read-back exposes that the floor never landed.")
 (defconstant +tls1-2-version+ #x0303)
+(defconstant +openssl-3+ #x30000000
+  "OpenSSL_version_num of 3.0.0.")
+(defconstant +ssl-op-ignore-unexpected-eof+ #x80
+  "SSL_OP_BIT(7): OpenSSL 3.0 and later.")
 (defconstant +ssl-error-want-read+ 2)
 (defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-syscall+ 5)
@@ -235,6 +251,20 @@
                (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
                                            +tls1-2-version+ (sb-sys:int-sap 0)))
                  (error "SSL_CTX set min proto version failed"))
+               ;; A peer that closes without close_notify is how an
+               ;; HTTP/1.0-style response ends, and SSL-READ-EOF-OR-RAISE
+               ;; reads it as the end of the body. OpenSSL 1.1.1 reported it
+               ;; as SSL_ERROR_SYSCALL with errno 0, which is the arm that
+               ;; reading lives in. OpenSSL 3 reports the same close as a
+               ;; fatal SSL_ERROR_SSL, so without this every such response
+               ;; failed — and so did a framed one whose last bytes and the
+               ;; close came in one wake-up, before completeness was checked.
+               ;; The option makes 3.x report it as SSL_ERROR_ZERO_RETURN,
+               ;; a clean end, which puts both versions back on one reading.
+               ;; Truncation of a framed body is still caught where it always
+               ;; was, by a short Content-Length or a missing terminator.
+               (when (>= (%openssl-version-num) +openssl-3+)
+                 (%ssl-ctx-set-options ctx +ssl-op-ignore-unexpected-eof+))
                ;; Load system CA certificates. Raising rather than warning:
                ;; SSL_VERIFY_PEER is set two lines down, so with no trust
                ;; anchors every handshake fails anyway — the old warning was
@@ -523,7 +553,11 @@
      errno = 0                  — end of stream with no close_notify.
                                   Benign, and load-bearing: it is the
                                   framing signal for HTTP/1.0-style
-                                  servers that never send one.
+                                  servers that never send one. This is
+                                  OpenSSL 1.1.1's shape; 3.x reports the
+                                  same close as SSL_ERROR_ZERO_RETURN,
+                                  because ENSURE-SSL-CTX sets
+                                  SSL_OP_IGNORE_UNEXPECTED_EOF.
      errno = EAGAIN/EWOULDBLOCK — would block. :AGAIN, per above.
      errno = EINTR              — a signal arrived before the call moved
                                   any bytes. Nothing is wrong with the
