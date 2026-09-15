@@ -644,12 +644,14 @@
    so teardown doesn't wait a full second per call. Float accepted —
    the worker converts to ms for epoll_wait.
 
-   It does not set the periodic-maintenance cadence. RUN-EVENT-LOOP gates
-   the idle sweep on a hardcoded one second and the WebSocket ping on
-   *WS-PING-INTERVAL*; this only bounds how often the loop can wake to
-   check them. Lowering it makes shutdown prompt without making either
-   scan run more often — the harness sets it to 0.05 and the sweep still
-   runs at 1 Hz.")
+   It does not set the periodic-maintenance cadence, but it bounds it.
+   RUN-EVENT-LOOP gates the idle sweep and the census publish on a
+   hardcoded one second and the WebSocket ping on *WS-PING-INTERVAL*, and
+   looks at those gates only when the loop wakes. Lowering this makes
+   shutdown prompt without making either scan run more often — the harness
+   sets it to 0.05 and the sweep still runs at 1 Hz. Raising it past a
+   second does the opposite for a worker with no traffic to wake it: the
+   sweep, the publish and the ping all wait out the full interval.")
 
 (defconstant +max-events+ 64
   "Maximum events to process per epoll_wait call. Internal — not a
