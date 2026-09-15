@@ -104,7 +104,11 @@
    vector it built itself: the framework queues it as given and never learns
    its status — which is also how an application keeps a response out of the
    count on purpose. And the interim 100 Continue, which precedes the final
-   response to the same request rather than standing in for one."
+   response to the same request rather than standing in for one.
+
+   That leaves one 1xx the framework counts of its own: the 101 that
+   completes a WebSocket upgrade. So :INFORMATIONAL is the upgrades, plus any
+   1xx an application's handler builds itself."
   (when *counters*
     (incf (counters-responses *counters*))
     (case (floor status 100)

@@ -195,7 +195,8 @@ tests/
   response the serializer refuses is never counted, so the 500 that replaces
   it is the only one that is, and a client that resets its connection is
   closed without one. Not counted either: a byte vector a handler builds and
-  returns itself, and the interim `100 Continue`. WebSocket frames count those
+  returns itself, and the interim `100 Continue` — so `informational` counts
+  the 101 of each WebSocket upgrade. WebSocket frames count those
   an application hands over, by `ws-send` or as a ws-handler's reply, and not
   the pings, pongs and closes the framework sends itself. The counts are
   cumulative for the life of each worker and never windowed — five minutes
