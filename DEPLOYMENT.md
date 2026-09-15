@@ -750,8 +750,13 @@ continuation feeds the handler that returned it and nothing else. A
                              (stream-send client chunk)
                              nil)
                   :then (lambda (status headers body)
-                          (declare (ignore status headers body))
-                          (stream-close client)
+                          (declare (ignore headers body))
+                          ;; Only a delivered response ends with a terminator.
+                          ;; A NIL status is a failed fetch: closing here would
+                          ;; tell the client a truncated body was complete,
+                          ;; and left open, the framework closes it without one.
+                          (when status
+                            (stream-close client))
                           nil))))))
 ```
 
