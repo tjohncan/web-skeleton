@@ -139,10 +139,14 @@ hostnames in it, cannot be committed by reflex.
 
 ### Reverse proxy
 
-web-skeleton has no inbound TLS. In production, put it behind
-nginx, caddy, or a similar reverse proxy for HTTPS termination.
+web-skeleton has no inbound TLS, and it is not built to face the internet on
+its own. Put it behind nginx, caddy, or a similar reverse proxy. The proxy
+terminates TLS, and it is also where request buffering, rate limits and the
+patience for slow or hostile clients belong: the framework bounds everything
+it parses, but it does not try to be what absorbs an attack.
 The default bind address is localhost (`#(127 0 0 1)`), correct for this setup.
-Use `:host #(0 0 0 0)` only if the server must accept connections directly.
+Bind `#(0 0 0 0)` inside a container, where the published port decides who can
+arrive — not to take connections from the internet directly.
 
 ### Status codes the framework itself sends
 
