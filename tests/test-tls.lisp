@@ -28,6 +28,7 @@
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
         (test-https-close-without-close-notify-ends-the-body)
+        (test-https-a-dirty-error-queue-does-not-fail-a-read)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -1207,6 +1208,88 @@ printf 'TAIL-MARKER\\n' >> body.txt
                    final (list 200 t))
             (check "control: the peer was killed, with no alert of its own"
                    (sb-ext:process-status peer) :signaled))))))))
+
+(defun test-https-a-dirty-error-queue-does-not-fail-a-read ()
+  "A failed libcrypto call on a worker does not fail that worker's next TLS
+   read.
+
+   OpenSSL keeps one error queue per thread, and SSL_get_error reads it
+   first: with anything on it, a read that only needs more bytes comes back
+   SSL_ERROR_SSL. Nothing emptied it, so any earlier failure on the worker —
+   a certificate that did not verify, a token whose signature did not check
+   out — turned the next WANT_READ into a failed fetch.
+
+   Arranged directly. A held-open peer sends the head and first chunk of a
+   chunked response and waits. :ON-BODY takes the chunk on the worker's own
+   thread, hands ECDSA-VERIFY-P256-LIBSSL an all-zero key and signature,
+   which OpenSSL refuses and records on that thread's queue — what a forged
+   token does — and only then sends the rest. The drain that reads it ends
+   in WANT_READ, and the fetch completes only if that is read as what it is.
+
+   Between chunks, and not before the fetch. OpenSSL's handshake empties the
+   queue itself on every step, so a queue dirtied in the handler is clean
+   again before the first read, and a test arranged that way passes without
+   the fix.
+
+   Control: the queue was dirty in the way that matters. Asked about an SSL
+   that has done nothing, SSL_get_error has only the queue to go on, and
+   answers SSL_ERROR_SSL only for an error from outside the system library.
+   A system error reads as SSL_ERROR_SYSCALL, which the classifier settles
+   from errno, and would leave this passing without the fix."
+  (format t "~%HTTPS: a dirty error queue does not fail the next read~%")
+  (%call-with-https-fixture
+   "https error queue"
+   (lambda (dir)
+     (%call-with-held-tls-peer
+      dir "right"
+      (lambda (port peer)
+        (check "https error queue: the peer is listening" (not (null port)) t)
+        (when port
+          (let ((input (sb-ext:process-input peer))
+                (reads-as :never)
+                (chunks nil)
+                (final :never))
+            (flet ((send (&rest lines)
+                     (dolist (line lines)
+                       (format input "~a~c~c" line #\Return #\Linefeed))
+                     (finish-output input))
+                   (zeros (n)
+                     (make-array n :element-type '(unsigned-byte 8)
+                                   :initial-element 0)))
+              (send "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+                    "A" "FIRST-HALF")
+              (with-test-server
+                  (:handler
+                   (lambda (req)
+                     (declare (ignore req))
+                     (http-fetch
+                      :get (format nil "https://right.test:~d/" port)
+                      :on-body
+                      (lambda (conn chunk)
+                        (declare (ignore conn))
+                        (push (sb-ext:octets-to-string chunk :external-format :ascii)
+                              chunks)
+                        (when (eq reads-as :never)
+                          (funcall (tls-sym "ECDSA-VERIFY-P256-LIBSSL")
+                                   (zeros 32) (zeros 64) (zeros 32) (zeros 32))
+                          (let ((idle (funcall (tls-sym "%SSL-NEW")
+                                               (funcall (tls-sym "ENSURE-SSL-CTX")))))
+                            (setf reads-as
+                                  (funcall (tls-sym "%SSL-GET-ERROR") idle -1))
+                            (funcall (tls-sym "%SSL-FREE") idle))
+                          (send "B" "SECOND-HALF" "0" ""))
+                        nil)
+                      :then (lambda (status headers body)
+                              (declare (ignore headers body))
+                              (setf final status)
+                              (make-text-response 200 "relayed")))))
+                (test-http-request :get "/relay")))
+            (check "control: the worker's queue now reads as SSL_ERROR_SSL (1)"
+                   reads-as 1)
+            (check "https error queue: the fetch on that worker completed"
+                   final 200)
+            (check "https error queue: with both halves of the body"
+                   (reverse chunks) '("FIRST-HALF" "SECOND-HALF")))))))))
 
 (defun test-ssl-read-classification ()
   "Every branch of the SSL_read classifier, and the blocking wrapper's one

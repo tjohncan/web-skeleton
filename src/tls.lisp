@@ -107,26 +107,64 @@
   (ssl (* t))
   (fd sb-alien:int))
 
-(sb-alien:define-alien-routine ("SSL_connect" %ssl-connect) sb-alien:int
-  (ssl (* t)))
-
-(sb-alien:define-alien-routine ("SSL_shutdown" %ssl-shutdown) sb-alien:int
-  (ssl (* t)))
-
 (sb-alien:define-alien-routine ("SSL_get_error" %ssl-get-error) sb-alien:int
   (ssl (* t))
   (ret sb-alien:int))
 
-;;; I/O
-(sb-alien:define-alien-routine ("SSL_read" %ssl-read) sb-alien:int
+;;; The error queue, and the four calls SSL_get_error explains.
+;;;
+;;; OpenSSL keeps one error queue per thread, and SSL_get_error reads it
+;;; before anything else: if anything is already on it, the answer is
+;;; SSL_ERROR_SSL whatever the call that just returned really hit. Its man
+;;; page is plain about it — the queue "must be empty before the TLS/SSL I/O
+;;; operation is attempted, or SSL_get_error() will not work reliably."
+;;;
+;;; On a worker that is not a formality. The queue fills from anything on
+;;; the thread that fails: a certificate that did not verify, EVP_PKEY_verify
+;;; refusing a signature a client sent, a shutdown on a handshake that never
+;;; happened. Every drain ends in WANT_READ, so the next one on that worker
+;;; is reported as fatal, and a fetch to a healthy upstream fails with a 502.
+;;;
+;;; Emptied before each call rather than after each failure, because the
+;;; things that can fill the queue are an open list and the calls
+;;; SSL_get_error explains are these four. So they are bound under -RAW
+;;; names, and the names every call site uses are wrappers that empty the
+;;; queue first. A call site cannot forget to, and neither can the next one
+;;; written.
+(sb-alien:define-alien-routine ("ERR_clear_error" %err-clear-error)
+    sb-alien:void)
+
+(sb-alien:define-alien-routine ("SSL_connect" %ssl-connect-raw) sb-alien:int
+  (ssl (* t)))
+
+(sb-alien:define-alien-routine ("SSL_shutdown" %ssl-shutdown-raw) sb-alien:int
+  (ssl (* t)))
+
+(sb-alien:define-alien-routine ("SSL_read" %ssl-read-raw) sb-alien:int
   (ssl (* t))
   (buf (* t))
   (num sb-alien:int))
 
-(sb-alien:define-alien-routine ("SSL_write" %ssl-write) sb-alien:int
+(sb-alien:define-alien-routine ("SSL_write" %ssl-write-raw) sb-alien:int
   (ssl (* t))
   (buf (* t))
   (num sb-alien:int))
+
+(defun %ssl-connect (ssl)
+  (%err-clear-error)
+  (%ssl-connect-raw ssl))
+
+(defun %ssl-shutdown (ssl)
+  (%err-clear-error)
+  (%ssl-shutdown-raw ssl))
+
+(defun %ssl-read (ssl buf num)
+  (%err-clear-error)
+  (%ssl-read-raw ssl buf num))
+
+(defun %ssl-write (ssl buf num)
+  (%err-clear-error)
+  (%ssl-write-raw ssl buf num))
 
 ;;; Staging a write into foreign memory is a byte copy on the write path,
 ;;; so it goes through libc rather than a SAP loop.
