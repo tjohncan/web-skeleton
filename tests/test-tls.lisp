@@ -341,8 +341,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
    CONNECTION-READ-AVAILABLE over an SSL byte source, driven only by
    edge-triggered epoll.
 
-   This is the trap issue #8 calls the one that will bite, and until now it
-   was an argument rather than a test. SSL_read returns at most one record
+   This is the trap most likely to bite, and until now it was an argument
+   rather than a test. SSL_read returns at most one record
    per call and hands back already-decrypted bytes before it touches the
    socket. Consume part of a record and the remainder sits in OpenSSL's
    buffer with nothing left on the fd, so an edge-triggered epoll has no
@@ -691,7 +691,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                                       :output nil :error nil)))))
 
 (defun test-https-does-not-hold-the-worker ()
-  "Issue #8's headline criterion: with one worker, a request relaying from
+  "The headline criterion for HTTPS on the event loop: with one worker, a
+   request relaying from
    an https:// upstream must not delay a concurrent request to a fast
    endpoint.
 

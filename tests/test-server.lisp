@@ -2293,7 +2293,7 @@
    existed, at all three granularities below, which agreed — so a single
    recorded triple is not a lie about any of them. That capture is what
    makes the deletion of ~450 lines checkable rather than hopeful, and it
-   is the whole reason issue #4 put the seam there."
+   is the whole reason the seam was put there."
   (let* ((cr (string #\Return))
          (lf (string #\Newline))
          (crlf (concatenate 'string cr lf)))
@@ -4712,7 +4712,7 @@
    is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
    does not — which is what makes the two masks distinguishable without any
    data timing. Asserting delivery instead would pass against a mask that
-   never changed: issue #5 produced exactly that test, twice.
+   never changed, and exactly that test was written twice before this one.
 
    The second half is the security-relevant one. A connection whose
    transport has a handshake is not usable when the TCP connect lands, and
@@ -4885,8 +4885,8 @@
   "A paused outbound is resumed when the inbound it relays into drains its
    own backlog — without the application calling FETCH-RESUME.
 
-   Issue #5 described the resume as an inbound->outbound edge; what shipped
-   was FETCH-RESUME, a primitive the app had to invoke itself. The gap that
+   The resume belongs on the inbound->outbound edge. FETCH-RESUME alone is
+   a primitive the app has to invoke itself, and the gap that
    left is not theoretical: ON-BODY is the app's only scheduled contact
    with a relay, pausing is what stops ON-BODY firing, so an app that
    paused and had nothing else to run had removed its own way back.
@@ -4894,8 +4894,8 @@
    Asserted against epoll rather than against a flag. Clearing
    FETCH-PAUSED without re-arming EPOLLIN would look identical from the
    struct and would leave the connection waiting for an event nobody is
-   going to send — which is exactly the mistake issue #5's own re-arm test
-   was rewritten to catch."
+   going to send — which is exactly the mistake the re-arm test was
+   rewritten to catch."
   (format t "~%Automatic inbound-to-outbound resume~%")
   (multiple-value-bind (in-server in-client) (%loopback-pair)
     (multiple-value-bind (out-server out-client) (%loopback-pair)
@@ -5071,8 +5071,8 @@
    stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
    and until now not assertable without a real socket and a real partial
    read. A scripted byte source makes it deterministic, which matters
-   because issue #8 rests the whole SSL_pending argument on this loop
-   behaving exactly this way."
+   because the whole SSL_pending argument rests on this loop behaving
+   exactly this way."
   (format t "~%Connection transport seam~%")
   ;; ---- reads ----
   (let* ((calls (list 0))

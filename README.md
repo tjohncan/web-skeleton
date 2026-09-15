@@ -413,9 +413,9 @@ read about here.
   There are four write entry points an application can reach, and **three of
   the four refuse a connection another worker owns**: `ws-send`,
   `stream-close` and `fetch-into` each ask the connection table and raise
-  before anything is queued. None of the three did before #16:
-  `fetch-into` accepted the call outright, and `ws-send` and `stream-close`
-  raised only when the write left a remainder — after appending it, and in
+  before anything is queued. Before is the point: a check that ran later —
+  `ws-send` and `stream-close` once raised only when the write left a
+  remainder — would report the misuse after appending the bytes, and in
   `stream-close`'s case after telling the application the stream had closed
   normally.
 
@@ -424,7 +424,7 @@ read about here.
   the wrong thread; it is noticed only when the write leaves a remainder,
   because the arm that follows gets `ENOENT` — so the common case, where the
   bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
-  had before #16. It is left alone because closing it is a contract
+  had before it was guarded. It is left alone because closing it is a contract
   change rather than a fix: a cross-worker `stream-send` mostly succeeds today
   and code may lean on that accidentally, where a cross-worker `stream-close`
   already raised every time.

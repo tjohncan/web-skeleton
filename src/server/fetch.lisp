@@ -211,8 +211,9 @@
    Return :STOP from ON-BODY to end the fetch. The outbound is closed,
    the connection being fetched into is left untouched, and THEN receives
    the abort sentinel — a NIL status — because a response the caller cut
-   short is not a delivered one, and reporting a real status over it is
-   the silent truncation issue #12 closed. There is no resume; a stopped
+   short is not a delivered one, and reporting a real status over it would
+   be silent truncation: a partial body presented as a whole one. There is
+   no resume; a stopped
    fetch is over.
 
    :STOP ends the fetch, not the pass, so like :PAUSE it does not stop
@@ -2005,8 +2006,8 @@
   "End a pause that CONN's own write backlog caused, now that it has
    drained. A no-op unless an outbound paused while relaying into CONN.
 
-   This is the inbound->outbound edge issue #5 described and #7 shipped
-   without. Called where the backlog actually empties rather than on every
+   This is the inbound->outbound edge FETCH-RESUME alone does not provide.
+   Called where the backlog actually empties rather than on every
    write, because a relay whose client is keeping up never pauses at all
    and should not pay for the check twice per pass.
 
@@ -2715,8 +2716,8 @@
    The third way a detached fetch can end, and the only one that both
    reports the truth and keeps the target. COMPLETE-FETCH reports
    :DELIVERED — a real status and the partial body, which tells an
-   application that a response it cut short arrived whole, and is the same
-   silent truncation issue #12 closed. DELIVER-FETCH-ERROR reports the
+   application that a response it cut short arrived whole, which is silent
+   truncation again. DELIVER-FETCH-ERROR reports the
    truth and then takes the target with it through DELIVER-DETACHED's
    disposition. Stopping wants the honest report without the disposition,
    which is neither of them.

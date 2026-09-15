@@ -359,7 +359,7 @@
    remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
    — the common case, where the bytes fit, returns T and says nothing.
 
-   That is the shape WS-SEND had before #16 and it is stated here
+   That is the shape WS-SEND had before it was guarded, and it is stated here
    rather than fixed because fixing it is a contract change: today a
    cross-worker STREAM-SEND mostly succeeds, and applications may be
    relying on it accidentally. STREAM-CLOSE could be guarded without one,
