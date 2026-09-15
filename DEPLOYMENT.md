@@ -44,9 +44,10 @@ Register both your project and web-skeleton with ASDF, then load and start:
                        (make-pathname :directory (pathname-directory *load-truename*)))
       asdf:*central-registry*)
 
-;; Optional: load TLS support for outbound HTTPS
+;; Optional: load TLS support for outbound HTTPS. Print the error itself:
+;; a compile or read error in the TLS system is not a missing libssl.
 (handler-case (asdf:load-system "web-skeleton-tls")
-  (error () (format t "Note: TLS not available (libssl not found)~%")))
+  (error (e) (format t "Note: TLS not loaded (~a)~%" e)))
 
 (asdf:load-system "my-app")
 (my-app:start)
