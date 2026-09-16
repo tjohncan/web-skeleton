@@ -432,8 +432,19 @@ non-blocking socket `SO_RCVTIMEO` does nothing at all, so `EAGAIN` means only
 what it says and the event loop waits for readability; there the bound comes
 from the parked inbound's timer rather than from the socket.
 
-Operationally the guarantee is unchanged: a truncated HTTPS response is an
-error, never a short success, on either path.
+Operationally, a truncated *framed* response is an error on either path: a
+`Content-Length` short of its body meets `complete-fetch`'s truncation guard,
+and a chunked body with no terminator meets `decode-chunked-body`'s raise.
+Both become a 502.
+
+A close-delimited response has no framing to fall short of. It ends where the
+connection ends, so a FIN injected mid-body ends it early and reads as
+complete — on 1.1.1 by default, and on 3.x under the option above, which
+OpenSSL documents for protocols that can detect a truncation themselves. HTTP
+can when it is framed, and cannot when it is not. An RST is still the loud
+failure the paragraph above describes; it is the clean close that cannot be
+told from an honest one. An upstream whose responses matter should send
+`Content-Length` or chunked.
 
 **Framing headers are the framework's, not yours.** Passing either
 `Transfer-Encoding` or `Content-Length` in `:headers` signals an error
