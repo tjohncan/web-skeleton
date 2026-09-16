@@ -3,14 +3,18 @@
 ;;; ===========================================================================
 ;;; TLS via libssl FFI (OpenSSL 1.1+)
 ;;;
-;;; Provides blocking TLS connections for outbound HTTPS in http-fetch.
+;;; Outbound HTTPS, two ways: a transport under the event loop's own reads
+;;; and writes for HTTP-FETCH, and a blocking connection for
+;;; HTTP-FETCH-STREAM.
 ;;; Loaded by the web-skeleton-tls ASDF system — optional, not part of core.
 ;;;
 ;;; On load:
 ;;;   1. Opens libssl.so and libcrypto.so
-;;;   2. Initializes OpenSSL
-;;;   3. Creates a shared SSL_CTX with system CA roots
-;;;   4. Registers the HTTPS fetch handler with the core framework
+;;;   2. Swaps sha1, sha256 and ecdsa-verify-p256 to libssl-backed versions
+;;;   3. Registers the outbound TLS transport and the HTTPS stream hook
+;;;
+;;; On the first connection rather than on load: OPENSSL_init_ssl and the
+;;; shared SSL_CTX carrying the system CA roots, both in ENSURE-SSL-CTX.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
@@ -522,7 +526,7 @@
 (defun tls-write-all (ssl bytes)
   "Write all BYTES through the SSL connection. Blocks until complete.
    Surfaces SO_SNDTIMEO as a distinct error from transport failures
-   via SSL-WRITE-ERROR-RAISE — symmetric with SSL-READ-EOF-OR-RAISE
+   via SSL-WRITE-RETRY-OR-RAISE — symmetric with SSL-READ-EOF-OR-RAISE
    on the read path."
   (let ((pos 0)
         (len (length bytes)))

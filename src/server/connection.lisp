@@ -1182,7 +1182,7 @@
                               (= (aref buf (+ sp 7)) 46))  ; .
                    (http-parse-error "malformed request line"))
                  ;; Capture the minor-version byte (48 = HTTP/1.0,
-                 ;; 49 = HTTP/1.1) so SCAN-EXPECT-100-CONTINUE can be
+                 ;; 49 = HTTP/1.1) so SCAN-EXPECT-DISPOSITION can be
                  ;; gated on 1.1 below — RFC 7231 §5.1.1 scopes the
                  ;; interim 100 Continue response to HTTP/1.1.
                  (let ((minor-version-byte (aref buf (+ sp 8)))

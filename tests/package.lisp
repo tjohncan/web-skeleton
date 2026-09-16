@@ -8,5 +8,6 @@
            #:test-harness
            #:test-tls
            #:test-properties
-           ;; Framework-dev re-verification — not part of (test)
+           ;; Re-verification of the pure-Lisp crypto, which (test) runs
+           ;; last and only where libssl displaced it
            #:test-pure-lisp-crypto))

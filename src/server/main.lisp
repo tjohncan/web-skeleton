@@ -281,11 +281,12 @@
      body))
   "The refusal sent when a worker is at *MAX-CONNECTIONS*, built once.
 
-   No Date header, for the reason BUILD-STATIC-RESPONSE omits one: bytes
-   frozen at load time cannot carry a per-request timestamp, and a stale
-   Date is worse than none. Building it per refusal would put header
-   construction on the one path that exists because the worker is already
-   out of room.")
+   No Date header, and not for the reason a static response omits one
+   from its frozen bytes — that one is served as pieces with a date line
+   put between them per request. This is sent whole, and building it per
+   refusal would put header construction on the one path that exists
+   because the worker is already out of room. A stale Date would be worse
+   than none, so it carries none.")
 
 (defconstant +refusal-drain-size+ 2048
   "Bytes REFUSE-CONNECTION clears per read while draining a refused peer.

@@ -1,8 +1,9 @@
 ;;;; streaming.lisp — server-generated streaming responses
 ;;;;
-;;;; The framework has three chunked *decoders* and no encoder: everything
-;;;; chunked it has ever seen arrived from an upstream. Producing a stream
-;;;; is the other direction, and it starts here.
+;;;; The framework's three chunked *decoders* all read somebody else's
+;;;; bytes: everything chunked they see arrived from an upstream.
+;;;; Producing a stream is the other direction, and ENCODE-CHUNK below is
+;;;; where it starts.
 ;;;;
 ;;;; This file is deliberately not fetch.lisp. The decoders live there
 ;;;; because they belong to reading an upstream response; encoding belongs
@@ -307,6 +308,9 @@
                                ends: :DONE when the app closed it,
                                :DISCONNECTED when the peer went away,
                                :IDLE or :STALLED when a deadline took it,
+                               :UPSTREAM-FAILED when a FETCH-INTO
+                               relaying into it failed, or its close
+                               could not be written,
                                :SHUTDOWN on server drain. Release
                                whatever the app registered here.
    KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See

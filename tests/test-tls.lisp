@@ -694,9 +694,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
 (defun test-https-does-not-hold-the-worker ()
   "The headline criterion for HTTPS on the event loop: with one worker, a
-   request relaying from
-   an https:// upstream must not delay a concurrent request to a fast
-   endpoint.
+   request relaying from an https:// upstream must not delay a concurrent
+   request to a fast endpoint.
 
    The stall is a SIGSTOPped peer, and that choice is what makes this a
    test rather than a race. A frozen process completes the TCP connect —

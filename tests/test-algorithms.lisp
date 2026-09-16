@@ -616,11 +616,14 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Pure-Lisp crypto re-verification (framework-dev entry point)
 ;;;
-;;; NOT wired into the default (test) runner. Intended for humans editing
-;;; src/algorithms/sha1.lisp, sha256.lisp, or ecdsa.lisp who want to verify
-;;; their changes to the pure-Lisp implementations on a machine that has
-;;; web-skeleton-tls loaded (and therefore sees the libssl-backed versions
-;;; as the active sha1/sha256/ecdsa-verify-p256 by default).
+;;; (TEST) runs this last, and only on a machine where libssl displaced
+;;; the pure-Lisp crypto — there it is the only thing that exercises the
+;;; originals, since every earlier suite saw the libssl-backed versions
+;;; through the swapped symbol cells. Where libssl is absent the default
+;;; cells already are the pure-Lisp ones, so (TEST) skips it as a
+;;; re-run of what TEST-ALGORITHMS just did. Also the entry point to call
+;;; by hand when editing src/algorithms/sha1.lisp, sha256.lisp or
+;;; ecdsa.lisp.
 ;;;
 ;;; Mechanism: temporarily swap SYMBOL-FUNCTION for the three public
 ;;; crypto names back to their *-LISP originals, run the existing

@@ -5,8 +5,13 @@
 ;;;
 ;;; Integrates with the event loop — outbound connections are registered
 ;;; with the same epoll fd and processed alongside inbound connections.
-;;; Non-blocking I/O after connection. DNS resolution (get-host-by-name)
-;;; and HTTPS (via TLS hook) block the worker thread.
+;;; Nothing on the event loop's path blocks the worker: a name is resolved
+;;; by a getent subprocess whose pipe joins the same epoll
+;;; (INITIATE-DNS-LOOKUP), and https:// runs as a transport under the same
+;;; reads and writes (TLS-SETUP-OUTBOUND). The blocking pair —
+;;; RESOLVE-HOST-BLOCKING and HTTPS-FETCH-STREAM — belongs to
+;;; HTTP-FETCH-STREAM further down, which is a blocking entry point by
+;;; design and says so there.
 ;;;
 ;;; Usage from a handler:
 ;;;   (http-fetch :get "http://host/path"
@@ -25,8 +30,9 @@
   (headers  nil    :type list)
   (body     nil)
   (callback nil    :type function)
-  ;; (BYTES) called per chunk as the response arrives, on the async
-  ;; http:// path. NIL buffers the whole body as before.
+  ;; (CONN BYTES) called per chunk as the response arrives, over either
+  ;; scheme — the framing decides, not the transport. NIL buffers the
+  ;; whole body instead.
   (on-body  nil    :type (or null function))
   ;; :HTTP or :HTTPS, filled in by INITIATE-FETCH from the parsed URL.
   ;; It lives here rather than being re-derived because the DNS path
@@ -141,7 +147,10 @@
 
 (defparameter *max-outbound-response-size* (* 8 1024 1024)
   "Maximum total bytes (headers + body together) for a buffered
-   outbound HTTPS response read by TLS-READ-ALL. Default 8 MiB.
+   outbound response, whatever its scheme. Default 8 MiB. It is the
+   outbound arm of CONNECTION-READ-CAP, so the event loop stops growing
+   the read buffer there, and PARSE-CHUNKED-SIZE-LINE refuses a declared
+   chunk larger than it before any of it is read.
    Distinct from *MAX-BODY-SIZE*, which caps inbound request
    bodies — applying that 1 MiB inbound limit to outbound responses
    would reject legitimate 1 MiB HTTPS responses on principle.")
@@ -213,8 +222,7 @@
    the abort sentinel — a NIL status — because a response the caller cut
    short is not a delivered one, and reporting a real status over it would
    be silent truncation: a partial body presented as a whole one. There is
-   no resume; a stopped
-   fetch is over.
+   no resume; a stopped fetch is over.
 
    :STOP ends the fetch, not the pass, so like :PAUSE it does not stop
    the chunks already in hand from reaching ON-BODY. It differs in the
@@ -1260,9 +1268,11 @@
    raises on parse failure. Returns the integer size (0 for the
    final chunk).
 
-   Shared between stream-chunked-lines (streaming, either
-   transport) and decode-chunked-body (buffered) so every path
-   rejects the same garbage inputs. Strict rejection matters because a
+   The streaming path's parser, reached from stream-chunked-lines over
+   either transport. DECODE-CHUNKED-BODY scans the buffered path's
+   sizes itself, deliberately symmetric with this one down to the digit
+   cap and the bytes it will accept after the digits: two implementations
+   kept in step rather than one shared. Strict rejection matters because a
    permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
    the decoder loop as if the stream were complete — a parser-
    disagreement smuggling primitive against any stricter
@@ -2187,12 +2197,13 @@
    NEXT-CHUNK-SCAN back in on the following call so a chunked body is
    walked once across a growing buffer (see CHUNKED-BODY-COMPLETE-P).
 
-   One definition of 'the response is done', shared by the non-blocking
-   plain-HTTP read path (HANDLE-OUTBOUND-READ) and the blocking TLS one
-   (TLS-READ-ALL). They used to disagree: plain HTTP recognized the
-   chunked terminator while TLS read to EOF, so the same upstream could
-   be handled cleanly over http:// and stall over https://. A single
-   predicate is the only way that divergence stays fixed.
+   One definition of 'the response is done', reached through
+   HANDLE-OUTBOUND-READ for every outbound response, http:// and https://
+   alike — TLS is a transport under that read, not a second reader. Two
+   readers did once disagree, one recognizing the chunked terminator and
+   the other reading to EOF, so the same upstream could be handled
+   cleanly over one scheme and stall over the other. A single predicate
+   is the only way that divergence stays fixed.
 
    Framing, in RFC 7230 §3.3.3 order:
      HEAD           — no body ever (§4.3.2), even when the upstream
@@ -2717,10 +2728,9 @@
    reports the truth and keeps the target. COMPLETE-FETCH reports
    :DELIVERED — a real status and the partial body, which tells an
    application that a response it cut short arrived whole, which is silent
-   truncation again. DELIVER-FETCH-ERROR reports the
-   truth and then takes the target with it through DELIVER-DETACHED's
-   disposition. Stopping wants the honest report without the disposition,
-   which is neither of them.
+   truncation again. DELIVER-FETCH-ERROR reports the truth and then takes
+   the target with it through DELIVER-DETACHED's disposition. Stopping wants
+   the honest report without the disposition, which is neither of them.
 
    It ends through CLOSE-OUTBOUND rather than around it. The exactly-once
    contract, the epoll removal, the DNS reap and the abort sentinel are all

@@ -618,7 +618,7 @@
 ;;; Install our dispatchers into fetch.lisp's hook slots so initiate-
 ;;; http-fetch, fetch-stream-plain, and tls-connect can reach us without
 ;;; compile-time forward references. The hook pattern mirrors src/tls.lisp's
-;;; registration of *HTTPS-FETCH-FN*.
+;;; registration of *HTTPS-STREAM-FN*.
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)
