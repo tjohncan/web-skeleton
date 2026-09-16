@@ -1221,10 +1221,18 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    Arranged directly. A held-open peer sends the head and first chunk of a
    chunked response and waits. :ON-BODY takes the chunk on the worker's own
-   thread, hands ECDSA-VERIFY-P256-LIBSSL an all-zero key and signature,
-   which OpenSSL refuses and records on that thread's queue — what a forged
-   token does — and only then sends the rest. The drain that reads it ends
-   in WANT_READ, and the fetch completes only if that is read as what it is.
+   thread and hands ECDSA-VERIFY-P256-LIBSSL a real public key — RFC 7515
+   A.3's, the one TEST-ECDSA verifies against — with a signature of zeros.
+   That is the forgery an attacker can send without credentials: it needs no
+   secret, only the public key. OpenSSL refuses it with an EC error and
+   records that on the thread's queue, and only then is the rest of the
+   response sent. The drain that reads it ends in WANT_READ, and the fetch
+   completes only if that is read as what it is.
+
+   Zeros rather than a wrong-but-well-formed signature, because the refusal
+   has to reach the queue: an r or s out of range is refused before any
+   arithmetic and recorded. The digest is not what is being refused, so it
+   is zeros too.
 
    Between chunks, and not before the fetch. OpenSSL's handshake empties the
    queue itself on every step, so a queue dirtied in the handler is clean
@@ -1271,7 +1279,11 @@ printf 'TAIL-MARKER\\n' >> body.txt
                               chunks)
                         (when (eq reads-as :never)
                           (funcall (tls-sym "ECDSA-VERIFY-P256-LIBSSL")
-                                   (zeros 32) (zeros 64) (zeros 32) (zeros 32))
+                                   (zeros 32) (zeros 64)
+                                   (base64url-decode
+                                    "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU")
+                                   (base64url-decode
+                                    "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
                           (let ((idle (funcall (tls-sym "%SSL-NEW")
                                                (funcall (tls-sym "ENSURE-SSL-CTX")))))
                             (setf reads-as
