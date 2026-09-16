@@ -2,7 +2,7 @@
 
 HTTP/1.1 and WebSocket server for SBCL on Linux,
 written from the syscalls up.
-One declared dependency: `sb-bsd-sockets`.
+One declared dependency is `sb-bsd-sockets`.
 
 The epoll event loop, the request parser, the chunked codec,
 the WebSocket framing, SSE, an epoll-integrated outbound HTTP client,
@@ -470,8 +470,7 @@ read about here.
   sends, and §5.3.4 defines asterisk-form (`OPTIONS * HTTP/1.1`), which some
   health checkers use. Both are answered `400` here. Deliberate — one
   accepted shape is one shape to get wrong, and behind a reverse proxy
-  neither form arrives — but it is a boundary rather than an oversight, and
-  it was previously written down nowhere.
+  neither form arrives — but it is a boundary rather than an oversight.
 - **Percent-decoding assumes UTF-8.** `url-decode` decodes to a string and
   raises on a byte sequence that is not valid UTF-8, so `?q=%FF` — a legal
   percent-encoding — becomes a `400` raised from inside the handler at
@@ -607,8 +606,8 @@ read about here.
   keeps its connection open indefinitely. Memory is still bounded —
   `*max-write-backlog*` caps what may pile up behind it — so the cost is
   a connection slot and its backlog, not unbounded growth. This is the
-  deliberate trade for `ws-send` no longer holding the worker: the old
-  ten-second bound was a total, and it was a total on the wrong thing.
+  deliberate trade for `ws-send` not holding the worker: a total deadline
+  would bound the frame rather than the stall.
 - **A stream can only be written from the worker that owns it.**
   `stream-send` touches an unsynchronized write queue, and the connection
   belonging to exactly one event loop is what lets that queue exist

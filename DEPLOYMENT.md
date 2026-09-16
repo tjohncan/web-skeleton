@@ -120,10 +120,8 @@ tighten it for known-small line protocols or raise it for unusual schemas.
 
 ### Runnable artifacts
 
-`demo/deploy/` holds a working set for the demo, and they exist because this
-document is long and none of it was executable: a Dockerfile and an nginx
-server block can be run and can therefore be wrong in a way a paragraph
-cannot.
+`demo/deploy/` holds a working set for the demo
+(a runnable Dockerfile and nginx server block).
 
 | file | what it settles |
 |---|---|
@@ -139,14 +137,17 @@ hostnames in it, cannot be committed by reflex.
 
 ### Reverse proxy
 
-web-skeleton has no inbound TLS, and it is not built to face the internet on
-its own. Put it behind nginx, caddy, or a similar reverse proxy. The proxy
-terminates TLS, and it is also where request buffering, rate limits and the
-patience for slow or hostile clients belong: the framework bounds everything
-it parses, but it does not try to be what absorbs an attack.
+web-skeleton has no inbound TLS, and it is
+not built to face the internet on its own.
+Put it behind nginx, caddy, or a similar reverse proxy.
+The proxy terminates TLS, and it is also where request buffering,
+rate limits and the patience for slow or hostile clients belong:
+the framework bounds everything it parses,
+but it does not try to be what absorbs an attack.
 The default bind address is localhost (`#(127 0 0 1)`), correct for this setup.
-Bind `#(0 0 0 0)` inside a container, where the published port decides who can
-arrive — not to take connections from the internet directly.
+Bind `#(0 0 0 0)` inside a container,
+where the published port decides who can arrive —
+not to take connections from the internet directly.
 
 ### Status codes the framework itself sends
 
@@ -166,20 +167,10 @@ specific status, not a blanket 400:
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised |
 
-**If you alert on 400s, this changes what you see.** Every 4xx and 5xx
-above except the 503 was a 400 previously, so a dashboard counting
-"client errors" will start splitting them out — and a spike that used to
-look like malformed requests may resolve into something more specific,
-such as a client retrying with an oversized body or a scanner speaking
-HTTP/2 at a 1.1 port. That is the point of the change, but it does move
-the numbers.
-
-**The 503 is new traffic, not re-labelled traffic.** A worker at
-`*max-connections*` used to accept the socket and close it without a
-word, so an overloaded instance and a crashed one were indistinguishable
-from the client side and there was nothing to back off against. It now
-answers before closing. Two consequences worth knowing before you build
-an alert on it:
+**The 503 says overloaded, where silence would say crashed.** A worker at
+`*max-connections*` answers before it closes, so a client can tell a full
+instance from a gone one and has something to back off against. Two
+consequences worth knowing before you build an alert on it:
 
 - **The 503 is always written; whether it is seen is not guaranteed.**
   The refusal is one non-blocking write followed by a bounded drain of
@@ -199,16 +190,18 @@ an alert on it:
   race like any other. A client refused mid-upload, or simply slower than
   the accept, can end up with a reset and nothing else.
 
-  This is still strictly better than the bare close it replaces, which
-  conveyed nothing by construction. It is not a delivery guarantee, and
-  an alert built on counting 503s at the client will undercount.
+  So it is not a delivery guarantee, and an alert built on counting 503s
+  at the client will undercount.
 - **It is not in your access path**, so it will not appear in handler
   metrics or anything else counted after dispatch. If you want to see
   refusals, watch the `connection limit reached` warning, which is
   logged once per refusal.
 
-Like static responses, the refusal carries no `Date` — see the header's
-own section below for why pre-built bytes omit it.
+The refusal carries no `Date`. It is one frozen vector sent whole, and
+building a header per refusal would put that work on the path that exists
+because the worker is out of room. Static responses start from the same
+constraint and answer it the other way: their bytes are stored as pieces,
+with a current date line written between them per request.
 
 `status-reason` covers the codes above plus the ones handlers commonly
 need — 202, 303, 410, 411, 412, 415, 422, 428 and the usual 2xx/3xx/4xx
@@ -343,9 +336,9 @@ for everything after it. `http-fetch-stream` still gets the three per-phase boun
 above; `http-fetch` gets one total.
 
 This is not a tuning detail on the HTTPS path, it is the only bound there is:
-`SO_RCVTIMEO` does nothing on a non-blocking socket, so the per-phase reading
-that used to bound encrypted reads no longer applies to them at all. The
-`:awaiting` timer replaced it. Tune `*fetch-timeout*` with this in mind —
+`SO_RCVTIMEO` does nothing on a non-blocking socket, so nothing per-phase
+bounds an encrypted read and the `:awaiting` timer is what stands in its
+place. Tune `*fetch-timeout*` with this in mind —
 it is the worst-case wall time the parked inbound will sit in `:awaiting`
 before the idle sweeper answers **`504 Gateway Timeout`** and closes.
 
@@ -477,7 +470,7 @@ fires **exactly once per fetch** with one of two argument shapes:
   A body stops early by falling short of a declared `Content-Length`,
   or by ending without its chunked terminator — and `:on-body` having
   already delivered chunks does not make a truncated response complete.
-  The closure's return value is discarded in this branch
+  The closure's return value is discarded on this path
   because there is no inbound to deliver anything to.
 
 The cleanup sentinel exists so apps can release state deterministically
@@ -509,10 +502,10 @@ Don't rely on cleanup-path exceptions propagating back to the caller — they do
 ### TLS trust anchors
 
 **A missing CA store raises rather than warning.** `SSL_VERIFY_PEER` is
-set, so a process with no trust anchors fails every handshake regardless
-— the old warning was already fail-closed, it just left you to connect
-one startup line to an unrelated-looking stream of handshake errors
-afterwards. The first HTTPS fetch now says so directly.
+set, so a process with no trust anchors fails every handshake regardless.
+Raising is not what makes it fail-closed; it is what makes the failure
+legible, said once at the first HTTPS fetch rather than left to be
+inferred from an unrelated-looking stream of handshake errors.
 
 This bites on distroless and scratch images. Install a CA bundle
 (`ca-certificates`), or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at one. A
@@ -698,8 +691,9 @@ diverges from the server's permanently with nothing raised anywhere.
 Something forwarding an upstream should stop reading it instead, because
 the client has not misbehaved, and letting the upstream's TCP window fill
 turns a killed download into a slow one. That second disposition is why
-the bound exposes a state rather than picking an answer — though see
-Limitations for why forwarding onward cannot presently be built.
+the bound exposes a state rather than picking an answer, and `fetch-into`
+below is what builds it: an `:on-body` that answers `:PAUSE` stops reading
+the upstream, whose window then fills, and `fetch-resume` starts it again.
 
 Per connection, so the ceiling is `*max-write-backlog*` × `*max-connections*`
 × workers — the same shape as the read-buffer arithmetic above, and it takes
@@ -867,10 +861,9 @@ response size or by whatever proxy sits in front of it. Write the handler
 to take the bytes from `:on-body` when they arrive there and from
 `:then`'s body when they do not.
 
-The one asymmetry this used to have is gone: `:on-body` now behaves
-identically over `https://`, because both schemes take the same path and
-there is no second implementation to differ from. It is the framing that
-decides, not the transport.
+`:on-body` behaves identically over `https://`: both schemes take the same
+path, so there is no second implementation to differ from. It is the
+framing that decides, not the transport.
 
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
@@ -1195,19 +1188,15 @@ multiple workers this is fine for bounded work (e.g. streaming an LLM
 response for a few seconds), but avoid unbounded blocking — that is your
 code on the worker thread, and no framework change removes it.
 
-**What `ws-send` contributes to that is now nothing.** It used to block
-until every byte was flushed or its send deadline expired, and because
-the event loop is paused while a handler runs, the thing being held was
-the worker: every other connection on it, frozen for up to ten seconds by
-one peer that stopped reading. With `(cpu-count)` workers that was 1/N of
-the server's capacity held by a single slow client, and N of them arriving
-together was a full stall.
-
-The frame now goes onto that connection's write queue and `ws-send`
-returns. A peer that is keeping up still gets incremental delivery,
-because the flush happens on the spot rather than waiting for the handler
-to finish; a peer that is not accumulates a backlog instead of freezing
-anything. **The blast radius is one connection.**
+**`ws-send` contributes nothing to that.** The frame goes onto that
+connection's write queue and `ws-send` returns. A peer that is keeping up
+still gets incremental delivery, because the flush happens on the spot
+rather than waiting for the handler to finish; a peer that is not
+accumulates a backlog instead of freezing anything. A send that waited for
+every byte would hold the worker instead — the event loop is paused while
+a handler runs, so one peer that stopped reading would freeze every other
+connection on that worker, which with `(cpu-count)` workers is 1/N of the
+server. **The blast radius is one connection.**
 
 Two limits bound what is left, and they answer different questions.
 `*max-write-backlog*` is how much may pile up; `*write-stall-timeout*` is
@@ -1229,47 +1218,41 @@ surface on the first maximal message.
 
 `*write-stall-timeout*` applies to every connection with a backlog,
 whatever state it is in — WebSocket frames, server-sent streams, ordinary
-responses to a client that stopped reading. It was called
-`*ws-send-timeout*` while it bounded a spin inside `ws-send`; that name
-would have sent anyone tuning a stalled SSE stream looking at a WebSocket
-setting, and scoping the check to WebSocket connections would have left
-long-lived streams — the state most likely to build a backlog — as the
-one state with no stall bound at all.
+responses to a client that stopped reading. Scoping it to WebSocket
+connections would leave long-lived streams — the state most likely to
+build a backlog — as the one state with no stall bound at all, and a
+WebSocket-shaped name would send anyone tuning a stalled SSE stream
+looking in the wrong place.
 
 It must be positive, and `start-server` refuses to start otherwise.
 `ws-send` checks it too, but only `ws-send` does — a handler that returns
 a frame rather than pushing one appends through a path that never sees
 it, so the startup check is what actually backs the promise.
 
-**It is an inactivity bound, not a total.** The old ten-second deadline
-was a total: one frame, ten seconds, trickle or not. This one restarts
-every time the peer accepts any bytes at all, so a client reading one
-byte per interval holds its connection open indefinitely. That is the
-deliberate trade for not holding the worker — the total bound was a total
-on the wrong thing — and the cost is capped at one connection slot plus
+**It is an inactivity bound, not a total.** It restarts every time the
+peer accepts any bytes at all, so a client reading one byte per interval
+holds its connection open indefinitely. That is the deliberate trade for
+not holding the worker: a total deadline would bound the frame instead of
+the stall, and the cost here is capped at one connection slot plus
 `*max-write-backlog*` rather than 1/N of the server. If your deployment
 needs a hard ceiling on how long a single peer may occupy a slot, that is
 the proxy's job, not this one's.
 
-This changes the advice for fan-out. One unresponsive subscriber used to
-be enough to stall a broadcast, which was the reason to prefer your own
-queue over calling `ws-send` in a loop. It now costs that subscriber its
-own connection and nothing else. `ws-send` returns NIL when it leaves a
-remainder, so a broadcast loop that wants to know which subscribers are
-falling behind can see it without tracking anything itself.
+That settles the advice for fan-out: one unresponsive subscriber costs
+that subscriber its own connection and nothing else, so a `ws-send` loop
+is a reasonable broadcast rather than a stall waiting for its slowest
+member. `ws-send` returns NIL when it leaves a remainder, so a broadcast
+loop that wants to know which subscribers are falling behind can see it
+without tracking anything itself.
 
-That sentence was not true until recently, and the gap is worth naming
-because the shape it broke is the one this section recommends.
 `handle-client-read` arms the connection it was woken for — the one whose
 handler is running. A frame pushed to *another* connection had nothing
 downstream to arm it, so a lagging subscriber did not cost its own
 connection: it got a truncated message, with every `ws-send` reporting
 success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
-connection it wrote to whenever it leaves a remainder, which is what makes
-the paragraph above describe the code.
+connection it wrote to whenever it leaves a remainder.
 
-One boundary on "nothing else", and it is the sender rather than the
-subscriber. A `ws-send` to a connection belonging to a *different worker*
+A `ws-send` to a connection belonging to a *different worker*
 raises, and the raise is caught by the handler-case around the handler that
 made the call. That closes the sender's connection, not the subscriber's.
 Fan out only over connections this worker owns; a registry that spans
@@ -1289,11 +1272,11 @@ from the wrong thread, and returning success.
 **It catches the wrong worker, not the wrong thread.** Asking whether an fd is
 on *this worker's* table requires being on a worker, so a thread that is not
 one — an application's own timer, a queue consumer, a background pump feeding a
-subscriber registry — finds no table, skips the check, and gets the old
-behaviour in full. `stream-send` and `stream-close` are the same. The rule that
-actually holds is the one at the top of this section: write to a connection
-only from the callback the framework handed it to you in. The refusal narrows
-what a mistake inside that rule costs; it does not replace the rule.
+subscriber registry — finds no table, skips the check, and gets the
+unguarded behaviour in full. `stream-send` and `stream-close` are the same.
+Write to a connection only from the callback the framework handed it to you in.
+The refusal narrows what a mistake inside that rule costs;
+it does not replace the rule.
 
 ### Logging holds the only shared lock
 
@@ -1324,7 +1307,8 @@ Two operational consequences:
 
 ### Static files
 
-`load-static-files` reads files into memory at startup and pre-builds HTTP responses.
+`load-static-files` reads files into memory at startup
+and pre-builds HTTP responses.
 Call it **before** `start-server`.
 It is not thread-safe and must not be called while the server is running.
 
@@ -1348,9 +1332,9 @@ or leave large media to the reverse proxy, which is already in front of
 this server for TLS termination and is better at it. The cap is per-call,
 not global, so additive calls each bring their own budget.
 
-Static responses **carry a `Date`**, like every other response, and the
-pre-built path survives intact. RFC 7231 §7.1.1.2 makes it a `MUST` and
-this used to be the one place the server did not comply.
+Static responses **carry a `Date`**
+and the pre-built path survives intact.
+RFC 7231 §7.1.1.2 makes it a `MUST`.
 
 The bytes are still built once at startup, but they are stored as pieces
 rather than as a finished response: a prefix holding the status line and
@@ -1365,12 +1349,12 @@ by reference while it drains — a `Date` rewritten under a half-sent
 response would be a torn header with nothing to catch it. A new line is
 built when the second turns instead.
 
-Storing the body separately also retired an offset that used to matter: a
-range was sliced out of the pre-built 200 at a position derived from the
-header block's length. Anything added to the headers of one pre-built
-vector and not the other would have moved the body under the slice — a
-`206` with a correct status, a correct `Content-Length`, and content
-starting a few bytes early. No offset depends on header length now.
+Storing the body separately also retires an offset that would otherwise
+matter: a range sliced out of the pre-built 200 at a position derived from
+the header block's length moves under anything added to the headers of one
+pre-built vector and not the other — a `206` with a correct status, a
+correct `Content-Length`, and content starting a few bytes early. No offset
+depends on header length.
 
 `206` and `416` build their headers per request, so they get a `Date`
 from the ordinary serializer along with everything else.
@@ -1603,8 +1587,8 @@ well-formed-but-wrong document.
 
 Both are `(string . cons)`. A serializer handed a bare list cannot tell an array
 of pairs from an alist with a structured value, so any rule that emits `{…}` for
-the second emits it for the first — which is how `[["a",1],["b",2]]` used to come
-back out as `{"a":[1],"b":[2]}`. Well-formed, silently wrong, no error anywhere.
+the second emits it for the first, turning `[["a",1],["b",2]]` into
+`{"a":[1],"b":[2]}`. Well-formed, silently wrong, no error anywhere.
 The information is destroyed at parse time, so no heuristic downstream can
 recover it; typing objects is the only fix that works in both directions.
 
