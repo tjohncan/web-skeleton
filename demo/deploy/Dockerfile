@@ -7,6 +7,12 @@
 # parser has never been tested against, and the failure would be a server that
 # starts cleanly and cannot resolve anything, with nothing in the log to say
 # why. One base image is one thing to get wrong.
+#
+# bookworm's SBCL is 2.2.9, which is right for this demo and not for every
+# application. The demo never fetches by hostname, so it never spawns the
+# getent child SBCL leaks before 2.4.11: measured on 2.2.9, 200 fetches to a
+# name that resolves left 14 zombies, and 2.6 left none. An application that
+# does fetch by hostname wants a newer SBCL than this base image carries.
 FROM debian:bookworm-slim
 
 # sbcl is the runtime. libssl3 and ca-certificates are optional and are what

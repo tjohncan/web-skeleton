@@ -16,8 +16,8 @@ It is the network and protocol layer; applications must bring their own flesh.
 ## Requirements
 
 - SBCL (Steel Bank Common Lisp). 2.4.11 or later for a long-running server
-  that fetches by hostname: before it, a lookup whose `getent` child has not
-  exited when its connection closes leaves that child a zombie
+  that fetches by hostname: before it, every lookup whose `getent` child
+  outlives its answer leaves a zombie
 - Linux
 - `getent` on PATH — ships with glibc and musl, present on every
   mainstream distro (used via `sb-ext:run-program`
