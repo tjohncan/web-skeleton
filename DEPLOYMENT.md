@@ -149,6 +149,14 @@ Bind `#(0 0 0 0)` inside a container,
 where the published port decides who can arrive —
 not to take connections from the internet directly.
 
+Request buffering is a setting, not a given.
+nginx buffers a request body before forwarding it, by default.
+Caddy, HAProxy and Traefik stream it to the upstream unless told otherwise
+(`request_buffers`, `option http-buffer-request`, the `buffering` middleware).
+Behind a proxy that streams, the client trickling a body
+is this server's to hold after all,
+which is the one job above that comes back here.
+
 ### Status codes the framework itself sends
 
 A request the framework rejects before your handler sees it gets a
