@@ -401,11 +401,12 @@
    slow peer looks, not an error. Failures of the flush itself do surface
    here; failures of the deferred remainder surface on the event loop.
 
-   Call it from within ws-handler, or from a fetch callback on a
-   :WEBSOCKET target. Inside a handler the event loop is paused, so there
-   is no write contention; from a fetch callback the target is a
+   Call it from within ws-handler, from :ON-TICK on a WebSocket this worker
+   owns — MAP-WORKER-WEBSOCKETS walks them — or from a fetch callback on a
+   :WEBSOCKET target. Inside a handler or the hook the event loop is paused,
+   so there is no write contention; from a fetch callback the target is a
    connection nothing else is writing to for the life of the fetch. A
-   remainder is handed to the event loop the same way in both — see the
+   remainder is handed to the event loop the same way in all three — see the
    header comment for why it has to be handed over here.
 
    Signals if the connection is already at *MAX-WRITE-BACKLOG*: the frame
@@ -479,6 +480,12 @@
            (connection-fd conn)
            (connection-write-pending conn)
            (length frame-bytes)))
+  ;; After the append succeeded, so a frame refused at the backlog is not
+  ;; counted as one sent. This counts frames handed to the queue, not bytes
+  ;; that reached a peer — the queue is where this function's responsibility
+  ;; ends, and a count that claimed delivery would be claiming something no
+  ;; write path here can know.
+  (note-ws-frame)
   (let ((done (eq (connection-on-write conn) :done)))
     (unless (or done (null *epoll-fd*))
       (epoll-modify *epoll-fd* (connection-fd conn)
@@ -583,7 +590,12 @@
                    (setf (connection-last-active conn) (get-universal-time))
                    (when ws-handler
                      (let ((response (funcall ws-handler conn frame)))
-                       (when response (push response responses)))))
+                       ;; A reply is a frame handed to this connection as
+                       ;; surely as one from WS-SEND, and it does not pass
+                       ;; through WS-SEND, so it is counted here.
+                       (when response
+                         (note-ws-frame)
+                         (push response responses)))))
                  ;; First fragment — start accumulating. Enforce the
                  ;; message-size cap on the starting size too, not
                  ;; only on continuation accumulation, so apps that
@@ -648,7 +660,9 @@
                                   :payload payload)))
                    (when ws-handler
                      (let ((response (funcall ws-handler conn complete)))
-                       (when response (push response responses))))))))
+                       (when response
+                         (note-ws-frame)
+                         (push response responses))))))))
             ;; Control frames (can arrive between fragments per RFC 6455 §5.4)
             ((= opcode +ws-op-ping+)
              (log-debug "ws ping from client fd ~d" (connection-fd conn))

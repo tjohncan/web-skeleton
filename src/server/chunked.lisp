@@ -188,8 +188,8 @@
    is reported as an error so the caller's outer handler-case can
    convert it into a 502 or fire the fetch cleanup callback — the
    same discipline as the Content-Length truncation guard in
-   COMPLETE-FETCH and HTTPS-FETCH, applied to the chunked path
-   which has no Content-Length to compare against.
+   COMPLETE-FETCH and STREAM-RESPONSE-LINES, applied to the chunked
+   path which has no Content-Length to compare against.
 
    Also requires strict CRLF after both chunk-size and chunk-data
    per RFC 7230 §4.1. Lax trailing CRLF is a smuggling primitive

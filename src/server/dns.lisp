@@ -75,6 +75,12 @@
    parseable line yet. Safe to call on partial buffers — returns NIL
    until at least one line with a newline terminator has been received.
 
+   Second value: how many parseable addresses policy refused. NIL with a
+   positive count is a policy decision; NIL with zero is a name that did not
+   resolve. Callers must keep giving both the same answer to the client —
+   see below — but they should not give an operator the same answer, and
+   before this existed they did.
+
    Token boundary: STREAM must appear as the token immediately after
    the address, not as a substring anywhere in the line. A substring
    match (`(search \" STREAM\" line)`) would classify a DGRAM row
@@ -93,10 +99,16 @@
    to every caller from a name that did not resolve. Gating here rather
    than at the connect syscall introduces no new failure mode and keeps
    the fallback behavior for free."
-  (let ((line-start 0))
+  (let ((line-start 0)
+        ;; Counted so a caller can tell "nothing resolved" from "everything
+        ;; that resolved was refused". Both return NIL, deliberately — the
+        ;; client must not learn which — but an operator reading a log is a
+        ;; different audience, and sending them to debug a resolver when
+        ;; their own filter said no costs an afternoon.
+        (refused 0))
     (loop while (< line-start end) do
       (let ((lf (position 10 buf :start line-start :end end)))
-        (unless lf (return nil))
+        (unless lf (return (values nil refused)))
         (let ((line (handler-case
                         (sb-ext:octets-to-string
                          buf :start line-start :end lf
@@ -123,16 +135,17 @@
                                    (char= after #\Tab)))))))
               (when (and stream-token-p addr-str)
                 (let ((v4 (parse-ipv4-literal addr-str)))
-                  (when (and v4 (not (%unspecified-address-p v4))
-                             (fetch-address-allowed-p
-                              v4 :inet (or host addr-str)))
-                    (return (cons v4 :inet))))
+                  (when (and v4 (not (%unspecified-address-p v4)))
+                    (if (fetch-address-allowed-p v4 :inet (or host addr-str))
+                        (return (values (cons v4 :inet) refused))
+                        (incf refused))))
                 (let ((v6 (parse-ipv6-literal addr-str)))
-                  (when (and v6 (not (%unspecified-address-p v6))
-                             (fetch-address-allowed-p
-                              v6 :inet6 (or host addr-str)))
-                    (return (cons v6 :inet6))))))))
-        (setf line-start (1+ lf))))))
+                  (when (and v6 (not (%unspecified-address-p v6)))
+                    (if (fetch-address-allowed-p v6 :inet6 (or host addr-str))
+                        (return (values (cons v6 :inet6) refused))
+                        (incf refused))))))))
+        (setf line-start (1+ lf)))
+          finally (return (values nil refused)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Optional per-worker resolution cache
@@ -385,7 +398,7 @@
 ;;; Completion paths
 ;;; ---------------------------------------------------------------------------
 
-(defun deliver-dns-error (dns-conn epoll-fd)
+(defun deliver-dns-error (dns-conn epoll-fd &optional (reason "DNS lookup failed"))
   "DNS lookup failed — no usable address, getent gave up, or a parse
    error. Ends the fetch the way every other outbound failure ends: the
    parked inbound is answered 502, a detached one gets its callback's
@@ -400,7 +413,7 @@
    caller chose. A dns-conn is an outbound connection like any other; what
    is particular about its failure is only where in the lookup it
    happened, and all three of its callers already log that."
-  (deliver-fetch-error dns-conn epoll-fd "DNS lookup failed"))
+  (deliver-fetch-error dns-conn epoll-fd reason))
 
 (defun handle-dns-ready (dns-conn epoll-fd)
   "Called from HANDLE-OUTBOUND-EVENT when epoll reports readability
@@ -410,10 +423,11 @@
   (let ((result (connection-read-available dns-conn)))
     (case result
       ((:ok :ok-eof :eof)
-       (let ((parsed (parse-getent-output
-                      (connection-read-buf dns-conn)
-                      (connection-read-pos dns-conn)
-                      (connection-dns-host dns-conn))))
+       (multiple-value-bind (parsed refused)
+           (parse-getent-output
+            (connection-read-buf dns-conn)
+            (connection-read-pos dns-conn)
+            (connection-dns-host dns-conn))
          (cond
            (parsed
             (let ((dns-then (connection-dns-then dns-conn))
@@ -482,9 +496,20 @@
             ;; So neither arm is dead. :EOF is the common path and
             ;; :OK-EOF is the coalesced one, and the branch has to accept
             ;; both because which one arrives is not ours to decide.
-            (log-warn "dns: no usable address for ~a in getent output"
-                      (or (connection-dns-host dns-conn) "<host>"))
-            (deliver-dns-error dns-conn epoll-fd))
+            (if (plusp refused)
+                ;; The resolver worked. Policy is what said no, and an
+                ;; operator told "DNS lookup failed" here goes and debugs
+                ;; their resolver instead of reading their own filter.
+                (log-warn "dns: every address for ~a was refused by ~
+                           *fetch-address-filter* (~d candidate~:p) — policy, ~
+                           not a resolution failure"
+                          (or (connection-dns-host dns-conn) "<host>") refused)
+                (log-warn "dns: no usable address for ~a in getent output"
+                          (or (connection-dns-host dns-conn) "<host>")))
+            (deliver-dns-error dns-conn epoll-fd
+                               (if (plusp refused)
+                                   "address refused by policy"
+                                   "DNS lookup failed")))
            ;; :OK and incomplete — next epoll wake will bring more.
            )))
       (:again nil)
@@ -593,7 +618,7 @@
 ;;; Install our dispatchers into fetch.lisp's hook slots so initiate-
 ;;; http-fetch, fetch-stream-plain, and tls-connect can reach us without
 ;;; compile-time forward references. The hook pattern mirrors src/tls.lisp's
-;;; registration of *HTTPS-FETCH-FN*.
+;;; registration of *HTTPS-STREAM-FN*.
 ;;; ---------------------------------------------------------------------------
 
 (eval-when (:load-toplevel :execute)

@@ -455,7 +455,7 @@
 (defun prop-chunked-inbound-parity (seed)
   "The generated corpus, driven through the *request* path.
 
-   The instrument issue #9 asked for. The inbound acceptance set has to be
+   The instrument parity needs. The inbound acceptance set has to be
    provably identical to the outbound one, and a disagreement is only ever
    visible when both sides read the same input — a hand-written table of
    cases cannot show it, because the two sides would be given different
@@ -729,8 +729,8 @@
    Returns (STATUS LINES).
 
    This drove TLS-STREAM-RESPONSE until that function was deleted, and it
-   is the arm that made the deletion checkable — the seam issue #4 added
-   was reachable only from here. What it compares changed and what it
+   is the arm that made the deletion checkable — the READ-FN seam was
+   reachable only from here. What it compares changed and what it
    covers did not: the TLS transport now uses this very reader, so the
    third implementation is gone rather than merely agreed with, and the
    distinction still worth exercising is the byte source. READ-SEQUENCE

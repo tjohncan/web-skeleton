@@ -2,7 +2,7 @@
 
 HTTP/1.1 and WebSocket server for SBCL on Linux,
 written from the syscalls up.
-One declared dependency: `sb-bsd-sockets`.
+One declared dependency is `sb-bsd-sockets`.
 
 The epoll event loop, the request parser, the chunked codec,
 the WebSocket framing, SSE, an epoll-integrated outbound HTTP client,
@@ -15,7 +15,9 @@ It is the network and protocol layer; applications must bring their own flesh.
 
 ## Requirements
 
-- SBCL (Steel Bank Common Lisp)
+- SBCL (Steel Bank Common Lisp). 2.4.11 or later for a long-running server
+  that fetches by hostname: before it, every lookup whose `getent` child
+  outlives its answer leaves a zombie
 - Linux
 - `getent` on PATH — ships with glibc and musl, present on every
   mainstream distro (used via `sb-ext:run-program`
@@ -34,9 +36,21 @@ ASDF ships with SBCL.
 sbcl --non-interactive --load run-server.lisp
 ```
 
-Starts the demo server on port 8081.
-The demo page (load `http://localhost:8081/` in a browser)
-opens a WebSocket connection and echoes messages back.
+Starts the demo server on port 8081 with four workers.
+Load `http://localhost:8081/` in a browser, and in a second tab too.
+
+**x-ray** is a live bulletin, the connections each worker owns, and the
+server's own counters. Anything posted reaches every open connection,
+including your own, by way of the worker that owns it — which is the only
+worker allowed to write to it.
+
+**x-periments** leads with lab samples — base64 both ways, a digest, a JWT
+taken apart — each run as a real request that shows the request as the server
+parsed it, and the response's body as received with its headers as `fetch()`
+exposes them. An appendix hands malformed requests to the real parser and
+shows what it said, which a browser cannot send itself because `fetch()`
+normalises them.
+
 Ctrl-C or SIGTERM triggers graceful shutdown (drains active connections).
 
 ## Building
@@ -110,6 +124,7 @@ run-pure-lisp-tests.lisp   Entry point — verify pure-Lisp crypto paths
 src/
   package.lisp     Package (namespace) declaration
   log.lisp         Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
+  counters.lisp    Per-worker counts only the framework sees: accepts, responses, frames
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
   json.lisp        JSON parser and serializer (RFC 8259)
   random.lisp      Crypto random bytes and tokens (/dev/urandom)
@@ -127,16 +142,20 @@ src/
   server/
     connection.lisp    Connection state machine, read/write buffers
     http.lisp          HTTP request parser, response builder, URL/query/routing
+    chunked.lisp       Chunked transfer coding decoders, shared by both directions
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
     fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch)
     dns.lisp           Async DNS via getent ahosts subprocess
+    streaming.lisp     Streamed responses, chunked or close-delimited, produced over time
     main.lisp          epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp     Demo package declaration
-  handler.lisp     WebSocket echo handler, demo entry point
+  handler.lisp     Bulletin fan-out, census endpoint, request lab, refusal bench
+  test-origin.lisp The /ws Origin check's cases, as a table CI runs
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
+  deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/
   package.lisp           Test package declaration
   run.lisp               Test utilities and combined runner
@@ -158,6 +177,43 @@ tests/
 - **Worker thread pool** — one event loop per CPU core, each with its own
   listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
   Kernel distributes accepts across workers. Zero shared state in the hot path
+- **Periodic work on a worker's own loop** — `:on-tick` runs an application
+  function on every pass of every worker's event loop, on that worker's
+  thread, with that worker's connection table and epoll fd bound. Those
+  bindings are the point: they are what makes `ws-send` legal from inside it
+  and its ownership guard effective rather than skipped. `map-worker-websockets`
+  walks the connections that loop owns, so a broadcast to everyone is one pass
+  per worker over that worker's share and the application keeps no registry.
+  A hook runs inside the loop, so one that blocks stops that worker for every
+  connection on it; one that raises is caught, reported once and then at most
+  once a minute, and the loop continues
+- **Census and counters** — `connection-census` reports connections per worker
+  with their states, and cumulative counts of what only the framework sees:
+  accepts taken and refused, responses by status class, WebSocket frames
+  handed over. Each worker publishes its own slot on the maintenance tick and
+  a reader on any thread sums them, so nothing is locked and what you read is
+  up to a tick old. A response is counted where the framework produces it,
+  once its bytes exist — `format-response` for anything built per request,
+  and the static, range, streaming and connection-limit paths for the rest —
+  which is why the refusals no handler ever ran for are in there.
+  `format-response` and `serve-static` count on the worker that calls them,
+  whether or not the bytes are then sent; off a worker they count nothing. A
+  response the serializer refuses is never counted, so the 500 that replaces
+  it is the only one that is, and a client that resets its connection is
+  closed without one. Not counted either: a byte vector a handler builds and
+  returns itself, and the interim `100 Continue` — so `informational` counts
+  the 101 of each WebSocket upgrade. WebSocket frames count those an
+  application hands over, by `ws-send` or as a ws-handler's reply, and not the
+  pings, pongs and closes the framework sends itself. The counts are
+  cumulative for the life of each worker and never windowed — five minutes
+  and an hour are presentation, and a caller wanting a rate samples twice and
+  subtracts, which can go negative across a worker restart. Its docstring
+  splits the contract: some keys are stable, the state breakdown is
+  diagnostic, and a consumer must render unknown keys generically.
+  `*worker-id*` says which slot is the one you are running on, and
+  `connection-serial` names a connection within its worker: a count of that
+  worker's accepts that goes on counting across a restart, so unlike an fd
+  number it never names two connections on one worker
 - **epoll event loop** — edge-triggered, non-blocking I/O via `sb-alien`
   FFI to Linux epoll, fcntl, read, write
 - **Connection state machine** — per-connection read/write buffers, tracks
@@ -336,7 +392,18 @@ tests/
   `make-test-request` and `make-test-ws-frame` build structs for
   unit-style handler tests. Downstream apps can depend on it in their test build
   without pulling in the framework's own test suite
-- **Demo application** — separate ASDF system with static demo page and echo server
+- **Demo application** — a separate ASDF system, and the only thing in this
+  repository that reaches the framework the way an application would. It
+  broadcasts to every connected WebSocket across every worker using nothing
+  but the exported surface — `:on-tick`, `map-worker-websockets`, `ws-send`
+  and `make-store` — which is the one check that the exported surface
+  composes, since the test suite reaches `::` internals wherever convenient.
+  It also serves its own census, runs a small lab of ordinary GETs that report
+  the request as the server parsed it alongside both sides' clocks, and hands
+  malformed requests to the real parser so the framing claims above can be
+  performed rather than read.
+  `demo/deploy/` holds a Dockerfile and an nginx sample, so the deployment
+  notes are runnable rather than only written down
 
 ## Limitations
 
@@ -352,9 +419,9 @@ read about here.
   There are four write entry points an application can reach, and **three of
   the four refuse a connection another worker owns**: `ws-send`,
   `stream-close` and `fetch-into` each ask the connection table and raise
-  before anything is queued. None of the three did before this branch:
-  `fetch-into` accepted the call outright, and `ws-send` and `stream-close`
-  raised only when the write left a remainder — after appending it, and in
+  before anything is queued. Before is the point: a check that ran later —
+  `ws-send` and `stream-close` once raised only when the write left a
+  remainder — would report the misuse after appending the bytes, and in
   `stream-close`'s case after telling the application the stream had closed
   normally.
 
@@ -363,7 +430,7 @@ read about here.
   the wrong thread; it is noticed only when the write leaves a remainder,
   because the arm that follows gets `ENOENT` — so the common case, where the
   bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
-  had before this branch. It is left alone because closing it is a contract
+  had before it was guarded. It is left alone because closing it is a contract
   change rather than a fix: a cross-worker `stream-send` mostly succeeds today
   and code may lean on that accidentally, where a cross-worker `stream-close`
   already raised every time.
@@ -378,16 +445,32 @@ read about here.
   reachable, but a change to three functions at once, and one they have to
   make together or not at all.
 
-  Fan-out *across* workers is not provided, and building it needs a mechanism
-  this framework deliberately does not have.
+  Fan-out *across* workers is still not provided, but it is now buildable:
+  `:on-tick` runs application code on each worker's own event loop with that
+  worker's connection table and epoll fd bound, and `map-worker-websockets`
+  walks the connections that loop owns. Together they are the one place a
+  `ws-send` to those connections is legal, and a broadcast to everyone needs
+  nothing else — it is one pass per worker over that worker's share.
+
+  What the framework still does not supply is the registry. Deciding *who*
+  receives an event stays the application's, because a framework owning that
+  would own per-process state and become the horizontal-scaling limit. An
+  application addressing a subset therefore keeps its own set, and there is
+  no notification when a WebSocket closes, so that set goes stale and has to
+  prune on the refusal. Broadcasting to all of them avoids the problem by
+  keeping no set at all.
+
+  `demo/handler.lisp` is the worked example: a shared store holding recent
+  lines, one integer per worker recording how far that worker has got, and a
+  tick that sends the difference to the connections it owns. No registry, no
+  membership, and no worker aware that another exists.
 - **Only origin-form request targets.** The request line must start with `/`.
   RFC 7230 §5.3.2 requires a server to accept absolute-form
   (`GET http://host/p HTTP/1.1`), which a client behind a forward proxy
   sends, and §5.3.4 defines asterisk-form (`OPTIONS * HTTP/1.1`), which some
   health checkers use. Both are answered `400` here. Deliberate — one
   accepted shape is one shape to get wrong, and behind a reverse proxy
-  neither form arrives — but it is a boundary rather than an oversight, and
-  it was previously written down nowhere.
+  neither form arrives — but it is a boundary rather than an oversight.
 - **Percent-decoding assumes UTF-8.** `url-decode` decodes to a string and
   raises on a byte sequence that is not valid UTF-8, so `?q=%FF` — a legal
   percent-encoding — becomes a `400` raised from inside the handler at
@@ -523,8 +606,8 @@ read about here.
   keeps its connection open indefinitely. Memory is still bounded —
   `*max-write-backlog*` caps what may pile up behind it — so the cost is
   a connection slot and its backlog, not unbounded growth. This is the
-  deliberate trade for `ws-send` no longer holding the worker: the old
-  ten-second bound was a total, and it was a total on the wrong thing.
+  deliberate trade for `ws-send` not holding the worker: a total deadline
+  would bound the frame rather than the stall.
 - **A stream can only be written from the worker that owns it.**
   `stream-send` touches an unsynchronized write queue, and the connection
   belonging to exactly one event loop is what lets that queue exist
@@ -532,9 +615,11 @@ read about here.
   bytes; deciding *who* receives an event is the app's, and its registry
   has to push from the owning worker. Delivering to a connection this
   thread does not own is a designed-for next step and not a thing you can
-  do today. Fan-out across workers is not provided at all, deliberately —
-  a framework that owned the subscriber registry would own per-process
-  state and become the horizontal-scaling limit.
+  do today. Fan-out is per worker, as the top of this list says: each
+  worker delivers to the connections it owns, from `:on-tick` with
+  `map-worker-websockets`. What the framework does not provide is the
+  subscriber registry, deliberately — a framework that owned it would own
+  per-process state and become the horizontal-scaling limit.
 
 ## Configuration
 
@@ -572,10 +657,10 @@ All configurable via `setf` before calling `start-server`.
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
 | `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
-| `*shutdown-poll-interval*`     | `1`       | Seconds between shutdown-signal checks (main-thread sleep + worker epoll timeout)                                                                                                                                                                  |
+| `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes |
 
-The `host`, `port`, `workers`, `handler`, `ws-handler`, and `on-listen` are
-passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, `on-listen`, and
+`on-tick` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)

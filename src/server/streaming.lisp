@@ -1,8 +1,9 @@
 ;;;; streaming.lisp — server-generated streaming responses
 ;;;;
-;;;; The framework has three chunked *decoders* and no encoder: everything
-;;;; chunked it has ever seen arrived from an upstream. Producing a stream
-;;;; is the other direction, and it starts here.
+;;;; The framework's three chunked *decoders* all read somebody else's
+;;;; bytes: everything chunked they see arrived from an upstream.
+;;;; Producing a stream is the other direction, and ENCODE-CHUNK below is
+;;;; where it starts.
 ;;;;
 ;;;; This file is deliberately not fetch.lisp. The decoders live there
 ;;;; because they belong to reading an upstream response; encoding belongs
@@ -219,10 +220,17 @@
            (headers (if (assoc "date" headers :test #'string-equal)
                         headers
                         (cons (cons "date" (http-date)) headers))))
-      (serialize-http-message
-       (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
-       headers
-       nil))))
+      ;; A streamed response is one response, counted at its head. The chunks
+      ;; that follow are not responses and STREAM-SEND does not count them.
+      ;; PROG1 so the count lands after serialization, not before: a head the
+      ;; serializer refuses raises out of here uncounted, matching
+      ;; FORMAT-RESPONSE, so the 500 that replaces it is the only one counted.
+      (prog1
+          (serialize-http-message
+           (format nil "HTTP/1.1 ~d ~a" status (status-reason status))
+           headers
+           nil)
+        (note-response status)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The app-facing stream
@@ -300,6 +308,9 @@
                                ends: :DONE when the app closed it,
                                :DISCONNECTED when the peer went away,
                                :IDLE or :STALLED when a deadline took it,
+                               :UPSTREAM-FAILED when a FETCH-INTO
+                               relaying into it failed, or its close
+                               could not be written,
                                :SHUTDOWN on server drain. Release
                                whatever the app registered here.
    KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See
@@ -352,7 +363,7 @@
    remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
    — the common case, where the bytes fit, returns T and says nothing.
 
-   That is the shape WS-SEND had before this branch and it is stated here
+   That is the shape WS-SEND had before it was guarded, and it is stated here
    rather than fixed because fixing it is a contract change: today a
    cross-worker STREAM-SEND mostly succeeds, and applications may be
    relying on it accidentally. STREAM-CLOSE could be guarded without one,

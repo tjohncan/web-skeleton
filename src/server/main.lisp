@@ -55,6 +55,59 @@
 (defun lookup-connection (fd)
   (gethash fd *connections*))
 
+(defun map-worker-websockets (function)
+  "Call FUNCTION on each open WebSocket this worker owns. Returns the count.
+
+   The companion to :ON-TICK, and the supported way to reach a set of
+   connections at once. Fan-out is per worker because the write queue has no
+   lock: a connection belongs to exactly one event loop and WS-SEND refuses
+   one that belongs to another. An application broadcasting to everyone
+   broadcasts once per worker, to that worker's share, from inside that
+   worker — which is what this walks.
+
+   Named for the worker and not for the set, because the set is the point.
+   This is never every connection on the server, only the ones on this loop.
+   Whether that is all of them or a sixteenth is a fact about the deployment.
+
+   Only the :WEBSOCKET state is visited. A connection still upgrading,
+   already closing, or driving an outbound fetch is not something an
+   application can hand a frame to.
+
+   Two properties make it safe to call without ceremony. The table is
+   collected before anything runs, so FUNCTION may close what it was handed —
+   or send on it and have the send close it — without the walk stepping on a
+   table that moved underneath it; this is the discipline the idle sweep and
+   worker teardown already use for the same reason. And liveness is
+   re-checked immediately before each call, so a connection an earlier call
+   closed is skipped rather than handed over dead.
+
+   It does not catch. If FUNCTION raises, the walk stops and the condition
+   propagates — into :ON-TICK's handler, when called from there. The
+   framework has no basis for ruling that a partial fan-out is fine, and
+   WS-SEND raising at *MAX-WRITE-BACKLOG* is the ordinary fate of one slow
+   peer in a broadcast, so it is worth an application deciding rather than
+   hoping about. Continuing past a refusing connection is three lines in the
+   callback.
+
+   Signals off a worker rather than returning zero, which would be
+   indistinguishable from a server with no clients."
+  (unless *connections*
+    (error "map-worker-websockets: no connection table on this thread. It ~
+            walks the connections one worker owns, so it has to run on that ~
+            worker — from :on-tick, from a handler, or from a fetch ~
+            callback. A background thread owns none."))
+  (let ((live nil))
+    (maphash (lambda (fd conn)
+               (declare (ignore fd))
+               (when (eq (connection-state conn) :websocket)
+                 (push conn live)))
+             *connections*)
+    (let ((visited 0))
+      (dolist (conn live visited)
+        (when (eq (lookup-connection (connection-fd conn)) conn)
+          (incf visited)
+          (funcall function conn))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Connection census
 ;;;
@@ -80,7 +133,19 @@
 
 (defvar *worker-id* nil
   "This worker's index into *CONNECTION-CENSUS*. Bound per-worker by
-   RUN-WORKER beside the other share-nothing slots; NIL off a worker.")
+   RUN-WORKER beside the other share-nothing slots; NIL off a worker.
+
+   Exported to be read, never set. An application that wants to attribute
+   work to the worker that did it — a log line, a per-worker accumulator,
+   telling a socket which of the four it is talking to — has no other way to
+   ask, and the census already publishes per-worker data without offering a
+   way to know which entry is yours. NIL off a worker is the answer to that
+   question rather than an absence: a REPL or a test thread is on no worker
+   and a caller that prints it should say so.
+
+   Constant for the life of a thread. It is not a handle to anything: it
+   indexes the census and it names a thread, and nothing keyed on it may be
+   touched by another worker.")
 
 (defun census-counts ()
   "Count the current worker's connection table: total, the inbound/outbound
@@ -98,7 +163,8 @@
     (list :total total
           :outbound outbound
           :inbound (- total outbound)
-          :states states)))
+          :states states
+          :counters (counters-snapshot))))
 
 (defun publish-connection-census ()
   "Store this worker's counts into its own census slot. No-op off a worker.
@@ -120,25 +186,65 @@
     (setf (aref *connection-census* *worker-id*) nil)))
 
 (defun connection-census ()
-  "Sum every worker's most recently published counts. Returns a plist shaped
-   like CENSUS-COUNTS, or NIL before any worker has published.
+  "A snapshot of every worker's connections. NIL before any has published.
 
-   Read from any thread. What it reports is up to one maintenance tick old,
-   which is a second by default — a caller asserting that something has gone
-   away polls until it does rather than reading once."
+   Readable from any thread, including one that is no worker — it reads the
+   published slots, never a connection table. What it reports is up to one
+   maintenance tick old, a second by default, so a caller asserting that
+   something has gone away polls until it does rather than reading once.
+
+   The contract is split, and the split is the part to read.
+
+   Stable — :WORKERS, :TOTAL, :INBOUND, :OUTBOUND, and :COUNTERS. Counts of
+   things an application already has names for. Safe to render, alert on, and
+   compare across versions.
+
+   :COUNTERS is cumulative for the life of each worker, never windowed: a
+   caller wanting a rate samples twice and subtracts, and a negative
+   difference means a worker restarted in between. Exactly where each count is
+   taken — and the two responses no count sees — is NOTE-RESPONSE's docstring,
+   and it is worth reading before alerting on these. It counts what only the
+   framework sees — responses by class including every refusal no handler ever
+   ran for, accepts taken and refused, and the WebSocket frames an application
+   handed to a connection, by WS-SEND or as a ws-handler's return value. Not
+   the pings, pongs and closes the framework sends on its own behalf. A worker
+   that crashes and restarts begins a fresh set, so these can go down.
+
+   Diagnostic — :STATES and :PER-WORKER. :STATES is keyed by the connection
+   state machine's own keywords, which are internals and will change when it
+   does. :PER-WORKER is one entry per worker, indexed by worker id, each the
+   same shape as the sums above or NIL for a worker that has not published
+   yet. Both are for looking at. Neither is worth depending on.
+
+   A consumer must render unknown keys generically rather than matching an
+   exhaustive set. Keys will be added — :COUNTERS was — and a panel that
+   switches on a closed list silently stops showing whatever arrives next.
+
+   The sums are consistent with :PER-WORKER because they are computed from
+   it. They are not simultaneous: worker 3 may have published a tick after
+   worker 0, so this is a picture of a server rather than an instant. The
+   distinction matters exactly once — when the totals have to add up against
+   something counted elsewhere, and do not."
   (when *connection-census*
-    (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil))
+    (let ((total 0) (outbound 0) (inbound 0) (states nil) (seen nil)
+          (counters nil) (per-worker nil))
       (loop for slot across *connection-census*
-            when slot
-            do (setf seen t)
-               (incf total    (getf slot :total 0))
-               (incf outbound (getf slot :outbound 0))
-               (incf inbound  (getf slot :inbound 0))
-               (loop for (state n) on (getf slot :states) by #'cddr
-                     do (incf (getf states state 0) n)))
+            do (push slot per-worker)
+               (when slot
+                 (setf seen t)
+                 (incf total    (getf slot :total 0))
+                 (incf outbound (getf slot :outbound 0))
+                 (incf inbound  (getf slot :inbound 0))
+                 (loop for (state n) on (getf slot :states) by #'cddr
+                       do (incf (getf states state 0) n))
+                 (loop for (name n) on (getf slot :counters) by #'cddr
+                       do (incf (getf counters name 0) n))))
       (when seen
-        (list :total total :outbound outbound :inbound inbound
-              :states states)))))
+        (list :workers (length *connection-census*)
+              :total total :outbound outbound :inbound inbound
+              :states states
+              :counters counters
+              :per-worker (nreverse per-worker))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Connection lifecycle — idle timeout and WebSocket ping/pong
@@ -175,11 +281,12 @@
      body))
   "The refusal sent when a worker is at *MAX-CONNECTIONS*, built once.
 
-   No Date header, for the reason BUILD-STATIC-RESPONSE omits one: bytes
-   frozen at load time cannot carry a per-request timestamp, and a stale
-   Date is worse than none. Building it per refusal would put header
-   construction on the one path that exists because the worker is already
-   out of room.")
+   No Date header, and not for the reason a static response omits one
+   from its frozen bytes — that one is served as pieces with a date line
+   put between them per request. This is sent whole, and building it per
+   refusal would put header construction on the one path that exists
+   because the worker is already out of room. A stale Date would be worse
+   than none, so it carries none.")
 
 (defconstant +refusal-drain-size+ 2048
   "Bytes REFUSE-CONNECTION clears per read while draining a refused peer.
@@ -522,20 +629,30 @@
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
 
-(defparameter *shutdown-poll-interval* 1
-  "Seconds between shutdown-signal checks in the main thread's wait loop
-   and each worker's event-loop epoll timeout.
+(defparameter *worker-wake-interval* 1
+  "Seconds a worker's event loop may sleep in epoll_wait before waking to
+   do periodic work, and the interval between shutdown-signal checks in
+   the main thread's wait loop.
+
+   This is the floor under everything periodic. A worker with no I/O is
+   asleep in the kernel, so nothing that rides the event loop can happen
+   more often than this — lowering it is the only way to make periodic
+   work prompt, and the cost is one syscall return per worker per
+   interval.
+
    Default 1 second balances wake-up overhead against shutdown
    responsiveness. Test harnesses bind this to a small value (e.g. 0.05)
    so teardown doesn't wait a full second per call. Float accepted —
    the worker converts to ms for epoll_wait.
 
-   It does not set the periodic-maintenance cadence. RUN-EVENT-LOOP gates
-   the idle sweep on a hardcoded one second and the WebSocket ping on
-   *WS-PING-INTERVAL*; this only bounds how often the loop can wake to
-   check them. Lowering it makes shutdown prompt without making either
-   scan run more often — the harness sets it to 0.05 and the sweep still
-   runs at 1 Hz.")
+   It does not set the periodic-maintenance cadence, but it bounds it.
+   RUN-EVENT-LOOP gates the idle sweep and the census publish on a
+   hardcoded one second and the WebSocket ping on *WS-PING-INTERVAL*, and
+   looks at those gates only when the loop wakes. Lowering this makes
+   shutdown prompt without making either scan run more often — the harness
+   sets it to 0.05 and the sweep still runs at 1 Hz. Raising it past a
+   second does the opposite for a worker with no traffic to wake it: the
+   sweep, the publish and the ping all wait out the full interval.")
 
 (defconstant +max-events+ 64
   "Maximum events to process per epoll_wait call. Internal — not a
@@ -741,6 +858,12 @@
                (>= (hash-table-count *connections*) *max-connections*))
       (log-warn "connection limit reached (~d), refusing new accept"
                 *max-connections*)
+      (note-refused)
+      ;; And a response: REFUSE-CONNECTION writes a pre-built 503 straight to
+      ;; the socket, so nothing downstream of here would count it. It is the
+      ;; plainest case of a refusal no handler ran for, which is what the
+      ;; census promises to count.
+      (note-response 503)
       (refuse-connection client-socket)
       (return-from accept-connection t))
     (handler-case
@@ -750,6 +873,7 @@
           (unwind-protect
                (progn
                  (register-connection conn)
+                 (note-accepted)
                  (setf registered t)
                  (epoll-add epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+))
@@ -1264,6 +1388,20 @@
         (error ()
           (close-connection conn epoll-fd))))
     (error (e)
+      ;; This connection's own descriptor failed under a read or a write: the
+      ;; peer reset, or the network between us did. Answered the way an end of
+      ;; stream is, by closing and nothing else. A 500 would be addressed to
+      ;; nobody — the write carrying it fails the same way — and counting it
+      ;; would put a client's disconnect into :SERVER-ERROR, a count the
+      ;; census calls safe to alert on. Only this connection's descriptor: a
+      ;; handler whose own I/O failed on another one has failed a request,
+      ;; and the 500 below is owed to it.
+      (when (and (typep e 'fd-io-error)
+                 (eql (fd-io-error-fd e) (connection-fd conn)))
+        (log-debug "fd ~d: ~a — the peer is gone, closing"
+                   (connection-fd conn) e)
+        (close-connection conn epoll-fd :disconnected)
+        (return-from handle-client-read nil))
       (log-warn "error fd ~d: ~a" (connection-fd conn) e)
       ;; Send 500 before closing so the client gets a proper HTTP response
       (handler-case
@@ -1431,18 +1569,20 @@
 ;;; Event loop
 ;;; ---------------------------------------------------------------------------
 
-(defun run-event-loop (listener-socket epoll-fd handler ws-handler)
+(defun run-event-loop (listener-socket epoll-fd handler ws-handler on-tick)
   "Main event loop. Runs until *shutdown* is set."
   (let ((listener-fd    (socket-fd listener-socket))
         (last-ping-time  (get-universal-time))
         (last-sweep-time (get-universal-time))
+        (tick-errors     0)
+        (tick-error-at   0)
         (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when *shutdown*
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
       (let ((n (epoll-wait epoll-fd event-buf +max-events+
-                           (max 10 (round (* *shutdown-poll-interval* 1000))))))
+                           (max 10 (round (* *worker-wake-interval* 1000))))))
         (loop for i from 0 below n
               do (block handle-event
                    (let ((fd    (epoll-event-fd event-buf i))
@@ -1510,17 +1650,51 @@
           ;; does — a third timer to walk the table a third time per second
           ;; is the waste the gate exists to prevent.
           (publish-connection-census)
-          (log-debug "census ~s" (connection-census))
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
-          (setf last-ping-time now))))))
+          (setf last-ping-time now)))
+      ;; ON-TICK runs last: after this pass's I/O, and after the sweep
+      ;; above, so a hook sees a table the sweeper has already walked and
+      ;; a census it has already published. It never runs on connections
+      ;; that are draining — the *SHUTDOWN* check at the top of the loop
+      ;; returns through DRAIN-CONNECTIONS before reaching here — so an
+      ;; application cannot queue new work onto them. A pass that was
+      ;; already under way when shutdown was requested still gets here
+      ;; once, before that check sees the flag; the drain comes after it.
+      ;;
+      ;; Neither ordering is asserted by a test. Nothing a hook can observe
+      ;; says when the loop noticed *SHUTDOWN*, and the flag is set from
+      ;; another thread, so a test of "not after shutdown" would fail on the
+      ;; in-flight pass above whenever the timing landed there. They hold by
+      ;; the order of the forms in this loop, and this comment is where that
+      ;; order is written down.
+      (when on-tick
+        (handler-case (funcall on-tick *worker-id*)
+          (error (e)
+            ;; A hook that raises every pass would log at the wake rate —
+            ;; twenty lines a second per worker at the cadence a fan-out
+            ;; demo wants — and every one of them takes *LOG-LOCK*, which
+            ;; log.lisp documents as the one lock every worker contends
+            ;; for. Silence would be worse: a hook that never runs looks
+            ;; exactly like a hook that was never installed. So report the
+            ;; first immediately, then at most once a minute with a count
+            ;; of what was suppressed.
+            (incf tick-errors)
+            (let ((now (get-universal-time)))
+              (when (>= (- now tick-error-at) 60)
+                (log-error ":on-tick raised on worker ~d: ~a ~
+                            (~d occurrence~:p since last reported)"
+                           *worker-id* e tick-errors)
+                (setf tick-errors 0
+                      tick-error-at now)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Worker
 ;;; ---------------------------------------------------------------------------
 
-(defun run-worker (host port worker-id handler ws-handler &optional listener)
+(defun run-worker (host port worker-id handler ws-handler on-tick
+                   &optional listener)
   "Run a single worker: own listener, own epoll fd, own connections.
    Automatically restarts on unhandled errors (with backoff).
 
@@ -1553,6 +1727,10 @@
               ;; share-nothing slots, because owning the slot outright is
               ;; what lets the publish be lock-free.
               (*worker-id* worker-id)
+              ;; *CONNECTION-SERIAL* is not bound here. Everything in this
+              ;; LET a crash may throw away and begin again; a serial may
+              ;; not, so it is bound by the thread START-SERVER spawns,
+              ;; outside this loop. See the comment there.
               ;; Per-worker DNS cache. Workers share nothing in the hot
               ;; path, so each keeps its own table and no lock is needed.
               ;; Inert unless the app opts in via *DNS-CACHE-TTL*; a
@@ -1598,13 +1776,20 @@
                         ;; never returns through, and a remainder left queued
                         ;; with nothing armed waits for an event that is not
                         ;; coming.
-                        (*epoll-fd* epoll-fd))
+                        (*epoll-fd* epoll-fd)
+                        ;; Same reasoning, one slot over: counted on this
+                        ;; thread only, so an increment needs no lock and
+                        ;; cannot contend. A restart after a crash starts a
+                        ;; fresh set rather than resuming the dead worker's,
+                        ;; which is honest — the counts describe a worker, and
+                        ;; this is a new one.
+                        (*counters* (make-counters)))
                    (log-info "worker ~d started (epoll fd ~d)"
                              worker-id epoll-fd)
                    (epoll-add epoll-fd (socket-fd listener)
                               (logior +epollin+ +epollet+))
                    (unwind-protect
-                       (run-event-loop listener epoll-fd handler ws-handler)
+                       (run-event-loop listener epoll-fd handler ws-handler on-tick)
                      ;; Cleanup on worker crash or normal exit. Split the
                      ;; table into outbounds and everything else — outbounds
                      ;; go through CLOSE-OUTBOUND so their fetch callbacks
@@ -1640,14 +1825,14 @@
           (return)))
       (error (e)
         (log-error "worker ~d crashed: ~a — restarting" worker-id e)
-        ;; 1-second backoff, sliced into *shutdown-poll-interval*
+        ;; 1-second backoff, sliced into *worker-wake-interval*
         ;; chunks so a SIGTERM arriving during the backoff is noticed
         ;; within one slice rather than after the full second.
         (let ((until (+ (get-internal-real-time)
                         internal-time-units-per-second)))
           (loop until (or *shutdown*
                           (>= (get-internal-real-time) until))
-                do (sleep *shutdown-poll-interval*)))
+                do (sleep *worker-wake-interval*)))
         (when *shutdown* (return))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1828,7 +2013,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler on-listen)
+                          handler ws-handler on-listen on-tick)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -1839,8 +2024,48 @@
    IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
+   ON-TICK: function (worker-id), a symbol naming one, or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
+
+   ON-TICK runs on every pass of every worker's event loop, on that
+   worker's own thread, with that worker's connection table and epoll fd
+   bound. The bindings are the point: the hook runs on the thread that
+   owns this worker's connections, so writing to those from it is legal.
+   It does not make another worker's connections writable. WS-SEND,
+   STREAM-CLOSE and FETCH-INTO check, and refuse a connection this worker
+   does not own; STREAM-SEND does not check (README, under Limitations), so
+   a hook that walks a registry shared across workers and calls it on each
+   entry is exactly where a cross-worker write goes through without a word.
+   It is how an application does periodic per-worker work — rotating
+   counters it keeps itself, or writing to the connections this worker
+   owns, which is the only way to reach them, since no worker may touch
+   another's table.
+
+   Three things a hook has to be.
+
+   Cheap. It runs inside the loop, so one that blocks stops that worker
+   for every connection on it. There is no timeout and no watchdog: the
+   loop cannot preempt it, and a hook that hangs is indistinguishable
+   from a worker that died.
+
+   Ready to run often. The interval is bounded below by
+   *WORKER-WAKE-INTERVAL* only while the worker is idle, and by nothing
+   at all while it is busy — a loaded worker may tick thousands of times
+   a second. Work that should happen on a schedule needs its own gate,
+   the way the idle sweep gates itself at one second.
+
+   Allowed to raise. A raise is caught, the worker continues, and the
+   error is logged once and then at most once a minute with a count —
+   enough that a broken hook is never silent, bounded so that one
+   raising every pass cannot flood *LOG-LOCK*.
+
+   It does not run while a worker drains for shutdown. That is the precise
+   claim, and it is narrower than never running after shutdown: shutdown is requested
+   from another thread and a worker notices at the top of its next pass, so a
+   pass already under way — waiting in epoll_wait, say — finishes, hook
+   included, before the drain begins. The hook can run once after shutdown is
+   requested; it never runs on connections that are draining.
 
    PORT may be 0, in which case the kernel assigns one and ON-LISTEN —
    a function of one argument, called once, on the calling thread, after
@@ -1904,6 +2129,30 @@
             thing that answers a parked caller when an upstream goes quiet ~
             — there is no setting that disables it."
            *fetch-timeout*))
+  ;; Fourth invariant, same place and the same argument as the three
+  ;; above. A non-function :ON-TICK raises on the first pass of every
+  ;; worker's loop and on every pass after it — which is precisely the
+  ;; shape the rate limit in RUN-EVENT-LOOP exists to survive, arrived at
+  ;; through a typo rather than a bug. Refusing at boot costs one check
+  ;; and turns a log full of suppressed occurrences into one clear error
+  ;; before a socket is ever bound.
+  ;;
+  ;; A symbol naming a function is accepted, as :HANDLER accepts one: FUNCALL
+  ;; looks it up on every call, which is what lets a running server pick up a
+  ;; hook redefined at the REPL. A symbol naming nothing is still refused, and
+  ;; so is one naming a macro or a special operator, since neither can be
+  ;; funcalled and each would fail every pass exactly as a typo would.
+  (unless (or (null on-tick)
+              (functionp on-tick)
+              (and (symbolp on-tick)
+                   (fboundp on-tick)
+                   (not (macro-function on-tick))
+                   (not (special-operator-p on-tick))))
+    (error "start-server: :on-tick is ~s; it must be a function of one ~
+            argument (the worker id), a symbol naming one, or NIL. It runs ~
+            on every pass of every worker's event loop, so a value that ~
+            cannot be funcalled fails on every pass rather than once."
+           on-tick))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is
   ;; its id and the vector has to be there when the first tick publishes.
@@ -1962,9 +2211,18 @@
                                    (adopted (when (zerop i) listener0)))
                                (push (sb-thread:make-thread
                                       (lambda ()
-                                        (run-worker host port id
-                                                    handler ws-handler
-                                                    adopted))
+                                        ;; Bound here, around RUN-WORKER and
+                                        ;; so outside its restart loop, where
+                                        ;; every other per-worker slot is
+                                        ;; bound fresh on each pass. A serial
+                                        ;; names a connection, and a worker
+                                        ;; that crashed and counted from one
+                                        ;; again would hand a second peer the
+                                        ;; first one's name.
+                                        (let ((*connection-serial* 0))
+                                          (run-worker host port id
+                                                      handler ws-handler
+                                                      on-tick adopted)))
                                       :name (format nil "web-skeleton-~d" i))
                                      threads)
                                ;; Ownership passes to the thread only once
@@ -1982,7 +2240,7 @@
                            (when on-listen (funcall on-listen port))
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
-                               (loop (sleep *shutdown-poll-interval*)
+                               (loop (sleep *worker-wake-interval*)
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))

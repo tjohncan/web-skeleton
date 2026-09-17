@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self';">
     <title>web-skeleton</title>
     <meta name="description" content="SBCL web server framework for Linux">
     <meta property="og:title" content="web-skeleton">
@@ -20,11 +20,64 @@
     <script src="/app.js" defer></script>
 </head>
 <body>
-    <h1>web-skeleton</h1>
-    <div id="log"></div>
-    <form id="form">
-        <input id="msg" type="text" placeholder="type a message..." autofocus>
-        <button type="submit">send</button>
-    </form>
+    <header class="topbar">
+        <h1>web-skeleton demo page</h1>
+        __BACKLINK__
+    </header>
+
+    <nav class="tabs" id="tabs" role="tablist">
+        <button class="tab" role="tab" data-panel="x-ray" aria-controls="x-ray" aria-selected="true">x-ray</button>
+        <button class="tab" role="tab" data-panel="x-periments" aria-controls="x-periments" aria-selected="false">x-periments</button>
+    </nav>
+
+    <div id="x-ray" class="panel" role="tabpanel">
+
+    <section>
+        <h2>teeth</h2>
+        <p class="sub">live bulletin - posted messages reach every open
+        connection, including yours - no auth or history</p>
+        <div id="log"></div>
+        <form id="form">
+            <input id="msg" type="text" placeholder="type a message..." autofocus>
+            <button type="submit">send</button>
+        </form>
+    </section>
+
+    <section>
+        <h2>arms and legs</h2>
+        <div class="scroll-x">
+            <table id="limbs" class="limbs">
+                <thead>
+                    <tr><th>worker</th><th>live connections</th><th>work since start</th></tr>
+                </thead>
+                <tbody id="limb-rows"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section>
+        <h2>sternum</h2>
+        <div id="sternum" class="vitals">&hellip;</div>
+    </section>
+
+    </div><!-- x-ray -->
+
+    <div id="x-periments" class="panel" role="tabpanel" hidden>
+        <section>
+            <h2>lab samples</h2>
+            <p class="sub">three ordinary GETs, shown whole - the request is
+            what the server parsed, the response is what your browser
+            received, and each clock is reported by the side that kept it</p>
+            <div id="lab"></div>
+        </section>
+
+        <section>
+            <h2>appendix</h2>
+            <p class="sub">a browser cannot send a malformed request - fetch()
+            normalises everything - so the server hands these exact bytes to
+            its own parser and shows you what it said</p>
+            <div id="bench">&hellip;</div>
+        </section>
+    </div>
 </body>
 </html>

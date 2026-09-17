@@ -69,7 +69,18 @@
    before putting this on a per-request path."
   (when (>= (log-level-value level) (log-level-value *log-level*))
     (sb-thread:with-mutex (*log-lock*)
-      (let ((stream (or *log-stream* *standard-output*)))
+      (let ((stream (or *log-stream* *standard-output*))
+            ;; One call is one line. ~S on any structure otherwise wraps at
+            ;; *PRINT-RIGHT-MARGIN*, turning one call into a dozen lines that
+            ;; no grep can reassemble — and each of them is another line
+            ;; through this mutex for every reader who then has to widen
+            ;; their filter to find the rest of it.
+            (*print-pretty* nil)
+            ;; And bounded. A cyclic or enormous value logged by mistake
+            ;; should truncate, not fill a disk, on a path that holds the one
+            ;; lock every worker contends for.
+            (*print-length* 100)
+            (*print-level* 8))
         (handler-case
             (progn
               (format stream "~a [~a] ~?~%"

@@ -2,6 +2,9 @@
   (:use :cl)
   (:export ;; Server
            #:start-server
+           #:map-worker-websockets
+           #:connection-census
+           #:*worker-id*
            ;; HTTP request
            #:http-request
            #:http-request-method
@@ -73,6 +76,7 @@
            #:jwt-key-y
            #:parse-jwks
            #:jwt-verify
+           #:jwt-split
            #:*jwt-clock-skew*
            #:jwt-claim
            ;; JSON
@@ -86,6 +90,7 @@
            ;; Connection (minimal — for ws-handler identity)
            #:connection
            #:connection-fd
+           #:connection-serial
            #:connection-remote-addr
            ;; The authority CONNECTION-WRITE-FULL-P's docstring names.
            ;; Exported so an app can run the test CONNECTION-APPEND-WRITE
@@ -118,6 +123,8 @@
            #:*https-stream-fn*
            ;; Conditions
            #:http-parse-error
+           #:http-parse-error-status
+           #:http-parse-error-message
            ;; Limits
            #:*max-request-line-length*
            #:*max-header-count*
@@ -157,7 +164,7 @@
            #:*dns-cache-max-entries*
            ;; Shutdown
            #:*drain-timeout*
-           #:*shutdown-poll-interval*
+           #:*worker-wake-interval*
            #:register-cleanup
            ;; Concurrent store
            #:storep

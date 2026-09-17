@@ -20,9 +20,35 @@
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
 
+(defvar *connection-serial* 0
+  "Accepted connections on this worker so far. Bound once per worker thread,
+   so the increment needs no lock and two workers cannot contend for it —
+   and bound by the thread START-SERVER spawns rather than inside RUN-WORKER
+   beside the other per-worker slots, because RUN-WORKER rebinds those on
+   every restart. A worker that crashes and restarts keeps counting instead
+   of beginning again at one.
+
+   Per worker rather than global on purpose: a global would be the one
+   counter every accept on every core had to agree about, which is the
+   contention this design exists to avoid. The consequence is that a serial
+   is unique within a worker and not across them, so anything naming a
+   connection has to carry the worker id too.")
+
 (defstruct connection
   ;; Identity
   (fd        -1  :type fixnum)               ; raw file descriptor
+  ;; This worker's count of accepted connections at the time this one was
+  ;; accepted. Together with the worker id it names a connection for as long
+  ;; as the server runs, a crashed worker's restart included, which FD alone
+  ;; cannot do: an fd is unique only
+  ;; among the connections open right now, and the kernel hands the lowest
+  ;; free one to the next accept. A closed connection's fd belongs to a
+  ;; stranger within milliseconds, so anything that labels a peer by fd
+  ;; labels two different peers the same.
+  ;;
+  ;; 0 for a connection this worker did not accept — an outbound fetch is a
+  ;; connection too, and it is nobody's peer.
+  (serial    0   :type unsigned-byte)
   (socket    nil)                             ; sb-bsd-sockets object (for accept)
   (remote-addr nil)                           ; peer IP as string, or NIL for outbound
   ;; Byte source and sink. NIL means the raw fd, via NB-READ / NB-WRITE.
@@ -310,6 +336,7 @@
     (set-nonblocking fd)
     (make-connection :fd fd
                      :socket client-socket
+                     :serial (incf *connection-serial*)
                      :remote-addr addr
                      :last-active (get-universal-time))))
 
@@ -1155,7 +1182,7 @@
                               (= (aref buf (+ sp 7)) 46))  ; .
                    (http-parse-error "malformed request line"))
                  ;; Capture the minor-version byte (48 = HTTP/1.0,
-                 ;; 49 = HTTP/1.1) so SCAN-EXPECT-100-CONTINUE can be
+                 ;; 49 = HTTP/1.1) so SCAN-EXPECT-DISPOSITION can be
                  ;; gated on 1.1 below — RFC 7231 §5.1.1 scopes the
                  ;; interim 100 Continue response to HTTP/1.1.
                  (let ((minor-version-byte (aref buf (+ sp 8)))

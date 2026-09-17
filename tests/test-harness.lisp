@@ -1461,13 +1461,13 @@
    MAKE-THREAD."
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain *drain-timeout*)
-        (saved-poll *shutdown-poll-interval*)
+        (saved-poll *worker-wake-interval*)
         (bound nil)
         (sem (sb-thread:make-semaphore :name "bare-server-port")))
     (setf web-skeleton::*shutdown-hooks* nil
           web-skeleton::*shutdown* nil
           *drain-timeout* 1
-          *shutdown-poll-interval* 0.05)
+          *worker-wake-interval* 0.05)
     (unwind-protect
          (let ((th (sb-thread:make-thread
                     (lambda ()
@@ -1490,7 +1490,7 @@
                  (ignore-errors (sb-thread:join-thread th))))))
       (setf web-skeleton::*shutdown-hooks* saved-hooks
             *drain-timeout* saved-drain
-            *shutdown-poll-interval* saved-poll))))
+            *worker-wake-interval* saved-poll))))
 
 (defun %port-answers-with-p (port marker)
   "T if a plain GET / on PORT comes back containing MARKER.
@@ -2055,6 +2055,335 @@
                    (check "pipelined: body /b delivered"
                           (not (null (search "path=/b" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
+(defun %worker-ids-in (text)
+  "Every worker= value in TEXT, in the order they appear.
+
+   Collected as strings rather than parsed, so an id that came back NIL is
+   captured as \"NIL\" and fails the assertion below. Parsing here would raise
+   instead, and a raise ends a run rather than reporting one.
+
+   The semicolon is why the handler writes one. These responses are
+   pipelined, so the first body is followed immediately by the second
+   response's status line with nothing in between: a scan for the end of the
+   value ran off \"worker=0\" straight into \"HTTP\" and collected 0HTTP."
+  (let ((out nil) (start 0))
+    (loop
+      (let ((i (search "worker=" text :start2 start)))
+        (unless i (return (nreverse out)))
+        (let* ((from (+ i 7))
+               (to (or (position #\; text :start from) (length text))))
+          (push (subseq text from to) out)
+          (setf start from))))))
+
+(defun test-worker-id-is-public-and-holds-still-per-connection ()
+  "*WORKER-ID* is readable by an application, it differs between workers, and
+   one connection sees one worker for its whole life.
+
+   It is exported for a single job: attributing work to the worker that did
+   it. Three claims have to hold for that to be worth anything, and they fail
+   in different ways, so each is asserted separately.
+
+   That it is readable at all. That the three workers do not all report the
+   same number — asserted through :ON-TICK rather than through requests,
+   because every worker ticks whether or not it has a connection, while which
+   worker accepts a connection is the kernel's business and a test that
+   waited for three different ones to answer would be a coin flip dressed as
+   an assertion.
+
+   And that it holds still. Two requests go down one socket below and must
+   come back carrying one id. A server that migrated a connection between
+   workers would answer twice and differently, and every per-connection thing
+   an application hung off the id would be quietly wrong.
+
+   The pair recorded in the tick is the fourth claim, and the cheapest one to
+   get wrong: the id :ON-TICK is handed and the id bound on the thread it
+   runs on must be the same number. The demo indexes one array by the
+   argument and reads the special in a handler, so a disagreement would show
+   up as a fan-out writing one worker's slot from another worker's thread.
+
+   NIL off a worker is the other half of the contract, and it is an answer
+   rather than an absence: the thread running this test is on no worker, and
+   a caller that prints the id should say so instead of guessing zero."
+  (format t "~%server: the worker a connection is on~%")
+  (check "off a worker it is NIL, not 0" *worker-id* nil)
+  (let ((seen nil)
+        (lock (sb-thread:make-mutex)))
+    (with-test-server
+        (:workers 3
+         :on-tick (lambda (id)
+                    (sb-thread:with-mutex (lock)
+                      (pushnew (cons id *worker-id*) seen :test #'equal)))
+         :handler (lambda (req)
+                    (declare (ignore req))
+                    (make-text-response
+                     200 (format nil "worker=~a;" *worker-id*))))
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (concatenate 'string
+                              "GET /one HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf* *crlf*
+                              "GET /two HTTP/1.1" *crlf*
+                              "Host: localhost" *crlf*
+                              "Connection: close" *crlf* *crlf*)
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (ignore-errors
+                (sb-bsd-sockets:socket-shutdown socket :direction :output))
+               (let ((buf (make-array 16384 :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0 :adjustable t)))
+                 (read-to-eof-bounded stream buf)
+                 (let* ((text (sb-ext:octets-to-string
+                               (subseq buf 0 (fill-pointer buf))
+                               :external-format :utf-8))
+                        (ids (%worker-ids-in text)))
+                   ;; The control. Without it the two assertions after it
+                   ;; pass on a server that answered nothing at all: one
+                   ;; empty list equals another, and every id in it is a
+                   ;; digit for the reason that there are none.
+                   (check "both requests were answered" (length ids) 2)
+                   (check "an application can read it at all"
+                          (and ids (every (lambda (s)
+                                            (and (plusp (length s))
+                                                 (every #'digit-char-p s)))
+                                          ids))
+                          t)
+                   (check "one socket, one worker, both times"
+                          (and (= (length ids) 2)
+                               (string= (first ids) (second ids)))
+                          t)
+                   (check "and it indexes a worker this server actually has"
+                          (and ids
+                               (every (lambda (s)
+                                        (and (every #'digit-char-p s)
+                                             (< -1 (parse-integer s) 3)))
+                                      ids))
+                          t))))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      ;; Polled rather than slept: the tick rides *WORKER-WAKE-INTERVAL* and
+      ;; this test has no business guessing what a reader set it to.
+      (let ((deadline (+ (get-universal-time) 8)))
+        (loop until (or (>= (length (sb-thread:with-mutex (lock) seen)) 3)
+                        (> (get-universal-time) deadline))
+              do (sleep 0.05))))
+    (let ((pairs (sb-thread:with-mutex (lock) (copy-list seen))))
+      (check "three workers, three different ids"
+             (sort (mapcar #'cdr pairs) #'<) '(0 1 2))
+      (check "the id :ON-TICK is handed is the one bound on its thread"
+             (and pairs (every (lambda (p) (eql (car p) (cdr p))) pairs))
+             t))))
+
+(defun test-connection-serial-does-not-repeat-when-an-fd-does ()
+  "Every accepted connection gets a number this worker will not hand out
+   again, which is the thing a file descriptor cannot promise.
+
+   An fd is unique among the sockets open at this instant and no longer than
+   that. The kernel gives the next accept the lowest free descriptor, so the
+   fd of a connection that closed a moment ago belongs to a stranger now, and
+   anything that labelled a peer by fd would label two peers the same. The
+   demo puts a name on every line of a public broadcast; a name that silently
+   changes hands is worse than no name.
+
+   Three connections are opened and closed one after another below, which is
+   precisely the shape that reuses an fd. Whether a given run actually reuses
+   one is the kernel's business and is reported rather than asserted — what
+   is asserted is that the serials did not repeat regardless, because that is
+   the claim the field makes.
+
+   Collected from :ON-TICK rather than from a handler: an HTTP handler is
+   given a request and never sees the connection it arrived on, so the tick,
+   which runs with this worker's table bound, is the only place an
+   application can look at one.
+
+   Keyed on the connection object, and that is load-bearing. The first
+   version recorded (fd . serial) pairs deduplicated by EQUAL, so a server
+   handing every connection the same serial collapsed them to one pair per fd
+   — and the control counting observations went red with the property it was
+   meant to be independent of. A mutation that turns the control red cannot
+   be read: it says the observation broke, not that the property did. Here
+   the count of connections seen does not depend on the serials at all.
+
+   The fd is captured when the connection is seen rather than read back
+   later, because CONNECTION-CLOSE sets it to -1. The serial it leaves alone.
+
+   There is no assertion that the serials increase. There was one, and it
+   compared a sorted list with a sorted copy of itself, which is true of any
+   list whatever. Distinct serials, and a highest serial no lower than the
+   number of connections, are the claims a repeating or constant counter
+   actually fails."
+  (format t "~%server: a connection number that is not an fd~%")
+  (let ((seen nil)
+        (lock (sb-thread:make-mutex))
+        (saved *worker-wake-interval*))
+    (unwind-protect
+         (progn
+           ;; Set before the workers start so they pick it up on their first
+           ;; pass rather than after one second of the old value.
+           (setf *worker-wake-interval* 0.05)
+           (with-test-server
+               (:workers 1
+                :on-tick
+                (lambda (id)
+                  (declare (ignore id))
+                  (maphash
+                   (lambda (fd conn)
+                     (sb-thread:with-mutex (lock)
+                       (unless (assoc conn seen :test #'eq)
+                         (push (cons conn fd) seen))))
+                   web-skeleton::*connections*))
+                :handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             ;; Connecting is enough: a connection is registered at accept,
+             ;; and no request has to be made for it to exist. Held open for
+             ;; a few ticks so the hook above is certain to have seen it.
+             (dotimes (i 3)
+               (multiple-value-bind (socket stream) (%raw-connect)
+                 (declare (ignore stream))
+                 (sleep 0.25)
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))
+                 ;; And closed before the next one opens, so the fd it was
+                 ;; using is free when the next accept asks for one.
+                 (sleep 0.15)))))
+      (setf *worker-wake-interval* saved))
+    (let* ((pairs (sb-thread:with-mutex (lock) (copy-list seen)))
+           (serials (mapcar (lambda (p) (connection-serial (car p))) pairs))
+           (fds (mapcar #'cdr pairs)))
+      (format t "  (observed ~d connection~:p across ~d distinct fd~:p)~%"
+              (length pairs) (length (remove-duplicates fds)))
+      ;; The control, and it counts connection objects, so nothing about the
+      ;; serials can move it. Every assertion after it is true of an empty
+      ;; list, so without it the test passes on a server that accepted
+      ;; nothing and a hook that never ran. At least three rather than
+      ;; exactly three: WITH-TEST-SERVER probes the port to know it is up,
+      ;; and those are accepted connections like any other.
+      (check "at least the three opened here were seen"
+             (>= (length pairs) 3) t)
+      (check "no serial was handed out twice"
+             (length (remove-duplicates serials)) (length serials))
+      (check "and they count accepts, so the highest is at least the count"
+             (and serials (>= (reduce #'max serials) (length serials))) t))))
+
+(defun test-connection-serial-survives-a-worker-restart ()
+  "A worker that crashes and restarts keeps counting its accepts, so no two
+   connections the server accepts share a name.
+
+   The serial names a connection, and the demo prints that name on a public
+   line. Bound beside the other per-worker slots, it began again at one on
+   every restart, so a crashed worker's next peer took the name of its first.
+
+   The crash is real rather than simulated. The hook duplicates /dev/null over
+   the worker's own epoll fd, once; the next pass's epoll_wait fails with
+   EINVAL, because that number no longer names an epoll instance, nothing in
+   RUN-EVENT-LOOP catches it, and RUN-WORKER takes the restart path it takes
+   for any error that escapes — the path its docstring records a shipping
+   server taking. So this is also the first test that watches a worker come
+   back at all.
+
+   Duplicated over, not closed. RUN-WORKER's cleanup closes the epoll fd
+   itself, so closing it here first would free the number for whatever opens
+   a descriptor next and leave the cleanup to close that instead — the reuse
+   race any close by number runs. dup2 keeps the number owned until the
+   cleanup's own close.
+
+   The restart is detected by the connection table, not assumed from the
+   close. RUN-WORKER binds a fresh table on every pass, so the hook seeing a
+   second distinct table is proof a restart happened; counting ticks after the
+   close would not be, because a worker that somehow survived the close would
+   go on ticking too. The log line is a second, independent witness."
+  (format t "~%server: a serial survives the worker restarting~%")
+  (let ((seen nil)
+        (tables nil)
+        (lock (sb-thread:make-mutex))
+        (crash nil)
+        (log (make-string-output-stream))
+        (saved-stream web-skeleton::*log-stream*))
+    ;; Global SETF: the worker is a thread START-SERVER spawns and reads the
+    ;; global value, so a binding here would capture nothing.
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:workers 1
+              :on-tick
+              (lambda (id)
+                (declare (ignore id))
+                (sb-thread:with-mutex (lock)
+                  (let ((table web-skeleton::*connections*))
+                    (unless (member table tables :test #'eq)
+                      (push table tables))
+                    (maphash (lambda (fd conn)
+                               (unless (assoc conn seen :test #'eq)
+                                 (push (cons conn fd) seen)))
+                             table))
+                  (when crash
+                    (setf crash nil)
+                    (with-open-file (devnull "/dev/null")
+                      (unless (= (sb-alien:alien-funcall
+                                  (sb-alien:extern-alien
+                                   "dup2" (function sb-alien:int sb-alien:int
+                                                    sb-alien:int))
+                                  (sb-sys:fd-stream-fd devnull)
+                                  web-skeleton::*epoll-fd*)
+                                 web-skeleton::*epoll-fd*)
+                        (error "dup2 over the epoll fd failed"))))))
+              :handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "ok")))
+           (flet ((hold-one ()
+                    ;; Retried, because across the restart there is a second
+                    ;; with no listener and a refused connect is expected.
+                    ;; Held open for a few ticks so the hook is certain to
+                    ;; see it, then closed.
+                    (let ((deadline (+ (get-universal-time) 8)))
+                      (loop
+                        (let ((socket (ignore-errors (%raw-connect))))
+                          (when socket
+                            (sleep 0.25)
+                            (ignore-errors (sb-bsd-sockets:socket-close socket))
+                            (sleep 0.15)
+                            (return t)))
+                        (when (> (get-universal-time) deadline) (return nil))
+                        (sleep 0.1))))
+                  (tables-seen ()
+                    (sb-thread:with-mutex (lock) (length tables))))
+             (check "control: a connection was accepted before the crash"
+                    (hold-one) t)
+             (let ((before (sb-thread:with-mutex (lock) (copy-list seen))))
+               (sb-thread:with-mutex (lock) (setf crash t))
+               ;; The restart backs off a second before rebinding; wait for
+               ;; the second table rather than guessing at the second.
+               (let ((deadline (+ (get-universal-time) 8)))
+                 (loop until (or (>= (tables-seen) 2)
+                                 (> (get-universal-time) deadline))
+                       do (sleep 0.05)))
+               (check "control: the worker crashed and came back"
+                      (tables-seen) 2)
+               (check "control: a connection was accepted after the restart"
+                      (hold-one) t)
+               (let* ((after (sb-thread:with-mutex (lock)
+                               (remove-if (lambda (p)
+                                            (assoc (car p) before :test #'eq))
+                                          seen)))
+                      (before-serials
+                        (mapcar (lambda (p) (connection-serial (car p))) before))
+                      (after-serials
+                        (mapcar (lambda (p) (connection-serial (car p))) after)))
+                 (format t "  (serials before the crash ~a, after ~a)~%"
+                         (sort (copy-list before-serials) #'<)
+                         (sort (copy-list after-serials) #'<))
+                 (check "every serial after the restart is above every one before"
+                        (and before-serials after-serials
+                             (> (reduce #'min after-serials)
+                                (reduce #'max before-serials)))
+                        t)))))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (check "control: the log names the crash"
+           (not (null (search "crashed" (get-output-stream-string log))))
+           t)))
 
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
@@ -2740,7 +3069,24 @@
                                (and body
                                     (search "connection limit" body)
                                     t)
-                               t))))
+                               t))
+                      ;; The same refusal from an operator's side. One event,
+                      ;; two call sites — the accept turned away and the 503
+                      ;; sent for it — and either can be deleted without the
+                      ;; other noticing, so each gets its own line. Polled for
+                      ;; both at once, so the wait cannot end on half.
+                      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+                        (loop until (or (and k
+                                             (>= (getf k :refused 0) 1)
+                                             (>= (getf k :server-error 0) 1))
+                                        (> (get-universal-time) deadline))
+                              do (setf k (getf (web-skeleton:connection-census)
+                                               :counters))
+                                 (sleep 0.05))
+                        (check "the census counts the accept it refused"
+                               (>= (getf k :refused 0) 1) t)
+                        (check "and the 503 as a response, though no handler ran"
+                               (>= (getf k :server-error 0) 1) t))))
                (when holder
                  (ignore-errors (sb-bsd-sockets:socket-close holder))))))
       (setf web-skeleton::*max-connections* saved))))
@@ -4266,6 +4612,9 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-pipelined-with-fin-e2e)
+  (test-worker-id-is-public-and-holds-still-per-connection)
+  (test-connection-serial-does-not-repeat-when-an-fd-does)
+  (test-connection-serial-survives-a-worker-restart)
   (test-harness-pipelined-after-body-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)

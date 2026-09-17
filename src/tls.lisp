@@ -3,14 +3,18 @@
 ;;; ===========================================================================
 ;;; TLS via libssl FFI (OpenSSL 1.1+)
 ;;;
-;;; Provides blocking TLS connections for outbound HTTPS in http-fetch.
+;;; Outbound HTTPS, two ways: a transport under the event loop's own reads
+;;; and writes for HTTP-FETCH, and a blocking connection for
+;;; HTTP-FETCH-STREAM.
 ;;; Loaded by the web-skeleton-tls ASDF system — optional, not part of core.
 ;;;
 ;;; On load:
 ;;;   1. Opens libssl.so and libcrypto.so
-;;;   2. Initializes OpenSSL
-;;;   3. Creates a shared SSL_CTX with system CA roots
-;;;   4. Registers the HTTPS fetch handler with the core framework
+;;;   2. Swaps sha1, sha256 and ecdsa-verify-p256 to libssl-backed versions
+;;;   3. Registers the outbound TLS transport and the HTTPS stream hook
+;;;
+;;; On the first connection rather than on load: OPENSSL_init_ssl and the
+;;; shared SSL_CTX carrying the system CA roots, both in ENSURE-SSL-CTX.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
@@ -107,26 +111,64 @@
   (ssl (* t))
   (fd sb-alien:int))
 
-(sb-alien:define-alien-routine ("SSL_connect" %ssl-connect) sb-alien:int
-  (ssl (* t)))
-
-(sb-alien:define-alien-routine ("SSL_shutdown" %ssl-shutdown) sb-alien:int
-  (ssl (* t)))
-
 (sb-alien:define-alien-routine ("SSL_get_error" %ssl-get-error) sb-alien:int
   (ssl (* t))
   (ret sb-alien:int))
 
-;;; I/O
-(sb-alien:define-alien-routine ("SSL_read" %ssl-read) sb-alien:int
+;;; The error queue, and the four calls SSL_get_error explains.
+;;;
+;;; OpenSSL keeps one error queue per thread, and SSL_get_error reads it
+;;; before anything else: if anything is already on it, the answer is
+;;; SSL_ERROR_SSL whatever the call that just returned really hit. Its man
+;;; page is plain about it — the queue "must be empty before the TLS/SSL I/O
+;;; operation is attempted, or SSL_get_error() will not work reliably."
+;;;
+;;; On a worker that is not a formality. The queue fills from anything on
+;;; the thread that fails: a certificate that did not verify, EVP_PKEY_verify
+;;; refusing a signature a client sent, a shutdown on a handshake that never
+;;; happened. Every drain ends in WANT_READ, so the next one on that worker
+;;; is reported as fatal, and a fetch to a healthy upstream fails with a 502.
+;;;
+;;; Emptied before each call rather than after each failure, because the
+;;; things that can fill the queue are an open list and the calls
+;;; SSL_get_error explains are these four. So they are bound under -RAW
+;;; names, and the names every call site uses are wrappers that empty the
+;;; queue first. A call site cannot forget to, and neither can the next one
+;;; written.
+(sb-alien:define-alien-routine ("ERR_clear_error" %err-clear-error)
+    sb-alien:void)
+
+(sb-alien:define-alien-routine ("SSL_connect" %ssl-connect-raw) sb-alien:int
+  (ssl (* t)))
+
+(sb-alien:define-alien-routine ("SSL_shutdown" %ssl-shutdown-raw) sb-alien:int
+  (ssl (* t)))
+
+(sb-alien:define-alien-routine ("SSL_read" %ssl-read-raw) sb-alien:int
   (ssl (* t))
   (buf (* t))
   (num sb-alien:int))
 
-(sb-alien:define-alien-routine ("SSL_write" %ssl-write) sb-alien:int
+(sb-alien:define-alien-routine ("SSL_write" %ssl-write-raw) sb-alien:int
   (ssl (* t))
   (buf (* t))
   (num sb-alien:int))
+
+(defun %ssl-connect (ssl)
+  (%err-clear-error)
+  (%ssl-connect-raw ssl))
+
+(defun %ssl-shutdown (ssl)
+  (%err-clear-error)
+  (%ssl-shutdown-raw ssl))
+
+(defun %ssl-read (ssl buf num)
+  (%err-clear-error)
+  (%ssl-read-raw ssl buf num))
+
+(defun %ssl-write (ssl buf num)
+  (%err-clear-error)
+  (%ssl-write-raw ssl buf num))
 
 ;;; Staging a write into foreign memory is a byte copy on the write path,
 ;;; so it goes through libc rather than a SAP loop.
@@ -155,6 +197,18 @@
   (larg sb-alien:long)
   (parg (* t)))
 
+;;; Options, and the library version that decides which ones exist. Both are
+;;; functions in 1.1.0 and later; the option bit set below means what it says
+;;; only from 3.0, so it is gated on the version rather than on the symbol,
+;;; and the options are bound as 3.0 declares them, uint64_t.
+(sb-alien:define-alien-routine ("OpenSSL_version_num" %openssl-version-num)
+    sb-alien:unsigned-long)
+
+(sb-alien:define-alien-routine ("SSL_CTX_set_options" %ssl-ctx-set-options)
+    (sb-alien:unsigned 64)
+  (ctx (* t))
+  (options (sb-alien:unsigned 64)))
+
 ;;; Hostname verification (OpenSSL 1.1.0+)
 (sb-alien:define-alien-routine ("SSL_set1_host" %ssl-set1-host) sb-alien:int
   (ssl (* t))
@@ -180,6 +234,10 @@
    SSL_CTX_ctrl mixup) can return 1 while writing to a garbage offset,
    and only the read-back exposes that the floor never landed.")
 (defconstant +tls1-2-version+ #x0303)
+(defconstant +openssl-3+ #x30000000
+  "OpenSSL_version_num of 3.0.0.")
+(defconstant +ssl-op-ignore-unexpected-eof+ #x80
+  "SSL_OP_BIT(7): OpenSSL 3.0 and later.")
 (defconstant +ssl-error-want-read+ 2)
 (defconstant +ssl-error-want-write+ 3)
 (defconstant +ssl-error-syscall+ 5)
@@ -235,6 +293,20 @@
                (unless (= 1 (%ssl-ctx-ctrl ctx +ssl-ctrl-set-min-proto-version+
                                            +tls1-2-version+ (sb-sys:int-sap 0)))
                  (error "SSL_CTX set min proto version failed"))
+               ;; A peer that closes without close_notify is how an
+               ;; HTTP/1.0-style response ends, and SSL-READ-EOF-OR-RAISE
+               ;; reads it as the end of the body. OpenSSL 1.1.1 reported it
+               ;; as SSL_ERROR_SYSCALL with errno 0, which is the arm that
+               ;; reading lives in. OpenSSL 3 reports the same close as a
+               ;; fatal SSL_ERROR_SSL, so without this every such response
+               ;; failed — and so did a framed one whose last bytes and the
+               ;; close came in one wake-up, before completeness was checked.
+               ;; The option makes 3.x report it as SSL_ERROR_ZERO_RETURN,
+               ;; a clean end, which puts both versions back on one reading.
+               ;; Truncation of a framed body is still caught where it always
+               ;; was, by a short Content-Length or a missing terminator.
+               (when (>= (%openssl-version-num) +openssl-3+)
+                 (%ssl-ctx-set-options ctx +ssl-op-ignore-unexpected-eof+))
                ;; Load system CA certificates. Raising rather than warning:
                ;; SSL_VERIFY_PEER is set two lines down, so with no trust
                ;; anchors every handshake fails anyway — the old warning was
@@ -454,7 +526,7 @@
 (defun tls-write-all (ssl bytes)
   "Write all BYTES through the SSL connection. Blocks until complete.
    Surfaces SO_SNDTIMEO as a distinct error from transport failures
-   via SSL-WRITE-ERROR-RAISE — symmetric with SSL-READ-EOF-OR-RAISE
+   via SSL-WRITE-RETRY-OR-RAISE — symmetric with SSL-READ-EOF-OR-RAISE
    on the read path."
   (let ((pos 0)
         (len (length bytes)))
@@ -523,7 +595,11 @@
      errno = 0                  — end of stream with no close_notify.
                                   Benign, and load-bearing: it is the
                                   framing signal for HTTP/1.0-style
-                                  servers that never send one.
+                                  servers that never send one. This is
+                                  OpenSSL 1.1.1's shape; 3.x reports the
+                                  same close as SSL_ERROR_ZERO_RETURN,
+                                  because ENSURE-SSL-CTX sets
+                                  SSL_OP_IGNORE_UNEXPECTED_EOF.
      errno = EAGAIN/EWOULDBLOCK — would block. :AGAIN, per above.
      errno = EINTR              — a signal arrived before the call moved
                                   any bytes. Nothing is wrong with the

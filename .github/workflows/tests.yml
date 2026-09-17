@@ -25,6 +25,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The Lisp suite cannot see a JavaScript syntax error, and the demo page
+      # is served from this repo. A corrupt app.js is a dead page — no socket,
+      # no census, no tab switching — behind a totals line reading ALL TESTS
+      # PASSED, because none of those tests are in the browser. That happened:
+      # escape sequences were eaten out of a regex literal, the file stopped
+      # parsing, and the whole demo went inert with a green gate.
+      #
+      # node --check is a real parse, not a lint, and the runner already has
+      # node, so this costs a second and installs nothing.
+      - name: Parse the demo's JavaScript
+        run: |
+          set -o pipefail
+          found=0
+          for f in demo/static/*.js; do
+            [ -e "$f" ] || continue
+            found=$((found + 1))
+            echo "checking $f"
+            node --check "$f"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no .js found under demo/static — this check is now vacuous"
+            exit 1
+          fi
+
       # Ubuntu runners already carry libssl3 and glibc's getent, so the
       # optional web-skeleton-tls system loads: the suite exercises the
       # libssl crypto swap AND re-verifies the pure-Lisp originals against it.
@@ -64,5 +88,51 @@ jobs:
           if grep -qiE 'caught (warning|style-warning)' /tmp/build.log; then
             echo "::error::compile emitted warnings"
             grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/build.log
+            exit 1
+          fi
+
+      # The demo is a consumer of the framework, and the test system depends
+      # on the framework and the harness rather than on it — so nothing in
+      # this job had ever compiled demo/. It reached a deployment before it
+      # reached a runner and stopped there, on a symbol that is external in
+      # one SBCL and internal in another: a READ error, not a warning, so the
+      # build ended before it began.
+      #
+      # Loading the system is most of the check: a demo that does not compile
+      # has no behaviour to test. The one behaviour checked here is the Origin
+      # check on /ws, the page's only security control and the part of it most
+      # likely to be copied into something else. demo/test-origin.lisp runs
+      # between the load and the sentinel, so a wrong answer leaves no
+      # sentinel either.
+      #
+      # Success is a file, not a word in the log, and that is not fussiness.
+      # The first version of this printed DEMO COMPILED and grepped for it —
+      # and passed on a failing build, because SBCL prints its --eval list in
+      # the backtrace, so the log of the failure contained the exact string
+      # that was supposed to prove success. A sentinel the failure can quote
+      # back is not a sentinel. This one exists only if the form ran.
+      #
+      # The suite's own totals-line check above is safe from this for the
+      # reason this one was not: run-tests.lisp arrives through --load, so
+      # the string it prints is nowhere on the command line.
+      - name: Compile the demo system, and check its Origin table
+        run: |
+          set -o pipefail
+          rm -f /tmp/demo.ok
+          sbcl --non-interactive \
+               --eval '(require :asdf)' \
+               --eval '(push *default-pathname-defaults* asdf:*central-registry*)' \
+               --eval '(asdf:load-system "web-skeleton-demo")' \
+               --load demo/test-origin.lisp \
+               --eval '(with-open-file (f "/tmp/demo.ok" :direction :output) (write-line "ok" f))' \
+               2>&1 | tee /tmp/demo.log
+          if [ ! -f /tmp/demo.ok ]; then
+            echo "::error::the demo system did not load, or its Origin table failed"
+            tail -40 /tmp/demo.log
+            exit 1
+          fi
+          if grep -qiE 'caught (warning|style-warning)' /tmp/demo.log; then
+            echo "::error::the demo emitted compile warnings"
+            grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/demo.log
             exit 1
           fi

@@ -27,7 +27,7 @@ body {
 }
 
 h1 {
-  margin-bottom: 1em;
+  margin-bottom: 1.2em;
   color: var(--bone-bright);
   text-shadow: 0 0 20px rgba(96, 128, 224, 0.3);
 }
@@ -44,7 +44,6 @@ h1 {
 }
 
 .status { color: var(--electric); }
-.sent { color: var(--bone-dim); }
 .recv { color: var(--spark-blue); }
 .err { color: var(--err); }
 
@@ -81,3 +80,267 @@ button {
 button:hover {
   background: var(--purple);
 }
+
+/* Sections. Sparse on purpose: the page should read as things the server
+   said, not as prose about a server. */
+
+section { margin-bottom: 2.5em; }
+
+h2 {
+  font-size: 1em;
+  font-weight: normal;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--purple);
+  margin-bottom: 0.5em;
+}
+
+.sub {
+  color: var(--bone-dim);
+  margin-bottom: 1em;
+  max-width: 54em;
+}
+
+.vitals {
+  background: var(--bg-mid);
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  color: var(--electric-bright);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.limbs {
+  background: var(--bg-mid);
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  color: var(--bone-dim);
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 40em;
+}
+
+.limbs th {
+  text-align: left;
+  font-weight: normal;
+  color: var(--purple);
+  padding: 0 2em 0.4em 0;
+  border-bottom: 1px solid var(--bg-glow);
+}
+
+.limbs td {
+  padding: 0.3em 2em 0.3em 0;
+  color: var(--bone);
+}
+
+/* Tabs */
+
+.tabs {
+  display: flex;
+  gap: 0.5em;
+  margin-bottom: 2em;
+  border-bottom: 1px solid var(--bg-glow);
+}
+
+.tab {
+  font-family: inherit;
+  font-size: 1em;
+  letter-spacing: 0.12em;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--bone-dim);
+  padding: 0.4em 0.9em;
+  cursor: pointer;
+}
+
+.tab:hover { color: var(--bone); }
+
+.tab[aria-selected="true"] {
+  color: var(--bone-bright);
+  border-bottom-color: var(--purple);
+}
+
+/* The refusal bench */
+
+.case {
+  background: var(--bg-mid);
+  border-radius: 4px;
+  padding: 1em;
+  margin-bottom: 1.2em;
+  max-width: 46em;
+}
+
+.case-title {
+  color: var(--bone-bright);
+  margin-bottom: 0.6em;
+}
+
+.case-bytes {
+  color: var(--bone-dim);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: pre;
+  margin-bottom: 0.8em;
+}
+
+.case-row {
+  display: flex;
+  align-items: center;
+  gap: 1em;
+  margin-bottom: 0.8em;
+}
+
+.case-out { color: var(--bone-dim); }
+.case-out.refused { color: var(--spark-blue); }
+.case-out.accepted { color: var(--electric); }
+
+.case-why {
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  line-height: 1.5;
+}
+
+/* The lab */
+
+.tool {
+  background: var(--bg-mid);
+  border-radius: 4px;
+  padding: 1em;
+  margin-bottom: 1.2em;
+  max-width: 60em;
+}
+
+.tool-title {
+  color: var(--bone-bright);
+  margin-bottom: 0.6em;
+}
+
+.tool-note {
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  margin-bottom: 0.8em;
+}
+
+.tool-form { flex-wrap: wrap; align-items: center; }
+
+.tool-form input { flex: 0 1 14em; min-width: 8em; }
+.tool-form input.wide { flex: 1 1 24em; }
+
+.tool-form select {
+  padding: 0.5em;
+  font-family: monospace;
+  font-size: 1em;
+  background: var(--bg-mid);
+  color: var(--bone);
+  border: 1px solid var(--purple-deep);
+  border-radius: 4px;
+  outline: none;
+}
+
+.tool-out { margin-top: 1em; }
+
+.tool-answer {
+  color: var(--electric-bright);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-bottom: 0.8em;
+}
+
+.tool-answer.bad { color: var(--err); }
+
+.tool-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em 1.4em;
+  color: var(--bone-dim);
+  font-size: 0.92em;
+  margin-bottom: 1em;
+}
+
+.tool-worker { color: var(--purple); }
+
+.tool-label {
+  color: var(--purple);
+  font-size: 0.92em;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.3em;
+}
+
+.tool-wire {
+  color: var(--bone-dim);
+  background: var(--bg-deep);
+  padding: 0.7em 0.9em;
+  border-radius: 3px;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 22em;
+  white-space: pre;
+  margin-bottom: 1em;
+}
+
+/* The worker holding this page's socket. */
+.limbs tr.mine td { color: var(--electric-bright); }
+
+/* Who said it */
+
+/* Long enough now that a mid-stamp line break would be unreadable. */
+.when { color: var(--bone-dim); white-space: nowrap; }
+.who { color: var(--purple); }
+
+/* Your own lines. The handle is the page's own, answered by the server over
+   the control channel, so this marks what you sent without the page having
+   to guess from timing. */
+.recv.own .who { color: var(--electric-bright); }
+
+/* Arms and legs, with room to stretch. The first two columns are short and
+   fixed-width, so the slack lands in the third, which is the one that grows. */
+.scroll-x { overflow-x: auto; }
+
+.limbs { max-width: 64em; }
+.limbs th:nth-child(1), .limbs td:nth-child(1),
+.limbs th:nth-child(2), .limbs td:nth-child(2) { white-space: nowrap; }
+.limbs th:nth-child(1), .limbs td:nth-child(1) { width: 5em; }
+.limbs th:nth-child(2), .limbs td:nth-child(2) { width: 20em; }
+.limbs th:nth-child(3), .limbs td:nth-child(3) { width: auto; }
+
+/* Narrow screens. The page is monospace and full of wire bytes, which no
+   amount of stacking makes narrow — so the blocks that cannot shrink scroll
+   inside themselves, and everything else gives back the padding. */
+@media (max-width: 720px) {
+  body { padding: 1em 0.9em; }
+  h1 { font-size: 1.3em; }
+  #log { height: 55vh; max-height: 400px; }
+  .limbs th, .limbs td { padding-right: 1em; }
+  .tool-form input.wide { flex-basis: 100%; }
+  .tool-wire { max-height: 16em; }
+  .tabs { gap: 0.2em; }
+  .tab { padding: 0.4em 0.6em; }
+}
+
+/* The way back to wherever this is hung off, when there is one. */
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6em 1.5em;
+  flex-wrap: wrap;
+  margin-bottom: 1.2em;
+}
+
+.topbar h1 { margin-bottom: 0; }
+
+.backlink {
+  color: var(--bone-dim);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.backlink:hover { color: var(--electric-bright); }

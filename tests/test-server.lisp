@@ -2293,7 +2293,7 @@
    existed, at all three granularities below, which agreed — so a single
    recorded triple is not a lie about any of them. That capture is what
    makes the deletion of ~450 lines checkable rather than hopeful, and it
-   is the whole reason issue #4 put the seam there."
+   is the whole reason the seam was put there."
   (let* ((cr (string #\Return))
          (lf (string #\Newline))
          (crlf (concatenate 'string cr lf)))
@@ -4712,7 +4712,7 @@
    is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
    does not — which is what makes the two masks distinguishable without any
    data timing. Asserting delivery instead would pass against a mask that
-   never changed: issue #5 produced exactly that test, twice.
+   never changed, and exactly that test was written twice before this one.
 
    The second half is the security-relevant one. A connection whose
    transport has a handshake is not usable when the TCP connect lands, and
@@ -4885,8 +4885,8 @@
   "A paused outbound is resumed when the inbound it relays into drains its
    own backlog — without the application calling FETCH-RESUME.
 
-   Issue #5 described the resume as an inbound->outbound edge; what shipped
-   was FETCH-RESUME, a primitive the app had to invoke itself. The gap that
+   The resume belongs on the inbound->outbound edge. FETCH-RESUME alone is
+   a primitive the app has to invoke itself, and the gap that
    left is not theoretical: ON-BODY is the app's only scheduled contact
    with a relay, pausing is what stops ON-BODY firing, so an app that
    paused and had nothing else to run had removed its own way back.
@@ -4894,8 +4894,8 @@
    Asserted against epoll rather than against a flag. Clearing
    FETCH-PAUSED without re-arming EPOLLIN would look identical from the
    struct and would leave the connection waiting for an event nobody is
-   going to send — which is exactly the mistake issue #5's own re-arm test
-   was rewritten to catch."
+   going to send — which is exactly the mistake the re-arm test was
+   rewritten to catch."
   (format t "~%Automatic inbound-to-outbound resume~%")
   (multiple-value-bind (in-server in-client) (%loopback-pair)
     (multiple-value-bind (out-server out-client) (%loopback-pair)
@@ -5071,8 +5071,8 @@
    stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
    and until now not assertable without a real socket and a real partial
    read. A scripted byte source makes it deterministic, which matters
-   because issue #8 rests the whole SSL_pending argument on this loop
-   behaving exactly this way."
+   because the whole SSL_pending argument rests on this loop behaving
+   exactly this way."
   (format t "~%Connection transport seam~%")
   ;; ---- reads ----
   (let* ((calls (list 0))
@@ -8623,6 +8623,891 @@
              (and (stringp msg) (search "*fetch-timeout*" msg) t))
            t)))
 
+(defun test-on-tick-runs-with-the-workers-bindings ()
+  "ON-TICK runs on each worker's own thread with that worker's epoll fd
+   and connection table bound.
+
+   The bindings are the entire primitive. Fanning a message out to the
+   connections a worker owns has to happen from that worker, and WS-SEND's
+   ownership guard is (WHEN *EPOLL-FD* ...) — so a hook running anywhere
+   else would not merely fail, it would skip the guard and append to an
+   unlocked queue while reporting success. Asserting the hook was called
+   proves almost nothing; asserting the bindings are live inside it is what
+   makes the call worth making.
+
+   Two workers, so `every worker ticks` is measured rather than inferred
+   from where the call sits in RUN-EVENT-LOOP."
+  (format t "~%on-tick: runs on every worker with its bindings live~%")
+  ;; Counted, not flagged. A boolean initialised to T and only cleared on
+  ;; failure passes when the hook never runs at all, which is the one
+  ;; outcome this test exists to catch.
+  (let ((ticks 0) (ids nil) (epoll-live 0) (table-live 0)
+        (lock (sb-thread:make-mutex :name "on-tick-bindings")))
+    (with-test-server (:workers 2
+                       :on-tick (lambda (id)
+                                  (sb-thread:with-mutex (lock)
+                                    (incf ticks)
+                                    (pushnew id ids)
+                                    (when web-skeleton::*epoll-fd*
+                                      (incf epoll-live))
+                                    (when web-skeleton::*connections*
+                                      (incf table-live)))))
+      ;; Control. Passes whether or not ON-TICK exists, so a failure here
+      ;; says the fixture broke rather than the feature.
+      (check "control: the server is up and answering"
+             (multiple-value-bind (status) (test-http-request :get "/__nonce")
+               (eql status 200))
+             t)
+      (sleep 0.6)
+      (sb-thread:with-mutex (lock)
+        (check "on-tick ran" (> ticks 0) t)
+        (check "*epoll-fd* was bound on every tick"
+               (and (> ticks 0) (= epoll-live ticks)) t)
+        (check "*connections* was bound on every tick"
+               (and (> ticks 0) (= table-live ticks)) t)
+        (check "both workers ticked"
+               (and (member 0 ids) (member 1 ids) t)
+               t)))))
+
+(defun test-on-tick-survives-a-raising-hook ()
+  "A raising hook is caught and the loop keeps turning.
+
+   A per-pass hook runs thousands of times a second under load, so any
+   raise it can produce it will produce. Letting one out would take down a
+   worker and every connection on it.
+
+   Asserted on the tick COUNT rather than on the server still answering,
+   because RUN-WORKER restarts a crashed worker with backoff — so a server
+   that answers proves nothing here. Eight-odd ticks in 0.4s at the
+   harness's 0.05s wake interval means the same loop kept running; a crash
+   and restart cycle would show one or two. The counter also makes a revert
+   visible: with no ON-TICK support it stays 0 rather than passing because
+   nothing ever ran."
+  (format t "~%on-tick: a raising hook does not take the worker down~%")
+  (let ((entered 0)
+        (lock (sb-thread:make-mutex :name "on-tick-raise"))
+        ;; Global SETF, not a binding: the worker is a thread START-SERVER
+        ;; spawns and reads the global value, so a LET here would capture
+        ;; nothing and the count below would pass on an empty string.
+        (log (make-string-output-stream))
+        (saved-stream web-skeleton::*log-stream*))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server (:on-tick (lambda (id)
+                                       (declare (ignore id))
+                                       (sb-thread:with-mutex (lock) (incf entered))
+                                       (error "deliberate: on-tick raised")))
+           (sleep 0.4)
+           (let ((n (sb-thread:with-mutex (lock) entered)))
+             (check "the hook ran and raised" (> n 0) t)
+             (check "the loop kept turning rather than crashing and backing off"
+                    (> n 3) t))
+           (check "the server still answers after all that"
+                  (multiple-value-bind (status) (test-http-request :get "/__nonce")
+                    (eql status 200))
+                  t))
+      (setf web-skeleton::*log-stream* saved-stream))
+    ;; Several raises and one report. A hook that raises on every pass would
+    ;; otherwise write a line on every pass, holding the one lock every worker
+    ;; takes to log — and the suite passed with that limit removed, because
+    ;; nothing counted the lines.
+    (let* ((text (get-output-stream-string log))
+           (reports (loop with start = 0
+                          for i = (search ":on-tick raised" text :start2 start)
+                          while i count t do (setf start (1+ i)))))
+      (check "a hook raising on every pass is reported once, not every pass"
+             reports 1))))
+
+(defun test-on-tick-validated-at-boot ()
+  "START-SERVER refuses a non-function :ON-TICK before it binds.
+
+   Same argument as the three boot invariants above it: a misconfiguration
+   should not wait for the shape that reveals it. This one is worse than
+   most if it waits — a value that cannot be funcalled raises on the first
+   pass of every worker's loop and on every pass after, which is exactly
+   the flood the rate limit in RUN-EVENT-LOOP exists to survive, reached
+   through a typo instead of a bug.
+
+   :HOST is deliberately invalid, so a revert fails this assertion at
+   MAKE-TCP-LISTENER instead of starting a real server inside the suite."
+  (format t "~%start-server: the fourth boot invariant~%")
+  (check "boot: a non-function :on-tick is refused by name"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 42))))
+           (and (stringp msg) (search ":on-tick" msg) t))
+         t)
+  (check "control: the same call without :on-tick fails elsewhere"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1))))
+           (and (stringp msg) (not (search ":on-tick" msg)) t))
+         t)
+  ;; A symbol naming a function is accepted, as :HANDLER accepts one, so a
+  ;; hook redefined at the REPL reaches a running server. Accepted here means
+  ;; the call gets past the check and fails on the bad host instead.
+  (check "boot: a symbol naming a function is accepted"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'identity))))
+           (and (stringp msg) (not (search ":on-tick" msg)) t))
+         t)
+  ;; And the two a symbol could still get wrong. Without these, accepting
+  ;; every symbol would pass the assertion above.
+  (check "boot: a symbol naming no function is still refused"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'no-function-is-named-this))))
+           (and (stringp msg) (search ":on-tick" msg) t))
+         t)
+  (check "boot: a symbol naming a macro is refused, since it cannot be funcalled"
+         (let ((msg (attempt (web-skeleton:start-server
+                              :host #(1 2 3) :port 0 :workers 1
+                              :on-tick 'when))))
+           (and (stringp msg) (search ":on-tick" msg) t))
+         t))
+
+(defun %ws-conn (fd state)
+  "Register a bare connection in the current *CONNECTIONS* with STATE."
+  (let ((c (web-skeleton::make-connection :fd fd :last-active 0)))
+    (setf (web-skeleton::connection-state c) state)
+    (web-skeleton::register-connection c)
+    c))
+
+(defun test-map-worker-websockets-visits-only-websockets ()
+  "The walk visits :WEBSOCKET and nothing else.
+
+   The states it must skip are not hypothetical: a connection mid-upgrade,
+   one already closing, and one writing a plain HTTP response all live in the
+   same table, and handing any of them to an application that is about to
+   call WS-SEND would produce a frame on a socket that is not speaking that
+   protocol yet, or at all."
+  (format t "~%map-worker-websockets: only websockets, only this worker~%")
+  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
+    (%ws-conn 101 :websocket)
+    (%ws-conn 102 :websocket)
+    (%ws-conn 103 :read-http)
+    (%ws-conn 104 :closing)
+    (%ws-conn 105 :write-response)
+    ;; Control: every state really is in the table, so a walk finding two is
+    ;; selecting rather than failing to see the other three.
+    (check "control: all five states are registered"
+           (hash-table-count web-skeleton::*connections*) 5)
+    (let ((seen nil))
+      (let ((n (web-skeleton:map-worker-websockets
+                (lambda (c) (push (web-skeleton::connection-fd c) seen)))))
+        (check "visits exactly the websockets" (sort seen #'<) (list 101 102))
+        (check "and returns how many it called" n 2)))))
+
+(defun test-map-worker-websockets-skips-what-a-callback-closed ()
+  "A connection an earlier callback closed is skipped, not handed over dead.
+
+   This is what lets a broadcast call WS-SEND without asking first. One slow
+   peer's send can close its connection, and on a table collected up front
+   the entry behind it would otherwise still be walked — WS-SEND would then
+   refuse it for not being in the table, turning one dead peer into a raise
+   that stops the fan-out to everyone after it."
+  (format t "~%map-worker-websockets: the liveness re-check~%")
+  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
+    (let* ((a (%ws-conn 201 :websocket))
+           (b (%ws-conn 202 :websocket))
+           (calls 0))
+      (let ((n (web-skeleton:map-worker-websockets
+                (lambda (c)
+                  (incf calls)
+                  ;; Whichever one we were handed, close the other.
+                  (web-skeleton::unregister-connection (if (eq c a) b a))))))
+        (check "the closed one is not visited" calls 1)
+        (check "the count reflects only what was called" n 1)))))
+
+(defun test-map-worker-websockets-refuses-off-a-worker ()
+  "Off a worker there is no table, and zero would be a lie.
+
+   Returning zero would be indistinguishable from a server with no clients,
+   which is the shape a background thread would see every time — the same
+   silence that makes writing from off a worker dangerous in the first
+   place, since the ownership guards are (WHEN *EPOLL-FD* ...) and skip."
+  (format t "~%map-worker-websockets: refuses off a worker~%")
+  (let ((web-skeleton::*connections* nil))
+    (check "refuses by name rather than answering zero"
+           (let ((msg (attempt (web-skeleton:map-worker-websockets #'identity))))
+             (and (stringp msg) (search "connection table" msg) t))
+           t)))
+
+(defun test-map-worker-websockets-delivers-from-on-tick ()
+  "A frame sent to every WebSocket from inside :ON-TICK reaches the client.
+
+   The fan-out the demo is built on, end to end on a live server: a real
+   handshake, a hook that walks the worker's WebSockets and sends each a
+   frame, and that frame read back off the client's own socket. This replaces
+   a test that showed only that the walk could run inside the hook — over an
+   empty table — and left delivery resting on two halves proven apart,
+   because the suite had no handshake helper then. %WS-CLIENT-UPGRADE is one.
+
+   The hook sends once, when the test arms it, after the client has read its
+   101. An upgrade the client has seen is one the worker has recorded: the
+   state changes in the pass that writes the response, before any hook runs.
+   The walk counts what it visits, and that count is the control — a frame
+   from a hook whose walk found nothing did not come from the walk."
+  (format t "~%map-worker-websockets: a frame from on-tick reaches the client~%")
+  (let ((armed nil) (visited 0) (errs 0)
+        (lock (sb-thread:make-mutex :name "fan-out")))
+    (with-test-server
+        (:handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil)
+         :on-tick (lambda (id)
+                    (declare (ignore id))
+                    (when (sb-thread:with-mutex (lock) (shiftf armed nil))
+                      (handler-case
+                          (web-skeleton:map-worker-websockets
+                           (lambda (c)
+                             (sb-thread:with-mutex (lock) (incf visited))
+                             (web-skeleton:ws-send
+                              c (web-skeleton:build-ws-text "from the tick"))))
+                        (error () (sb-thread:with-mutex (lock) (incf errs)))))))
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (check "control: the upgrade was accepted"
+                      (not (null (search "101" (%ws-client-upgrade stream))))
+                      t)
+               (sb-thread:with-mutex (lock) (setf armed t))
+               ;; A server frame is unmasked: a first byte, a length under 126
+               ;; for a payload this short, and the payload.
+               (let ((frame (read-until-bounded
+                             stream :seconds 3
+                             :until (lambda (buf fill)
+                                      (and (>= fill 2)
+                                           (>= fill (+ 2 (logand (aref buf 1)
+                                                                 #x7f))))))))
+                 (sb-thread:with-mutex (lock)
+                   (check "control: the walk visited the one WebSocket" visited 1)
+                   (check "and nothing in it signalled" errs 0))
+                 (check "the frame the hook sent is the frame the client read"
+                        (and (>= (length frame) 2)
+                             (= (aref frame 0) #x81)
+                             (string= (sb-ext:octets-to-string
+                                       (subseq frame 2) :external-format :utf-8)
+                                      "from the tick"))
+                        t)))
+          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
+
+(defun test-connection-census-is-exported-with-a-split-contract ()
+  "CONNECTION-CENSUS is reachable without :: and reports per worker.
+
+   Two workers, and a connection held open for the duration, so the sums are
+   over something rather than over nothing — a census of an empty server
+   agrees with almost any mistake.
+
+   Polled rather than slept: the census publishes on the maintenance gate at
+   1 Hz, and each worker publishes its own slot on its own tick, so there is
+   no single interval that is both long enough and not wasteful.
+
+   :STATES and :PER-WORKER are asserted to exist and to be consistent with
+   the sums, never on their exact contents, which is what the docstring
+   calls diagnostic. A test pinning the state keywords would be a test of
+   the state machine wearing a census costume."
+  (format t "~%connection-census: exported, per worker, split contract~%")
+  (with-test-server (:workers 2)
+    (let ((held (connect-to-test-server)))
+      (unwind-protect
+           (let ((census nil)
+                 (deadline (+ (get-universal-time) 6)))
+             (loop until (or (let ((pw (getf census :per-worker)))
+                               (and pw (= (length pw) 2) (every #'identity pw)))
+                             (> (get-universal-time) deadline))
+                   do (setf census (web-skeleton:connection-census))
+                      (sleep 0.05))
+             (check "every worker published a slot"
+                    (let ((pw (getf census :per-worker)))
+                      (and (= (length pw) 2) (every #'identity pw) t))
+                    t)
+             (check ":workers is the configured count"
+                    (getf census :workers) 2)
+             (check "the held connection is counted"
+                    (>= (getf census :total 0) 1) t)
+             (check "the sums are computed from the per-worker entries"
+                    (= (getf census :total)
+                       (reduce #'+ (getf census :per-worker)
+                               :key (lambda (slot) (getf slot :total 0))))
+                    t)
+             (check ":states accounts for as many connections as :total"
+                    (= (getf census :total)
+                       (loop for (state n) on (getf census :states) by #'cddr
+                             do (progn state)
+                             sum n))
+                    t))
+        (ignore-errors (close held))))))
+
+(defun test-a-log-line-is-one-line ()
+  "One LOG-MSG call emits exactly one line, whatever it was handed.
+
+   ~S on a nested structure pretty-prints by default, wrapping at
+   *PRINT-RIGHT-MARGIN* and turning one call into a dozen lines. That is
+   not cosmetic on this logger: it holds *LOG-LOCK* — the one lock every
+   worker contends for — across the format and the FORCE-OUTPUT, and it
+   makes a line unfindable, because a grep matching the message returns the
+   first fragment and silently hides the rest.
+
+   Found by tripping on it: a census logged at :DEBUG came out eleven lines
+   wide, and reading one back needed grep -A6 and a guess at the number.
+
+   Also asserts the bound. A value large enough to fill a disk from inside
+   the mutex should truncate instead."
+  (format t "~%log: one call, one line~%")
+  (let ((deep (loop for i from 0 below 40
+                    collect (list :k i :v (list :a i :b (list :c i))))))
+    (let ((out (with-output-to-string (capture)
+                 (let ((web-skeleton:*log-stream* capture)
+                       (web-skeleton:*log-level* :debug))
+                   (web-skeleton::log-debug "structure ~s" deep)))))
+      ;; Control: it logged at all, and logged the thing it was given.
+      (check "control: the message reached the stream"
+             (and (search "structure" out) (search ":K" out) t) t)
+      (check "one call is one line" (count #\Newline out) 1))
+    (let ((out (with-output-to-string (capture)
+                 (let ((web-skeleton:*log-stream* capture)
+                       (web-skeleton:*log-level* :debug))
+                   (web-skeleton::log-debug "wide ~s"
+                                            (loop for i from 0 below 5000
+                                                  collect i))))))
+      (check "a runaway structure is truncated, not printed whole"
+             (< (length out) 2000) t))))
+
+(defun test-counters-count-responses-by-class ()
+  "Every response is counted once in total and once in its class.
+
+   The class split is the point. A total alone cannot tell a server answering
+   a thousand requests from one refusing a thousand, and the refusals are the
+   half an application cannot see for itself."
+  (format t "~%counters: responses by class~%")
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (mapc #'web-skeleton::note-response (list 100 200 201 301 400 404 500))
+    (web-skeleton::note-accepted)
+    (web-skeleton::note-refused)
+    (web-skeleton::note-ws-frame)
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "counted in total"  (getf snap :responses) 7)
+      (check "1xx informational" (getf snap :informational) 1)
+      (check "2xx successful"    (getf snap :successful) 2)
+      (check "3xx redirected"    (getf snap :redirected) 1)
+      (check "4xx client-error"  (getf snap :client-error) 2)
+      (check "5xx server-error"  (getf snap :server-error) 1)
+      (check "accepts taken"     (getf snap :accepted) 1)
+      (check "accepts refused"   (getf snap :refused) 1)
+      (check "ws frames queued"  (getf snap :ws-frames) 1)))
+  (check "off a worker: nothing to snapshot, and no raise getting there"
+         (let ((web-skeleton::*counters* nil))
+           (web-skeleton::note-response 200)
+           (web-skeleton::note-accepted)
+           (web-skeleton::counters-snapshot))
+         nil))
+
+(defun test-counters-see-a-response-no-handler-produced ()
+  "A request refused by the parser is counted, and the handler never runs.
+
+   This is the argument for counting in the framework rather than in the
+   application. Transfer-Encoding alongside Content-Length is refused before
+   dispatch, so the caller gets a 400 no handler produced — and an
+   application counting its own calls would report that request as never
+   having happened at all.
+
+   Polled rather than slept: the census publishes on the maintenance gate at
+   1 Hz, which is slower than this test would care to guess at."
+  (format t "~%counters: the refusals an application cannot see~%")
+  (let ((calls 0))
+    (with-test-server (:workers 1
+                       :handler (lambda (req)
+                                  (declare (ignore req))
+                                  (incf calls)
+                                  (web-skeleton:make-text-response 200 "ok")))
+      (test-http-request :get "/")
+      (let ((calls-before calls))
+        (let* ((sock (connect-to-test-server))
+               (stream (sb-bsd-sockets:socket-make-stream
+                        sock :input t :output t
+                        :element-type '(unsigned-byte 8))))
+          (unwind-protect
+               (progn
+                 (write-sequence
+                  (sb-ext:string-to-octets
+                   (crlf "POST /x HTTP/1.1" "Host: h"
+                         "Content-Length: 5" "Transfer-Encoding: chunked")
+                   :external-format :utf-8)
+                  stream)
+                 (force-output stream)
+                 (sleep 0.3))
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close sock))))
+        (check "the handler never ran for the refused request"
+               calls calls-before))
+      ;; Waits for both responses rather than the first. A census published
+      ;; between the two requests would otherwise end the poll on a count of
+      ;; one and fail the total for a reason that has nothing to do with it.
+      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+        (loop until (or (and k (>= (getf k :responses 0) 2))
+                        (> (get-universal-time) deadline))
+              do (setf k (getf (web-skeleton:connection-census) :counters))
+                 (sleep 0.05))
+        (check "control: the handled request was counted successful"
+               (>= (getf k :successful 0) 1) t)
+        (check "the refusal was counted as a client error"
+               (>= (getf k :client-error 0) 1) t)
+        (check "and both are in the total"
+               (>= (getf k :responses 0) 2) t)
+        ;; Two connections were taken, the refused one included: the parser
+        ;; refused its request, not the accept. The class counts above are
+        ;; asserted on responses and would all pass with the accept count
+        ;; never incremented, which is the gap this closes.
+        (check "every connection taken is counted as an accept"
+               (>= (getf k :accepted 0) 2) t)))))
+
+(defun %ws-client-upgrade (stream)
+  "Send an RFC 6455 handshake for /ws on STREAM and read the response head,
+   to its blank line and no further, so a frame the server sends next is left
+   on the stream for the caller. Returns the head as a string, for the caller
+   to find its 101 in."
+  (write-sequence (sb-ext:string-to-octets
+                   (crlf "GET /ws HTTP/1.1" "Host: localhost"
+                         "Upgrade: websocket" "Connection: Upgrade"
+                         "Sec-WebSocket-Version: 13"
+                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")
+                   :external-format :ascii)
+                  stream)
+  (force-output stream)
+  (sb-ext:octets-to-string
+   (read-until-bounded stream
+                       :seconds 3
+                       :until (lambda (buf fill)
+                                (and (>= fill 4)
+                                     (= (aref buf (- fill 4)) 13)
+                                     (= (aref buf (- fill 3)) 10)
+                                     (= (aref buf (- fill 2)) 13)
+                                     (= (aref buf (- fill 1)) 10))))
+   :external-format :latin-1))
+
+(defun %reset-socket (socket)
+  "Close SOCKET with a reset rather than a FIN.
+
+   SO_LINGER on with a zero timeout makes close(2) drop anything unsent and
+   send RST, which is how a client looks when it crashes or its network drops
+   it. Signals if the option does not take: a close that quietly sent a FIN
+   instead would pass any test built on this, whether the server handled a
+   reset or not. SOL_SOCKET is 1 and SO_LINGER is 13 on Linux, the one
+   platform the framework runs on."
+  (let ((fd (sb-bsd-sockets:socket-file-descriptor socket)))
+    (sb-alien:with-alien ((linger (array sb-alien:int 2)))
+      (setf (sb-alien:deref linger 0) 1
+            (sb-alien:deref linger 1) 0)
+      (unless (zerop (sb-alien:alien-funcall
+                      (sb-alien:extern-alien
+                       "setsockopt"
+                       (function sb-alien:int sb-alien:int sb-alien:int
+                                 sb-alien:int sb-alien:system-area-pointer
+                                 sb-alien:unsigned))
+                      fd 1 13 (sb-alien:alien-sap linger) 8))
+        (error "setsockopt SO_LINGER failed on fd ~d" fd)))
+    (sb-bsd-sockets:socket-close socket)))
+
+(defun %ws-client-frame (opcode payload &key (fin t))
+  "A client-to-server frame: masked, as RFC 6455 requires of a client.
+   PAYLOAD is under 126 bytes, which is all these tests send."
+  (let* ((bytes (if (stringp payload)
+                    (sb-ext:string-to-octets payload :external-format :utf-8)
+                    payload))
+         (len (length bytes))
+         (mask #(55 11 202 99))
+         (out (make-array (+ 6 len) :element-type '(unsigned-byte 8))))
+    (assert (< len 126))
+    (setf (aref out 0) (logior (if fin #x80 0) opcode)
+          (aref out 1) (logior #x80 len))
+    (dotimes (i 4) (setf (aref out (+ 2 i)) (aref mask i)))
+    (dotimes (i len)
+      (setf (aref out (+ 6 i)) (logxor (aref bytes i) (aref mask (mod i 4)))))
+    out))
+
+(defun test-counters-count-every-way-a-frame-is-handed-over ()
+  "A frame is counted however the application hands it over, and a frame the
+   framework sends on its own is not.
+
+   Three call sites and one exclusion, each asserted as a delta so a revert of
+   any one site reddens its own line: WS-SEND, a ws-handler's reply to a
+   single frame, and its reply to a fragmented message, which completes on a
+   different path. The first version of the counter counted only WS-SEND, and
+   the suite passed with it deleted outright, because the only test called
+   NOTE-WS-FRAME directly.
+
+   The last delta sends a ping beside a reply. The framework answers the ping
+   with a pong of its own, which is not the application's traffic and must not
+   move the count — but a check that the count did not move passes on a census
+   that never published. So the reply rides along as the control: the delta is
+   exactly one, which is the reply counted and the pong not."
+  (format t "~%counters: every way a frame is handed over~%")
+  (with-test-server
+      (:workers 1
+       :handler (lambda (req)
+                  (declare (ignore req))
+                  :upgrade)
+       :ws-handler (lambda (conn frame)
+                     (let ((text (sb-ext:octets-to-string
+                                  (web-skeleton:ws-frame-payload frame)
+                                  :external-format :utf-8)))
+                       (cond ((string= text "send")
+                              (web-skeleton::ws-send
+                               conn (web-skeleton:build-ws-text "sent"))
+                              nil)
+                             ((string= text "reply")
+                              (web-skeleton:build-ws-text "replied"))
+                             (t nil)))))
+    (let* ((sock (connect-to-test-server))
+           (stream (sb-bsd-sockets:socket-make-stream
+                    sock :input t :output t :element-type '(unsigned-byte 8))))
+      (unwind-protect
+           (flet ((put (bytes) (write-sequence bytes stream) (force-output stream))
+                  (frames ()
+                    (getf (getf (web-skeleton:connection-census) :counters)
+                          :ws-frames 0)))
+             (flet ((frames-after (previous)
+                      ;; Polled: the census publishes at 1 Hz, and a site
+                      ;; that was reverted never moves, so the wait ends on
+                      ;; the deadline and the delta reads zero.
+                      (let ((deadline (+ (get-universal-time) 4))
+                            (n (frames)))
+                        (loop until (or (> n previous)
+                                        (> (get-universal-time) deadline))
+                              do (sleep 0.05) (setf n (frames)))
+                        n)))
+               ;; The control for all of it: without an upgrade there are
+               ;; no frames, and every delta below would read as a revert.
+               (check "control: the upgrade was accepted"
+                      (not (null (search "101" (%ws-client-upgrade stream))))
+                      t)
+               (let ((deadline (+ (get-universal-time) 4)))
+                 (loop until (or (web-skeleton:connection-census)
+                                 (> (get-universal-time) deadline))
+                       do (sleep 0.05)))
+               (let* ((b0 (frames))
+                      (n1 (progn (put (%ws-client-frame 1 "send"))
+                                 (frames-after b0)))
+                      (n2 (progn (put (%ws-client-frame 1 "reply"))
+                                 (frames-after n1)))
+                      (n3 (progn (put (%ws-client-frame 1 "rep" :fin nil))
+                                 (put (%ws-client-frame 0 "ly"))
+                                 (frames-after n2)))
+                      (n4 (progn (put (%ws-client-frame 9 "are you there"))
+                                 (put (%ws-client-frame 1 "reply"))
+                                 (frames-after n3))))
+                 (check "a frame handed over with ws-send is counted"
+                        (- n1 b0) 1)
+                 (check "a ws-handler's reply to a frame is counted"
+                        (- n2 n1) 1)
+                 (check "and its reply to a fragmented message"
+                        (- n3 n2) 1)
+                 (check "the pong the framework sends is not, the reply is"
+                        (- n4 n3) 1))))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
+(defun test-counters-a-client-reset-is-not-a-server-error ()
+  "A client that resets its connection is closed, not answered with a 500 that
+   is then counted against the server.
+
+   A read of a reset socket fails with ECONNRESET, and HANDLE-CLIENT-READ
+   answered anything that escaped its dispatch with a 500 built through
+   FORMAT-RESPONSE. The 500 was always addressed to nobody. Counting it made a
+   client's disconnect a :SERVER-ERROR, in the block the census calls safe to
+   alert on, and clients reset all the time.
+
+   Three resets, from the three places a client can be when it goes: idle
+   before sending a byte, part way through a request, and upgraded to a
+   WebSocket.
+
+   Two controls. The log shows the server read each reset as ECONNRESET, not
+   as an end of stream; without that, a close that sent a FIN would pass here
+   on code that still counts resets. And a handler that raises still gets its
+   500, counted, so the fix reaches the client's own descriptor and not every
+   error."
+  (format t "~%counters: a client's reset is not a server error~%")
+  (let ((log (make-string-output-stream))
+        (so-far "")
+        (saved-stream web-skeleton:*log-stream*)
+        (saved-level web-skeleton:*log-level*))
+    ;; Global SETF, as the restart test does: the worker thread reads the
+    ;; global values, so a binding here would capture nothing.
+    (setf web-skeleton:*log-stream* log
+          web-skeleton:*log-level* :debug)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (let ((path (web-skeleton:http-request-path req)))
+                           (cond ((string= path "/ws") :upgrade)
+                                 ((string= path "/boom")
+                                  (error "the handler failed on purpose"))
+                                 (t (make-text-response 200 "ok")))))
+              :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil))
+           (flet ((resets-read ()
+                    ;; Drained under the lock the worker holds while writing,
+                    ;; and kept, because draining a string stream empties it.
+                    (setf so-far
+                          (concatenate 'string so-far
+                                       (sb-thread:with-mutex
+                                           (web-skeleton::*log-lock*)
+                                         (get-output-stream-string log))))
+                    (loop with start = 0
+                          for at = (search "ECONNRESET" so-far :start2 start)
+                          while at
+                          count t
+                          do (setf start (1+ at)))))
+             (let* ((idle (connect-to-test-server))
+                    (partial (connect-to-test-server))
+                    (ws (connect-to-test-server))
+                    (partial-stream (sb-bsd-sockets:socket-make-stream
+                                     partial :output t
+                                     :element-type '(unsigned-byte 8)))
+                    (ws-stream (sb-bsd-sockets:socket-make-stream
+                                ws :input t :output t
+                                :element-type '(unsigned-byte 8))))
+               ;; A request line and one header, and no blank line to end them.
+               (write-sequence (sb-ext:string-to-octets
+                                (format nil "GET / HTTP/1.1~c~cHost: localhost~c~c"
+                                        #\Return #\Linefeed #\Return #\Linefeed)
+                                :external-format :ascii)
+                               partial-stream)
+               (force-output partial-stream)
+               (check "control: the WebSocket was upgraded before it reset"
+                      (not (null (search "101" (%ws-client-upgrade ws-stream))))
+                      t)
+               ;; Long enough for the worker to accept the other two and take
+               ;; the partial request into its buffer before anything resets.
+               (sleep 0.3)
+               (mapc #'%reset-socket (list idle partial ws)))
+             (let ((deadline (+ (get-universal-time) 6)))
+               (loop until (or (>= (resets-read) 3)
+                               (> (get-universal-time) deadline))
+                     do (sleep 0.05)))
+             (check "control: the server read all three resets as ECONNRESET"
+                    (>= (resets-read) 3) t)
+             (check "control: a handler that raises still answers 500"
+                    (test-http-request :get "/boom") 500)
+             ;; Polled until that 500 is published and every connection has
+             ;; gone, so the count read is one taken after all four were seen.
+             (let ((census nil) (deadline (+ (get-universal-time) 6)))
+               (loop until (or (and census
+                                    (>= (getf (getf census :counters)
+                                              :server-error 0)
+                                        1)
+                                    (zerop (getf census :total 1)))
+                               (> (get-universal-time) deadline))
+                     do (sleep 0.05)
+                        (setf census (web-skeleton:connection-census)))
+               (let ((errors (getf (getf census :counters) :server-error 0)))
+                 (check "control: that 500 is counted" (>= errors 1) t)
+                 (check "and the three resets added nothing to it" errors 1)))))
+      (setf web-skeleton:*log-stream* saved-stream
+            web-skeleton:*log-level* saved-level))))
+
+(defun test-counters-count-a-response-the-serializer-never-built ()
+  "A cached file is a response, and it was not being counted.
+
+   FORMAT-RESPONSE is where a per-request response is built, so counting
+   there caught everything that passes through it. Static files do not pass
+   through it: their bytes are serialized once at startup and sent from the
+   cache thereafter. Static files are also most of what a page load asks
+   for, so the census reported one response for a page that made a dozen —
+   wrong by an order of magnitude, in the one number a reader would check.
+
+   The first assertion is a control. A per-request response counted before
+   this fix and counts after it, so a run where the cached paths also count
+   is telling us about the cache rather than about the harness."
+  (format t "~%counters: a cached file is a response~%")
+  (let* ((content (sb-ext:string-to-octets
+                   "0123456789abcdefghijklmnopqrstuvwxyz"
+                   :external-format :ascii))   ; 36 bytes
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (flet ((counted (thunk)
+                    ;; A fresh set per case, so each number below is that
+                    ;; case's own and not a running total someone has to
+                    ;; subtract in their head to read.
+                    (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+                      (funcall thunk)
+                      (web-skeleton::counters-snapshot)))
+                  (get* (&rest headers)
+                    (serve-static (make-test-request :method :GET
+                                                     :path "/data.txt"
+                                                     :headers headers))))
+             (let ((snap (counted
+                          (lambda ()
+                            (web-skeleton::format-response
+                             (web-skeleton::make-http-response :status 200))))))
+               (check "control: a per-request response counts"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get*)))))
+               (check "a cached 200 is one response"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted
+                          (lambda ()
+                            (serve-static (make-test-request :method :HEAD
+                                                             :path "/data.txt"))))))
+               (check "a cached HEAD is one response"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             ;; 304 and 416 are the two a reader is most likely to want and
+             ;; least likely to generate on purpose: a browser revalidating,
+             ;; and a client asking for bytes that are not there.
+             (let ((snap (counted
+                          (lambda ()
+                            (get* (cons "if-none-match"
+                                        (web-skeleton::static-entry-etag entry)))))))
+               (check "a cached 304 is one response, counted 3xx"
+                      (list (getf snap :responses) (getf snap :redirected))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get* (cons "range" "bytes=10-19"))))))
+               (check "a 206 is one response, counted 2xx"
+                      (list (getf snap :responses) (getf snap :successful))
+                      '(1 1)))
+             (let ((snap (counted (lambda () (get* (cons "range" "bytes=900-999"))))))
+               (check "a 416 is one response, counted 4xx"
+                      (list (getf snap :responses) (getf snap :client-error))
+                      '(1 1)))))
+      (setf web-skeleton::*static-cache* saved)))
+  ;; A response the serializer refuses is not counted — and neither the
+  ;; original nor the 500 that replaces it is counted twice. The count used
+  ;; to be taken before the serialize that can reject the headers, so a 302
+  ;; whose Location carried a CRLF counted a phantom redirect the client never
+  ;; saw, on top of the 500 it did. The three assertions pin it: the
+  ;; serializer refuses, the refused response counts nothing, and the same
+  ;; 302 without the CRLF still counts once — so the fix cannot be reverted
+  ;; (the refused one would count) or over-applied (the good one would not).
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (flet ((crlf-302 ()
+             (let ((r (web-skeleton::make-http-response :status 302)))
+               (web-skeleton::set-response-header
+                r "location" (format nil "/a~c~c/b" #\Return #\Linefeed))
+               r)))
+      (check "the serializer refuses a CRLF smuggled into a header value"
+             (handler-case (progn (web-skeleton::format-response (crlf-302))
+                                  :built)
+               (error () :refused))
+             :refused)
+      (let ((snap (web-skeleton::counters-snapshot)))
+        (check "a response the serializer refused is counted nowhere"
+               (list (getf snap :responses)
+                     (getf snap :redirected)
+                     (getf snap :server-error))
+               '(0 0 0)))))
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (web-skeleton::format-response
+     (web-skeleton::make-http-response :status 302))
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "control: the same 302, serialized, counts once as a redirect"
+             (list (getf snap :responses) (getf snap :redirected))
+             '(1 1))))
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (flet ((crlf-head ()
+             (let ((r (web-skeleton::make-http-response :status 200)))
+               (web-skeleton::set-response-header
+                r "x-note" (format nil "a~cb" #\Return))
+               r)))
+      (ignore-errors
+       (web-skeleton::format-streaming-head (crlf-head) :chunked))
+      (check "a streamed head the serializer refused is not counted"
+             (getf (web-skeleton::counters-snapshot) :responses)
+             0)))
+  ;; The streamed head is the fourth path that never reaches FORMAT-RESPONSE.
+  ;; One response, counted once, at the head — the chunks after it are not
+  ;; responses and STREAM-SEND does not count them.
+  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
+    (web-skeleton::format-streaming-head
+     (web-skeleton::make-http-response :status 200) :chunked)
+    (let ((snap (web-skeleton::counters-snapshot)))
+      (check "a streamed response is counted once, at its head"
+             (list (getf snap :responses) (getf snap :successful))
+             '(1 1)))))
+
+(defun test-getent-parse-separates-policy-from-resolution ()
+  "A name whose addresses policy refused is distinguishable from one that
+   did not resolve.
+
+   Both still return NIL, and both still answer the client 502: which of the
+   two happened is not the client's business, and the docstring has said so
+   for longer than this second value has existed. An operator is a different
+   audience. Told `DNS lookup failed` when getent answered perfectly well and
+   their own filter said no, they go and debug a resolver — which is what
+   happened, and is why this exists.
+
+   The two controls are the point of the test. Without them a second value
+   that always returned zero, or always returned one, would pass whichever
+   single case was asserted."
+  (format t "~%dns: a refusal is not a resolution failure~%")
+  (let ((line (sb-ext:string-to-octets
+               (format nil "127.0.0.1 STREAM localhost~%")
+               :external-format :ascii))
+        (web-skeleton:*log-stream* (make-broadcast-stream)))
+    (let ((web-skeleton:*fetch-address-filter* nil))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output line (length line) "localhost")
+        (check "control: with no filter the address is chosen"
+               (and (consp parsed) (equalp (car parsed) #(127 0 0 1)) t) t)
+        (check "control: and nothing was refused" refused 0)))
+    (let ((web-skeleton:*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore ip family host))
+              nil)))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output line (length line) "localhost")
+        (check "a refused address still yields no answer" parsed nil)
+        (check "but the caller can see policy refused one" refused 1)))
+    (let ((nothing (sb-ext:string-to-octets (format nil "~%")
+                                            :external-format :ascii)))
+      (multiple-value-bind (parsed refused)
+          (web-skeleton::parse-getent-output nothing (length nothing) "nowhere")
+        (check "control: nothing to refuse when nothing resolved"
+               (list parsed refused) (list nil 0))))))
+
+(defun test-parse-error-carries-its-status-to-a-caller ()
+  "An application that catches HTTP-PARSE-ERROR can ask what it carries.
+
+   The condition was exported and its readers were not, which gives a caller
+   something it can catch and cannot interrogate. A handler wanting to log
+   that a request was refused with 505 rather than 400 had to re-derive the
+   status by reading the printed message, which is a parser of a parser.
+
+   Reached through the WEB-SKELETON package rather than WEB-SKELETON:: on
+   purpose: the whole assertion is that these are public."
+  (format t "~%http-parse-error: status and message reach a caller~%")
+  (flet ((bad (version)
+           (format nil "GET /x HTTP/~a~c~cHost: h~c~c~c~c"
+                   version #\Return #\Newline #\Return #\Newline
+                   #\Return #\Newline)))
+    (check "the status is readable"
+           (handler-case (web-skeleton:parse-request (bad "9.9"))
+             (web-skeleton:http-parse-error (e)
+               (web-skeleton:http-parse-error-status e)))
+           505)
+    (check "the message is readable without parsing the printed form"
+           (handler-case (web-skeleton:parse-request (bad "9.9"))
+             (web-skeleton:http-parse-error (e)
+               (and (stringp (web-skeleton:http-parse-error-message e))
+                    (search "version" (web-skeleton:http-parse-error-message e))
+                    t)))
+           t)
+    ;; Control: a well-formed request does not signal, so the two assertions
+    ;; above are reading a condition that was raised rather than one the test
+    ;; manufactured.
+    (check "control: a well-formed request parses"
+           (handler-case (progn (web-skeleton:parse-request (bad "1.1")) :parsed)
+             (web-skeleton:http-parse-error () :refused))
+           :parsed)))
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -8790,5 +9675,21 @@
   (test-ws-oversized-frame-close-code)
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
+  (test-on-tick-runs-with-the-workers-bindings)
+  (test-on-tick-survives-a-raising-hook)
+  (test-on-tick-validated-at-boot)
+  (test-map-worker-websockets-visits-only-websockets)
+  (test-map-worker-websockets-skips-what-a-callback-closed)
+  (test-map-worker-websockets-refuses-off-a-worker)
+  (test-map-worker-websockets-delivers-from-on-tick)
+  (test-connection-census-is-exported-with-a-split-contract)
+  (test-a-log-line-is-one-line)
+  (test-counters-count-responses-by-class)
+  (test-counters-see-a-response-no-handler-produced)
+  (test-counters-count-every-way-a-frame-is-handed-over)
+  (test-counters-count-a-response-the-serializer-never-built)
+  (test-counters-a-client-reset-is-not-a-server-error)
+  (test-getent-parse-separates-policy-from-resolution)
+  (test-parse-error-carries-its-status-to-a-caller)
   (report-suite "Server")
   (zerop *tests-failed*))

@@ -474,9 +474,31 @@
 ;;; Non-blocking read/write
 ;;; ---------------------------------------------------------------------------
 
+(define-condition fd-io-error (error)
+  ((fd        :initarg :fd        :reader fd-io-error-fd)
+   (operation :initarg :operation :reader fd-io-error-operation)
+   (errno     :initarg :errno     :reader fd-io-error-errno))
+  (:report (lambda (c stream)
+             (format stream "~a failed: ~a"
+                     (fd-io-error-operation c)
+                     (errno-string (fd-io-error-errno c)))))
+  (:documentation
+   "A read(2) or write(2) on FD failed outright: any errno but EAGAIN.
+
+   The descriptor is carried because whoever catches this is not always the
+   code whose read or write raised it. HANDLE-CLIENT-READ answers whatever
+   escapes its dispatch with a 500, and the right answer depends on whose
+   descriptor failed. The client's own means the client is gone and there is
+   nobody to answer; a handler's own I/O failing on some other descriptor is
+   a failed request, and it is owed its 500.
+
+   It reports exactly as the plain error it replaced did, so no log line
+   reads any differently."))
+
 (defun nb-read (fd buffer start max-bytes)
   "Non-blocking read into BUFFER starting at START, up to MAX-BYTES.
-   Returns bytes read, :AGAIN if EAGAIN/EWOULDBLOCK, or :EOF on close."
+   Returns bytes read, :AGAIN if EAGAIN/EWOULDBLOCK, or :EOF on close.
+   Any other failure signals FD-IO-ERROR, naming FD."
   (sb-sys:with-pinned-objects (buffer)
     (let ((n (%read fd
                     (sb-sys:sap+ (sb-sys:vector-sap buffer) start)
@@ -487,7 +509,7 @@
         (t (let ((err (get-errno)))
              (if (or (= err +eagain+) (= err +ewouldblock+))
                  :again
-                 (error "read failed: ~a" (errno-string err)))))))))
+                 (error 'fd-io-error :fd fd :operation "read" :errno err))))))))
 
 (defun nb-write (fd buffer start nbytes)
   "Non-blocking write from BUFFER starting at START, NBYTES bytes.
@@ -509,4 +531,4 @@
         (t (let ((err (get-errno)))
              (if (or (= err +eagain+) (= err +ewouldblock+))
                  :again
-                 (error "write failed: ~a" (errno-string err)))))))))
+                 (error 'fd-io-error :fd fd :operation "write" :errno err))))))))
