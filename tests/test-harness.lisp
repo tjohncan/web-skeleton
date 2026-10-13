@@ -197,12 +197,39 @@
         (check "HEAD fetch: callback saw 200 status"
                body "status=200 body-nil=T")))))
 
+(defun test-harness-large-body-grows-the-buffer-e2e ()
+  "A body many times the size of a connection's first read buffer arrives
+   whole over a real socket.
+
+   The buffer starts at 4 KiB and is grown by CONNECTION-READ-AVAILABLE as
+   bytes arrive, never in advance to the length the client declared. This
+   is the path every large upload takes, through as many partial reads as
+   the kernel happens to deliver, and nothing else drives it end to end.
+   The digest is compared rather than the length alone, because a buffer
+   that grew in the wrong place would lose bytes at a doubling boundary
+   and could still report the right count."
+  (format t "~%Harness: a large body grows the read buffer~%")
+  (let* ((n (* 600 1024))
+         (body (let ((s (make-string n)))
+                 (dotimes (i n s)
+                   (setf (char s i) (code-char (+ 97 (mod (* i 7) 26)))))))
+         (want (format nil "~d ~a" n
+                       (sha256-hex (sb-ext:string-to-octets
+                                    body :external-format :ascii)))))
+    (with-test-server
+        (:handler (lambda (req)
+                    (let ((b (http-request-body req)))
+                      (make-text-response
+                       200 (format nil "~d ~a" (length b) (sha256-hex b))))))
+      (multiple-value-bind (status headers response-body)
+          (test-http-request :post "/upload" :body body)
+        (declare (ignore headers))
+        (check "large body: dispatches" status 200)
+        (check "large body: every byte arrived, in order" response-body want)))))
+
 (defun test-harness-body-at-max-size-e2e ()
-  "A POST whose Content-Length equals *MAX-BODY-SIZE* dispatches
-   cleanly even though pre-growing the buffer to body-start+CL
-   takes it past CONNECTION-READ-AVAILABLE's cap: :FULL fires at
-   pos=body-start+CL, which IS the complete body, and the state
-   machine reaches :DISPATCH.
+  "A POST whose Content-Length equals *MAX-BODY-SIZE* dispatches: the cap
+   is a ceiling the body may reach, and the comparison is > rather than >=.
 
    SETF (not LET) on *MAX-BODY-SIZE*: the worker thread reads the
    top-level value — dynamic bindings do not cross thread creation —
@@ -4611,6 +4638,7 @@
   (test-harness-expect-100-continue-e2e)
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
+  (test-harness-large-body-grows-the-buffer-e2e)
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
   (test-connection-serial-does-not-repeat-when-an-fd-does)

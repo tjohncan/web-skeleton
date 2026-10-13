@@ -1120,8 +1120,8 @@
          ((eq (connection-state conn) :websocket)
           (return-from connection-on-read :websocket))
          ;; :read-body with a complete body means the buffer cap fired
-         ;; after we already had everything we need (content-length
-         ;; near *MAX-BODY-SIZE*, or pipelined bytes queued past the
+         ;; after we already had everything we need (a request that
+         ;; fills the cap exactly, or pipelined bytes queued past the
          ;; body). Fall through to the state-machine dispatch check.
          ;;
          ;; Through CONNECTION-BODY-COMPLETE-P rather than by recomputing
@@ -1359,40 +1359,40 @@
                        unfinished)))
                    ;; Body present — read it, dispatching when complete.
                    ((and content-length (> content-length 0))
-                    ;; Reject oversized bodies before allocating.
+                    ;; Reject oversized bodies before reading them.
                     (when (> content-length *max-body-size*)
                       (http-reject 413 "body too large (~d bytes, max ~d)"
                                    content-length *max-body-size*))
-                    ;; Grow read buffer if needed.
-                    (let ((total-needed (+ body-start content-length)))
-                      (when (> total-needed (length (connection-read-buf conn)))
-                        (let ((new-buf (make-array total-needed
-                                                   :element-type '(unsigned-byte 8)
-                                                   :initial-element 0)))
-                          (replace new-buf (connection-read-buf conn)
-                                   :end2 (connection-read-pos conn))
-                          (setf (connection-read-buf conn) new-buf))
-                        ;; Re-drain: buffer grew past connection-read-available's
-                        ;; original cap, kernel may still have data (edge-triggered).
-                        ;; :EOF and :OK-EOF (peer FIN'd, with or without
-                        ;; bytes on the way past) and :FULL (buffer at cap)
-                        ;; are terminal only if the body is still
-                        ;; incomplete. :OK-EOF belongs here for the same
-                        ;; reason :EOF does — a body that arrives with its
-                        ;; own FIN and is still short of Content-Length is
-                        ;; never going to be completed, and waiting for a
-                        ;; wake-up that cannot come just holds the slot
-                        ;; until the idle sweeper takes it.
-                        ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
-                        ;; the pre-grown buffer exceeds the drain cap and
-                        ;; :FULL fires at pos = body-start+CL — which IS
-                        ;; the complete body. Close only on truly incomplete
-                        ;; bodies so that CL-at-cap requests still dispatch.
-                        (case (connection-read-available conn)
-                          ((:eof :ok-eof :full)
-                           (when (< (- (connection-read-pos conn) body-start)
-                                    content-length)
-                             (return-from connection-on-read :close))))))
+                    ;; The buffer is not grown here to the length the client
+                    ;; declared. A declaration is one header line, and
+                    ;; honouring it up front let a head of a few dozen bytes
+                    ;; make the server allocate up to *MAX-BODY-SIZE* before
+                    ;; any body arrived — that much per connection, for
+                    ;; whoever opens connections and sends nothing more.
+                    ;; CONNECTION-READ-AVAILABLE grows the buffer as bytes
+                    ;; arrive, so the memory follows what was sent.
+                    ;;
+                    ;; It grows only to CONNECTION-READ-CAP, so a request
+                    ;; whose head and body together pass the cap is refused
+                    ;; here, before its body is waited for. The cap is the
+                    ;; sum of the request-line, header and body budgets, so
+                    ;; a head within its own budgets always leaves room for
+                    ;; a body within *MAX-BODY-SIZE*: only a head over them
+                    ;; gets here, and parsing it raises what it has earned —
+                    ;; 414 or 431 for the budget, or whatever else is wrong
+                    ;; with it first. Waiting would fill the buffer to the
+                    ;; cap with the rest of the body still in the kernel,
+                    ;; and an edge-triggered descriptor reports no new edge
+                    ;; for bytes already there, so a client that had sent
+                    ;; everything would get no answer until the idle sweep
+                    ;; closed it. The 413 is for a head the parser accepts,
+                    ;; which the arithmetic says cannot happen; it keeps the
+                    ;; refusal from resting on that.
+                    (let ((cap (connection-read-cap conn)))
+                      (when (> (+ body-start content-length) cap)
+                        (parse-request-bytes buf 0 body-start)
+                        (http-reject 413 "request too large (~d bytes, max ~d)"
+                                     (+ body-start content-length) cap)))
                     (let ((body-available (- (connection-read-pos conn) body-start)))
                       (setf (connection-body-expected conn) content-length
                             (connection-header-end conn) header-end

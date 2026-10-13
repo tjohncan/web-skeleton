@@ -7846,6 +7846,125 @@
            :dispatch)))
 
 ;;; ---------------------------------------------------------------------------
+;;; A declared body costs what arrives, not what was declared
+;;; ---------------------------------------------------------------------------
+
+(defun test-declared-body-is-not-preallocated ()
+  (format t "~%Content-Length: the read buffer follows the bytes~%")
+  (labels ((head (path headers)
+             (with-output-to-string (s)
+               (format s "POST ~a HTTP/1.1~a" path *crlf*)
+               (dolist (h headers) (format s "~a~a" h *crlf*))
+               (format s "~a" *crlf*)))
+           (drive (raw)
+             ;; RAW arrives as fast as the buffer takes it, then the source
+             ;; would block. Returns (values VERDICT CONN). :AGAIN rather
+             ;; than :EOF at the end, so a request still short of its body
+             ;; is waiting rather than unfinishable.
+             (let* ((bytes (sb-ext:string-to-octets raw :external-format :ascii))
+                    (sent 0)
+                    (conn (web-skeleton::make-connection
+                           :fd -1
+                           :read-fn
+                           (lambda (buffer start max-bytes)
+                             (if (>= sent (length bytes))
+                                 :again
+                                 (let ((n (min max-bytes (- (length bytes) sent))))
+                                   (replace buffer bytes :start1 start
+                                                         :start2 sent
+                                                         :end2 (+ sent n))
+                                   (incf sent n)
+                                   n))))))
+               (values (handler-case (web-skeleton::connection-on-read conn)
+                         (web-skeleton:http-parse-error (e)
+                           (web-skeleton::http-parse-error-status e))
+                         (error (e) (princ-to-string e)))
+                       conn))))
+
+    ;; The headline. A head declaring a megabyte, and no byte of the
+    ;; megabyte. Broken state: the buffer is grown to the declared length
+    ;; on the spot, and every connection that sends only this much holds
+    ;; *MAX-BODY-SIZE* of memory for as long as the idle timeout allows.
+    (let ((web-skeleton:*max-body-size* (* 1024 1024)))
+      (multiple-value-bind (v conn)
+          (drive (head "/u" (list "Host: x"
+                                  (format nil "Content-Length: ~d"
+                                          web-skeleton:*max-body-size*))))
+        (check "content-length: a declared body waits for its bytes" v :continue)
+        (check "content-length: and nothing is allocated ahead of them"
+               (< (length (web-skeleton::connection-read-buf conn))
+                  web-skeleton:*max-body-size*)
+               t)))
+
+    ;; Small budgets so the arithmetic can be stated exactly. The read cap
+    ;; is their sum plus every CRLF they leave out: 64 + 64 + 64 + 2*4 + 4.
+    (let ((web-skeleton:*max-body-size* 64)
+          (web-skeleton:*max-total-header-bytes* 64)
+          (web-skeleton:*max-request-line-length* 64)
+          (web-skeleton:*max-header-count* 4))
+      (check "content-length: the cap these budgets give is 204"
+             (web-skeleton::connection-read-cap
+              (web-skeleton::make-connection :fd -1))
+             204)
+
+      ;; The premise the refusal below rests on: the largest request the
+      ;; budgets admit fits the cap exactly. A 64-byte request line, four
+      ;; headers totalling 64 bytes, a 64-byte body — 204 on the wire.
+      ;; Broken state: the cap loses a byte to an edit, and a request the
+      ;; parser would have accepted is refused for its size.
+      (let* ((line-path (concatenate 'string "/"
+                                     (make-string 49 :initial-element #\a)))
+             (headers (list "Host: x"
+                            "Content-Length: 64"
+                            (concatenate 'string "X-A: "
+                                         (make-string 14 :initial-element #\b))
+                            (concatenate 'string "X-B: "
+                                         (make-string 15 :initial-element #\c))))
+             (raw (head line-path headers))
+             (body (make-string 64 :initial-element #\d)))
+        (check "content-length: the largest admissible request is 204 bytes"
+               (+ (length raw) (length body))
+               204)
+        (check "content-length: and it is not refused for its size"
+               (values (drive raw))
+               :continue)
+        (multiple-value-bind (v conn) (drive (concatenate 'string raw body))
+          (check "content-length: and it dispatches once its body is here"
+                 v :dispatch)
+          (check "content-length: and the parser accepts it"
+                 (attempt (length (web-skeleton:http-request-body
+                                   (web-skeleton::connection-parse-request
+                                    conn))))
+                 64)))
+
+      ;; Over the header budget, and with a body that takes the whole past
+      ;; the cap. The head is refused the moment it is complete, with the
+      ;; code that names the budget. Broken state: it waits for a body that
+      ;; cannot fit — on a socket, until the idle sweep closes it without an
+      ;; answer, because the edge for bytes left in the kernel already fired.
+      (let ((raw (head "/u" (list "Host: x"
+                                  "Content-Length: 64"
+                                  (concatenate 'string "X-Pad: "
+                                               (make-string 100
+                                                            :initial-element #\p))))))
+        (check "content-length: an over-budget head that cannot fit is 431"
+               (values (drive raw))
+               431))
+
+      ;; The same over-budget head with a body small enough to fit still
+      ;; waits for it, and is refused at dispatch as it always was. The
+      ;; early refusal is for the request that cannot fit, not a second
+      ;; header check.
+      (let ((raw (head "/u" (list "Host: x"
+                                  "Content-Length: 1"
+                                  (concatenate 'string "X-Pad: "
+                                               (make-string 100
+                                                            :initial-element #\p))))))
+        (check "content-length: an over-budget head that fits still waits"
+               (values (drive raw))
+               :continue)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -9612,6 +9731,7 @@
   (test-transfer-encoding-rules)
   (test-chunked-request-body)
   (test-unfinishable-request-closes)
+  (test-declared-body-is-not-preallocated)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)
