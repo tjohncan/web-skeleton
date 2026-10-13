@@ -1852,24 +1852,66 @@
          (is-public-address-p
           #(#x01 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
 
+  ;; The rest of 2001::/23, IETF Protocol Assignments, which is refused
+  ;; whole as 192.0.0.0/24 is. 2001:3::/32 is AMT and 2001:30::/28 the
+  ;; drone-ID prefix (RFC 9374), both marked reachable by the registry and
+  ;; both protocol machinery rather than anything fetched by URL; 2001:1ff::
+  ;; is the block's last /32. Broken state: the /23 clause is narrowed back
+  ;; to the named prefixes inside it, and these pass as public.
+  (check "v6 2001:3:: AMT, inside 2001::/23, is refused"
+         (is-public-address-p
+          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:30:: drone-ID prefix, inside 2001::/23, is refused"
+         (is-public-address-p
+          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:1ff:: the last of 2001::/23 is refused"
+         (is-public-address-p
+          #(#x20 #x01 #x01 #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
+  ;; Outside global unicast, 2000::/3, nothing is public. A list of
+  ;; exceptions to public answers each of these public, because no clause
+  ;; names it. Broken state: the 2000::/3 test is gone and they pass as
+  ;; public.
+  (check "v6 100:0:0:1:: dummy prefix (RFC 9780) is refused"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 64:ff9b:1:: local-use translation (RFC 8215) is refused"
+         (is-public-address-p
+          #(0 #x64 #xff #x9b 0 1 0 0 0 0 0 0 8 8 8 8) :inet6) nil)
+  (check "v6 ::ffff:0:a.b.c.d IPv4-translated is refused"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 #xff #xff 0 0 8 8 8 8) :inet6) nil)
+  (check "v6 5f00:: SRv6 SIDs (RFC 9602) are refused"
+         (is-public-address-p
+          #(#x5f 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 4000::1, reserved space just past 2000::/3, is refused"
+         (is-public-address-p
+          #(#x40 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 1fff:ffff::, reserved space just before 2000::/3, is refused"
+         (is-public-address-p
+          #(#x1f #xff #xff #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  ;; Inside it, the second documentation block. Broken state: only
+  ;; 2001:db8::/32 is named, and this passes as public.
+  (check "v6 3fff:fff:: documentation (RFC 9637) is refused"
+         (is-public-address-p
+          #(#x3f #xff #x0f #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
   ;; The neighbours, so each clause is the prefix it claims and not a
-  ;; wider match sitting on top of 2001:: or 100::. Without these a
-  ;; too-broad guard would pass every assertion above it.
+  ;; wider match. Without these a too-broad guard would pass every
+  ;; assertion above it: the first address of 2000::/3, the first past
+  ;; 2001::/23, the first past 3fff::/20, and an ordinary allocation.
+  (check "v6 2000::1, the first of 2000::/3, is public"
+         (is-public-address-p
+          #(#x20 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 2001:200::1, the first past 2001::/23, is public"
+         (is-public-address-p
+          #(#x20 #x01 #x02 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 3fff:1000::1, the first past 3fff::/20, is public"
+         (is-public-address-p
+          #(#x3f #xff #x10 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
   (check "v6 2001:4860:: is public"
          (is-public-address-p
           #(#x20 #x01 #x48 #x60 0 0 0 0 0 0 0 0 0 0 #x88 #x88) :inet6) t)
-  (check "v6 2001:3:: is public"
-         (is-public-address-p
-          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
-  ;; A neighbour outside both /28s. 2001:30:: is unallocated space above
-  ;; ORCHIDv2 and is where the too-wide-guard control belongs — the
-  ;; previous control named 2001:20::, which is the reserved prefix itself.
-  (check "v6 2001:30:: is public"
-         (is-public-address-p
-          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
-  (check "v6 100::/64 neighbour is public"
-         (is-public-address-p
-          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) t)
 
   ;; IPv4-mapped IPv6 — attacker cannot launder 127.0.0.1
   (check "v6 ::ffff:127.0.0.1 mapped loopback"

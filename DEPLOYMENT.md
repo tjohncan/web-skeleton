@@ -561,7 +561,10 @@ rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
 RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
 6to4 relay anycast (`192.88.99.0/24`), and cloud metadata IPs. It unwraps
 IPv4-mapped IPv6, NAT64, and 6to4, so an attacker cannot launder
-`127.0.0.1` as `::ffff:127.0.0.1`.
+`127.0.0.1` as `::ffff:127.0.0.1`. On IPv6 it states what public is rather
+than what it is not: only global unicast, `2000::/3`, can be public at all,
+so a special-purpose block assigned later out of reserved space is refused
+before anyone has written a clause for it. Its docstring lists every range.
 
 The 6to4 relay prefix is refused *because* RFC 7526 deprecated it. The
 relays are gone, so the prefix is still globally routed but no longer
