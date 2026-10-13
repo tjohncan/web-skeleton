@@ -700,7 +700,8 @@
                  (copy-list *shutdown-hooks*))))
     (dolist (fn hooks)
       (handler-case (funcall fn)
-        (error (e)
+        ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
+        ((or error storage-condition) (e)
           (log-error "shutdown hook error: ~a" e))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1254,7 +1255,9 @@
               (multiple-value-bind (response close-frame)
                   (handler-case
                       (websocket-on-read conn ws-handler)
-                    (error (e)
+                    ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's own
+                    ;; catch at the bottom of this function.
+                    ((or error storage-condition) (e)
                       ;; Handler error — close directly without a close frame.
                       ;; A ws-send may have put part of a frame on the wire
                       ;; and left the rest queued, and this teardown drops
@@ -1387,7 +1390,22 @@
                            (logior +epollout+ +epollet+))))
         (error ()
           (close-connection conn epoll-fd))))
-    (error (e)
+    ;; STORAGE-CONDITION beside ERROR, because it is not one: CL makes both
+    ;; SERIOUS-CONDITIONs and neither a subtype of the other. It is what a
+    ;; handler gets when it recurses past the control stack, or asks for an
+    ;; allocation larger than the heap has left, and both are a request
+    ;; failing rather than the server — the frames or the allocation are
+    ;; gone once the catch unwinds. Uncaught, it passed every handler here
+    ;; and RUN-WORKER's too, and SBCL ends the process for a condition
+    ;; nothing handles: one request's recursion took every worker down. So
+    ;; it costs what an error costs, a 500 and the connection. A heap
+    ;; worn out by many small allocations can be out of reach of any
+    ;; catch — the collector can run out of room itself, and that ends the
+    ;; process before anything is signalled — so this is containment for
+    ;; the request that asked too much, not a defence against running out.
+    ;; Every catch around application code in this framework takes the
+    ;; same pair, for this reason.
+    ((or error storage-condition) (e)
       ;; This connection's own descriptor failed under a read or a write: the
       ;; peer reset, or the network between us did. Answered the way an end of
       ;; stream is, by closing and nothing else. A 500 would be addressed to
@@ -1671,7 +1689,8 @@
       ;; order is written down.
       (when on-tick
         (handler-case (funcall on-tick *worker-id*)
-          (error (e)
+          ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
+          ((or error storage-condition) (e)
             ;; A hook that raises every pass would log at the wake rate —
             ;; twenty lines a second per worker at the cadence a fan-out
             ;; demo wants — and every one of them takes *LOG-LOCK*, which
@@ -1823,7 +1842,11 @@
           ;; Normal exit (shutdown requested)
           (log-info "worker ~d stopped" worker-id)
           (return)))
-      (error (e)
+      ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch. Here
+      ;; it is the backstop for one raised outside every narrower catch,
+      ;; where a restart costs this worker's connections and an uncaught
+      ;; condition costs the process.
+      ((or error storage-condition) (e)
         (log-error "worker ~d crashed: ~a — restarting" worker-id e)
         ;; 1-second backoff, sliced into *worker-wake-interval*
         ;; chunks so a SIGTERM arriving during the backoff is noticed

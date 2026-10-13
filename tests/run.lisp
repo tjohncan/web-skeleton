@@ -215,6 +215,60 @@
   `(handler-case (progn ,@body)
      (error (e) (princ-to-string e))))
 
+;;; ---------------------------------------------------------------------------
+;;; Storage conditions, raised on purpose
+;;;
+;;; Unbounded recursion and an allocation larger than the heap both signal a
+;;; STORAGE-CONDITION, which is a SERIOUS-CONDITION and not an ERROR: ATTEMPT
+;;; does not catch one, and neither does a HANDLER-CASE on ERROR anywhere in
+;;; the framework that is meant to. A test asserting that the framework
+;;; contains one has to survive the framework not doing so, or a revert does
+;;; not fail the test — it ends the process, since SBCL quits on a condition
+;;; nothing handles when the debugger is disabled, and the run ends with no
+;;; totals line.
+;;; ---------------------------------------------------------------------------
+
+(defun %exhaust-the-stack (n)
+  "Recurse until the control stack runs out. Not a tail call — the 1+ waits
+   on the result — so every level keeps its frame."
+  (1+ (%exhaust-the-stack (1+ n))))
+
+(defun %exhaust-the-heap ()
+  "Ask for one byte more than the whole dynamic space. No collection can
+   satisfy it, so SBCL signals at once rather than after a struggle."
+  (make-array (1+ (sb-ext:dynamic-space-size))
+              :element-type '(unsigned-byte 8)))
+
+(defun call-with-escapes-ending-the-thread (thunk)
+  "Call THUNK with a condition that escapes every handler on some thread
+   ending that thread, not the process.
+
+   The global value of *INVOKE-DEBUGGER-HOOK* is replaced rather than bound,
+   because the threads this is for are workers START-SERVER spawned, which
+   inherit no binding; SYMBOL-GLOBAL-VALUE so that a binding on this thread
+   cannot absorb the write. Each escape prints a NOTE naming its condition
+   and thread, so a revert reads as what it is rather than as a run of
+   connection errors.
+
+   The main thread cannot be ended this way, and an escape there is a
+   defect in the test rather than in the framework, so it goes to the hook
+   that was installed before."
+  (let ((saved (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*)))
+    (setf (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*)
+          (lambda (condition hook)
+            ;; Returning from the hook hands the condition on to the
+            ;; ordinary debugger, which is what NIL would have done.
+            (if (sb-thread:main-thread-p)
+                (when saved (funcall saved condition hook))
+                (progn
+                  (format t "  NOTE  ~a escaped every handler on ~a; ~
+                             ending the thread~%"
+                          (type-of condition)
+                          (sb-thread:thread-name sb-thread:*current-thread*))
+                  (sb-thread:abort-thread)))))
+    (unwind-protect (funcall thunk)
+      (setf (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*) saved))))
+
 (defmacro check (name expr expected)
   "Assert that EXPR produces EXPECTED. Logs pass/fail."
   `(let ((result ,expr))
