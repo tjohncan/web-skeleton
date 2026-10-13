@@ -1501,6 +1501,9 @@
                           (connection-request conn) nil
                           (connection-body-expected conn) 0
                           (connection-body-decoded conn) 0
+                          ;; The pipelined bytes have moved to offset 0
+                          ;; and have not been searched; see the slot.
+                          (connection-header-scan-pos conn) 0
                           (connection-header-end conn) 0
                           (connection-request-end conn) 0
                           (connection-body-framing conn) :length
@@ -1525,6 +1528,7 @@
                       (connection-request conn) nil
                       (connection-body-expected conn) 0
                       (connection-body-decoded conn) 0
+                      (connection-header-scan-pos conn) 0
                       (connection-header-end conn) 0
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length

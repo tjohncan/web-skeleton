@@ -162,6 +162,22 @@
   ;; TEST-HARNESS-PIPELINED-AFTER-BODY-E2E fails, which is the sharper of
   ;; the two: the next request is read out of the tail of its predecessor.
   (body-expected 0 :type fixnum)             ; Content-Length value
+  ;; How far the search for the CRLFCRLF ending the request head has got:
+  ;; READ-BUF holds no CRLFCRLF in [0, HEADER-SCAN-POS). The next search
+  ;; starts three bytes before it, since a terminator can straddle the
+  ;; place one read ended and the next began, so each byte of a head is
+  ;; searched about once. Searching from 0 on every read would make a head
+  ;; that arrives in small pieces quadratic: the whole buffer again on
+  ;; every wake-up, up to CONNECTION-READ-CAP.
+  ;;
+  ;; Its one writer is conditional — the :READ-HTTP arm records how far it
+  ;; got only when it found nothing — so the two resets have to clear it,
+  ;; and that is a necessity rather than the choice REQUEST-END's frame
+  ;; rule describes. Both move the next request's bytes to offset 0, and a
+  ;; position left over from the request before would start the search
+  ;; past a terminator that is now nearer the front: the next request
+  ;; waits for an end it has already sent.
+  (header-scan-pos 0 :type fixnum)
   (header-end    0 :type fixnum)             ; byte offset where body starts
   ;; Byte offset one past the whole request on the wire — headers, the
   ;; CRLFCRLF, and every byte the body's framing occupies. Read by the
@@ -1229,7 +1245,10 @@
     (ecase (connection-state conn)
       (:read-http
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
-                                          0 (connection-read-pos conn))))
+                                          (max 0 (- (connection-header-scan-pos
+                                                     conn)
+                                                    3))
+                                          (connection-read-pos conn))))
          (if header-end
              (let* ((buf (connection-read-buf conn))
                     ;; Scanners match on CRLF-anchored header patterns,
@@ -1515,8 +1534,11 @@
                     (setf (connection-header-end conn) header-end
                           (connection-request-end conn) (+ header-end 4))
                     :dispatch)))))))
-             ;; No CRLFCRLF yet — keep reading
-             (funcall unfinished))))
+             ;; No CRLFCRLF yet — keep reading, and resume the search near
+             ;; here next time rather than from the start.
+             (progn
+               (setf (connection-header-scan-pos conn) (connection-read-pos conn))
+               (funcall unfinished)))))
       (:read-body
        (if (connection-body-complete-p conn)
            :dispatch

@@ -8034,6 +8034,85 @@
                :continue)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; A request head arriving in pieces is searched once, not once per piece
+;;; ---------------------------------------------------------------------------
+
+(defun test-head-search-resumes ()
+  "The search for the CRLFCRLF that ends a request head resumes where the
+   last one stopped, so a head arriving in small pieces costs linear work.
+
+   Measured by encapsulating SCAN-CRLF-CRLF and summing the bytes each call
+   is asked to search. Searching from 0 on every read makes that the sum
+   of every prefix of the head — for 8 KiB in 16-byte pieces, two million
+   bytes for eight thousand delivered. Broken state: the sum is quadratic.
+
+   The terminator itself can arrive split across reads, three bytes of it
+   on one side at most, and each of the three splits is asserted. A resume
+   point off by one passes the work bound and fails one of these."
+  (format t "~%Request head: searched once, however it arrives~%")
+  (labels ((ascii (s) (sb-ext:string-to-octets s :external-format :ascii))
+           (drive-pieces (pieces)
+             ;; One piece per wake-up: each CONNECTION-ON-READ reads one piece
+             ;; and then finds the source empty, as a socket would between
+             ;; segments. Returns the last verdict and the connection.
+             (let* ((queue (copy-list pieces))
+                    (ready nil)
+                    (conn (web-skeleton::make-connection
+                           :fd -1
+                           :read-fn
+                           (lambda (buffer start max-bytes)
+                             (if (not ready)
+                                 :again
+                                 (let* ((piece (first queue))
+                                        (n (min max-bytes (length piece))))
+                                   (replace buffer piece :start1 start :end2 n)
+                                   (if (= n (length piece))
+                                       (progn (pop queue) (setf ready nil))
+                                       (setf (first queue) (subseq piece n)))
+                                   n)))))
+                    (verdict nil))
+               (loop while queue
+                     do (setf ready t
+                              verdict (handler-case
+                                          (web-skeleton::connection-on-read conn)
+                                        (web-skeleton:http-parse-error (e)
+                                          (web-skeleton::http-parse-error-status e)))))
+               (values verdict conn)))
+           (split (bytes size)
+             (loop for i from 0 below (length bytes) by size
+                   collect (subseq bytes i (min (length bytes) (+ i size))))))
+    (let* ((head (ascii (concatenate 'string
+                                     "GET / HTTP/1.1" *crlf*
+                                     "Host: x" *crlf*
+                                     "X-Pad: " (make-string 8000 :initial-element #\a)
+                                     *crlf* *crlf*)))
+           (searched 0))
+      (unwind-protect
+           (progn
+             (sb-int:encapsulate 'web-skeleton::scan-crlf-crlf 'counted
+                                 (lambda (f buf start end)
+                                   (incf searched (max 0 (- end start)))
+                                   (funcall f buf start end)))
+             (multiple-value-bind (v conn) (drive-pieces (split head 16))
+               (check "head search: a head in 16-byte pieces dispatches" v :dispatch)
+               (check "head search: at the right boundary"
+                      (web-skeleton::connection-request-end conn) (length head))
+               (check "head search: the work is linear in the head, not quadratic"
+                      (< searched (* 4 (length head)))
+                      t)))
+        (sb-int:unencapsulate 'web-skeleton::scan-crlf-crlf 'counted))
+      ;; Each place the terminator can be cut: CR | LF CR LF, CR LF | CR LF,
+      ;; CR LF CR | LF.
+      (dolist (k '(3 2 1))
+        (multiple-value-bind (v conn)
+            (drive-pieces (list (subseq head 0 (- (length head) k))
+                                (subseq head (- (length head) k))))
+          (check (format nil "head search: a terminator split ~d byte~:p from its end is found"
+                         k)
+                 (list v (web-skeleton::connection-request-end conn))
+                 (list :dispatch (length head))))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; A buffer that fills on a read is answered on that read
 ;;; ---------------------------------------------------------------------------
 
@@ -10099,6 +10178,7 @@
   (test-chunked-request-body)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
+  (test-head-search-resumes)
   (test-full-buffer-is-answered-when-it-fills)
   (test-expect-100-continue)
   (test-http-date)

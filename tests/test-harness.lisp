@@ -227,6 +227,59 @@
         (check "large body: dispatches" status 200)
         (check "large body: every byte arrived, in order" response-body want)))))
 
+(defun test-harness-split-head-then-pipelined-e2e ()
+  "A short request pipelined behind one whose head arrived in two pieces is
+   answered.
+
+   The first head's search records how far it got when the first piece
+   held no terminator. The keep-alive reset then moves the pipelined
+   request to offset 0, where its whole head sits before that position.
+   Broken state: the reset leaves the position as it was, the search for
+   the second head starts past its terminator, and the second request
+   waits for an end it has already sent — here until the read deadline.
+
+   The pause between the two writes is what makes the first head two
+   wake-ups rather than one; without it this is an ordinary pipelined
+   pair and passes whatever the reset does."
+  (format t "~%Harness: a split head, then a pipelined request~%")
+  (with-test-server (:handler (lambda (req)
+                                (make-text-response
+                                 200 (http-request-path req))))
+    (let* ((socket (connect-to-test-server))
+           (stream (sb-bsd-sockets:socket-make-stream
+                    socket :input t :output t :element-type '(unsigned-byte 8))))
+      (flet ((put (s)
+               (write-sequence (sb-ext:string-to-octets s :external-format :ascii)
+                               stream)
+               (force-output stream)))
+        (unwind-protect
+             (progn
+               (put (concatenate 'string
+                                 "GET /first HTTP/1.1" *crlf*
+                                 "Host: localhost" *crlf*
+                                 "X-Pad: " (make-string 100 :initial-element #\a)))
+               (sleep 0.2)
+               (put (concatenate 'string
+                                 *crlf* *crlf*
+                                 "GET /b HTTP/1.1" *crlf*
+                                 "Host: x" *crlf* *crlf*))
+               (let* ((buf (read-until-bounded
+                            stream :seconds 3
+                            :until (lambda (buf fill)
+                                     ;; Both bodies, the second one last.
+                                     (and (>= fill 2)
+                                          (= (aref buf (- fill 2)) 47)     ; /
+                                          (= (aref buf (- fill 1)) 98))))) ; b
+                      (text (sb-ext:octets-to-string buf :external-format :latin-1)))
+                 (check "split head: the first request is answered"
+                        (not (null (search "/first" text))) t)
+                 (check "split head: and the pipelined one behind it"
+                        (let ((tail (search "HTTP/1.1 200" text :from-end t)))
+                          (and tail (plusp tail) (search "/b" text :start2 tail) t))
+                        t)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
 (defun test-harness-full-buffer-answered-promptly-e2e ()
   "A request that fills the read buffer without finishing is answered as
    the buffer fills, not when the idle sweep gets to it.
@@ -4807,6 +4860,7 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-large-body-grows-the-buffer-e2e)
+  (test-harness-split-head-then-pipelined-e2e)
   (test-harness-full-buffer-answered-promptly-e2e)
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
