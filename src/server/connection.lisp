@@ -1135,7 +1135,8 @@
 (defun connection-on-read (conn)
   "Handle readable event. Reads available data and advances protocol state."
   (let* ((read-result (connection-read-available conn))
-         ;; The verdict every "not yet" site answers with. :CONTINUE means
+         ;; The verdict every "not yet" site answers with, by calling this
+         ;; once it has found the request unfinished. :CONTINUE means
          ;; more bytes will finish this request; when the peer's FIN arrived
          ;; in the same read no more bytes can, so the request is
          ;; unfinishable rather than merely incomplete and the slot is not
@@ -1156,9 +1157,29 @@
          ;; would risk withholding it from a live client to save a write to
          ;; a dead one, and a client waiting the full 1-3s for an interim
          ;; that never comes is the failure interims exist to avoid.
-         (unfinished (if (member read-result '(:eof :ok-eof))
-                         :close
-                         :continue)))
+         ;;
+         ;; And a buffer at CONNECTION-READ-CAP holding a request that is
+         ;; not finished will never hold a finished one, so it is refused
+         ;; here with the :FULL arm's 413. The :FULL arm sees only a buffer
+         ;; that was already full when the read began; the read that fills
+         ;; it reports :OK, because it read something, and stops with the
+         ;; rest of the request still in the kernel. An edge-triggered
+         ;; descriptor reports no new edge for bytes already there, so a
+         ;; client that had sent everything would get no answer until the
+         ;; idle sweep closed it. A function rather than a value, because
+         ;; the refusal must come only from a site that has found the
+         ;; request unfinished: the same full buffer can hold a request
+         ;; that is complete. A peer that has gone is answered first: there
+         ;; is no one to send a 413 to.
+         (unfinished
+           (lambda ()
+             (let ((buf (connection-read-buf conn)))
+               (cond
+                 ((member read-result '(:eof :ok-eof)) :close)
+                 ((and (>= (connection-read-pos conn) (length buf))
+                       (>= (length buf) (connection-read-cap conn)))
+                  (http-reject 413 "request too large (buffer full)"))
+                 (t :continue))))))
     ;; :OK and :OK-EOF both fall through to the state machine below, and
     ;; deliberately: bytes are bytes, and a fire-and-close client whose
     ;; request arrived with its FIN still deserves an answer. The :EOF arm
@@ -1414,7 +1435,7 @@
                        :flush-queued)
                       (t
                        (setf (connection-state conn) :read-body)
-                       unfinished)))
+                       (funcall unfinished))))
                    ;; Body present — read it, dispatching when complete.
                    ((and content-length (> content-length 0))
                     ;; Reject oversized bodies before reading them.
@@ -1481,7 +1502,7 @@
                         ;; Plain body wait.
                         (t
                          (setf (connection-state conn) :read-body)
-                         unfinished))))
+                         (funcall unfinished)))))
                    ;; No body — request is complete.
                    (t
                     ;; BODY-EXPECTED is deliberately not set here: it is
@@ -1495,11 +1516,11 @@
                           (connection-request-end conn) (+ header-end 4))
                     :dispatch)))))))
              ;; No CRLFCRLF yet — keep reading
-             unfinished)))
+             (funcall unfinished))))
       (:read-body
        (if (connection-body-complete-p conn)
            :dispatch
-           unfinished))
+           (funcall unfinished)))
       (:websocket
        :websocket))))
 

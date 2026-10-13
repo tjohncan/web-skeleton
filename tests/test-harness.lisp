@@ -227,6 +227,75 @@
         (check "large body: dispatches" status 200)
         (check "large body: every byte arrived, in order" response-body want)))))
 
+(defun test-harness-full-buffer-answered-promptly-e2e ()
+  "A request that fills the read buffer without finishing is answered as
+   the buffer fills, not when the idle sweep gets to it.
+
+   The client sends everything at once and then only reads. The read that
+   fills the buffer leaves the rest in the kernel, and nothing more will
+   arrive to raise another edge, so the answer has to come from that read.
+   Broken state: the read deadline below expires with nothing received,
+   because the server is waiting for an event that will not come and will
+   close the connection, unanswered, at *IDLE-TIMEOUT*.
+
+   The answer is the 413 and then a close with the rest of the request
+   unread, which on Linux is a reset — and a reset can destroy the
+   response before the client reads it. So the claim asserted is the
+   prompt end, and the 413 is checked only if bytes did arrive.
+
+   Budgets are set with SETF, not LET: the worker reads the global values."
+  (format t "~%Harness: a full buffer is answered when it fills~%")
+  (let ((saved (list web-skeleton:*max-body-size*
+                     web-skeleton:*max-total-header-bytes*
+                     web-skeleton:*max-request-line-length*
+                     web-skeleton:*max-header-count*)))
+    (setf web-skeleton:*max-body-size* 8192
+          web-skeleton:*max-total-header-bytes* 1024
+          web-skeleton:*max-request-line-length* 1024
+          web-skeleton:*max-header-count* 10)
+    (unwind-protect
+         (with-test-server (:handler (lambda (req)
+                                       (declare (ignore req))
+                                       (make-text-response 200 "unreached")))
+           (let* ((socket (connect-to-test-server))
+                  (stream (sb-bsd-sockets:socket-make-stream
+                           socket :input t :output t
+                           :element-type '(unsigned-byte 8))))
+             (unwind-protect
+                  (progn
+                    ;; 12 KiB of one-byte chunks against a 10 KiB cap: the
+                    ;; decoded body is 2000 bytes, well inside the body cap,
+                    ;; so it is the buffer that fills.
+                    (write-sequence
+                     (sb-ext:string-to-octets
+                      (concatenate 'string
+                                   "POST /u HTTP/1.1" *crlf*
+                                   "Host: localhost" *crlf*
+                                   "Transfer-Encoding: chunked" *crlf*
+                                   *crlf*
+                                   (with-output-to-string (s)
+                                     (dotimes (i 2000)
+                                       (format s "1~aX~a" *crlf* *crlf*))))
+                      :external-format :ascii)
+                     stream)
+                    (force-output stream)
+                    (multiple-value-bind (buf reason)
+                        (read-until-bounded stream :seconds 4)
+                      (check "full buffer e2e: the connection ends promptly"
+                             (not (eq reason :deadline)) t)
+                      (check "full buffer e2e: and what arrived, if anything, is a 413"
+                             (or (zerop (fill-pointer buf))
+                                 (eql 0 (search "HTTP/1.1 413"
+                                                (sb-ext:octets-to-string
+                                                 buf :external-format :latin-1))))
+                             t)))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+      (setf web-skeleton:*max-body-size* (first saved)
+            web-skeleton:*max-total-header-bytes* (second saved)
+            web-skeleton:*max-request-line-length* (third saved)
+            web-skeleton:*max-header-count* (fourth saved)))))
+
 (defun test-harness-body-at-max-size-e2e ()
   "A POST whose Content-Length equals *MAX-BODY-SIZE* dispatches: the cap
    is a ceiling the body may reach, and the comparison is > rather than >=.
@@ -4738,6 +4807,7 @@
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
   (test-harness-large-body-grows-the-buffer-e2e)
+  (test-harness-full-buffer-answered-promptly-e2e)
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
   (test-connection-serial-does-not-repeat-when-an-fd-does)

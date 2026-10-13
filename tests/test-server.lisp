@@ -8034,6 +8034,98 @@
                :continue)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; A buffer that fills on a read is answered on that read
+;;; ---------------------------------------------------------------------------
+
+(defun test-full-buffer-is-answered-when-it-fills ()
+  "A read that fills the buffer to its cap, with the request still
+   unfinished, is answered 413 by that read.
+
+   The :FULL arm answers a buffer that was already full when a read began.
+   The read that fills it reports :OK instead, because it read something,
+   and leaves the rest of the request in the kernel — where an
+   edge-triggered descriptor reports nothing new, so a client that had
+   sent everything waited out the idle timeout and got no answer.
+
+   The source here never runs dry: it has more than the cap to give and
+   would give it, which is the kernel holding the rest. Budgets are set so
+   the cap is above the 4 KiB first buffer and the buffer grows to meet it,
+   as a real one does."
+  (format t "~%Read buffer: full on the read that fills it~%")
+  (let ((web-skeleton:*max-body-size* 8192)
+        (web-skeleton:*max-total-header-bytes* 1024)
+        (web-skeleton:*max-request-line-length* 1024)
+        (web-skeleton:*max-header-count* 10))
+    (labels ((ascii (s) (sb-ext:string-to-octets s :external-format :ascii))
+             (drive (bytes)
+               (let* ((sent 0)
+                      (conn (web-skeleton::make-connection
+                             :fd -1
+                             :read-fn
+                             (lambda (buffer start max-bytes)
+                               (if (>= sent (length bytes))
+                                   :again
+                                   (let ((n (min max-bytes (- (length bytes) sent))))
+                                     (replace buffer bytes :start1 start
+                                                           :start2 sent
+                                                           :end2 (+ sent n))
+                                     (incf sent n)
+                                     n))))))
+                 (values (handler-case (web-skeleton::connection-on-read conn)
+                           (web-skeleton:http-parse-error (e)
+                             (web-skeleton::http-parse-error-status e))
+                           (error (e) (princ-to-string e)))
+                         conn))))
+      (let ((cap (web-skeleton::connection-read-cap
+                  (web-skeleton::make-connection :fd -1))))
+        (check "full buffer: the cap is past the first buffer, so it grows"
+               (> cap 4096) t)
+        ;; Small chunks: the wire carries six bytes for each one decoded, so
+        ;; the buffer fills long before the body reaches *MAX-BODY-SIZE*.
+        ;; Broken state: :CONTINUE, and a wait for an edge that has fired.
+        (let ((body (with-output-to-string (s)
+                      (dotimes (i 2000) (format s "1~aX~a" *crlf* *crlf*)))))
+          (check "full buffer: a chunked body of small chunks is 413 at once"
+                 (values (drive (ascii (concatenate
+                                        'string
+                                        "POST /u HTTP/1.1" *crlf*
+                                        "Host: x" *crlf*
+                                        "Transfer-Encoding: chunked" *crlf*
+                                        *crlf* body))))
+                 413))
+        ;; A header block that never ends. Same read, same edge.
+        (check "full buffer: headers that never end are 413 at once"
+               (values (drive (ascii (concatenate
+                                      'string
+                                      "GET / HTTP/1.1" *crlf*
+                                      "X-Pad: "
+                                      (make-string (* 2 cap)
+                                                   :initial-element #\p)))))
+               413)
+        ;; The other half: a full buffer is not a refusal by itself. A
+        ;; complete request with pipelined bytes behind it can fill the
+        ;; buffer just as well, and is dispatched. Broken state: the
+        ;; refusal is decided on the buffer alone, ahead of the state
+        ;; machine, and a well-formed request is refused for what follows
+        ;; it on the wire.
+        (multiple-value-bind (v conn)
+            (drive (ascii (concatenate
+                           'string
+                           "POST /u HTTP/1.1" *crlf*
+                           "Host: x" *crlf*
+                           "Transfer-Encoding: chunked" *crlf*
+                           *crlf*
+                           "3" *crlf* "abc" *crlf* "0" *crlf* *crlf*
+                           "GET /next HTTP/1.1" *crlf*
+                           "X-Pad: " (make-string (* 2 cap)
+                                                  :initial-element #\q))))
+          (check "full buffer: a complete request in a full buffer dispatches"
+                 v :dispatch)
+          (check "full buffer: and the buffer really was full"
+                 (= (web-skeleton::connection-read-pos conn) cap)
+                 t))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
 
@@ -10007,6 +10099,7 @@
   (test-chunked-request-body)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
+  (test-full-buffer-is-answered-when-it-fills)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)
