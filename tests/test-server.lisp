@@ -9734,6 +9734,69 @@
       (setf (aref out (+ 6 i)) (logxor (aref bytes i) (aref mask (mod i 4)))))
     out))
 
+(defun test-ws-handler-reply-of-the-wrong-type ()
+  "A ws-handler that returns something other than a frame's bytes — a
+   string, the commonest slip — has its connection closed, however many
+   frames shared the read.
+
+   The reply is checked where it is received. Handed on unchecked, a
+   single reply fails in the write queue's type declaration, outside the
+   WebSocket's catch and inside the HTTP request path's, whose answer is a
+   500: an HTTP response written onto an established WebSocket, which the
+   client reads as frame bytes. Two replies are joined first and fail
+   inside the WebSocket's catch, which closes. Broken state: the one-reply
+   session receives HTTP/1.1 500.
+
+   The two-reply session is the control for the claim that both shapes now
+   end alike, and the frame-returning session is the control that the
+   check refuses only the wrong type."
+  (format t "~%ws-handler: a reply that is not a frame~%")
+  (with-test-server
+      (:handler (lambda (req) (declare (ignore req)) :upgrade)
+       :ws-handler (lambda (conn frame)
+                     (declare (ignore conn))
+                     (if (string= (sb-ext:octets-to-string
+                                   (web-skeleton:ws-frame-payload frame)
+                                   :external-format :utf-8)
+                                  "frame")
+                         (web-skeleton:build-ws-text "a frame")
+                         "a string, not a frame")))
+    (flet ((session (texts &key until)
+             ;; Upgrade, send every text frame in one write so they share a
+             ;; read, and return (REASON . TEXT) of what came back.
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                             :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (progn
+                      (%ws-client-upgrade stream)
+                      (write-sequence
+                       (apply #'concatenate '(vector (unsigned-byte 8))
+                              (mapcar (lambda (s) (%ws-client-frame 1 s)) texts))
+                       stream)
+                      (force-output stream)
+                      (multiple-value-bind (buf reason)
+                          (read-until-bounded stream :seconds 3 :until until)
+                        (cons reason (sb-ext:octets-to-string
+                                      buf :external-format :latin-1))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (let ((one (session '("string"))))
+        (check "ws reply: a string reply closes the connection, unanswered"
+               one '(:eof . ""))
+        (check "ws reply: and no HTTP response is written onto the WebSocket"
+               (search "HTTP/1.1" (cdr one)) nil))
+      (check "ws reply: two string replies in one read end the same way"
+             (session '("string" "string"))
+             '(:eof . ""))
+      (check "ws reply: a frame reply still arrives"
+             (car (session '("frame")
+                           :until (lambda (buf fill)
+                                    (declare (ignore buf))
+                                    (>= fill 9))))
+             :satisfied))))
+
 (defun test-counters-count-every-way-a-frame-is-handed-over ()
   "A frame is counted however the application hands it over, and a frame the
    framework sends on its own is not.
@@ -10274,6 +10337,7 @@
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-send-refuses-a-foreign-connection)
+  (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)

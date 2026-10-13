@@ -492,6 +492,26 @@
                     (logior +epollout+ +epollet+)))
     done))
 
+(defun check-ws-reply (reply)
+  "REPLY, a ws-handler's return value, if it is one the write queue can
+   carry: NIL for no reply, or a frame's bytes. Signals otherwise.
+
+   Checked where the reply is received, because nothing further along
+   answers it one way. WEBSOCKET-ON-READ joins two or more replies into one
+   vector, and a string among them raises there, inside the catch that
+   closes the WebSocket; a single reply is handed on untouched, and a
+   string raises later, in CONNECTION-APPEND-WRITE, where the catch is the
+   HTTP request path's and its answer is a 500 written onto an established
+   WebSocket. One mistake, two outcomes, chosen by how many frames shared
+   the read. Raised here, it is the first in both, and the message names
+   the fix the way DISPATCH-REQUEST's does for an HTTP handler."
+  (unless (or (null reply)
+              (typep reply '(simple-array (unsigned-byte 8) (*))))
+    (error "ws-handler returned ~a; expected NIL, or a frame's bytes from ~
+            BUILD-WS-TEXT or BUILD-WS-FRAME"
+           (type-of reply)))
+  reply)
+
 (defun ws-shift-buffer (conn buf pos end)
   "Shift unconsumed bytes to the start of the read buffer."
   (let ((remaining (- end pos)))
@@ -589,7 +609,8 @@
                               (connection-fd conn))
                    (setf (connection-last-active conn) (get-universal-time))
                    (when ws-handler
-                     (let ((response (funcall ws-handler conn frame)))
+                     (let ((response (check-ws-reply
+                                      (funcall ws-handler conn frame))))
                        ;; A reply is a frame handed to this connection as
                        ;; surely as one from WS-SEND, and it does not pass
                        ;; through WS-SEND, so it is counted here.
@@ -659,7 +680,8 @@
                                   :opcode (connection-ws-frag-opcode conn)
                                   :payload payload)))
                    (when ws-handler
-                     (let ((response (funcall ws-handler conn complete)))
+                     (let ((response (check-ws-reply
+                                      (funcall ws-handler conn complete))))
                        (when response
                          (note-ws-frame)
                          (push response responses))))))))
