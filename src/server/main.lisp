@@ -1668,6 +1668,10 @@
           ;; does — a third timer to walk the table a third time per second
           ;; is the waste the gate exists to prevent.
           (publish-connection-census)
+          ;; And so does closing the getent children that have exited
+          ;; since their lookups ended. A second is soon enough for a
+          ;; process that is only waiting to be collected.
+          (reap-dns-children)
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
@@ -1756,6 +1760,12 @@
               ;; worker restart drops its cache, which is harmless — the
               ;; next fetch to each host pays one getent again.
               (*dns-cache* (make-hash-table :test #'equal))
+              ;; getent children whose lookups are over and whose exits
+              ;; have not been seen yet. Per worker for the same reason as
+              ;; the cache. A restart drops only this record of them: a
+              ;; child that was never closed is still on SBCL's list of
+              ;; active processes, which is the list SBCL collects from.
+              (*dns-children* (make-hash-table :test #'eq))
               (*epoll-ctl-buf* (make-array +epoll-event-size+
                                            :element-type '(unsigned-byte 8)))
               (*poll-buf* (make-array 8 :element-type '(unsigned-byte 8)))
@@ -1832,6 +1842,12 @@
                                 *connections*)
                        (dolist (conn outbounds)
                          (close-outbound conn epoll-fd)))
+                     ;; One last pass over the children those closes and the
+                     ;; worker's life parked. Any still running is left on
+                     ;; SBCL's own list rather than waited for here, where a
+                     ;; child that would not die would hold the worker's
+                     ;; exit.
+                     (reap-dns-children)
                      ;; Drop this worker's published counts on the way out,
                      ;; or a torn down server leaves totals a later reader
                      ;; would sum into a fresh one's.

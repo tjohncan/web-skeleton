@@ -1198,6 +1198,105 @@
                   sentinel-fires 1))
       (setf web-skeleton:*fetch-address-filter* saved))))
 
+(defun %proc-pids ()
+  "Every pid with a directory under /proc.
+
+   Listed with * and filtered for digits afterwards, because SBCL's
+   pathnames have no character classes: /proc/[0-9]*/ matches nothing at
+   all, and a zombie count built on it passes on every build ever made.
+   Symlinks are left unresolved so /proc/self is skipped as a name rather
+   than counted twice as a pid."
+  (loop for p in (directory "/proc/*/stat" :resolve-symlinks nil)
+        for dir = (pathname-directory p)
+        for name = (car (last dir))
+        when (and (= (length dir) 3)
+                  (stringp name)
+                  (plusp (length name))
+                  (every #'digit-char-p name))
+          collect (parse-integer name)))
+
+(defun %proc-stat-fields (line)
+  "(STATE PPID) from a /proc/PID/stat LINE. Read from after the last ')',
+   because the command name before it is in parentheses and may contain
+   anything, a ')' or a space included."
+  (let ((rp (position #\) line :from-end t)))
+    (when rp
+      (let ((fields (%split-ws (subseq line (1+ rp)))))
+        (list (first fields)
+              (ignore-errors (parse-integer (second fields))))))))
+
+(defun %zombie-children ()
+  "Pids of this process's children that have exited and not been
+   collected: state Z, and this process as the parent."
+  (let ((self (sb-unix:unix-getpid)))
+    (loop for pid in (%proc-pids)
+          for line = (ignore-errors
+                      (with-open-file (s (format nil "/proc/~d/stat" pid)
+                                         :if-does-not-exist nil)
+                        (and s (read-line s nil nil))))
+          for (state ppid) = (and line (%proc-stat-fields line))
+          when (and (equal state "Z") (eql ppid self))
+            collect pid)))
+
+(defun test-harness-hostname-fetches-leave-no-zombie-e2e ()
+  "Two hundred fetches by hostname leave no zombie behind.
+
+   Each one spawns a getent child, and its lookup ends when the answer
+   arrives, which may be before the child has exited. Closing the process
+   then makes a zombie on an SBCL before 2.4.11. The framework closes a
+   child only once it has seen it exit, collecting it on the worker's tick.
+
+   On 2.4.11 and later SBCL collects a closed child itself, so there this
+   passes with or without the fix and is a control: two hundred real
+   lookups through the whole path, and nothing left behind. On an older
+   SBCL it is a detector, and not a perfect one. A zombie needs getent to
+   be still running at the moment its lookup ends, which is a race: on
+   2.2.9, closing early left between two and fourteen in two hundred over
+   the runs that were counted, so a broken build can come through a lucky
+   run clean. TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child alive
+   on purpose and is the check that never misses, on any SBCL.
+
+   Any answer is accepted from the fetch itself. What is under test is the
+   child, and a lookup that resolved and then failed to connect ended the
+   same way one that succeeded did."
+  (format t "~%Harness: hostname fetches leave no zombie~%")
+  ;; The counter's premises. Without the first, a listing that matches
+  ;; nothing reads as no zombies forever; without the second, a parse
+  ;; thrown by a command name does.
+  (check "hostname fetches: the /proc walk finds this process"
+         (not (null (member (sb-unix:unix-getpid) (%proc-pids))))
+         t)
+  (check "hostname fetches: a stat line reads past a name holding ') '"
+         (%proc-stat-fields "42 (odd) S name) Z 7 1 1 0")
+         '("Z" 7))
+  (let ((upstream-port nil)
+        (before (%zombie-children)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/upstream")
+               (make-text-response 200 "up")
+               (defer-to-fetch :GET (format nil "http://localhost:~d/upstream"
+                                            upstream-port)
+                 :then (lambda (status headers body)
+                         (declare (ignore headers body))
+                         (make-text-response (or status 502) "via name"))))))
+      (setf upstream-port *test-port*)
+      (let ((answered (loop repeat 200
+                            count (member (ignore-errors
+                                           (values (test-http-request :get "/via")))
+                                          '(200 502)))))
+        (check "hostname fetches: all two hundred were answered" answered 200))
+      ;; Collected on the worker's tick, so give it two.
+      (let ((deadline (+ (get-internal-real-time)
+                         (* 3 internal-time-units-per-second)))
+            (left nil))
+        (loop do (setf left (set-difference (%zombie-children) before))
+              while (and left (< (get-internal-real-time) deadline))
+              do (sleep 0.1))
+        (check "hostname fetches: no zombie children left behind"
+               (length left) 0)))))
+
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
   "When an HTTP/1.1 client sends 'Connection: close', the server's
    response MUST carry 'Connection: close' (RFC 7230 §6.1: a sender
@@ -4660,6 +4759,7 @@
   (test-harness-awaiting-timeout-answers-504-e2e)
   (test-harness-close-delimited-fetch-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
+  (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)

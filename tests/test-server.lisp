@@ -7091,6 +7091,75 @@
 ;;; the delegation buys, on the sink the copy had never heard of.
 ;;; ---------------------------------------------------------------------------
 
+(defun test-dns-child-closed-only-once-dead ()
+  "A getent child is closed once it has exited, and never before.
+
+   A lookup ends when its answer arrives, and the child that wrote the
+   answer may not have exited yet. SB-EXT:PROCESS-CLOSE on a child that is
+   still running takes it, on an SBCL before 2.4.11, off the list SBCL
+   collects exits from, and the zombie it becomes stays for the life of
+   the server. So the close waits for the exit, on the worker's tick,
+   while the pipe — a descriptor — goes at once.
+
+   Deterministic because PROCESS-KILL is stubbed: a real SIGKILL races the
+   close that follows it, and the old code lost that race only most of the
+   time. With the kill held back the child is running at the end of the
+   lookup on every run, which is the case that matters, and every
+   PROCESS-CLOSE is recorded with whether its child was alive at the
+   time. Broken state: one close, made while it was."
+  (format t "~%DNS child: closed once it has exited, never before~%")
+  (let ((closes nil)
+        (kills 0))
+    (unwind-protect
+         (progn
+           (sb-int:encapsulate 'sb-ext:process-kill 'held-alive
+                               (lambda (f process signal &rest more)
+                                 (declare (ignore f process signal more))
+                                 (incf kills)
+                                 t))
+           (sb-int:encapsulate 'sb-ext:process-close 'watched
+                               (lambda (f process)
+                                 (push (sb-ext:process-alive-p process) closes)
+                                 (funcall f process)))
+           (let* ((process (sb-ext:run-program "sleep" '("30")
+                                               :search t :wait nil
+                                               :output :stream))
+                  (pipe (sb-ext:process-output process))
+                  (web-skeleton::*dns-children* (make-hash-table :test #'eq))
+                  (conn (web-skeleton::make-connection
+                         :fd (sb-sys:fd-stream-fd pipe)
+                         :state :out-dns :outbound-p t
+                         :dns-process process)))
+             (web-skeleton::maybe-reap-dns-process conn)
+             (check "dns child: the end of the lookup sends it SIGKILL" kills 1)
+             (check "dns child: its pipe is closed at once" (open-stream-p pipe) nil)
+             (check "dns child: and the connection lets go of both"
+                    (list (web-skeleton::connection-fd conn)
+                          (web-skeleton::connection-dns-process conn))
+                    '(-1 nil))
+             (check "dns child: a child still running is not closed" closes nil)
+             (check "dns child: it is parked for the tick instead"
+                    (hash-table-count web-skeleton::*dns-children*) 1)
+             (web-skeleton::reap-dns-children)
+             (check "dns child: a tick while it still runs leaves it parked"
+                    (list closes (hash-table-count web-skeleton::*dns-children*))
+                    '(nil 1))
+             ;; Now let it die, for real.
+             (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
+             (sb-ext:process-kill process 9)
+             (let ((deadline (+ (get-internal-real-time)
+                                (* 3 internal-time-units-per-second))))
+               (loop while (and (sb-ext:process-alive-p process)
+                                (< (get-internal-real-time) deadline))
+                     do (sleep 0.02)))
+             (web-skeleton::reap-dns-children)
+             (check "dns child: once it has exited, the tick closes it, dead"
+                    closes '(nil))
+             (check "dns child: and forgets it"
+                    (hash-table-count web-skeleton::*dns-children*) 0)))
+      (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
+      (sb-int:unencapsulate 'sb-ext:process-close 'watched))))
+
 (defun test-dns-error-ends-a-detached-fetch ()
   "A detached fetch to a name that will not resolve releases its target.
 
@@ -9949,6 +10018,7 @@
   (test-fetch-address-filter)
   (test-dns-cache)
   (test-dns-lookup-sink)
+  (test-dns-child-closed-only-once-dead)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-format-peer-addr)

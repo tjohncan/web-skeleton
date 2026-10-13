@@ -376,23 +376,81 @@
             (connection-socket conn) nil
             (connection-state conn) :closing))))
 
+(defvar *dns-children* nil
+  "getent children this worker has finished with and not yet seen exit,
+   as a table of process to T. Bound per worker by RUN-WORKER beside
+   *DNS-CACHE*, and emptied by REAP-DNS-CHILDREN on the maintenance tick.
+   NIL off a worker, where RELEASE-DNS-PROCESS waits instead of parking.
+
+   It exists because a lookup ends when its answer arrives, and the
+   process that gave the answer has not necessarily exited by then.
+   SB-EXT:PROCESS-CLOSE on a child that is still running takes it, on an
+   SBCL before 2.4.11, off the list SBCL waits on, so when the child does
+   exit nothing collects it — one in every few hostname fetches would
+   leave a zombie for the life of the server. A child is therefore closed
+   only once it has been seen dead, which holds on any SBCL.")
+
+(defun settle-dns-process (process)
+  "Close PROCESS if it has exited; otherwise leave it for REAP-DNS-CHILDREN.
+
+   Off a worker there is no tick to come back on, so it waits for the exit
+   instead. The callers have sent SIGKILL before getting here, so the wait
+   is for the kernel to finish a death it has already been told about."
+  (cond
+    ((not (ignore-errors (sb-ext:process-alive-p process)))
+     (ignore-errors (sb-ext:process-close process)))
+    (*dns-children*
+     (setf (gethash process *dns-children*) t))
+    (t
+     (ignore-errors (sb-ext:process-wait process))
+     (ignore-errors (sb-ext:process-close process)))))
+
+(defun release-dns-process (process)
+  "End a getent child whose lookup is over: kill it if it is still
+   running, close its pipe now, and close the process itself once it has
+   exited — see *DNS-CHILDREN* for why those last two are apart.
+
+   The pipe goes at once because it is a descriptor, and a descriptor
+   held until a child is collected is one more reason a connection slot
+   is not free. Closing the stream is what PROCESS-CLOSE would have done
+   for it; the PROCESS-CLOSE that follows later finds it closed."
+  (ignore-errors
+   (when (sb-ext:process-alive-p process)
+     (sb-ext:process-kill process 9)))
+  (ignore-errors (close (sb-ext:process-output process)))
+  (settle-dns-process process))
+
+(defun reap-dns-children ()
+  "Close every parked getent child that has since exited. Called from
+   the maintenance tick, and once more as a worker exits. Asking whether
+   a child is alive is what collects it, on any SBCL, so this is also the
+   wait itself. A child still running stays parked for the next call; it
+   was sent SIGKILL before it was parked."
+  (when *dns-children*
+    (let ((dead nil))
+      (maphash (lambda (process v)
+                 (declare (ignore v))
+                 (unless (ignore-errors (sb-ext:process-alive-p process))
+                   (push process dead)))
+               *dns-children*)
+      (dolist (process dead)
+        (ignore-errors (sb-ext:process-close process))
+        (remhash process *dns-children*)))))
+
 (defun maybe-reap-dns-process (conn)
   "If CONN has an attached getent process (a :out-dns outbound during
-   the DNS phase), kill it (if still running) and reap the zombie.
-   Safe to call on any connection — no-op when there is no process.
-   Idempotent: nulls the process slot so repeat calls are harmless.
-   Called from every teardown path (CLOSE-OUTBOUND in fetch.lisp,
-   CLOSE-CONNECTION in main.lisp) so a half-finished DNS lookup never
-   leaks a zombie process. Lives here alongside CONNECTION-CLOSE for
+   the DNS phase), release it through RELEASE-DNS-PROCESS. Safe to call
+   on any connection — no-op when there is no process. Idempotent: nulls
+   the process slot so repeat calls are harmless. Called from every
+   teardown path (CLOSE-OUTBOUND in fetch.lisp, CLOSE-CONNECTION in
+   main.lisp) so neither a finished lookup nor a half-finished one
+   leaves a child behind. Lives here alongside CONNECTION-CLOSE for
    load-order symmetry with both callers."
   (let ((process (connection-dns-process conn)))
     (when process
-      (ignore-errors
-       (when (sb-ext:process-alive-p process)
-         (sb-ext:process-kill process 9)))
-      (ignore-errors (sb-ext:process-close process))
-      ;; process-close already closed the pipe fd — mark it so
-      ;; connection-close's (when (>= fd 0) (%close fd)) skips
+      (release-dns-process process)
+      ;; The pipe was this connection's descriptor and it is closed now —
+      ;; mark it so connection-close's (when (>= fd 0) (%close fd)) skips
       ;; the double-close.
       (setf (connection-fd conn) -1)
       (setf (connection-dns-process conn) nil))))

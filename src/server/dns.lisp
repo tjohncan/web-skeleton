@@ -382,17 +382,14 @@
                         (connection-fd conn) host out-fd)
              (setf success t))
         ;; Error path: partial setup. Unregister the dns-conn if we
-        ;; created it, reap the getent child, let the outer error
+        ;; created it, release the getent child, let the outer error
         ;; handler in initiate-fetch deliver the 502.
         (unless success
           (when dns-conn
             (ignore-errors
              (epoll-remove epoll-fd (connection-fd dns-conn)))
             (unregister-connection dns-conn))
-          (ignore-errors
-           (when (sb-ext:process-alive-p process)
-             (sb-ext:process-kill process 9)))
-          (ignore-errors (sb-ext:process-close process)))))))
+          (release-dns-process process))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Completion paths

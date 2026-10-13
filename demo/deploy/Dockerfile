@@ -8,11 +8,11 @@
 # starts cleanly and cannot resolve anything, with nothing in the log to say
 # why. One base image is one thing to get wrong.
 #
-# bookworm's SBCL is 2.2.9, which is right for this demo and not for every
-# application. The demo never fetches by hostname, so it never spawns the
-# getent child SBCL leaks before 2.4.11: measured on 2.2.9, 200 fetches to a
-# name that resolves left 14 zombies, and 2.6 left none. An application that
-# does fetch by hostname wants a newer SBCL than this base image carries.
+# bookworm's SBCL is 2.2.9, the oldest the suite is run on, and it serves an
+# application that fetches by hostname as well as this demo, which does not.
+# Each such fetch spawns a getent child, and the framework closes one only
+# once it has exited: an SBCL before 2.4.11 never collects a child closed
+# while it was still running, and leaves it as a zombie.
 FROM debian:bookworm-slim
 
 # sbcl is the runtime. libssl3 and ca-certificates are optional and are what
