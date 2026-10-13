@@ -244,6 +244,15 @@
   (unless (or (null same-site)
               (member same-site '(:lax :strict :none)))
     (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
+  ;; The one attribute FORMAT writes rather than WRITE-STRING, and ~D
+  ;; prints anything that is not an integer as ~A would: a string of
+  ;; "3600; Domain=…" lands on the wire as two attributes, the injection
+  ;; VALIDATE-COOKIE-FIELD closes for every other field. Named by type,
+  ;; not echoed, since a value worth refusing is not one to put in a log.
+  (unless (or (null max-age) (integerp max-age))
+    (error "build-cookie: :max-age must be an integer number of seconds ~
+            or NIL, got a ~a"
+           (type-of max-age)))
   (when (and (eq same-site :none) (not secure))
     (error "build-cookie: :same-site :none requires :secure t"))
   (with-output-to-string (out)

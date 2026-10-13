@@ -1039,6 +1039,19 @@
            (containsp "Max-Age=3600"
                       (build-cookie "k" "v" :max-age 3600))
            t)
+    ;; The attribute FORMAT writes with ~D, which prints a non-integer as
+    ;; it is. Broken state: the string goes out whole, and its Domain is a
+    ;; second attribute on the cookie.
+    (check-error "build-cookie: a string max-age is refused"
+                 (build-cookie "k" "v" :max-age "3600; Domain=evil.example"))
+    (check-error "build-cookie: a float max-age is refused"
+                 (build-cookie "k" "v" :max-age 3600.5))
+    ;; Zero and negative are integers, and RFC 6265 §5.2.2 gives them a
+    ;; meaning: expire at once. The check is a type, not a range.
+    (check "max-age 0 is rendered"
+           (containsp "Max-Age=0" (build-cookie "k" "v" :max-age 0)) t)
+    (check "max-age -1 is rendered"
+           (containsp "Max-Age=-1" (build-cookie "k" "v" :max-age -1)) t)
     ;; Domain
     (check "domain rendered"
            (containsp "Domain=example.com"
