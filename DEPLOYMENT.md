@@ -166,9 +166,9 @@ specific status, not a blanket 400:
 |------|-----------|
 | `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing either the completion walk or the decoder rejects — the walk decides a chunk-size line it can already tell is invalid, the decoder decides everything else |
 | `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
-| `414 URI Too Long` | Request line over `*max-request-line-length*` |
+| `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
-| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
+| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
 | `501 Not Implemented` | A method not in the accepted set, or a transfer coding that is legal and unimplemented — `gzip`, or `gzip, chunked` (RFC 7230 §3.3.1). A bare final `chunked` is accepted |
 | `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
 | `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |

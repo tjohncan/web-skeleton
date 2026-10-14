@@ -475,6 +475,39 @@
 ;;; Read buffer helpers
 ;;; ---------------------------------------------------------------------------
 
+(defun request-head-budget ()
+  "The longest request head PARSE-REQUEST-BYTES can accept, terminator
+   included: the request line and the header bytes, each within its own
+   budget, and every CRLF the two budgets leave out.
+
+   A head that has not ended within this many bytes never will in a form
+   the parser accepts, which is what lets CONNECTION-ON-READ refuse it
+   then rather than buffering it toward CONNECTION-READ-CAP, the larger
+   bound that also makes room for a body."
+  (+ *max-total-header-bytes*
+     *max-request-line-length*
+     (* 2 *max-header-count*)  ; CRLF ending each header
+     4))                       ; request-line and blank-line CRLFs
+
+(defun refuse-unterminated-head (buf end)
+  "Refuse the request head in BUF[0..END), which has passed
+   REQUEST-HEAD-BUDGET without its blank line, with the status its first
+   fault has earned. Raises, always.
+
+     414   no CRLF within *MAX-REQUEST-LINE-LENGTH*: the request line is
+           what never ended
+     ...   whatever PARSE-REQUEST-BYTES raises over the lines that did
+           end — 431 for a header budget, 501, 505, 400 — as the
+           Content-Length arm's early refusal does
+     431   otherwise: the bytes past the last complete line are a header
+           that has not ended within the budget either"
+  (unless (scan-crlf buf 0 (min end (+ *max-request-line-length* 2)))
+    (http-reject 414 "request line too long (no end within ~d bytes)"
+                 *max-request-line-length*))
+  (parse-request-bytes buf 0 end)
+  (http-reject 431 "request head too large (no end within ~d bytes)"
+               (request-head-budget)))
+
 (defun connection-read-cap (conn)
   "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
@@ -511,16 +544,11 @@
     ;; the body.
     ;;
     ;; Summed exactly rather than padded with slack, the same way the
-    ;; :websocket arm spells out its 14-byte masked header. The last two
-    ;; terms are why this is not simply the sum of two variables:
-    ;; *max-total-header-bytes* counts header line bytes only, so the
-    ;; request line and every CRLF fall outside it.
+    ;; :websocket arm spells out its 14-byte masked header. The head's share
+    ;; is REQUEST-HEAD-BUDGET, which counts the CRLFs the header budgets
+    ;; leave out, and is why this is not simply the sum of two variables.
     (t
-     (+ *max-body-size*
-        *max-total-header-bytes*
-        *max-request-line-length*
-        (* 2 *max-header-count*)  ; CRLF ending each header
-        4))))                     ; request-line and blank-line CRLFs
+     (+ *max-body-size* (request-head-budget)))))
 
 (defun connection-read-into (conn buffer start max-bytes)
   "Read from CONN's transport into BUFFER[START..START+MAX-BYTES).
@@ -1535,8 +1563,18 @@
                           (connection-request-end conn) (+ header-end 4))
                     :dispatch)))))))
              ;; No CRLFCRLF yet — keep reading, and resume the search near
-             ;; here next time rather than from the start.
+             ;; here next time rather than from the start. Unless the head
+             ;; has reached its budget: then it is decided, not incomplete,
+             ;; since a terminator still to come would make it longer than
+             ;; any head the parser accepts. Waiting for the read cap
+             ;; instead would hold fourteen times the head budget per
+             ;; connection and answer with an idle close, or a 413 naming
+             ;; the body. Checked against the count, never by rescanning,
+             ;; so a head that arrives a byte at a time costs no more.
              (progn
+               (when (>= (connection-read-pos conn) (request-head-budget))
+                 (refuse-unterminated-head (connection-read-buf conn)
+                                           (connection-read-pos conn)))
                (setf (connection-header-scan-pos conn) (connection-read-pos conn))
                (funcall unfinished)))))
       (:read-body

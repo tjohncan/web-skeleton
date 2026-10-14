@@ -8232,6 +8232,68 @@
 ;;; A declared body costs what arrives, not what was declared
 ;;; ---------------------------------------------------------------------------
 
+(defun test-unterminated-head-refused-at-its-budget ()
+  "A request head still unterminated at REQUEST-HEAD-BUDGET is refused
+   then, with the status its first fault earns, not buffered toward the
+   read cap, which also makes room for a body.
+
+   Small budgets so the arithmetic is exact: the head budget is 64 + 64 +
+   2*4 + 4 = 140 bytes, the read cap 64 more. Broken state: every
+   unterminated head below the read cap waits, and on a socket is
+   answered by the idle sweep's close."
+  (format t "~%An unterminated head is refused at its budget~%")
+  (labels ((drive (raw)
+             ;; RAW arrives as fast as the buffer takes it, then the source
+             ;; would block: the verdict CONNECTION-ON-READ reaches, or the
+             ;; status it raised.
+             (let* ((bytes (sb-ext:string-to-octets raw :external-format :ascii))
+                    (sent 0)
+                    (conn (web-skeleton::make-connection
+                           :fd -1
+                           :read-fn
+                           (lambda (buffer start max-bytes)
+                             (if (>= sent (length bytes))
+                                 :again
+                                 (let ((n (min max-bytes (- (length bytes) sent))))
+                                   (replace buffer bytes :start1 start
+                                                         :start2 sent
+                                                         :end2 (+ sent n))
+                                   (incf sent n)
+                                   n))))))
+               (handler-case (web-skeleton::connection-on-read conn)
+                 (web-skeleton:http-parse-error (e)
+                   (web-skeleton::http-parse-error-status e))
+                 (error (e) (princ-to-string e)))))
+           (unterminated (total)
+             ;; A request line and one header line that has not ended, TOTAL
+             ;; bytes in all.
+             (let ((line (format nil "GET / HTTP/1.1~a" *crlf*)))
+               (concatenate 'string line "X-P: "
+                            (make-string (- total (length line) 5)
+                                         :initial-element #\p)))))
+    (let ((web-skeleton:*max-body-size* 64)
+          (web-skeleton:*max-total-header-bytes* 64)
+          (web-skeleton:*max-request-line-length* 64)
+          (web-skeleton:*max-header-count* 4))
+      (check "the head budget these give is 140" (web-skeleton::request-head-budget) 140)
+      (check "one byte short of the budget, an unterminated head still waits"
+             (drive (unterminated 139)) :continue)
+      (check "at the budget it is refused 431, its terminator still to come"
+             (drive (unterminated 140)) 431)
+      (check "a request line that never ends is refused 414"
+             (drive (concatenate 'string "GET /"
+                                 (make-string 150 :initial-element #\a)))
+             414)
+      ;; The lines that did end are parsed, and their first fault wins:
+      ;; here the version, which PARSE-REQUEST-BYTES judges before headers.
+      (check "a fault in the lines that ended is the one answered"
+             (drive (concatenate 'string "GET / HTTP/2.0" *crlf* "X-P: "
+                                 (make-string 130 :initial-element #\p)))
+             505)
+      (check "control: a head that ends is left to dispatch, as before"
+             (drive (format nil "GET / HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+             :dispatch))))
+
 (defun test-declared-body-is-not-preallocated ()
   (format t "~%Content-Length: the read buffer follows the bytes~%")
   (labels ((head (path headers)
@@ -8486,15 +8548,19 @@
                                         "Transfer-Encoding: chunked" *crlf*
                                         *crlf* body))))
                  413))
-        ;; A header block that never ends. Same read, same edge.
-        (check "full buffer: headers that never end are 413 at once"
+        ;; A header block that never ends is answered at once as well, but
+        ;; not by the full buffer: it reaches REQUEST-HEAD-BUDGET first and
+        ;; is refused there with the 431 its headers earn, before the
+        ;; buffer can fill. TEST-UNTERMINATED-HEAD-REFUSED-AT-ITS-BUDGET has
+        ;; that boundary exactly.
+        (check "full buffer: headers that never end are refused at once, 431"
                (values (drive (ascii (concatenate
                                       'string
                                       "GET / HTTP/1.1" *crlf*
                                       "X-Pad: "
                                       (make-string (* 2 cap)
                                                    :initial-element #\p)))))
-               413)
+               431)
         ;; The other half: a full buffer is not a refusal by itself. A
         ;; complete request with pipelined bytes behind it can fill the
         ;; buffer just as well, and is dispatched. Broken state: the
@@ -10916,6 +10982,7 @@
   (test-chunked-request-body)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
+  (test-unterminated-head-refused-at-its-budget)
   (test-head-search-resumes)
   (test-full-buffer-is-answered-when-it-fills)
   (test-expect-100-continue)
