@@ -152,7 +152,10 @@
    HASH: 32-byte SHA-256 digest of the signed message.
    SIG-BYTES: 64-byte signature (r || s, each 32 bytes big-endian).
    PUBKEY-X, PUBKEY-Y: 32-byte x and y coordinates of the public key.
-   Returns T if valid, NIL otherwise.
+   Returns T if valid, NIL otherwise. All four are (unsigned-byte 8)
+   vectors, taken through OCTETS-ARGUMENT as ECDSA-VERIFY-P256-LIBSSL
+   takes them: an argument of another type signals, because it is the
+   caller's mistake rather than a signature that failed to verify.
 
    Always reachable under this name regardless of whether
    web-skeleton-tls has been loaded — the TLS system swaps the public
@@ -165,6 +168,12 @@
    through the function cell, and an inlined caller would bypass the
    cell and keep calling whichever implementation was visible at
    compile time."
+  ;; The type contract first, shared with the libssl side: see
+  ;; OCTETS-ARGUMENT.
+  (setf hash      (octets-argument hash 'ecdsa-verify-p256)
+        sig-bytes (octets-argument sig-bytes 'ecdsa-verify-p256)
+        pubkey-x  (octets-argument pubkey-x 'ecdsa-verify-p256)
+        pubkey-y  (octets-argument pubkey-y 'ecdsa-verify-p256))
   ;; Length-gate the signature before indexing into it. ES256 is
   ;; fixed-width r||s = 64 bytes; anything else is malformed, not
   ;; merely 'contains the bytes we wanted plus some'. Without this

@@ -11,15 +11,20 @@
                (:file "src/address" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
                (:file "src/algorithms/word32" :depends-on ("src/package"))
+               (:file "src/algorithms/octets" :depends-on ("src/package"))
                (:file "src/algorithms/sha1"  :depends-on ("src/package"
                                                            "src/algorithms/hex"
-                                                           "src/algorithms/word32"))
+                                                           "src/algorithms/word32"
+                                                           "src/algorithms/octets"))
                (:file "src/algorithms/sha256" :depends-on ("src/package"
                                                             "src/algorithms/hex"
-                                                            "src/algorithms/word32"))
+                                                            "src/algorithms/word32"
+                                                            "src/algorithms/octets"))
                (:file "src/algorithms/hmac"   :depends-on ("src/package"
-                                                           "src/algorithms/sha256"))
-               (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))
+                                                           "src/algorithms/sha256"
+                                                           "src/algorithms/octets"))
+               (:file "src/algorithms/ecdsa"  :depends-on ("src/package"
+                                                           "src/algorithms/octets"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
                (:file "src/random" :depends-on ("src/package"
                                                  "src/algorithms/base64"))

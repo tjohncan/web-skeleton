@@ -961,12 +961,16 @@
 ;;; SHA via EVP_MD_CTX
 ;;; ---------------------------------------------------------------------------
 
-(defun %libssl-digest (evp-md data out-len)
+(defun %libssl-digest (evp-md data out-len caller)
   "Compute a digest via OpenSSL's EVP interface. EVP-MD is the alien
-   pointer returned by %EVP-SHA1 or %EVP-SHA256. DATA is the input byte
-   vector. OUT-LEN is the expected digest size in bytes (20 for SHA-1,
-   32 for SHA-256). Returns a fresh OUT-LEN byte vector."
-  (let ((ctx (%evp-md-ctx-new)))
+   pointer returned by %EVP-SHA1 or %EVP-SHA256. DATA is the input, taken
+   through OCTETS-ARGUMENT on CALLER's behalf before its address is handed
+   to EVP_DigestUpdate: VECTOR-SAP takes any specialized vector, and given
+   a character string would hash a prefix of its four-byte-a-character
+   storage. OUT-LEN is the expected digest size in bytes (20 for SHA-1, 32
+   for SHA-256). Returns a fresh OUT-LEN byte vector."
+  (let ((data (octets-argument data caller))
+        (ctx (%evp-md-ctx-new)))
     (when (sb-sys:sap= (sb-alien:alien-sap ctx) (sb-sys:int-sap 0))
       (error "EVP_MD_CTX_new failed"))
     (unwind-protect
@@ -991,14 +995,16 @@
       (%evp-md-ctx-free ctx))))
 
 (defun sha1-libssl (data)
-  "libssl-accelerated SHA-1. Matches SHA1-LISP's contract — byte-vector
-   in, 20-byte digest out."
-  (%libssl-digest (%evp-sha1) data 20))
+  "libssl-accelerated SHA-1. SHA1-LISP's contract, by the same function:
+   an (unsigned-byte 8) vector in through OCTETS-ARGUMENT, a 20-byte digest
+   out."
+  (%libssl-digest (%evp-sha1) data 20 'sha1))
 
 (defun sha256-libssl (data)
-  "libssl-accelerated SHA-256. Matches SHA256-LISP's contract — byte
-   vector in, 32-byte digest out."
-  (%libssl-digest (%evp-sha256) data 32))
+  "libssl-accelerated SHA-256. SHA256-LISP's contract, by the same
+   function: an (unsigned-byte 8) vector in through OCTETS-ARGUMENT, a
+   32-byte digest out."
+  (%libssl-digest (%evp-sha256) data 32 'sha256))
 
 ;;; ---------------------------------------------------------------------------
 ;;; ECDSA P-256 verify via d2i_PUBKEY + EVP_PKEY_verify
@@ -1074,11 +1080,13 @@
 
 (defun ecdsa-verify-p256-libssl (hash sig-bytes pubkey-x pubkey-y)
   "libssl-accelerated ECDSA P-256 signature verification. Matches
-   ECDSA-VERIFY-P256-LISP's contract — all inputs are byte vectors,
-   returns T on valid, NIL on any failure. Builds a DER SubjectPublicKeyInfo
-   from the raw (X, Y) coordinates, parses it to an EVP_PKEY via
-   d2i_PUBKEY, DER-encodes the raw r||s signature, then calls
-   EVP_PKEY_verify. Cleanup via unwind-protect regardless of path.
+   ECDSA-VERIFY-P256-LISP's contract — all inputs are (unsigned-byte 8)
+   vectors, taken through OCTETS-ARGUMENT, and an argument of another
+   type signals; returns T on valid, NIL on any failure to verify. Builds
+   a DER SubjectPublicKeyInfo from the raw (X, Y) coordinates, parses it
+   to an EVP_PKEY via d2i_PUBKEY, DER-encodes the raw r||s signature,
+   then calls EVP_PKEY_verify. Cleanup via unwind-protect regardless of
+   path.
    OpenSSL handles r/s range and invalid-curve point rejection
    internally, so those checks are not duplicated here. Both (r, s)
    and (r, n-s) are accepted — RFC 7515 / 7518 do not mandate low-S.
@@ -1088,6 +1096,13 @@
    cell at load time, so on a libssl machine this *is* the verifier, and
    a gate that exists on only one of the two is a gate that most
    deployments do not have."
+  ;; The type contract first, as on the pure-Lisp side: HASH is handed to
+  ;; OpenSSL by address, and a character string there would be read as a
+  ;; prefix of its four-byte-a-character storage. See OCTETS-ARGUMENT.
+  (setf hash      (octets-argument hash 'ecdsa-verify-p256)
+        sig-bytes (octets-argument sig-bytes 'ecdsa-verify-p256)
+        pubkey-x  (octets-argument pubkey-x 'ecdsa-verify-p256)
+        pubkey-y  (octets-argument pubkey-y 'ecdsa-verify-p256))
   ;; HASH is gated for the reason the pure-Lisp path gives at length: a
   ;; digest shorter than 32 bytes is a smaller integer, which is the same
   ;; thing as left-padding it into a different message. OpenSSL takes it

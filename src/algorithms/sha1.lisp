@@ -127,8 +127,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun sha1-lisp (data)
-  "Pure-Lisp SHA-1 (FIPS 180-4). Takes a byte vector, returns a 20-byte
-   digest vector. Always reachable under this name regardless of whether
+  "Pure-Lisp SHA-1 (FIPS 180-4). Takes an (unsigned-byte 8) vector through
+   OCTETS-ARGUMENT, as SHA1-LIBSSL does, and returns a 20-byte digest
+   vector. Always reachable under this name regardless of whether
    web-skeleton-tls has been loaded — the TLS system swaps the public
    SHA1 symbol to a libssl-backed version at load time via SETF
    SYMBOL-FUNCTION, but this function stays accessible directly so the
@@ -138,7 +139,7 @@
    DO NOT declaim SHA1 inline: the libssl swap works through the
    function cell, and an inlined caller would bypass the cell and keep
    calling whichever implementation was visible at compile time."
-  (let ((padded (sha1-pad data))
+  (let ((padded (sha1-pad (octets-argument data 'sha1)))
         ;; One scratch schedule for the whole digest — see
         ;; SHA1-PROCESS-BLOCK. Allocated per call, so concurrent
         ;; digests stay independent.
@@ -169,7 +170,9 @@
         digest))))
 
 (defun sha1 (data)
-  "Compute SHA-1 digest of DATA (byte vector). Returns a 20-byte vector.
+  "Compute SHA-1 digest of DATA, an (unsigned-byte 8) vector; a string is
+   refused, with the call that makes one into bytes (see OCTETS-ARGUMENT).
+   Returns a 20-byte vector.
    Delegates to SHA1-LISP by default; web-skeleton-tls replaces this
    function with a libssl-backed version at load time. SHA1-HEX and any
    other caller picks up the swap transparently by routing through the

@@ -167,8 +167,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun sha256-lisp (data)
-  "Pure-Lisp SHA-256 (FIPS 180-4). Takes a byte vector, returns a
-   32-byte digest vector. Always reachable under this name regardless
+  "Pure-Lisp SHA-256 (FIPS 180-4). Takes an (unsigned-byte 8) vector
+   through OCTETS-ARGUMENT, as SHA256-LIBSSL does, and returns a 32-byte
+   digest vector. Always reachable under this name regardless
    of whether web-skeleton-tls has been loaded — the TLS system swaps
    the public SHA256 symbol to a libssl-backed version at load time
    via SETF SYMBOL-FUNCTION, but this function stays accessible
@@ -178,7 +179,7 @@
    DO NOT declaim SHA256 inline: the libssl swap works through the
    function cell, and an inlined caller would bypass the cell and keep
    calling whichever implementation was visible at compile time."
-  (let ((padded (sha256-pad data))
+  (let ((padded (sha256-pad (octets-argument data 'sha256)))
         ;; One scratch schedule for the whole digest — see
         ;; SHA256-PROCESS-BLOCK. Allocated per call, so concurrent
         ;; digests stay independent.
@@ -207,7 +208,9 @@
         digest))))
 
 (defun sha256 (data)
-  "Compute SHA-256 digest of DATA (byte vector). Returns a 32-byte vector.
+  "Compute SHA-256 digest of DATA, an (unsigned-byte 8) vector; a string is
+   refused, with the call that makes one into bytes (see OCTETS-ARGUMENT).
+   Returns a 32-byte vector.
    Delegates to SHA256-LISP by default; web-skeleton-tls replaces this
    function with a libssl-backed version at load time. SHA256-HEX,
    HMAC-SHA256, and any other caller picks up the swap transparently by

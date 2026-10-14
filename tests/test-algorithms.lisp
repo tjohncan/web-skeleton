@@ -416,6 +416,135 @@
          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"))
 
 ;;; ---------------------------------------------------------------------------
+;;; The octet contract — what SHA1, SHA256, HMAC-SHA256 and
+;;; ECDSA-VERIFY-P256 accept, asked of whatever is in their function cells
+;;;
+;;; TEST-ALGORITHMS runs this, and TEST-PURE-LISP-CRYPTO runs it again with
+;;; the pure-Lisp implementations swapped back in, so on a libssl machine the
+;;; same assertions meet both sides of the swap. That is the property under
+;;; test: one exported name, one contract, whichever library is loaded.
+;;; ---------------------------------------------------------------------------
+
+(defun test-octet-contract ()
+  (format t "~%Digest, MAC and verifier inputs: octets, under one contract~%")
+  (labels ((outcome (thunk)
+             ;; :REFUSED for the contract's own refusal; otherwise the value,
+             ;; or the text of whatever else was raised.
+             (handler-case (funcall thunk)
+               (error (e)
+                 (let ((text (princ-to-string e)))
+                   (if (search "takes an (unsigned-byte 8) vector" text)
+                       :refused
+                       text)))))
+           (octets (s) (sb-ext:string-to-octets s :external-format :utf-8))
+           (adjustable (bytes)
+             ;; BYTES behind a fill pointer, with bytes past it that must not
+             ;; be read.
+             (let ((v (make-array (+ (length bytes) 7)
+                                  :element-type '(unsigned-byte 8)
+                                  :adjustable t :fill-pointer (length bytes)
+                                  :initial-element #xEE)))
+               (replace v bytes)
+               v))
+           (displaced (bytes)
+             (let ((backing (make-array (+ (length bytes) 4)
+                                        :element-type '(unsigned-byte 8)
+                                        :initial-element #xEE)))
+               (replace backing bytes :start1 2)
+               (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                          :displaced-to backing
+                                          :displaced-index-offset 2))))
+    ;; Strings. These two share their first quarter, which is all a libssl
+    ;; digest read of a character string; they hashed alike there.
+    (let ((a "secret=s3cr3t;amount=100;to=alice")
+          (b "secret=s3X;amount=999999;to=mallo"))
+      (check "octets: sha256 refuses a character string"
+             (outcome (lambda () (sha256 a))) :refused)
+      (check "octets: sha256-hex refuses the string sharing its prefix"
+             (outcome (lambda () (sha256-hex b))) :refused)
+      (check "octets: sha1 refuses a character string"
+             (outcome (lambda () (sha1 a))) :refused)
+      (check "octets: a base-string is refused too, whatever its storage"
+             (outcome (lambda () (sha256 (coerce "abc" 'base-string))))
+             :refused)
+      (check "octets: the refusal names the call that makes a string into bytes"
+             (handler-case (progn (sha256 a) nil)
+               (error (e)
+                 (not (null (search "string-to-octets" (princ-to-string e))))))
+             t))
+    ;; Bytes held in something other than an (unsigned-byte 8) vector.
+    (check "octets: a simple-vector of byte values is refused"
+           (outcome (lambda () (sha256 (vector 97 98 99)))) :refused)
+    (check "octets: an (unsigned-byte 16) vector is refused"
+           (outcome (lambda ()
+                      (sha256 (make-array 3 :element-type '(unsigned-byte 16)
+                                            :initial-contents '(97 98 99)))))
+           :refused)
+    ;; Octets held non-simply digest as their active elements do.
+    (let ((abc (octets "abc")))
+      (check "octets: an adjustable vector digests to its fill pointer"
+             (outcome (lambda () (sha256-hex (adjustable abc))))
+             (sha256-hex abc))
+      (check "octets: a displaced vector digests what it shows"
+             (outcome (lambda () (sha256-hex (displaced abc))))
+             (sha256-hex abc))
+      (check "octets: sha1 takes an adjustable vector the same way"
+             (outcome (lambda () (sha1-hex (adjustable abc))))
+             (sha1-hex abc)))
+    ;; HMAC: both arguments, and the long-key branch that reaches SHA256
+    ;; before anything copies the key.
+    (let ((secret (concatenate 'string "a-long-secret-key-"
+                               (make-string 60 :initial-element #\k)))
+          (msg (octets "what do ya want for nothing?")))
+      (check "octets: hmac-sha256 refuses a string key longer than a block"
+             (outcome (lambda () (hmac-sha256 secret msg))) :refused)
+      (check "octets: and a short one"
+             (outcome (lambda () (hmac-sha256 "Jefe" msg))) :refused)
+      (check "octets: and a string message"
+             (outcome (lambda () (hmac-sha256 (octets "Jefe")
+                                              "what do ya want for nothing?")))
+             :refused)
+      (check "octets: the refusal of a key does not carry the key"
+             (handler-case (progn (hmac-sha256 secret msg) nil)
+               (error (e) (search "a-long-secret" (princ-to-string e))))
+             nil)
+      ;; RFC 4231 case 2, with both arguments held non-simply.
+      (check "octets: hmac-sha256 takes adjustable and displaced octets"
+             (outcome (lambda ()
+                        (bytes-to-hex (hmac-sha256 (adjustable (octets "Jefe"))
+                                                   (displaced msg)))))
+             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"))
+    ;; The verifier, with RFC 7515 A.3.
+    (let* ((hash (sha256 (octets "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")))
+           (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
+           (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+           (sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")))
+      (check "octets: ecdsa-verify-p256 refuses a string hash"
+             (outcome (lambda ()
+                        (ecdsa-verify-p256 (make-string 32 :initial-element #\a)
+                                           sig x y)))
+             :refused)
+      (check "octets: and verifies arguments held non-simply"
+             (outcome (lambda ()
+                        (ecdsa-verify-p256 (adjustable hash) (displaced sig)
+                                           (adjustable x) (displaced y))))
+             t))
+    ;; Parity at every padding boundary. Without libssl the cells hold the
+    ;; pure-Lisp functions and this compares each with itself.
+    (flet ((disagreements (public lisp)
+             (loop for n in '(0 1 55 56 57 63 64 65 119 120 128 1000)
+                   for bytes = (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                                 (dotimes (i n v)
+                                   (setf (aref v i) (mod (* (1+ i) 131) 256))))
+                   unless (equalp (outcome (lambda () (funcall public bytes)))
+                                  (funcall lisp bytes))
+                     collect n)))
+      (check "parity: sha256 agrees with sha256-lisp at every padding boundary"
+             (disagreements #'sha256 #'web-skeleton::sha256-lisp) nil)
+      (check "parity: sha1 agrees with sha1-lisp at every padding boundary"
+             (disagreements #'sha1 #'web-skeleton::sha1-lisp) nil))))
+
+;;; ---------------------------------------------------------------------------
 ;;; constant-time-equal tests
 ;;; ---------------------------------------------------------------------------
 
@@ -607,6 +736,7 @@
   (test-ecdsa)
   (test-mod-inv-raise)
   (test-hmac-sha256)
+  (test-octet-contract)
   (test-constant-time-equal)
   (test-hex)
   (test-random)
@@ -627,8 +757,9 @@
 ;;;
 ;;; Mechanism: temporarily swap SYMBOL-FUNCTION for the three public
 ;;; crypto names back to their *-LISP originals, run the existing
-;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-ECDSA functions
-;;; unchanged (so the FIPS / RFC vectors live in exactly one place),
+;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-OCTET-CONTRACT /
+;;; TEST-ECDSA functions unchanged (so the FIPS / RFC vectors and the input
+;;; contract live in exactly one place),
 ;;; then restore via UNWIND-PROTECT. Safe only in a serial test runner.
 ;;; If libssl isn't loaded, the swap still works — it just replaces
 ;;; the thin SHA1/SHA256/ECDSA-VERIFY-P256 wrappers with their direct
@@ -639,15 +770,14 @@
   "Framework-dev entry point: re-run the existing crypto tests against
    the pure-Lisp implementations by temporarily swapping SYMBOL-FUNCTION
    for SHA1 / SHA256 / ECDSA-VERIFY-P256. HMAC-SHA256 is exercised for
-   free because it calls SHA256 through the function cell.
+   free because it calls SHA256 through the function cell, and
+   TEST-OCTET-CONTRACT puts the same input contract to the pure-Lisp side
+   that TEST-ALGORITHMS put to the libssl one.
 
    Run by TEST automatically whenever libssl is loaded, which is the only
    condition under which it has anything to say — without libssl the
    default function cells already are the pure-Lisp ones and the first
-   TEST-ALGORITHMS pass covered them. This docstring said the opposite for
-   long enough that three other places — RUN.LISP's header, TEST's own
-   comment, and the README — all describe the real behaviour and this one
-   did not."
+   TEST-ALGORITHMS pass covered them."
   (setf *tests-passed* 0
         *tests-failed* 0
         *failed-names* nil)
@@ -663,6 +793,7 @@
            (test-sha1)
            (test-sha256)
            (test-hmac-sha256)
+           (test-octet-contract)
            (test-ecdsa))
       (setf (symbol-function 'sha1)              saved-sha1
             (symbol-function 'sha256)            saved-sha256
