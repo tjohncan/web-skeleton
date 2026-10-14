@@ -874,6 +874,43 @@
             (return))))))
   (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
 
+(defvar *refusal-report* nil
+  "This worker's record of how the connection-limit warning was last
+   reported: a cons of (UNIVERSAL-TIME . REFUSALS-SINCE), the time 0 until
+   the first report. Bound per worker by RUN-WORKER; NIL off a worker,
+   where every refusal is reported.")
+
+(defun report-refusal ()
+  "Log a refusal at the connection limit — the first at once, then at most
+   once a minute per worker with a count of the ones in between.
+
+   A refusal happens only when a worker is out of room, which is when a
+   flood of connections is likeliest, and every log line holds *LOG-LOCK*,
+   the one lock every worker contends for, across a format and a flush.
+   Logged per refusal, a flood would serialize every worker on logging,
+   and a stalled log pipe would stop them all. The :ON-TICK error report in
+   RUN-EVENT-LOOP is throttled the same way for the same reason. The line
+   says refusals are happening; CONNECTION-CENSUS counts every one of them
+   under :REFUSED."
+  (let ((report *refusal-report*)
+        (now (get-universal-time)))
+    (cond
+      ((null report)
+       (log-warn "connection limit reached (~d), refusing new accept"
+                 *max-connections*))
+      ((zerop (car report))
+       (log-warn "connection limit reached (~d), refusing new accepts — ~
+                  reported at most once a minute from here, and counted ~
+                  under :refused in the census" *max-connections*)
+       (setf (car report) now))
+      ((>= (- now (car report)) 60)
+       (log-warn "connection limit reached (~d): ~d more refused in the ~
+                  last ~d seconds" *max-connections* (1+ (cdr report))
+                  (- now (car report)))
+       (setf (car report) now
+             (cdr report) 0))
+      (t (incf (cdr report))))))
+
 (defun accept-connection (listener-socket epoll-fd)
   "Accept a pending connection and register it with epoll.
    Returns T if a connection was accepted, NIL if none pending (EAGAIN).
@@ -889,8 +926,7 @@
     ;; Enforce per-worker connection limit
     (when (and (> *max-connections* 0)
                (>= (hash-table-count *connections*) *max-connections*))
-      (log-warn "connection limit reached (~d), refusing new accept"
-                *max-connections*)
+      (report-refusal)
       (note-refused)
       ;; And a response: REFUSE-CONNECTION writes a pre-built 503 straight to
       ;; the socket, so nothing downstream of here would count it. It is the
@@ -1838,6 +1874,7 @@
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
+              (*refusal-report* (cons 0 0))
               (*stream-drain-buf*
                 (make-array 4096 :element-type '(unsigned-byte 8)))
               ;; CAR is the second the string was built for. 0 can never

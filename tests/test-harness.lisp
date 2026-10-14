@@ -3764,6 +3764,54 @@
                  (ignore-errors (sb-bsd-sockets:socket-close holder))))))
       (setf web-skeleton::*max-connections* saved))))
 
+(defun test-harness-refusals-are-reported-not-logged-each ()
+  "A flood of refusals at *MAX-CONNECTIONS* is logged once, and counted
+   in full by the census.
+
+   Each refusal logged its own WARN, and every log line holds the one lock
+   all workers share across a format and a flush: a flood arrives exactly
+   when a worker is out of room, and a line per refusal had every worker
+   queueing on logging. The first refusal is logged at once and the rest
+   are reported at most once a minute, so in a test well inside that
+   minute fifty refusals are one line. The census is what counts them."
+  (format t "~%Harness: refusals are reported, not logged one by one~%")
+  (let ((saved web-skeleton::*max-connections*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream)))
+    (setf web-skeleton::*max-connections* 1
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "")))
+           (let ((holder (claim-connection-slot)))
+             (unwind-protect
+                  (progn
+                    (check "control: the one slot is taken" (not (null holder)) t)
+                    (when holder
+                      (let ((refused (loop repeat 50
+                                           count (eql (values (request-expecting-refusal))
+                                                      503))))
+                        (check "control: fifty connections were refused" refused 50))
+                      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+                        (loop until (or (and k (>= (getf k :refused 0) 50))
+                                        (> (get-universal-time) deadline))
+                              do (setf k (getf (web-skeleton:connection-census)
+                                               :counters))
+                                 (sleep 0.05))
+                        (check "the census counts every refusal"
+                               (>= (getf k :refused 0) 50) t))))
+               (when holder
+                 (ignore-errors (sb-bsd-sockets:socket-close holder))))))
+      (setf web-skeleton::*max-connections* saved
+            web-skeleton::*log-stream* saved-stream))
+    (let* ((text (get-output-stream-string log))
+           (lines (loop with start = 0
+                        for i = (search "connection limit reached" text :start2 start)
+                        while i count t do (setf start (1+ i)))))
+      (check "and the log says so once, not fifty times" lines 1))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -5312,6 +5360,7 @@
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
+  (test-harness-refusals-are-reported-not-logged-each)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-write-backlog-minimum-rejected)

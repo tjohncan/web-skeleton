@@ -202,8 +202,12 @@ consequences worth knowing before you build an alert on it:
   at the client will undercount.
 - **It is not in your access path**, so it will not appear in handler
   metrics or anything else counted after dispatch. If you want to see
-  refusals, watch the `connection limit reached` warning, which is
-  logged once per refusal.
+  refusals, watch the `connection limit reached` warning. It is logged on
+  a worker's first refusal and then at most once a minute with a count,
+  because a refusal comes when a worker is out of room, and a line per
+  refusal would have every worker queueing on the log lock in a flood.
+  For exact numbers read `:refused` in `connection-census`, which counts
+  every one.
 
 The refusal carries no `Date`. It is one frozen vector sent whole, and
 building a header per refusal would put that work on the path that exists
