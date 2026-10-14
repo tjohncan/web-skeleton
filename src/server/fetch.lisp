@@ -805,7 +805,124 @@
 ;;; Reads the response body line by line, calling a callback per line.
 ;;; Designed for NDJSON/SSE streaming APIs (e.g. LLM token streams).
 ;;; Blocks the calling thread — call from ws-handler or HTTP handler.
+;;;
+;;; Both schemes talk to a blocking socket carrying SO_RCVTIMEO and
+;;; SO_SNDTIMEO, one system call at a time: read(2) and write(2) here,
+;;; SSL_read and SSL_write in tls.lisp. Not through an SBCL fd-stream,
+;;; whose refill and flush wait for the descriptor on their own clock —
+;;; untimed unless the stream was made with :TIMEOUT — and go back to that
+;;; wait when the call reports the would-block an expired socket timeout
+;;; produces. Through one, an upstream that goes silent would hold the
+;;; calling worker until it chose to close, and READ-SEQUENCE, which waits
+;;; to fill its buffer, would hold every line of a slow stream until 8 KiB
+;;; had arrived.
 ;;; ---------------------------------------------------------------------------
+
+(defun call-retrying-eintr (thunk)
+  "Call THUNK until it answers something other than :RETRY, and return
+   that answer.
+
+   :RETRY is what the blocking byte sources report for EINTR —
+   PLAIN-BYTE-READER and PLAIN-WRITE-ALL here, and the SSL classifiers in
+   tls.lisp: the call was interrupted before it moved any bytes, so
+   re-issuing it unchanged is the whole of the correction. Nothing was
+   lost and nothing is done twice.
+
+   Bounded by *FETCH-TIMEOUT* across the whole sequence, and deliberately
+   not by a count of retries. The difference is the whole of it. A counter
+   turns a *correct* retry into a spurious failure after N signals, so it
+   fails a healthy connection for something that is not its fault. A
+   deadline fails only a fetch that has already outrun the budget the
+   caller set, which is what setting that budget asked for.
+
+   Leaving it unbounded was the first answer, and it was wrong for a
+   reason specific to this framework. SO_RCVTIMEO restarts per syscall,
+   so it bounds each call and never the sequence — and this process
+   generates SIGCHLD by design, one getent child per DNS lookup. That is
+   the same fact SSL-READ-EOF-OR-RAISE uses to argue that EINTR is
+   reachable at all, and it cuts both ways.
+
+   The deadline is taken on the first interruption rather than up front:
+   the ordinary path never retries, and should not pay a clock read per
+   call to be told so.
+
+   The caller pins across this loop, not inside THUNK. OpenSSL requires a
+   repeated call to present the same address and length, and a GC landing
+   between the interrupted call and its retry would move the vector out
+   from under exactly that requirement."
+  (let ((deadline nil))
+    (loop
+      (let ((verdict (funcall thunk)))
+        (unless (eq verdict :retry)
+          (return verdict))
+        (unless deadline
+          (setf deadline (+ (get-internal-real-time)
+                            (* *fetch-timeout*
+                               internal-time-units-per-second))))
+        ;; >= not >: at the deadline the budget is spent, and a zero
+        ;; budget therefore means no retries rather than one.
+        (when (>= (get-internal-real-time) deadline)
+          (error "interrupted repeatedly: no progress in ~d seconds"
+                 *fetch-timeout*))))))
+
+(defun plain-io-failed (fd operation errno)
+  "Classify a failed read(2) or write(2) on the blocking fetch socket FD:
+   :RETRY for EINTR, and a raise for everything else.
+
+   A would-block cannot mean what it means on the event loop's sockets.
+   This one blocks, so read(2) and write(2) return EAGAIN only when
+   SO_RCVTIMEO or SO_SNDTIMEO expired: the upstream sent nothing, or read
+   nothing, for *FETCH-TIMEOUT*. That is raised as the timeout it is. Any
+   other errno is FD-IO-ERROR naming FD, so a handler whose fetch failed
+   answers 500 rather than being taken for its own client leaving."
+  (cond
+    ((= errno +eintr+) :retry)
+    ((or (= errno +eagain+) (= errno +ewouldblock+))
+     (error "fetch-stream: ~a timed out: nothing ~a in ~a second~:p (*fetch-timeout*)"
+            operation (if (string= operation "read") "received" "accepted")
+            *fetch-timeout*))
+    (t (error 'fd-io-error :fd fd :operation operation :errno errno))))
+
+(defun plain-byte-reader (fd)
+  "Byte source over the blocking socket FD for STREAM-READER, the plain
+   twin of SSL-BYTE-READER: one read(2) per fill, answering with however
+   many bytes it returned, :EOF at a clean end of stream, or a raise from
+   PLAIN-IO-FAILED.
+
+   One call per fill is what lets a line out as soon as it arrives. A fill
+   that waited for its buffer to be full would hold an NDJSON token stream
+   back until its end."
+  (lambda (buf len)
+    ;; Pinned outside the retry loop, as SSL-BYTE-READER's is: an
+    ;; interrupted call is re-issued with the same address.
+    (sb-sys:with-pinned-objects (buf)
+      (call-retrying-eintr
+       (lambda ()
+         (let ((n (%read fd (sb-sys:vector-sap buf) len)))
+           (cond
+             ((> n 0) n)
+             ((zerop n) :eof)
+             (t (plain-io-failed fd "read" (get-errno))))))))))
+
+(defun plain-write-all (fd bytes)
+  "Write all of BYTES to the blocking socket FD with write(2), the plain
+   twin of TLS-WRITE-ALL. SO_SNDTIMEO bounds each call, so an upstream that
+   stops reading a large request body fails the fetch rather than holding
+   the caller; see PLAIN-IO-FAILED."
+  (let ((pos 0)
+        (len (length bytes)))
+    (loop while (< pos len)
+          do (incf pos
+                   ;; Pinned across the retry loop, as TLS-WRITE-ALL's is.
+                   (sb-sys:with-pinned-objects (bytes)
+                     (call-retrying-eintr
+                      (lambda ()
+                        (let ((n (%write fd
+                                         (sb-sys:sap+ (sb-sys:vector-sap bytes) pos)
+                                         (- len pos))))
+                          (if (> n 0)
+                              n
+                              (plain-io-failed fd "write" (get-errno)))))))))))
 
 (defun http-fetch-stream (method url &key headers body on-line)
   "Blocking streaming HTTP(S) fetch.
@@ -822,10 +939,13 @@
 (defun fetch-stream-plain (method host port path headers body on-line)
   "HTTP streaming fetch over plain TCP. Blocks the calling thread for
    the full request/response lifecycle, bounded by *FETCH-TIMEOUT* for
-   each of DNS resolution, TCP connect, and socket-level read/write.
-   DNS uses the shared getent resolver (same as the async path); the
-   TCP connect uses a non-blocking connect + poll(2) so a black-holed
-   peer cannot pin the worker for ~120s under tcp_syn_retries."
+   each of DNS resolution, TCP connect, and each read and write on the
+   socket. DNS uses the shared getent resolver (same as the async path);
+   the TCP connect uses a non-blocking connect + poll(2) so a black-holed
+   peer cannot pin the worker for ~120s under tcp_syn_retries. The request
+   goes out through PLAIN-WRITE-ALL and the response comes back through
+   PLAIN-BYTE-READER, read(2) and write(2) on the descriptor itself, for
+   the reason this section's header gives."
   (multiple-value-bind (ip family)
       (funcall *dns-resolve-blocking-fn* host)
     (unless ip
@@ -835,22 +955,16 @@
                                      'sb-bsd-sockets:inet6-socket)
                                  :type :stream :protocol :tcp)))
       (unwind-protect
-          (progn
-            (set-socket-timeout (socket-fd socket) *fetch-timeout*)
+          (let ((fd (socket-fd socket)))
+            (set-socket-timeout fd *fetch-timeout*)
             (blocking-connect socket ip port *fetch-timeout*)
-            (let ((stream (sb-bsd-sockets:socket-make-stream
-                           socket :input t :output t
-                           :element-type '(unsigned-byte 8)
-                           :buffering :full)))
-              (unwind-protect
-                  (let ((request-bytes (build-outbound-request
-                                        method host path
-                                        :port port
-                                        :headers headers :body body)))
-                    (write-sequence request-bytes stream)
-                    (force-output stream)
-                    (stream-response-lines stream on-line :method method))
-                (close stream))))
+            (plain-write-all fd (build-outbound-request
+                                 method host path
+                                 :port port
+                                 :headers headers :body body))
+            (stream-response-lines nil on-line
+                                   :method method
+                                   :read-fn (plain-byte-reader fd)))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -893,7 +1007,9 @@
    available and a short fill means nothing at all. Every caller loops
    and treats only 0 as terminal, so both work — but a caller that ever
    reads a short fill as EOF would be correct on one source and silently
-   truncating on the other.
+   truncating on the other. Both transports read through a READ-FN,
+   PLAIN-BYTE-READER and SSL-BYTE-READER; a stream is how a test hands
+   this canned bytes.
 
    A READ-FN may also raise, which this function otherwise cannot. That
    is deliberate on the TLS side: SSL-READ-EOF-OR-RAISE answers :EOF for
@@ -1041,9 +1157,9 @@
   "Read COUNT bytes through the buffered reader, splitting into lines.
    Calls ON-LINE per complete line. Returns the number of bytes
    actually consumed — the caller compares against COUNT to detect
-   truncation (EOF before the requested body was delivered, which
-   is indistinguishable on the SBCL stream layer from SO_RCVTIMEO
-   firing mid-stream).
+   truncation, an end of stream before the requested body was
+   delivered. An expired SO_RCVTIMEO is not one of those: the READ-FN
+   raises it as a timeout.
 
    Terminators: CR, LF, CRLF all recognized (WHATWG EventStream
    §9.2). PREV-CR on the reader struct carries the CR-partner state
@@ -1105,9 +1221,10 @@
    Returns the status code.
 
    READ-FN substitutes the byte source and STREAM is then ignored; see
-   READER-FILL for the contract. TLS supplies SSL-BYTE-READER, which is
-   how this function serves both transports and why there is no second
-   copy of it in tls.lisp.
+   READER-FILL for the contract. The plain path supplies
+   PLAIN-BYTE-READER and TLS supplies SSL-BYTE-READER, which is how this
+   function serves both transports and why there is no second copy of it
+   in tls.lisp.
 
    METHOD gates the body-framing discipline: for :HEAD, RFC 7231
    §4.3.2 guarantees an empty body even when the upstream echoes
@@ -1119,11 +1236,12 @@
        terminator never arrives. Same contract as decode-chunked-body
        for the buffered path.
      - content-length (no TE): reader-read-bytes is called with the
-       declared length; a short return means EOF (or SO_RCVTIMEO on
-       the underlying blocking socket) before the full body was
-       delivered — raise so the caller sees a loud error instead of
+       declared length; a short return means EOF before the full body
+       was delivered — raise so the caller sees a loud error instead of
        a silently short stream. This is the plain-HTTP twin of the
        SSL_ERROR_SYSCALL discipline in tls.lisp's ssl-read-eof-or-raise.
+       A read that times out raises from the READ-FN before it gets
+       here.
      - close-delimited (no TE, no CL): by definition the connection
        close IS the end; we cannot distinguish a legitimate end from
        a premature RST without out-of-band framing, so treat clean

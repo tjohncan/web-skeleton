@@ -1814,6 +1814,199 @@
         (check "fetch-stream: every line arrived, in order"
                (nreverse lines) (list "alpha" "beta" "gamma"))))))
 
+(defun %scripted-upstream (listener script &key (read-request t) stop
+                                              (name "scripted-upstream"))
+  "Accept once and play SCRIPT on the connection, then close. Returns the
+   thread.
+
+   SCRIPT is a list of steps: a string is written and flushed at once, a
+   number is that many seconds of silence. READ-REQUEST NIL skips reading
+   the request head, for an upstream that never reads at all; otherwise
+   the head is read to its CRLFCRLF first, as %CANNED-UPSTREAM reads it
+   and for its reason.
+
+   STOP, a cons, ends a silence early once its car is true. A test whose
+   fetch has already given up has no use for the rest of the script, and
+   the suite should not wait it out."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (unwind-protect
+                (progn
+                  (when read-request
+                    (loop for byte = (read-byte st nil nil)
+                          while byte
+                          do (vector-push-extend byte b)
+                          until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b))))
+                  (dolist (step script)
+                    (if (stringp step)
+                        (progn
+                          (write-sequence (sb-ext:string-to-octets
+                                           step :external-format :ascii)
+                                          st)
+                          (force-output st))
+                        (let ((until (+ (get-internal-real-time)
+                                        (* step internal-time-units-per-second))))
+                          (loop until (or (and stop (car stop))
+                                          (>= (get-internal-real-time) until))
+                                do (sleep 0.05))))))
+             (ignore-errors (sb-bsd-sockets:socket-close s))))
+       (error () nil)))
+   :name name))
+
+(defun %call-with-scripted-upstream (script fn &key (read-request t))
+  "Call FN with the port of a listener playing SCRIPT, and tear both down,
+   cutting short whatever silence the script has left once FN returns."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (stop (list nil))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (setf thread (%scripted-upstream listener script
+                                            :read-request read-request
+                                            :stop stop))
+           (funcall fn (nth-value 1 (sb-bsd-sockets:socket-name listener))))
+      (setf (car stop) t)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun %timed (seconds thunk)
+  "Run THUNK on its own thread for at most SECONDS. Returns (VALUES OUTCOME
+   ELAPSED): what THUNK returned, or the text of what it raised, or :HUNG;
+   and the seconds it took. The bound is the test's, so a blocking call
+   that never returns fails a check instead of the run."
+  (let* ((start (get-internal-real-time))
+         (outcome :hung)
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (setf outcome (handler-case (funcall thunk)
+                                    (error (e) (princ-to-string e)))))
+                  :name "timed-call")))
+    (handler-case (sb-thread:join-thread thread :timeout seconds :default nil)
+      (error () nil))
+    (when (sb-thread:thread-alive-p thread)
+      (ignore-errors (sb-thread:terminate-thread thread)))
+    (values outcome
+            (/ (float (- (get-internal-real-time) start))
+               internal-time-units-per-second))))
+
+(defun test-harness-fetch-stream-plain-read-timeout-e2e ()
+  "HTTP-FETCH-STREAM over http:// gives up on an upstream that accepts,
+   takes the request and says nothing, after *FETCH-TIMEOUT*.
+
+   SO_RCVTIMEO is what bounds the read, and it bounds read(2) only. The
+   upstream here closes after six seconds, so a read that waits on
+   anything else finishes then, with a different error, and the elapsed
+   time is what tells the two apart."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, a silent upstream~%")
+  (%call-with-scripted-upstream
+   '(6)
+   (lambda (port)
+     (multiple-value-bind (outcome secs)
+         (%timed 12 (lambda ()
+                      (let ((web-skeleton:*fetch-timeout* 1))
+                        (http-fetch-stream
+                         :get (format nil "http://127.0.0.1:~d/silent" port)
+                         :on-line #'identity))))
+       (check "silent upstream: the fetch raised a read timeout"
+              (and (stringp outcome) (search "read timed out" outcome) t) t)
+       (check "silent upstream: within the timeout, not at the upstream's close"
+              (< secs 4.0) t)))))
+
+(defun test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e ()
+  "HTTP-FETCH-STREAM over http:// hands each line to :ON-LINE as it
+   arrives, not when the response ends.
+
+   Five NDJSON lines a third of a second apart, the shape of a token
+   stream, in both framings a streaming upstream uses. The first line must
+   arrive while the last is still unsent; a reader that waits to fill an
+   8 KiB buffer gets all five at once, at the end."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, lines as they arrive~%")
+  (flet ((paced (framing)
+           (let ((lines (loop for i from 1 to 5
+                              collect (format nil "{\"token\":~d}~c" i #\Newline))))
+             (ecase framing
+               (:close
+                (cons (%crlf "HTTP/1.1 200 OK"
+                             "Content-Type: application/x-ndjson" "")
+                      (loop for line in lines append (list line 0.3))))
+               (:chunked
+                (append
+                 (list (%crlf "HTTP/1.1 200 OK"
+                              "Content-Type: application/x-ndjson"
+                              "Transfer-Encoding: chunked" ""))
+                 (loop for line in lines
+                       append (list (%crlf (format nil "~x" (length line)) line)
+                                    0.3))
+                 (list (%crlf "0" "")))))))
+         (arrivals (port)
+           ;; (SECONDS . LINE) for each line, in the order they came.
+           (let ((start (get-internal-real-time))
+                 (seen nil))
+             (values
+              (%timed 10 (lambda ()
+                           (http-fetch-stream
+                            :get (format nil "http://127.0.0.1:~d/tokens" port)
+                            :on-line (lambda (line)
+                                       (push (cons (/ (float (- (get-internal-real-time)
+                                                                start))
+                                                      internal-time-units-per-second)
+                                                   line)
+                                             seen)))))
+              (reverse seen)))))
+    (dolist (framing '(:close :chunked))
+      (%call-with-scripted-upstream
+       (paced framing)
+       (lambda (port)
+         (multiple-value-bind (status seen) (arrivals port)
+           (check (format nil "~(~a~): the upstream answered" framing) status 200)
+           (check (format nil "~(~a~): all five lines, in order" framing)
+                  (mapcar #'cdr seen)
+                  (loop for i from 1 to 5 collect (format nil "{\"token\":~d}" i)))
+           ;; The last line goes out at 1.2 s, the close at 1.5 s.
+           (check (format nil "~(~a~): the first line came before the last was sent"
+                          framing)
+                  (and seen (< (car (first seen)) 0.9) t)
+                  t)))))))
+
+(defun test-harness-fetch-stream-plain-write-timeout-e2e ()
+  "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
+   the request, after *FETCH-TIMEOUT*.
+
+   The body is larger than both ends' socket buffers together, so the
+   write blocks once they fill. SO_SNDTIMEO bounds write(2) only; the
+   upstream closes after six seconds, and the elapsed time tells a write
+   that timed out from one that waited for the close."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, an upstream that never reads~%")
+  (%call-with-scripted-upstream
+   '(6)
+   (lambda (port)
+     (let ((body (make-array (* 24 1024 1024) :element-type '(unsigned-byte 8)
+                                              :initial-element 97)))
+       (multiple-value-bind (outcome secs)
+           (%timed 12 (lambda ()
+                        (let ((web-skeleton:*fetch-timeout* 1))
+                          (http-fetch-stream
+                           :post (format nil "http://127.0.0.1:~d/sink" port)
+                           :body body
+                           :on-line #'identity))))
+         (check "non-reading upstream: the fetch raised a write timeout"
+                (and (stringp outcome) (search "write timed out" outcome) t) t)
+         (check "non-reading upstream: within the timeout, not at the close"
+                (< secs 4.0) t))))
+   :read-request nil))
+
 (defun test-harness-port-zero-reported ()
   "START-SERVER with :PORT 0 binds an ephemeral port and reports it
    through :ON-LISTEN, and the port it reports is the one that serves.
@@ -4894,6 +5087,9 @@
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-write-backlog-minimum-rejected)
   (test-harness-fetch-stream-plain-e2e)
+  (test-harness-fetch-stream-plain-read-timeout-e2e)
+  (test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e)
+  (test-harness-fetch-stream-plain-write-timeout-e2e)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)
