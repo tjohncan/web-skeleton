@@ -3784,6 +3784,95 @@
                    (logxor (aref payload i) (aref mask (logand i 3)))))
     frame))
 
+(defun test-websocket-read-buffer-gives-back-what-a-frame-grew ()
+  "A WebSocket's read buffer, grown by one large frame, goes back to 4 KiB
+   once the frame is consumed — and a large upgrade request's growth goes
+   at the upgrade.
+
+   The keep-alive reset shrinks an HTTP connection's buffer; nothing
+   shrank a WebSocket's, the connection type that lives longest. One
+   maximal message pinned ~64 KiB for the life of the socket, and a large
+   upgrade request (cookies, auth) could pin more. The control is a frame
+   not yet consumed, whose bytes the buffer must keep."
+  (format t "~%WebSocket: the read buffer gives back what a frame grew~%")
+  (flet ((conn-holding (bytes &optional (size 65550))
+           ;; A :WEBSOCKET connection whose read buffer has grown to SIZE and
+           ;; holds BYTES, as one that has just read them would.
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :websocket :last-active 0))
+                 (buf (make-array size :element-type '(unsigned-byte 8))))
+             (replace buf bytes)
+             (setf (web-skeleton::connection-read-buf conn) buf
+                   (web-skeleton::connection-read-pos conn) (length bytes))
+             conn)))
+    (let* ((payload (make-array 60000 :element-type '(unsigned-byte 8)
+                                      :initial-element 120))
+           (frame (make-masked-frame t 2 payload))
+           (seen nil))
+      (let ((conn (conn-holding frame)))
+        (web-skeleton::websocket-on-read
+         conn (lambda (c f) (declare (ignore c)) (setf seen (length (ws-frame-payload f))) nil))
+        (check "control: the 60000-byte message was delivered" seen 60000)
+        (check "the buffer is back to 4 KiB once the frame is consumed"
+               (length (web-skeleton::connection-read-buf conn)) 4096))
+      (let ((conn (conn-holding (subseq frame 0 50000))))
+        (web-skeleton::websocket-on-read
+         conn (lambda (c f) (declare (ignore c f)) nil))
+        (check "control: a frame still arriving keeps its bytes"
+               (list (web-skeleton::connection-read-pos conn)
+                     (>= (length (web-skeleton::connection-read-buf conn)) 50000))
+               (list 50000 t)))))
+  ;; The upgrade. A request carrying 12 KiB of headers — two, each under
+  ;; *MAX-HEADER-LINE-LENGTH* — grows the buffer past 4 KiB; an :ON-TICK
+  ;; hook reads the upgraded connection's buffer length from the worker
+  ;; that owns it.
+  (let ((sizes nil)
+        (lock (sb-thread:make-mutex :name "ws-buffer")))
+    (with-test-server
+        (:handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (c f) (declare (ignore c f)) nil)
+         :on-tick (lambda (id)
+                    (declare (ignore id))
+                    (maphash (lambda (fd conn)
+                               (declare (ignore fd))
+                               (when (eq (web-skeleton::connection-state conn) :websocket)
+                                 (sb-thread:with-mutex (lock)
+                                   (pushnew (length (web-skeleton::connection-read-buf conn))
+                                            sizes))))
+                             web-skeleton::*connections*)))
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (crlf "GET /ws HTTP/1.1" "Host: localhost"
+                       "Upgrade: websocket" "Connection: Upgrade"
+                       "Sec-WebSocket-Version: 13"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+                       (concatenate 'string "X-A: "
+                                    (make-string (* 6 1024) :initial-element #\a))
+                       (concatenate 'string "X-B: "
+                                    (make-string (* 6 1024) :initial-element #\b)))
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (read-until-bounded stream :seconds 3
+                                          :until (lambda (buf fill)
+                                                   (declare (ignore buf))
+                                                   (>= fill 12)))
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* 3 internal-time-units-per-second))))
+                 (loop until (or (sb-thread:with-mutex (lock) sizes)
+                                 (> (get-internal-real-time) deadline))
+                       do (sleep 0.05)))
+               (check "a large upgrade request's buffer goes back to 4 KiB"
+                      (sb-thread:with-mutex (lock) sizes)
+                      '(4096)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
+
 (defun test-websocket-fragmentation ()
   (format t "~%WebSocket Fragmentation~%")
 
@@ -11118,6 +11207,7 @@
   (test-ws-send-refuses-a-foreign-connection)
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
+  (test-websocket-read-buffer-gives-back-what-a-frame-grew)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)

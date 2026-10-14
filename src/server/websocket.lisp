@@ -576,6 +576,10 @@
           ;; No complete frame — shift unconsumed bytes to start of buffer
           (when (> pos 0)
             (ws-shift-buffer conn buf pos end))
+          ;; and give back a buffer one large frame grew, once what is
+          ;; left fits the default: a WebSocket lives for hours, and
+          ;; nothing else shrinks it. See CONNECTION-SHRINK-READ-BUF.
+          (connection-shrink-read-buf conn)
           (return))
         ;; Advance past this frame
         (incf pos consumed)

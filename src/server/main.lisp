@@ -1575,23 +1575,11 @@
                       (replace (connection-read-buf conn)
                                (connection-read-buf conn)
                                :start1 0 :start2 consumed :end2 buffered))
-                    ;; Shrink the read buffer back to the default 4 KiB
-                    ;; when a prior large body grew it and the shifted
-                    ;; pipelined bytes fit in the default. 10k idle
-                    ;; keep-alives × 1 MiB grown buffers would otherwise
-                    ;; sit on ~10 GiB after a burst of large POSTs.
-                    ;; Heuristic: a uniform-large-POST workload will
-                    ;; shrink-then-grow each cycle — fine for bursty
-                    ;; traffic (the common case), measurable if traffic
-                    ;; happens to be uniform-large.
-                    (let ((buf (connection-read-buf conn)))
-                      (when (and (> (length buf) 4096)
-                                 (< extra 4096))
-                        (let ((fresh (make-array 4096
-                                                  :element-type '(unsigned-byte 8))))
-                          (when (> extra 0)
-                            (replace fresh buf :end2 extra))
-                          (setf (connection-read-buf conn) fresh))))
+                    ;; Back to the default 4 KiB when a prior large body
+                    ;; grew the buffer and the shifted pipelined bytes fit
+                    ;; in the default; see CONNECTION-SHRINK-READ-BUF.
+                    (setf (connection-read-pos conn) (max extra 0))
+                    (connection-shrink-read-buf conn)
                     (connection-reset-write conn)
                     (setf (connection-read-pos conn) (max extra 0)
                           (connection-request conn) nil
@@ -1633,12 +1621,16 @@
                       ;; two otherwise-identical resets disagreed on.
                       ;; WEBSOCKET-UPGRADE-P only looks for the upgrade
                       ;; token, so `Connection: close, Upgrade` is a legal
-                      ;; upgrade that left the flag set for the life of the
-                      ;; socket. Dead state today — nothing in :WEBSOCKET
+                      ;; upgrade that would leave the flag set for the life
+                      ;; of the socket. Dead state — nothing in :WEBSOCKET
                       ;; reads it — which is precisely why it would be read
                       ;; wrong the first time something does.
                       (connection-close-after-p conn) nil
-                      (connection-state conn) :websocket))
+                      (connection-state conn) :websocket)
+                ;; A WebSocket outlives any request, so a buffer a large
+                ;; upgrade request grew goes back to 4 KiB now rather than
+                ;; for the socket's life. See CONNECTION-SHRINK-READ-BUF.
+                (connection-shrink-read-buf conn))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+))
               ;; Edge-triggered: buffered frame data from the upgrade

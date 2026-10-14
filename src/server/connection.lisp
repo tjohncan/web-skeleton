@@ -550,6 +550,28 @@
     (t
      (+ *max-body-size* (request-head-budget)))))
 
+(defun connection-shrink-read-buf (conn)
+  "Swap CONN's read buffer for a fresh 4 KiB one when it has grown past
+   that and holds less, carrying over the bytes it holds.
+
+   A buffer grows to fit what arrives and nothing shrinks it, so a
+   connection that once received something large holds that much for as
+   long as it lives. 10k idle keep-alives with 1 MiB buffers would sit on
+   ~10 GiB, and the long-lived connection is the WebSocket: a day by
+   default under *WS-IDLE-TIMEOUT*, so 10k sockets that have each sent one
+   maximal message hold ~640 MiB against ~40 MiB at 4 KiB. Called where a
+   connection settles: the keep-alive reset, the upgrade to a WebSocket,
+   and a WebSocket read that has consumed what it could. A uniform stream
+   of large requests or frames shrinks and regrows each time — fine for
+   bursty traffic, the common case, and measurable when it is not."
+  (let ((buf (connection-read-buf conn))
+        (held (connection-read-pos conn)))
+    (when (and (> (length buf) 4096) (< held 4096))
+      (let ((fresh (make-array 4096 :element-type '(unsigned-byte 8))))
+        (when (> held 0)
+          (replace fresh buf :end2 held))
+        (setf (connection-read-buf conn) fresh)))))
+
 (defun connection-read-into (conn buffer start max-bytes)
   "Read from CONN's transport into BUFFER[START..START+MAX-BYTES).
    Returns bytes read, :AGAIN if it would block, :EOF at end of stream,
