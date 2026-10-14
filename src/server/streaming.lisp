@@ -96,9 +96,13 @@
 ;;; The terminator's lifecycle, decided here because this is the function
 ;;; that decides there is no Content-Length:
 ;;;
-;;;   The framework emits CHUNKED-TERMINATOR on stream teardown, on every
-;;;   path out — normal end, handler error, connection reaped. The app
-;;;   never writes it and is given no way to.
+;;;   The framework emits CHUNKED-TERMINATOR when a stream ends normally,
+;;;   through STREAM-CLOSE, and on no other path. The app never writes it
+;;;   and is given no way to. A terminator is a claim that the body is
+;;;   complete, so every other way out — application code raising, the
+;;;   connection reaped, a relayed upstream failing, the server draining —
+;;;   closes the connection without one, and the peer reads the truncation
+;;;   that actually happened.
 ;;;
 ;;;   A stream whose terminator was not written may not return its
 ;;;   connection to :READ-HTTP. If the terminator cannot be emitted at all
@@ -311,6 +315,8 @@
                                :UPSTREAM-FAILED when a FETCH-INTO
                                relaying into it failed, or its close
                                could not be written,
+                               :ERROR when ON-OPEN raised after the
+                               head went out,
                                :SHUTDOWN on server drain. Release
                                whatever the app registered here.
    KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See

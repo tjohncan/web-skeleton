@@ -9432,6 +9432,141 @@
                           reached)
                     '(:returned t)))))))
 
+(defun test-a-raise-after-the-response-began ()
+  "Application code that raises after its response has begun gets the
+   connection closed, not a second response.
+
+   A stream's ON-OPEN runs after the head is queued, and on an idle socket
+   the head — and whatever ON-OPEN sent — is on the wire by the time it
+   raises. Answering that with a 500 put a whole second response inside
+   the first one's chunked body: a status line where a reader expects a
+   chunk-size, which a proxy reports as an invalid chunked response, and
+   two responses counted for one request.
+
+   The WebSocket half is the same rule from the other side: a raise outside
+   the ws-handler's own catch put an HTTP 500 among the frames. Provoked by
+   making the read path raise once on the established WebSocket, since a
+   ws-handler's own raise is caught before it gets that far.
+
+   Controls: a handler that raises before answering still gets its 500,
+   and a stream that ends normally still gets its terminator."
+  (format t "~%a raise after the response began: closed, not answered twice~%")
+  (let ((reasons nil)
+        (armed nil)
+        (lock (sb-thread:make-mutex :name "begun-response")))
+    (flet ((ascii (s) (sb-ext:string-to-octets s :external-format :ascii)))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (cond
+                 ((string= path "/raises-midway")
+                  (make-stream-response
+                   :on-open (lambda (c)
+                              (stream-send c (ascii "first part"))
+                              (error "deliberate: the producer failed after ~
+                                      its first send"))
+                   :on-close (lambda (c reason)
+                               (declare (ignore c))
+                               (sb-thread:with-mutex (lock)
+                                 (push reason reasons)))))
+                 ((string= path "/ends-normally")
+                  (make-stream-response
+                   :on-open (lambda (c)
+                              (stream-send c (ascii "whole"))
+                              (stream-close c))))
+                 ((string= path "/raises-first")
+                  (error "deliberate: the handler failed before answering"))
+                 ((string= path "/ws") :upgrade)
+                 (t (make-text-response 200 "ok")))))
+           :ws-handler (lambda (conn frame)
+                         (declare (ignore conn frame))
+                         nil))
+        (flet ((raw-get (path)
+                 ;; Everything the server sends for PATH, read to the close.
+                 (let* ((sock (connect-to-test-server))
+                        (stream (sb-bsd-sockets:socket-make-stream
+                                 sock :input t :output t
+                                 :element-type '(unsigned-byte 8))))
+                   (unwind-protect
+                        (progn
+                          (write-sequence
+                           (ascii (crlf (format nil "GET ~a HTTP/1.1" path)
+                                        "Host: localhost" "Connection: close"))
+                           stream)
+                          (force-output stream)
+                          (multiple-value-bind (buf reason)
+                              (read-until-bounded stream :seconds 3)
+                            (values (sb-ext:octets-to-string
+                                     buf :external-format :latin-1)
+                                    reason)))
+                     (ignore-errors (close stream))
+                     (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+               (status-lines (text)
+                 (loop with start = 0
+                       for i = (search "HTTP/1.1 " text :start2 start)
+                       while i count t do (setf start (1+ i))))
+               (ends-with-terminator-p (text)
+                 (let ((n (length text)))
+                   (and (>= n 5)
+                        (string= (subseq text (- n 5))
+                                 (coerce '(#\0 #\Return #\Newline
+                                           #\Return #\Newline)
+                                         'string))))))
+          (multiple-value-bind (text reason) (raw-get "/raises-midway")
+            (check "midway: the head and the first chunk went out"
+                   (and (search "HTTP/1.1 200" text) (search "first part" text) t)
+                   t)
+            (check "midway: no second status line follows them"
+                   (status-lines text) 1)
+            (check "midway: and no terminator claims the body complete"
+                   (ends-with-terminator-p text) nil)
+            (check "midway: the peer saw the connection close" reason :eof))
+          (check "midway: on-close heard :error, once"
+                 (sb-thread:with-mutex (lock) reasons) '(:error))
+          (check "control: a handler raising before answering gets its 500"
+                 (attempt (values (test-http-request :get "/raises-first")))
+                 500)
+          (check "control: a stream that ends normally gets its terminator"
+                 (ends-with-terminator-p (values (raw-get "/ends-normally")))
+                 t)
+          ;; The WebSocket half.
+          (let* ((sock (connect-to-test-server))
+                 (stream (sb-bsd-sockets:socket-make-stream
+                          sock :input t :output t
+                          :element-type '(unsigned-byte 8))))
+            (unwind-protect
+                 (progn
+                   ;; Raises after a real read that found the frame, not
+                   ;; instead of it: bytes left unread in the kernel make
+                   ;; close(2) send RST, which can destroy what was sent
+                   ;; before it, and the check below has to see what was
+                   ;; sent. The read the worker makes as the upgrade
+                   ;; completes finds nothing and answers :CONTINUE.
+                   (sb-int:encapsulate
+                    'web-skeleton::connection-on-read 'raise-once
+                    (lambda (f conn)
+                      (let ((verdict (funcall f conn)))
+                        (when (and armed (eq verdict :websocket))
+                          (setf armed nil)
+                          (error "deliberate: the read path raised on a ~
+                                  WebSocket"))
+                        verdict)))
+                   (check "ws: the upgrade completes"
+                          (not (null (search "101" (%ws-client-upgrade stream))))
+                          t)
+                   (setf armed t)
+                   (write-sequence (%ws-client-frame 1 "hello") stream)
+                   (force-output stream)
+                   (check "ws: the raise closes the WebSocket with nothing sent"
+                          (multiple-value-bind (buf reason)
+                              (read-until-bounded stream :seconds 3)
+                            (list reason (fill-pointer buf)))
+                          '(:eof 0)))
+              (sb-int:unencapsulate 'web-skeleton::connection-on-read 'raise-once)
+              (ignore-errors (close stream))
+              (ignore-errors (sb-bsd-sockets:socket-close sock)))))))))
+
 (defun test-on-tick-validated-at-boot ()
   "START-SERVER refuses a non-function :ON-TICK before it binds.
 
@@ -10463,6 +10598,7 @@
   (test-serious-conditions-spare-the-hook)
   (test-serious-conditions-at-the-backstop)
   (test-serious-conditions-at-the-callback-sites)
+  (test-a-raise-after-the-response-began)
   (test-on-tick-validated-at-boot)
   (test-map-worker-websockets-visits-only-websockets)
   (test-map-worker-websockets-skips-what-a-callback-closed)

@@ -1117,14 +1117,52 @@
             ;; queued and the ordinary write path takes it from here.
             (logior +epollout+ +epollet+)))))))
 
+(defun answer-error-or-close (conn epoll-fd status)
+  "Answer CONN's request with an error STATUS and close after it — or, when
+   the connection is past the point where an answer can go, close it now.
+
+   An answer is owed only while the request is still being read or
+   dispatched: :READ-HTTP or :READ-BODY. Past that, the connection has
+   committed to something — a stream's head is on the wire, a 101 has
+   switched protocols, a response is queued, a fetch is parked — and a
+   second response would land inside or behind the first: a status line
+   where a reader expects a chunk-size, or HTTP among WebSocket frames, read
+   downstream as more of the first. Closing is the one answer nothing can
+   misread. The peer sees the response end short, a stream's ON-CLOSE hears
+   :ERROR, and a parked fetch's outbound is closed with the connection.
+
+   The answer goes through STRIP-BODY-FOR-HEAD, so a HEAD request gets its
+   error without a body. That needs CONNECTION-REQUEST, which is set only
+   once PARSE-REQUEST-BYTES succeeds, so for a parse error it is usually a
+   no-op. The answer can itself fail — CONNECTION-QUEUE-WRITE refuses to
+   put it behind anything already queued — and then the connection is
+   closed without one."
+  (if (member (connection-state conn) '(:read-http :read-body))
+      (handler-case
+          (let ((resp (make-error-response status)))
+            (set-response-header resp "connection" "close")
+            (connection-queue-write conn (strip-body-for-head
+                                          (format-response resp) conn))
+            (setf (connection-state conn) :write-response
+                  (connection-close-after-p conn) t)
+            (epoll-modify epoll-fd (connection-fd conn)
+                          (logior +epollout+ +epollet+)))
+        (error ()
+          (close-connection conn epoll-fd)))
+      (progn
+        (log-debug "fd ~d: closing in state ~a rather than answering ~d — ~
+                    its response has begun" (connection-fd conn)
+                    (connection-state conn) status)
+        (close-connection conn epoll-fd :error))))
+
 (defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection.
    State dispatch is permissive: a stale EPOLLIN for a connection
    whose state moved to :write-response / :ws-upgrade / :closing /
    :sending-100-continue earlier in the same epoll batch silently
-   no-ops instead of raising into the outer handler-case and
-   queueing a 500 over the legitimate response that's already in
-   the write buffer. The race is reachable when one event in a
+   no-ops instead of raising into the outer handler-case, which
+   would close the connection with the legitimate response still
+   in the write buffer. The race is reachable when one event in a
    batch completes a fetch (setting an inbound's state to
    :write-response) and a later event in the same batch is a
    stale EPOLLIN for that inbound."
@@ -1361,7 +1399,7 @@
         (:awaiting nil)
         ;; Stale EPOLLIN for a state that isn't currently reading.
         ;; Silently ignored so a late notification can't escalate
-        ;; into a 500 via the handler-case fallback below.
+        ;; into a close via the handler-case fallback below.
         (otherwise
          (log-debug "stale EPOLLIN fd ~d in state ~a — ignoring"
                     (connection-fd conn) (connection-state conn))))
@@ -1373,23 +1411,9 @@
       ;; knew better (413 for a body over the cap, 414 for a request line
       ;; over its cap, 431 for headers, 501 for a method or transfer
       ;; coding we do not implement, 505 for a version we do not speak).
-      ;; Runs through STRIP-BODY-FOR-HEAD for symmetry with the 500 path
-      ;; below — typically a no-op here because CONNECTION-REQUEST isn't
-      ;; set until PARSE-REQUEST-BYTES fully succeeds, but harmless and
-      ;; correct on any future path that raises HTTP-PARSE-ERROR after
-      ;; the request is parsed.
-      (handler-case
-          (let ((resp (make-error-response (http-parse-error-status e))))
-            (set-response-header resp "connection" "close")
-            (let ((err-bytes (strip-body-for-head
-                              (format-response resp) conn)))
-              (connection-queue-write conn err-bytes)
-              (setf (connection-state conn) :write-response
-                    (connection-close-after-p conn) t)
-              (epoll-modify epoll-fd (connection-fd conn)
-                           (logior +epollout+ +epollet+))))
-        (error ()
-          (close-connection conn epoll-fd))))
+      ;; An application can raise one too — URL-DECODE does, on bytes
+      ;; that are not UTF-8 — including after its response has begun.
+      (answer-error-or-close conn epoll-fd (http-parse-error-status e)))
     ;; SERIOUS-CONDITION, not ERROR. CL has serious conditions that are not
     ;; errors, and SBCL signals two kinds of them into ordinary code:
     ;;
@@ -1440,19 +1464,10 @@
         (close-connection conn epoll-fd :disconnected)
         (return-from handle-client-read nil))
       (log-warn "error fd ~d: ~a" (connection-fd conn) e)
-      ;; Send 500 before closing so the client gets a proper HTTP response
-      (handler-case
-          (let ((resp (make-error-response 500)))
-            (set-response-header resp "connection" "close")
-            (let ((err-bytes (strip-body-for-head
-                              (format-response resp) conn)))
-              (connection-queue-write conn err-bytes)
-              (setf (connection-state conn) :write-response
-                    (connection-close-after-p conn) t)
-              (epoll-modify epoll-fd (connection-fd conn)
-                           (logior +epollout+ +epollet+))))
-        (error ()
-          (close-connection conn epoll-fd))))))
+      ;; A 500 before closing, so the client gets a proper HTTP response —
+      ;; unless one has already begun, which is where a stream's ON-OPEN
+      ;; raising after its first send lands.
+      (answer-error-or-close conn epoll-fd 500))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handle writable event on a client fd
