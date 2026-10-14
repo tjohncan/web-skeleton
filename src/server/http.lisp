@@ -1055,6 +1055,85 @@
                    (cdr cache) bytes)
              bytes))))))
 
+(defun status-without-body-p (status)
+  "True for a status whose response ends at its blank line whatever its
+   headers say: 1xx, 204 and 304 (RFC 9112 §6.3). A reader takes any byte
+   after that head as the start of the next response."
+  (or (<= 100 status 199) (= status 204) (= status 304)))
+
+(defun response-framing-headers (status body-bytes headers head-only-p)
+  "HEADERS with the Content-Length FORMAT-RESPONSE will send, after
+   refusing any framing the caller set that the bytes would contradict.
+
+   Framing is the serializer's, as it is for FORMAT-STREAMING-HEAD and
+   BUILD-OUTBOUND-REQUEST. The body goes out whole, so the only framing
+   this response can have is the length of BODY-BYTES, and two opinions
+   about where a body ends are the disagreement this codebase treats as
+   its threat model: the proxy, cache or client reading next takes the
+   wrong one, and on a keep-alive connection that is a desync. The
+   likeliest way in needs no exotic header, only an upstream's
+   Transfer-Encoding or Content-Length copied along with the rest of its
+   header alist by a relay whose :THEN received the body already decoded.
+
+     Transfer-Encoding   refused, always.
+     Content-Length      accepted when it says what the bytes say;
+                         refused when it contradicts them, or appears
+                         twice. Without a body it is accepted for HEAD,
+                         where it describes the body a GET would carry.
+     1xx and 204         no body, and no Content-Length (RFC 9110 §8.6).
+     304                 no body. A caller's Content-Length is kept: there
+                         it describes the representation, not this
+                         response (RFC 9110 §8.6).
+
+   A body on a status that cannot carry one is refused rather than
+   dropped. Bytes the caller meant to send and the framework quietly
+   discarded are a disagreement too, one nobody would see. Every refusal
+   is an error, and the error is the ordinary 500."
+  (when (assoc "transfer-encoding" headers :test #'string-equal)
+    (error "format-response: the caller set Transfer-Encoding. The body ~
+            goes out whole, framed by Content-Length, and framing is the ~
+            framework's; a relay copying an upstream's headers has to ~
+            leave the upstream's framing behind"))
+  (let ((declared (remove-if-not (lambda (h)
+                                   (string-equal (car h) "content-length"))
+                                 headers))
+        (body-length (if body-bytes (length body-bytes) 0)))
+    (when (rest declared)
+      (error "format-response: the caller set Content-Length ~d times"
+             (length declared)))
+    (let ((declared-length
+            (when declared
+              ;; 1*DIGIT, as the ingress parser requires of a request; a
+              ;; sign or a space inside would pass PARSE-INTEGER and fail
+              ;; a strict reader downstream.
+              (let ((value (string-trim '(#\Space #\Tab) (cdr (first declared)))))
+                (if (and (plusp (length value)) (every #'digit-char-p value))
+                    (parse-integer value)
+                    (error "format-response: the caller's Content-Length ~s ~
+                            is not a length" (cdr (first declared))))))))
+      (cond
+        ((status-without-body-p status)
+         (when (plusp body-length)
+           (error "format-response: status ~d cannot carry a body, and ~d ~
+                   byte~:p were given. The response ends at its blank ~
+                   line, so they would be read as the start of the next one"
+                  status body-length))
+         (when (and declared (/= status 304))
+           (error "format-response: status ~d must not carry ~
+                   Content-Length" status))
+         headers)
+        (declared
+         (unless (or (= declared-length body-length)
+                     (and head-only-p (null body-bytes)))
+           (error "format-response: the caller's Content-Length is ~d but ~
+                   the body is ~d byte~:p" declared-length body-length))
+         headers)
+        ;; The length goes on even when it is zero: a response with no
+        ;; framing at all is read to the end of the connection, and a
+        ;; keep-alive client would wait for an end that never comes.
+        (t (cons (cons "content-length" (write-to-string body-length))
+                 headers))))))
+
 (defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
 
@@ -1094,7 +1173,11 @@
    back out — two large allocations for the cold HEAD path.
    Passing :HEAD-ONLY-P T encodes the body once for length, then
    skips emission. The byte-vector path (static files) still goes
-   through STRIP-BODY-FOR-HEAD post-serialize."
+   through STRIP-BODY-FOR-HEAD post-serialize.
+
+   Framing is decided by RESPONSE-FRAMING-HEADERS, which refuses a
+   caller's Transfer-Encoding, a Content-Length the body contradicts,
+   and a body on a status that cannot carry one."
   (let ((status (http-response-status response)))
     ;; Validate status up front so an out-of-range value short-
     ;; circuits before the body encode + header build below.
@@ -1112,24 +1195,9 @@
                          (string (sb-ext:string-to-octets
                                   body :external-format :utf-8))
                          ((simple-array (unsigned-byte 8) (*)) body)))
-           (headers (http-response-headers response))
-           (headers (cond
-                     ;; Body present — add CL if not already set
-                     ((and body-bytes
-                           (not (assoc "content-length" headers
-                                       :test #'string-equal)))
-                      (cons (cons "content-length"
-                                  (write-to-string (length body-bytes)))
-                            headers))
-                     ;; No body, status requires CL:0 to prevent
-                     ;; keep-alive clients from waiting forever
-                     ((and (null body-bytes)
-                           (not (or (<= 100 status 199)
-                                    (= status 204) (= status 304)))
-                           (not (assoc "content-length" headers
-                                       :test #'string-equal)))
-                      (cons (cons "content-length" "0") headers))
-                     (t headers)))
+           (headers (response-framing-headers
+                     status body-bytes (http-response-headers response)
+                     head-only-p))
            ;; Stamp the Connection header from the hint without touching
            ;; the caller's struct. App-set Connection header wins — if
            ;; the handler already put one in the alist, the hint is
@@ -1213,7 +1281,18 @@
     resp))
 
 (defun make-error-response (status &optional message)
-  "Build a plain-text error response."
-  (let ((body (or message
-                  (format nil "~d ~a" status (status-reason status)))))
-    (make-text-response status body)))
+  "Build a plain-text error response: MESSAGE, or the status and its
+   reason, as the body.
+
+   A status that cannot carry a body — 1xx, 204, 304 — gets a bare
+   response instead, with no body and no Content-Type. FORMAT-RESPONSE
+   refuses a body there, and a Content-Type on a 304 is worse than
+   useless: a cache that revalidates with it replaces the stored
+   response's type with text/plain. A MESSAGE given for one of those
+   statuses is a body all the same, and is refused when the response is
+   sent."
+  (if (and (null message) (status-without-body-p status))
+      (make-http-response :status status)
+      (make-text-response status (or message
+                                     (format nil "~d ~a" status
+                                             (status-reason status))))))

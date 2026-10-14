@@ -754,6 +754,17 @@ the cleanup sentinel passes `NIL`. Answering `200` with a count from a
 fetch that never completed is the failure this section was rewritten to
 stop describing.
 
+**Copying an upstream's headers onto your response takes a filter.**
+`:then` receives the body decoded and whole, while `headers` still
+describes it the way the upstream sent it: `Transfer-Encoding: chunked`,
+or a `Content-Length` for bytes that are no longer there. `format-response`
+refuses a caller's `Transfer-Encoding`, and a `Content-Length` the body
+contradicts, so a relay that copies everything is answered `500`. Leave out
+the framing headers (`transfer-encoding`, `content-length`) and the
+hop-by-hop ones (`connection`, `keep-alive`, `te`, `trailer`, `upgrade`,
+`proxy-connection`, and any header the upstream's `Connection` names), and
+copy the rest.
+
 **To forward the bytes onward, use `fetch-into`.** A handler-returned
 continuation feeds the handler that returned it and nothing else. A
 `:streaming` connection or a WebSocket owns its own write path, and

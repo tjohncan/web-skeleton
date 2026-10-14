@@ -170,7 +170,7 @@
         (headers (http-response-headers response)))
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
-    (when (or (<= 100 status 199) (= status 204) (= status 304))
+    (when (status-without-body-p status)
       (error "streaming response: status ~d cannot carry a body" status))
     (when (assoc "content-length" headers :test #'string-equal)
       (error "streaming response: caller set Content-Length; a stream ~

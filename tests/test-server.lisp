@@ -592,6 +592,166 @@
 ;;; HTTP response builder tests
 ;;; ---------------------------------------------------------------------------
 
+(defun test-format-response-owns-framing ()
+  "FORMAT-RESPONSE sends only framing its bytes agree with.
+
+   A caller's Transfer-Encoding beside the computed Content-Length, a
+   caller's Content-Length that the body contradicts, a body on a 1xx, 204
+   or 304: each is two answers to where the response ends, and the reader
+   that comes next on a keep-alive connection takes one of them. Each is
+   refused. The controls are the shapes that agree with themselves and
+   must keep working."
+  (format t "~%format-response: framing is the serializer's~%")
+  (labels ((serialize (resp &rest keys)
+             (handler-case (sb-ext:octets-to-string
+                            (apply #'format-response resp keys)
+                            :external-format :utf-8)
+               (error () :refused)))
+           (resp (status &key body headers)
+             (web-skeleton::make-http-response :status status :body body
+                                               :headers headers))
+           (has (text needle)
+             (and (stringp text) (search needle text :test #'char-equal) t))
+           (count-matches (needle text)
+             (loop with start = 0
+                   for i = (search needle text :start2 start :test #'char-equal)
+                   while i count t do (setf start (1+ i)))))
+    ;; Refused.
+    (check "a caller's Transfer-Encoding is refused"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("Transfer-Encoding" . "chunked"))))
+           :refused)
+    (check "a caller's Content-Length the body contradicts is refused"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "4"))))
+           :refused)
+    (check "two caller Content-Lengths are refused, even agreeing ones"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "5")
+                                           ("Content-Length" . "5"))))
+           :refused)
+    (check "a Content-Length with a sign is not a length"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "+5"))))
+           :refused)
+    (check "a bodiless GET answer cannot declare a length"
+           (serialize (resp 200 :headers '(("content-length" . "1234"))))
+           :refused)
+    (check "a 204 with a body is refused"
+           (serialize (make-text-response 204 "gone")) :refused)
+    (check "a 304 with a body is refused"
+           (serialize (make-text-response 304 "stale")) :refused)
+    (check "a 204 cannot declare a length"
+           (serialize (resp 204 :headers '(("content-length" . "0"))))
+           :refused)
+    ;; Accepted, as they agree.
+    (let ((text (serialize (resp 200 :body "hello"
+                                     :headers '(("content-length" . "5"))))))
+      (check "a caller's Content-Length that agrees is sent once"
+             (and (has text "content-length: 5")
+                  (= 1 (count-matches "content-length" text)))
+             t))
+    (check "a HEAD answer with no body may declare the GET's length"
+           (has (serialize (resp 200 :headers '(("content-length" . "1234")))
+                           :head-only-p t)
+                "content-length: 1234")
+           t)
+    (check "a 304 keeps a caller's Content-Length and sends no body"
+           (let ((text (serialize (resp 304 :headers '(("content-length" . "1234"))))))
+             (and (has text "content-length: 1234")
+                  (string= (subseq text (- (length text) 4))
+                           (coerce '(#\Return #\Newline #\Return #\Newline) 'string))))
+           t)
+    (check "a 204 with an empty body goes out with no Content-Length"
+           (has (serialize (make-text-response 204 "")) "content-length")
+           nil)
+    ;; The framework's own constructor, the obvious way to write these.
+    (dolist (status '(100 204 304))
+      (let ((text (serialize (make-error-response status))))
+        (check (format nil "make-error-response ~d: sent, ending at its blank line" status)
+               (and (stringp text)
+                    (= (+ (search (coerce '(#\Return #\Newline #\Return #\Newline)
+                                          'string)
+                                  text)
+                          4)
+                       (length text)))
+               t)
+        (check (format nil "make-error-response ~d: no Content-Length, no Content-Type"
+                       status)
+               (list (has text "content-length") (has text "content-type"))
+               '(nil nil))))
+    (check "make-error-response 404 still carries its text"
+           (has (serialize (make-error-response 404)) "404 Not Found") t)))
+
+(defun test-bodiless-statuses-on-the-wire ()
+  "A 304 from MAKE-ERROR-RESPONSE leaves a kept-alive connection where the
+   next response starts, and a relay that copies an upstream's framing
+   headers is answered 500 rather than sent with two framings.
+
+   The 304 is the obvious way to write one, and it carried a default body:
+   a reader honouring 304 framing took that body as the start of the next
+   response. The relay copies the upstream's Transfer-Encoding onto a body
+   :THEN received already decoded, which went out beside the computed
+   Content-Length."
+  (format t "~%bodiless statuses and copied framing, on the wire~%")
+  (let ((upstream-port nil))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (let ((path (http-request-path req)))
+             (cond
+               ((string= path "/304") (make-error-response 304))
+               ((string= path "/chunky")
+                (make-stream-response
+                 :on-open (lambda (c)
+                            (stream-send c (sb-ext:string-to-octets
+                                            "hello" :external-format :ascii))
+                            (stream-close c))))
+               ((string= path "/relay")
+                (http-fetch :get (format nil "http://127.0.0.1:~d/chunky"
+                                         upstream-port)
+                            :then (lambda (status headers body)
+                                    (let ((r (make-bytes-response status body)))
+                                      (dolist (h headers)
+                                        (set-response-header r (car h) (cdr h)))
+                                      r))))
+               (t (make-text-response 200 "ok"))))))
+      (setf upstream-port *test-port*)
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (write-sequence (sb-ext:string-to-octets
+                                (concatenate 'string
+                                             (crlf "GET /304 HTTP/1.1" "Host: x")
+                                             (crlf "GET /ok HTTP/1.1" "Host: x"
+                                                   "Connection: close"))
+                                :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (let* ((text (sb-ext:octets-to-string
+                             (read-until-bounded stream :seconds 3)
+                             :external-format :latin-1))
+                      (blank (search (coerce '(#\Return #\Newline #\Return #\Newline)
+                                             'string)
+                                     text)))
+                 (check "pipelined: the 304 came first"
+                        (and (search "HTTP/1.1 304" text) (zerop (search "HTTP/1.1 304" text)) t)
+                        t)
+                 (check "pipelined: the next response starts at the 304's blank line"
+                        (and blank
+                             (eql (search "HTTP/1.1 200" text :start2 (+ blank 4))
+                                  (+ blank 4)))
+                        t)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close sock))))
+      (multiple-value-bind (status headers) (test-http-request :get "/relay")
+        (check "relay copying the upstream's Transfer-Encoding: answered 500"
+               status 500)
+        (check "relay: no Transfer-Encoding reached the client"
+               (assoc "transfer-encoding" headers :test #'string-equal) nil)))))
+
 (defun test-http-response ()
   (format t "~%HTTP Response~%")
 
@@ -10531,6 +10691,8 @@
   (test-http-date)
   (test-http-date-cache)
   (test-http-response)
+  (test-format-response-owns-framing)
+  (test-bodiless-statuses-on-the-wire)
   (test-cookie-builder)
   (test-fetch)
   (test-dns)
