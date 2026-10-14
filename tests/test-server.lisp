@@ -9749,6 +9749,79 @@
               (ignore-errors (close stream))
               (ignore-errors (sb-bsd-sockets:socket-close sock)))))))))
 
+(defun test-a-worker-crash-closes-its-streams-with-on-close ()
+  "A stream on a worker that crashes hears ON-CLOSE, once, with :ERROR.
+
+   ON-CLOSE fires exactly once however the stream ends, and applications
+   release whatever they registered for a stream there — a subscriber set,
+   a fan-out list. RUN-WORKER's crash cleanup closed every client
+   connection with the bare CONNECTION-CLOSE, which does not notify, so a
+   crash left every stream on that worker registered for good.
+
+   The crash is real: the worker is interrupted with an error while idle,
+   which reaches RUN-WORKER's backstop the way any escaping raise does."
+  (format t "~%a worker crash tells its streams, through ON-CLOSE~%")
+  (let ((reasons nil)
+        (lock (sb-thread:make-mutex :name "crash-on-close"))
+        (log (make-string-output-stream))
+        (saved-stream web-skeleton::*log-stream*))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (declare (ignore req))
+                (make-stream-response
+                 :on-open (lambda (c)
+                            (stream-send c (sb-ext:string-to-octets
+                                            "open" :external-format :ascii)))
+                 :on-close (lambda (c reason)
+                             (declare (ignore c))
+                             (sb-thread:with-mutex (lock)
+                               (push reason reasons))))))
+           (let* ((sock (connect-to-test-server))
+                  (stream (sb-bsd-sockets:socket-make-stream
+                           sock :input t :output t
+                           :element-type '(unsigned-byte 8))))
+             (unwind-protect
+                  (progn
+                    (write-sequence (sb-ext:string-to-octets
+                                     (crlf "GET /events HTTP/1.1" "Host: x")
+                                     :external-format :ascii)
+                                    stream)
+                    (force-output stream)
+                    (check "control: the stream is open and has sent its first chunk"
+                           (nth-value 1 (read-until-bounded
+                                         stream :seconds 3
+                                         :until (lambda (buf fill)
+                                                  (search (sb-ext:string-to-octets
+                                                           "open" :external-format :ascii)
+                                                          buf :end2 fill))))
+                           :satisfied)
+                    (let ((worker (find "web-skeleton-0" (sb-thread:list-all-threads)
+                                        :key #'sb-thread:thread-name
+                                        :test #'equal)))
+                      (when worker
+                        (sb-thread:interrupt-thread
+                         worker (lambda () (error "deliberate: the worker crashed")))))
+                    (check "the peer sees its stream end"
+                           (nth-value 1 (read-until-bounded stream :seconds 3))
+                           :eof)
+                    (let ((deadline (+ (get-internal-real-time)
+                                       (* 3 internal-time-units-per-second))))
+                      (loop until (or (sb-thread:with-mutex (lock) reasons)
+                                      (> (get-internal-real-time) deadline))
+                            do (sleep 0.05)))
+                    (check "ON-CLOSE heard the crash, once, as :error"
+                           (sb-thread:with-mutex (lock) reasons)
+                           '(:error)))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (check "control: the worker did crash"
+           (not (null (search "crashed" (get-output-stream-string log))))
+           t)))
+
 (defun test-on-tick-validated-at-boot ()
   "START-SERVER refuses a non-function :ON-TICK before it binds.
 
@@ -10843,6 +10916,7 @@
   (test-serious-conditions-at-the-backstop)
   (test-serious-conditions-at-the-callback-sites)
   (test-a-raise-after-the-response-began)
+  (test-a-worker-crash-closes-its-streams-with-on-close)
   (test-on-tick-validated-at-boot)
   (test-map-worker-websockets-visits-only-websockets)
   (test-map-worker-websockets-skips-what-a-callback-closed)

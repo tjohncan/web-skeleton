@@ -316,7 +316,8 @@
                                relaying into it failed, or its close
                                could not be written,
                                :ERROR when ON-OPEN raised after the
-                               head went out,
+                               head went out, or the worker carrying
+                               the stream crashed,
                                :SHUTDOWN on server drain. Release
                                whatever the app registered here.
    KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See

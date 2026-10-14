@@ -1881,13 +1881,20 @@
                         ;; fresh set rather than resuming the dead worker's,
                         ;; which is honest — the counts describe a worker, and
                         ;; this is a new one.
-                        (*counters* (make-counters)))
+                        (*counters* (make-counters))
+                        ;; Set once the event loop returns, which it does
+                        ;; only after a drain. Still NIL in the cleanup below
+                        ;; means a condition is unwinding through it.
+                        (loop-returned nil))
                    (log-info "worker ~d started (epoll fd ~d)"
                              worker-id epoll-fd)
                    (epoll-add epoll-fd (socket-fd listener)
                               (logior +epollin+ +epollet+))
                    (unwind-protect
-                       (run-event-loop listener epoll-fd handler ws-handler on-tick)
+                       (progn
+                         (run-event-loop listener epoll-fd handler ws-handler
+                                         on-tick)
+                         (setf loop-returned t))
                      ;; Cleanup on worker crash or normal exit. Split the
                      ;; table into outbounds and everything else — outbounds
                      ;; go through CLOSE-OUTBOUND so their fetch callbacks
@@ -1896,19 +1903,35 @@
                      ;; :then closure runs exactly once. Non-outbounds get
                      ;; the raw CONNECTION-CLOSE; we can't deliver anything
                      ;; to their clients at this point and the epoll fd is
-                     ;; about to be torn down anyway. The collect step
-                     ;; avoids mutating the hash table during MAPHASH — we
-                     ;; only call UNREGISTER-CONNECTION (via close-outbound)
-                     ;; in the dolist after the walk.
-                     (let ((outbounds nil))
+                     ;; about to be torn down anyway.
+                     ;;
+                     ;; A stream's ON-CLOSE carries the same contract —
+                     ;; exactly once, however the stream ends — and fires
+                     ;; here first: :ERROR when the loop was unwound by a
+                     ;; crash, :SHUTDOWN when it returned after a drain that
+                     ;; ran out of time. Skipping it would leave every
+                     ;; stream on a crashed worker registered wherever the
+                     ;; application put it, for good. NOTIFY-STREAM-CLOSED
+                     ;; absorbs a raising callback, so one cannot stop the
+                     ;; closes after it.
+                     ;;
+                     ;; Both kinds are collected before anything is closed
+                     ;; or any callback runs: nothing may mutate the table
+                     ;; MAPHASH is walking, and a callback is application
+                     ;; code that may close a connection of its own.
+                     (let ((outbounds nil)
+                           (inbounds nil)
+                           (reason (if loop-returned :shutdown :error)))
                        (maphash (lambda (fd conn)
                                   (declare (ignore fd))
                                   (if (connection-outbound-p conn)
                                       (push conn outbounds)
-                                      (progn
-                                        (maybe-reap-dns-process conn)
-                                        (connection-close conn))))
+                                      (push conn inbounds)))
                                 *connections*)
+                       (dolist (conn inbounds)
+                         (notify-stream-closed conn reason)
+                         (maybe-reap-dns-process conn)
+                         (connection-close conn))
                        (dolist (conn outbounds)
                          (close-outbound conn epoll-fd)))
                      ;; One last pass over the children those closes and the
