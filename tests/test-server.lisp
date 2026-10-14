@@ -1307,7 +1307,37 @@
     (check-error "delete-cookie: semicolon in path"
                  (delete-cookie "s" :path "/; Secure"))
     (check-error "delete-cookie: semicolon in domain"
-                 (delete-cookie "s" :domain "evil.com; Secure"))))
+                 (delete-cookie "s" :domain "evil.com; Secure"))
+    ;; Secure on a deletion. A browser refuses a Set-Cookie for a
+    ;; __Secure- or __Host- name without it, deletions included, so the
+    ;; logout of a cookie BUILD-COOKIE made with its defaults was dropped
+    ;; and the session cookie stayed.
+    (check "delete: Secure by default, as build-cookie sets it"
+           (containsp "; Secure" (delete-cookie "session")) t)
+    (check "delete: :secure nil leaves it off"
+           (attempt (delete-cookie "session" :secure nil))
+           "session=; Path=/; Max-Age=0")
+    (check "delete: a __Host- cookie's deletion is one a browser accepts"
+           (delete-cookie "__Host-sid")
+           "__Host-sid=; Path=/; Max-Age=0; Secure")
+    ;; The prefixes' rules, refused where a browser would refuse them.
+    (check-error "delete-cookie: __Host- without Secure"
+                 (delete-cookie "__Host-sid" :secure nil))
+    (check-error "delete-cookie: __Host- with a Domain"
+                 (delete-cookie "__Host-sid" :domain "example.com"))
+    (check-error "delete-cookie: __Host- off the root path"
+                 (delete-cookie "__Host-sid" :path "/app"))
+    (check-error "delete-cookie: __secure-, any case, without Secure"
+                 (delete-cookie "__secure-x" :secure nil))
+    (check-error "build-cookie: __Host- without Secure"
+                 (build-cookie "__Host-sid" "v" :secure nil))
+    (check-error "build-cookie: __Host- off the root path"
+                 (build-cookie "__Host-sid" "v" :path "/app"))
+    (check-error "build-cookie: __Secure- without Secure"
+                 (build-cookie "__Secure-x" "v" :secure nil))
+    (check "build-cookie: a __Host- cookie with the defaults is built"
+           (build-cookie "__Host-sid" "abc123")
+           "__Host-sid=abc123; Path=/; HttpOnly; Secure; SameSite=Lax")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP client (fetch) tests — pure functions only, no networking

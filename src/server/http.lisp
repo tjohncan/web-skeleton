@@ -224,12 +224,39 @@
     (error "build-cookie: name contains '=' — browsers would split ~
             the cookie at it")))
 
+(defun check-cookie-prefix (who name secure path domain)
+  "Refuse a cookie whose name carries a prefix its attributes break.
+
+     __Secure-   needs Secure
+     __Host-     needs Secure, Path=/ and no Domain
+
+   A browser refuses such a Set-Cookie outright (RFC 6265bis §4.1.3), so
+   the cookie is never stored — or, for a deletion, never deleted — and
+   nothing anywhere says so. The prefixes are matched without regard to
+   case, as browsers match them. Same footing as :SAME-SITE :NONE without
+   :SECURE in BUILD-COOKIE: a refusal here beats a cookie that silently
+   does not exist."
+  (flet ((prefixed-p (prefix)
+           (and (>= (length name) (length prefix))
+                (string-equal prefix name :end2 (length prefix)))))
+    (cond
+      ((prefixed-p "__Host-")
+       (unless (and secure (equal path "/") (null domain))
+         (error "~a: a __Host- cookie needs :secure t, :path \"/\" and no ~
+                 :domain — browsers refuse it otherwise" who)))
+      ((prefixed-p "__Secure-")
+       (unless secure
+         (error "~a: a __Secure- cookie needs :secure t — browsers refuse ~
+                 it otherwise" who))))))
+
 (defun build-cookie (name value &key (path "/") (http-only t) (secure t)
                                      (same-site :lax) max-age domain)
   "Build a Set-Cookie header value string.
    :SAME-SITE accepts :LAX (default), :STRICT, :NONE, or NIL (omit).
    :NONE requires :SECURE T — browsers reject the combination otherwise,
    and catching it here is friendlier than a silent client-side failure.
+   A __Secure- or __Host- name is held to its prefix's rules the same way;
+   see CHECK-COOKIE-PREFIX.
    :MAX-AGE is an integer (seconds) or NIL (session cookie, drops on
    browser close).
    :PATH defaults to '/'; :DOMAIN is omitted by default.
@@ -241,6 +268,7 @@
   (validate-cookie-field "value" value)
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
+  (check-cookie-prefix "build-cookie" name secure path domain)
   (unless (or (null same-site)
               (member same-site '(:lax :strict :none)))
     (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
@@ -279,17 +307,25 @@
                       (:none   "None"))
                     out))))
 
-(defun delete-cookie (name &key (path "/") domain)
+(defun delete-cookie (name &key (path "/") domain (secure t))
   "Build a Set-Cookie header value that removes the cookie NAME.
    Empty value + Max-Age=0 so the browser drops it on receipt.
    :PATH and :DOMAIN must match how the cookie was originally set —
    browsers match cookies to Set-Cookie by (name, domain, path);
-   HttpOnly / Secure / SameSite do not participate in matching."
+   HttpOnly / Secure / SameSite do not participate in matching.
+
+   Secure is sent all the same, by default, as BUILD-COOKIE sends it, for
+   the deletion to be accepted at all. A browser refuses any Set-Cookie for
+   a __Secure- or __Host- name that lacks Secure, a deletion included, so
+   without it the logout of a cookie built with the recommended defaults
+   is dropped and the cookie stays. Pass the :SECURE the cookie was built
+   with; CHECK-COOKIE-PREFIX refuses the combinations a browser would."
   (validate-cookie-field "name" name)
   (when (zerop (length name))
     (error "delete-cookie: empty cookie name"))
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
+  (check-cookie-prefix "delete-cookie" name secure path domain)
   (with-output-to-string (out)
     (write-string name out)
     (write-char #\= out)
@@ -299,7 +335,9 @@
     (when domain
       (write-string "; Domain=" out)
       (write-string domain out))
-    (write-string "; Max-Age=0" out)))
+    (write-string "; Max-Age=0" out)
+    (when secure
+      (write-string "; Secure" out))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL percent-decoding (RFC 3986)

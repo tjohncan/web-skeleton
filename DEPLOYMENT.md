@@ -1574,6 +1574,15 @@ since browsers match Set-Cookie to stored cookies on those two fields:
 (add-response-header resp "set-cookie" (delete-cookie "session"))
 ```
 
+`delete-cookie` sends `Secure` by default, as `build-cookie` does, and takes
+the same `:secure`. It does not take part in matching, but a browser refuses
+any Set-Cookie for a `__Secure-` or `__Host-` name that lacks it, deletions
+included — so without it, logging out of a `__Host-sid` session would leave
+the cookie where it was. Both functions refuse a prefixed name whose
+attributes break its prefix (`__Secure-` needs `Secure`; `__Host-` needs
+`Secure`, `Path=/` and no `Domain`), for the reason they refuse
+`SameSite=None` without `Secure`: the browser would refuse it silently.
+
 ### JSON objects are a distinct type
 
 `json-parse` returns a `json-object` struct for a JSON object, and a plain list
