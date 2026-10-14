@@ -1743,6 +1743,100 @@
             *drain-timeout* saved-drain
             *worker-wake-interval* saved-poll))))
 
+(defun test-harness-a-worker-left-behind-stays-with-its-run ()
+  "A worker its run's join gave up on does not come back to serve beside
+   the next run on the same port.
+
+   Server A's handler is inside a slow request when shutdown is asked for,
+   so A's join gives up on that worker and START-SERVER returns, saying
+   so. Server B starts on the same port. When A's handler returns, its
+   worker finds *SHUTDOWN* cleared by B and, keyed on the flag alone, went
+   back to serving: listener open, old handler, and SO_REUSEPORT splitting
+   connections between it and B. Every request made after A's handler
+   returned is asserted to reach B, and the log to have named the worker
+   left running.
+
+   Started by hand rather than through WITH-TEST-SERVER, which owns one
+   server at a time and resolves its own port; this needs two servers on
+   one port, in sequence."
+  (format t "~%Harness: a worker left behind by its run stays with that run~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (port nil)
+        (a-up (sb-thread:make-semaphore :name "server-a"))
+        (b-up (sb-thread:make-semaphore :name "server-b"))
+        (threads nil))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 0
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (flet ((serve (port* marker semaphore &optional slow)
+             (sb-thread:make-thread
+              (lambda ()
+                (start-server
+                 :host #(127 0 0 1) :port port* :workers 1
+                 :on-listen (lambda (p)
+                              (setf port p)
+                              (sb-thread:signal-semaphore semaphore))
+                 :handler (lambda (req)
+                            (when (and slow (string= (http-request-path req)
+                                                     "/slow"))
+                              (sleep slow))
+                            (make-text-response 200 marker))))
+              :name (format nil "server-~a" marker)))
+           (body-from (p)
+             (let ((*test-port* p))
+               (nth-value 2 (handler-case (test-http-request :get "/")
+                              (error (e) (values nil nil (princ-to-string e))))))))
+      (unwind-protect
+           (let ((slow-start nil))
+             ;; A's join gives up after *DRAIN-TIMEOUT* + 3 seconds; its
+             ;; handler sleeps past that.
+             (push (serve 0 "A" a-up 4.5) threads)
+             (check "control: server A came up"
+                    (not (null (sb-thread:wait-on-semaphore a-up :timeout 10))) t)
+             (setf slow-start (get-internal-real-time))
+             (push (sb-thread:make-thread
+                    (lambda ()
+                      (let ((*test-port* port))
+                        (ignore-errors (test-http-request :get "/slow"))))
+                    :name "slow-client")
+                   threads)
+             (sleep 0.3)
+             (setf web-skeleton::*shutdown* t)
+             ;; Server A returns once its join has given up.
+             (let ((a (car (last threads))))
+               (handler-case (sb-thread:join-thread a :timeout 10)
+                 (error () nil)))
+             (push (serve port "B" b-up) threads)
+             (check "control: server B came up on the same port"
+                    (not (null (sb-thread:wait-on-semaphore b-up :timeout 10))) t)
+             ;; Past the end of A's slow handler, with room for its worker
+             ;; to come back to its loop.
+             (loop until (> (/ (- (get-internal-real-time) slow-start)
+                               internal-time-units-per-second)
+                            5.5)
+                   do (sleep 0.1))
+             (let ((bodies (loop repeat 20 collect (body-from port))))
+               (check "every request after A's handler returned reached B"
+                      (count "B" bodies :test #'equal) 20)))
+        (setf web-skeleton::*shutdown* t)
+        (dolist (th threads)
+          (handler-case (sb-thread:join-thread th :timeout 10)
+            (error () (ignore-errors (sb-thread:terminate-thread th)))))
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll
+              web-skeleton::*log-stream* saved-stream)))
+    (check "the log named the worker A left running"
+           (not (null (search "still running" (get-output-stream-string log))))
+           t)))
+
 (defun %port-answers-with-p (port marker)
   "T if a plain GET / on PORT comes back containing MARKER.
 
@@ -5136,6 +5230,7 @@
   (test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e)
   (test-harness-fetch-stream-plain-write-timeout-e2e)
   (test-harness-fetch-bodiless-status-kept-alive-e2e)
+  (test-harness-a-worker-left-behind-stays-with-its-run)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)

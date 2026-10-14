@@ -131,6 +131,13 @@
    START-SERVER has sized it. DEFGLOBAL rather than DEFVAR for the reason
    *SHUTDOWN* is: one shared value cell, never a per-thread binding.")
 
+(defvar *worker-census* nil
+  "The census vector of this worker's run, bound by the thread START-SERVER
+   spawns, beside *WORKER-GENERATION*. A worker publishes into its own run's
+   vector rather than whatever *CONNECTION-CENSUS* holds now, so a worker an
+   earlier run left behind cannot overwrite — or on its way out clear — the
+   slot a later run's worker of the same id owns. NIL off a worker.")
+
 (defvar *worker-id* nil
   "This worker's index into *CONNECTION-CENSUS*. Bound per-worker by
    RUN-WORKER beside the other share-nothing slots; NIL off a worker.
@@ -174,16 +181,16 @@
    one, never a half-updated one — the same discipline *HTTP-DATE-LINE-CACHE*
    documents for the same reason: patching in place would be cheaper and
    wrong."
-  (when (and *connection-census* *worker-id*
-             (< *worker-id* (length *connection-census*)))
-    (setf (aref *connection-census* *worker-id*) (census-counts))))
+  (let ((census *worker-census*))
+    (when (and census *worker-id* (< *worker-id* (length census)))
+      (setf (aref census *worker-id*) (census-counts)))))
 
 (defun clear-connection-census ()
   "Drop this worker's published counts. Called as a worker exits, so a torn
    down server does not leave counts a later reader would sum."
-  (when (and *connection-census* *worker-id*
-             (< *worker-id* (length *connection-census*)))
-    (setf (aref *connection-census* *worker-id*) nil)))
+  (let ((census *worker-census*))
+    (when (and census *worker-id* (< *worker-id* (length census)))
+      (setf (aref census *worker-id*) nil))))
 
 (defun connection-census ()
   "A snapshot of every worker's connections. NIL before any has published.
@@ -625,6 +632,31 @@
   "Set to T to signal all workers to exit.
    defglobal (not defvar) to avoid per-thread bindings and ensure
    a single shared value cell across all worker threads.")
+
+(sb-ext:defglobal *run-generation* 0
+  "Which START-SERVER run is the current one, counted up as each begins.
+
+   *SHUTDOWN* cannot tell runs apart. START-SERVER clears it on entry, and
+   a worker an earlier run left behind — still inside a handler when that
+   run's join gave up waiting — would see it clear when the handler
+   returned and go back to serving: its old port, its old handler, beside
+   the new run's workers. Every listener sets SO_REUSEPORT, so both hold
+   the port and the kernel splits connections between them with nothing in
+   either log. A worker belongs to the run that spawned it,
+   *WORKER-GENERATION*, and WORKER-STOPPING-P stops it once a later run has
+   begun.")
+
+(defvar *worker-generation* nil
+  "The run this worker thread belongs to: the *RUN-GENERATION* START-SERVER
+   gave it, bound by the thread START-SERVER spawns, outside RUN-WORKER's
+   restart loop. NIL off a worker.")
+
+(defun worker-stopping-p ()
+  "True when this worker should stop: shutdown was requested, or a later
+   START-SERVER has begun since this worker's run did."
+  (or *shutdown*
+      (and *worker-generation*
+           (/= *worker-generation* *run-generation*))))
 
 (defparameter *drain-timeout* 5
   "Seconds to wait for connections to drain during graceful shutdown.")
@@ -1623,7 +1655,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler on-tick)
-  "Main event loop. Runs until *shutdown* is set."
+  "Main event loop. Runs until WORKER-STOPPING-P: *SHUTDOWN* is set, or a
+   later START-SERVER has begun. Either way it drains first, so a response
+   a handler finished after its run was told to stop still goes out."
   (let ((listener-fd    (socket-fd listener-socket))
         (last-ping-time  (get-universal-time))
         (last-sweep-time (get-universal-time))
@@ -1631,7 +1665,7 @@
         (tick-error-at   0)
         (event-buf (make-epoll-event-buf +max-events+)))
     (loop
-      (when *shutdown*
+      (when (worker-stopping-p)
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
       (let ((n (epoll-wait epoll-fd event-buf +max-events+
@@ -1904,10 +1938,10 @@
         ;; within one slice rather than after the full second.
         (let ((until (+ (get-internal-real-time)
                         internal-time-units-per-second)))
-          (loop until (or *shutdown*
+          (loop until (or (worker-stopping-p)
                           (>= (get-internal-real-time) until))
                 do (sleep *worker-wake-interval*)))
-        (when *shutdown* (return))))))
+        (when (worker-stopping-p) (return))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CPU count
@@ -2227,6 +2261,10 @@
             on every pass of every worker's event loop, so a value that ~
             cannot be funcalled fails on every pass rather than once."
            on-tick))
+  ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
+  ;; ever sees the flag clear while its run is still the current one: see
+  ;; *RUN-GENERATION*.
+  (setf *run-generation* (1+ *run-generation*))
   (setf *shutdown* nil)
   ;; Sized here, before any worker exists, because a worker's slot index is
   ;; its id and the vector has to be there when the first tick publishes.
@@ -2277,7 +2315,9 @@
                   ;; COLLECT: if MAKE-THREAD raises on iteration N, the
                   ;; partial list in THREADS still covers workers 0..N-1 so
                   ;; the drain cleanup can signal and join them.
-                  (let ((threads nil))
+                  (let ((threads nil)
+                        (generation *run-generation*)
+                        (census *connection-census*))
                     (unwind-protect
                          (progn
                            (dotimes (i workers)
@@ -2292,8 +2332,13 @@
                                         ;; names a connection, and a worker
                                         ;; that crashed and counted from one
                                         ;; again would hand a second peer the
-                                        ;; first one's name.
-                                        (let ((*connection-serial* 0))
+                                        ;; first one's name. The run and its
+                                        ;; census belong to the thread for the
+                                        ;; same reason: a restart is the same
+                                        ;; worker of the same run.
+                                        (let ((*connection-serial* 0)
+                                              (*worker-generation* generation)
+                                              (*worker-census* census))
                                           (run-worker host port id
                                                       handler ws-handler
                                                       on-tick adopted)))
@@ -2331,17 +2376,38 @@
                       (when listener0
                         (ignore-errors
                          (sb-bsd-sockets:socket-close listener0)))
-                      (dolist (thread threads)
-                        (ignore-errors
-                         (sb-thread:join-thread thread
-                                                :timeout (+ *drain-timeout* 3))))
-                      ;; Workers have drained; run any app-registered cleanup
-                      ;; before returning. Hooks own their own error handling —
-                      ;; one raising hook cannot block the rest, cannot block
-                      ;; the "stopped" log, and cannot prevent START-SERVER
-                      ;; from returning to its caller.
-                      (run-shutdown-hooks)
-                      (log-info "stopped"))))
+                      ;; A worker still inside a handler or a callback when
+                      ;; its join gives up is still running, and is said to
+                      ;; be, by name, rather than this returning under a
+                      ;; plain "stopped". It belongs to this run and stops
+                      ;; when it comes back to its loop — WORKER-STOPPING-P
+                      ;; holds even after a later START-SERVER clears
+                      ;; *SHUTDOWN* — but until then it holds its listener,
+                      ;; and the port with it.
+                      (let ((still-running 0))
+                        (dolist (thread threads)
+                          (when (eq :timeout
+                                    (nth-value 1 (ignore-errors
+                                                  (sb-thread:join-thread
+                                                   thread :default nil
+                                                   :timeout (+ *drain-timeout* 3)))))
+                            (incf still-running)
+                            (log-warn "~a did not stop within ~d seconds and is ~
+                                       still running: a handler or callback on ~
+                                       it has not returned. It stops when it ~
+                                       does."
+                                      (sb-thread:thread-name thread)
+                                      (+ *drain-timeout* 3))))
+                        ;; Workers have drained; run any app-registered
+                        ;; cleanup before returning. Hooks own their own error
+                        ;; handling — one raising hook cannot block the rest,
+                        ;; cannot block the "stopped" log, and cannot prevent
+                        ;; START-SERVER from returning to its caller.
+                        (run-shutdown-hooks)
+                        (if (zerop still-running)
+                            (log-info "stopped")
+                            (log-warn "stopped, with ~d worker~:p still running"
+                                      still-running))))))
              ;; Inner cleanup: restore SIGTERM
              (ignore-errors
               (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
