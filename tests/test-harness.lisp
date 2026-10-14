@@ -1837,6 +1837,96 @@
            (not (null (search "still running" (get-output-stream-string log))))
            t)))
 
+(defun test-harness-drain-closes-a-keep-alive-response-it-let-finish ()
+  "A shutdown that finds a keep-alive response in flight lets it finish,
+   then closes the connection, and returns well inside *DRAIN-TIMEOUT*.
+
+   The drain let such a response finish and left the connection's
+   keep-alive alone, so the last byte reset it to reading a next request.
+   The drain never closes a connection that is reading, so shutdown sat
+   out the whole *DRAIN-TIMEOUT* for a response delivered at once, and
+   logged a force-close.
+
+   The handler is still running when shutdown is asked for, so its
+   response is queued after the drain has begun: the shape the finding
+   reproduced with SIGTERM."
+  (format t "~%Harness: the drain closes a keep-alive response it let finish~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (port nil)
+        (up (sb-thread:make-semaphore :name "drain-server"))
+        (reply nil))
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 5
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (let ((server (sb-thread:make-thread
+                        (lambda ()
+                          (start-server
+                           :host #(127 0 0 1) :port 0 :workers 1
+                           :on-listen (lambda (p)
+                                        (setf port p)
+                                        (sb-thread:signal-semaphore up))
+                           :handler (lambda (req)
+                                      (declare (ignore req))
+                                      (sleep 1)
+                                      (make-text-response 200 "answered"))))
+                        :name "drain-server"))
+               (client nil))
+           (check "control: the server came up"
+                  (not (null (sb-thread:wait-on-semaphore up :timeout 10))) t)
+           ;; HTTP/1.1 and no Connection: close — a keep-alive request — and
+           ;; the socket held open after the response, as a client reusing
+           ;; it would.
+           (setf client
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let* ((*test-port* port)
+                           (sock (connect-to-test-server))
+                           (stream (sb-bsd-sockets:socket-make-stream
+                                    sock :input t :output t
+                                    :element-type '(unsigned-byte 8))))
+                      (unwind-protect
+                           (progn
+                             (write-sequence (sb-ext:string-to-octets
+                                              (crlf "GET /slow HTTP/1.1" "Host: x")
+                                              :external-format :ascii)
+                                             stream)
+                             (force-output stream)
+                             (setf reply (sb-ext:octets-to-string
+                                          (read-until-bounded stream :seconds 8)
+                                          :external-format :latin-1)))
+                        (ignore-errors (close stream))
+                        (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+                  :name "drain-client"))
+           (sleep 0.4)
+           (let ((start (get-internal-real-time)))
+             (setf web-skeleton::*shutdown* t)
+             (handler-case (sb-thread:join-thread server :timeout 10)
+               (error () (ignore-errors (sb-thread:terminate-thread server))))
+             (let ((secs (/ (float (- (get-internal-real-time) start))
+                            internal-time-units-per-second)))
+               (check "the server stopped well inside *drain-timeout*"
+                      (< secs 3.0) t)))
+           (handler-case (sb-thread:join-thread client :timeout 10)
+             (error () (ignore-errors (sb-thread:terminate-thread client))))
+           (check "the response in flight was delivered whole"
+                  (and reply (search "HTTP/1.1 200" reply) (search "answered" reply) t)
+                  t))
+      (setf web-skeleton::*shutdown* t
+            web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll
+            web-skeleton::*log-stream* saved-stream))
+    (check "and nothing was force-closed"
+           (search "force-closing" (get-output-stream-string log))
+           nil)))
+
 (defun %port-answers-with-p (port marker)
   "T if a plain GET / on PORT comes back containing MARKER.
 
@@ -5231,6 +5321,7 @@
   (test-harness-fetch-stream-plain-write-timeout-e2e)
   (test-harness-fetch-bodiless-status-kept-alive-e2e)
   (test-harness-a-worker-left-behind-stays-with-its-run)
+  (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)

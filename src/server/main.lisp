@@ -1007,73 +1007,94 @@
     (when (zerop count)
       (return-from drain-connections))
     (log-info "draining ~d connection~:p" count))
-  ;; Phase 1: initiate shutdown on each connection. Outbound
-  ;; connections and inbound connections that haven't completed a
-  ;; request are closed immediately. WebSocket connections get a
-  ;; 1001 close frame and are flipped to :closing so the event
-  ;; loop finishes flushing the close before tearing them down.
-  ;; Outbounds and inbounds are split into two lists so outbounds
-  ;; can be routed through close-outbound (which fires the fetch
-  ;; callback); close-connection on a direct outbound wouldn't
-  ;; because its :awaiting branch only handles paired-outbound
-  ;; teardown, not the outbound itself.
-  (let ((outbounds-to-close nil)
-        (inbounds-to-close nil))
-    (maphash (lambda (fd conn)
-               (declare (ignore fd))
-               (cond
-                 ((connection-outbound-p conn)
-                  (push conn outbounds-to-close))
-                 ;; A stream will not end on its own, so waiting for it
-                 ;; would spend the whole drain timeout. Closed without a
-                 ;; terminator on purpose: the client reads a truncated
-                 ;; chunked body, which is exactly what happened, and a
-                 ;; terminator would claim a complete response the app
-                 ;; never finished sending. The app hears :SHUTDOWN.
-                 ((member (connection-state conn)
-                          '(:read-http :read-body :awaiting :streaming))
-                  (push conn inbounds-to-close))
-                 ((eq (connection-state conn) :websocket)
-                  ;; Must not clobber an in-flight write. The race:
-                  ;; ping-ws-connections queued a 2-byte ping whose
-                  ;; first byte was flushed, write-pos=1 write-end=2
-                  ;; (EAGAIN on byte 2). SIGTERM arrives, drain runs,
-                  ;; connection-queue-write overwrites write-buf with
-                  ;; the close frame bytes and resets write-pos to 0.
-                  ;; What hits the wire: partial ping + close frame
-                  ;; bytes as one contiguous buffer, and the client
-                  ;; interprets the close frame's FIN+opcode byte as
-                  ;; the ping's length, then waits forever. Same
-                  ;; discipline ping-ws-connections itself uses
-                  ;; (queue only when nothing is in flight). If a
-                  ;; write IS in flight, transition to :closing and
-                  ;; let handle-client-write tear the connection
-                  ;; down after the partial write finishes — the
-                  ;; peer sees a truncated frame rather than a
-                  ;; corrupt one.
-                  ;; Pending counts the append queue as well as the head,
-                  ;; so a connection with frames stacked behind the one in
-                  ;; flight takes the same branch rather than having the
-                  ;; close frame overwrite the head out from under them.
-                  (cond
-                    ((plusp (connection-write-pending conn))
-                     (setf (connection-state conn) :closing))
-                    (t
-                     (connection-queue-write conn (build-ws-close 1001))
-                     (setf (connection-state conn) :closing)
-                     (epoll-modify epoll-fd (connection-fd conn)
-                                   (logior +epollout+ +epollet+)))))
-                 ;; :write-response, :ws-upgrade, :closing — let them finish
-                 (t nil)))
-             *connections*)
-    ;; Close outbounds first so their fetch callbacks fire. Inbounds
-    ;; afterward — any that were in :awaiting find their paired
-    ;; outbound already gone and short-circuit cleanly.
-    (dolist (conn outbounds-to-close)
-      (close-outbound conn epoll-fd))
-    (dolist (conn inbounds-to-close)
-      (close-connection conn epoll-fd :shutdown)))
-  ;; Phase 2: flush remaining writes until drained or timeout
+  ;; Phase 1: put every connection on its way out. Outbounds are closed
+  ;; first, through CLOSE-OUTBOUND so their fetch callbacks fire —
+  ;; CLOSE-CONNECTION on an outbound would not, because its :AWAITING
+  ;; branch handles a paired outbound's teardown and not the outbound
+  ;; itself. Inbounds afterward, by WIND-DOWN: any parked in :AWAITING find
+  ;; their outbound already gone and short-circuit cleanly. Both lists are
+  ;; collected first, because a fetch callback is application code and may
+  ;; close a connection of its own.
+  (flet ((wind-down (conn)
+           ;; What a connection gets at shutdown, decided by its state.
+           (case (connection-state conn)
+             ;; Nothing owed to the peer that a drain could finish: a
+             ;; request still arriving, or one whose 100 Continue has
+             ;; invited a body nothing will read. A stream will not end on
+             ;; its own, so waiting for it would spend the whole drain
+             ;; timeout. Closed without a terminator on purpose: the client
+             ;; reads a truncated chunked body, which is exactly what
+             ;; happened, and a terminator would claim a complete response
+             ;; the app never finished sending. The app hears :SHUTDOWN.
+             ((:read-http :read-body :sending-100-continue :awaiting :streaming)
+              (close-connection conn epoll-fd :shutdown))
+             (:websocket
+              ;; Must not clobber an in-flight write. The race:
+              ;; ping-ws-connections queued a 2-byte ping whose
+              ;; first byte was flushed, write-pos=1 write-end=2
+              ;; (EAGAIN on byte 2). SIGTERM arrives, drain runs,
+              ;; connection-queue-write overwrites write-buf with
+              ;; the close frame bytes and resets write-pos to 0.
+              ;; What hits the wire: partial ping + close frame
+              ;; bytes as one contiguous buffer, and the client
+              ;; interprets the close frame's FIN+opcode byte as
+              ;; the ping's length, then waits forever. Same
+              ;; discipline ping-ws-connections itself uses
+              ;; (queue only when nothing is in flight). If a
+              ;; write IS in flight, transition to :closing and
+              ;; let handle-client-write tear the connection
+              ;; down after the partial write finishes — the
+              ;; peer sees a truncated frame rather than a
+              ;; corrupt one.
+              ;; Pending counts the append queue as well as the head,
+              ;; so a connection with frames stacked behind the one in
+              ;; flight takes the same branch rather than having the
+              ;; close frame overwrite the head out from under them.
+              (cond
+                ((plusp (connection-write-pending conn))
+                 (setf (connection-state conn) :closing))
+                (t
+                 (connection-queue-write conn (build-ws-close 1001))
+                 (setf (connection-state conn) :closing)
+                 (epoll-modify epoll-fd (connection-fd conn)
+                               (logior +epollout+ +epollet+)))))
+             ;; :write-response, :ws-upgrade, :closing — a response or a
+             ;; frame is in flight, and is let finish. Marked to close after
+             ;; it, or a keep-alive response would reset the connection to
+             ;; :READ-HTTP on its last byte: the drain never closes a
+             ;; connection that is reading, so shutdown would wait out
+             ;; *DRAIN-TIMEOUT* for a response delivered in milliseconds,
+             ;; while the client, told nothing, sends its next request onto
+             ;; a socket about to be force-closed. A response already
+             ;; serialized cannot be given Connection: close any more; its
+             ;; connection can still be closed after it.
+             (t
+              (setf (connection-close-after-p conn) t)))))
+    (let ((outbounds nil)
+          (inbounds nil))
+      (maphash (lambda (fd conn)
+                 (declare (ignore fd))
+                 (if (connection-outbound-p conn)
+                     (push conn outbounds)
+                     (push conn inbounds)))
+               *connections*)
+      (dolist (conn outbounds)
+        (close-outbound conn epoll-fd))
+      (dolist (conn inbounds)
+        (when (eq (lookup-connection (connection-fd conn)) conn)
+          (wind-down conn))))
+    ;; Phase 2: flush remaining writes until drained or timeout
+    (drain-pending-writes epoll-fd event-buf #'wind-down)))
+
+(defun drain-pending-writes (epoll-fd event-buf wind-down)
+  "Phase 2 of DRAIN-CONNECTIONS: flush what phase 1 let finish, until the
+   table is empty or *DRAIN-TIMEOUT* runs out.
+
+   A write that completes can move a connection on rather than close it:
+   a 101 becomes :WEBSOCKET, which clears the close-after mark the drain
+   set on it. A connection that lands in a state phase 1 would have
+   handled is handed to WIND-DOWN as it lands, so the WebSocket gets its
+   1001 like every other, rather than sitting until the deadline."
   (let ((deadline (+ (get-universal-time) *drain-timeout*)))
     (loop
       (when (zerop (hash-table-count *connections*))
@@ -1094,7 +1115,14 @@
                             (logtest flags +epollhup+))
                         (close-connection conn epoll-fd))
                        ((logtest flags +epollout+)
-                        (handle-client-write conn epoll-fd))))))))))
+                        (handle-client-write conn epoll-fd)
+                        (when (and (eq (lookup-connection fd) conn)
+                                   (member (connection-state conn)
+                                           '(:read-http :read-body
+                                             :sending-100-continue
+                                             :awaiting :streaming
+                                             :websocket)))
+                          (funcall wind-down conn)))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Handle readable event on a client fd
