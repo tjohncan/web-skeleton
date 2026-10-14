@@ -291,10 +291,13 @@
    because the server is waiting for an event that will not come and will
    close the connection, unanswered, at *IDLE-TIMEOUT*.
 
-   The answer is the 413 and then a close with the rest of the request
-   unread, which on Linux is a reset — and a reset can destroy the
-   response before the client reads it. So the claim asserted is the
-   prompt end, and the 413 is checked only if bytes did arrive.
+   The answer is the 413 and then a lingering close: a FIN after the
+   response, and the rest of the request read and discarded. Closed at
+   once instead, with the rest unread, Linux answers with a reset, which
+   a client on Linux survives — the 413 arrived first and stays readable
+   — but which discards anything unsent and reads as a failure to a peer
+   that treats it as one. The read ending in :EOF rather than :ERROR is
+   what tells the two apart.
 
    Budgets are set with SETF, not LET: the worker reads the global values."
   (format t "~%Harness: a full buffer is answered when it fills~%")
@@ -336,12 +339,13 @@
                         (read-until-bounded stream :seconds 4)
                       (check "full buffer e2e: the connection ends promptly"
                              (not (eq reason :deadline)) t)
-                      (check "full buffer e2e: and what arrived, if anything, is a 413"
-                             (or (zerop (fill-pointer buf))
-                                 (eql 0 (search "HTTP/1.1 413"
-                                                (sb-ext:octets-to-string
-                                                 buf :external-format :latin-1))))
-                             t)))
+                      (check "full buffer e2e: the 413 arrives"
+                             (eql 0 (search "HTTP/1.1 413"
+                                            (sb-ext:octets-to-string
+                                             buf :external-format :latin-1)))
+                             t)
+                      (check "full buffer e2e: and ends with a FIN, not a reset"
+                             reason :eof)))
                (ignore-errors (close stream))
                (ignore-errors (sb-bsd-sockets:socket-close socket)))))
       (setf web-skeleton:*max-body-size* (first saved)

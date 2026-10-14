@@ -309,6 +309,10 @@
   (stream-keepalive nil :type (or null (simple-array (unsigned-byte 8) (*))))
   ;; Keep-alive
   (close-after-p  nil :type boolean)          ; T = close after response sent
+  ;; T when that close should linger: the response answered a request
+  ;; whose bytes may still be arriving, so the close half-closes and
+  ;; drains rather than resetting. See BEGIN-LINGERING-CLOSE.
+  (linger         nil :type boolean)
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
   (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
@@ -737,11 +741,12 @@
           ((eq result :again) (return (if any-read :ok :again)))
           ;; The same arm CONNECTION-READ-AVAILABLE carries, for the reason
           ;; the docstring above gives: the two are meant to be readable
-          ;; side by side, and they were not. Without it :WANT-WRITE fell
-          ;; into the integer default and this loop spun inside the event
-          ;; loop with no exit. Unreachable today — the only caller is the
-          ;; :STREAMING inbound path and there is no inbound TLS — which is
-          ;; exactly how long a spin like this stays invisible.
+          ;; side by side. Without it :WANT-WRITE would fall into the
+          ;; integer default and this loop would spin inside the event loop
+          ;; with no exit. Unreachable from the callers there are — both
+          ;; inbound, :STREAMING and :LINGERING, and there is no inbound
+          ;; TLS — which is exactly how long a spin like this stays
+          ;; invisible.
           ((eq result :want-write)
            (return (if any-read :ok-want-write :want-write)))
           ;; Defensive, and not redundant with the arm above: a fifth
@@ -1451,8 +1456,11 @@
                        (format-response (make-error-response 417)
                                         :connection-hint :close
                                         :head-only-p head-p)))
+                    ;; Lingering: a client with a body may be sending it
+                    ;; anyway, and an unread byte at close is a reset.
                     (setf (connection-state conn) :write-response
-                          (connection-close-after-p conn) t)
+                          (connection-close-after-p conn) t
+                          (connection-linger conn) t)
                     :flush-queued)
                    ;; Chunked body. Ahead of the Content-Length arm rather
                    ;; than inside it, because a chunked request declares no

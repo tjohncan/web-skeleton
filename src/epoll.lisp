@@ -149,6 +149,14 @@
 (sb-alien:define-alien-routine ("close" %close) sb-alien:int
   (fd sb-alien:int))
 
+(sb-alien:define-alien-routine ("shutdown" %shutdown) sb-alien:int
+  (fd sb-alien:int)
+  (how sb-alien:int))
+
+(defconstant +shut-wr+ 1
+  "shutdown(2)'s HOW for the write side alone: the peer reads a FIN after
+   whatever was already written, and the read side stays open.")
+
 (sb-alien:define-alien-routine ("poll" %poll) sb-alien:int
   (fds (sb-alien:* t))
   (nfds sb-alien:unsigned-long)

@@ -345,6 +345,20 @@
    reverse-proxy section says. A slow download is not cut off: the write
    path counts a writable socket as activity.")
 
+(defparameter *linger-timeout* 2
+  "Seconds a connection closed after an early error response may go on
+   reading — and discarding — what its client is still sending, before it
+   is closed. 0 closes at once.
+
+   An answer given before the request has been read in full — a 413 for a
+   body over the cap, a 431, any refusal of the request line or head —
+   leaves the client mid-send. Closing then, with its bytes unread, makes
+   Linux answer RST rather than FIN, which discards response bytes not yet
+   sent and tells the peer the connection failed. See
+   BEGIN-LINGERING-CLOSE. Bounded by time
+   alone: the bytes are the client's to send, so draining them costs what
+   receiving them would have.")
+
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
    Inactivity = no text or binary frames from the client (pongs don't count).")
@@ -441,6 +455,9 @@
                                    ;; day holds dead ones.
                                    ((eq state :streaming) *stream-idle-timeout*)
                                    ((eq state :awaiting)  *fetch-timeout*)
+                                   ;; Measured from the start of the linger;
+                                   ;; discarded bytes do not refresh it.
+                                   ((eq state :lingering) *linger-timeout*)
                                    (t                     *idle-timeout*)))
                         ;; A stream is judged on when its app last
                         ;; produced, not on when the connection last saw
@@ -978,6 +995,48 @@
 ;;; Close and clean up a connection
 ;;; ---------------------------------------------------------------------------
 
+(defun begin-lingering-close (conn epoll-fd)
+  "Close CONN after an early error response the way RFC 9112 §9.6 asks of
+   a server that answers before it has read the request: shut down the
+   write side, so the response is followed by a FIN, then read and discard
+   whatever the client is still sending until it stops or *LINGER-TIMEOUT*
+   runs out, and only then close.
+
+   Closing at once, with the client's bytes unread in the kernel, makes
+   Linux abort the connection with RST rather than end it with FIN: any
+   response bytes still unsent are discarded, and the peer is told the
+   connection failed. A reader on Linux keeps what had already arrived, so
+   a small response read promptly survives. What survives elsewhere
+   depends on the peer — a proxy or client stack that treats a reset as a
+   failure may not pass the answer on — and the FIN removes the question.
+   It is not a cure for every intermediary: WSL2's localhost relay, which
+   forwards nothing back while an upload is in flight, lost the 413 to a
+   32 MiB upload with and without the linger.
+
+   :LINGERING is a state of its own so no worker waits: HANDLE-CLIENT-READ
+   discards on each readable event and closes at the client's FIN, and
+   the idle sweep closes what outlives *LINGER-TIMEOUT*, measured from
+   here — the bytes discarded do not extend it."
+  (unless (zerop (%shutdown (connection-fd conn) +shut-wr+))
+    ;; The peer is already gone, or the socket is: nothing to linger for.
+    (close-connection conn epoll-fd)
+    (return-from begin-lingering-close))
+  (setf (connection-state conn) :lingering
+        (connection-last-active conn) (get-universal-time))
+  (epoll-modify epoll-fd (connection-fd conn) (logior +epollin+ +epollet+))
+  ;; Edge-triggered: what the client sent before this moment raises no new
+  ;; edge, so the first drain is now.
+  (linger-discard conn epoll-fd))
+
+(defun linger-discard (conn epoll-fd)
+  "Discard what a :LINGERING connection's client has sent, and close it once
+   the client has finished."
+  (case (connection-discard-available
+         conn (or *stream-drain-buf*
+                  (make-array 4096 :element-type '(unsigned-byte 8))))
+    ((:eof :ok-eof) (close-connection conn epoll-fd))
+    (t nil)))
+
 (defun close-connection (conn epoll-fd &optional (reason :closed))
   "Remove from epoll, unregister, close fd.
 
@@ -1075,7 +1134,8 @@
              ;; reads a truncated chunked body, which is exactly what
              ;; happened, and a terminator would claim a complete response
              ;; the app never finished sending. The app hears :SHUTDOWN.
-             ((:read-http :read-body :sending-100-continue :awaiting :streaming)
+             ((:read-http :read-body :sending-100-continue :awaiting :streaming
+               :lingering)
               (close-connection conn epoll-fd :shutdown))
              (:websocket
               ;; Must not clobber an in-flight write. The race:
@@ -1170,7 +1230,7 @@
                                            '(:read-http :read-body
                                              :sending-100-continue
                                              :awaiting :streaming
-                                             :websocket)))
+                                             :websocket :lingering)))
                           (funcall wind-down conn)))))))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1252,8 +1312,11 @@
             (set-response-header resp "connection" "close")
             (connection-queue-write conn (strip-body-for-head
                                           (format-response resp) conn))
+            ;; Lingering: an answer given while the request is still being
+            ;; read may leave the client sending. See BEGIN-LINGERING-CLOSE.
             (setf (connection-state conn) :write-response
-                  (connection-close-after-p conn) t)
+                  (connection-close-after-p conn) t
+                  (connection-linger conn) t)
             (epoll-modify epoll-fd (connection-fd conn)
                           (logior +epollout+ +epollet+)))
         (error ()
@@ -1470,6 +1533,9 @@
              ;; spurious wake-up, or a transport that wants to write before
              ;; it can read. Nothing to do for either.
              (t nil))))
+        ;; Closing after an early error answer: discard what the client is
+        ;; still sending, and close at its FIN. See BEGIN-LINGERING-CLOSE.
+        (:lingering (linger-discard conn epoll-fd))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
         ;; Stale EPOLLIN for a state that isn't currently reading.
@@ -1578,7 +1644,12 @@
            (case (connection-state conn)
              (:write-response
               (if (connection-close-after-p conn)
-                  (close-connection conn epoll-fd)
+                  ;; An early error answer lingers, so the response is
+                  ;; followed by a FIN and not a reset; see
+                  ;; BEGIN-LINGERING-CLOSE. Every other close is at once.
+                  (if (and (connection-linger conn) (plusp *linger-timeout*))
+                      (begin-lingering-close conn epoll-fd)
+                      (close-connection conn epoll-fd))
                   ;; Keep-alive — reset for next request,
                   ;; preserving any pipelined bytes already buffered
                   (let* ((consumed (connection-request-end conn))
