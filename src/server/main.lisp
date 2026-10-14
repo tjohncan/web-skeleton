@@ -700,8 +700,8 @@
                  (copy-list *shutdown-hooks*))))
     (dolist (fn hooks)
       (handler-case (funcall fn)
-        ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-        ((or error storage-condition) (e)
+        ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+        (serious-condition (e)
           (log-error "shutdown hook error: ~a" e))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1255,9 +1255,9 @@
               (multiple-value-bind (response close-frame)
                   (handler-case
                       (websocket-on-read conn ws-handler)
-                    ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's own
-                    ;; catch at the bottom of this function.
-                    ((or error storage-condition) (e)
+                    ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's
+                    ;; own catch at the bottom of this function.
+                    (serious-condition (e)
                       ;; Handler error — close directly without a close frame.
                       ;; A ws-send may have put part of a frame on the wire
                       ;; and left the rest queued, and this teardown drops
@@ -1390,22 +1390,41 @@
                            (logior +epollout+ +epollet+))))
         (error ()
           (close-connection conn epoll-fd))))
-    ;; STORAGE-CONDITION beside ERROR, because it is not one: CL makes both
-    ;; SERIOUS-CONDITIONs and neither a subtype of the other. It is what a
-    ;; handler gets when it recurses past the control stack, or asks for an
-    ;; allocation larger than the heap has left, and both are a request
-    ;; failing rather than the server — the frames or the allocation are
-    ;; gone once the catch unwinds. Uncaught, it passed every handler here
-    ;; and RUN-WORKER's too, and SBCL ends the process for a condition
-    ;; nothing handles: one request's recursion took every worker down. So
-    ;; it costs what an error costs, a 500 and the connection. A heap
-    ;; worn out by many small allocations can be out of reach of any
+    ;; SERIOUS-CONDITION, not ERROR. CL has serious conditions that are not
+    ;; errors, and SBCL signals two kinds of them into ordinary code:
+    ;;
+    ;;   STORAGE-CONDITION  recursion past the control stack, or one
+    ;;                      allocation larger than the heap has left
+    ;;   SB-EXT:TIMEOUT     the end of an SB-EXT:WITH-TIMEOUT, and
+    ;;                      SB-SYS:DEADLINE-TIMEOUT, its subtype, the end of
+    ;;                      an SB-SYS:WITH-DEADLINE around SBCL's own waits
+    ;;                      on sockets and descriptors
+    ;;
+    ;; Putting a time limit on a slow call is an ordinary thing for a
+    ;; handler to do, and when the slowness is an upstream's, the far end of
+    ;; that call decides when the timeout fires. Each of these is a request
+    ;; failing rather than the server — the frames, the allocation, the wait
+    ;; are gone once the catch unwinds — and a condition nothing handles
+    ;; ends the process when the debugger is disabled, every worker with it.
+    ;; So each costs what an error costs: the request, and the connection.
+    ;; A heap worn out by many small allocations can be out of reach of any
     ;; catch — the collector can run out of room itself, and that ends the
-    ;; process before anything is signalled — so this is containment for
-    ;; the request that asked too much, not a defence against running out.
-    ;; Every catch around application code in this framework takes the
-    ;; same pair, for this reason.
-    ((or error storage-condition) (e)
+    ;; process before anything is signalled — so for the heap this is
+    ;; containment for the request that asked too much, not a defence
+    ;; against running out. SB-SYS:INTERACTIVE-INTERRUPT, the remaining one,
+    ;; is delivered to the main thread and never reaches a worker.
+    ;;
+    ;; Every catch around application code in this framework takes
+    ;; SERIOUS-CONDITION, for this reason. What it gives up is the reason
+    ;; SBCL keeps the timeouts out of ERROR: a timeout armed outside one of
+    ;; these catches, firing while the code inside it runs, is taken as that
+    ;; code's failure. A worker has no outside — nothing in the framework
+    ;; arms a timeout — and the two catches that can run on an
+    ;; application's own thread are the fetch address filter and the
+    ;; shutdown hooks, whose contracts (a raise refuses the address; one
+    ;; hook cannot stop the rest) are the ones a condition passing through
+    ;; would break.
+    (serious-condition (e)
       ;; This connection's own descriptor failed under a read or a write: the
       ;; peer reset, or the network between us did. Answered the way an end of
       ;; stream is, by closing and nothing else. A 500 would be addressed to
@@ -1697,8 +1716,8 @@
       ;; order is written down.
       (when on-tick
         (handler-case (funcall on-tick *worker-id*)
-          ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-          ((or error storage-condition) (e)
+          ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+          (serious-condition (e)
             ;; A hook that raises every pass would log at the wake rate —
             ;; twenty lines a second per worker at the cadence a fan-out
             ;; demo wants — and every one of them takes *LOG-LOCK*, which
@@ -1862,11 +1881,11 @@
           ;; Normal exit (shutdown requested)
           (log-info "worker ~d stopped" worker-id)
           (return)))
-      ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch. Here
-      ;; it is the backstop for one raised outside every narrower catch,
-      ;; where a restart costs this worker's connections and an uncaught
-      ;; condition costs the process.
-      ((or error storage-condition) (e)
+      ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+      ;; Here it is the backstop for one raised outside every narrower
+      ;; catch, where a restart costs this worker's connections and an
+      ;; uncaught condition costs the process.
+      (serious-condition (e)
         (log-error "worker ~d crashed: ~a — restarting" worker-id e)
         ;; 1-second backoff, sliced into *worker-wake-interval*
         ;; chunks so a SIGTERM arriving during the backoff is noticed

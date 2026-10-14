@@ -447,8 +447,8 @@
     (when fn
       (setf (connection-stream-on-close conn) nil)
       (handler-case (funcall fn conn reason)
-        ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-        ((or error storage-condition) (e)
+        ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+        (serious-condition (e)
           (log-warn "stream on-close signalled on fd ~d (~a): ~a"
                     (connection-fd conn) reason e))))))
 

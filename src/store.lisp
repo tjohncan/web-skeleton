@@ -182,11 +182,11 @@
                      (let ((n (reap-store store)))
                        (when (> n 0)
                          (log-info "store reaped ~d entr~:@p" n)))
-                   ;; STORAGE-CONDITION too, as every catch around
+                   ;; SERIOUS-CONDITION, not ERROR, as every catch around
                    ;; application code takes it: see HANDLE-CLIENT-READ's
                    ;; last catch. EXPIRY-FN is application code, and this
                    ;; thread has nothing above it to catch what this misses.
-                   ((or error storage-condition) (e)
+                   (serious-condition (e)
                      (log-error "store reaper error: ~a" e))))))
            :name "web-skeleton-store-reaper"))
     (register-cleanup (lambda () (stop-store-reaper store)))))

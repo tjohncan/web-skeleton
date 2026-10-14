@@ -146,35 +146,37 @@
             (web-skeleton:*log-stream* (make-broadcast-stream)))
         (web-skeleton::run-shutdown-hooks)))))
 
-(defun test-store-reaper-survives-a-storage-condition ()
-  "An expiry predicate that runs out of stack costs one sweep, not the
-   reaper.
+(defun test-store-reaper-survives-a-serious-condition ()
+  "An expiry predicate that runs out of stack, or out of the time it gave
+   itself, costs one sweep, not the reaper.
 
    The reaper is a thread of its own with nothing above it, so a condition
    its catch lets past ends it — and SBCL ends the process with it when the
-   debugger is disabled. STORAGE-CONDITION is not an ERROR, so a catch on
-   ERROR alone is that catch. The predicate runs out of stack on its first
-   call only; the entries it would have reaped on later sweeps being gone
-   is the evidence that later sweeps happened."
-  (format t "~%Store reaper: a predicate out of stack~%")
+   debugger is disabled. Neither STORAGE-CONDITION nor SB-EXT:TIMEOUT is an
+   ERROR, so a catch on ERROR alone is that catch. The predicate runs out
+   of stack on its first call and out of time on its second, each ending
+   its sweep; the entries a later sweep would reap being gone is the
+   evidence that a later sweep happened."
+  (format t "~%Store reaper: a predicate out of stack, then out of time~%")
   (let ((web-skeleton::*shutdown-hooks* nil)
-        (blown nil))
+        (calls 0))
     (call-with-escapes-ending-the-thread
      (lambda ()
        (let ((s (make-store
                  :expiry-fn (lambda (k v)
                               (declare (ignore k))
-                              (unless blown
-                                (setf blown t)
-                                (%exhaust-the-stack 0))
+                              (case (incf calls)
+                                (1 (%exhaust-the-stack 0))
+                                (2 (%run-out-of-time)))
                               (eq v :doomed))
                  :reap-interval 0.2)))
          (store-set s "keep" :alive)
          (store-set s "doomed" :doomed)
-         ;; The first sweep is the one that runs out; two more fit in the
-         ;; wait with room for the scheduler.
-         (sleep 0.9)
-         (check "reaper: the predicate did run out of stack" blown t)
+         ;; The first two sweeps are the ones that fail; a third fits in
+         ;; the wait with room for the scheduler.
+         (sleep 1.2)
+         (check "reaper: the predicate did run out of stack, then time"
+                (>= calls 2) t)
          (check "reaper: and a later sweep still reaped"
                 (store-count s) 1)
          (let ((web-skeleton:*log-level* :error)
@@ -219,7 +221,7 @@
   (test-store-map)
   (test-store-validation)
   (test-store-reaper)
-  (test-store-reaper-survives-a-storage-condition)
+  (test-store-reaper-survives-a-serious-condition)
   (test-store-thread-safety)
   (report-suite "Store")
   (zerop *tests-failed*))

@@ -134,8 +134,8 @@
     (cond
       ((null filter) t)
       ((handler-case (funcall filter ip family host)
-         ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-         ((or error storage-condition) (e)
+         ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+         (serious-condition (e)
            (log-error "fetch: address filter raised on ~a (host ~a): ~a ~
                        — refusing address"
                       (format-ip ip) host e)
@@ -1862,9 +1862,9 @@
                                      "connection error after partial read")))
              (t
               (deliver-fetch-error conn epoll-fd "connection error"))))))
-    ;; STORAGE-CONDITION too, because :ON-BODY runs inside this: see
+    ;; SERIOUS-CONDITION, not ERROR, because :ON-BODY runs inside this: see
     ;; HANDLE-CLIENT-READ's last catch in main.lisp.
-    ((or error storage-condition) (e)
+    (serious-condition (e)
       (log-error "outbound error fd ~d: ~a" (connection-fd conn) e)
       ;; Skip the error-delivery if the connection was already torn
       ;; down (e.g. complete-fetch ran earlier in this call and
@@ -2327,8 +2327,9 @@
       (flet ((invoke () (funcall callback s h b)))
         (if (eq outcome :aborted)
             (handler-case (invoke)
-              ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-              ((or error storage-condition) (e)
+              ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last
+              ;; catch.
+              (serious-condition (e)
                 (log-warn "fetch cleanup callback raised: ~a" e)
                 nil))
             (invoke))))))
@@ -2392,8 +2393,8 @@
     (handler-case
         (finish-fetch callback outcome
                       :status status :headers headers :body body)
-      ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-      ((or error storage-condition) (e)
+      ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+      (serious-condition (e)
         (log-warn "detached fetch callback raised for fd ~d: ~a" target-fd e))))
   ;; Looked up again: the callback may have closed the connection, and on
   ;; a reused fd number it may not even be the same one.
@@ -2651,8 +2652,9 @@
                     (epoll-modify epoll-fd (connection-fd inbound)
                                   (logior +epollout+ +epollet+))
                     (log-debug "fetch: resumed fd ~d" inbound-fd)))
-              ;; STORAGE-CONDITION too: see HANDLE-CLIENT-READ's last catch.
-              ((or error storage-condition) (e)
+              ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last
+              ;; catch.
+              (serious-condition (e)
                 (log-error "fetch callback error: ~a" e)
                 (let ((err-bytes (strip-body-for-head
                                   (format-response

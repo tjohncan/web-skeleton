@@ -9132,19 +9132,24 @@
       (check "a hook raising on every pass is reported once, not every pass"
              reports 1))))
 
-(defun %storage-condition-p (thunk)
-  "What THUNK signals, as (STORAGE-CONDITION-P ERROR-P), or :RETURNED."
+(defun %what-escapes (thunk)
+  "What THUNK signals, as (STORAGE-CONDITION-P TIMEOUT-P ERROR-P), or
+   :RETURNED."
   (handler-case (progn (funcall thunk) :returned)
     (serious-condition (c)
-      (list (typep c 'storage-condition) (typep c 'error)))))
+      (list (typep c 'storage-condition)
+            (typep c 'sb-ext:timeout)
+            (typep c 'error)))))
 
-(defun test-storage-conditions-cost-the-request ()
-  "Application code that runs out of stack or heap costs its own request,
-   and nothing more.
+(defun test-serious-conditions-cost-the-request ()
+  "Application code that runs out of stack, out of heap, or out of the time
+   it gave itself costs its own request, and nothing more.
 
-   Both signal a STORAGE-CONDITION, which is not an ERROR, so every catch
-   written as (ERROR (E) ...) let it past, RUN-WORKER's included, and SBCL
-   ended the process: one request's recursion took the whole server down.
+   The first two signal a STORAGE-CONDITION and the third an SB-EXT:TIMEOUT,
+   and none of them is an ERROR, so a catch written as (ERROR (E) ...) lets
+   it past — RUN-WORKER's included — and SBCL ends the process: one
+   request's recursion, or one slow upstream behind a handler's own
+   WITH-TIMEOUT, takes the whole server down.
 
    One server for every site an HTTP request can reach, asserted in an
    order where each answer is read off the request that caused it. Under
@@ -9154,15 +9159,18 @@
    being asserted against. The checks between the failures are the
    server still answering, and they are what separate a 500 from a worker
    that happened to restart in time."
-  (format t "~%storage conditions: what the stack or heap costs is one request~%")
-  ;; The premise. If either of these were an ERROR, every check below
-  ;; would pass against code that never names STORAGE-CONDITION.
+  (format t "~%serious conditions: stack, heap or a handler's own timeout cost one request~%")
+  ;; The premise. If any of these were an ERROR, every check below would
+  ;; pass against code that never looks past ERROR.
   (check "premise: unbounded recursion is a storage-condition, not an error"
-         (%storage-condition-p (lambda () (%exhaust-the-stack 0)))
-         '(t nil))
+         (%what-escapes (lambda () (%exhaust-the-stack 0)))
+         '(t nil nil))
   (check "premise: an allocation past the heap is one too"
-         (%storage-condition-p #'%exhaust-the-heap)
-         '(t nil))
+         (%what-escapes #'%exhaust-the-heap)
+         '(t nil nil))
+  (check "premise: the end of a with-timeout is a timeout, not an error"
+         (%what-escapes #'%run-out-of-time)
+         '(nil t nil))
   (let ((upstream-port nil))
     (call-with-escapes-ending-the-thread
      (lambda ()
@@ -9170,82 +9178,106 @@
            (:handler
             (lambda (req)
               (let ((path (http-request-path req)))
-                (cond
-                  ((string= path "/stack") (%exhaust-the-stack 0))
-                  ((string= path "/heap") (%exhaust-the-heap))
-                  ((string= path "/ws") :upgrade)
-                  ((string= path "/upstream") (make-text-response 200 "up"))
-                  ((string= path "/upstream-chunked")
-                   (make-stream-response
-                    :on-open (lambda (c)
-                               (stream-send c (sb-ext:string-to-octets
-                                               "chunk" :external-format :ascii))
-                               (stream-close c))))
-                  ((string= path "/then")
-                   (defer-to-fetch :get (format nil "http://127.0.0.1:~d/upstream"
-                                                upstream-port)
-                     :then (lambda (s h b)
-                             (declare (ignore s h b))
-                             (%exhaust-the-stack 0))))
-                  ((string= path "/on-body")
-                   (http-fetch :get (format nil "http://127.0.0.1:~d/upstream-chunked"
-                                            upstream-port)
-                               :on-body (lambda (out chunk)
-                                          (declare (ignore out chunk))
-                                          (%exhaust-the-stack 0))
-                               :then (lambda (s h b)
-                                       (declare (ignore s h b))
-                                       (make-text-response 200 "unreached"))))
-                  (t (make-text-response 200 "alive")))))
+                (flet ((fetch-then (fail)
+                         (defer-to-fetch :get (format nil "http://127.0.0.1:~d/upstream"
+                                                      upstream-port)
+                           :then (lambda (s h b)
+                                   (declare (ignore s h b))
+                                   (funcall fail))))
+                       (fetch-on-body (fail)
+                         (http-fetch :get (format nil "http://127.0.0.1:~d/upstream-chunked"
+                                                  upstream-port)
+                                     :on-body (lambda (out chunk)
+                                                (declare (ignore out chunk))
+                                                (funcall fail))
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (make-text-response 200 "unreached")))))
+                  (cond
+                    ((string= path "/stack") (%exhaust-the-stack 0))
+                    ((string= path "/heap") (%exhaust-the-heap))
+                    ((string= path "/late") (%run-out-of-time))
+                    ((string= path "/ws") :upgrade)
+                    ((string= path "/upstream") (make-text-response 200 "up"))
+                    ((string= path "/upstream-chunked")
+                     (make-stream-response
+                      :on-open (lambda (c)
+                                 (stream-send c (sb-ext:string-to-octets
+                                                 "chunk" :external-format :ascii))
+                                 (stream-close c))))
+                    ((string= path "/then")
+                     (fetch-then (lambda () (%exhaust-the-stack 0))))
+                    ((string= path "/then-late") (fetch-then #'%run-out-of-time))
+                    ((string= path "/on-body")
+                     (fetch-on-body (lambda () (%exhaust-the-stack 0))))
+                    ((string= path "/on-body-late")
+                     (fetch-on-body #'%run-out-of-time))
+                    (t (make-text-response 200 "alive"))))))
             :ws-handler (lambda (conn frame)
-                          (declare (ignore conn frame))
-                          (%exhaust-the-stack 0)))
+                          (declare (ignore conn))
+                          (if (equalp (ws-frame-payload frame)
+                                      (sb-ext:string-to-octets
+                                       "late" :external-format :ascii))
+                              (%run-out-of-time)
+                              (%exhaust-the-stack 0))))
          (setf upstream-port *test-port*)
          (flet ((status (path)
-                  (attempt (values (test-http-request :get path)))))
-           (check "a handler out of stack is answered 500" (status "/stack") 500)
-           (check "and the server answers the next request" (status "/") 200)
-           (check "a handler out of heap is answered 500" (status "/heap") 500)
-           (check "and the next one after that" (status "/") 200)
-           (check "a fetch :then out of stack is answered 500" (status "/then") 500)
-           (check "an :on-body out of stack fails its fetch, 502"
-                  (status "/on-body") 502)
-           ;; The WebSocket arm closes without a frame, exactly as it does for
-           ;; an ERROR: a WS-SEND may have left part of a frame on the wire.
-           (let* ((sock (attempt (connect-to-test-server)))
-                  (stream (and (typep sock 'sb-bsd-sockets:socket)
-                               (sb-bsd-sockets:socket-make-stream
-                                sock :input t :output t
-                                :element-type '(unsigned-byte 8)))))
-             (unwind-protect
-                  (check "a ws-handler out of stack closes its connection, unanswered"
+                  (attempt (values (test-http-request :get path))))
+                (ws-answer (text)
+                  ;; What a WebSocket gets back for one frame of TEXT.
+                  (let* ((sock (attempt (connect-to-test-server)))
+                         (stream (and (typep sock 'sb-bsd-sockets:socket)
+                                      (sb-bsd-sockets:socket-make-stream
+                                       sock :input t :output t
+                                       :element-type '(unsigned-byte 8)))))
+                    (unwind-protect
                          (and stream
                               (search "101" (%ws-client-upgrade stream))
                               (progn
-                                (write-sequence (%ws-client-frame 1 "deep") stream)
+                                (write-sequence (%ws-client-frame 1 text) stream)
                                 (force-output stream)
                                 (multiple-value-bind (buf reason)
                                     (read-until-bounded stream :seconds 3)
                                   (list reason (fill-pointer buf)))))
-                         '(:eof 0))
-               (when stream (ignore-errors (close stream)))
-               (when (typep sock 'sb-bsd-sockets:socket)
-                 (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+                      (when stream (ignore-errors (close stream)))
+                      (when (typep sock 'sb-bsd-sockets:socket)
+                        (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
+           (check "a handler out of stack is answered 500" (status "/stack") 500)
+           (check "and the server answers the next request" (status "/") 200)
+           (check "a handler out of heap is answered 500" (status "/heap") 500)
+           (check "and the next one after that" (status "/") 200)
+           (check "a handler whose own with-timeout ran out is answered 500"
+                  (status "/late") 500)
+           (check "and the next one after that, too" (status "/") 200)
+           (check "a fetch :then out of stack is answered 500" (status "/then") 500)
+           (check "a fetch :then whose with-timeout ran out is answered 500"
+                  (status "/then-late") 500)
+           (check "an :on-body out of stack fails its fetch, 502"
+                  (status "/on-body") 502)
+           (check "an :on-body whose with-timeout ran out fails its fetch, 502"
+                  (status "/on-body-late") 502)
+           ;; The WebSocket arm closes without a frame, exactly as it does for
+           ;; an ERROR: a WS-SEND may have left part of a frame on the wire.
+           (check "a ws-handler out of stack closes its connection, unanswered"
+                  (ws-answer "deep") '(:eof 0))
+           (check "a ws-handler whose with-timeout ran out closes it the same way"
+                  (ws-answer "late") '(:eof 0))
            (check "and the server answers after that too" (status "/") 200)))))))
 
-(defun test-storage-conditions-spare-the-hook ()
-  "An :ON-TICK hook that runs out of stack is reported like one that raises,
-   and the loop keeps turning.
+(defun test-serious-conditions-spare-the-hook ()
+  "An :ON-TICK hook that runs out of stack, or out of the time it gave
+   itself, is reported like one that raises, and the loop keeps turning.
 
    A server of its own, because under a revert the escape ends the worker
    on its first pass, before any request could tell one site from another.
    Asserted on the pass count, as TEST-ON-TICK-SURVIVES-A-RAISING-HOOK is
    and for its reason: RUN-WORKER restarts a crashed worker, so a server
-   that still answers proves nothing about the loop that was running."
-  (format t "~%storage conditions: an :on-tick hook out of stack~%")
+   that still answers proves nothing about the loop that was running. The
+   first pass runs out of stack and the second out of time, so a loop that
+   survives only one of them stops after it."
+  (format t "~%serious conditions: an :on-tick hook out of stack, then out of time~%")
   (let ((ticks 0)
-        (blown nil)
-        (lock (sb-thread:make-mutex :name "storage-tick"))
+        (lock (sb-thread:make-mutex :name "serious-tick"))
         (log (make-string-output-stream))
         (saved-stream web-skeleton::*log-stream*))
     (setf web-skeleton::*log-stream* log)
@@ -9254,89 +9286,151 @@
           (lambda ()
             (with-test-server (:on-tick (lambda (id)
                                           (declare (ignore id))
-                                          (sb-thread:with-mutex (lock)
-                                            (incf ticks))
-                                          (unless blown
-                                            (setf blown t)
-                                            (%exhaust-the-stack 0))))
+                                          (case (sb-thread:with-mutex (lock)
+                                                  (incf ticks))
+                                            (1 (%exhaust-the-stack 0))
+                                            (2 (%run-out-of-time)))))
               (sleep 0.4)
-              (check "the hook ran out of stack and the loop kept turning"
+              (check "the hook ran out of stack, then time, and the loop kept turning"
                      (> (sb-thread:with-mutex (lock) ticks) 3)
                      t))))
       (setf web-skeleton::*log-stream* saved-stream))
     (let ((text (get-output-stream-string log)))
-      (check "the hook's storage condition was reported"
+      (check "the hook's first condition was reported"
              (not (null (search ":on-tick raised" text))) t)
-      (check "and no worker crashed and restarted for it"
+      (check "and no worker crashed and restarted for either"
              (search "crashed" text) nil))))
 
-(defun test-storage-conditions-at-the-callback-sites ()
+(defun test-serious-conditions-at-the-backstop ()
+  "A timeout that reaches a worker outside every narrower catch restarts
+   that worker; it does not end the process.
+
+   SB-EXT:WITH-TIMEOUT delivers its TIMEOUT by interrupting the thread
+   from a timer, and a timer that expires as the timed call returns can
+   deliver it after the call has left: into the event loop, outside every
+   catch around application code. RUN-WORKER's backstop is what remains
+   there, and a backstop on ERROR alone lets a TIMEOUT through.
+
+   Delivered here the way the timer delivers it, by INTERRUPT-THREAD, to a
+   worker with nothing to do, so it lands in the loop rather than inside a
+   request's catch. Under a revert it ends the worker — through
+   CALL-WITH-ESCAPES-ENDING-THE-THREAD, rather than the process — and the
+   server never answers again."
+  (format t "~%serious conditions: a stray timeout at RUN-WORKER's backstop~%")
+  (let ((log (make-string-output-stream))
+        (saved-stream web-skeleton::*log-stream*))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (call-with-escapes-ending-the-thread
+          (lambda ()
+            (with-test-server (:handler (lambda (req)
+                                          (declare (ignore req))
+                                          (make-text-response 200 "ok")))
+              (flet ((answers-p (seconds)
+                       ;; Retried: across a restart there is a second with
+                       ;; no listener, and a refused connect is expected.
+                       (let ((deadline (+ (get-internal-real-time)
+                                          (* seconds
+                                             internal-time-units-per-second))))
+                         (loop
+                           (when (eql (attempt (values (test-http-request
+                                                        :get "/")))
+                                      200)
+                             (return t))
+                           (when (> (get-internal-real-time) deadline)
+                             (return nil))
+                           (sleep 0.1)))))
+                (check "control: the server answers before the timeout"
+                       (answers-p 2) t)
+                (let ((worker (find "web-skeleton-0" (sb-thread:list-all-threads)
+                                    :key #'sb-thread:thread-name
+                                    :test #'equal)))
+                  (check "control: the worker thread was found" (not (null worker)) t)
+                  (when worker
+                    (sb-thread:interrupt-thread
+                     worker (lambda () (error 'sb-ext:timeout)))))
+                ;; The restart backs off a second before it binds again.
+                (check "the worker took the timeout, restarted, and answers"
+                       (answers-p 6) t)))))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (check "the log names the restart"
+           (not (null (search "crashed" (get-output-stream-string log))))
+           t)))
+
+(defun test-serious-conditions-at-the-callback-sites ()
   "Each remaining place application code is called, given a callback that
-   runs out of stack, returns the way it returns for one that raises.
+   runs out of stack or out of the time it gave itself, returns the way it
+   returns for one that raises.
 
    Driven directly rather than through a server: these are teardown paths
    and policy hooks, where the answer is that the call came back and what
    it came back with. Under a revert the condition leaves the call, and
-   %STORAGE-CONDITION-P reports it in place of the answer."
-  (format t "~%storage conditions: the callback sites~%")
+   %WHAT-ESCAPES reports it in place of the answer."
+  (format t "~%serious conditions: the callback sites~%")
   (let ((web-skeleton:*log-stream* (make-broadcast-stream)))
-    ;; Fails closed, the same as a raising filter: no address is dialed on
-    ;; the word of a policy that could not answer.
-    (let ((web-skeleton:*fetch-address-filter*
-            (lambda (ip family host)
-              (declare (ignore ip family host))
-              (%exhaust-the-stack 0))))
-      (check "an address filter out of stack refuses the address"
-             (%storage-condition-p
-              (lambda ()
-                (web-skeleton::fetch-address-allowed-p #(93 184 216 34) :inet "x")))
-             :returned)
-      (check "and the answer is a refusal"
-             (handler-case
-                 (web-skeleton::fetch-address-allowed-p #(93 184 216 34) :inet "x")
-               (serious-condition () :escaped))
-             nil))
-    (check "a stream's :on-close out of stack is absorbed like a raise"
-           (%storage-condition-p
-            (lambda ()
-              (web-skeleton::notify-stream-closed
-               (web-skeleton::make-connection
-                :fd -1
-                :stream-on-close (lambda (conn reason)
-                                   (declare (ignore conn reason))
-                                   (%exhaust-the-stack 0)))
-               :closed)))
-           :returned)
-    (check "a fetch cleanup callback out of stack is absorbed"
-           (%storage-condition-p
-            (lambda ()
-              (web-skeleton::finish-fetch (lambda (s h b)
-                                            (declare (ignore s h b))
-                                            (%exhaust-the-stack 0))
-                                          :aborted)))
-           :returned)
-    (check "a detached fetch's :then out of stack is absorbed"
-           (%storage-condition-p
-            (lambda ()
-              (let ((web-skeleton::*connections* (make-hash-table)))
-                (web-skeleton::deliver-detached
-                 4242 -1 (lambda (s h b)
-                           (declare (ignore s h b))
-                           (%exhaust-the-stack 0))
-                 :delivered :status 200))))
-           :returned)
-    ;; LIFO: the hook registered last runs first, so the one that runs out of
-    ;; stack is registered second and the one that records is registered
-    ;; first. Reaching the recorder is the claim — a raise must not stop the
-    ;; rest.
-    (let* ((reached nil)
-           (web-skeleton::*shutdown-hooks* nil))
-      (web-skeleton:register-cleanup (lambda () (setf reached t)))
-      (web-skeleton:register-cleanup (lambda () (%exhaust-the-stack 0)))
-      (check "a shutdown hook out of stack does not stop the next one"
-             (list (%storage-condition-p #'web-skeleton::run-shutdown-hooks)
-                   reached)
-             '(:returned t)))))
+    (loop
+      for (how . fail) in (list (cons "out of stack" (lambda () (%exhaust-the-stack 0)))
+                                (cons "out of time" #'%run-out-of-time))
+      do (let ((fail fail))
+           ;; Fails closed, the same as a raising filter: no address is
+           ;; dialed on the word of a policy that could not answer.
+           (let ((web-skeleton:*fetch-address-filter*
+                   (lambda (ip family host)
+                     (declare (ignore ip family host))
+                     (funcall fail))))
+             (check (format nil "an address filter ~a refuses the address" how)
+                    (%what-escapes
+                     (lambda ()
+                       (web-skeleton::fetch-address-allowed-p
+                        #(93 184 216 34) :inet "x")))
+                    :returned)
+             (check (format nil "and the answer to a filter ~a is a refusal" how)
+                    (handler-case
+                        (web-skeleton::fetch-address-allowed-p
+                         #(93 184 216 34) :inet "x")
+                      (serious-condition () :escaped))
+                    nil))
+           (check (format nil "a stream's :on-close ~a is absorbed like a raise" how)
+                  (%what-escapes
+                   (lambda ()
+                     (web-skeleton::notify-stream-closed
+                      (web-skeleton::make-connection
+                       :fd -1
+                       :stream-on-close (lambda (conn reason)
+                                          (declare (ignore conn reason))
+                                          (funcall fail)))
+                      :closed)))
+                  :returned)
+           (check (format nil "a fetch cleanup callback ~a is absorbed" how)
+                  (%what-escapes
+                   (lambda ()
+                     (web-skeleton::finish-fetch (lambda (s h b)
+                                                   (declare (ignore s h b))
+                                                   (funcall fail))
+                                                 :aborted)))
+                  :returned)
+           (check (format nil "a detached fetch's :then ~a is absorbed" how)
+                  (%what-escapes
+                   (lambda ()
+                     (let ((web-skeleton::*connections* (make-hash-table)))
+                       (web-skeleton::deliver-detached
+                        4242 -1 (lambda (s h b)
+                                  (declare (ignore s h b))
+                                  (funcall fail))
+                        :delivered :status 200))))
+                  :returned)
+           ;; LIFO: the hook registered last runs first, so the failing one
+           ;; is registered second and the one that records is registered
+           ;; first. Reaching the recorder is the claim — a raise must not
+           ;; stop the rest.
+           (let* ((reached nil)
+                  (web-skeleton::*shutdown-hooks* nil))
+             (web-skeleton:register-cleanup (lambda () (setf reached t)))
+             (web-skeleton:register-cleanup (lambda () (funcall fail)))
+             (check (format nil "a shutdown hook ~a does not stop the next one" how)
+                    (list (%what-escapes #'web-skeleton::run-shutdown-hooks)
+                          reached)
+                    '(:returned t)))))))
 
 (defun test-on-tick-validated-at-boot ()
   "START-SERVER refuses a non-function :ON-TICK before it binds.
@@ -10365,9 +10459,10 @@
   (test-fetch-timeout-validated-at-boot)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
-  (test-storage-conditions-cost-the-request)
-  (test-storage-conditions-spare-the-hook)
-  (test-storage-conditions-at-the-callback-sites)
+  (test-serious-conditions-cost-the-request)
+  (test-serious-conditions-spare-the-hook)
+  (test-serious-conditions-at-the-backstop)
+  (test-serious-conditions-at-the-callback-sites)
   (test-on-tick-validated-at-boot)
   (test-map-worker-websockets-visits-only-websockets)
   (test-map-worker-websockets-skips-what-a-callback-closed)

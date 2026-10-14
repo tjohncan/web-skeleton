@@ -173,7 +173,7 @@ specific status, not a blanket 400:
 | `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
 | `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
-| `500 Internal Server Error` | Your handler raised — an error, or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Either costs that request and nothing more. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
+| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
 
 **The 503 says overloaded, where silence would say crashed.** A worker at
 `*max-connections*` answers before it closes, so a client can tell a full

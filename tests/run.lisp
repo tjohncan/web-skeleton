@@ -216,10 +216,11 @@
      (error (e) (princ-to-string e))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Storage conditions, raised on purpose
+;;; Serious conditions that are not errors, raised on purpose
 ;;;
 ;;; Unbounded recursion and an allocation larger than the heap both signal a
-;;; STORAGE-CONDITION, which is a SERIOUS-CONDITION and not an ERROR: ATTEMPT
+;;; STORAGE-CONDITION, and the end of an SB-EXT:WITH-TIMEOUT signals an
+;;; SB-EXT:TIMEOUT. Each is a SERIOUS-CONDITION and not an ERROR: ATTEMPT
 ;;; does not catch one, and neither does a HANDLER-CASE on ERROR anywhere in
 ;;; the framework that is meant to. A test asserting that the framework
 ;;; contains one has to survive the framework not doing so, or a revert does
@@ -238,6 +239,14 @@
    satisfy it, so SBCL signals at once rather than after a struggle."
   (make-array (1+ (sb-ext:dynamic-space-size))
               :element-type '(unsigned-byte 8)))
+
+(defun %run-out-of-time ()
+  "Wait inside SB-EXT:WITH-TIMEOUT for far longer than it allows. A real
+   timer and a real TIMEOUT, rather than a TIMEOUT made with ERROR, because
+   the timer interrupts the thread from outside and the condition arrives
+   the way an application's own WITH-TIMEOUT delivers it."
+  (sb-ext:with-timeout 0.01
+    (sleep 10)))
 
 (defun call-with-escapes-ending-the-thread (thunk)
   "Call THUNK with a condition that escapes every handler on some thread

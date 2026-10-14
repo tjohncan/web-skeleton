@@ -714,7 +714,9 @@
                ;; held the socket open would accept the second
                ;; request and respond, flipping GOT-SECOND to T.
                ;; SB-EXT:WITH-TIMEOUT bounds the probe so a pathological
-               ;; regression doesn't hang the suite.
+               ;; regression doesn't hang the suite. The TIMEOUT it signals
+               ;; is not an ERROR, so it is named in the catch; a catch on
+               ;; ERROR alone would let it end the run instead.
                (let ((got-second nil))
                  (handler-case
                      (sb-ext:with-timeout 1
@@ -722,7 +724,7 @@
                        (force-output stream)
                        (let ((b (read-byte stream nil nil)))
                          (when b (setf got-second t))))
-                   (error () nil))
+                   ((or error sb-ext:timeout) () nil))
                  (check "handler close: second request on same socket fails"
                         got-second nil))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
@@ -789,7 +791,8 @@
                          (force-output stream)
                          (let ((b (read-byte stream nil nil)))
                            (when b (setf got-second t))))
-                     (error () nil))
+                     ;; TIMEOUT named beside ERROR, as in the test above.
+                     ((or error sb-ext:timeout) () nil))
                    (check "fetch close: second request on same socket fails"
                           got-second nil))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
