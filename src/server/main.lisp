@@ -1306,10 +1306,12 @@
                                 (connection-fd conn) e)
                       (close-connection conn epoll-fd)
                       (return-from handle-client-read)))
-                ;; Every branch appends rather than replaces. The handler
-                ;; may already have queued frames through WS-SEND, and
-                ;; CONNECTION-QUEUE-WRITE would either clobber them or,
-                ;; now that its guard counts the queue, signal.
+                ;; The replies are queued already, by WEBSOCKET-ON-READ, in
+                ;; the order they were produced among the handler's own
+                ;; WS-SEND frames. What is left is the close frame, which
+                ;; appends behind them rather than replacing anything:
+                ;; CONNECTION-QUEUE-WRITE would clobber the queue or, since
+                ;; its guard counts the queue, signal.
                 (cond
                   ;; Close requested — send close frame back, then shut down
                   ((eq response :close)
@@ -1319,23 +1321,18 @@
                      (connection-append-write conn close-frame))
                    ;; Mark as closing so on-write knows to disconnect
                    (setf (connection-state conn) :closing))
-                  ;; Response frame(s) to send
-                  (response
-                   (unless (connection-append-write conn response)
-                     ;; The handler produced a frame for a peer already at
-                     ;; *MAX-WRITE-BACKLOG*. Dropping it would leave the
-                     ;; app's view of the stream and the peer's permanently
-                     ;; different with nothing raised anywhere, so the
-                     ;; connection goes instead.
-                     (log-warn "ws backlog full fd ~d (~d bytes pending) — closing"
-                               (connection-fd conn)
-                               (connection-write-pending conn))
-                     (close-connection conn epoll-fd)
-                     (return-from handle-client-read))
-                   (setf (connection-state conn) :websocket))
-                  ;; No response. If the buffer is at capacity (no frames
-                  ;; were consumed), a partial frame exceeds our limit —
-                  ;; close with 1009 to prevent a spin loop.
+                  ;; A reply met *MAX-WRITE-BACKLOG*; WEBSOCKET-ON-READ's
+                  ;; QUEUE-REPLY has why the connection goes.
+                  ((eq response :backlog-full)
+                   (log-warn "ws backlog full fd ~d (~d bytes pending) — closing"
+                             (connection-fd conn)
+                             (connection-write-pending conn))
+                   (close-connection conn epoll-fd)
+                   (return-from handle-client-read))
+                  ;; If the buffer is at capacity, no frame was consumed —
+                  ;; consuming one shifts the rest down — so a partial
+                  ;; frame exceeds our limit: close with 1009 to prevent a
+                  ;; spin loop.
                   (t
                    (when (>= (connection-read-pos conn)
                              (length (connection-read-buf conn)))

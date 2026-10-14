@@ -496,15 +496,12 @@
   "REPLY, a ws-handler's return value, if it is one the write queue can
    carry: NIL for no reply, or a frame's bytes. Signals otherwise.
 
-   Checked where the reply is received, because nothing further along
-   answers it one way. WEBSOCKET-ON-READ joins two or more replies into one
-   vector, and a string among them raises there, inside the catch that
-   closes the WebSocket; a single reply is handed on untouched, and a
-   string raises later, in CONNECTION-APPEND-WRITE, where the catch is the
-   HTTP request path's and its answer is a 500 written onto an established
-   WebSocket. One mistake, two outcomes, chosen by how many frames shared
-   the read. Raised here, it is the first in both, and the message names
-   the fix the way DISPATCH-REQUEST's does for an HTTP handler."
+   Checked where the reply is received, before WEBSOCKET-ON-READ queues
+   it. CONNECTION-APPEND-WRITE declares its argument a byte vector, so a
+   string would otherwise raise inside the queue, with a message about a
+   type declaration rather than about the handler. Raised here, it raises
+   inside the catch that closes the WebSocket, and the message names the
+   fix the way DISPATCH-REQUEST's does for an HTTP handler."
   (unless (or (null reply)
               (typep reply '(simple-array (unsigned-byte 8) (*))))
     (error "ws-handler returned ~a; expected NIL, or a frame's bytes from ~
@@ -523,38 +520,41 @@
 ;;; WebSocket event handler
 ;;;
 ;;; Called by the event loop when a WebSocket connection is readable.
-;;; Parses frames from the read buffer and returns response bytes to write,
-;;; or :CLOSE if the connection should be shut down.
+;;; Parses frames from the read buffer, queues each reply on the connection
+;;; as it is produced, and says whether the connection should close.
 ;;; ---------------------------------------------------------------------------
 
 (defun websocket-on-read (conn ws-handler)
   "Process WebSocket frames from CONN's read buffer.
-   Returns a byte vector to write back, :CLOSE, or NIL (no response needed)."
+
+   Every reply goes onto CONN's write queue the moment it exists, the
+   ws-handler's returned frames and the pongs alike, so it is ordered
+   among the frames WS-SEND appends exactly as it was produced. Held back
+   to the end of the batch, a reply would go out behind a WS-SEND made
+   while a later message in the same read was handled, and the order a
+   peer saw would turn on how TCP had segmented its writes.
+
+   Returns (VALUES :CLOSE CLOSE-FRAME) when the connection should close —
+   the caller queues the frame behind the replies already there —
+   :BACKLOG-FULL when a reply was refused at *MAX-WRITE-BACKLOG*, and NIL
+   otherwise."
   (let ((buf (connection-read-buf conn))
         (pos 0)
-        (end (connection-read-pos conn))
-        (responses nil))
+        (end (connection-read-pos conn)))
     (labels ((close-with (code)
-               ;; Tear-down helper for every error-close site. A
-               ;; bare (values :close (build-ws-close NNNN)) would
-               ;; drop the RESPONSES list populated by earlier frames
-               ;; in the same batch — a reply from frame N-1 would be
-               ;; lost if frame N had an RSV bit set. Funneling every
-               ;; site through one helper keeps the concat-then-close
-               ;; shape consistent with the normal close branch.
+               ;; Tear-down helper for every close site, client-initiated
+               ;; or an error's. Replies from earlier frames in the batch
+               ;; are already queued, so the close frame the caller adds
+               ;; lands behind them.
                (ws-shift-buffer conn buf pos end)
-               (let ((close-frame (build-ws-close code)))
-                 (if responses
-                     (let* ((all (nreverse (cons close-frame responses)))
-                            (total (reduce #'+ all :key #'length))
-                            (out (make-array total
-                                              :element-type '(unsigned-byte 8)))
-                            (offset 0))
-                       (dolist (r all)
-                         (replace out r :start1 offset)
-                         (incf offset (length r)))
-                       (values :close out))
-                     (values :close close-frame)))))
+               (values :close (build-ws-close code)))
+             (queue-reply (bytes)
+               ;; A peer already at *MAX-WRITE-BACKLOG* is not draining.
+               ;; Dropping the reply would leave the application's view of
+               ;; the conversation and the peer's permanently different with
+               ;; nothing raised anywhere, so the caller closes instead.
+               (unless (connection-append-write conn bytes)
+                 (return-from websocket-on-read :backlog-full))))
     (loop
       (multiple-value-bind (frame consumed)
           (handler-case
@@ -616,7 +616,7 @@
                        ;; through WS-SEND, so it is counted here.
                        (when response
                          (note-ws-frame)
-                         (push response responses)))))
+                         (queue-reply response)))))
                  ;; First fragment — start accumulating. Enforce the
                  ;; message-size cap on the starting size too, not
                  ;; only on continuation accumulation, so apps that
@@ -684,11 +684,11 @@
                                       (funcall ws-handler conn complete))))
                        (when response
                          (note-ws-frame)
-                         (push response responses))))))))
+                         (queue-reply response))))))))
             ;; Control frames (can arrive between fragments per RFC 6455 §5.4)
             ((= opcode +ws-op-ping+)
              (log-debug "ws ping from client fd ~d" (connection-fd conn))
-             (push (build-ws-pong (ws-frame-payload frame)) responses))
+             (queue-reply (build-ws-pong (ws-frame-payload frame))))
             ((= opcode +ws-op-pong+)
              (log-debug "ws pong fd ~d" (connection-fd conn))
              (setf (connection-missed-pongs conn) 0))
@@ -717,23 +717,12 @@
                      (log-warn "ws invalid UTF-8 in close reason fd ~d"
                                (connection-fd conn))
                      (return-from websocket-on-read (close-with 1007)))))
-               ;; Normal client-initiated close: CLOSE-WITH concatenates
-               ;; any pending responses from earlier frames in this batch
-               ;; with the close frame and shifts the buffer.
+               ;; Normal client-initiated close: the replies to earlier
+               ;; frames in this batch are queued already, and CLOSE-WITH
+               ;; shifts the buffer.
                (return-from websocket-on-read (close-with code))))
             (t
              ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
              (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
              (return-from websocket-on-read (close-with 1002)))))))
-      ;; Concatenate response frames into a single write buffer
-      (when responses
-        (setf responses (nreverse responses))
-        (if (= (length responses) 1)
-            (first responses)
-            (let* ((total (reduce #'+ responses :key #'length))
-                   (out (make-array total :element-type '(unsigned-byte 8)))
-                   (offset 0))
-              (dolist (r responses)
-                (replace out r :start1 offset)
-                (incf offset (length r)))
-              out))))))
+      nil)))

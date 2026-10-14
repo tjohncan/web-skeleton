@@ -3871,13 +3871,11 @@
       (check "fragment reassembly: concatenated payload"
              received-text "hello world"))
 
-    ;; Error-close preserves earlier batch responses. First text
-    ;; frame produces a handler response; second frame has an
-    ;; unknown opcode (5) which triggers close-with 1002. A naive
-    ;; (values :close (build-ws-close NNNN)) at each error site
-    ;; would drop the earlier response on the floor — the
-    ;; close-with helper funnels every error-close through the
-    ;; same concat-then-return path as the normal close branch.
+    ;; Error-close keeps earlier batch replies. The first text frame
+    ;; produces a handler reply; the second has an unknown opcode (5),
+    ;; which closes with 1002. The reply is on the write queue by then,
+    ;; ahead of where the caller puts the close frame, so a close cannot
+    ;; drop it.
     (let* ((good (make-masked-frame t 1 #(104 105)))  ; text "hi"
            (bad  (make-masked-frame t 5 #()))         ; unknown opcode 5
            (buf  (concatenate '(simple-array (unsigned-byte 8) (*))
@@ -3889,24 +3887,18 @@
             (web-skeleton::connection-read-pos conn) (length buf))
       (let ((handler (lambda (c frame)
                        (declare (ignore c frame))
-                       ;; Return raw bytes — websocket-on-read pushes
-                       ;; into RESPONSES.
                        reply)))
-        (multiple-value-bind (action response)
+        (multiple-value-bind (action close-frame)
             (web-skeleton::websocket-on-read conn handler)
           (check "error-close action :close" action :close)
-          ;; Response should contain BOTH the reply bytes and a
-          ;; close frame. Search for the literal "REPLY" prefix
-          ;; as the first response, and the 1002 status code in
-          ;; the close frame payload further down.
-          (check "error-close carries earlier response"
-                 (and response (search reply response)) 0)
-          (check "error-close carries close code 1002"
-                 (let ((close-start (+ (length reply) 2)))
-                   (and response
-                        (>= (length response) (+ close-start 2))
-                        (logior (ash (aref response close-start) 8)
-                                (aref response (1+ close-start)))))
+          (check "error-close: the earlier reply is queued"
+                 (equalp (web-skeleton::connection-write-buf conn) reply)
+                 t)
+          (check "error-close: the close frame carries 1002"
+                 (and close-frame
+                      (>= (length close-frame) 4)
+                      (logior (ash (aref close-frame 2) 8)
+                              (aref close-frame 3)))
                  1002))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -10169,19 +10161,14 @@
 (defun test-ws-handler-reply-of-the-wrong-type ()
   "A ws-handler that returns something other than a frame's bytes — a
    string, the commonest slip — has its connection closed, however many
-   frames shared the read.
+   frames shared the read, and nothing is written onto the WebSocket: no
+   HTTP 500, which a client would read as frame bytes.
 
-   The reply is checked where it is received. Handed on unchecked, a
-   single reply fails in the write queue's type declaration, outside the
-   WebSocket's catch and inside the HTTP request path's, whose answer is a
-   500: an HTTP response written onto an established WebSocket, which the
-   client reads as frame bytes. Two replies are joined first and fail
-   inside the WebSocket's catch, which closes. Broken state: the one-reply
-   session receives HTTP/1.1 500.
-
-   The two-reply session is the control for the claim that both shapes now
-   end alike, and the frame-returning session is the control that the
-   check refuses only the wrong type."
+   CHECK-WS-REPLY refuses the reply where it is received, inside the catch
+   that closes the WebSocket, with a message naming the fix. The two-reply
+   session asserts the batch shape ends the same way, and the
+   frame-returning session is the control that the check refuses only the
+   wrong type."
   (format t "~%ws-handler: a reply that is not a frame~%")
   (with-test-server
       (:handler (lambda (req) (declare (ignore req)) :upgrade)
@@ -10228,6 +10215,70 @@
                                     (declare (ignore buf))
                                     (>= fill 9))))
              :satisfied))))
+
+(defun test-ws-replies-keep-the-order-they-were-made-in ()
+  "A reply a ws-handler returns and a frame it pushes with WS-SEND reach
+   the peer in the order they were produced, however the messages that
+   prompted them were segmented.
+
+   The handler returns its reply to \"first\" and pushes its reply to
+   \"second\". Sent in separate writes the two always came back in order;
+   sent in one write, the returned reply was held to the end of the batch
+   while the pushed one went out at once, and the peer read them reversed.
+   Both shapes are asserted, the separate writes as the control."
+  (format t "~%ws: replies keep the order they were made in~%")
+  (with-test-server
+      (:handler (lambda (req) (declare (ignore req)) :upgrade)
+       :ws-handler (lambda (conn frame)
+                     (let ((text (sb-ext:octets-to-string
+                                  (ws-frame-payload frame) :external-format :utf-8)))
+                       (if (string= text "first")
+                           (build-ws-text "reply-to-first")
+                           (progn (ws-send conn (build-ws-text "reply-to-second"))
+                                  nil)))))
+    (flet ((replies (writes)
+             ;; Send WRITES, each a list of texts going out in one write, and
+             ;; return the texts of the first two frames that come back.
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                             :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (progn
+                      (%ws-client-upgrade stream)
+                      (dolist (texts writes)
+                        (write-sequence
+                         (apply #'concatenate '(vector (unsigned-byte 8))
+                                (mapcar (lambda (s) (%ws-client-frame 1 s)) texts))
+                         stream)
+                        (force-output stream)
+                        (sleep 0.2))
+                      ;; Server frames are unmasked; these replies are short,
+                      ;; so a frame is two header bytes and its payload.
+                      (let ((buf (read-until-bounded
+                                  stream :seconds 3
+                                  :until (lambda (buf fill)
+                                           (and (>= fill 2)
+                                                (let ((second (+ 2 (aref buf 1))))
+                                                  (and (>= fill (+ second 2))
+                                                       (>= fill (+ second 2
+                                                                   (aref buf (1+ second)))))))))))
+                        (loop with pos = 0
+                              repeat 2
+                              while (< (1+ pos) (fill-pointer buf))
+                              collect (let ((len (aref buf (1+ pos))))
+                                        (prog1 (sb-ext:octets-to-string
+                                                (subseq buf (+ pos 2) (+ pos 2 len))
+                                                :external-format :latin-1)
+                                          (incf pos (+ 2 len)))))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (check "ws order: in separate writes, as produced"
+             (replies '(("first") ("second")))
+             '("reply-to-first" "reply-to-second"))
+      (check "ws order: in one write, as produced too"
+             (replies '(("first" "second")))
+             '("reply-to-first" "reply-to-second")))))
 
 (defun test-counters-count-every-way-a-frame-is-handed-over ()
   "A frame is counted however the application hands it over, and a frame the
@@ -10772,6 +10823,7 @@
   (test-ws-send-queues)
   (test-ws-send-refuses-a-foreign-connection)
   (test-ws-handler-reply-of-the-wrong-type)
+  (test-ws-replies-keep-the-order-they-were-made-in)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
