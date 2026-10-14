@@ -592,9 +592,11 @@
    That structural closure holds only while this is the sole path in. A
    direct SSL_read anywhere else re-opens exactly the hang it removes, and
    it would do so intermittently, on records that happen to be larger than
-   one buffer. It also covers WANT_READ alone: WANT_WRITE from a read is a
-   direction inversion the state machine cannot express yet, and belongs
-   to a later round rather than to this seam."
+   one buffer. It covers WANT_READ alone. WANT_WRITE from a read is a
+   different request — the same read again once the socket is writable —
+   and this seam passes it through as :WANT-WRITE for CONNECTION-READ-
+   AVAILABLE to report and the outbound read path to answer by inverting
+   the interest."
   (let ((fn (connection-read-fn conn)))
     (if fn
         (funcall fn buffer start max-bytes)
@@ -1884,8 +1886,8 @@
    Every one of the current call sites is reached from a read state,
    a freshly-created outbound connection, or an inbound parked in
    :awaiting with its buffer already drained, so the invariant holds
-   by construction — but by construction is a property of today's
-   nineteen callers, not of the function. DRAIN-CONNECTIONS and
+   by construction — but by construction is a property of the callers,
+   not of the function. DRAIN-CONNECTIONS and
    PING-WS-CONNECTIONS both test (< write-pos write-end) before
    calling, which is the same invariant enforced two levels out; the
    next caller to skip that test would otherwise ship the peer a

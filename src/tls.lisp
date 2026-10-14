@@ -685,11 +685,12 @@
    once the socket exists and the non-blocking connect is under way, before
    the request is queued or epoll is armed.
 
-   This is the function items 3 through 8 were built for. Everything it
-   installs is a closure over one SSL: a handshake step, a byte source, a
-   byte sink, and a release. Nothing about the outbound state machine knows
-   that TLS exists — it asks a connection to read, to write, to take one
-   more handshake step, and to let go.
+   It installs a transport as four closures over one SSL: a handshake step,
+   a byte source, a byte sink, and a release. Nothing about the outbound
+   state machine knows that TLS exists — it asks a connection to read, to
+   write, to take one more handshake step, and to let go, through
+   CONNECTION-HANDSHAKE-FN, -READ-FN, -WRITE-FN and -CLOSE-FN, which a plain
+   connection leaves NIL.
 
    HOST rather than the connection's peer address, because the certificate
    is checked against the name the caller asked for. Checking it against
@@ -740,10 +741,11 @@
    connection's CLOSE-FN; a seam that allocates without a matching release
    is a leak by construction.
 
-   WANT_READ from a write is refused for the same reason WANT_WRITE is
-   refused from a read: the retry it asks for is another SSL_write once the
-   socket is *readable*, and the event loop outside :OUT-HANDSHAKE cannot
-   express that."
+   WANT_READ from a write is the mirror of WANT_WRITE from a read, and comes
+   back as :WANT-READ: the retry it asks for is another SSL_write once the
+   socket is *readable*. HANDLE-OUTBOUND-WRITE arms readability through
+   INVERT-INTEREST and re-issues the same write when it fires, with the
+   staged bytes OpenSSL requires a retry to present."
   (let ((stage (sb-alien:make-alien (sb-alien:unsigned 8)
                                     +ssl-write-stage-size+))
         (pending 0))
@@ -808,14 +810,15 @@
    space with nothing left on the fd, and an edge-triggered epoll has no
    reason to wake again — the connection hangs holding its own answer.
 
-   WANT_WRITE is deliberately not :AGAIN. It means the SSL wants to send
-   before it can read — a renegotiation or a post-handshake message — and
-   what it is asking for is another SSL_READ once the socket is *writable*.
-   The event loop outside :OUT-HANDSHAKE is built on readable-means-read,
-   so there is nowhere to put that request; answering :AGAIN would park the
-   connection waiting for a readability event that is not coming, turning a
-   condition we can name into a hang we cannot. Raising is the honest
-   answer until the direction inversion lands.
+   WANT_WRITE is deliberately not :AGAIN, and comes back as :WANT-WRITE. It
+   means the SSL wants to send before it can read — a renegotiation or a
+   post-handshake message — and what it asks for is another SSL_READ once
+   the socket is *writable*. Answered :AGAIN, it would park the connection
+   waiting for a readability event that is not coming. CONNECTION-READ-
+   AVAILABLE reports it upward, and HANDLE-OUTBOUND-READ arms writability
+   through INVERT-INTEREST and re-issues the same read when it fires:
+   the state says which operation is in flight, so the retry is the read
+   and not a write.
 
    Everything else defers to SSL-READ-EOF-OR-RAISE, with the error code
    passed along, so the four-way reading of SSL_ERROR_SYSCALL stays in one

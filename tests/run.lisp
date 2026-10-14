@@ -109,12 +109,18 @@
 ;;;     affected function directly rather than through TEST. A revert
 ;;;     that takes the harness down produces a hang, not a result.
 ;;;   - An inlined or block-compiled callee does not follow a redefinition
-;;;     at all: the caller holds the expansion, not the fdefn. Nothing here
-;;;     is declaimed INLINE today, and TEST-DISCARD-AVAILABLE-WANT-WRITE is
-;;;     the first test that depends on that staying true — it stubs
-;;;     CONNECTION-READ-INTO and asserts what its caller does with the
-;;;     answer. Declaim that function INLINE and the test passes against
-;;;     the original code while appearing to drive the stub.
+;;;     at all: the caller holds the expansion, not the fdefn. Check for a
+;;;     declaim before reverting a function by redefining it — grep for
+;;;     "declaim (inline". A handful of small helpers are inlined: SCAN-CRLF
+;;;     and TCHAR-BYTE-P in http.lisp, the byte packers and event
+;;;     accessors in epoll.lisp, HEX-DIGIT-VALUE, the modular arithmetic in
+;;;     ecdsa.lisp, and the SHA-256 and 32-bit word helpers. A revert of one
+;;;     of those in an image keeps the old code in every caller already
+;;;     compiled, and the test looks as though it has no teeth.
+;;;     TEST-DISCARD-AVAILABLE-WANT-WRITE depends on CONNECTION-READ-INTO
+;;;     staying out of that list — it stubs that function and asserts what
+;;;     its caller does with the answer. Declaim it INLINE and the test
+;;;     passes against the original code while appearing to drive the stub.
 ;;;
 ;;; The same rule holds outside testing: do not enter a multi-step state
 ;;; change without first confirming every intermediate step passes.

@@ -991,13 +991,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
 (defun test-https-fetch-async-e2e ()
   "An https:// fetch through the event loop, end to end, on one worker.
 
-   This is what items 3 through 8 were for. Until now every one of them
-   was mechanism with tests and no production caller: the seam, the
-   handshake state, the byte source, the byte sink, the direction
-   inversion and the errno discipline had never all been wired at once,
-   let alone driven by a real request. Here a handler calls HTTP-FETCH on
-   an https:// URL, and the worker returns to the event loop between every
-   step of it.
+   The test that wires every piece of the TLS transport at once: the
+   seam, the handshake state, the byte source, the byte sink, the
+   direction inversion and the errno discipline each have tests of their
+   own, and only a real request drives them together. Here a handler
+   calls HTTP-FETCH on an https:// URL, and the worker returns to the
+   event loop between every step of it.
 
    DNS is overridden through *DNS-LOOKUP-FN*, the hook dns.lisp fills, and
    SETF globally rather than bound: the worker reading it lives in a

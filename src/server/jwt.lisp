@@ -117,12 +117,16 @@
   "Verify a JWT token string against a list of JWT-KEY structs.
    Returns the claims as a JSON-OBJECT if valid, NIL if invalid — read
    them with JWT-CLAIM (or JSON-GET, which JWT-CLAIM is a thin alias for).
-   Checks: algorithm is ES256, signature is valid, token is not expired.
+
+   Checks: the algorithm is ES256, the signature is valid, and exp and nbf
+   when they are present. Both are optional (RFC 7519 §4.1), so a token
+   that omits exp verifies and never expires; iss and aud are not checked
+   at all. A caller whose issuer can mint a token without exp checks for
+   it — DEPLOYMENT.md's \"JWT issuer and audience\" shows how.
 
    The claims value is always non-NIL on success, including for a token
-   whose payload is {}. It used to be a bare alist, so an empty-but-valid
-   claim set came back as NIL and was indistinguishable from a rejected
-   token at the call site."
+   whose payload is {}, so an empty but valid claim set cannot be taken
+   for a rejected token at the call site."
   (handler-case
       (let ((parts (jwt-split token)))
         (unless (= (length parts) 3)
