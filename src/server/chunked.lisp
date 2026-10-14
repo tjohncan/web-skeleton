@@ -71,14 +71,17 @@
    reading' — so a too-strict predicate would hang, while a too-lax one
    merely reaches a loud decode error. Lean lax.
 
-   With one exception, and the exception is what the rule is actually
-   about. Laxness applies to framing that *more bytes could complete*. A
-   chunk-size line past the sixteen-hex-digit cap is not incomplete, it is
-   decided: no further byte makes it valid, so answering 'keep reading'
+   With exceptions, and they are what the rule is actually about. Laxness
+   applies to framing that *more bytes could complete*. Two shapes are
+   not incomplete but decided, since no further byte makes them valid: a
+   chunk-size line past the sixteen-hex-digit cap, and a chunk boundary
+   whose first byte has arrived and is not a hex digit (a chunk-size is
+   1*HEXDIG, with nothing before it). Answering 'keep reading' to either
    means waiting for a body that can never arrive, until some outer cap
-   fires and describes itself instead of the fault. That case raises here,
-   with the same wording DECODE-CHUNKED-BODY uses for it, and callers
-   convert — 400 inbound, and the outbound handler-case's 502.
+   fires and describes itself instead of the fault — inbound, a client
+   answered by nothing and closed at the idle timeout. Both raise here,
+   and callers convert — 400 inbound, and the outbound handler-case's
+   502.
 
    It stops at the zero-size chunk header rather than at the trailing
    CRLF, which is exactly where DECODE-CHUNKED-BODY stops too (trailers
@@ -144,6 +147,11 @@
                   found t)
             (incf pos)))
         (unless found
+          ;; Decided, not incomplete, once a byte is here to look at: the
+          ;; loop above stopped on it, so it is not a hex digit.
+          (when (< pos end)
+            (chunked-error "chunked: expected a chunk-size, found byte 0x~2,'0x"
+                           (aref buf pos)))
           (return (values nil boundary 0 data-bytes 0)))
         ;; Skip any chunk-extensions; the size line's LF must have landed.
         (let ((lf (position 10 buf :start pos :end end)))

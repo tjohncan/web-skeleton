@@ -1399,9 +1399,13 @@
    decode-chunked-body's buffered-path guard: without it, a 1 MiB
    attacker-framed hex string lands in parse-integer, which is
    super-linear in digit count."
+  ;; Trailing whitespace only: BWS may follow the digits, before a ';'
+  ;; (RFC 7230 §4.1.1), but nothing precedes them. Trimmed on both sides,
+  ;; ' 5' would parse here while DECODE-CHUNKED-BODY and
+  ;; CHUNKED-BODY-COMPLETE-P refuse it — the same bytes framed two ways.
   (let* ((semi (position #\; size-line))
          (hex-end (or semi (length size-line)))
-         (hex (string-trim '(#\Space #\Tab) (subseq size-line 0 hex-end))))
+         (hex (string-right-trim '(#\Space #\Tab) (subseq size-line 0 hex-end))))
     (when (zerop (length hex))
       (error "chunked: empty chunk-size line"))
     (when (> (length hex) 16)

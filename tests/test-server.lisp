@@ -6988,6 +6988,50 @@
 ;;; Chunked completion detection (async outbound read path)
 ;;; ---------------------------------------------------------------------------
 
+(defun test-chunked-request-with-a-bad-chunk-size-e2e ()
+  "A chunked request whose chunk-size is not hex is answered 400 at once.
+
+   The completion walk took the boundary for 'not complete yet', so the
+   request was never dispatched or refused: no bytes came back, and the
+   idle sweep closed the connection ten seconds later. The control is the
+   same request with a valid chunk-size, answered the ordinary way."
+  (format t "~%chunked request: a chunk-size that is not hex~%")
+  (with-test-server (:handler (lambda (req)
+                                (declare (ignore req))
+                                (make-text-response 200 "ok")))
+    (flet ((answer (size)
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                             :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (progn
+                      (write-sequence
+                       (sb-ext:string-to-octets
+                        (concatenate 'string
+                                     (crlf "POST /x HTTP/1.1" "Host: x"
+                                           "Transfer-Encoding: chunked")
+                                     (format nil "~a~c~chello~c~c0~c~c~c~c" size
+                                             #\Return #\Newline #\Return #\Newline
+                                             #\Return #\Newline #\Return #\Newline))
+                        :external-format :ascii)
+                       stream)
+                      (force-output stream)
+                      (let ((text (sb-ext:octets-to-string
+                                   (read-until-bounded
+                                    stream :seconds 3
+                                    :until (lambda (buf fill)
+                                             (declare (ignore buf))
+                                             (>= fill 12)))
+                                   :external-format :latin-1)))
+                        (subseq text 0 (min 12 (length text)))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (check "a chunk-size of ZZ is answered 400, not left to the idle sweep"
+             (answer "ZZ") "HTTP/1.1 400")
+      (check "control: a chunk-size of 5 is answered 200"
+             (answer "5") "HTTP/1.1 200"))))
+
 (defun test-chunked-body-complete-p ()
   (format t "~%Chunked completion~%")
   (flet ((complete-p (s)
@@ -7020,6 +7064,39 @@
     (check "incomplete: empty buffer"
            (complete-p "")
            nil)
+    ;; A chunk boundary whose first byte has arrived and is not a hex digit
+    ;; is decided, not incomplete: no later byte makes it a chunk-size. It
+    ;; raises, as an over-long size does, rather than waiting for a body
+    ;; that cannot come.
+    (flet ((raises-p (s)
+             (handler-case (progn (complete-p s) nil)
+               (web-skeleton::chunked-framing-error () t))))
+      (check "decided: a first chunk-size that is not hex raises"
+             (raises-p (format nil "ZZ~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: a later chunk-size that is not hex raises"
+             (raises-p (format nil "5~a~ahello~a~aZ" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: whitespace before a chunk-size raises"
+             (raises-p (format nil " 5~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "control: a boundary with nothing past it yet only waits"
+             (raises-p (format nil "5~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             nil))
+    ;; The streaming path's size parser agrees: BWS may follow the digits,
+    ;; nothing precedes them.
+    (check "size line: leading whitespace refused on the streaming path too"
+           (handler-case (progn (web-skeleton::parse-chunked-size-line " 5") :parsed)
+             (error () :refused))
+           :refused)
+    (check "size line: trailing whitespace before an extension is accepted"
+           (web-skeleton::parse-chunked-size-line "5 ;ext=1")
+           5)
     ;; Chunk-extensions on the size line are skipped, per RFC 7230 §4.1.1.
     (check "complete: chunk-extension tolerated"
            (complete-p (format nil "5;foo=bar~a~ahello~a~a0~a~a~a~a"
@@ -10867,6 +10944,7 @@
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
+  (test-chunked-request-with-a-bad-chunk-size-e2e)
   (test-chunked-encoder)
   (test-chunk-walk-on-data)
   (test-fetch-on-body-pause)
