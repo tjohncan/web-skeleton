@@ -1007,12 +1007,12 @@
     (check "204: no CL injected"
            (search "content-length" text :test #'char-equal) nil))
 
-  ;; 304 + CL: the bodiless-status exemption must skip the guard.
-  ;; Tests the exemption predicate directly — 304 is in the skip set.
-  (check "304+CL: truncation guard skipped"
-         (let ((status 304))
-           (or (<= 100 status 199) (= status 204) (= status 304)))
-         t)
+  ;; The statuses whose response ends at its blank line, as the
+  ;; serializer and the streaming head read them.
+  (check "status-without-body-p: 1xx, 204 and 304, and nothing else"
+         (mapcar #'web-skeleton::status-without-body-p
+                 '(100 101 199 200 204 205 299 304 404 500))
+         '(t t t nil t nil nil t nil nil))
 
   ;; HEAD byte-vector strip: scan-crlf-crlf + subseq truncates at
   ;; the header boundary, keeping CL in headers but removing body.

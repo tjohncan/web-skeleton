@@ -1980,6 +1980,51 @@
                   (and seen (< (car (first seen)) 0.9) t)
                   t)))))))
 
+(defun test-harness-fetch-bodiless-status-kept-alive-e2e ()
+  "A fetch whose upstream answers 304 or 204 and keeps the connection open
+   completes at the response's blank line.
+
+   Neither status has a body, whatever its headers say — a 304's
+   Content-Length describes the representation — so nothing more is coming
+   and the end of the connection is not either. The upstream holds the
+   connection for five seconds; a fetch that waited for a body or a close
+   finishes then, when it finishes at all, and the elapsed time is what
+   tells the two apart."
+  (format t "~%Harness: a 304 or 204 from an upstream that keeps the connection~%")
+  (dolist (case (list (list "304 with a Content-Length"
+                            (%crlf "HTTP/1.1 304 Not Modified" "ETag: \"v1\""
+                                   "Content-Length: 1234" "")
+                            304)
+                      (list "204 with no framing at all"
+                            (%crlf "HTTP/1.1 204 No Content" "")
+                            204)))
+    (destructuring-bind (name head status) case
+      (%call-with-scripted-upstream
+       (list head 5)
+       (lambda (port)
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (declare (ignore req))
+                (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                  :headers '(("connection" . "keep-alive")
+                             ("if-none-match" . "\"v1\""))
+                  :then (lambda (s h b)
+                          (declare (ignore h b))
+                          (make-text-response 200 (format nil "upstream ~a" s))))))
+           (let ((start (get-internal-real-time)))
+             (multiple-value-bind (code headers body)
+                 (handler-case (test-http-request :get "/relay")
+                   (error (e) (values nil nil (princ-to-string e))))
+               (declare (ignore headers))
+               (let ((secs (/ (float (- (get-internal-real-time) start))
+                              internal-time-units-per-second)))
+                 (check (format nil "~a: :then saw the upstream's status" name)
+                        (list code body)
+                        (list 200 (format nil "upstream ~d" status)))
+                 (check (format nil "~a: at the blank line, not the close" name)
+                        (< secs 2.5) t))))))))))
+
 (defun test-harness-fetch-stream-plain-write-timeout-e2e ()
   "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
    the request, after *FETCH-TIMEOUT*.
@@ -5090,6 +5135,7 @@
   (test-harness-fetch-stream-plain-read-timeout-e2e)
   (test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e)
   (test-harness-fetch-stream-plain-write-timeout-e2e)
+  (test-harness-fetch-bodiless-status-kept-alive-e2e)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)

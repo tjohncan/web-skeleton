@@ -2330,6 +2330,14 @@
      HEAD           — no body ever (§4.3.2), even when the upstream
                       echoes the GET body's Content-Length. Done at
                       headers.
+     204 or 304     — no body ever (rule 1, RFC 9112 §6.3), whatever
+                      Content-Length or Transfer-Encoding says; a 304's
+                      Content-Length describes the representation, not
+                      this response. Done at headers. COMPLETE-FETCH and
+                      STREAM-RESPONSE-LINES read these two statuses the
+                      same way, and an upstream that keeps the connection
+                      open would otherwise be waited on for a body it
+                      will never send, until the fetch timed out.
      Transfer-Encoding present — TE wins over Content-Length. Done at the
                       zero-size chunk header, but only once the encoding
                       is confirmed to actually be chunked: a TE that is
@@ -2359,11 +2367,17 @@
     (unless header-end
       (return-from outbound-response-complete-p (values nil chunk-scan)))
     (let* ((body-start (+ header-end 4))
+           (status (parse-response-status buf start end))
            (te-present (scan-transfer-encoding buf header-end start))
            (content-length (unless te-present
                              (scan-content-length buf header-end start))))
       (cond
         ((eq method :HEAD)
+         (values t chunk-scan))
+        ;; 1xx is absent for the reason COMPLETE-FETCH gives: the skip
+        ;; above has consumed every complete interim, so a status here is
+        ;; final or unparseable.
+        ((and status (or (= status 204) (= status 304)))
          (values t chunk-scan))
         (te-present
          (multiple-value-bind (complete next)
