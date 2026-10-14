@@ -19,6 +19,7 @@
         (test-ssl-ctx-init)
         (test-tls-client-ssl)
         (test-tls-end-to-end)
+        (test-tls-blocking-read-timeout-is-reported-as-one)
         (test-tls-ssl-pending)
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
@@ -334,6 +335,73 @@ printf 'TAIL-MARKER\\n' >> body.txt
                   (check-error
                    "tls e2e: a trusted certificate for another host is refused"
                    (funcall (tls-sym "TLS-CONNECT") "right.test" port)))))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-tls-blocking-read-timeout-is-reported-as-one ()
+  "HTTP-FETCH-STREAM over https:// to a peer that takes the request and
+   never answers gives up after *FETCH-TIMEOUT*, and says it timed out.
+
+   The bound always held; the report did not. OpenSSL reports a blocking
+   socket's receive-timeout expiry as SSL_ERROR_WANT_READ, and the shared
+   classifier answers that code with an error calling it a caller bug, so
+   an operator facing a slow upstream was sent to read tls.lisp. The
+   classifier tests asserted the timeout with SYSCALL and EAGAIN, a pair
+   OpenSSL does not produce for this; this one provokes the real pair.
+
+   The peer is s_server in relay mode with a stdin that never speaks: it
+   completes the handshake, reads the request, and has nothing to relay."
+  (format t "~%TLS: a blocking read that times out says so~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "tls timeout: fixture certificates generated" nil t)
+             (return-from test-tls-blocking-read-timeout-is-reported-as-one))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir)
+                    nil)
+           (let* ((port (%pick-free-port))
+                  (proc (sb-ext:run-program
+                         "openssl"
+                         (list "s_server" "-accept" (princ-to-string port)
+                               "-cert" (format nil "~a/right.pem" dir)
+                               "-key"  (format nil "~a/right.key" dir)
+                               "-quiet" "-naccept" "1")
+                         :wait nil :output nil :error nil
+                         :directory dir :search t :input :stream)))
+             (unwind-protect
+                  (progn
+                    (check "tls timeout: the silent peer is listening"
+                           (%wait-for-listener port) t)
+                    (let ((web-skeleton::*dns-resolve-blocking-fn*
+                            (lambda (host)
+                              (declare (ignore host))
+                              (values #(127 0 0 1) :inet)))
+                          (web-skeleton:*fetch-timeout* 1)
+                          (start (get-internal-real-time)))
+                      (let ((outcome
+                              (handler-case
+                                  (http-fetch-stream
+                                   :get (format nil "https://right.test:~d/" port)
+                                   :on-line #'identity)
+                                (error (e) (princ-to-string e))))
+                            (secs (/ (float (- (get-internal-real-time) start))
+                                     internal-time-units-per-second)))
+                        (check "tls timeout: the read was bounded by *fetch-timeout*"
+                               (< secs 4.0) t)
+                        (check "tls timeout: and reported as a timeout"
+                               (and (stringp outcome)
+                                    (search "SSL_read: timed out" outcome)
+                                    t)
+                               t))))
+               (ignore-errors (close (sb-ext:process-input proc)))
+               (ignore-errors (sb-ext:process-kill proc 15))
+               (ignore-errors (sb-ext:process-wait proc)))))
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
@@ -874,6 +942,13 @@ printf 'TAIL-MARKER\\n' >> body.txt
            t)
     (check "eintr: SSL_write with ECONNRESET still raises"
            (stringp (attempt (funcall wclass nil -1 econnreset syscall))) t)
+    ;; The send timeout as OpenSSL reports it on a blocking socket: WANT_WRITE.
+    (check "SSL_write with WANT_WRITE is the send timeout"
+           (let ((text (attempt (funcall wclass nil -1 0
+                                         (symbol-value
+                                          (tls-sym "+SSL-ERROR-WANT-WRITE+"))))))
+             (and (stringp text) (search "timed out" text) t))
+           t)
     ;; And the loop.
     (let ((calls 0))
       (check "eintr: the retry loop runs until the answer is not :retry"
@@ -1382,7 +1457,22 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                  (attempt (funcall classify nil -1 0 want-wr)))
                          t))
            t)
-    ;; The blocking wrapper differs in exactly one place.
+    ;; The blocking wrapper differs in what a would-block means. OpenSSL
+    ;; reports a blocking socket's receive-timeout expiry as WANT_READ (a
+    ;; renegotiating read's send expiry as WANT_WRITE); some paths report
+    ;; SYSCALL with EAGAIN. All of them are the timeout on that socket.
+    ;; TEST-TLS-BLOCKING-READ-TIMEOUT-IS-REPORTED-AS-ONE provokes the
+    ;; real one.
+    (check "blocking: WANT_READ is the receive timeout, and raises"
+           (attempt (and (search "timed out"
+                                 (attempt (funcall blocking nil -1 0 want-rd)))
+                         t))
+           t)
+    (check "blocking: WANT_WRITE too"
+           (attempt (and (search "timed out"
+                                 (attempt (funcall blocking nil -1 0 want-wr)))
+                         t))
+           t)
     (check "blocking: EAGAIN is the receive timeout, and raises"
            ;; Two ATTEMPTs, and both are needed. The inner one turns the
            ;; expected raise into its text so SEARCH has something to look

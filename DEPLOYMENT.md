@@ -435,7 +435,10 @@ answers it and two callers read it. On a socket left in blocking mode with
 `SO_RCVTIMEO` installed, a read cannot return would-block unless the receive
 timeout expired, so `ssl-blocking-read-eof-or-raise` turns it into the loud
 timeout this document promises — that is what bounds the HTTPS read path for
-close-delimited responses and for `http-fetch-stream` over HTTPS. On a
+close-delimited responses and for `http-fetch-stream` over HTTPS. OpenSSL
+reports that expiry as `SSL_ERROR_WANT_READ` rather than as `EAGAIN` under
+`SSL_ERROR_SYSCALL`, so on this socket both read as the timeout, and the
+blocking write side reads `WANT_WRITE` the same way. On a
 non-blocking socket `SO_RCVTIMEO` does nothing at all, so `EAGAIN` means only
 what it says and the event loop waits for readability; there the bound comes
 from the parked inbound's timer rather than from the socket.

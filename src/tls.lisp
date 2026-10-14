@@ -454,13 +454,20 @@
 (defun ssl-write-retry-or-raise (ssl n &optional
                                        (errno (get-errno))
                                        (err (%ssl-get-error ssl n)))
-  "Classify a non-positive SSL_write return: :RETRY if the call was
-   interrupted before it moved any bytes, and otherwise raise, with the
-   same errno discipline as SSL-READ-EOF-OR-RAISE — a SO_SNDTIMEO expiry
-   (errno = EAGAIN/EWOULDBLOCK) told apart from a real transport failure
-   so operators chasing timeouts can tell them apart in the log. Write
-   has no benign-EOF case: every non-positive return is an error or a
-   retry.
+  "Classify a non-positive SSL_write return on a blocking socket with
+   SO_SNDTIMEO installed: :RETRY if the call was interrupted before it
+   moved any bytes, and otherwise raise, with the same errno discipline as
+   SSL-READ-EOF-OR-RAISE — a SO_SNDTIMEO expiry told apart from a real
+   transport failure so operators chasing timeouts can tell them apart in
+   the log. Write has no benign-EOF case: every non-positive return is an
+   error or a retry.
+
+   The expiry arrives as SSL_ERROR_WANT_WRITE, for the reason
+   SSL-BLOCKING-READ-EOF-OR-RAISE gives for WANT_READ on the read side,
+   and as WANT_READ when the write had to read first and that timed out;
+   some OpenSSL paths report it as SSL_ERROR_SYSCALL with EAGAIN instead.
+   All three are the timeout here. TLS-WRITE-ALL is the only caller, and
+   its socket blocks; the event loop's writer has its own classifier.
 
    ERRNO before ERR, and the ordering is load-bearing: &OPTIONAL defaults
    evaluate left to right, so errno is taken before SSL_get_error runs.
@@ -468,6 +475,9 @@
    afterwards reports what that call did rather than what SSL_write did --
    and errno is the entire basis of the split below."
   (cond
+    ((or (= err +ssl-error-want-write+) (= err +ssl-error-want-read+))
+     (error "SSL_write: timed out (no progress within *fetch-timeout*, ~a s)"
+            *fetch-timeout*))
     ((= err +ssl-error-syscall+)
      (cond
        ((= errno +eintr+) :retry)
@@ -608,20 +618,35 @@
   "SSL-READ-EOF-OR-RAISE for a socket still in blocking mode with
    SO_RCVTIMEO installed.
 
-   The only difference is what :AGAIN means there, and it is not a
+   The difference is what a would-block means there, and it is not a
    difference of degree: a blocking read does not return would-block
-   unless the receive timeout expired, so :AGAIN is the timeout and gets
-   the loud error DEPLOYMENT.md promises. Silence here made that promise
-   a lie once, for close-delimited HTTPS responses and for
-   http-fetch-stream over HTTPS.
+   unless the receive timeout expired, so it is the timeout and gets the
+   loud error DEPLOYMENT.md promises.
+
+   OpenSSL reports that expiry as SSL_ERROR_WANT_READ, not as
+   SSL_ERROR_SYSCALL with EAGAIN: its socket BIO sees read(2) fail with
+   EAGAIN, marks the call retryable, and SSL_read returns -1 with the
+   continuable code. On the event loop's sockets that code is the
+   caller's to continue, which is why the shared classifier refuses it;
+   on this socket nothing will continue it, because the wait it asks for
+   is the one that just ran out. So WANT_READ is the receive timeout here,
+   and so is WANT_WRITE, which a read reports when it had to send first —
+   a renegotiation — and the send timed out. Measured against an
+   s_server that takes the request and never answers: WANT_READ, after
+   one *FETCH-TIMEOUT*. SYSCALL with EAGAIN, which some OpenSSL paths
+   report for the same event, still reaches the same error through
+   :AGAIN.
 
    :RETRY passes straight through. An interrupted call means the same
    thing on either kind of socket, and the caller's CALL-RETRYING-EINTR
-   is what acts on it. Only :AGAIN reads differently here.
+   is what acts on it.
 
    A wrapper rather than a flag on the classifier: that one answers what
    the transport reported, this one answers what it means on this kind of
    socket, and neither has to know the other's business."
+  (when (or (= err +ssl-error-want-read+) (= err +ssl-error-want-write+))
+    (error "SSL_read: timed out (no progress within *fetch-timeout*, ~a s)"
+           *fetch-timeout*))
   (let ((verdict (ssl-read-eof-or-raise ssl n errno err)))
     (if (eq verdict :again)
         (error "SSL_read: timed out (~a)" (errno-string errno))
