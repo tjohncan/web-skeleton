@@ -752,6 +752,81 @@
         (check "relay: no Transfer-Encoding reached the client"
                (assoc "transfer-encoding" headers :test #'string-equal) nil)))))
 
+(defun test-fetch-then-answers-like-a-handler ()
+  "A fetch :THEN can answer with whatever a handler can, SERVE-STATIC's
+   result included: ask an upstream, then serve a file.
+
+   COMPLETE-FETCH kept its own list of response shapes, and it lacked the
+   one SERVE-STATIC returns for a 200, a HEAD and a 304, a list of
+   segments. FORMAT-RESPONSE met the list and raised a type error, so
+   the request got a 500 that the same value returned from a handler
+   would not have. A Range request got through, because a 206 is a
+   single vector, which made the failure depend on request headers too.
+
+   A :THEN answering with a STREAM-RESPONSE stays a 500, now with a
+   message that says how to relay into a stream."
+  (format t "~%fetch :then answers the way a handler does~%")
+  (let* ((content (sb-ext:string-to-octets "0123456789abcdefghijklmnopqrstuvwxyz"
+                                           :external-format :ascii))
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*)
+         (log (make-string-output-stream))
+         (saved-stream web-skeleton::*log-stream*))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (let ((upstream-port nil))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (let ((path (http-request-path req)))
+                      (cond
+                        ((string= path "/auth") (make-text-response 200 "allowed"))
+                        ((string= path "/stream")
+                         (http-fetch :get (format nil "http://127.0.0.1:~d/auth"
+                                                  upstream-port)
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (make-stream-response))))
+                        (t
+                         (http-fetch :get (format nil "http://127.0.0.1:~d/auth"
+                                                  upstream-port)
+                                     :then (lambda (s h b)
+                                             (declare (ignore h b))
+                                             (if (eql s 200)
+                                                 (serve-static req)
+                                                 (make-error-response 403)))))))))
+               (setf upstream-port *test-port*)
+               (multiple-value-bind (status headers body)
+                   (attempt (test-http-request :get "/data.txt"))
+                 (declare (ignore headers))
+                 (check "a :then answering with SERVE-STATIC's result is served"
+                        (list status body)
+                        (list 200 "0123456789abcdefghijklmnopqrstuvwxyz")))
+               (multiple-value-bind (status headers body)
+                   (attempt (test-http-request :head "/data.txt"))
+                 (check "and a HEAD through it gets the head alone"
+                        (list status
+                              (cdr (assoc "content-length" headers :test #'string-equal))
+                              (if (plusp (length body)) body :no-body))
+                        (list 200 "36" :no-body)))
+               (check "control: a Range request through the same :then, a 206"
+                      (attempt (values (test-http-request
+                                        :get "/data.txt"
+                                        :headers '(("range" . "bytes=0-9")))))
+                      206)
+               (check "a :then answering with a stream is still a 500"
+                      (attempt (values (test-http-request :get "/stream")))
+                      500))))
+      (setf web-skeleton::*static-cache* saved
+            web-skeleton::*log-stream* saved-stream))
+    (check "and its log line says how to relay into a stream"
+           (not (null (search "FETCH-INTO" (get-output-stream-string log))))
+           t)))
+
 (defun test-http-response ()
   (format t "~%HTTP Response~%")
 
@@ -10991,6 +11066,7 @@
   (test-http-response)
   (test-format-response-owns-framing)
   (test-bodiless-statuses-on-the-wire)
+  (test-fetch-then-answers-like-a-handler)
   (test-cookie-builder)
   (test-fetch)
   (test-dns)

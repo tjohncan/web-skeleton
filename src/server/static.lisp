@@ -739,8 +739,12 @@
 
 (defun serve-static (request)
   "Look up the request path in the static file cache.
-   Returns a pre-built HTTP response byte vector ready to write, or
-   NIL if the path is not cached. Serves GET and HEAD requests.
+   Returns a response ready to return from a handler or a fetch :THEN, or
+   NIL if the path is not cached: a list of byte vectors — the pre-built
+   message in segments, with a current Date — for a 200, a HEAD and a
+   304, and a single byte vector for a 206 or 416. Either is a whole
+   message; a caller hands it on rather than taking it apart. Serves GET
+   and HEAD requests.
    Honors If-None-Match (RFC 7232) — a cached ETag match returns the
    pre-built 304 Not Modified response instead of the full body.
    Rejects paths containing '..'. Directories (paths ending in /)

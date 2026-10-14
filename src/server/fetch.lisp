@@ -173,8 +173,12 @@
 (defun http-fetch (method url &key headers body then on-body)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
-   THEN is called with (status headers body) when the response arrives;
-   it must return an HTTP response, byte vector, or another http-fetch-continuation.
+   THEN is called with (status headers body) when the response arrives,
+   and answers the parked request with any response a handler can return:
+   an HTTP-RESPONSE, a byte vector, or SERVE-STATIC's result. It may also
+   return another http-fetch-continuation, to chain. Not a
+   STREAM-RESPONSE: the parked request is answered whole, and a relay into
+   a stream starts its fetch with FETCH-INTO from the stream's ON-OPEN.
 
    ON-BODY, if given, is called as (CONN BYTES) with each chunk of a
    chunked response as it arrives, on the async http:// path — CONN is
@@ -1519,6 +1523,56 @@
         (if end (subseq bytes 0 (+ end 4)) bytes))
       bytes))
 
+(defun queue-final-response (conn response)
+  "Queue RESPONSE on CONN as the whole answer to its request, in any of the
+   shapes a handler or a fetch :THEN may answer with:
+
+     HTTP-RESPONSE    serialized here, with CONN's connection hint, and
+                      without its body for HEAD
+     byte vector      a whole message already serialized, cut at its head
+                      for HEAD
+     list of vectors  segments written in order — SERVE-STATIC's shape —
+                      whose producer has already decided what HEAD gets
+
+   Anything else signals, naming those shapes, rather than reaching a
+   struct accessor inside FORMAT-RESPONSE and raising a type error about
+   an internal. One function for HANDLE-CLIENT-READ and COMPLETE-FETCH, so
+   a :THEN can answer with whatever a handler can — asking an upstream and
+   then serving a file is the ordinary case — and the two cannot drift.
+
+   A response struct is treated as immutable: a caller that caches a
+   (make-error-response 404) across requests must not have HEAD strip its
+   body slot or HTTP/1.0 keep-alive stamp a Connection header onto it.
+   :CONNECTION-HINT stamps the header at serialize time and :HEAD-ONLY-P
+   skips the body without allocating it; neither touches the struct.
+
+   Segments are queued as one act, and outside *MAX-WRITE-BACKLOG*. That
+   bound is for a producer outrunning its peer; held to it, a finished
+   static file over the bound would have its body refused after its
+   headers had gone out promising one.
+
+   The caller moves the state and arms the descriptor; what follows the
+   queueing differs between them."
+  (let ((head-p (and (connection-request conn)
+                     (eq (http-request-method (connection-request conn)) :HEAD))))
+    (cond
+      ((typep response 'http-response)
+       (connection-queue-write conn (format-response
+                                     response
+                                     :connection-hint (connection-hint-for conn)
+                                     :head-only-p head-p)))
+      ((typep response '(simple-array (unsigned-byte 8) (*)))
+       (connection-queue-write conn (strip-body-for-head response conn)))
+      ((and (consp response)
+            (every (lambda (segment)
+                     (typep segment '(simple-array (unsigned-byte 8) (*))))
+                   response))
+       (connection-queue-segments conn response))
+      (t
+       (error "~a is not a response: expected an HTTP-RESPONSE, a byte ~
+               vector, or a list of byte vectors (what SERVE-STATIC returns)"
+              (type-of response))))))
+
 (defun awaiting-inbound-for (inbound-fd out-fd)
   "Return the inbound connection parked on OUT-FD, or NIL.
 
@@ -2758,36 +2812,30 @@
                   ;; header on the wire instead of leaving the framing
                   ;; implicit.
                   (sync-close-after-p-from-response inbound response)
-                  ;; Queue the response on the inbound connection. On
-                  ;; HEAD, FORMAT-RESPONSE emits headers only via
-                  ;; :HEAD-ONLY-P — saves the full body encode + the
-                  ;; downstream STRIP-BODY-FOR-HEAD subseq, which on a
-                  ;; large response body doubled the peak allocation.
-                  ;; Byte-vector responses still go through the strip
-                  ;; because they're already-serialized blocks.
-                  (let* ((head-p (and (connection-request inbound)
-                                      (eq (http-request-method
-                                           (connection-request inbound))
-                                          :HEAD)))
-                         (bytes (cond
-                                  ((typep response '(simple-array (unsigned-byte 8) (*)))
-                                   (strip-body-for-head response inbound))
-                                  ((typep response 'http-fetch-continuation)
-                                   ;; Chained fetch — initiate another outbound call
-                                   (initiate-fetch inbound epoll-fd response)
-                                   (return-from complete-fetch))
-                                  (t (format-response
-                                      response
-                                      :connection-hint
-                                      (connection-hint-for inbound)
-                                      :head-only-p head-p)))))
-                    (connection-queue-write inbound bytes)
-                    (setf (connection-state inbound) :write-response
-                          (connection-awaiting-fd inbound) -1
-                          (connection-last-active inbound) (get-universal-time))
-                    (epoll-modify epoll-fd (connection-fd inbound)
-                                  (logior +epollout+ +epollet+))
-                    (log-debug "fetch: resumed fd ~d" inbound-fd)))
+                  (cond
+                    ;; Chained fetch — initiate another outbound call
+                    ((typep response 'http-fetch-continuation)
+                     (initiate-fetch inbound epoll-fd response)
+                     (return-from complete-fetch))
+                    ;; A stream answers a request before its body exists,
+                    ;; and this request is parked until the fetch answers
+                    ;; it whole. Named, so the 500 says how to get one.
+                    ((typep response 'stream-response)
+                     (error "a fetch :then answered with a STREAM-RESPONSE; ~
+                             a parked request is answered whole. To relay ~
+                             an upstream into a stream, return the stream ~
+                             from the handler and start the fetch with ~
+                             FETCH-INTO from its :ON-OPEN.")))
+                  ;; Every shape a handler may answer with, through the
+                  ;; function HANDLE-CLIENT-READ uses, so the two accept
+                  ;; the same things.
+                  (queue-final-response inbound response)
+                  (setf (connection-state inbound) :write-response
+                        (connection-awaiting-fd inbound) -1
+                        (connection-last-active inbound) (get-universal-time))
+                  (epoll-modify epoll-fd (connection-fd inbound)
+                                (logior +epollout+ +epollet+))
+                  (log-debug "fetch: resumed fd ~d" inbound-fd))
               ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last
               ;; catch.
               (serious-condition (e)

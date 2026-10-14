@@ -801,14 +801,12 @@
                   (http-request-method request)
                   (http-request-path request))
        (values response nil))
-      ;; Normal HTTP response — must be an HTTP-RESPONSE struct. The
-      ;; previous catch-all let a handler that forgot MAKE-TEXT-RESPONSE
-      ;; (returning a raw string or alist) fall through to FORMAT-RESPONSE
-      ;; where it tripped a deep SIMPLE-TYPE-ERROR from the struct
-      ;; accessor, which the outer handler-case converted to a 500.
-      ;; Correct outcome, terrible message — apps debugging their own
-      ;; handler bugs had to trace into HTTP-RESPONSE-STATUS to realize
-      ;; the issue was upstream. Check here and raise a pointed error.
+      ;; Normal HTTP response — must be an HTTP-RESPONSE struct. Anything
+      ;; else is refused here with a pointed error. Let through, a handler
+      ;; that forgot MAKE-TEXT-RESPONSE (returning a raw string or alist)
+      ;; would trip a deep SIMPLE-TYPE-ERROR from a struct accessor inside
+      ;; FORMAT-RESPONSE: the same 500, with a message that sends the
+      ;; reader into HTTP-RESPONSE-STATUS rather than to their handler.
       ((typep response 'http-response)
        (log-debug "~a ~a -> ~d"
                   (http-request-method request)
@@ -816,8 +814,10 @@
                   (http-response-status response))
        (values response nil))
       (t
-       (error "handler returned ~a; expected an HTTP-RESPONSE, ~
-               HTTP-FETCH-CONTINUATION, byte vector, or :UPGRADE"
+       (error "handler returned ~a; expected an HTTP-RESPONSE, a ~
+               STREAM-RESPONSE, an HTTP-FETCH-CONTINUATION, a byte vector, ~
+               a list of byte vectors (what SERVE-STATIC returns), or ~
+               :UPGRADE"
               (type-of response))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1290,46 +1290,15 @@
                     ;; Streaming response — send the head, hand over
                     ((typep response 'stream-response)
                      (start-stream conn epoll-fd request response))
-                    ;; Normal response — queue for writing.
-                    ;; Handler-returned response structs are treated as
-                    ;; immutable: a caller that caches a (make-error-response
-                    ;; 404) across requests must not have HEAD strip the
-                    ;; body slot or HTTP/1.0 keep-alive stamp a Connection
-                    ;; header onto it. :CONNECTION-HINT stamps the
-                    ;; Connection header at serialize time, :HEAD-ONLY-P
-                    ;; skips body emission for HEAD without allocating —
-                    ;; neither touches the struct. The byte-vector path
-                    ;; (pre-built static files) still goes through
-                    ;; STRIP-BODY-FOR-HEAD since the bytes are already
-                    ;; fully serialized and we have no encode step to
-                    ;; short-circuit.
-                    ;; Segments — a complete response in pieces, queued
-                    ;; as one act and outside the backlog bound. Routing
-                    ;; them through CONNECTION-APPEND-WRITE subjected a
-                    ;; finished in-memory response to a limit meant for a
-                    ;; producer outrunning its peer, and a static file
-                    ;; over *MAX-WRITE-BACKLOG* had its body refused
-                    ;; while its headers went out promising one.
-                    ((consp response)
-                     (connection-queue-segments conn response)
-                     (setf (connection-state conn) :write-response)
-                     (epoll-modify epoll-fd (connection-fd conn)
-                                   (logior +epollout+ +epollet+)))
+                    ;; A complete response, in any of its shapes, through
+                    ;; the function COMPLETE-FETCH shares, so a fetch's
+                    ;; :THEN can answer with whatever a handler can.
                     (t
-                     (let* ((head-p (eq (http-request-method request) :HEAD))
-                            (bytes
-                             (if (typep response
-                                        '(simple-array (unsigned-byte 8) (*)))
-                                 (strip-body-for-head response conn)
-                                 (format-response
-                                  response
-                                  :connection-hint (connection-hint-for conn)
-                                  :head-only-p head-p))))
-                       (connection-queue-write conn bytes)
-                       (setf (connection-state conn)
-                             (if upgrade-p :ws-upgrade :write-response))
-                       (epoll-modify epoll-fd (connection-fd conn)
-                                    (logior +epollout+ +epollet+))))))))
+                     (queue-final-response conn response)
+                     (setf (connection-state conn)
+                           (if upgrade-p :ws-upgrade :write-response))
+                     (epoll-modify epoll-fd (connection-fd conn)
+                                   (logior +epollout+ +epollet+)))))))
              (:flush-queued
               ;; connection-on-read queued response bytes that must flush
               ;; before further reads happen. Covers two cases:
