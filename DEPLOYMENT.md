@@ -156,6 +156,15 @@ Caddy, HAProxy and Traefik stream it to the upstream unless told otherwise
 Behind a proxy that streams, the client trickling a body
 is this server's to hold after all,
 which is the one job above that comes back here.
+What holds it is `*idle-timeout*`, and it holds it bluntly:
+it is the whole budget for one request to arrive, head and body together,
+and the bytes arriving do not extend it.
+That is what stops a client that drips a request from keeping its slot,
+and it also cuts off an honest upload that is merely slow —
+at 20 KiB/s, ten seconds is about 200 KiB —
+with a close and no response.
+Behind a streaming proxy, either have the proxy buffer bodies
+or raise `*idle-timeout*` to cover the slowest upload you accept.
 
 ### Status codes the framework itself sends
 

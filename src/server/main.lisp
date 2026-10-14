@@ -330,7 +330,20 @@
    replaces is still what happens.")
 
 (defparameter *idle-timeout* 10
-  "Seconds before an idle HTTP connection is closed. 0 to disable.")
+  "Seconds before an idle HTTP connection is closed. 0 to disable.
+
+   Idle means no request completed and no response bytes written, so this
+   covers the gap between requests on a keep-alive connection and also
+   the whole arrival of one request, head and body together. A partial
+   read does not refresh it, deliberately: a client that drips a request
+   a byte at a time would otherwise hold its slot for as long as it kept
+   dripping. The same rule cuts off an honest upload that is merely
+   slow — at 20 KiB/s, ten seconds is about 200 KiB — with a close and no
+   response. Behind a proxy that buffers request bodies the body arrives
+   at once and this never matters; behind one that streams them, raise
+   this to cover the slowest upload you accept, as DEPLOYMENT.md's
+   reverse-proxy section says. A slow download is not cut off: the write
+   path counts a writable socket as activity.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
