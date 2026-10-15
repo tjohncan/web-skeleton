@@ -47,7 +47,9 @@
                                                            "src/algorithms/base64"))
                (:file "src/server/static" :depends-on ("src/counters" "src/package"
                                                          "src/log"
-                                                         "src/server/http"))
+                                                         "src/server/http"
+                                                         ;; WRITE-SPAN, for a 206.
+                                                         "src/server/connection"))
                (:file "src/json" :depends-on ("src/package"))
                (:file "src/server/jwt"  :depends-on ("src/package"
                                                        "src/json"

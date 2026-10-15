@@ -1793,6 +1793,35 @@
         (connection-write-queue-tail conn) nil
         (connection-write-queued conn) 0))
 
+(defstruct (write-span (:constructor make-write-span (bytes start end)))
+  "BYTES[START, END) as one piece of a response, for the write queue to send
+   without a copy.
+
+   A 206's body is a slice of a static file that every request for it
+   shares. As a SUBSEQ it would cost a copy of the range per request, held
+   by the connection until its peer has read all of it: a whole-file range,
+   what a browser asks for first on <video>, per slow reader. As a span the
+   slice is the file's own bytes, and only WRITE-POS and WRITE-END, which
+   live on the connection, move through them."
+  (bytes nil :type (simple-array (unsigned-byte 8) (*)))
+  (start 0 :type fixnum)
+  (end 0 :type fixnum))
+
+(defun segment-bounds (segment)
+  "(values BYTES START END) for a write-queue SEGMENT: a byte vector, which
+   is the whole of itself, or a WRITE-SPAN."
+  (if (write-span-p segment)
+      (values (write-span-bytes segment)
+              (write-span-start segment)
+              (write-span-end segment))
+      (values segment 0 (length segment))))
+
+(defun segment-length (segment)
+  "How many bytes SEGMENT puts on the wire."
+  (multiple-value-bind (bytes start end) (segment-bounds segment)
+    (declare (ignore bytes))
+    (- end start)))
+
 (defun connection-append-write (conn bytes)
   "Queue BYTES behind whatever CONN has pending. Returns T if accepted,
    NIL if it would pass *MAX-WRITE-BACKLOG* — in which case nothing is
@@ -1835,16 +1864,16 @@
        t)
       (t (%queue-tail conn bytes) t))))
 
-(defun %queue-tail (conn bytes)
-  "Put BYTES on the tail of CONN's write queue. No bound check — whether
-   a bound applies is the caller's question, and the two callers answer
-   it differently."
-  (let ((cell (list bytes)))
+(defun %queue-tail (conn segment)
+  "Put SEGMENT, a byte vector or a WRITE-SPAN, on the tail of CONN's write
+   queue. No bound check — whether a bound applies is the caller's
+   question, and the two callers answer it differently."
+  (let ((cell (list segment)))
     (if (connection-write-queue-tail conn)
         (setf (cdr (connection-write-queue-tail conn)) cell)
         (setf (connection-write-queue conn) cell))
     (setf (connection-write-queue-tail conn) cell))
-  (incf (connection-write-queued conn) (length bytes))
+  (incf (connection-write-queued conn) (segment-length segment))
   t)
 
 (defun connection-queue-segments (conn segments)
@@ -1876,15 +1905,16 @@
   t)
 
 (defun connection-promote-write (conn)
-  "Make the next queued vector the head. Returns NIL if the queue is empty."
+  "Make the next queued segment the head. Returns NIL if the queue is empty."
   (let ((next (pop (connection-write-queue conn))))
     (when next
       (unless (connection-write-queue conn)
         (setf (connection-write-queue-tail conn) nil))
-      (decf (connection-write-queued conn) (length next))
-      (setf (connection-write-buf conn) next
-            (connection-write-pos conn) 0
-            (connection-write-end conn) (length next))
+      (decf (connection-write-queued conn) (segment-length next))
+      (multiple-value-bind (bytes start end) (segment-bounds next)
+        (setf (connection-write-buf conn) bytes
+              (connection-write-pos conn) start
+              (connection-write-end conn) end))
       t)))
 
 (defun connection-queue-write (conn bytes)
@@ -1912,12 +1942,14 @@
     (when (plusp pending)
       (error "connection-queue-write would clobber ~d un-flushed byte~:p on fd ~d"
              pending (connection-fd conn))))
-  (setf (connection-write-buf conn) bytes
-        (connection-write-pos conn) 0
-        (connection-write-end conn) (length bytes)
-        ;; Guard above proves nothing was pending, so this is always the
-        ;; start of an episode.
-        (connection-write-progress-at conn) (get-universal-time)))
+  ;; BYTES may be a WRITE-SPAN, when it is the first segment of a response.
+  (multiple-value-bind (vector start end) (segment-bounds bytes)
+    (setf (connection-write-buf conn) vector
+          (connection-write-pos conn) start
+          (connection-write-end conn) end
+          ;; Guard above proves nothing was pending, so this is always the
+          ;; start of an episode.
+          (connection-write-progress-at conn) (get-universal-time))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write

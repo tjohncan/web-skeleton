@@ -1536,8 +1536,9 @@
                       without its body for HEAD
      byte vector      a whole message already serialized, cut at its head
                       for HEAD
-     list of vectors  segments written in order — SERVE-STATIC's shape —
-                      whose producer has already decided what HEAD gets
+     list of segments byte vectors and WRITE-SPANs, written in order —
+                      SERVE-STATIC's shape — whose producer has already
+                      decided what HEAD gets
 
    Anything else signals, naming those shapes, rather than reaching a
    struct accessor inside FORMAT-RESPONSE and raising a type error about
@@ -1570,12 +1571,13 @@
        (connection-queue-write conn (strip-body-for-head response conn)))
       ((and (consp response)
             (every (lambda (segment)
-                     (typep segment '(simple-array (unsigned-byte 8) (*))))
+                     (or (typep segment '(simple-array (unsigned-byte 8) (*)))
+                         (write-span-p segment)))
                    response))
        (connection-queue-segments conn response))
       (t
        (error "~a is not a response: expected an HTTP-RESPONSE, a byte ~
-               vector, or a list of byte vectors (what SERVE-STATIC returns)"
+               vector, or a list of segments (what SERVE-STATIC returns)"
               (type-of response))))))
 
 (defun awaiting-inbound-for (inbound-fd out-fd)

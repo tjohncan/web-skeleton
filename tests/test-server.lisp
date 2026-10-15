@@ -4486,6 +4486,84 @@
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
+(defun test-static-range-copies-nothing ()
+  "A 206 for a static file allocates its head and not its body, and the
+   body still arrives whole and in place.
+
+   A range is a window on the cached file. As a copy it would cost the
+   range per request, held by the connection until its peer had read it
+   all, and `Range: bytes=0-` from a slow reader, what a browser sends
+   first for <video>, would hold a copy of the whole file per
+   connection. The 200 path already allocates nothing, so it is the
+   control.
+
+   The wire half sends each answer through a real socket, so the span is
+   taken through the write queue's promotion and not only through
+   SERVE-STATIC."
+  (format t "~%Static: a 206 allocates its head, not its body~%")
+  (let* ((size (* 1024 1024))
+         ;; Printable ASCII, varied by position so a slice from the wrong
+         ;; offset cannot match; the test client reads bodies as UTF-8.
+         (content (let ((v (make-array size :element-type '(unsigned-byte 8))))
+                    (dotimes (i size v) (setf (aref v i) (+ 32 (mod (* i 7) 95))))))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/big.bin" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response
+                  "application/octet-stream" content 0))
+           (flet ((consed (&rest headers)
+                    (let ((request (make-test-request :method :GET
+                                                      :path "/big.bin"
+                                                      :headers headers)))
+                      ;; Once untimed, so the Date line cache and any
+                      ;; first-call setup are not counted.
+                      (serve-static request)
+                      (let ((before (sb-ext:get-bytes-consed)))
+                        (serve-static request)
+                        (- (sb-ext:get-bytes-consed) before)))))
+             (check "control: a whole-file GET allocates under 64 KiB"
+                    (< (consed) 65536) t)
+             (check "a whole-file range allocates under 64 KiB, not the file"
+                    (< (consed (cons "range" "bytes=0-")) 65536) t)
+             (check "an offset range allocates under 64 KiB too"
+                    (< (consed (cons "range" "bytes=1-")) 65536) t))
+           (with-test-server
+               (:handler (lambda (req)
+                           (or (serve-static req) (make-error-response 404))))
+             (dolist (spec (list (list "bytes=0-" 0 size)
+                                 (list "bytes=1-" 1 size)
+                                 (list "bytes=1000-1999" 1000 2000)
+                                 (list (format nil "bytes=-~d" 4096)
+                                       (- size 4096) size)))
+               (destructuring-bind (range start end) spec
+                 (multiple-value-bind (status headers body)
+                     (attempt (test-http-request
+                               :get "/big.bin" :headers (list (cons "range" range))))
+                   (declare (ignore headers))
+                   (check (format nil "206 over the wire: ~a arrives whole" range)
+                          (list status
+                                (and (stringp body)
+                                     (equalp (sb-ext:string-to-octets
+                                              body :external-format :latin-1)
+                                             (subseq content start end))))
+                          (list 206 t)))))))
+      (setf web-skeleton::*static-cache* saved))))
+
+(defun %response-octets (response)
+  "RESPONSE as the bytes a client would read: a byte vector as it is, and a
+   list of segments — byte vectors and WRITE-SPANs, what SERVE-STATIC
+   returns — concatenated in order."
+  (if (consp response)
+      (apply #'concatenate '(vector (unsigned-byte 8))
+             (mapcar (lambda (segment)
+                       (multiple-value-bind (bytes start end)
+                           (web-skeleton::segment-bounds segment)
+                         (subseq bytes start end)))
+                     response))
+      response))
+
 (defun test-static-range ()
   (format t "~%Static Range (RFC 7233)~%")
 
@@ -4559,10 +4637,10 @@
          (progn
            (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
            (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
-           ;; SERVE-STATIC answers either as one vector (the ranged and
-           ;; 416 paths, built per request) or as the segments a
-           ;; pre-built response is assembled from. What a client sees is
-           ;; the concatenation either way, and that is what these
+           ;; SERVE-STATIC answers either as one vector (the 416, built per
+           ;; request) or as segments: a pre-built response's pieces, or a
+           ;; 206's head and the span of the file it covers. What a client
+           ;; sees is the concatenation either way, and that is what these
            ;; assertions are about.
            (flet ((fetch (&rest headers)
                     (let ((r (serve-static
@@ -4571,10 +4649,7 @@
                                                  :headers headers))))
                       (and r
                            (sb-ext:octets-to-string
-                            (if (consp r)
-                                (apply #'concatenate
-                                       '(vector (unsigned-byte 8)) r)
-                                r)
+                            (%response-octets r)
                             :external-format :latin-1))))
                   (body-of (text)
                     (let ((i (search (format nil "~a~a~a~a"
@@ -4652,10 +4727,7 @@
                                     :headers (list (cons "range"
                                                          "bytes=0-3"))))))
                            (sb-ext:octets-to-string
-                            (if (consp r)
-                                (apply #'concatenate
-                                       '(vector (unsigned-byte 8)) r)
-                                r)
+                            (%response-octets r)
                             :external-format :latin-1))))
                (check "range: HEAD ignores range, stays 200"
                       (not (null (search "200 OK" head))) t)
@@ -6511,9 +6583,7 @@
                               (make-test-request :method method :path "/d.txt"
                                                  :headers headers))))
                       (sb-ext:octets-to-string
-                       (if (consp r)
-                           (apply #'concatenate '(vector (unsigned-byte 8)) r)
-                           r)
+                       (%response-octets r)
                        :external-format :latin-1)))
                   (body (text)
                     (let ((i (search (format nil "~c~c~c~c" #\Return #\Newline
@@ -11572,6 +11642,7 @@
   (test-static-serves-what-the-router-sees)
   (test-static-etag)
   (test-static-range)
+  (test-static-range-copies-nothing)
   (test-static-date)
   (test-jwt)
   (test-shutdown-hooks)
