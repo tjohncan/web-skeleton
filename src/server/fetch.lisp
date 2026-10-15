@@ -693,6 +693,17 @@
       (parse-headers-bytes buf (+ first-crlf 2) (+ header-end 4)
                            :invalid-utf-8 :latin-1))))
 
+(defun response-head-budget ()
+  "How long one response head may grow before it ends: a status line of
+   *MAX-HEADER-LINE-LENGTH*, *MAX-TOTAL-HEADER-BYTES* of field lines and
+   the CRLFs around them. No head PARSE-HEADERS-BYTES would accept is
+   longer, so a head still unended past this never will be accepted. The
+   streaming reader (READER-READ-HEAD) and the buffered one
+   (OUTBOUND-RESPONSE-HEAD) both refuse at this length, so the two cannot
+   disagree about how long a head may be."
+  (+ *max-header-line-length* *max-total-header-bytes*
+     (* 2 (+ *max-header-count* 2))))
+
 (defun parse-response-head (buf start header-end)
   "Read the final response head in BUF that begins at START and whose
    CRLFCRLF is at HEADER-END. Returns
@@ -790,6 +801,46 @@
           (if (and status (<= 100 status 199))
               (setf pos (+ header-end 4))
               (return pos)))))))
+
+(defun outbound-response-head (conn)
+  "Find the final response head in outbound CONN's read buffer, resuming
+   where the last read left off. Returns (START . HEADER-END), the head's
+   first byte and the offset of its CRLFCRLF, or NIL while it is still
+   arriving.
+
+   Incremental, as a request's head search is. An interim already
+   stepped over is not walked again, and the search for the head still
+   arriving resumes three bytes before where the last one stopped, which
+   is enough for a CRLFCRLF split across two reads. Searching from the top
+   on every read would make an upstream that dribbles its head cost a
+   scan of the whole buffer per wake-up.
+
+   Signals, like SKIP-INTERIM-RESPONSES, past *MAX-INTERIM-RESPONSES*
+   interims, and once a head has outgrown RESPONSE-HEAD-BUDGET without
+   ending — at the length the streaming path refuses it too, rather than
+   at the buffer's cap. The outbound handler turns either into a 502."
+  (let ((buf (connection-read-buf conn))
+        (end (connection-read-pos conn)))
+    (loop
+      (let* ((start (connection-out-head-start conn))
+             (header-end (scan-crlf-crlf
+                          buf (max start (- (connection-header-scan-pos conn) 3))
+                          end)))
+        (cond
+          ((null header-end)
+           (when (> (- end start) (response-head-budget))
+             (error "upstream response head exceeds ~d bytes without ending"
+                    (response-head-budget)))
+           (setf (connection-header-scan-pos conn) end)
+           (return nil))
+          ((let ((status (parse-response-status buf start end)))
+             (and status (<= 100 status 199)))
+           (when (> (incf (connection-out-interims conn)) *max-interim-responses*)
+             (error "upstream sent more than ~d interim responses"
+                    *max-interim-responses*))
+           (setf (connection-out-head-start conn) (+ header-end 4)
+                 (connection-header-scan-pos conn) (+ header-end 4)))
+          (t (return (cons start header-end))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTPS hook — set by web-skeleton-tls when loaded
@@ -1117,15 +1168,13 @@
    bare CR or LF ends no line here either.
 
    Signals at end of stream inside a head, which the buffered path also
-   refuses, and once the head is longer than any those readers accept: a
-   status line of *MAX-HEADER-LINE-LENGTH*, *MAX-TOTAL-HEADER-BYTES* of
-   field lines and the CRLFs around them. The exact caps are
+   refuses, and once the head outgrows RESPONSE-HEAD-BUDGET, the length
+   the buffered path refuses at too. The exact caps are
    PARSE-HEADERS-BYTES' to enforce. This bound only stops an upstream that
    never ends its head from growing the vector without limit."
   (let ((head (make-array 512 :element-type '(unsigned-byte 8)
                               :fill-pointer 0 :adjustable t))
-        (limit (+ *max-header-line-length* *max-total-header-bytes*
-                  (* 2 (+ *max-header-count* 2)))))
+        (limit (response-head-budget)))
     (loop
       (when (>= (stream-reader-pos r) (stream-reader-end r))
         (when (zerop (reader-fill r))
@@ -2149,6 +2198,9 @@
        ;; outstanding is resolved by this same MOD rather than by a second.
        (setf (connection-state conn) :out-read
              (connection-read-pos conn) 0
+             (connection-header-scan-pos conn) 0
+             (connection-out-head-start conn) 0
+             (connection-out-interims conn) 0
              (connection-interest-inverted conn) nil)
        (epoll-modify epoll-fd (connection-fd conn)
                     (logior +epollin+ +epollet+)))
@@ -2341,7 +2393,9 @@
                     ;; for this has to avoid.
                     (setf pause (eq verdict :pause))
                     (when (eq verdict :stop)
-                      (setf stop t))))))
+                      (setf stop t)))))
+              ;; Found incrementally; see OUTBOUND-RESPONSE-HEAD.
+              (outbound-response-head conn))
            (setf (connection-chunk-scan-pos conn) next-scan)
            ;; A relay that is still reading frees what it has handed on;
            ;; a fetch ending in this pass needs nothing freed.
@@ -2424,12 +2478,19 @@
         thereis (and (string-equal name "transfer-encoding")
                      (header-has-token-p value "chunked"))))
 
-(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0) on-data)
+(defun outbound-response-complete-p (buf end method &optional (chunk-scan 0) on-data
+                                                         (head nil head-p))
   "Return (values COMPLETE-P NEXT-CHUNK-SCAN CHUNKED-BODY-START) for the
    outbound HTTP response accumulated in BUF[0..END), given the request
    METHOD. Thread NEXT-CHUNK-SCAN back in on the following call so a
    chunked body is walked once across a growing buffer (see
    CHUNKED-BODY-COMPLETE-P).
+
+   HEAD, when given, is OUTBOUND-RESPONSE-HEAD's answer for this buffer —
+   (START . HEADER-END), or NIL for a head still arriving — and the
+   search for it is not repeated here. HANDLE-OUTBOUND-READ passes it, so
+   a connection's head is searched incrementally; a caller holding only a
+   buffer leaves it out, and the head is found from the top.
 
    CHUNKED-BODY-START is where the body begins, given only when the
    response's Transfer-Encoding is exactly chunked, the one framing the
@@ -2481,8 +2542,12 @@
   ;; CL-framed 200 look close-delimited, so the predicate would answer NIL
   ;; forever and the fetch would hang until *FETCH-TIMEOUT* on any upstream
   ;; that keeps the connection alive.
-  (let* ((start (skip-interim-responses buf 0 end))
-         (header-end (scan-crlf-crlf buf start end)))
+  (let* ((start (if head-p
+                    (car head)
+                    (skip-interim-responses buf 0 end)))
+         (header-end (if head-p
+                         (cdr head)
+                         (scan-crlf-crlf buf start end))))
     (unless header-end
       (return-from outbound-response-complete-p (values nil chunk-scan)))
     (let* ((body-start (+ header-end 4))

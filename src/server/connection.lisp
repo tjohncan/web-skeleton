@@ -229,6 +229,13 @@
   ;; resets, where it would write the same 0 the setter already writes.
   ;; That changes no failure mode and hides the setter from every test.
   (chunk-scan-pos  0  :type fixnum)
+  ;; Where an outbound response's head search resumes: the first byte of
+  ;; the head still arriving, after the interims already stepped over, and
+  ;; how many interims those were. HEADER-SCAN-POS is the search's resume
+  ;; point inside that head, as it is for a request. See
+  ;; OUTBOUND-RESPONSE-HEAD.
+  (out-head-start  0  :type fixnum)
+  (out-interims    0  :type fixnum)
   ;; (CONN BYTES) per chunk as an outbound response arrives, or NIL to
   ;; buffer the whole body. Set from the continuation by INITIATE-FETCH.
   (fetch-on-body   nil :type (or null function))

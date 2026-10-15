@@ -1166,6 +1166,110 @@
                    finally (return n))
              1))))
 
+(defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
+  "Accept once, read the request head, write PIECES (strings, one byte per
+   character) one at a time with PAUSE seconds between them, then hold the
+   connection open for HOLD seconds before closing. Returns the thread."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (loop for byte = (read-byte st nil nil)
+                 while byte
+                 do (vector-push-extend byte b)
+                 until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
+           (dolist (piece pieces)
+             (write-sequence (sb-ext:string-to-octets piece :external-format :latin-1) st)
+             (force-output st)
+             (sleep pause))
+           (sleep hold)
+           (sb-bsd-sockets:socket-close s))
+       (error () nil)))
+   :name "piecemeal-upstream"))
+
+(defun %pieces (string size)
+  "STRING cut into consecutive pieces of SIZE characters."
+  (loop for i from 0 below (length string) by size
+        collect (subseq string i (min (length string) (+ i size)))))
+
+(defun %fetch-through (pieces &key (hold 6))
+  "Fetch from a %PIECEMEAL-UPSTREAM sending PIECES. Returns
+   (values STATUS SECONDS) as the client of the relay saw them."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host port) (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread (%piecemeal-upstream listener pieces :hold hold))
+             (with-test-server
+                 (:handler (lambda (req)
+                             (declare (ignore req))
+                             (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/h" port)
+                               :then (lambda (status headers body)
+                                       (declare (ignore headers body))
+                                       (make-text-response (or status 502) "relayed")))))
+               (let ((start (get-internal-real-time)))
+                 (values (attempt (values (test-http-request :get "/relay")))
+                         (/ (- (get-internal-real-time) start)
+                            internal-time-units-per-second))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-outbound-head-budget-and-search-e2e ()
+  "An upstream's response head is searched once and refused at the
+   streaming path's length.
+
+   Two halves. An upstream that sends a head longer than
+   RESPONSE-HEAD-BUDGET and then holds the connection open is answered 502
+   at once, where waiting for the buffer's 8 MiB cap or for the upstream
+   to close would keep the fetch alive. An upstream that dribbles a 20 KiB
+   head in 200 pieces is searched incrementally: the bytes SCAN-CRLF-CRLF
+   walks stay near the head's size, where a search from the top on every
+   read would walk the buffer once per piece, about 4 MiB."
+  (format t "~%Harness: an upstream head is budgeted and searched once~%")
+  ;; A head that never ends.
+  (let ((head (with-output-to-string (s)
+                (format s "HTTP/1.1 200 OK~c~c" #\Return #\Newline)
+                (dotimes (i 100)
+                  (format s "X-Pad-~3,'0d: ~a~c~c" i (make-string 1000 :initial-element #\p)
+                          #\Return #\Newline)))))
+    (multiple-value-bind (status seconds) (%fetch-through (%pieces head 4096))
+      (check "head budget: an unending head is answered 502" status 502)
+      (check "head budget: at once, not when the upstream gives up"
+             (< seconds 4) t)))
+  ;; A head that ends, sent in pieces.
+  (let* ((head (with-output-to-string (s)
+                 (format s "HTTP/1.1 200 OK~c~cContent-Length: 2~c~c" #\Return #\Newline
+                         #\Return #\Newline)
+                 (dotimes (i 50)
+                   (format s "X-Pad-~3,'0d: ~a~c~c" i (make-string 390 :initial-element #\p)
+                           #\Return #\Newline))
+                 (format s "~c~cok" #\Return #\Newline)))
+         (scanned 0))
+    (sb-int:encapsulate 'web-skeleton::scan-crlf-crlf 'count-scan
+                        (lambda (f buf start end)
+                          (incf scanned (max 0 (- end start)))
+                          (funcall f buf start end)))
+    (unwind-protect
+         (multiple-value-bind (status seconds)
+             (%fetch-through (%pieces head 100) :hold 0)
+           (declare (ignore seconds))
+           (check "head search: the dribbled head is read and relayed" status 200)
+           (check "head search: the bytes walked stay near the head's size"
+                  (< scanned (* 200 1024)) t))
+      (sb-int:unencapsulate 'web-skeleton::scan-crlf-crlf 'count-scan))))
+
 (defparameter *chunked-corpus* '("aa" "bbb" "cccc")
   "The chunk payloads the :ON-BODY framing tests assert on.
 
@@ -5676,6 +5780,7 @@
   (test-harness-fetch-latin-1-header-e2e)
   (test-harness-accept-failure-is-retried-e2e)
   (test-harness-client-errors-log-once-a-minute-e2e)
+  (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
