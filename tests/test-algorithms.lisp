@@ -353,6 +353,42 @@
            (web-skeleton::ecdsa-verify-p256-lisp hash sig huge huge)
            nil)))
 
+(defun test-ecdsa-corpus ()
+  "ECDSA-VERIFY-P256-LISP answers every *ECDSA-P256-CORPUS* entry as
+   OpenSSL did, and with web-skeleton-tls loaded so does libssl.
+
+   The corpus is what the verifier's arithmetic is held to: random
+   signatures and their high-S twins, single-bit damage of every kind, r
+   and s at the edges of their range, and crafted signatures for what a
+   random one never reaches. Among those are a sum u1 G + u2 Q that
+   doubles or vanishes, and public keys for which G + Q is 2G or the
+   point at infinity — where an addition that skips its special cases
+   answers wrongly. See ecdsa-corpus.lisp for how each verdict was made.
+
+   The pure-Lisp verifier is called by name, so this holds whichever
+   implementation ECDSA-VERIFY-P256 is swapped to."
+  (format t "~%ECDSA P-256 corpus~%")
+  (let ((libssl (when (tls-loaded-p) (tls-sym "ECDSA-VERIFY-P256-LIBSSL")))
+        (libssl-disagrees nil))
+    (dolist (e *ecdsa-p256-corpus*)
+      (destructuring-bind (name expected digest sig x y) e
+        (let ((digest (hex-decode digest))
+              (sig (hex-decode sig))
+              (x (hex-decode x))
+              (y (hex-decode y)))
+          (check (format nil "ecdsa corpus: ~a" name)
+                 (attempt (web-skeleton::ecdsa-verify-p256-lisp digest sig x y))
+                 expected)
+          (when (and libssl
+                     (not (eq (attempt (funcall libssl digest sig x y))
+                              expected)))
+            (push name libssl-disagrees)))))
+    (when libssl
+      (check (format nil "ecdsa corpus: libssl agrees on all ~d entries"
+                     (length *ecdsa-p256-corpus*))
+             (reverse libssl-disagrees)
+             nil))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; mod-inv raises on non-invertible input (pure-Lisp primitive)
 ;;;
@@ -734,6 +770,7 @@
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)
+  (test-ecdsa-corpus)
   (test-mod-inv-raise)
   (test-hmac-sha256)
   (test-octet-contract)
