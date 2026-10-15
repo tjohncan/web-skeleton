@@ -1464,12 +1464,13 @@
   "A chunked upstream that delivers chunks and then closes without the
    zero-size terminator fails the fetch, rather than reporting success.
 
-   The truncation guard on this framing is DECODE-CHUNKED-BODY's raise —
-   there is no Content-Length to compare against — and suppressing the
-   buffered body suppressed the guard along with it. Chunks went to
-   :ON-BODY, the upstream vanished mid-body, and :THEN fired 200 with a
-   NIL body: byte-for-byte the report a *whole* response produces. The
-   app cannot tell the two apart, which is the failure the Content-Length
+   There is no Content-Length to compare against, and under :ON-BODY the
+   delivered chunks have been freed, so the guard is COMPLETE-FETCH's own:
+   a chunked relay that reaches end of stream without the walk finding
+   its terminator is a 502. Without it, chunks would go to :ON-BODY, the
+   upstream would vanish mid-body, and :THEN would fire 200 with a NIL
+   body: byte-for-byte the report a *whole* response produces. The app
+   could not tell the two apart, which is the failure the Content-Length
    guard already refuses to have.
 
    The chunks arriving first is asserted rather than assumed. Without
@@ -4273,8 +4274,8 @@
    The upstream is dialled by **name**, which is what makes this the only
    e2e in the suite to reach INITIATE-DNS-LOOKUP on its success path. Every
    other FETCH-INTO here dials an IP literal and takes INITIATE-HTTP-FETCH's
-   PARSE-IPV4-LITERAL fast path straight past it — which is how three
-   defects lived in that function behind a green suite.
+   PARSE-IPV4-LITERAL fast path straight past it, so a defect in that
+   function would live behind a green suite.
 
    Both ends are moved together rather than one end being assumed. The
    listener binds whatever RESOLVE-HOST-BLOCKING answers for the same name
@@ -4353,11 +4354,11 @@
   "A detached fetch to a name that will not resolve, end to end, through the
    real resolver.
 
-   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all, and there
-   were none before them. Every other e2e FETCH-INTO dials an IP literal,
-   which takes INITIATE-HTTP-FETCH's fast path on PARSE-IPV4-LITERAL and
-   never enters the function — which is how three defects lived there
-   behind a green suite. Every unit detector for them drives the seam; this
+   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all. Every other
+   e2e FETCH-INTO dials an IP literal, which takes INITIATE-HTTP-FETCH's
+   fast path on PARSE-IPV4-LITERAL and never enters the function, so a
+   defect there would live behind a green suite. Every unit detector for
+   that function drives the seam; this
    one spawns getent.
 
    RFC 2606 reserves .invalid, so the lookup fails on every machine and

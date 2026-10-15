@@ -645,8 +645,7 @@
                 does. See CONNECTION-READ-INTO.
 
    :OK-EOF is separate from :OK because the difference is the whole
-   framing on two paths, and collapsing them cost this framework two
-   bugs.
+   framing on two paths, and collapsing them breaks both.
 
    Both arise when a peer's last bytes and its end-of-stream arrive in the
    same wake-up, which is the ordinary shape on loopback and a coin-toss
@@ -656,8 +655,8 @@
      A close-delimited outbound response — no Content-Length, no
      Transfer-Encoding — is framed by the close and nothing else.
      OUTBOUND-RESPONSE-COMPLETE-P says so in as many words and returns NIL
-     forever, deferring to the caller's EOF branch. That branch was
-     unreachable, so the fetch sat until *FETCH-TIMEOUT*.
+     forever, deferring to the caller's EOF branch. With the EOF dropped
+     that branch never runs, and the fetch sits until *FETCH-TIMEOUT*.
 
      A `getent` pipe carries the same hazard, on a race rather than
      reliably. getent writes its output in one go and the EOF appears when
@@ -666,7 +665,8 @@
      :OK, the exit arrives as a later event, and HANDLE-DNS-READY's \"no
      usable address\" branch fires on a clean :EOF. When it has — a cached
      answer, a loaded box, any scheduling that lets it finish first — the
-     two coalesce and that branch was skipped. The name it strands is one
+     two coalesce, and with the EOF dropped that branch is skipped. The
+     name it strands is one
      whose every address *FETCH-ADDRESS-FILTER* refused, so the failure
      lands on the SSRF-defense path and only sometimes.
 
@@ -709,7 +709,7 @@
             ;; re-issues the *read*. Split into two verdicts for the same
             ;; reason :OK-EOF is split from :EOF: the caller has bytes to
             ;; process in one case and not the other, and collapsing that
-            ;; distinction has cost this framework two bugs already.
+            ;; distinction loses the bytes or the wait.
             ((eq result :want-write)
              (return (if any-read :ok-want-write :want-write)))
             (t (incf (connection-read-pos conn) result)
@@ -722,7 +722,7 @@
    below answers them in the same order so the two can be read side by
    side. The caller needs to tell 'the peer said something' from 'the
    peer is gone', and those two arrive in one wake-up often enough that
-   collapsing them cost this framework two bugs already.
+   collapsing them would lose one of them in ordinary traffic.
 
    One arm more than its sibling, and deliberately. Both end with a
    default that assumes a byte count; the sibling's ADDs that count to
