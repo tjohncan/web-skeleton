@@ -1152,12 +1152,11 @@
   ;; Registration goes last, after every swap above has returned, so that
   ;; a hook being set means the whole file succeeded and not merely that
   ;; execution reached this form. TLS-LOADED-P reads *HTTPS-STREAM-FN* as
-  ;; exactly that signal, and it was reading it before the swaps ran —
-  ;; a raise from one of them (an OpenSSL without EVP_MD_CTX_new, say)
-  ;; would have left TLS reporting itself loaded with sha1, sha256 and
-  ;; ecdsa-verify-p256 still pure-Lisp. TEST-PURE-LISP-CRYPTO exists to
-  ;; re-verify those on a libssl machine, so a half-swap could have read
-  ;; as a pass.
+  ;; exactly that signal. Registered before the swaps, a raise from one of
+  ;; them (an OpenSSL without EVP_MD_CTX_new, say) would leave TLS
+  ;; reporting itself loaded with sha1, sha256 and ecdsa-verify-p256 still
+  ;; pure-Lisp. TEST-PURE-LISP-CRYPTO exists to re-verify those on a
+  ;; libssl machine, so a half-swap could read as a pass.
   (setf *tls-outbound-setup-fn* #'tls-setup-outbound)
   (setf *https-stream-fn* #'https-fetch-stream)
   (log-info "tls: HTTPS fetch enabled"))

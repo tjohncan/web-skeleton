@@ -1704,8 +1704,8 @@
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length
                       ;; Cleared for the same reason the keep-alive reset
-                      ;; two arms up clears it, and it was the one field the
-                      ;; two otherwise-identical resets disagreed on.
+                      ;; two arms up clears it, so the two otherwise-
+                      ;; identical resets agree on every field.
                       ;; WEBSOCKET-UPGRADE-P only looks for the upgrade
                       ;; token, so `Connection: close, Upgrade` is a legal
                       ;; upgrade that would leave the flag set for the life

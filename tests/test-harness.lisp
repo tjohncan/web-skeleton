@@ -1737,18 +1737,18 @@
    unique per socket, cannot over-report, and leaves only the undercount
    for the caller to handle.
 
-   NIL rather than 0 because a read of this file has been seen to fail,
-   and 'no listeners there' and 'could not look' are different answers:
-   a caller that conflates them reports a spurious failure whenever the
-   machine is busy.
+   NIL rather than 0 when the read fails, because 'no listeners there'
+   and 'could not look' are different answers: a caller that conflates
+   them reports a spurious failure whenever the read does.
 
-   Two separate things happen to this file and they were conflated once,
-   so: the undercount above is seq_file resume, measured directly. The
-   failed read was not. That was EBADF on a descriptor nothing here
-   closed, and its cause turned out to live in CONNECTION-CLOSE -- a
-   finalizer closing a reissued fd number under its new owner. Fixed
-   there. The guard stays because a busy machine can still make the
-   count late, and because a caller should not have to know which."
+   The two are separate failures and easy to conflate. The undercount
+   above is seq_file resume, measured directly. A read that fails
+   outright is not: EBADF on a descriptor nothing here closed means
+   something else closed it, which is the shape CONNECTION-CLOSE's
+   comment describes, a finalizer closing a reissued fd number under its
+   new owner. The guard is kept all the same: a busy machine can still
+   make the count late, and a caller should not have to know which
+   failure it met."
   (handler-case
       (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
         (when in

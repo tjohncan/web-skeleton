@@ -851,8 +851,8 @@
    deadline fails only a fetch that has already outrun the budget the
    caller set, which is what setting that budget asked for.
 
-   Leaving it unbounded was the first answer, and it was wrong for a
-   reason specific to this framework. SO_RCVTIMEO restarts per syscall,
+   Leaving it unbounded would be wrong, for a reason specific to this
+   framework. SO_RCVTIMEO restarts per syscall,
    so it bounds each call and never the sequence — and this process
    generates SIGCHLD by design, one getent child per DNS lookup. That is
    the same fact SSL-READ-EOF-OR-RAISE uses to argue that EINTR is
