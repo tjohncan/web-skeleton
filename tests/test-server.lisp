@@ -1171,7 +1171,7 @@
                 (+ web-skeleton::*max-body-size*
                    web-skeleton::*max-total-header-bytes*))
              t)
-      ;; The tightened-body-cap case the aliasing broke, stated directly:
+      ;; The tightened-body-cap case aliasing would break, stated directly:
       ;; a 32 KiB body budget must still admit a full 64 KiB of headers.
       (let ((web-skeleton::*max-body-size* (* 32 1024)))
         (check "read cap: tight body cap still admits full headers"
@@ -2634,27 +2634,25 @@
 
 (defun %response-corpus ()
   "Response byte-strings covering every framing the line reader decides
-   between, each with the result TLS-STREAM-RESPONSE produced for it.
-   Entries are (NAME METHOD BYTES EXPECTED).
+   between, each with its expected result. Entries are
+   (NAME METHOD BYTES EXPECTED).
 
-   EXPECTED is recorded, not derived. It was captured from
-   TLS-STREAM-RESPONSE through its READ-FN seam while that function still
-   existed, at all three granularities below, which agreed — so a single
-   recorded triple is not a lie about any of them. That capture is what
-   makes the deletion of ~450 lines checkable rather than hopeful, and it
-   is the whole reason the seam was put there."
+   EXPECTED is recorded, not derived: each triple is what an independent
+   implementation of this reader produced for the bytes, at all three
+   granularities below, which agreed — so a single recorded triple is not
+   a lie about any of them. The reader under test is held to an answer it
+   did not compute."
   (let* ((cr (string #\Return))
          (lf (string #\Newline))
          (crlf (concatenate 'string cr lf)))
     (flet ((raw (&rest parts)
              (ascii-bytes (apply #'concatenate 'string parts))))
       (list
-       ;; Byte counts here are load-bearing and were wrong once: a
-       ;; Content-Length longer than its body, or a chunk-size that
-       ;; misdescribes its chunk, makes the case test truncation under
-       ;; the name of the happy path. Three of these did, and the parity
-       ;; run still passed, because both readers agreed about the error.
-       ;; Count them.
+       ;; Byte counts here are load-bearing: a Content-Length longer
+       ;; than its body, or a chunk-size that misdescribes its chunk,
+       ;; makes the case test truncation under the name of the happy
+       ;; path — and a parity run still passes, because both readers
+       ;; agree about the error. Count them.
        (list "content-length" :GET               ; "one\ntwo\n" = 8
              (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
                   "one" lf "two" lf)
@@ -2704,10 +2702,10 @@
   "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
    Returns (STATUS LINES RAISED-P).
 
-   RAISED-P rather than the condition text. The recorded expectations came
-   from a different implementation, which worded its truncation errors
-   differently; the claim under test is that the verdict and the lines
-   delivered before it survived the replacement, not the phrasing."
+   RAISED-P rather than the condition text. The recorded expectations come
+   from an independent implementation that words its truncation errors
+   its own way; the claim under test is the verdict and the lines
+   delivered before it, not the phrasing."
   (let ((lines nil))
     (handler-case
         (let ((status (web-skeleton::stream-response-lines
@@ -2720,16 +2718,21 @@
 
 (defun test-line-reader-over-read-fn ()
   "STREAM-RESPONSE-LINES over a READ-FN reproduces, on every framing and
-   at three byte-source granularities, what the deleted
-   TLS-STREAM-RESPONSE produced for the same bytes.
+   at three byte-source granularities, the recorded result for the same
+   bytes.
 
    The granularities are the part with teeth. READ-SEQUENCE fills a whole
    buffer, so a corpus driven only through a stream never splits a token
    across two fills and the reader's refill-and-resume paths go
    unexercised; :CHUNK 1 puts a boundary between every pair of bytes.
-   Measured: disabling the CRLF-straddle refill in READER-READ-LINE
-   leaves all ten whole-response cases passing and the rest of the suite
-   green, while failing nine of ten at :CHUNK 1."
+
+   The corpus's body lines end in bare LF or CR, so it never asks
+   READER-READ-LINE to join a CRLF split across two fills, and the head,
+   where every line ends in CRLF, is READER-READ-HEAD's. The CRLF body
+   case after the corpus is what does. Its expectation is stated rather
+   than recorded. Measured: disabling the CRLF-straddle refill in
+   READER-READ-LINE leaves the whole corpus and the rest of the suite
+   green, and fails that case at :CHUNK 7 and :CHUNK 1."
   (format t "~%Shared line reader over a byte-source function~%")
   (dolist (chunk '(nil 7 1))
     (dolist (entry (%response-corpus))
@@ -2738,7 +2741,20 @@
                        (if chunk (format nil "chunk ~d" chunk) "whole")
                        name)
                (%run-line-reader raw method chunk)
-               expected)))))
+               expected))))
+  ;; At one byte per fill every CR is the last byte of its fill and its LF
+  ;; the first of the next, so the refill is all that keeps the pair one
+  ;; terminator rather than a line and an empty one.
+  (let* ((crlf (format nil "~c~c" #\Return #\Newline))
+         (raw (ascii-bytes (concatenate 'string
+                                        "HTTP/1.1 200 OK" crlf
+                                        "Content-Type: text/plain" crlf crlf
+                                        "one" crlf "two" crlf))))
+    (dolist (chunk '(nil 7 1))
+      (check (format nil "CRLF body lines [~a]"
+                     (if chunk (format nil "chunk ~d" chunk) "whole"))
+             (%run-line-reader raw :GET chunk)
+             '(200 ("one" "two") nil)))))
 
 (defun %latin-1-bytes (&rest parts)
   "PARTS concatenated and encoded one byte per character, so a test can
