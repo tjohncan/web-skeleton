@@ -24,6 +24,7 @@
            #:url-decode
            #:form-decode
            #:match-path
+           #:*match-path-literals*
            ;; HTTP response
            #:http-response
            #:http-response-status

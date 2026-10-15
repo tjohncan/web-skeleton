@@ -2395,6 +2395,14 @@
             on every pass of every worker's event loop, so a value that ~
             cannot be funcalled fails on every pass rather than once."
            on-tick))
+  ;; Fifth, for the same reason. MATCH-PATH reads *MATCH-PATH-LITERALS* on
+  ;; every call, so a typo there would fail every routed request with a
+  ;; 500 instead of failing once, here.
+  (unless (member *match-path-literals* '(:exact :decoded))
+    (error "start-server: *match-path-literals* is ~s; it must be :EXACT ~
+            (a route's literals match a path as it arrived) or :DECODED ~
+            (they match it percent-decoded)."
+           *match-path-literals*))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.

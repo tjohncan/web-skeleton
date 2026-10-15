@@ -2530,7 +2530,57 @@
 
   (check "literal mismatch with capture"
          (match-path "/api/users/:id" "/api/posts/99")
-         nil))
+         nil)
+
+  ;; Literals are compared with the path as it arrived unless
+  ;; *MATCH-PATH-LITERALS* says :DECODED. /%61dmin is /admin to RFC 3986
+  ;; and not to a prefix check on HTTP-REQUEST-PATH, so by default the
+  ;; router reads the path the way the application's own checks do.
+  (check "literals: :exact is the default"
+         web-skeleton:*match-path-literals* :exact)
+  (check "literals :exact: an escaped spelling does not match"
+         (match-path "/admin" "/%61dmin") nil)
+  (check "literals :exact: nor does one escaped in a longer pattern"
+         (match-path "/admin/:id" "/%61dmin/7") nil)
+  (check "literals :exact: a non-ASCII literal is written as it arrives"
+         (match-path "/caf%C3%A9" "/caf%C3%A9") t)
+  (check "literals :exact: and its decoded spelling does not match"
+         (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") nil)
+  (check "literals :exact: an escape that is not UTF-8 fails, not raises"
+         (attempt (match-path "/admin" "/%FF")) nil)
+  (check "literals :exact: a capture is still decoded"
+         (match-path "/files/:name" "/files/hello%20world")
+         '(("name" . "hello world")))
+  (let ((web-skeleton:*match-path-literals* :decoded))
+    (check "literals :decoded: an escaped spelling matches"
+           (match-path "/admin" "/%61dmin") t)
+    (check "literals :decoded: a non-ASCII literal matches its escapes"
+           (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") t)
+    (check "literals :decoded: a capture is decoded as under :exact"
+           (match-path "/files/:name" "/files/hello%20world")
+           '(("name" . "hello world"))))
+  (let ((web-skeleton:*match-path-literals* :decode))
+    (check "literals: a value that is neither is refused"
+           (stringp (attempt (match-path "/admin" "/admin")))
+           t)))
+
+(defun test-match-path-literals-validated-at-boot ()
+  "START-SERVER refuses a *MATCH-PATH-LITERALS* that is neither :EXACT nor
+   :DECODED before it binds.
+
+   MATCH-PATH reads the variable on every call, so a typo would fail every
+   routed request rather than the boot. The :HOST is invalid for the
+   reason TEST-FETCH-TIMEOUT-VALIDATED-AT-BOOT gives: if the check is
+   reverted, MAKE-TCP-LISTENER refuses the host by name instead of a real
+   server starting inside the suite, and the message says which refusal
+   it was."
+  (format t "~%start-server: *match-path-literals* is checked at boot~%")
+  (let ((web-skeleton:*match-path-literals* :decode))
+    (check "boot: a *match-path-literals* that is neither is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*match-path-literals*" msg) t))
+           t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Streaming fetch tests (no network — in-memory byte stream mock)
@@ -2696,12 +2746,6 @@
   (sb-ext:string-to-octets (apply #'concatenate 'string parts)
                            :external-format :latin-1))
 
-(defun %attempt (thunk)
-  "THUNK's value, or (:RAISED text) if it signals. A check over a raise
-   then fails as a check, with the message, instead of ending the suite."
-  (handler-case (funcall thunk)
-    (error (e) (list :raised (princ-to-string e)))))
-
 (defun test-upstream-field-values ()
   "An upstream's field value that is not UTF-8 is read as Latin-1, where a
    request's is refused.
@@ -2716,23 +2760,20 @@
          (filename (concatenate 'string "attachment; filename=\"r" e9
                                 "sum.pdf\""))
          (field (%latin-1-bytes "Content-Disposition: " filename crlf crlf)))
-    (labels ((response-headers (buf)
-               (%attempt (lambda ()
-                           (web-skeleton::parse-headers-bytes
-                            buf 0 (length buf) :invalid-utf-8 :latin-1))))
-             (value-of (result name)
-               ;; NIL for a refusal, so a raise fails the check that reads
-               ;; it rather than the ASSOC.
-               (unless (eq (first result) :raised)
-                 (cdr (assoc name result :test #'string=)))))
+    ;; ATTEMPT answers a refusal as its text, so a string here is a raise.
+    (flet ((response-headers (buf)
+             (attempt (web-skeleton::parse-headers-bytes
+                       buf 0 (length buf) :invalid-utf-8 :latin-1)))
+           (value-of (result name)
+             ;; NIL for a refusal, so a raise fails the check that reads
+             ;; it rather than the ASSOC.
+             (when (listp result)
+               (cdr (assoc name result :test #'string=)))))
       ;; The request side, unchanged: the same byte is refused.
       (check "request field: a byte that is not UTF-8 is refused"
-             (let ((r (%attempt (lambda ()
-                                  (web-skeleton::parse-headers-bytes
-                                   field 0 (length field))))))
-               (and (consp r) (eq (first r) :raised)
-                    (search "invalid UTF-8 in request" (second r))
-                    t))
+             (let ((r (attempt (web-skeleton::parse-headers-bytes
+                                field 0 (length field)))))
+               (and (stringp r) (search "invalid UTF-8 in request" r) t))
              t)
       (let ((value (value-of (response-headers field) "content-disposition")))
         (check "response field: a Latin-1 byte reads as its character"
@@ -2751,28 +2792,27 @@
                        "x-name")
              (concatenate 'string "caf" e9))
       (check "response field: a CTL in a value is still refused"
-             (first (response-headers
-                     (%latin-1-bytes "X-Name: a" (string (code-char 1)) "b"
-                                     crlf crlf)))
-             :raised)
+             (stringp (response-headers
+                       (%latin-1-bytes "X-Name: a" (string (code-char 1)) "b"
+                                       crlf crlf)))
+             t)
       (check "response field: a separator in a name is still refused"
-             (first (response-headers
-                     (%latin-1-bytes "X(Name): v" crlf crlf)))
-             :raised)
+             (stringp (response-headers
+                       (%latin-1-bytes "X(Name): v" crlf crlf)))
+             t)
       ;; The function both outbound paths read a head with.
       (check "response head: status, the Latin-1 value and the framing"
-             (%attempt
-              (lambda ()
-                (let ((head (%latin-1-bytes "HTTP/1.1 200 OK" crlf
-                                            "Content-Disposition: " filename
-                                            crlf "Content-Length: 2" crlf crlf)))
-                  (multiple-value-bind (status headers chunked-p te cl)
-                      (web-skeleton::parse-response-head
-                       head 0 (- (length head) 4))
-                    (list status
-                          (cdr (assoc "content-disposition" headers
-                                      :test #'string=))
-                          chunked-p te cl)))))
+             (attempt
+               (let ((head (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                           "Content-Disposition: " filename
+                                           crlf "Content-Length: 2" crlf crlf)))
+                 (multiple-value-bind (status headers chunked-p te cl)
+                     (web-skeleton::parse-response-head
+                      head 0 (- (length head) 4))
+                   (list status
+                         (cdr (assoc "content-disposition" headers
+                                     :test #'string=))
+                         chunked-p te cl))))
              (list 200 filename nil nil 2)))))
 
 (defun test-streaming-fetch-reads-the-buffered-head ()
@@ -2835,12 +2875,12 @@
                                   raw 0 (length raw))))
                  (if (null header-end)
                      :no-head
-                     (let ((r (%attempt
-                               (lambda ()
-                                 (multiple-value-list
-                                  (web-skeleton::parse-response-head
-                                   raw 0 header-end))))))
-                       (if (or (eq (first r) :raised) (null (first r)))
+                     ;; A string is ATTEMPT's answer for a raise.
+                     (let ((r (attempt
+                                (multiple-value-list
+                                 (web-skeleton::parse-response-head
+                                  raw 0 header-end)))))
+                       (if (or (stringp r) (null (first r)))
                            :refused
                            (first r)))))
                buffered)))))
@@ -11308,6 +11348,7 @@
   (test-url-decode)
   (test-query-string)
   (test-match-path)
+  (test-match-path-literals-validated-at-boot)
   (test-streaming-fetch)
   (test-streaming-fetch-reads-the-buffered-head)
   (test-line-reader-over-read-fn)

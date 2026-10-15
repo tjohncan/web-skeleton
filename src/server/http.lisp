@@ -428,11 +428,37 @@
             (setf start (1+ slash))
             (return (nreverse segments)))))))
 
+(defparameter *match-path-literals* :exact
+  "How MATCH-PATH compares a pattern's literal segments with a path's.
+
+     :EXACT    the default. A literal matches the segment as it arrived,
+               so /%61dmin does not match /admin.
+     :DECODED  the segment is percent-decoded first, so /%61dmin does
+               match /admin — RFC 3986 §6.2.2.2 counts the two as one
+               URI.
+
+   A choice for the project, made once. :EXACT keeps a route matching
+   the spelling HTTP-REQUEST-PATH shows the application, so a check on
+   the raw path and the router read the same bytes the same way. Under
+   :DECODED, make access decisions on the matched route and never on the
+   raw path: a prefix test for \"/admin\" passes /%61dmin, which the
+   router then sends to the admin route.
+
+   Captured :param values are percent-decoded under both. Under :EXACT a
+   literal outside unreserved ASCII is written in the pattern the way it
+   arrives, percent-encoded: /caf%C3%A9, not /café. START-SERVER refuses
+   any other value.")
+
 (defun match-path (pattern path)
   "Match PATH against PATTERN with :param segment captures.
-   Literal segments must match exactly; segments starting with : capture.
+   Literal segments must match; segments starting with : capture.
    Empty segments are not captured (e.g. /users/ does not match /users/:id).
-   Captured values are percent-decoded.
+   Captured values are percent-decoded. Literals are compared as
+   *MATCH-PATH-LITERALS* says: with the segment as it arrived (:EXACT,
+   the default), or with the segment percent-decoded (:DECODED). Under
+   :EXACT a literal comparison decodes nothing, so a segment whose
+   escapes are not UTF-8 fails a literal instead of raising; a capture
+   decodes under both, and raises for one.
 
    Return contract is a deliberate tri-state:
      NIL      — PATH does not match PATTERN
@@ -449,6 +475,9 @@
        (when (and b (listp b)) (cdr (assoc \"id\" b))))"
   (let ((pat-segs  (split-path-segments pattern))
         (path-segs (split-path-segments path))
+        (decode-literals (ecase *match-path-literals*
+                           (:exact nil)
+                           (:decoded t)))
         (bindings nil))
     (when (= (length pat-segs) (length path-segs))
       (when (loop for pat in pat-segs
@@ -459,7 +488,9 @@
                                (push (cons (subseq pat 1) (url-decode seg))
                                      bindings)
                                t)
-                             (string= pat (url-decode seg))))
+                             (string= pat (if decode-literals
+                                              (url-decode seg)
+                                              seg))))
         (if bindings (nreverse bindings) t)))))
 
 ;;; ---------------------------------------------------------------------------
