@@ -2383,10 +2383,10 @@
    One definition of 'the response is done', reached through
    HANDLE-OUTBOUND-READ for every outbound response, http:// and https://
    alike — TLS is a transport under that read, not a second reader. Two
-   readers did once disagree, one recognizing the chunked terminator and
-   the other reading to EOF, so the same upstream could be handled
-   cleanly over one scheme and stall over the other. A single predicate
-   is the only way that divergence stays fixed.
+   readers can disagree, one recognizing the chunked terminator and the
+   other reading to EOF, and then the same upstream is handled cleanly
+   over one scheme and stalls over the other. A single predicate is the
+   only way that divergence cannot happen.
 
    Framing, in RFC 7230 §3.3.3 order:
      HEAD           — no body ever (§4.3.2), even when the upstream
@@ -2711,8 +2711,9 @@
     ;; below, because SKIP-INTERIM-RESPONSES has already consumed every
     ;; complete interim: STATUS here is either >= 200 or NIL, and NIL
     ;; was rejected by the gate above. Testing for 1xx would be dead
-    ;; code that reads as though an interim could be a final status —
-    ;; the belief that produced the defect the skip exists to fix.
+    ;; code that reads as though an interim could be a final status,
+    ;; which is the belief that lets an interim stand in for the
+    ;; response.
     (when (and content-length
                (not (or (= status 204) (= status 304)))
                (not (eq (connection-fetch-method out-conn) :HEAD))
@@ -2743,22 +2744,22 @@
            ;; walk ON-DATA is threaded into is CHUNKED-BODY-COMPLETE-P's
            ;; and no other — and a walk that reached the terminator.
            ;;
-           ;; Keying this on the callback merely being supplied dropped the
-           ;; body of every Content-Length and close-delimited response: no
-           ;; chunks delivered, NIL in :THEN, nothing raised. That is the
-           ;; majority of responses in the wild, and the caller does not
-           ;; choose the framing — the same origin switches by response
-           ;; size or by whatever proxy sits in front, so a relay would
-           ;; work against one upstream and come back empty against the
-           ;; next.
+           ;; Keyed on the callback merely being supplied, this would drop
+           ;; the body of every Content-Length and close-delimited
+           ;; response: no chunks delivered, NIL in :THEN, nothing raised.
+           ;; That is the majority of responses in the wild, and the caller
+           ;; does not choose the framing — the same origin switches by
+           ;; response size or by whatever proxy sits in front, so a relay
+           ;; would work against one upstream and come back empty against
+           ;; the next.
            ;;
-           ;; Keying it on callback-and-chunked still suppressed the guard
-           ;; on a body that stopped early: chunks delivered, upstream RSTs
-           ;; before the terminator, and :THEN fires 200 with NIL as though
-           ;; the response were whole. Requiring the walk to have finished
-           ;; falls through to DECODE-CHUNKED-BODY instead, whose missing-
-           ;; terminator raise becomes the same 502 every other truncation
-           ;; on this path already produces.
+           ;; Keyed on callback-and-chunked, it would still suppress the
+           ;; guard on a body that stopped early: chunks delivered,
+           ;; upstream RSTs before the terminator, and :THEN fires 200 with
+           ;; NIL as though the response were whole. Requiring the walk to
+           ;; have finished falls through to DECODE-CHUNKED-BODY instead,
+           ;; whose missing-terminator raise becomes the same 502 every
+           ;; other truncation on this path produces.
            (body (cond
                    ((and (connection-fetch-on-body out-conn) chunked-p
                          framing-complete)

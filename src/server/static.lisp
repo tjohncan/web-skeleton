@@ -70,16 +70,15 @@
 ;;; ---------------------------------------------------------------------------
 
 (defstruct static-entry
-  "Cached static file with pre-built responses. Three byte vectors:
-   the 200 GET (headers + body), the 200 HEAD (same headers, body
-   suppressed), and the 304 Not Modified (etag + cache-control only,
-   no body). ETAG is the content's SHA-256 hex wrapped in a quoted
-   string — a strong entity tag per RFC 7232 §2.3.
+  "Cached static file, kept as the pieces its responses are built from:
+   HEAD-PREFIX, the 200's status line and headers, which GET and HEAD
+   share; NOT-MODIFIED-PREFIX, the 304's (etag and cache-control, no
+   body); and CONTENT, the body. ETAG is the content's SHA-256 hex
+   wrapped in a quoted string — a strong entity tag per RFC 7232 §2.3.
 
-   HEADERS, BODY-OFFSET and CONTENT-LENGTH exist for Range requests
-   (RFC 7233). A 206 needs a fresh header set — a different
-   Content-Length plus a Content-Range — so the 200's header alist is
-   kept to build from.
+   HEADERS and CONTENT-LENGTH exist for Range requests (RFC 7233). A 206
+   needs a fresh header set — a different Content-Length plus a
+   Content-Range — so the 200's header alist is kept to build from.
 
    Stored in pieces rather than as finished responses, because a Date
    has to be current and these vectors are built once at startup and

@@ -59,10 +59,9 @@
    ;; default because most raise sites are exactly that. It is not the
    ;; right answer for a request we understood perfectly and refused on
    ;; its merits — a 12 MiB body, an HTTP/2 preface, a method we do not
-   ;; implement. Those told the client "you wrote this wrong" when the
-   ;; truth was "this is too big", "wrong protocol", "not supported",
-   ;; and 413 / 414 / 431 already sat in *STATUS-REASONS* unreachable
-   ;; because every path through here answered 400.
+   ;; implement. A 400 would tell the client "you wrote this wrong" when
+   ;; the truth is "this is too big", "wrong protocol", "not supported",
+   ;; which is what 413 / 414 / 431 / 505 / 501 say.
    (status  :initarg :status  :reader http-parse-error-status
             :initform 400))
   (:report (lambda (condition stream)

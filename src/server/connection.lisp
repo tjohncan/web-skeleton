@@ -540,12 +540,12 @@
     ((connection-outbound-p conn)
      *max-outbound-response-size*)
     ;; The inbound cap is the sum of the budgets that actually apply, not
-    ;; *max-body-size* alone. Aliasing them made one knob quietly move
-    ;; two: a JSON API tightening the body cap to 32 KiB also capped
-    ;; total request bytes at 32 KiB, so a request with large-but-legal
-    ;; headers — a fat cookie jar, a long Authorization, a proxy's
-    ;; X-Forwarded-* chain — died on the buffer with a 400 that blamed
-    ;; the body.
+    ;; *max-body-size* alone. Aliasing them would make one knob quietly
+    ;; move two: a JSON API tightening the body cap to 32 KiB would also
+    ;; cap total request bytes at 32 KiB, so a request with
+    ;; large-but-legal headers — a fat cookie jar, a long Authorization,
+    ;; a proxy's X-Forwarded-* chain — would die on the buffer with a 400
+    ;; that blamed the body.
     ;;
     ;; Summed exactly rather than padded with slack, the same way the
     ;; :websocket arm spells out its 14-byte masked header. The head's share
@@ -797,14 +797,14 @@
                    (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
                          ;; 10 decimal digits caps at 9_999_999_999 ≈ 9.3 GB
                          ;; which is still four orders of magnitude past
-                         ;; any sensible *MAX-BODY-SIZE* default. The prior
-                         ;; 15-digit cap permitted values up to 10^15 ~ 900 TB,
-                         ;; which the real *MAX-BODY-SIZE* check always
-                         ;; rejected anyway — so the per-digit loop was
-                         ;; cosmetic, and an attacker sending
-                         ;; 'Content-Length: 999999999999999' forced a
-                         ;; bignum accumulator for free. Tightening to 10
-                         ;; makes the per-digit cap do real work.
+                         ;; any sensible *MAX-BODY-SIZE* default. A looser
+                         ;; cap, 15 digits, would admit values up to
+                         ;; 10^15 ~ 900 TB that the *MAX-BODY-SIZE* check
+                         ;; always rejects anyway — a cosmetic per-digit
+                         ;; cap, under which 'Content-Length:
+                         ;; 999999999999999' would force a bignum
+                         ;; accumulator for free. At 10 the per-digit cap
+                         ;; does real work.
                          do (incf digits)
                             (when (> digits 10)
                               ;; An 11-digit length is >= 10 GB, which is
