@@ -1025,23 +1025,29 @@
    Queued before reading the body when the client asks for it.")
 
 (defun scan-expect-disposition (buf end &optional (start 0))
-  "Classify the Expect header in BUF[START..END). Returns
-     :100-CONTINUE — an Expect: 100-continue header (case-insensitive)
-                     with a valid token terminator. Near-miss values
-                     like 100-continued are classified as :UNKNOWN.
-     :UNKNOWN      — an Expect header whose value is not 100-continue.
-                     RFC 7231 §5.1.1 lets the server respond with 417
-                     (MAY); the state machine uses this classification
-                     to do so unconditionally.
+  "Classify the expectations in BUF[START..END). Returns
+     :100-CONTINUE — at least one Expect header, and every member of
+                     every one is 100-continue (case-insensitive). A
+                     member may carry ;parameters. Near-miss values like
+                     100-continued are not 100-continue.
+     :UNKNOWN      — an Expect header with any other member, or with no
+                     member at all. RFC 9110 §10.1.1 lets a server answer
+                     417 (MAY); the state machine does so unconditionally.
      :NONE         — no Expect header present.
-   Start-of-line match only — suffixed names like X-Expect do not
-   match. First Expect header wins (early return)."
+
+   Every header and every member counts, because the policy is about which
+   expectations a request carries. Reading the first token of the first
+   header would make `Expect: 100-continue, foo` and an `Expect: foo`
+   after an `Expect: 100-continue` pass where the same set in another
+   order is refused. Repeated headers are combined, as RFC 9110 §5.3
+   combines field lines; empty list elements are the list grammar, not
+   members. Start-of-line match only — suffixed names like X-Expect do
+   not match."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "expect:"
                                          :external-format :ascii)))
-        (token (load-time-value
-                (sb-ext:string-to-octets "100-continue"
-                                          :external-format :ascii))))
+        (seen nil)
+        (members 0))
     (loop for i from start below end
           do (when (and (>= i 2)
                         (= (aref buf (- i 2)) 13)
@@ -1053,44 +1059,27 @@
                               always (or (= b n)
                                          (and (<= 97 n 122)
                                               (= b (- n 32))))))
-               ;; Found an Expect header. Classify it.
-               (let ((pos (+ i (length name))))
-                 ;; Skip OWS after the colon.
-                 (loop while (and (< pos end)
-                                  (or (= (aref buf pos) 32)
-                                      (= (aref buf pos) 9)))
-                       do (incf pos))
-                 ;; Case-insensitive match against "100-continue".
-                 (when (and (<= (+ pos (length token)) end)
-                            (loop for k below (length token)
-                                  for b = (aref buf (+ pos k))
-                                  for n = (aref token k)
-                                  always (or (= b n)
-                                             (and (<= 97 n 122)
-                                                  (= b (- n 32))))))
-                   ;; Require a token terminator so 100-continued (etc.)
-                   ;; does not match. Accepted terminators:
-                   ;;   CR (13)  — end of header line
-                   ;;   SP (32)  — whitespace continuation
-                   ;;   TAB (9)  — whitespace continuation
-                   ;;   ';' (59) — header parameter start
-                   ;;              (Expect: 100-continue;q=1.0 — rare
-                   ;;               but permitted by RFC 7231)
-                   ;;   ',' (44) — list separator. RFC 7231 §5.1.1
-                   ;;              defines Expect as 1#expectation
-                   ;;              (the RFC 7230 §7 list rule), so
-                   ;;              Expect: 100-continue, foo is a
-                   ;;              well-formed shape and the comma
-                   ;;              terminates the 100-continue token.
-                   (let ((after (+ pos (length token))))
-                     (when (or (>= after end)
-                               (let ((b (aref buf after)))
-                                 (or (= b 13) (= b 32) (= b 9)
-                                     (= b 59) (= b 44))))
-                       (return-from scan-expect-disposition :100-continue))))
-                 ;; Header present but value not 100-continue.
-                 (return-from scan-expect-disposition :unknown))))
-    :none))
+               (setf seen t)
+               ;; The value runs to the line's CR; walk its members.
+               (let* ((line-end (or (position 13 buf :start i :end end) end))
+                      (pos (+ i (length name))))
+                 (loop
+                   (let ((comma (or (position 44 buf :start pos :end line-end)
+                                    line-end)))
+                     (multiple-value-bind (ms me) (trim-ows-bounds buf pos comma)
+                       (when (> me ms)
+                         (incf members)
+                         ;; The member's name ends at a parameter's ';'.
+                         (multiple-value-bind (ts te)
+                             (trim-ows-bounds
+                              buf ms (or (position 59 buf :start ms :end me) me))
+                           (unless (ascii-token-equal-p buf ts te "100-continue")
+                             (return-from scan-expect-disposition :unknown)))))
+                     (when (>= comma line-end) (return))
+                     (setf pos (1+ comma)))))))
+    (cond ((not seen) :none)
+          ((zerop members) :unknown)
+          (t :100-continue))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Is this request's body finished?

@@ -554,19 +554,35 @@
            (disp "Host: localhost"
                  (format nil "Expect:~c100-continue" #\Tab))
            :100-continue)
-    ;; RFC 7231 §5.1.1: Expect is 1#expectation — a list. Comma
-    ;; terminates the 100-continue token just like ';' or CR.
-    (check "comma separator accepted"
-           (disp "Host: localhost" "Expect: 100-continue, x-foo=y") :100-continue)
-    (check "comma immediately after token"
-           (disp "Host: localhost" "Expect: 100-continue,x-foo=y") :100-continue)
+    ;; RFC 9110 §10.1.1: Expect is #expectation, a list, and every
+    ;; member counts. The verdict is the set of members, never their
+    ;; order or which header carried them.
+    (check "a list of 100-continue alone is 100-continue"
+           (disp "Host: localhost" "Expect: 100-continue, 100-continue") :100-continue)
+    (check "empty list elements are the list grammar, not members"
+           (disp "Host: localhost" "Expect: 100-continue,,") :100-continue)
+    (check "100-continue in two headers is 100-continue"
+           (disp "Host: localhost" "Expect: 100-continue" "Expect: 100-continue")
+           :100-continue)
+    (check "another member after 100-continue → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue, x-foo=y") :unknown)
+    (check "another member before 100-continue → :unknown"
+           (disp "Host: localhost" "Expect: x-foo=y, 100-continue") :unknown)
+    (check "another member right after the comma → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue,x-foo=y") :unknown)
+    (check "another expectation in a second header → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue" "Expect: foo") :unknown)
+    (check "another expectation in the first header → :unknown"
+           (disp "Host: localhost" "Expect: foo" "Expect: 100-continue") :unknown)
+    (check "an Expect header naming nothing → :unknown"
+           (disp "Host: localhost" "Expect: ,") :unknown)
     ;; :NONE — no Expect header at all.
     (check "no Expect header"
            (disp "Host: localhost" "Content-Length: 10") :none)
     (check "suffixed header name does not match"
            (disp "Host: localhost" "X-Expect: 100-continue") :none)
     ;; :UNKNOWN — Expect header present with a non-100-continue value.
-    ;; RFC 7231 §5.1.1 MAYs a 417 response on these; the framework
+    ;; RFC 9110 §10.1.1 MAYs a 417 response on these; the framework
     ;; chooses to always 417. Scanner just reports the classification,
     ;; the state machine handles the 417.
     (check "different expect value → :unknown"
