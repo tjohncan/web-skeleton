@@ -272,6 +272,21 @@ If your JWKS key set is shared across services, always verify these:
     ...))
 ```
 
+### What a signature check costs
+
+`jwt-verify` checks the signature on the worker handling the request, after
+the cheap checks: `alg`, a known `kid`, and `exp`. Every one of those is in an
+attacker's hands. The `kid` is in your public JWKS, and the attacker writes the
+claims. So each forged token costs one full ECDSA verification, and sending
+forged tokens is a way to spend your workers' CPU.
+
+Without `web-skeleton-tls`, the verification is pure Lisp and takes on the
+order of a millisecond of one worker's time. With it loaded,
+`ecdsa-verify-p256` is OpenSSL's `EVP_PKEY_verify`, which takes a fraction of
+that. Rate limit JWT-guarded routes at the proxy either way. An application
+that verifies a token on every request should load `web-skeleton-tls` even if
+it never fetches over HTTPS.
+
 ### Keying on the token string
 
 **Do not key a revocation list, replay-dedup cache, rate-limit bucket, or audit

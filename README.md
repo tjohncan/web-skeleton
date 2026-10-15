@@ -281,7 +281,10 @@ tests/
   `random-token` returns a base64url-encoded token (default 32 bytes / ~256 bits).
   For session IDs, CSRF tokens, nonces, PKCE verifiers
 - **ECDSA P-256** — signature verification per FIPS 186-4.
-  Pure Lisp bignum arithmetic, verification only (no signing, no key generation)
+  Pure Lisp bignum arithmetic, verification only (no signing, no key generation).
+  Jacobian coordinates and Shamir's trick. DEPLOYMENT.md says what a
+  verification costs a worker, and why a JWT-guarded app loads
+  `web-skeleton-tls` for it
 - **JWT validation** — ES256 token verification, JWKS key set parsing,
   claim extraction, expiration checking.
 - **WebSocket handshake** — validates upgrade request, computes accept key

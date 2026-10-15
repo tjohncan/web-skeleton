@@ -313,12 +313,25 @@
              (aref der 3)
              31)))
 
-  ;; Generator point self-test: n*G should be the point at infinity
+  ;; Generator point self-test: n*G is the point at infinity, Z = 0. With
+  ;; Q = G and U2 = 0 this is also Shamir's table building 2G.
   (check "n*G = infinity"
-         (web-skeleton::ec-mul web-skeleton::+p256-n+
-                               (cons web-skeleton::+p256-gx+
-                                     web-skeleton::+p256-gy+))
-         nil)
+         (nth-value 2 (web-skeleton::ec-mul-add web-skeleton::+p256-n+ 0
+                                                web-skeleton::+p256-gx+
+                                                web-skeleton::+p256-gy+))
+         0)
+  ;; (n-1)G is -G: the same x, the opposite y.
+  (check "(n-1)*G = -G"
+         (multiple-value-bind (x y z)
+             (web-skeleton::ec-mul-add (1- web-skeleton::+p256-n+) 0
+                                       web-skeleton::+p256-gx+
+                                       web-skeleton::+p256-gy+)
+           (let* ((p web-skeleton::+p256-p+)
+                  (zi (web-skeleton::mod-inv z p))
+                  (zi2 (mod (* zi zi) p)))
+             (list (mod (* x zi2) p) (mod (* y zi2 zi) p))))
+         (list web-skeleton::+p256-gx+
+               (- web-skeleton::+p256-p+ web-skeleton::+p256-gy+)))
 
   ;; Short pubkey coordinate rejected
   (let ((short-x (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -366,7 +379,15 @@
    answers wrongly. See ecdsa-corpus.lisp for how each verdict was made.
 
    The pure-Lisp verifier is called by name, so this holds whichever
-   implementation ECDSA-VERIFY-P256 is swapped to."
+   implementation ECDSA-VERIFY-P256 is swapped to.
+
+   Measured against the Jacobian verifier: a JACOBIAN-ADD that answers
+   infinity for P + P fails the two Q = G entries, where Shamir's table
+   builds G + Q by doubling, and a verifier without its point-at-infinity
+   check fails the entry whose sum is infinity. The entry whose halves
+   are equal does not catch the first. Shamir's trick never adds the two
+   halves to each other, so that entry guards a verifier that computes
+   them apart, which this one does not."
   (format t "~%ECDSA P-256 corpus~%")
   (let ((libssl (when (tls-loaded-p) (tls-sym "ECDSA-VERIFY-P256-LIBSSL")))
         (libssl-disagrees nil))
