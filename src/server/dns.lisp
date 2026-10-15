@@ -38,11 +38,11 @@
 ;;; ---------------------------------------------------------------------------
 ;;; fd extraction from the SBCL stream
 ;;;
-;;; sb-sys:fd-stream-fd has been an external symbol on SBCL 2.2+
-;;; (the framework targets modern SBCL on Linux). Previous code here
-;;; reached into sb-impl:: for the struct-slot reader; that works
-;;; but uses an internal symbol that has no export contract and
-;;; could be renamed across releases. sb-sys: is the stable path.
+;;; sb-sys:fd-stream-fd is an external symbol on SBCL 2.2+ (the
+;;; framework targets modern SBCL on Linux). The struct-slot reader
+;;; in sb-impl:: works too, but it is an internal symbol with no
+;;; export contract and could be renamed across releases. sb-sys: is
+;;; the stable path.
 ;;; ---------------------------------------------------------------------------
 
 (defun %process-output-fd (process)
@@ -79,7 +79,7 @@
    positive count is a policy decision; NIL with zero is a name that did not
    resolve. Callers must keep giving both the same answer to the client —
    see below — but they should not give an operator the same answer, and
-   before this existed they did.
+   without the count they could not tell the two apart.
 
    Token boundary: STREAM must appear as the token immediately after
    the address, not as a substring anywhere in the line. A substring
@@ -430,17 +430,14 @@
             (let ((dns-then (connection-dns-then dns-conn))
                   (chained nil))
               ;; CHAINED is what separates "the lookup failed" from "the
-              ;; lookup succeeded and tidying up after it did not", and the
-              ;; two stopped being the same question when DELIVER-DNS-ERROR
-              ;; started delegating. It used to know only about a parked
-              ;; inbound, so a raise from the cleanup below found no
-              ;; :AWAITING match and did nothing. Now it reaches
-              ;; DELIVER-DETACHED with :ABORTED — which would apply the
-              ;; target's failure disposition, closing a WebSocket or
-              ;; abandoning a stream, while the outbound DNS-THEN just
-              ;; opened is alive and still running the fetch it was asked
-              ;; for. Delegation is what made a failure to close a pipe
-              ;; into a failure of the fetch.
+              ;; lookup succeeded and tidying up after it did not". The
+              ;; two are different questions because DELIVER-DNS-ERROR
+              ;; delegates: it reaches DELIVER-DETACHED with :ABORTED,
+              ;; which would apply the target's failure disposition,
+              ;; closing a WebSocket or abandoning a stream, while the
+              ;; outbound DNS-THEN just opened is alive and still running
+              ;; the fetch it was asked for. Without CHAINED, a failure to
+              ;; close a pipe would be a failure of the fetch.
               (handler-case
                   (destructuring-bind (ip . family) parsed
                     ;; Remember the resolution before chaining to TCP: the
@@ -475,19 +472,19 @@
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
             ;; are "no address we are willing to dial" — same 502.
             ;;
-            ;; :OK-EOF used to be missing here, and its absence was a
-            ;; race rather than a certainty — which is why the branch
-            ;; mostly worked and the bug was hard to see.
+            ;; :OK-EOF belongs here as much as :EOF, and leaving it out
+            ;; would be a race rather than a certainty — a branch that
+            ;; mostly works, with a bug that is hard to see.
             ;;
             ;; getent writes its output in one go and the EOF appears
             ;; when it exits. Usually it has not exited by the time we
             ;; drain, so the bytes come back :OK, the exit arrives as a
-            ;; later event, and this branch fires on a clean :EOF — which
-            ;; is the common ordering and the reason the old code was
-            ;; right most of the time. When getent has already exited,
-            ;; both land in one read; reported as :OK, that fell straight
-            ;; past here to wait for a wake-up the closed pipe would
-            ;; never deliver, and the parked inbound sat until the
+            ;; later event, and this branch fires on a clean :EOF — the
+            ;; common ordering, under which a branch taking :EOF alone
+            ;; is right. When getent has already exited, both land in
+            ;; one read; reported as :OK, that would fall straight past
+            ;; here to wait for a wake-up the closed pipe will never
+            ;; deliver, and the parked inbound would sit until the
             ;; sweeper took it.
             ;;
             ;; So neither arm is dead. :EOF is the common path and
@@ -540,9 +537,9 @@
    spawned with :WAIT NIL, the caller sleeps in short slices until
    process exit or deadline, and we SIGKILL the child on expiry. A
    libc resolver hang (unresponsive nameserver, slow NSS module, hung
-   mDNS responder) no longer pins the worker thread indefinitely —
-   the promise that *FETCH-TIMEOUT* covers each of DNS, connect, and
-   I/O on the blocking path is now actually kept."
+   mDNS responder) cannot pin the worker thread indefinitely, so
+   *FETCH-TIMEOUT* does cover each of DNS, connect, and I/O on the
+   blocking path."
   ;; Literal fast paths are gated on *FETCH-ADDRESS-FILTER* for the same
   ;; reason INITIATE-HTTP-FETCH's are: they skip DNS, so a resolver-only
   ;; check would let https://169.254.169.254/ straight through. A refused

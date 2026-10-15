@@ -31,7 +31,7 @@
 
    The shape of a fix is per-worker buffers drained on the existing
    maintenance tick. Not done: nothing in the framework logs often enough
-   today to pay for it. Recorded so that whoever adds something that does
+   to pay for it. Recorded so that whoever adds something that does
    meets this first rather than afterwards.")
 
 (defparameter *log-levels* '(:debug :info :warn :error)

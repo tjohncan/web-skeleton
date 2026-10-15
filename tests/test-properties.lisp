@@ -706,12 +706,10 @@
 ;;; buffered and streaming paths are both drivable from a byte vector, so
 ;;; the same fixture goes through both and the results must match.
 ;;;
-;;; The HTTPS path needs no arm of its own any more. It used to have a
-;;; second reader of these bytes in tls.lisp, first untestable and then
-;;; testable through an injected byte source; that reader is deleted and
-;;; the TLS transport now calls STREAM-RESPONSE-LINES with a byte source
-;;; of its own. There is nothing left to disagree with, which is a
-;;; stronger result than an arm that agreed.
+;;; The HTTPS path needs no arm of its own: the TLS transport calls
+;;; STREAM-RESPONSE-LINES with a byte source of its own, so there is no
+;;; second reader of these bytes to disagree with — a stronger result
+;;; than an arm that agreed.
 ;;; ---------------------------------------------------------------------------
 
 (defun parity-fixture (interims body)
@@ -728,20 +726,16 @@
   "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
    Returns (STATUS LINES).
 
-   This drove TLS-STREAM-RESPONSE until that function was deleted, and it
-   is the arm that made the deletion checkable — the READ-FN seam was
-   reachable only from here. What it compares changed and what it
-   covers did not: the TLS transport now uses this very reader, so the
-   third implementation is gone rather than merely agreed with, and the
-   distinction still worth exercising is the byte source. READ-SEQUENCE
-   fills a whole buffer; a READ-FN hands over buffer-sized bites, so a
-   record boundary can fall anywhere and the cross-read state (PREV-CR,
-   the chunk phase flags) is exercised rather than bypassed.
+   The TLS transport uses this very reader, so what is worth exercising
+   here is the byte source. READ-SEQUENCE fills a whole buffer; a READ-FN
+   hands over buffer-sized bites, so a record boundary can fall anywhere
+   and the cross-read state (PREV-CR, the chunk phase flags) is exercised
+   rather than bypassed.
 
-   It also no longer resolves a symbol at run time or answers :SKIPPED,
-   which matters more than the line count: when TLS-STREAM-RESPONSE was
-   deleted, the FIND-SYMBOL miss turned these five assertions into SKIPs
-   and the suite stayed green while losing them."
+   It calls the reader directly rather than resolving a symbol at run
+   time, so it never answers :SKIPPED: a FIND-SYMBOL miss would turn
+   these assertions into SKIPs, and the suite would stay green while
+   losing them."
   (let ((pos 0)
         (lines nil))
     ;; A divergence in the reader shows up as a raise as often as a
@@ -797,12 +791,9 @@
                      (length interims))
              (nreverse streamed-lines)
              (list "{\"a\":1}" "{\"b\":2}"))
-      ;; The same reader over the other byte source. This arm used to be
-      ;; tls.lisp's independent implementation of this read, which the
-      ;; header of this suite once recorded as an unclosable gap; the
-      ;; gap is closed by there no longer being a second implementation.
-      ;; What it still buys is fill granularity — buffer-sized bites put
-      ;; a record boundary anywhere, where a stream hands over the lot.
+      ;; The same reader over the other byte source. What it buys is
+      ;; fill granularity — buffer-sized bites put a record boundary
+      ;; anywhere, where a stream hands over the lot.
       (check (format nil "parity: ~d interim block(s), read-fn source agrees"
                      (length interims))
              (read-fn-stream-lines raw)

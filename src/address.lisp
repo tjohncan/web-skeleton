@@ -120,9 +120,9 @@
       ;; semantically IPv4, and the framework's policy is to
       ;; reject every dangerous-looking address. Unwrap and
       ;; classify via the embedded v4 for consistency with the
-      ;; mapped branch. Also subsumes the old ::/120 check: ::
-      ;; unwraps to 0.0.0.0 (rejected), ::1 unwraps to 0.0.0.1
-      ;; (rejected — zero first octet).
+      ;; mapped branch. This also covers ::/120, which needs no
+      ;; check of its own: :: unwraps to 0.0.0.0 (rejected), ::1
+      ;; unwraps to 0.0.0.1 (rejected — zero first octet).
       ((loop for i from 0 below 12 always (zerop (aref bytes i)))
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 12 :end2 16)

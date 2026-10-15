@@ -772,9 +772,9 @@ printf 'TAIL-MARKER\\n' >> body.txt
    fast request against a peer that merely happens to be slow would be a
    measurement of the machine.
 
-   Before this branch the relay held the worker for the whole exchange,
-   and /fast would not have been answered until the upstream finished.
-   With one worker there is no other thread to rescue it: whether the fast
+   A relay that held the worker for the whole exchange would leave /fast
+   unanswered until the upstream finished. With one worker there is no
+   other thread to rescue it: whether the fast
    request is served at all is the entire question."
   (format t "~%HTTPS relay does not hold the worker~%")
   (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
@@ -1073,14 +1073,13 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    Asserted against *CHUNKED-CORPUS*, which is also what the plain-TCP
    test asserts and what this upstream is built from. That shared
-   definition is the point: two literals could agree today and drift
-   apart later without either test noticing.
+   definition is the point: two literals can agree and later drift apart
+   without either test noticing.
 
-   Measured, this does *not* reach the :OK-EOF branch, and the docstring
-   said it did until the claim was checked. s_server's close_notify
-   arrives as its own wake-up, so the walk completes on :OK while the
-   stream is still open — confirmed by reintroducing the :OK-EOF defect,
-   which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
+   Measured, this does *not* reach the :OK-EOF branch. s_server's
+   close_notify arrives as its own wake-up, so the walk completes on :OK
+   while the stream is still open — confirmed by removing the :OK-EOF
+   arm, which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
    where that branch is pinned. This one covers the boundaries."
   (format t "~%HTTPS fetch :on-body chunk boundaries~%")
   (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
@@ -1288,9 +1287,10 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    OpenSSL keeps one error queue per thread, and SSL_get_error reads it
    first: with anything on it, a read that only needs more bytes comes back
-   SSL_ERROR_SSL. Nothing emptied it, so any earlier failure on the worker —
-   a certificate that did not verify, a token whose signature did not check
-   out — turned the next WANT_READ into a failed fetch.
+   SSL_ERROR_SSL. Left unemptied, any earlier failure on the worker — a
+   certificate that did not verify, a token whose signature did not check
+   out — would turn the next WANT_READ into a failed fetch, which is why
+   every SSL call is preceded by ERR_clear_error.
 
    Arranged directly. A held-open peer sends the head and first chunk of a
    chunked response and waits. :ON-BODY takes the chunk on the worker's own
@@ -1310,13 +1310,13 @@ printf 'TAIL-MARKER\\n' >> body.txt
    Between chunks, and not before the fetch. OpenSSL's handshake empties the
    queue itself on every step, so a queue dirtied in the handler is clean
    again before the first read, and a test arranged that way passes without
-   the fix.
+   the clear.
 
    Control: the queue was dirty in the way that matters. Asked about an SSL
    that has done nothing, SSL_get_error has only the queue to go on, and
    answers SSL_ERROR_SSL only for an error from outside the system library.
    A system error reads as SSL_ERROR_SYSCALL, which the classifier settles
-   from errno, and would leave this passing without the fix."
+   from errno, and would leave this passing without the clear."
   (format t "~%HTTPS: a dirty error queue does not fail the next read~%")
   (%call-with-https-fixture
    "https error queue"
@@ -1369,7 +1369,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                               (setf final status)
                               (make-text-response 200 "relayed")))))
                 (test-http-request :get "/relay")))
-            (check "control: the worker's queue now reads as SSL_ERROR_SSL (1)"
+            (check "control: the dirtied queue reads as SSL_ERROR_SSL (1)"
                    reads-as 1)
             (check "https error queue: the fetch on that worker completed"
                    final 200)
@@ -1412,8 +1412,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
     ;; framing signal HTTP/1.0-style servers actually use.
     (check "classify: SYSCALL with errno 0 is end of stream"
            (attempt (funcall classify nil -1 0 syscall)) :eof)
-    ;; The re-derivation. This used to be "the receive timeout fired",
-    ;; which is true only on a blocking socket.
+    ;; Would-block, not "the receive timeout fired", which is true only
+    ;; on a blocking socket.
     (check "classify: SYSCALL with EAGAIN is would-block, not an error"
            (attempt (funcall classify nil -1 eagain syscall)) :again)
     ;; The one that must never be quiet.

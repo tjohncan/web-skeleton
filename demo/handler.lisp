@@ -513,10 +513,10 @@
 
    So every subtraction of two of these clamps at zero: the lab's handler
    timer, and the post budget's refill. A backward step then reads as no
-   time having passed, never as negative time. Unclamped, the budget turned
-   a one-hour backward step into minus three thousand six hundred posts,
-   and a connection that had posted before the step stayed locked out for
-   the hour it took to earn them back.
+   time having passed, never as negative time. Unclamped, the budget would
+   turn a one-hour backward step into minus three thousand six hundred
+   posts, and a connection that had posted before the step would stay
+   locked out for the hour it takes to earn them back.
 
    The bulletin's stamps are not clamped, and say so where they are taken:
    a stamp is the time the server believed it was, and a clock that stepped
@@ -700,12 +700,12 @@
       (if err
           (%lab-json request started nil :error err :status 400)
           (handler-case
-              ;; The framework's splitter, not one of the demo's own. This
-              ;; used to carry its own, which accepted a token with base64
-              ;; padding that JWT-SPLIT refuses — two readers of one token
-              ;; disagreeing about whether it was one, on a page whose
-              ;; subject is that disagreement. RFC 7515 omits the padding, so
-              ;; JWT-SPLIT is the one that is right.
+              ;; The framework's splitter, not one of the demo's own. A
+              ;; splitter of its own is a second reader of the token: one
+              ;; that accepted base64 padding JWT-SPLIT refuses would have
+              ;; the two disagreeing about whether a token is one, on a page
+              ;; whose subject is that disagreement. RFC 7515 omits the
+              ;; padding, so JWT-SPLIT is the one that is right.
               (let ((parts (jwt-split token)))
                 (unless parts
                   (error "not a JWS compact serialization: it needs exactly ~
@@ -787,11 +787,11 @@
    that have not.
 
    This is what makes the container healthcheck mean something. The census
-   used to be the healthcheck, and a probe lands on one of four workers: a
-   wedged worker failed about one probe in four, and a check that wants three
-   failures in a row almost never saw it. Here any live worker answers for
-   all of them, because the ticks it reads are every worker's own, so one
-   stuck loop fails every probe, whichever worker takes it."
+   would make a poor one, because a probe lands on one of four workers: a
+   wedged worker would fail about one probe in four, and a check that wants
+   three failures in a row would almost never see it. Here any live worker
+   answers for all of them, because the ticks it reads are every worker's
+   own, so one stuck loop fails every probe, whichever worker takes it."
   (declare (ignore request))
   (let* ((now (get-universal-time))
          (stale (loop for at across *last-tick*
@@ -962,7 +962,7 @@
 (defun %bulletin-payload (entry)
   "Wire form: sequence, TAB, UTC stamp, TAB, sender handle, TAB, the line.
 
-   Three tabs now, and the line itself still cannot contain one —
+   Three tabs, and the line itself cannot contain one —
    %SANITIZE-LINE strips every byte below 32, TAB among them. So a client
    splits on the first three and whatever is left is the text, however many
    tabs somebody tried to type into it.
@@ -1243,7 +1243,7 @@
   ;; and still off any worker so they stay out of the census. See
   ;; %BENCH-RESPONSE.
   (setf *bench-responses* (%build-bench-responses))
-  ;; Backquoted rather than quoted now: the backlink is not known until
+  ;; Backquoted rather than quoted: the backlink is not known until
   ;; this call, and the cache is built once from what it says here.
   (load-static-files "demo/static/"
                      :substitutions

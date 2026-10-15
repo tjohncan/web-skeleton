@@ -335,11 +335,11 @@
    bracketed per RFC 3986 §3.2.2 so the port cannot be read as another
    hex group; the v4 form needs no brackets.
 
-   The address itself is FORMAT-IP's job. This used to walk the sixteen
-   bytes itself, which meant two implementations of one hex format — and
-   a log line that disagreed with a filter decision about what an address
-   even looked like would be a miserable thing to debug. Brackets and a
-   port are the whole difference, so that is all this adds."
+   The address itself is FORMAT-IP's job. Walking the sixteen bytes here
+   would make two implementations of one hex format — and a log line that
+   disagreed with a filter decision about what an address even looked
+   like would be a miserable thing to debug. Brackets and a port are the
+   whole difference, so that is all this adds."
   (let ((addr (format-ip host)))
     (if (= (length host) 16)
         (format nil "[~a]:~d" addr port)
@@ -1100,13 +1100,13 @@
 ;;; arm, deciding whether a buffer at its cap holds a complete request or
 ;;; is a 413, and in the :READ-BODY arm, deciding whether to dispatch.
 ;;;
-;;; Not hypothetical. The :FULL arm used to be Content-Length arithmetic,
-;;; and (>= (- read-pos body-start) body-expected) is satisfied
+;;; Not hypothetical. Content-Length arithmetic in the :FULL arm,
+;;; (>= (- read-pos body-start) body-expected), is satisfied
 ;;; unconditionally by a chunked request, whose BODY-EXPECTED is 0 until
-;;; the decode runs. A chunked body that filled the buffer read as
+;;; the decode runs. A chunked body that filled the buffer would read as
 ;;; *complete* there while :READ-BODY answered :CONTINUE, and nothing
-;;; could read further — the connection sat until the idle sweeper took
-;;; it, instead of answering 413.
+;;; could read further — the connection would sit until the idle sweeper
+;;; took it, instead of answering 413.
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-body-complete-p (conn)
@@ -1125,7 +1125,7 @@
    header parser whose disagreement with the first is the exact shape
    these rules exist to prevent. Refusing also means the boundary for a
    trailer-bearing request is never computed at all, which is the strongest
-   possible answer to the smuggle this issue is named for."
+   possible answer to a smuggle hidden in a trailer."
   (let ((body-start (+ (connection-header-end conn) 4))
         (end (connection-read-pos conn)))
     (ecase (connection-body-framing conn)
@@ -1725,14 +1725,12 @@
    much queued, and queued too long. They share a prefix because they are
    two limits on one thing.
 
-   This was *WS-SEND-TIMEOUT*, which bounded a blocking spin inside
-   WS-SEND back when the thing at risk was the worker. WS-SEND queues and
-   returns now, so what can go wrong is that one connection's queue never
-   drains — and once SSE and chunked streams queue through the same path,
-   a name saying 'ws' pointed operators at the wrong knob for every
-   surface but the one it was named after. Renamed rather than widened
-   quietly: an operator tuning a stalled SSE stream would never have
-   looked at a WebSocket setting.
+   WS-SEND queues and returns, so what can go wrong is not a worker held
+   but one connection's queue that never drains. SSE and chunked streams
+   queue through the same path, so the name says write, not ws: a name
+   saying 'ws' would point operators at the wrong knob for every surface
+   but one, and an operator tuning a stalled SSE stream would never look
+   at a WebSocket setting.
 
    Measured from the last forward progress on the backlog, never from the
    connection's last activity — HANDLE-CLIENT-WRITE bumps LAST-ACTIVE on
@@ -1741,14 +1739,13 @@
 
    An inactivity bound, not a total. It restarts on any byte the peer
    accepts, so a peer that trickles is never closed: its memory is capped
-   by *MAX-WRITE-BACKLOG*, its time is not. Deliberate — the total bound
-   it replaced was a total on the worker, which is the more expensive
-   thing to hold.
+   by *MAX-WRITE-BACKLOG*, its time is not. Deliberate: a trickling peer
+   holds one connection's capped memory, never the worker, which does not
+   wait on a queue.
 
-   No setting disables it. Zero used to mean a worker pinned forever; it
-   would now mean a connection holding a full backlog forever, against
-   idle timeouts that are long by design on exactly the states most
-   likely to build one.")
+   No setting disables it. Zero would mean a connection holding a full
+   backlog forever, against idle timeouts that are long by design on
+   exactly the states most likely to build one.")
 
 (defun connection-write-pending (conn)
   "Unsent bytes on CONN: what is left of the head, plus the queue behind it."
@@ -1780,10 +1777,9 @@
   "Drop all write state. Used where a connection is recycled for its
    next request — keep-alive reset, ws-upgrade completion, 100-continue.
 
-   The queue has to go with the head. Those sites used to zero the three
-   buffer slots inline, which was the whole of the write state; leaving
-   a queued vector behind now would flush it into the *next* response on
-   the same socket, arriving as a prefix nobody sent."
+   The queue has to go with the head. Zeroing only the three buffer
+   slots would leave a queued vector behind, to be flushed into the
+   *next* response on the same socket, arriving as a prefix nobody sent."
   (setf (connection-write-buf conn) nil
         (connection-write-pos conn) 0
         (connection-write-end conn) 0
@@ -1930,10 +1926,10 @@
    Edge-triggered epoll requires draining writability in one pass.
 
    Reads the head's slots each turn instead of hoisting them out of the
-   loop. The hoist was correct while a connection could hold one vector
-   and only one, but the head now moves underneath: it advances to the
-   next queued vector as each drains, and an append can land while this
-   loop is running. A stale END would stop the pass at the old vector's
+   loop. A hoist would be correct if a connection held one vector and
+   only one, but the head moves underneath: it advances to the next
+   queued vector as each drains, and an append can land while this loop
+   is running. A stale END would stop the pass at the drained vector's
    length and wait for an EPOLLOUT that — the socket having never
    reported unwritable — is not coming."
   (let ((wrote nil))

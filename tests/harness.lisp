@@ -71,26 +71,25 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Readiness and ownership
 ;;;
-;;; There used to be a FIND-FREE-PORT here: bind port 0, close, hand the
-;;; number to START-SERVER, which rebound it milliseconds later. The gap
-;;; between that close and that rebind cost two investigations. Every
-;;; listener sets SO_REUSEPORT, so a second process handed the same
-;;; number in the gap did not fail its bind — both held the port and the
-;;; kernel split traffic between them, silently, measured at 17/23 across
-;;; 40 requests. From inside a test that looked like a ten-second read
+;;; START-SERVER takes :PORT 0 and reports the bound port through
+;;; :ON-LISTEN, so the number is never knowable before a listener holds
+;;; it. The alternative — bind port 0, close, and hand the number to
+;;; START-SERVER to rebind milliseconds later — leaves a gap between the
+;;; close and the rebind. Every listener sets SO_REUSEPORT, so a second
+;;; process handed the same number in the gap does not fail its bind:
+;;; both hold the port and the kernel splits traffic between them,
+;;; silently. From inside a test that looks like a ten-second read
 ;;; deadline expiring somewhere unrelated to whatever was being changed.
 ;;;
-;;; START-SERVER now takes :PORT 0 and reports the bound port through
-;;; :ON-LISTEN, so the number is never knowable before a listener holds
-;;; it and there is no gap to lose. CHECK-OWNS-PORT stays anyway — see
-;;; its docstring for why a closed hole still gets a detector.
+;;; CHECK-OWNS-PORT is kept anyway — see its docstring for why a closed
+;;; hole still gets a detector.
 ;;; ---------------------------------------------------------------------------
 
 (defun check-owns-port (nonce)
   "Confirm the server answering *TEST-PORT* is the one this test started.
 
-   START-SERVER resolving port 0 itself closes the close-then-rebind
-   window this was written for, so the probe is a detector against that
+   START-SERVER resolving port 0 itself leaves no close-then-rebind
+   window, so the probe is a detector against that
    resolution regressing rather than a warning about a live hazard. It
    costs one request per server start and nothing else would report the
    regression: with SO_REUSEPORT a shared port produces no error

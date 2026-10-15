@@ -1041,9 +1041,9 @@
                                 (sb-ext:octets-to-string
                                  bytes :external-format :utf-8))))
              t))
-    ;; Non-ASCII value — UTF-8 encoded, copied as bytes. Old path
-    ;; crashed on (aref buf pos) := (char-code #\é) = 233 which is
-    ;; fine, but (char-code #\✓) = 10003 exceeded (unsigned-byte 8).
+    ;; Non-ASCII value — UTF-8 encoded, copied as bytes. Storing char
+    ;; codes directly would do for #\é (233) but not for #\✓ (10003),
+    ;; which exceeds (unsigned-byte 8).
     (let* ((bytes (serialize "HTTP/1.1 200 OK" '(("x" . "café ✓")) nil))
            (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
       (check "non-ASCII value UTF-8 encoded"
@@ -1158,12 +1158,13 @@
          (sync (conn response)
            (web-skeleton::sync-close-after-p-from-response conn response)
            (web-skeleton::connection-close-after-p conn)))
-    ;; The inbound read cap used to be *max-body-size* verbatim, so one
-    ;; knob silently moved two budgets: an app tightening the body cap to
-    ;; 32 KiB also capped total request bytes at 32 KiB, and a request
-    ;; with large-but-legal headers died on the buffer with a 400 that
-    ;; blamed the body. Asserted as a strict inequality against the body
-    ;; cap rather than a literal, so the check survives retuned defaults.
+    ;; The inbound read cap is not *max-body-size* verbatim, which would
+    ;; let one knob silently move two budgets: an app tightening the body
+    ;; cap to 32 KiB would also cap total request bytes at 32 KiB, and a
+    ;; request with large-but-legal headers would die on the buffer with
+    ;; a 400 that blamed the body. Asserted as a strict inequality
+    ;; against the body cap rather than a literal, so the check survives
+    ;; retuned defaults.
     (let ((c (make-conn)))
       (check "read cap: inbound leaves room for headers beyond the body"
              (> (web-skeleton::connection-read-cap c)
@@ -1195,10 +1196,10 @@
       (check "sync-close: no Connection header — no-op"
              (sync c (make-text-response 200 "x")) nil))
 
-    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every
-    ;; current call site reaches it with a drained buffer, so the
-    ;; invariant holds by construction — but by construction is a fact
-    ;; about today's callers, not about the function, and the caller who
+    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every call
+    ;; site reaches it with a drained buffer, so the invariant holds by
+    ;; construction — but by construction is a fact about the callers,
+    ;; not about the function, and the caller who
     ;; gets it wrong would ship a truncated frame followed by a whole
     ;; one, surfacing as a protocol error somewhere unrelated.
     (let ((c (make-conn))
@@ -2030,8 +2031,7 @@
       (check "url: ipv6 root path"    path "/"))
     ;; https:// + IP literal is rejected. The covering rejection
     ;; tests live in test-fetch; this is here only to pin down that
-    ;; the DNS helper group's earlier https-with-bracketed-v6 case
-    ;; no longer parses successfully.
+    ;; https with a bracketed v6 host does not parse successfully.
     (check-error "url: https ipv6 rejected"
                  (web-skeleton::parse-url "https://[::1]:8443/v1"))))
 
@@ -2317,10 +2317,9 @@
 
 (defun test-parse-error-status ()
   (format t "~%Parse error status codes~%")
-  ;; Every parse failure used to answer 400, including ones the framework
-  ;; understood perfectly and refused on their merits. 413 / 414 / 431
-  ;; were already in *status-reasons* and unreachable for exactly that
-  ;; reason. These assert the status the condition carries, which is what
+  ;; A parse failure is not always a 400: one the framework understands
+  ;; perfectly and refuses on its merits gets its own status — 413, 414,
+  ;; 431. These assert the status the condition carries, which is what
   ;; HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE.
   (flet ((status-of (thunk)
            (handler-case (progn (funcall thunk) :no-error)
@@ -2908,10 +2907,10 @@
   ;; that would never arrive. Symmetric with complete-fetch's
   ;; exempt set on the buffered path.
   ;;
-  ;; 1xx deliberately does NOT appear here. It used to: 100 and 199
-  ;; were listed as "bodiless" and the reader returned them as the
-  ;; final status. That was the A1 defect — RFC 7231 §6.2 makes a 1xx
-  ;; interim by definition, so an upstream that sends one and then
+  ;; 1xx deliberately does NOT appear here. Listed as "bodiless", a
+  ;; 1xx would be returned by the reader as the final status — but
+  ;; RFC 7231 §6.2 makes a 1xx interim by definition, so an upstream
+  ;; that sends one and then
   ;; closes has not delivered a response at all, and reporting 103 as
   ;; the result silently discards the real one. Interim handling is
   ;; covered by TEST-INTERIM-RESPONSES, which asserts both that a 1xx
@@ -2987,10 +2986,10 @@
 
   ;; Chunk-size line terminator strictness — reader-read-crlf-line
   ;; rejects bare LF and bare CR on the size line itself (RFC 7230
-  ;; §4.1). Before the fix, the lenient reader-read-line accepted
-  ;; any of CR / LF / CRLF; streaming decoded "5\nhello\n0\n\n" as
-  ;; valid while the buffered decode-chunked-body rejected the same
-  ;; bytes — a parser-disagreement primitive.
+  ;; §4.1). A lenient line reader accepting any of CR / LF / CRLF
+  ;; would decode "5\nhello\n0\n\n" as valid on the streaming path
+  ;; while the buffered decode-chunked-body rejected the same bytes —
+  ;; a parser-disagreement primitive.
   (let* ((raw (ascii-bytes (concatenate 'string
                 "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
                 "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
@@ -3011,8 +3010,8 @@
       (close stream)))
 
   ;; Bare CR inside a chunk-size line — CR not followed by LF is
-  ;; malformed. "5\rhello..." would previously have been read as
-  ;; chunk-size "5" with "hello" silently becoming chunk-data.
+  ;; malformed. Read leniently, "5\rhello..." would be chunk-size "5"
+  ;; with "hello" silently becoming chunk-data.
   (let* ((raw (ascii-bytes (concatenate 'string
                 "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
                 "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
@@ -3169,10 +3168,10 @@
 ;;;
 ;;; The framing predicate has to skip too. An interim carries no
 ;;; Content-Length, so anchoring on it makes a CL-framed 200 look
-;;; close-delimited — which is how the fetch used to hang for the full
-;;; *FETCH-TIMEOUT* against any upstream that keeps the connection alive.
-;;; The regression cases below (plain 200, 204, partial interim) matter as
-;;; much as the fix cases.
+;;; close-delimited — and the fetch would hang for the full *FETCH-TIMEOUT*
+;;; against any upstream that keeps the connection alive. The regression
+;;; cases below (plain 200, 204, partial interim) matter as much as the
+;;; interim cases.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-interim-responses ()
@@ -3387,7 +3386,8 @@
     (check "chunked decode empty" (length decoded) 0))
 
   ;; Truncation — no zero-size terminator (MITM RST mid-stream).
-  ;; The old decoder silently returned the partial body; now raise.
+  ;; Returning the partial body would pass a truncation off as the whole;
+  ;; the decoder raises.
   (let ((raw (ascii-bytes (concatenate 'string
                 "5" (string #\Return) (string #\Newline)
                 "hello" (string #\Return) (string #\Newline)))))
@@ -3570,12 +3570,11 @@
             (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
 
-  ;; *write-stall-timeout* used to document 0 as "disable", which set no
-  ;; deadline and left the write loop with no exit — a peer that stopped
-  ;; draining its receive window pinned the worker permanently, and the
-  ;; worker is every other connection on it, not just this one. An empty
-  ;; frame is used so the loop body never runs and no fd is touched:
-  ;; before the guard, 0 with nothing to write returned normally.
+  ;; *write-stall-timeout* 0 is refused, never read as "disable": with no
+  ;; deadline, a peer that stopped draining its receive window could hold
+  ;; a full backlog forever. An empty frame is used so no fd is touched
+  ;; and the guard is the only thing that can signal: without it, 0 with
+  ;; nothing to write would return normally.
   (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (check "ws-send: zero timeout refused"
@@ -3708,11 +3707,12 @@
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
              t))
     ;; RFC 6455 §5.1: client frames are masked. The mask bit is in byte 1,
-    ;; so the rejection needs nothing but the two header bytes — it used
-    ;; to sit below the availability test, which meant a peer could make
-    ;; us buffer a whole payload before we refused a frame we had already
-    ;; decided against. Header-only input proves the check no longer waits:
-    ;; before the hoist this returned (values NIL 0) asking for more bytes.
+    ;; so the rejection needs nothing but the two header bytes. Below the
+    ;; availability test it would let a peer make us buffer a whole
+    ;; payload before we refused a frame we had already decided against.
+    ;; Header-only input proves the check does not wait: placed after the
+    ;; availability test, it would return (values NIL 0) here, asking for
+    ;; more bytes.
     (let ((header-only (make-array 2 :element-type '(unsigned-byte 8)
                                      :initial-contents '(#x81 100))))
       (check "reject unmasked frame from header alone"
@@ -4333,8 +4333,8 @@
     ;; An empty resource has no satisfiable range at all, which is the
     ;; definition of 416 rather than a reason to serve 200. RFC 7233 §2.1
     ;; puts every first-byte-pos at or past a zero length, and §4.4
-    ;; answers that with 416; this used to short-circuit to NIL and serve
-    ;; the full (empty) 200 instead. All three forms are checked because
+    ;; answers that with 416; a short-circuit to NIL would serve the full
+    ;; (empty) 200 instead. All three forms are checked because
     ;; only the suffix form needed telling — the other two reach
     ;; :unsatisfiable through the ordinary out-of-range branch, and a
     ;; later edit could break one without touching the others.
@@ -4564,8 +4564,8 @@
     (check "jwt split"
            (length (web-skeleton::jwt-split token)) 3)
     ;; Malformed tokens (≠ 2 dots) return NIL with early-bail — a
-    ;; pathological 8 KiB token with many dots no longer allocates
-    ;; O(dots) substrings before rejection.
+    ;; pathological 8 KiB token with many dots does not allocate O(dots)
+    ;; substrings before rejection.
     (check "jwt split: no dots returns nil"
            (web-skeleton::jwt-split "nodotshere") nil)
     (check "jwt split: one dot returns nil"
@@ -4630,9 +4630,9 @@
       (check "jwt verify: A.3 token verifies with the clock window widened"
              (jwt-claim (jwt-verify token keys) "iss")
              "joe")
-      ;; First end-to-end proof that the JSON-OBJECT survives out of
-      ;; JWT-VERIFY into JWT-CLAIM — the claims used to be a bare alist,
-      ;; and the type change had no test that crossed this boundary.
+      ;; End-to-end proof that the JSON-OBJECT survives out of JWT-VERIFY
+      ;; into JWT-CLAIM: the one check of the claims' type that crosses
+      ;; this boundary.
       (check "jwt verify: claims come back as a json-object"
              (json-object-p (jwt-verify token keys))
              t)
@@ -4935,8 +4935,8 @@
              '("world!" "third"))
 
       ;; --- QUEUE-WRITE's guard counts the queue, not just the head ---
-      ;; Drain the head only; a queue remains. The old guard subtracted
-      ;; write-pos from write-end and would have seen zero here.
+      ;; Drain the head only; a queue remains. A guard that subtracted
+      ;; write-pos from write-end would see zero here.
       (setf (web-skeleton::connection-write-pos conn)
             (web-skeleton::connection-write-end conn))
       (check "queue-write: signals when only the append queue is pending"
@@ -5113,7 +5113,7 @@
    is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
    does not — which is what makes the two masks distinguishable without any
    data timing. Asserting delivery instead would pass against a mask that
-   never changed, and exactly that test was written twice before this one.
+   never changed.
 
    The second half is the security-relevant one. A connection whose
    transport has a handshake is not usable when the TCP connect lands, and
@@ -5606,10 +5606,11 @@
 ;;; the buffer is 64 KiB, `sleep` does not drain it, so a payload past
 ;;; that size is guaranteed to leave a remainder.
 ;;;
-;;; The elapsed-time check is the point of the whole item. The old ws-send
-;;; sat in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT* expired,
-;;; holding the worker and every other connection on it. Against this
-;;; fixture — a peer that never reads at all — that is a full ten seconds.
+;;; The elapsed-time check is the point of the test. A ws-send that
+;;; waited in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT*
+;;; expired would hold the worker and every other connection on it —
+;;; against this fixture, a peer that never reads at all, a full ten
+;;; seconds.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-send-queues ()
@@ -5643,8 +5644,8 @@
                     (plusp (web-skeleton::connection-write-pending conn)) t)
              (check "ws-send: returns without waiting for the peer"
                     (< elapsed 1) t))
-           ;; Append, not substitute. The old ws-send never touched the
-           ;; connection's buffer at all; the new one must add to it.
+           ;; Append, not substitute: a second send must add to what the
+           ;; connection already holds.
            (let ((before (web-skeleton::connection-write-pending conn)))
              ;; Caught for the same reason as the first send: a blocking
              ;; ws-send raises here, and an unhandled raise ends the run
@@ -5690,23 +5691,23 @@
 (defun test-ws-send-refuses-a-foreign-connection ()
   "WS-SEND refuses a connection this worker does not own.
 
-   The small frame is the point of the first assertion. A cross-worker
-   WS-SEND used to be caught by the arming — an fd absent from this
-   worker's epoll gives ENOENT — and arming only happens when the flush
-   leaves a remainder. So the refusal covered the backed-up peer and
-   missed the ordinary one: a frame that fit was appended to an
-   unsynchronised queue, sent from the wrong thread, and reported success.
-   That is the case the README and DEPLOYMENT.md both described as
-   refused, and it is the common one.
+   The small frame is the point of the first assertion. Left to the
+   arming — an fd absent from this worker's epoll gives ENOENT — a
+   cross-worker WS-SEND would be caught only when the flush leaves a
+   remainder. The refusal would cover the backed-up peer and miss the
+   ordinary one: a frame that fit would be appended to an unsynchronised
+   queue, sent from the wrong thread, and reported as success. That is
+   the case the README and DEPLOYMENT.md both describe as refused, and it
+   is the common one.
 
    The big frame against a shrunk SO_SNDBUF is what makes the placement
    assertion mean anything, and it is the fixture rather than the
    assertion that does the work. PENDING = 0 after a refusal is supposed
    to say the guard ran before CONNECTION-APPEND-WRITE. Over a socket
    that takes everything it is offered, PENDING is 0 however late the
-   guard sits — including at the very end of the function, which is
-   exactly where the old incidental refusal lived and so the regression
-   worth guarding against. Backed up, an appended frame cannot flush
+   guard sits — including at the very end of the function, where the
+   arming's incidental refusal sits, and so the regression worth guarding
+   against. Backed up, an appended frame cannot flush
    away, so 0 means the append never happened and nothing else.
 
    Two socket pairs rather than one, because the foreign connection has
@@ -5804,16 +5805,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
 ;;;
-;;; *write-stall-timeout* used to bound a spin inside ws-send. It now bounds
-;;; how long a connection may sit on a backlog that is not moving. The
+;;; *write-stall-timeout* bounds how long a connection may sit on a backlog
+;;; that is not moving. The
 ;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
 ;;; a day, and a peer that has stopped reading may still be sending, which
 ;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
 ;;; current — that is precisely the case the idle timeout would miss.
 ;;;
 ;;; The sweep asks whether there is a backlog and whether it has moved,
-;;; not what state the connection is in. It used to name :WEBSOCKET, which
-;;; left every other state — including the long-lived ones most likely to
+;;; not what state the connection is in. A sweep naming :WEBSOCKET would
+;;; leave every other state — including the long-lived ones most likely to
 ;;; build a backlog — with no stall bound at all, so a second state is
 ;;; swept here to hold the generalization in place.
 ;;; ---------------------------------------------------------------------------
@@ -5851,8 +5852,8 @@
                (ignore-errors (web-skeleton::%close epfd))))))
 
     ;; Control: same backlog, progress just made. Must survive — and would
-    ;; also survive the old code, which is why the stalled case below is
-    ;; what carries the check.
+    ;; survive a sweep with no stall bound too, which is why the stalled
+    ;; case below is what carries the check.
     (destructuring-bind (count log) (sweep-one)
       (check "ws stall: a moving backlog is left alone" count 1)
       (check "ws stall: control logs nothing about stalling"
@@ -6269,10 +6270,11 @@
                               (setf i (1+ h)))))
                     1)
 
-             ;; The assertions the retired offset used to be load-bearing
-             ;; for. The body of a whole GET is the file and nothing else,
-             ;; and a range is the matching slice of it — both true no
-             ;; matter how long the header block happens to be.
+             ;; What a body offset into the pre-built response would be
+             ;; load-bearing for. The body of a whole GET is the file and
+             ;; nothing else, and a range is the matching slice of it —
+             ;; both true no matter how long the header block happens to
+             ;; be.
              (check "static date: the GET body is exactly the file"
                     (body (wire :GET))
                     "0123456789abcdefghijklmnopqrstuvwxyz")
@@ -6717,7 +6719,7 @@
     ;; Over a real pair rather than /dev/null, because the only site that
     ;; can tell a framed keepalive from a raw one is the wire. "Nothing
     ;; left queued", "counts as production" and "survives without arming"
-    ;; are all true either way — they were, for a whole item.
+    ;; are all true either way.
     (multiple-value-bind (server client) (%loopback-pair)
       (let ((epfd (web-skeleton::epoll-create)))
         (unwind-protect
@@ -6913,10 +6915,10 @@
 ;;;
 ;;; DEPLOYMENT.md's own example calls ws-send from inside ws-handler. A
 ;;; handler that does that *and* returns a frame is the natural next step,
-;;; and it is the case the read branch had to convert for: the returned
-;;; frame used to go through CONNECTION-QUEUE-WRITE, which either
-;;; overwrites what ws-send queued or — now that its guard counts the
-;;; queue — signals, taking the connection down through the handler-case.
+;;; and the read branch appends the returned frame rather than handing it
+;;; to CONNECTION-QUEUE-WRITE, which would either overwrite what ws-send
+;;; queued or — its guard counting the queue — signal, taking the
+;;; connection down through the handler-case.
 ;;;
 ;;; Needs a genuinely bidirectional fd, so this builds a connected
 ;;; loopback pair rather than a pipe.
@@ -7009,11 +7011,11 @@
 ;;; The ping sweep flushes inline
 ;;;
 ;;; A two-byte ping onto an empty queue fits in any socket with room, so
-;;; the sweep should hand it over on the spot and arm nothing. Under the
-;;; old shape the frame sat queued until EPOLLOUT came back — one
-;;; epoll_ctl per WebSocket connection per interval, in a burst, to
-;;; deliver two bytes that had already fit. PENDING = 0 on return is the
-;;; observable form of "no arming was needed".
+;;; the sweep should hand it over on the spot and arm nothing. Queued for
+;;; EPOLLOUT instead, it would cost one epoll_ctl per WebSocket connection
+;;; per interval, in a burst, to deliver two bytes that had already fit.
+;;; PENDING = 0 on return is the observable form of "no arming was
+;;; needed".
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-ping-flush ()
@@ -7458,9 +7460,9 @@
 ;;; INITIATE-HTTP-FETCH-TO-ADDRESS parks the target only for an :INBOUND
 ;;; fetch; INITIATE-DNS-LOOKUP has to make the same decision, because a
 ;;; hostname reaches the TCP phase through it and an IP literal does not.
-;;; It used to park unconditionally, so every FETCH-INTO to a name — the
-;;; shape DEPLOYMENT.md's relay example uses — moved the application's own
-;;; :STREAMING or :WEBSOCKET connection to :AWAITING and nothing ever moved
+;;; Parking unconditionally would move the application's own :STREAMING or
+;;; :WEBSOCKET connection to :AWAITING on every FETCH-INTO to a name — the
+;;; shape DEPLOYMENT.md's relay example uses — and nothing would ever move
 ;;; it back.
 ;;;
 ;;; Asserted against the real function rather than a stub, because the stub
@@ -7564,9 +7566,9 @@
 ;;; ---------------------------------------------------------------------------
 ;;; A name that will not resolve, and the fetch it still has to end
 ;;;
-;;; DELIVER-DNS-ERROR held a copy of DELIVER-FETCH-ERROR's body that knew
-;;; only about a parked inbound. Delegating is the fix; this asserts what
-;;; the delegation buys, on the sink the copy had never heard of.
+;;; DELIVER-DNS-ERROR delegates to DELIVER-FETCH-ERROR rather than keeping
+;;; a copy of its body, which would know only about a parked inbound. This
+;;; asserts what the delegation buys, on the detached sink.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-dns-child-closed-only-once-dead ()
@@ -7580,11 +7582,11 @@
    while the pipe — a descriptor — goes at once.
 
    Deterministic because PROCESS-KILL is stubbed: a real SIGKILL races the
-   close that follows it, and the old code lost that race only most of the
-   time. With the kill held back the child is running at the end of the
-   lookup on every run, which is the case that matters, and every
-   PROCESS-CLOSE is recorded with whether its child was alive at the
-   time. Broken state: one close, made while it was."
+   close that follows it, so a close made too early would be caught only
+   most of the time. With the kill held back the child is running at the
+   end of the lookup on every run, which is the case that matters, and
+   every PROCESS-CLOSE is recorded with whether its child was alive at
+   the time. Broken state: one close, made while it was."
   (format t "~%DNS child: closed once it has exited, never before~%")
   (let ((closes nil)
         (kills 0))
@@ -7642,16 +7644,17 @@
   "A detached fetch to a name that will not resolve releases its target.
 
    Three observations, and the first is a control that has to keep
-   passing. The old body called CLOSE-OUTBOUND, which fires an unclaimed
-   callback with the cleanup sentinel — so the application's callback ran
-   either way, and a detector that only counted it would have been green
-   against the defect. That is this branch's *confounded* mode: the right
-   outcome reached by a path that proves nothing.
+   passing. CLOSE-OUTBOUND fires an unclaimed callback with the cleanup
+   sentinel, so the application's callback runs whether or not the error
+   reaches the target, and a detector that only counted it would be green
+   against a body that never reached it. That is the *confounded* mode:
+   the right outcome reached by a path that proves nothing.
 
-   What the old body could not do was reach the target. FETCH-OUTSTANDING
-   stayed set for the rest of that connection's life, refusing every later
-   FETCH-INTO on it, and the failure disposition the caller chose was never
-   applied. Those two are the claim.
+   Reaching the target is what the other two observe. Unreached,
+   FETCH-OUTSTANDING would stay set for the rest of that connection's
+   life, refusing every later FETCH-INTO on it, and the failure
+   disposition the caller chose would never be applied. Those two are the
+   claim.
 
    No network and no getent: DELIVER-DNS-ERROR is called directly, which
    is what both of its failure sites do once they have decided the lookup
@@ -7696,23 +7699,21 @@
   "A resolution that succeeded is not undone by a failure to clean up
    after it.
 
-   The other side of the delegation the test above covers. HANDLE-DNS-
-   READY's HANDLER-CASE used to span two steps that run *after* DNS-THEN
-   has already returned — clearing the callback and closing the resolved
-   pipe. A raise there was harmless while DELIVER-DNS-ERROR knew only
-   about a parked inbound: the inbound's AWAITING-FD had already moved,
-   so the lookup matched nothing and the failure went nowhere. Delegating
-   to DELIVER-FETCH-ERROR is what made it consequential — the same raise
-   now reaches DELIVER-DETACHED with :ABORTED and applies the target's
-   failure disposition, closing a WebSocket whose fetch is alive and
-   running on the outbound DNS-THEN just opened.
+   The other side of the delegation the test above covers. A HANDLER-CASE
+   in HANDLE-DNS-READY spanning the two steps that run *after* DNS-THEN
+   has returned — clearing the callback and closing the resolved pipe —
+   would turn a raise there into a failed lookup. Because
+   DELIVER-DNS-ERROR delegates to DELIVER-FETCH-ERROR, that raise would
+   reach DELIVER-DETACHED with :ABORTED and apply the target's failure
+   disposition, closing a WebSocket whose fetch is alive and running on
+   the outbound DNS-THEN just opened.
 
    CLOSE-OUTBOUND raises once and then works, which is the shape that
    makes this a detector rather than a vacuous pass. A stub that always
    raised would raise a second time inside DELIVER-FETCH-ERROR — before
    it reaches DELIVER-DETACHED — so the target would come out untouched
-   against the old code too, and the assertions would agree for the wrong
-   reason.
+   even with the HANDLER-CASE spanning those steps, and the assertions
+   would agree for the wrong reason.
 
    DNS-THEN only sets a flag. Its contract here is that it returned
    normally; what it built is the next test's subject, not this one's."
@@ -7760,9 +7761,10 @@
                       (web-skeleton::register-connection target)
                       (web-skeleton::register-connection dns-conn)
                       ;; Raises on the first call only. The second — the one
-                      ;; DELIVER-FETCH-ERROR makes on the old path — has to
-                      ;; succeed, or the disposition is never reached and the
-                      ;; two sides of the revert look alike.
+                      ;; DELIVER-FETCH-ERROR makes when the first raise is
+                      ;; taken for a failed lookup — has to succeed, or the
+                      ;; disposition is never reached and the two sides of
+                      ;; the revert look alike.
                       (setf (symbol-function 'web-skeleton::close-outbound)
                             (lambda (c e)
                               (incf calls)
@@ -8152,7 +8154,7 @@
 
     (check "chunked: an empty chunked body decodes to nothing"
            (body-of (format nil "0~a~a" *crlf* *crlf*)) "")
-    ;; `5g` — the issue names this one. The walk accepts it as framing:
+    ;; `5g`, a size with junk after its digit. The walk accepts it as framing:
     ;; it reads one hex digit, stops at a byte that is not one, finds the
     ;; line's LF and skips five bytes, exactly as a well-formed header
     ;; would have it do. The decoder is what refuses, on the byte between
@@ -8224,9 +8226,9 @@
 
     ;; A chunked body larger than the read cap has to answer 413, and this
     ;; is the assertion for the third reader of "is the body complete".
-    ;; The :FULL arm used to be Content-Length arithmetic, which a chunked
-    ;; request satisfies unconditionally — BODY-EXPECTED is 0 — so it would
-    ;; call a half-arrived body complete, fall through, and then :READ-BODY
+    ;; Content-Length arithmetic in the :FULL arm, which a chunked request
+    ;; satisfies unconditionally — BODY-EXPECTED is 0 — would call a
+    ;; half-arrived body complete, fall through, and then :READ-BODY
     ;; would answer :CONTINUE while the buffer sat at its cap with nothing
     ;; able to read further. The connection would be held until the idle
     ;; sweeper took it. Broken state: :CONTINUE here instead of 413.
@@ -8836,16 +8838,15 @@
   "A paused detached fetch is resumed by its target's backlog draining.
 
    Sibling to TEST-AUTOMATIC-RESUME-EDGE rather than a replacement for it.
-   That one has covered the mechanism since the resume edge landed, and
-   with a :STREAMING target — what it could not cover is that anything
-   reached it. RESUME-PAUSED-OUTBOUND runs from HANDLE-CLIENT-WRITE's :DONE
-   arm when a connection's backlog empties, and until the detached seam the
-   only connection a fetch could pause against was an :AWAITING inbound,
-   which has nothing queued by construction and so never receives EPOLLOUT.
-   A tested mechanism with no reachable caller, which is the same shape as
-   the relay example this branch deleted.
+   That one covers the mechanism, with a :STREAMING target; what it cannot
+   cover is that anything reaches it. RESUME-PAUSED-OUTBOUND runs from
+   HANDLE-CLIENT-WRITE's :DONE arm when a connection's backlog empties, and
+   an :AWAITING inbound — the one connection a fetch can pause against
+   without the detached sink — has nothing queued by construction and so
+   never receives EPOLLOUT. Tested alone, the mechanism would have no
+   reachable caller.
 
-   So what is new here is the sink, not the edge: a paused outbound whose
+   So what this adds is the sink, not the edge: a paused outbound whose
    FETCH-SINK is :DETACHED, resumed by its target draining, with the
    deadline advanced by the interval spent paused.
 
@@ -8855,15 +8856,14 @@
    measured, 768 KiB went through with the target's pending bytes never
    leaving 0, and 5 MiB made the test slow without making it reliable. A
    test that cannot provoke the state it names is worse than one that
-   drives the edge directly — it passes for the wrong reason, which is the
-   failure this branch exists to delete.
+   drives the edge directly — it passes for the wrong reason.
 
    So the edge is driven: a target holding a backlog and a paused outbound
    behind it, flushed until :DONE, with the outbound's interest checked
    before and after.
 
-   The precondition this pins down, which no document has ever carried:
-   auto-resume needs the target to have *actually backed up*. STREAM-SEND
+   The precondition this pins down: auto-resume needs the target to have
+   *actually backed up*. STREAM-SEND
    flushes inline, and a flush that completes arms nothing and so never
    reaches HANDLE-CLIENT-WRITE — so a pause taken while the target's queue
    was empty has no wake-up coming and still needs an explicit
@@ -8873,15 +8873,14 @@
    HANDLE-CLIENT-WRITE's :DONE arm ahead of the state dispatch, and its own
    comment says why: every state that can be relayed into reaches that
    point, and a resume working for only one of them would be the kind of
-   gap nobody finds until a different response shape turns up. Only
-   :STREAMING was ever asserted against it.
+   gap nobody finds until a different response shape turns up.
 
-   The :WEBSOCKET pass is a regression guard and not a detector for this
-   branch — it passes on both sides, because the edge itself was always
-   state-agnostic. What the branch changes is whether it is reachable:
-   arming the remainder WS-SEND leaves behind is what lets
-   HANDLE-CLIENT-WRITE run for a websocket target at all. This asserts the
-   half of that chain the arming detector cannot see."
+   The :WEBSOCKET pass is a regression guard rather than a detector: the
+   edge itself is state-agnostic and passes either way. What decides
+   whether it is reachable is the arming — arming the remainder WS-SEND
+   leaves behind is what lets HANDLE-CLIENT-WRITE run for a websocket
+   target at all. This asserts the half of that chain the arming detector
+   cannot see."
   (format t "~%Detached fetch: pause resumes when the target drains~%")
   (%detached-pause-pass "detached pause" :streaming)
   (%detached-pause-pass "detached pause (ws)" :websocket))
@@ -8890,10 +8889,10 @@
 ;;; The write path a closed stream is handed to, and the event that runs it
 ;;;
 ;;; STREAM-CLOSE moves the connection to :WRITE-RESPONSE, which
-;;; HANDLE-CLIENT-WRITE and nothing else transitions out of. It used to
-;;; hand off through STREAM-FLUSH, which arms only when the flush did not
-;;; complete — so the ordinary close, a five-byte terminator onto a socket
-;;; with room, armed nothing and left the connection parked.
+;;; HANDLE-CLIENT-WRITE and nothing else transitions out of. Handing off
+;;; through STREAM-FLUSH, which arms only when the flush did not complete,
+;;; would arm nothing for the ordinary close — a five-byte terminator onto
+;;; a socket with room — and leave the connection parked.
 ;;;
 ;;; TEST-STREAM-LIFECYCLE builds this exact state and asserts both halves
 ;;; of its precondition — :WRITE-RESPONSE, and nothing left queued — and
@@ -8915,9 +8914,9 @@
    anything armed the fd.
 
    BACK-UP shrinks SO_SNDBUF and pre-queues more than the socket will take,
-   which is the branch STREAM-FLUSH used to be the only arming for. Without
-   it the terminator goes out whole, the flush completes, and that is both
-   the ordinary case and the one that armed nothing."
+   which is the branch STREAM-FLUSH's own arming covers. Without it the
+   terminator goes out whole, the flush completes, and that is both the
+   ordinary case and the one STREAM-FLUSH alone would leave unarmed."
   (multiple-value-bind (server client) (%loopback-pair)
     (let ((epfd (web-skeleton::epoll-create))
           (masks nil)
@@ -8992,8 +8991,8 @@
 
    The backed-up case is the control, and it is what makes the first
    assertion about STREAM-CLOSE rather than about streams in general. It
-   was armed before this change and still is — by STREAM-FLUSH then, by
-   STREAM-CLOSE now — so it passes on both sides. Only the case where the
+   is armed either way — by STREAM-FLUSH's own arming as much as by
+   STREAM-CLOSE's — so it passes on both sides. Only the case where the
    flush succeeded moves.
 
    The defect case also asserts what the arming buys: one turn of the loop
@@ -9066,7 +9065,7 @@
 
    CONNECTION-STATE is the second witness and it pins the placement
    directly. Moved to just before the arm — the natural wrong spot, since
-   that mirrors where the only previous check lived — the raise still
+   that is where the arming's incidental check sits — the raise still
    carries the right message and PENDING is still 0, but the counter is 1
    and the state has moved to :WRITE-RESPONSE. Both go red there and
    neither depends on socket-buffer behaviour.
@@ -9247,8 +9246,9 @@
 ;;; is not a hypothetical shape: it is the one DEPLOYMENT.md documents
 ;;; under fan-out, "calling ws-send in a loop" over a subscriber list.
 ;;;
-;;; The fix covers it by construction and the branch said nothing about it,
-;;; which by this suite's own criterion is a claim without a detector.
+;;; WS-SEND's own arming covers it by construction, and covered by
+;;; construction with nothing checking it is, by this suite's own
+;;; criterion, a claim without a detector.
 ;;; ---------------------------------------------------------------------------
 
 (defun %ws-fanout-pass ()
@@ -9361,15 +9361,15 @@
 
    The third is the control, and what it guards against is the fourth going
    vacuous later rather than anything failing now. Under the defect A is
-   still armed — HANDLE-CLIENT-READ names A's own fd and always did — so a
+   still armed — HANDLE-CLIENT-READ names A's own fd — so a
    failure list reading A touched, B not states the defect precisely.
 
    The case it really exists for is fixture drift. Simplify this test by
    calling the handler directly instead of driving HANDLE-CLIENT-READ — the
    obvious tidy-up, and someone will try it — and the fourth check still
-   passes, because WS-SEND now arms B itself. The seam stops being crossed
+   passes, because WS-SEND arms B itself. The seam stops being crossed
    and nothing says so. That is the *pre-arranged* mode, reachable only
-   because the fix landed, and this check is the thing that catches it:
+   because WS-SEND arms, and this check is the thing that catches it:
    measured, that drift fails check three alone and leaves the other three
    green.
 
@@ -9449,23 +9449,23 @@
         (check "oversized control frame: with 1002, not 1009" code 1002)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; The verdict the discard loop used to spin on
+;;; A verdict the discard loop must not spin on
 ;;; ---------------------------------------------------------------------------
 
 (defun test-discard-available-want-write ()
   "CONNECTION-DISCARD-AVAILABLE hands back :WANT-WRITE instead of looping.
 
-   CONNECTION-READ-INTO has four non-integer verdicts and this loop handled
-   two, so :WANT-WRITE fell into the integer default, set a flag and went
+   CONNECTION-READ-INTO has four non-integer verdicts. A loop handling two
+   would let :WANT-WRITE fall into the integer default, set a flag and go
    round again — a hot spin inside the event loop with no exit. Its own
    docstring says the cond is deliberately the same shape as
-   CONNECTION-READ-AVAILABLE's so the two can be read side by side, and it
-   was not.
+   CONNECTION-READ-AVAILABLE's so the two can be read side by side, and
+   this holds it to that.
 
-   Unreachable today: the only caller is the :STREAMING inbound path and
-   there is no inbound TLS. That is how long a spin like this stays
-   invisible, and it is the argument for the assertion rather than against
-   it.
+   Unreachable in practice: the only caller is the :STREAMING inbound path
+   and there is no inbound TLS. That is how long a spin like this would
+   stay invisible, and it is the argument for the assertion rather than
+   against it.
 
    The stub is bounded on purpose. An unbounded one would hang the run
    under the defect rather than fail it, which is the *too violent* mode —
@@ -9476,7 +9476,7 @@
    The call count is the second assertion for the same reason: a fix that
    answered :WANT-WRITE after looping ten times would satisfy the first
    check and still be the bug."
-  (format t "~%Discard loop: the verdict it used to spin on~%")
+  (format t "~%Discard loop: :WANT-WRITE is handed back, not spun on~%")
   (let ((calls 0)
         (real (symbol-function 'web-skeleton::connection-read-into)))
     (unwind-protect
@@ -10758,9 +10758,9 @@
 
    Two controls. The log shows the server read each reset as ECONNRESET, not
    as an end of stream; without that, a close that sent a FIN would pass here
-   on code that still counts resets. And a handler that raises still gets its
-   500, counted, so the fix reaches the client's own descriptor and not every
-   error."
+   on code that counts resets. And a handler that raises still gets its
+   500, counted, so what goes uncounted is the client's own descriptor
+   failing and not every error."
   (format t "~%counters: a client's reset is not a server error~%")
   (let ((log (make-string-output-stream))
         (so-far "")
@@ -10913,13 +10913,14 @@
                       '(1 1)))))
       (setf web-skeleton::*static-cache* saved)))
   ;; A response the serializer refuses is not counted — and neither the
-  ;; original nor the 500 that replaces it is counted twice. The count used
-  ;; to be taken before the serialize that can reject the headers, so a 302
-  ;; whose Location carried a CRLF counted a phantom redirect the client never
+  ;; original nor the 500 that replaces it is counted twice. A count taken
+  ;; before the serialize that can reject the headers would count a phantom
+  ;; redirect for a 302 whose Location carried a CRLF, one the client never
   ;; saw, on top of the 500 it did. The three assertions pin it: the
   ;; serializer refuses, the refused response counts nothing, and the same
-  ;; 302 without the CRLF still counts once — so the fix cannot be reverted
-  ;; (the refused one would count) or over-applied (the good one would not).
+  ;; 302 without the CRLF still counts once — so the count can move neither
+  ;; before the serialize (the refused one would count) nor out of reach
+  ;; of a good response (the good one would not).
   (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
     (flet ((crlf-302 ()
              (let ((r (web-skeleton::make-http-response :status 302)))
@@ -11054,9 +11055,9 @@
          (web-skeleton::parse-cpu-max "100000 100000") 1)
   (check "cpu.max: four CPUs"
          (web-skeleton::parse-cpu-max "400000 100000") 4)
-  ;; The shape this whole change exists for. FLOOR gives 0 here, and
-  ;; START-SERVER refuses a non-positive :WORKERS — so rounding down turns
-  ;; the fix into a server that will not boot in the deployment it serves.
+  ;; The shape the quota reading exists for. FLOOR gives 0 here, and
+  ;; START-SERVER refuses a non-positive :WORKERS — so rounding down would
+  ;; give a server that will not boot in the deployment it serves.
   (check "cpu.max: half a CPU still gets one worker"
          (web-skeleton::parse-cpu-max "50000 100000") 1)
   (check "cpu.max: 2.5 CPUs rounds up"

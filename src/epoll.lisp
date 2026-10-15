@@ -498,10 +498,7 @@
    escapes its dispatch with a 500, and the right answer depends on whose
    descriptor failed. The client's own means the client is gone and there is
    nobody to answer; a handler's own I/O failing on some other descriptor is
-   a failed request, and it is owed its 500.
-
-   It reports exactly as the plain error it replaced did, so no log line
-   reads any differently."))
+   a failed request, and it is owed its 500."))
 
 (defun nb-read (fd buffer start max-bytes)
   "Non-blocking read into BUFFER starting at START, up to MAX-BYTES.

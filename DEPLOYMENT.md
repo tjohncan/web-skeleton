@@ -384,7 +384,7 @@ from where the previous read stopped, so each chunk is walked once across
 the transfer instead of the body being rescanned on every read.
 
 That is the **response** side — decoding a chunked body an upstream sent
-to us. The **request** side now reads the same framing with the same walk,
+to us. The **request** side reads the same framing with the same walk,
 and that sharing is deliberate: one decoder, two directions, so the
 acceptance sets cannot drift apart. A disagreement about where a body ends
 is only visible when both sides read the same input.
@@ -583,10 +583,10 @@ so a special-purpose block assigned later out of reserved space is refused
 before anyone has written a clause for it. Its docstring lists every range.
 
 The 6to4 relay prefix is refused *because* RFC 7526 deprecated it. The
-relays are gone, so the prefix is still globally routed but no longer
-goes anywhere in particular — whoever announces it today receives the
-traffic. "Deprecated" reads like a reason to stop worrying about a range;
-here it is the reason to refuse it.
+relays are gone, so the prefix is still globally routed but goes nowhere
+in particular — whoever announces it receives the traffic. "Deprecated"
+reads like a reason to stop worrying about a range; here it is the reason
+to refuse it.
 
 **Why the framework has to do this and an app cannot.**
 The framework resolves hostnames itself. An app that resolves a name,
@@ -1030,7 +1030,7 @@ would be worse — a request that hangs to `*fetch-timeout*` and then dies —
 and reporting success would be the truncation the verdict exists to
 prevent. But `502` says the gateway failed, and what happened is that your
 application cancelled. **"Stop the upstream and let me answer the client
-myself" is not expressible today.** If that is what you want, do not stop
+myself" is not expressible.** If that is what you want, do not stop
 the fetch: let it finish and answer from `:then`, which is the one place a
 handler-returned fetch's response comes from.
 
@@ -1295,11 +1295,11 @@ loop that wants to know which subscribers are falling behind can see it
 without tracking anything itself.
 
 `handle-client-read` arms the connection it was woken for — the one whose
-handler is running. A frame pushed to *another* connection had nothing
-downstream to arm it, so a lagging subscriber did not cost its own
-connection: it got a truncated message, with every `ws-send` reporting
-success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
-connection it wrote to whenever it leaves a remainder.
+handler is running. A frame pushed to *another* connection has nothing
+downstream to arm it, so `ws-send` arms the connection it wrote to
+whenever it leaves a remainder. Without that, a lagging subscriber would
+get a truncated message, with every `ws-send` reporting success, and then
+a `*write-stall-timeout*` close.
 
 A `ws-send` to a connection belonging to a *different worker*
 raises, and the raise is caught by the handler-case around the handler that
@@ -1367,8 +1367,8 @@ resident for the life of the process, so without a cap a directory
 holding one large video buys a resident set to match — discovered on the
 box at deploy time rather than at the call. Range support makes that
 likelier rather than less: serving large media is what Range is *for*, so
-the invitation to keep large media next to the CSS now comes with a
-number attached.
+the invitation to keep large media next to the CSS comes with a number
+attached.
 
 There is no serve-from-disk path — every served file lives in this cache.
 If the cap fires, either raise it deliberately:

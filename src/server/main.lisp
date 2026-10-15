@@ -465,8 +465,8 @@
                         ;; on EPOLLOUT entry, so a draining backlog would
                         ;; keep refreshing the deadline of a stream whose
                         ;; producer stopped — the conflation
-                        ;; WRITE-PROGRESS-AT was added to break, one level
-                        ;; up and in a new knob.
+                        ;; WRITE-PROGRESS-AT exists to break, one level
+                        ;; up and in another knob.
                         (since (if (eq state :streaming)
                                    (connection-stream-produced-at conn)
                                    (connection-last-active conn))))
@@ -479,9 +479,9 @@
                      ;; bumps that on EPOLLOUT entry, which would refresh
                      ;; the deadline of precisely the stuck connection.
                      ;; Any connection sitting on a backlog, not just a
-                     ;; WebSocket one. This used to name :WEBSOCKET, which
-                     ;; made the state most likely to build a backlog —
-                     ;; a long-lived stream — the one state with no stall
+                     ;; WebSocket one. A test naming :WEBSOCKET would leave
+                     ;; the state most likely to build a backlog — a
+                     ;; long-lived stream — the one state with no stall
                      ;; bound, falling through to an idle test measured on
                      ;; LAST-ACTIVE, the clock this exists to avoid. Asking
                      ;; "is there a backlog and has it moved" needs no list
@@ -533,8 +533,8 @@
           ;; A failure to answer must not be worse than not trying. If
           ;; anything in the 504 path signals — a write buffer that was
           ;; not drained after all, a serializer refusing a header — fall
-          ;; back to the bare close this used to do unconditionally,
-          ;; rather than letting it escape into RUN-EVENT-LOOP, which has
+          ;; back to a bare close, rather than letting it escape into
+          ;; RUN-EVENT-LOOP, which has
           ;; no handler and would restart the worker mid-sweep.
           (handler-case (deliver-awaiting-timeout conn epoll-fd)
             (error (e)
@@ -886,7 +886,7 @@
    by definition no room for. Four buffers clears a request already in
    hand, which is the ordinary case; bytes still in flight, or a client
    midway through a large upload, still earn a reset — and are still no
-   worse off than the bare close they used to get."
+   worse off than under a bare close."
   (let ((fd (ignore-errors (socket-fd client-socket))))
     (when (and fd (>= fd 0))
       (ignore-errors (set-nonblocking fd))
@@ -1009,9 +1009,12 @@
    a small response read promptly survives. What survives elsewhere
    depends on the peer — a proxy or client stack that treats a reset as a
    failure may not pass the answer on — and the FIN removes the question.
-   It is not a cure for every intermediary: WSL2's localhost relay, which
-   forwards nothing back while an upload is in flight, lost the 413 to a
-   32 MiB upload with and without the linger.
+
+   What the linger can promise has two limits. A client still sending
+   when *LINGER-TIMEOUT* runs out is closed with bytes unread, so it gets
+   the reset after all. And an intermediary that passes nothing back
+   while it is still relaying an upload can lose the answer however the
+   connection ends.
 
    :LINGERING is a state of its own so no worker waits: HANDLE-CLIENT-READ
    discards on each readable event and closes at the client's FIN, and
@@ -1712,8 +1715,9 @@
                       (connection-close-after-p conn) nil
                       (connection-state conn) :websocket)
                 ;; A WebSocket outlives any request, so a buffer a large
-                ;; upgrade request grew goes back to 4 KiB now rather than
-                ;; for the socket's life. See CONNECTION-SHRINK-READ-BUF.
+                ;; upgrade request grew goes back to 4 KiB here rather
+                ;; than staying grown for the socket's life. See
+                ;; CONNECTION-SHRINK-READ-BUF.
                 (connection-shrink-read-buf conn))
               (epoll-modify epoll-fd (connection-fd conn)
                            (logior +epollin+ +epollet+))
@@ -1910,16 +1914,13 @@
    concrete number START-SERVER resolved — so the restarted worker
    rejoins its siblings rather than appearing somewhere new.
 
-   The epoll fd is logged at startup because a worker was once seen to
-   fail with EBADF on its own, and the number is what distinguished a
-   descriptor closed underneath it from a wrong one arriving. That is
-   settled now, and the answer was the worse of the two: CONNECTION-CLOSE
-   closed descriptors with %CLOSE and left SB-BSD-SOCKETS' finalizer armed
-   on a number the kernel had already reissued, so a later GC closed it
-   under its new owner. An epoll fd is a bare number with nothing owning
-   it, which made a worker the ideal victim. It reached shipping servers,
-   not only test trees. See CONNECTION-CLOSE; the log line stays because
-   it is what made the failure legible."
+   The epoll fd is logged at startup because, should a worker fail with
+   EBADF on its own, the number is what tells a descriptor closed
+   underneath it from a wrong one arriving. An epoll fd is a bare number
+   with nothing owning it, which makes a worker the ideal victim of a
+   stray close: a socket closed with %CLOSE leaves SB-BSD-SOCKETS'
+   finalizer armed on a number the kernel reissues, and a later GC closes
+   it under its new owner. CONNECTION-CLOSE says how it avoids that."
   (loop
     (handler-case
         (with-worker-urandom
@@ -2105,8 +2106,8 @@
 ;;; answer is correct only when every other source is silent, which makes it
 ;;; a special case of taking the least.
 ;;;
-;;; One cost, stated rather than discovered: a defective parser can now cap a
-;;; large host where first-answer-wins would have skipped it. That error lands
+;;; One cost, stated rather than discovered: a defective parser can cap a
+;;; large host where first-answer-wins would skip it. That error lands
 ;;; on the wasteful side rather than the over-subscribed one, which is the
 ;;; direction to fail in, and each parser carries its own assertions.
 ;;;
@@ -2130,9 +2131,9 @@
 
    CEILING, never FLOOR or ROUND. A 0.5-CPU container — `cpus: '0.5'`, the
    shape this whole function exists for — floors to 0 workers, and
-   START-SERVER refuses a non-positive :WORKERS, so flooring turns the fix
-   into a server that will not boot in exactly the deployment it was written
-   to serve. A fractional share still needs one worker to run on."
+   START-SERVER refuses a non-positive :WORKERS, so flooring would give a
+   server that will not boot in exactly the deployment this exists to
+   serve. A fractional share still needs one worker to run on."
   (when (and (integerp quota) (integerp period)
              (plusp quota) (plusp period))
     (max 1 (ceiling quota period))))

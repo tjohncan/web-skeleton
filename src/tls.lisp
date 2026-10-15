@@ -295,31 +295,32 @@
                  (error "SSL_CTX set min proto version failed"))
                ;; A peer that closes without close_notify is how an
                ;; HTTP/1.0-style response ends, and SSL-READ-EOF-OR-RAISE
-               ;; reads it as the end of the body. OpenSSL 1.1.1 reported it
+               ;; reads it as the end of the body. OpenSSL 1.1.1 reports it
                ;; as SSL_ERROR_SYSCALL with errno 0, which is the arm that
                ;; reading lives in. OpenSSL 3 reports the same close as a
                ;; fatal SSL_ERROR_SSL, so without this every such response
-               ;; failed — and so did a framed one whose last bytes and the
-               ;; close came in one wake-up, before completeness was checked.
-               ;; The option makes 3.x report it as SSL_ERROR_ZERO_RETURN,
-               ;; a clean end, which puts both versions back on one reading.
-               ;; Truncation of a framed body is still caught where it always
-               ;; was, by a short Content-Length or a missing terminator.
+               ;; would fail — and so would a framed one whose last bytes
+               ;; and the close came in one wake-up, before completeness was
+               ;; checked. The option makes 3.x report it as
+               ;; SSL_ERROR_ZERO_RETURN, a clean end, which puts both
+               ;; versions on one reading. Truncation of a framed body is
+               ;; caught elsewhere, by a short Content-Length or a missing
+               ;; terminator.
                (when (>= (%openssl-version-num) +openssl-3+)
                  (%ssl-ctx-set-options ctx +ssl-op-ignore-unexpected-eof+))
                ;; Load system CA certificates. Raising rather than warning:
                ;; SSL_VERIFY_PEER is set two lines down, so with no trust
-               ;; anchors every handshake fails anyway — the old warning was
-               ;; already fail-closed, it just made the operator derive that
-               ;; from one startup line and an unrelated-looking stream of
-               ;; handshake errors afterwards. This is init refusing to hand
+               ;; anchors every handshake fails anyway — a warning would be
+               ;; fail-closed too, but would leave the operator to derive
+               ;; that from one startup line and an unrelated-looking stream
+               ;; of handshake errors afterwards. This is init refusing to hand
                ;; back a context that cannot do the one thing it is for,
                ;; which is what the two checks above it already do.
                ;;
                ;; Safe to raise here because ENSURE-SSL-CTX is called from
                ;; TLS-CONNECT, not at startup: a plain-HTTP server on a
                ;; distroless image still boots, and only an actual HTTPS
-               ;; fetch — which was going to fail regardless — now says why.
+               ;; fetch — which would fail regardless — says why.
                (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
                  (error "tls: no system CA certificates found, so every HTTPS ~
                          fetch would fail certificate verification. Install a ~
@@ -418,7 +419,7 @@
    the shared *DNS-RESOLVE-BLOCKING-FN* getent resolver (same one the
    async HTTP path uses) so both v4 and v6 addresses are handled and
    there is exactly one DNS primitive in the framework."
-  ;; No CTX binding here any more: TLS-CLIENT-SSL calls ENSURE-SSL-CTX,
+  ;; No CTX binding here: TLS-CLIENT-SSL calls ENSURE-SSL-CTX,
   ;; which is idempotent and mutex-guarded, so touching it twice would
   ;; only be a second place to get the ordering wrong.
   (let ((ssl nil)
@@ -525,28 +526,26 @@
    style: &OPTIONAL defaults evaluate left to right, so errno is taken
    before SSL_get_error is called. SSL_get_error is a foreign call and can
    set errno itself, so reading errno afterwards reports what *it* did
-   rather than what SSL_read did. That is not hypothetical -- it is how a
-   plain EAGAIN came back from this codebase reading as EBADF, and errno
-   is the whole basis of the SSL_ERROR_SYSCALL split below.
+   rather than what SSL_read did. That is not hypothetical: read in the
+   other order, a plain EAGAIN can come back as EBADF, and errno is the
+   whole basis of the SSL_ERROR_SYSCALL split below.
 
    Both are passed in by a caller that already sampled them, which is what
    a caller must do if it needed to branch on WANT_READ first.
 
    ARGUMENT ORDER IS A TRAP, and it belongs up here rather than at the
    bottom because the next caller added is where it costs something.
-   ERRNO sits ahead of ERR. A caller written against the older shape and
-   passing ERR positionally now passes it as ERRNO, silently — and errno
-   is the whole basis of the split below, where a wrong value turns a
-   transport failure into a clean end of stream. Pass both or neither.
+   ERRNO sits ahead of ERR, so a caller that passes ERR alone positionally
+   passes it as ERRNO, silently — and errno is the whole basis of the
+   split below, where a wrong value turns a transport failure into a clean
+   end of stream. Pass both or neither.
 
-   :AGAIN IS THE CALLER'S TO INTERPRET, and that is the re-derivation this
-   function needed once the socket stopped being blocking. EAGAIN used to
-   mean exactly one thing here — SO_RCVTIMEO fired — and the error message
-   said so. SO_RCVTIMEO does nothing on a non-blocking socket, so there
-   EAGAIN means only what it says: nothing to read yet. On a blocking
-   socket with the timeout installed it still cannot mean anything else,
-   because a blocking read does not return would-block unless the receive
-   timeout expired.
+   :AGAIN IS THE CALLER'S TO INTERPRET, because what EAGAIN means depends
+   on the socket's mode. On a blocking socket with SO_RCVTIMEO installed
+   it means exactly one thing, that the timeout fired, because a blocking
+   read does not return would-block unless the receive timeout expired.
+   SO_RCVTIMEO does nothing on a non-blocking socket, so there EAGAIN
+   means only what it says: nothing to read yet.
 
    One classification, two readings, each made where the socket's mode is
    known: SSL-CONNECTION-READER passes :AGAIN to the event loop, and
@@ -662,12 +661,11 @@
   "Blocking streaming HTTPS fetch. Calls ON-LINE per response body line.
 
    The response is read by STREAM-RESPONSE-LINES, the same function the
-   plain-HTTP path uses, with SSL-BYTE-READER supplying the bytes. This
-   used to be TLS-STREAM-RESPONSE: 386 lines reimplementing interim 1xx
-   handling, header caps, chunk framing, :HEAD gating and three
-   truncation disciplines the shared reader already had. Two readers of
-   the same bytes is the shape this codebase spends the most effort
-   refusing, and the largest instance of it was here."
+   plain-HTTP path uses, with SSL-BYTE-READER supplying the bytes. A TLS
+   reader of its own would reimplement interim 1xx handling, header caps,
+   chunk framing, :HEAD gating and three truncation disciplines the
+   shared reader has — two readers of the same bytes, the shape this
+   codebase spends the most effort refusing."
   (multiple-value-bind (ssl socket)
       (tls-connect host port)
     (unwind-protect
@@ -828,10 +826,10 @@
     ;; The retry loop is here to keep a shared classifier's contract
     ;; total, not because EINTR is expected on this path -- these sockets
     ;; are non-blocking and answer EAGAIN instead. But
-    ;; SSL-READ-EOF-OR-RAISE can now answer :RETRY, and NB-READ's contract
-    ;; has no such value: leaking it would reach CONNECTION-READ-AVAILABLE
-    ;; as an unrecognised verdict, which is a worse failure than the raise
-    ;; it replaced. Consuming it here costs one loop and cannot be wrong.
+    ;; SSL-READ-EOF-OR-RAISE can answer :RETRY, and NB-READ's contract has
+    ;; no such value: leaking it would reach CONNECTION-READ-AVAILABLE as
+    ;; an unrecognised verdict, a worse failure than any raise. Consuming
+    ;; it here costs one loop and cannot be wrong.
     (sb-sys:with-pinned-objects (buffer)
       (call-retrying-eintr
        (lambda ()
@@ -845,7 +843,7 @@
                (let ((err (%ssl-get-error ssl n)))
                  (cond
                    ((= err +ssl-error-want-read+) :again)
-                   ;; The state machine can express this now: the caller
+                   ;; The state machine can express this: the caller
                    ;; arms writability and re-issues the read. It must be
                    ;; the read -- retrying as a write is a protocol error
                    ;; that surfaces looking like a broken peer.
@@ -1089,9 +1087,9 @@
   ;; digest shorter than 32 bytes is a smaller integer, which is the same
   ;; thing as left-padding it into a different message. OpenSSL takes it
   ;; without complaint — EVP_PKEY_verify does not know what length of
-  ;; digest the caller meant — so the refusal has to be here. JWT is the
-  ;; only caller today and always passes 32 bytes; this keeps the two
-  ;; implementations answering alike rather than fixing a live bug.
+  ;; digest the caller meant — so the refusal has to be here. JWT, the one
+  ;; caller, always passes 32 bytes; the gate keeps the two
+  ;; implementations answering alike.
   (unless (= (length hash) 32)
     (return-from ecdsa-verify-p256-libssl nil))
   ;; Length-gate like the pure-Lisp path. DER-ENCODE-ECDSA-SIGNATURE

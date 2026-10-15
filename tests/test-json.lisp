@@ -56,9 +56,9 @@
          '(("inner" . "deep")))
   (check "json-get reads a json-object"
          (json-get (json-parse "{\"a\":1}") "a") 1)
-  ;; json-get still accepts a bare alist so handler code written against
-  ;; the old representation keeps working.
-  (check "json-get still accepts a bare alist"
+  ;; json-get also accepts a bare alist, so code that holds an object as
+  ;; a plain alist reads it the same way.
+  (check "json-get also accepts a bare alist"
          (json-get '(("a" . 1)) "a") 1)
   (check "json-get on a non-object returns nil, does not raise"
          (json-get "not-an-object" "a") nil)
@@ -174,8 +174,8 @@
   (check "ser false" (json-serialize :false) "false")
   (check "ser null" (json-serialize :null) "null")
   ;; NIL is the empty list, so it emits []. Explicit null is :NULL and an
-  ;; empty object is an empty JSON-OBJECT — the three used to collapse
-  ;; onto "null" and now each round-trips to itself.
+  ;; empty object is an empty JSON-OBJECT, so each of the three
+  ;; round-trips to itself.
   (check "ser nil is []" (json-serialize nil) "[]")
   (check "ser empty json-object is {}"
          (json-serialize (make-json-object nil)) "{}")
@@ -217,7 +217,7 @@
             (lambda () (json-serialize '(("a" . 1) ("b" . 2) . 3)))) t))
 
   ;; Objects — MAKE-JSON-OBJECT is what emits {...}. A bare alist is an
-  ;; array of pairs now; see the A2 block below for why.
+  ;; array of pairs; see the arrays-of-pairs block below for why.
   (check "ser object"
          (json-serialize
           (make-json-object '(("name" . "ankle") ("size" . 4444))))
@@ -236,14 +236,15 @@
     (check "round-trip nested objects in an array"
            (json-serialize (json-parse doc)) doc))
 
-  ;; ---- A2: arrays of pairs must stay arrays ----
-  ;; The serializer used to decide "object vs array" by testing whether
-  ;; every element was a cons with a string car. An array whose elements
-  ;; are two-element arrays beginning with a string satisfies that test,
-  ;; so [["a",1],["b",2]] came back out as {"a":[1],"b":[2]} — well-formed,
-  ;; silently wrong, no error anywhere. That shape is not exotic: it is how
-  ;; Object.entries(), tabular payloads, and header lists serialize.
-  ;; Objects are a distinct type now, so no guessing happens.
+  ;; ---- arrays of pairs must stay arrays ----
+  ;; A serializer that decided "object vs array" by testing whether every
+  ;; element is a cons with a string car would be fooled: an array whose
+  ;; elements are two-element arrays beginning with a string satisfies
+  ;; that test, so [["a",1],["b",2]] would come back out as
+  ;; {"a":[1],"b":[2]} — well-formed, silently wrong, no error anywhere.
+  ;; That shape is not exotic: it is how Object.entries(), tabular
+  ;; payloads, and header lists serialize. Objects are a distinct type,
+  ;; so no guessing happens.
   (dolist (doc '("[[\"a\",1],[\"b\",2]]"
                  "[[\"a\",1]]"
                  "[[\"k\",\"v\"],[\"k2\",\"v2\"],[\"k3\",\"v3\"]]"
@@ -255,7 +256,7 @@
                  "null"
                  "[{\"a\":1},{\"a\":2}]"
                  "{\"outer\":{\"inner\":[[\"x\",1]]}}"))
-    (check (format nil "A2 round-trip ~a" doc)
+    (check (format nil "array of pairs round-trip ~a" doc)
            (json-serialize (json-parse doc)) doc))
 
   ;; A hand-built alist is an array of pairs, and a dotted pair is not a

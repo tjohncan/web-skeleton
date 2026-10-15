@@ -88,14 +88,13 @@
    and the terminator can be appended after it and the body after that —
    the write queue takes them as separate vectors and copies nothing.
 
-   The pieces also retire an identity that used to be load-bearing:
-   BODY-OFFSET was where the body began inside the pre-built 200, and it
-   was exactly the length of the HEAD response because the two shared a
-   header block. Splicing anything into one and not the other would have
-   moved a body out from under a range slice — a 206 with a correct
-   status, a correct length, and content starting a few bytes early. The
-   body now lives in CONTENT on its own, so no offset depends on how long
-   the headers happen to be."
+   The body lives in CONTENT on its own, so no offset depends on how long
+   the headers happen to be. A body kept inside a pre-built 200 would
+   begin at an offset equal to the HEAD response's length, true only while
+   the two share a header block: splicing anything into one and not the
+   other would move a body out from under a range slice — a 206 with a
+   correct status, a correct length, and content starting a few bytes
+   early."
   (head-prefix           nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (not-modified-prefix   nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (content               nil :type (or null (simple-array (unsigned-byte 8) (*))))
@@ -323,7 +322,7 @@
    holding a 4 GB video buys a 4 GB resident set — discovered at deploy
    time, on the box, rather than here. Range support makes that likelier
    rather than less: serving large media is what Range is for, so the
-   invitation to keep large media next to the CSS is now in the box.
+   invitation to keep large media next to the CSS comes in the box.
    Per-call, not global, because the limit belongs to the tree being
    loaded and additive calls each bring their own.
 
@@ -575,7 +574,7 @@
    that media players and download managers do not use. Anything
    unparseable also returns NIL: ignoring a Range is always a safe
    answer, where guessing at one is not."
-  ;; A zero-length resource used to short-circuit to NIL and serve a 200.
+  ;; A zero-length resource does not short-circuit to NIL and a 200.
   ;; RFC 7233 §2.1 makes a byte-range-spec unsatisfiable once its
   ;; first-byte-pos is at or past the current length, which for an empty
   ;; representation is true of every range there is — so the answer is the
@@ -701,8 +700,9 @@
                          (cons "content-range"
                                (format nil "bytes ~d-~d/~d" first last total))))))
     ;; Counted once the bytes exist, the order every producer keeps. Nothing
-    ;; in these headers can be refused today, but a response counted before
-    ;; its serialize is the shape FORMAT-RESPONSE's phantom had.
+    ;; in these headers can be refused, but a response counted before its
+    ;; serialize would be counted even when the serialize raised: a phantom
+    ;; 206 in the response counts.
     (prog1 (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)
       (note-response 206))))
 
@@ -727,7 +727,7 @@
                 (cons "accept-ranges" "bytes"))
           ;; Omit the validator rather than emit an empty one: ETag's grammar
           ;; has no empty form, so `etag: ""` would be malformed. Unreachable
-          ;; today (every entry is built with one) but a header that can only
+          ;; (every entry is built with one), but a header that can only
           ;; ever be well-formed is better than one that depends on that.
           (when etag (list (cons "etag" etag))))
          nil)

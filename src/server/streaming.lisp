@@ -158,8 +158,8 @@
    a third behavioral flag on it. Almost everything FORMAT-RESPONSE does
    with a body is Content-Length work — computing it, defaulting it to
    zero for bodiless statuses, preserving it across HEAD — and a stream
-   wants none of it. The flag would have switched off most of the
-   function it was added to.
+   wants none of it. The flag would switch off most of the function it
+   was added to.
 
    Refuses rather than reconciling. A caller-supplied Content-Length or
    Transfer-Encoding means the caller thinks it owns framing, and two
@@ -370,11 +370,11 @@
    remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
    — the common case, where the bytes fit, returns T and says nothing.
 
-   That is the shape WS-SEND had before it was guarded, and it is stated here
-   rather than fixed because fixing it is a contract change: today a
-   cross-worker STREAM-SEND mostly succeeds, and applications may be
-   relying on it accidentally. STREAM-CLOSE could be guarded without one,
-   since it already raised on that path every time. The rule for all four
+   It is stated here rather than guarded because guarding it is a
+   contract change: a cross-worker STREAM-SEND mostly succeeds, and
+   applications may be relying on it accidentally. STREAM-CLOSE's guard
+   changes no contract, since unguarded that call raises every time
+   anyway. The rule for all four
    is in README.md under Limitations; this paragraph exists so that a
    reader who has seen the other three enforce it does not infer that
    this one does."
@@ -416,10 +416,10 @@
     ;; goes out instead of what was sent. Reusing one buffer is the
     ;; obvious way to write a producer, and without this the rule for
     ;; whether that is allowed would depend on the client's HTTP version
-    ;; — chunked copies here because ENCODE-CHUNK builds a new vector,
-    ;; close framing did not. An app cannot see which framing it got, so
-    ;; it would be correct against every browser and corrupt against one
-    ;; old client.
+    ;; — chunked framing copies because ENCODE-CHUNK builds a new vector,
+    ;; and close framing would not without this. An app cannot see which
+    ;; framing it got, so it would be correct against every browser and
+    ;; corrupt against one HTTP/1.0 client.
     (:close (when (plusp (length bytes)) (copy-seq bytes)))))
 
 (defun stream-flush (conn)
@@ -430,7 +430,7 @@
    The arming is conditional and self-limiting: it happens only when a
    send does not fully flush, which means the socket is genuinely backed
    up. A peer keeping up costs no epoll_ctl at all, the same property
-   the ping sweep gained when its write moved inline.
+   the ping sweep has by writing inline.
 
    EPOLLIN stays in the mask because a stream still has to notice its
    peer going away — that is the only read event a :STREAMING connection
@@ -478,25 +478,26 @@
    would have armed one — see the comment below.
 
    Signals if the state is not :STREAMING, and signals if that arming
-   fails. The second is unconditional, where the arming it replaced was
-   skipped whenever the flush finished — so a failure to arm is reported
-   every time rather than only when the terminator did not fit.
+   fails. The second is unconditional: an arming skipped whenever the
+   flush finished would report a failure to arm only when the terminator
+   did not fit, where this reports it every time.
 
    Signals, before either of those has a chance to matter, if CONN is not
    on this worker's connection table — the same check WS-SEND and
    FETCH-INTO make, before anything is touched.
 
-   The arm was the only thing that noticed a cross-worker close, and it
-   arms last: by then the terminator has been appended to another
-   worker's unlocked queue and put on the wire with send(2) from the
-   wrong thread, the state has moved to :WRITE-RESPONSE, and ON-CLOSE
-   has fired :DONE. That last one is why this is a guard rather than a
-   documented limitation. NOTIFY-STREAM-CLOSED nulls the slot before
-   calling so the callback fires exactly once, so the owning worker's own
-   teardown notification is afterwards a no-op — the application's first
-   and last word about that stream is :DONE, it is false, and nothing can
-   correct it. A corrupted queue is at least a thing the framework knows
-   about; telling an app its stream ended normally when it did not is not."
+   Without the check, the arm would be the only thing to notice a
+   cross-worker close, and it arms last: by then the terminator has been
+   appended to another worker's unlocked queue and put on the wire with
+   send(2) from the wrong thread, the state has moved to :WRITE-RESPONSE,
+   and ON-CLOSE has fired :DONE. That last one is why this is a guard
+   rather than a documented limitation. NOTIFY-STREAM-CLOSED nulls the
+   slot before calling so the callback fires exactly once, so the owning
+   worker's own teardown notification is afterwards a no-op — the
+   application's first and last word about that stream would be :DONE,
+   false, with nothing able to correct it. A corrupted queue is at least
+   a thing the framework knows about; telling an app its stream ended
+   normally when it did not is not."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
@@ -612,8 +613,8 @@
   ;; Named rather than left to FIND's type error. An integer id is the
   ;; most natural thing an app passes — sequence numbers are what
   ;; Last-Event-ID replay is for — and "The value 42 is not of type
-  ;; SEQUENCE" names neither the argument nor the fix. RETRY already had
-  ;; a check of its own; three of the four fields did not.
+  ;; SEQUENCE" names neither the argument nor the fix. RETRY has a check
+  ;; of its own; this is the other three fields'.
   (unless (stringp value)
     (error "sse: ~a must be a string, got ~s. Field values go on the wire ~
             as text; convert first (WRITE-TO-STRING for a number)."

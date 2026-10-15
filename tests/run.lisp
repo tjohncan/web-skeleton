@@ -144,9 +144,8 @@
 ;;; absent. Such a guard cannot tell "TLS not loaded" from "that function
 ;;; was renamed or deleted", so the second case skips silently on a
 ;;; machine where TLS is loaded and the assertion was meant to run.
-;;; Deleting TLS-STREAM-RESPONSE did exactly that to five assertions in
-;;; test-properties: green suite, lost coverage, visible only as a
-;;; per-suite count dropping.
+;;; Deleting a function such a guard names does exactly that: a green
+;;; suite, lost coverage, visible only as a per-suite count dropping.
 ;;;
 ;;; So: ask TLS-LOADED-P whether the system is there, and inside that
 ;;; branch use TLS-SYM, which raises on a miss because by then a miss can

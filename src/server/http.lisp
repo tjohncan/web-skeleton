@@ -118,11 +118,9 @@
 
    Used for Transfer-Encoding: chunked, Connection: close/keep-alive,
    and Upgrade: websocket detection — a general HTTP token-list
-   primitive, callable from any header-parsing site. It was
-   CONNECTION-HEADER-HAS-TOKEN-P while it only served the Connection
-   header, and the docstring spent two lines apologising for the name
-   afterwards; eight call sites across four files now read as what they
-   are rather than as something borrowed."
+   primitive, callable from any header-parsing site. Named for what it
+   is rather than for the Connection header, so its call sites across
+   four files read as what they are rather than as something borrowed."
   (let ((len (length header-value))
         (token-len (length token)))
     (loop with pos = 0
@@ -619,11 +617,11 @@
                   (when (= colon pos)
                     (http-parse-error "empty header name"))
                   ;; RFC 7230 §3.2.6: header name must be a token,
-                  ;; i.e. each byte must be a tchar. The earlier
-                  ;; loose check (<=0x20 or =0x7F) rejected CTLs and
-                  ;; SP but let through separators like ':', '(',
-                  ;; ',', '/', etc. — any of which hidden in a name
-                  ;; is a smuggling primitive if it reaches assoc.
+                  ;; i.e. each byte must be a tchar. A looser check
+                  ;; (<=0x20 or =0x7F) would reject CTLs and SP but
+                  ;; let through separators like ':', '(', ',', '/',
+                  ;; etc. — any of which hidden in a name is a
+                  ;; smuggling primitive if it reaches assoc.
                   (loop for i from pos below colon
                         for b = (aref buf i)
                         unless (tchar-byte-p b)
@@ -640,9 +638,9 @@
                       ;; shape the request-target and method checks
                       ;; already close in parse-request-bytes, and
                       ;; symmetric with serialize-http-message's
-                      ;; value reject on egress. The asymmetry was
-                      ;; the bug — inbound accepted bytes the
-                      ;; outbound side would refuse to emit.
+                      ;; value reject on egress: without it, inbound
+                      ;; would accept bytes the outbound side
+                      ;; refuses to emit.
                       (loop for i from vs below ve
                             for b = (aref buf i)
                             when (or (and (< b #x20) (/= b 9))

@@ -620,7 +620,7 @@
    the 'HEAD ' method prefix inline and passes :head-only-p to
    format-response so Content-Length survives but body bytes
    are suppressed. Shape is vanishingly rare — HEAD with Expect
-   is meaningless in practice — but the test locks in the fix."
+   is meaningless in practice — but the test pins it."
   (format t "~%Harness: HEAD + Expect: unknown has no body on wire~%")
   (with-test-server
       (:handler (lambda (req)
@@ -700,10 +700,10 @@
                (write-sequence req1 stream)
                (force-output stream)
                ;; Drain the first response until EOF. A correct close
-               ;; makes EOF arrive promptly; a regression that held the
-               ;; socket open used to block here until with-test-server's
-               ;; teardown noticed. Bounded now, so the same regression
-               ;; fails these checks with whatever did arrive instead.
+               ;; makes EOF arrive promptly. The drain is bounded, so a
+               ;; regression that held the socket open fails these
+               ;; checks with whatever did arrive, rather than blocking
+               ;; here until with-test-server's teardown notices.
                (let ((text (drain-response stream)))
                  (check "handler close: response present"
                         (not (null (search "HTTP/1.1 200" text))) t)
@@ -928,12 +928,13 @@
   "A fetch of a close-delimited upstream completes when the close arrives,
    not when *FETCH-TIMEOUT* expires.
 
-   CONNECTION-READ-AVAILABLE used to report \"read bytes, then EOF\" as
-   :OK, discarding the end of stream. For a response with no
-   Content-Length and no Transfer-Encoding that end of stream *is* the
-   framing — OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
-   deferring to the caller's EOF branch — so the branch never ran and the
-   fetch hung until the sweeper took it.
+   CONNECTION-READ-AVAILABLE reports \"read bytes, then EOF\" as :OK-EOF,
+   not :OK. For a response with no Content-Length and no
+   Transfer-Encoding that end of stream *is* the framing —
+   OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
+   deferring to the caller's EOF branch — so a read that discarded it
+   would never run the branch, and the fetch would hang until the
+   sweeper took it.
 
    A TCP peer's close does not set EPOLLHUP, so HANDLE-OUTBOUND-EVENT's
    error arm did not rescue it either. Nothing about this needs
@@ -1272,19 +1273,19 @@
   "A hostname whose every resolved address the policy refuses fails the
    fetch promptly, with a 502, rather than stranding until the sweeper.
 
-   Read this before trusting it: **this test passes without the fix**, and
-   is here as an end-to-end assertion of the DEPLOYMENT.md promise rather
-   than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is the check with
-   teeth.
+   Read this before trusting it: **this test passes without the :OK-EOF
+   arm**, and is here as an end-to-end assertion of the DEPLOYMENT.md
+   promise rather than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is
+   the check with teeth.
 
    The reason is the mechanism. getent writes its output in one go and the
    EOF appears when it exits, so whether one drain sees both depends on
    whether it has exited by the time we read — and usually it has not. The
-   bytes come back :OK, the exit arrives as a separate event, and the old
-   code handled it on a clean :EOF. Only when getent finishes first do the
-   two coalesce, and that is the ordering the bug needed. A race, not a
-   certainty, which is exactly why it survived a suite that covers the
-   parser it sits behind.
+   bytes come back :OK, the exit arrives as a separate event, and a branch
+   taking only :EOF handles it. Only when getent finishes first do the two
+   coalesce, and that is the ordering that needs the arm. A race, not a
+   certainty, which is how a missing arm could survive a suite that covers
+   the parser it sits behind.
 
    What the test does assert is the promise: a name whose every resolved
    address *FETCH-ADDRESS-FILTER* refuses fails the fetch promptly with a
@@ -1376,7 +1377,8 @@
    child only once it has seen it exit, collecting it on the worker's tick.
 
    On 2.4.11 and later SBCL collects a closed child itself, so there this
-   passes with or without the fix and is a control: two hundred real
+   passes whether or not the framework waits for the exit, and is a
+   control: two hundred real
    lookups through the whole path, and nothing left behind. On an older
    SBCL it is a detector, and not a perfect one. A zombie needs getent to
    be still running at the moment its lookup ends, which is a race: on
@@ -1845,15 +1847,15 @@
   "A shutdown that finds a keep-alive response in flight lets it finish,
    then closes the connection, and returns well inside *DRAIN-TIMEOUT*.
 
-   The drain let such a response finish and left the connection's
-   keep-alive alone, so the last byte reset it to reading a next request.
-   The drain never closes a connection that is reading, so shutdown sat
-   out the whole *DRAIN-TIMEOUT* for a response delivered at once, and
-   logged a force-close.
+   A drain that let such a response finish and left the connection's
+   keep-alive alone would have the last byte reset it to reading a next
+   request. The drain never closes a connection that is reading, so
+   shutdown would sit out the whole *DRAIN-TIMEOUT* for a response
+   delivered at once, and log a force-close.
 
    The handler is still running when shutdown is asked for, so its
-   response is queued after the drain has begun: the shape the finding
-   reproduced with SIGTERM."
+   response is queued after the drain has begun: the shape a SIGTERM
+   during a request produces."
   (format t "~%Harness: the drain closes a keep-alive response it let finish~%")
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain *drain-timeout*)
@@ -2423,9 +2425,9 @@
 (defun test-harness-sse-keepalive-framed-e2e ()
   "A keepalive on a chunked stream has to be framed as a chunk.
 
-   Every check written for the keepalive before this one looked at the
-   response struct or the connection's queue — 'installed by default',
-   'nothing left queued', 'counts as production' — and all of those are
+   The other keepalive checks look at the response struct or the
+   connection's queue — 'installed by default', 'nothing left queued',
+   'counts as production' — and all of those are
    true of raw bytes and framed bytes alike. The only site that can tell
    them apart is the wire, so this reads the bytes back and puts them
    through the framework's own chunked decoder.
@@ -2508,8 +2510,8 @@
    rather than being accumulated, and delivering them twice would double
    the memory the callback exists to avoid.
 
-   The upstream is item 5's streaming surface, so this also checks that
-   what the encoder produces is what the walk hands back."
+   The upstream is the framework's own streaming surface, so this also
+   checks that what the encoder produces is what the walk hands back."
   (format t "~%Harness: fetch :on-body incremental delivery~%")
   (let ((collected nil)
         (final :never)
@@ -3174,11 +3176,10 @@
    this test's `server closed the connection` and `second request
    dispatched`.
 
-   That was measured after removing a second clear, not before. The
-   connection resets used to zero the cursor as well, and with both in
-   place neutering either one was silent: each masked the other, and this
-   test detected neither. Two mechanisms, one guarantee, no way to tell
-   them apart.
+   That holds because the cursor has one clear. With a second — the
+   connection resets zeroing it as well — neutering either one would be
+   silent: each would mask the other, and this test would detect neither.
+   Two mechanisms, one guarantee, no way to tell them apart.
 
    The second request is chunked too, rather than a plain GET, because a
    GET would never consult the cursor at all."
@@ -3360,8 +3361,8 @@
 (defun test-harness-chunked-trailer-smuggle-e2e ()
   "A trailer section carrying a complete HTTP request, end to end.
 
-   The headline acceptance criterion of the issue, and a delivery-shaped
-   assertion cannot see it: if the smuggle succeeded the client would get
+   The point of refusing trailers, and a delivery-shaped assertion cannot
+   see it: if the smuggle succeeded the client would get
    *two* responses, so what this asserts is that it gets one, and that the
    one it gets is the 400 the trailer earned rather than a 200 for /a
    followed by a 200 for the request hidden in its trailer.
@@ -3413,7 +3414,7 @@
                                                     :start2 (1+ first-status)))))
                    (check "trailer smuggle: refused with 400"
                           (not (null (search "HTTP/1.1 400" text))) t)
-                   ;; The assertion the issue exists for: not two responses.
+                   ;; The assertion that matters most: not two responses.
                    (check "trailer smuggle: exactly one response"
                           (null second-status) t)
                    (check "trailer smuggle: /admin was never served"
@@ -3682,7 +3683,7 @@
                           (multiple-value-bind (ended clean)
                               (read-to-eof-bounded stream buf :seconds 5)
                             ;; Bounded even though REFUSE-CONNECTION closes
-                            ;; unconditionally today: this test's subject
+                            ;; unconditionally: this test's subject
                             ;; is whether it closes, and the day that
                             ;; SOCKET-CLOSE moves inside a conditional, the
                             ;; test written to catch it should fail rather
@@ -3836,19 +3837,18 @@
              :external-format :ascii)
           (error (e) (princ-to-string e))))))
 (defun test-harness-fetch-into-relay-e2e ()
-  "The relay DEPLOYMENT.md described, now that it dials — and through the
-   real resolver.
+  "The relay DEPLOYMENT.md describes, end to end — and through the real
+   resolver.
 
    A streaming response whose :ON-OPEN starts a fetch, forwards each chunk
    into its own body as the framing proves it, and closes when the upstream
-   is done. Before FETCH-INTO this built a continuation inside :ON-OPEN and
-   dropped it: the client got a 200 with chunked framing that never
-   terminated, held for *STREAM-IDLE-TIMEOUT*, then a truncated body with
-   no error anywhere.
+   is done. A continuation built inside :ON-OPEN and dropped would leave
+   the client a 200 with chunked framing that never terminated, held for
+   *STREAM-IDLE-TIMEOUT*, then a truncated body with no error anywhere.
 
-   Asserted on the decoded body rather than on bytes arriving, because the
-   defect's signature was a body that never terminated — a check that only
-   looked for content would have passed against it.
+   Asserted on the decoded body rather than on bytes arriving, because
+   that failure's signature is a body that never terminates — a check that
+   only looked for content would pass against it.
 
    The upstream is dialled by **name**, which is what makes this the only
    e2e in the suite to reach INITIATE-DNS-LOOKUP on its success path. Every
@@ -4042,22 +4042,21 @@
 (defun test-harness-ipv6-listener-e2e ()
   "The listener binds IPv6, and the harness can reach it.
 
-   MAKE-TCP-LISTENER has dispatched the socket family on the host vector's
-   length since it was written, and README documents all four forms — and
-   nothing in this suite had ever passed it sixteen bytes. The :HOST
-   plumbing makes that reachable; this is what reaches it.
+   MAKE-TCP-LISTENER dispatches the socket family on the host vector's
+   length, and README documents all four forms. This is the test that
+   passes it sixteen bytes, through the harness's :HOST plumbing.
 
    Not a detector for a defect in the framework, and it should not be read
-   as one: the v6 bind was correct before this branch and is correct after.
-   It is a detector for the *harness* code the branch added, which is new
-   and untested surface — CONNECT-TO-TEST-SERVER dispatching the client
-   family from the same vector MAKE-TCP-LISTENER dispatches the bind from.
-   Pin that branch to INET-SOCKET and this is the only test that notices.
+   as one: the v6 bind is right with or without it. It is a detector for
+   the *harness* code, which nothing else exercises —
+   CONNECT-TO-TEST-SERVER dispatching the client family from the same
+   vector MAKE-TCP-LISTENER dispatches the bind from. Pin that branch to
+   INET-SOCKET and this is the only test that notices.
 
    The other e2e tests cannot reach it. Their :HOST is either the literal
    four-byte loopback or whatever RESOLVE-HOST-BLOCKING answers for
    `localhost`, and that is IPv4 on any machine ordering IPv4 first in
-   /etc/hosts — this one, and the GitHub ubuntu runner. Depending on the
+   /etc/hosts, the GitHub ubuntu runner among them. Depending on the
    resolver to hand us a v6 address is exactly the environment dependence
    the relay test exists to avoid, so the address is named outright here.
 
@@ -4158,8 +4157,8 @@
    They fail in different directions and a single \"it signals\" check
    would cover one of them by accident. And a refused call must leave
    nothing behind — no outbound, and a callback that never fired — which
-   is the one place on this branch where zero is the right answer for a
-   counter.
+   is the one place among the FETCH-INTO tests where zero is the right
+   answer for a counter.
 
    The two disposition refusals bring a seventh check that is not a
    refusal: the same argument on the target it is meant for has to get
@@ -4288,21 +4287,20 @@
    the socket is held until the process ends and the app's :THEN never
    fires — the leak the abort sentinel exists to prevent.
 
-   The arm was not uncovered before this, and saying otherwise would be
-   the overstatement this branch keeps deleting:
-   TEST-HARNESS-FETCH-INTO-UPSTREAM-STALLS-E2E fails when it is removed,
-   because the sentinel does not arrive. What that test cannot see is
-   everything after the callback — it has no way to look inside the
-   worker's connection table. So what is new here is the reclamation
-   rather than the notification: the outbound is actually unregistered,
-   the callback fired exactly once rather than merely at least once, and
-   the target got DELIVER-DETACHED's disposition instead of being left
-   open behind a body that stopped.
+   The arm has other coverage, and saying otherwise would be an
+   overstatement: TEST-HARNESS-FETCH-INTO-UPSTREAM-STALLS-E2E fails when
+   it is removed, because the sentinel does not arrive. What that test
+   cannot see is everything after the callback — it has no way to look
+   inside the worker's connection table. So what this one adds is the
+   reclamation rather than the notification: the outbound is actually
+   unregistered, the callback fired exactly once rather than merely at
+   least once, and the target got DELIVER-DETACHED's disposition instead
+   of being left open behind a body that stopped.
 
-   **The target is deliberately left alive.** The first version of this
-   test closed it, which proved nothing: CLOSE-CONNECTION walks a dying
-   target's detached outbounds and reaps them itself, so every assertion
-   below passed with the sweeper's arm deleted outright. That walk is
+   **The target is deliberately left alive.** Closing it would prove
+   nothing: CLOSE-CONNECTION walks a dying target's detached outbounds and
+   reaps them itself, so every assertion below would pass with the
+   sweeper's arm deleted outright. That walk is
    real and covered by TEST-HARNESS-FETCH-INTO-TARGET-CLOSED-E2E. A live
    target is what leaves the sweeper as the only remaining reaper, which
    is the whole point of the arm.
@@ -4512,7 +4510,8 @@
 (defun test-harness-fetch-into-target-closed-e2e ()
   "A client that leaves mid-relay tears the outbound down, once.
 
-   D5's arm reaches a detached outbound by walking, because nothing was
+   CLOSE-CONNECTION's detached-outbound arm reaches its outbound by
+   walking, because nothing was
    parked and AWAITING-FD names nothing. The subtlety is that it runs while
    the target is still :STREAMING with a live fd — CONNECTION-CLOSE is
    several lines below — so a disposition applied here would find it
@@ -4823,18 +4822,18 @@
 
 (defun test-fetch-failure-disposition-crosses-the-seam ()
   "FETCH-INTO writes the disposition and DELIVER-DETACHED reads it. This is
-   the wire between them, which nothing was watching.
+   the wire between them.
 
-   Both ends were covered and the wire was not. The refusal tests reach
-   FETCH-INTO's guards and stop there, which is before the write. The two
-   disposition fixtures set the slot themselves through MAKE-CONNECTION's
-   initarg, so they check the read against a value no production code ever
-   put there. Delete the disposition clause from FETCH-INTO's setf and the
-   slot keeps its :CLOSE default — :KEEP accepted, validated, and silently
-   ignored, which is the exact hazard the issue names — and every test on
-   this branch stayed green.
+   The ends are covered elsewhere and the wire is not. The refusal tests
+   reach FETCH-INTO's guards and stop there, which is before the write.
+   The two disposition fixtures set the slot themselves through
+   MAKE-CONNECTION's initarg, so they check the read against a value no
+   production code put there. Delete the disposition clause from
+   FETCH-INTO's setf and the slot keeps its :CLOSE default — :KEEP
+   accepted, validated, and silently ignored — and every other test stays
+   green.
 
-   The mode has a name now: *pre-arranged*. A fixture performs the step
+   That mode is *pre-arranged*. A fixture performs the step
    production is responsible for performing, then checks the consumer of
    that step. It is not vacuous, it can fail; not partial, it covers its
    claim; not confounded, it passes for the right reason. What it cannot do
@@ -4896,11 +4895,10 @@
    through (LOOKUP-CONNECTION TARGET-FD), and *CONNECTIONS* is per-worker
    while fds are unique across the process, so that lookup answers NIL.
 
-   The consequence is this branch's own thesis from a seventh direction.
-   FETCH-OUTSTANDING is set and never cleared, so every later FETCH-INTO on
-   that connection is refused for the rest of its life — which is exactly
-   what DELIVER-DNS-ERROR did before it delegated — and the failure
-   disposition never applies, so a :STREAMING target sits to
+   The consequence: FETCH-OUTSTANDING is set and never cleared, so every
+   later FETCH-INTO on that connection is refused for the rest of its
+   life, and the failure disposition never applies, so a :STREAMING
+   target sits to
    *STREAM-IDLE-TIMEOUT* when its upstream fails.
 
    Two calls differing only in registration. The refused one is the claim.
@@ -4949,7 +4947,7 @@
                          t))
                   t)
            ;; The control. Registering the same connection is the only
-           ;; change, and the call now reaches INITIATE-FETCH.
+           ;; difference, and the call then reaches INITIATE-FETCH.
            (web-skeleton::register-connection conn)
            (check "fetch-into: and the same call is accepted once it is owned"
                   (attempt

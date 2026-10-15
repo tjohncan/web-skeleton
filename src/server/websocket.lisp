@@ -279,9 +279,9 @@
    the unassigned 1016-2999, and 5000+ are rejected here — the
    stricter counterpart to CLAMP-CLOSE-CODE on the receive path,
    which accepts any out-of-range peer code by clamping it to
-   1000. A silent u16 truncation on out-of-range input (the old
-   behavior for values > 65535) would put bytes on the wire the
-   application never asked for."
+   1000. A silent u16 truncation on out-of-range input (values
+   > 65535) would put bytes on the wire the application never
+   asked for."
   (unless (or (<= 1000 code 1003)
               (<= 1007 code 1014)
               (<= 3000 code 4999))
@@ -423,7 +423,7 @@
    The wrong worker, not the wrong thread. Asking whether an fd is on this
    worker's table takes a worker to ask from, so a call off the event loop
    entirely — an application's own timer or queue consumer — finds no table
-   and gets the old behaviour. FETCH-INTO refuses that one as well, but for
+   and is not refused. FETCH-INTO refuses that one as well, but for
    an unrelated reason: it needs a loop to drive the outbound it opens — a
    functional precondition this function does not share, since a send off a
    worker to a connection nothing else is touching works correctly and the
@@ -438,11 +438,11 @@
    Signals also if the arming fails, and that one is not symmetric with the
    others: the frame has been queued and flushed by then, so the raise
    reports that the *remainder* has no event coming, not that the send did
-   not happen. Arming is what used to catch a cross-worker call, and only
-   incidentally — an fd absent from this worker's epoll gives ENOENT — so
-   it caught one only when the flush left something behind. The check
-   above is what makes that a guarantee; this one is left as the report
-   that a queued remainder has nothing coming."
+   not happen. Arming catches a cross-worker call only incidentally — an
+   fd absent from this worker's epoll gives ENOENT — and only when the
+   flush leaves something behind. The check above is what makes refusing
+   one a guarantee; this one stays as the report that a queued remainder
+   has nothing coming."
   (unless (plusp *write-stall-timeout*)
     (error "ws-send: *write-stall-timeout* is ~s; it must be positive. ~
             There is no unbounded setting, because it is the only ~

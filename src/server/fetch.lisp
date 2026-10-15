@@ -53,14 +53,13 @@
    parks in :AWAITING and the reaper bounds the whole exchange, handshake
    included, however many reads and writes it took.
 
-   Per phase everywhere else, which now means HTTP-FETCH-STREAM and the
+   Per phase everywhere else, which means HTTP-FETCH-STREAM and the
    blocking setup paths only. There it bounds DNS, connect, and each
    individual socket read separately, so a trickling upstream never trips
    it. README Limitations has what that costs.
 
-   This docstring has now been wrong twice in opposite directions, so:
-   the trigger for revisiting it is not 'find the sentence about
-   timeouts', it is any change to which paths reach the event loop.
+   The trigger for revisiting this docstring is not 'find the sentence
+   about timeouts' but any change to which paths reach the event loop.
    SO_RCVTIMEO does nothing on a non-blocking socket, so a path that
    becomes non-blocking silently stops being bounded by the per-phase
    reading and starts being bounded by the :AWAITING timer instead — a
@@ -608,13 +607,14 @@
                         headers
                         ;; Unconditional. The guard above refuses a
                         ;; caller-supplied Content-Length outright, so
-                        ;; there is no case left where theirs wins and
-                        ;; the test could only ever be true. Leaving it
-                        ;; in would leave the shape of the old contract —
-                        ;; "the caller may override framing" — sitting
-                        ;; thirty lines below a comment saying framing
-                        ;; headers are ours, and a reader who meets the
-                        ;; merge first would re-derive the wrong rule.
+                        ;; there is no case where theirs wins and a test
+                        ;; could only ever be true. A test would also
+                        ;; carry the shape of a contract this function
+                        ;; does not have — "the caller may override
+                        ;; framing" — thirty lines below a comment saying
+                        ;; framing headers are ours, and a reader who
+                        ;; meets the merge first would re-derive the
+                        ;; wrong rule.
                         ;; HOST / CONNECTION / USER-AGENT above stay
                         ;; conditional: those are real caller overrides.
                         (when body-bytes
@@ -719,10 +719,10 @@
 ;;;
 ;;; This is not a hypothetical shape an app can avoid by configuration.
 ;;; `103 Early Hints` (RFC 8297) is sent UNSOLICITED by CDNs — Cloudflare
-;;; and Fastly both do it. Nothing the application does invites it, and
-;;; the old caveat in this file ("Apps must not add Expect: 100-continue
-;;; to outbound fetch headers") pushed a protocol obligation onto the
-;;; application that it had no way to discharge.
+;;; and Fastly both do it. Nothing the application does invites it, and a
+;;; caveat in its place ("Apps must not add Expect: 100-continue to
+;;; outbound fetch headers") would push onto the application a protocol
+;;; obligation it has no way to discharge.
 ;;;
 ;;; A 1xx must never be reported as a final status either: it is by
 ;;; definition interim, so "keep reading" is the only correct response to
@@ -788,10 +788,8 @@
 
    Internal, like *DNS-LOOKUP-FN* and for the same reason — it is how
    fetch.lisp reaches an optional system loaded after it, not something an
-   application sets. It replaced *HTTPS-FETCH-FN*, which named a blocking
-   whole-exchange function that no longer exists; *HTTPS-STREAM-FN* is
-   still the exported one, because HTTP-FETCH-STREAM is still blocking by
-   design.")
+   application sets. *HTTPS-STREAM-FN* is the exported one, because
+   HTTP-FETCH-STREAM is blocking by design.")
 
 (defvar *https-stream-fn* nil
   "When non-NIL, a function (method host port path headers body on-line) that
@@ -1266,9 +1264,9 @@
     ;; The whole header phase repeats over any 1xx interim block
     ;; (RFC 7231 §6.2): an interim is terminated by its own empty line
     ;; and carries no body, so the final response's status line is the
-    ;; very next line. Without this the header loop stopped at the
-    ;; interim's blank line, reported 103 as the status, took the
-    ;; bodiless branch, and never called ON-LINE at all. Per-block
+    ;; very next line. Without this the header loop would stop at the
+    ;; interim's blank line, report 103 as the status, take the
+    ;; bodiless branch, and never call ON-LINE at all. Per-block
     ;; state is reset each pass so an interim's headers cannot leak
     ;; into the final response's framing decision.
     (loop
@@ -1582,10 +1580,10 @@
    fd for the next accept, and delivering to whatever now answers to that
    number would queue one caller's response onto another caller's socket.
 
-   Not reachable today — every route that closes an :AWAITING inbound goes
+   No caller reaches it: every route that closes an :AWAITING inbound goes
    through CLOSE-CONNECTION, which tears the paired outbound down with it.
-   But that is a property of today's callers rather than of these
-   functions, which is the reasoning CONNECTION-QUEUE-WRITE's own guard
+   But that is a property of the callers rather than of these functions,
+   which is the reasoning CONNECTION-QUEUE-WRITE's own guard
    rejects, and the window widens with every long-lived parked state the
    roadmap adds.
 
@@ -1606,7 +1604,7 @@
 
    CONNECTION is what the app's :ON-OPEN received, or what its WS-HANDLER
    was called with. CONTINUATION is an ordinary HTTP-FETCH continuation;
-   HTTP-FETCH is unchanged and remains a pure constructor.
+   HTTP-FETCH is a pure constructor either way.
 
    T means the fetch is initiated, not completed. Nothing is parked, the
    connection's state is untouched, and the app goes on writing to it. The
@@ -1764,11 +1762,10 @@
    CONN is the inbound connection to park.
    FETCH-REQ is the http-fetch-continuation descriptor.
 
-   Both schemes take the same non-blocking epoll path. HTTPS used to
-   branch here into a blocking call that held the worker for the whole
-   exchange; what differs now is a transport installed on the outbound
-   connection — a handshake step, a byte source, a byte sink and a
-   release — and nothing about the state machine that drives them."
+   Both schemes take the same non-blocking epoll path, and neither holds
+   the worker for the exchange. What differs is a transport installed on
+   the outbound connection — a handshake step, a byte source, a byte sink
+   and a release — and nothing about the state machine that drives them."
   (handler-case
       (multiple-value-bind (scheme host port path)
           (parse-url (http-fetch-continuation-url fetch-req))
@@ -1919,7 +1916,7 @@
             ;; A TLS transport is an SSL and a 16 KiB foreign staging
             ;; buffer, and both are freed by CLOSE-FN or by nothing —
             ;; the connection object is collected, the memory behind it
-            ;; is not. Unwinding here without this leaked both, and the
+            ;; is not. Unwinding here without this would leak both, and the
             ;; realistic trigger is EPOLL-ADD failing with ENOSPC or
             ;; ENOMEM: exactly when the machine is already short, once
             ;; per retry. After this the outer SOCKET-CLOSE is a no-op
@@ -1969,10 +1966,10 @@
    EPOLLERR / EPOLLHUP. Linux delivers (EPOLLIN | EPOLLHUP) together
    when an upstream sends its final bytes and FINs in the same TCP
    segment — a common shape for close-delimited and chunked
-   responses. The previous cond-first-match structure matched the
-   HUP arm first and returned 502 even though a complete response
-   was sitting in the kernel buffer. Now the read path runs first
-   (draining to :eof and calling complete-fetch), and the HUP arm
+   responses. A cond whose first match wins would take the HUP arm
+   and return 502 with a complete response sitting in the kernel
+   buffer. The read path runs first instead (draining to :eof and
+   calling complete-fetch), and the HUP arm
    only fires as fatal if the connection is still alive after the
    drain — meaning the response really was incomplete.
 
@@ -2167,9 +2164,9 @@
     ;; The total runs on unpaused time. A relay applying backpressure is
     ;; deliberately not reading, so a deadline that kept running while
     ;; paused would kill a correct app for taking the framework's own
-    ;; advice — which is the 504-on-a-healthy-upstream this seam removes.
+    ;; advice — which is the 504-on-a-healthy-upstream this seam prevents.
     ;;
-    ;; It leaves the deadline no longer a bound on wall clock: a target
+    ;; The cost is that the deadline is not a bound on wall clock: a target
     ;; that trickles restarts WRITE-PROGRESS-AT on every byte it accepts,
     ;; so it never stalls and can extend this indefinitely. Memory stays
     ;; capped and the connection is visible in the census; the residual is
@@ -2333,7 +2330,7 @@
              ;; nothing left to un-pause, so a pause recorded here would
              ;; strand the fetch until *FETCH-TIMEOUT* with its body
              ;; already sitting in the app — the same stranding :OK-EOF
-             ;; was introduced to delete, rebuilt one branch lower.
+             ;; exists to prevent, rebuilt one branch lower.
              ((eq result :ok-eof) (complete-fetch conn epoll-fd))
              ;; Backpressure: leave the bytes in the kernel and let the
              ;; upstream's window fill, which is the disposition a relay
@@ -2461,20 +2458,20 @@
 ;;; Ending a fetch
 ;;;
 ;;; An application's fetch callback fires exactly once per fetch lifetime.
-;;; That was held by four separate invocation sites agreeing with each other
-;;; about when to clear the slot and what a cleanup call looks like — three
-;;; readers of "how does a fetch end", which is the shape this codebase
-;;; refuses everywhere else.
+;;; Held by separate invocation sites, that would take each of them agreeing
+;;; with the others about when to clear the slot and what a cleanup call
+;;; looks like — several readers of "how does a fetch end", which is the
+;;; shape this codebase refuses everywhere else.
 ;;;
-;;; It is now two functions with one job each. CLAIM-FETCH-CALLBACK takes the
+;;; So it is two functions with one job each. CLAIM-FETCH-CALLBACK takes the
 ;;; callback off a connection so no later path can find it; FINISH-FETCH is
 ;;; the only place an application callback is invoked at all.
 ;;;
 ;;; They stay separate because on the delivery path the claim and the call
 ;;; are not adjacent: COMPLETE-FETCH must claim *before* CLOSE-OUTBOUND, or
 ;;; teardown fires the cleanup sentinel on a fetch that succeeded, and it
-;;; must call *after*, which is the order that was already there. Collapsing
-;;; the two into one atomic step would move one of those across the other.
+;;; must call *after*. Collapsing the two into one atomic step would move
+;;; one of those across the other.
 ;;; ---------------------------------------------------------------------------
 
 (defun claim-fetch-callback (conn)

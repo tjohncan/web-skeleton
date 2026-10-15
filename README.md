@@ -419,20 +419,19 @@ read about here.
   the four refuse a connection another worker owns**: `ws-send`,
   `stream-close` and `fetch-into` each ask the connection table and raise
   before anything is queued. Before is the point: a check that ran later —
-  `ws-send` and `stream-close` once raised only when the write left a
-  remainder — would report the misuse after appending the bytes, and in
-  `stream-close`'s case after telling the application the stream had closed
-  normally.
+  such as the arm after a write that left a remainder, which fails for an fd
+  on another worker's epoll — would report the misuse after appending the
+  bytes, and in `stream-close`'s case after telling the application the
+  stream had closed normally.
 
   **`stream-send` is the exception and does not check.** A cross-worker
   `stream-send` appends to the unsynchronised queue and calls `send(2)` from
   the wrong thread; it is noticed only when the write leaves a remainder,
   because the arm that follows gets `ENOENT` — so the common case, where the
-  bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
-  had before it was guarded. It is left alone because closing it is a contract
-  change rather than a fix: a cross-worker `stream-send` mostly succeeds today
-  and code may lean on that accidentally, where a cross-worker `stream-close`
-  already raised every time.
+  bytes fit, returns `T` and says nothing. It is left unguarded because
+  guarding it is a contract change: a cross-worker `stream-send` mostly
+  succeeds and code may lean on that accidentally, where an unguarded
+  cross-worker `stream-close` would raise every time anyway.
 
   A second boundary, and it applies to all four: the question they ask is
   "is this fd on **this worker's** table", and only a worker can ask it. A
@@ -444,7 +443,7 @@ read about here.
   reachable, but a change to three functions at once, and one they have to
   make together or not at all.
 
-  Fan-out *across* workers is still not provided, but it is now buildable:
+  Fan-out *across* workers is not provided, but it is buildable:
   `:on-tick` runs application code on each worker's own event loop with that
   worker's connection table and epoll fd bound, and `map-worker-websockets`
   walks the connections that loop owns. Together they are the one place a
@@ -514,7 +513,7 @@ read about here.
   legal, unimplemented. `chunked, gzip`, a repeated header, an obs-folded
   value, and `Transfer-Encoding` on an HTTP/1.0 request are 400.
 - **No response compression.** No gzip, no `Content-Encoding`
-  negotiation. Compressing static assets is the proxy's job today.
+  negotiation. Compressing static assets is the proxy's job.
 - **No HTTP/2, no multipart.** A request whose version token is not
   HTTP/1.0 or HTTP/1.1 gets 505. Form bodies are
   `application/x-www-form-urlencoded` only — `multipart/form-data`, and
@@ -566,7 +565,7 @@ read about here.
   every connection that worker is serving, not only the one that asked.
   `http-fetch` runs on the event loop for **both** schemes: the inbound
   parks, the outbound uses the same epoll, and one `*fetch-timeout*`
-  bounds the whole exchange. For `https://` that now includes the TLS
+  bounds the whole exchange. For `https://` that includes the TLS
   handshake and every encrypted read and write. What remains below is
   either your code or a deliberate sleep.
 
@@ -613,8 +612,8 @@ read about here.
   without a lock. So the framework holds connections open and writes
   bytes; deciding *who* receives an event is the app's, and its registry
   has to push from the owning worker. Delivering to a connection this
-  thread does not own is a designed-for next step and not a thing you can
-  do today. Fan-out is per worker, as the top of this list says: each
+  thread does not own is a designed-for next step, not part of the
+  framework. Fan-out is per worker, as the top of this list says: each
   worker delivers to the connections it owns, from `:on-tick` with
   `map-worker-websockets`. What the framework does not provide is the
   subscriber registry, deliberately — a framework that owned it would own

@@ -130,8 +130,8 @@
     (check "padded non-canonical 2-char group rejected"
            (signals-error-p (lambda () (base64-decode "QR=="))) t)
 
-    ;; Padding must complete the final group and then stop. The
-    ;; trailing-'=' scan used to swallow a stray pad, so "AAAA=" decoded
+    ;; Padding must complete the final group and then stop. A
+    ;; trailing-'=' scan that swallowed a stray pad would decode "AAAA="
     ;; as "AAAA" — a second spelling of three zero bytes.
     (check "stray pad after a complete group rejected"
            (signals-error-p (lambda () (base64-decode "AAAA="))) t)
@@ -298,10 +298,10 @@
 
   ;; DER encoding strips leading zeros per X.690 8.3.2.
   ;; der-encode-ecdsa-signature lives in the optional TLS system, so this
-  ;; asks TLS-LOADED-P whether to run and TLS-SYM for the function. It
-  ;; used to gate on (FBOUNDP 'WEB-SKELETON::DER-ENCODE-ECDSA-SIGNATURE),
-  ;; which cannot tell "no libssl" from "that name moved" and would have
-  ;; dropped this assertion silently on a rename. TLS-SYM raises instead.
+  ;; asks TLS-LOADED-P whether to run and TLS-SYM for the function. A
+  ;; gate on (FBOUNDP 'WEB-SKELETON::DER-ENCODE-ECDSA-SIGNATURE) could
+  ;; not tell "no libssl" from "that name moved", and would drop this
+  ;; assertion silently on a rename; TLS-SYM raises instead.
   (when (tls-loaded-p)
     (let* ((sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x42))
            (dummy (progn (setf (aref sig 0) #x00 (aref sig 1) #x4A) nil))
@@ -634,11 +634,11 @@
         (b (random-bytes 32)))
     (check "random-bytes: successive calls differ"
            (equalp a b) nil))
-  ;; The worker path. RANDOM-BYTES used to open, read and close
-  ;; /dev/urandom on every call, which a session-per-request app pays
-  ;; per request; a worker now holds one stream open for its lifetime.
-  ;; Outside a worker the binding is NIL and the per-call open remains,
-  ;; which is the state every check above runs in.
+  ;; The worker path. A worker holds one /dev/urandom stream open for its
+  ;; lifetime, where opening, reading and closing it on every call would
+  ;; cost a session-per-request app an open per request. Outside a worker
+  ;; the binding is NIL and RANDOM-BYTES opens per call, which is the
+  ;; state every check above runs in.
   (check "random-bytes: no cached stream outside a worker"
          web-skeleton::*urandom-stream* nil)
   (web-skeleton::with-worker-urandom

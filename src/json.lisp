@@ -25,9 +25,9 @@
 ;;;
 ;;; Why objects are a distinct type rather than a bare alist
 ;;; -------------------------------------------------------
-;;; They used to be bare alists, and the serializer guessed which of the
-;;; two a list was by testing whether every element was a cons with a
-;;; string car. That test cannot be made correct, because the two shapes
+;;; With objects as bare alists, the serializer would have to guess which
+;;; of the two a list is, by testing whether every element is a cons with
+;;; a string car. That test cannot be made correct, because the two shapes
 ;;; are the same Lisp object:
 ;;;
 ;;;   [["a",1],["b",2]]  parses to  (("a" 1) ("b" 2))
@@ -35,16 +35,17 @@
 ;;;
 ;;; ...and an alist whose values happen to be lists — (("items" . (1 2 3)))
 ;;; — is indistinguishable from an array of arrays. So an ordinary array of
-;;; key/value pairs (Object.entries output, CSV-ish rows, header lists) came
-;;; back out as an object: [["a",1],["b",2]] re-serialized to {"a":[1],"b":[2]}.
-;;; Well-formed, silently wrong, no error anywhere. The information was
-;;; destroyed at parse time, so no heuristic downstream could recover it.
+;;; key/value pairs (Object.entries output, CSV-ish rows, header lists)
+;;; would come back out as an object: [["a",1],["b",2]] re-serialized as
+;;; {"a":[1],"b":[2]}. Well-formed, silently wrong, no error anywhere. The
+;;; information is destroyed at parse time, so no heuristic downstream can
+;;; recover it.
 ;;;
-;;; Typing objects fixes the round trip in both directions and lets {} and
-;;; [] stop colliding: {} is an empty JSON-OBJECT, [] is NIL, and null is
-;;; :NULL — three distinct values that each serialize back to themselves.
+;;; Typed objects round-trip in both directions and keep {} and [] apart:
+;;; {} is an empty JSON-OBJECT, [] is NIL, and null is :NULL — three
+;;; distinct values that each serialize back to themselves.
 ;;;
-;;; Consequence for hand-built data: a bare alist is now an ARRAY of pairs.
+;;; Consequence for hand-built data: a bare alist is an ARRAY of pairs.
 ;;; Wrap it in MAKE-JSON-OBJECT to emit an object. This fails loudly rather
 ;;; than silently — a dotted pair is not a valid array element, so
 ;;; (json-serialize '(("a" . 1))) raises the improper-list error below
@@ -74,8 +75,8 @@
   "A JSON object: an ordered alist of (key . value) with string keys,
    wrapped so it is distinguishable from a JSON array at serialize time.
    ALIST preserves document order and may be read directly, but JSON-GET
-   is the supported accessor — it also accepts a bare alist, so handler
-   code written against the old representation keeps working."
+   is the supported accessor — it also accepts a bare alist, so code that
+   holds an object as a plain alist reads it the same way."
   (alist nil :type list))
 
 ;;; ---------------------------------------------------------------------------
@@ -394,11 +395,11 @@
 (defun json-get (obj key)
   "Look up KEY (string) in OBJ. Returns the value, or NIL if absent.
 
-   OBJ may be a JSON-OBJECT (what JSON-PARSE now produces) or a bare
-   alist. Accepting both is deliberate: handler code written against the
-   old alist representation keeps working unchanged, and so do the
-   framework's own callers (PARSE-JWKS, JWT-VERIFY), which only ever read
-   through this function. Anything else — a string, a number, an array —
+   OBJ may be a JSON-OBJECT (what JSON-PARSE produces) or a bare alist.
+   Accepting both is deliberate: code that holds an object as a plain
+   alist reads it the same way as a parsed one, and the framework's own
+   readers (PARSE-JWKS, JWT-VERIFY) go only through this function, so
+   they take either. Anything else — a string, a number, an array —
    returns NIL rather than raising, so walking a document whose shape
    differs from what the caller expected degrades to a miss instead of a
    type error deep inside ASSOC."
@@ -440,11 +441,9 @@
    proper-list shape, and a one-cell LISTP check misses the deeper
    improper case. Input (1 2 . 3) has (CDR x) = (2 . 3) — a cons —
    so LISTP says T, but JSON-WRITE-ARRAY's LOOP would emit a
-   trailing comma for the final non-NIL tail. ALSO used to guard
-   the alist-detection EVERY call: per CLHS, EVERY on an improper
-   list has undefined behavior. Iterative walk so very long lists
-   don't blow the stack. No circular-list detection — a circular
-   structure fed to JSON-SERIALIZE is pathological regardless."
+   trailing comma for the final non-NIL tail. Iterative walk so very
+   long lists don't blow the stack. No circular-list detection — a
+   circular structure fed to JSON-SERIALIZE is pathological regardless."
   (loop
     (cond ((null x) (return t))
           ((atom x) (return nil))
@@ -465,8 +464,8 @@
     ((eq value :false) (write-string "false" stream))
     ((eq value :null)  (write-string "null" stream))
     ;; NIL is the empty list, so it emits []. An empty object is an empty
-    ;; JSON-OBJECT and explicit null is :NULL — the three used to collapse
-    ;; onto "null" and now each round-trips to itself.
+    ;; JSON-OBJECT and explicit null is :NULL, so each of the three
+    ;; round-trips to itself.
     ((null value)      (write-string "[]" stream))
     ((stringp value)   (json-write-string value stream))
     ((integerp value)  (format stream "~d" value))
@@ -489,8 +488,8 @@
      (json-write-object (json-object-alist value) stream))
     ;; Improper lists reject up front — a dotted tail would emit a
     ;; trailing comma through json-write-array, producing invalid JSON.
-    ;; This is also where a hand-built alist lands now that objects are
-    ;; typed: ("a" . 1) is not a valid array element, so the mistake is
+    ;; This is also where a hand-built alist lands, objects being typed:
+    ;; ("a" . 1) is not a valid array element, so the mistake is
     ;; caught here with a message naming the fix rather than emitting a
     ;; well-formed-but-wrong document.
     ((and (consp value) (not (proper-list-p value)))
