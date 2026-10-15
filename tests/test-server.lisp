@@ -4663,6 +4663,97 @@
                       (body-of head) ""))))
       (setf web-skeleton::*static-cache* saved))))
 
+(defun test-static-serves-what-the-router-sees ()
+  "A route guarding a static file covers every spelling that reaches it.
+
+   The documented shape — routes first, SERVE-STATIC as the fallback —
+   is only safe when the two read a path alike. MATCH-PATH under :EXACT
+   compares the spelling that arrived, so SERVE-STATIC serves a file at
+   one spelling only, the one a browser sends. Every other spelling of a
+   guarded file is a 404 here, not the file.
+
+   Requests go through PARSE-REQUEST, so the path is the parser's."
+  (format t "~%Static: a guard covers every spelling that reaches the file~%")
+  (let* ((dir (format nil "/tmp/ws-static-spelling-~36r/" (random (expt 36 10))))
+         (saved-cache web-skeleton::*static-cache*)
+         (crlf (format nil "~c~c" #\Return #\Newline))
+         (e-acute (string (code-char #xE9))))
+    (flet ((write-file (name text)
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string dir name))))
+               (ensure-directories-exist path)
+               (with-open-file (s path :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+                 (write-sequence (sb-ext:string-to-octets
+                                  text :external-format :utf-8)
+                                 s))))
+           (app (request)
+             (let ((path (http-request-path request)))
+               (if (or (match-path "/admin" path)
+                       (match-path "/admin.html" path)
+                       (match-path "/admin/:file" path))
+                   (make-error-response 403)
+                   (or (serve-static request) (make-error-response 404)))))
+           (outcome (response)
+             (cond ((web-skeleton::http-response-p response)
+                    (web-skeleton::http-response-status response))
+                   (response :served)
+                   (t nil))))
+      (unwind-protect
+           (progn
+             (write-file "admin.html" "admin console")
+             (write-file "admin/report.txt" "secret report")
+             (write-file "a b.txt" "spaced")
+             (write-file (concatenate 'string "caf" e-acute ".txt") "accented")
+             (write-file "100%.txt" "percent")
+             (write-file "icon@2x.txt" "at sign")
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (web-skeleton::load-static-files dir)
+             (dolist (spec '(("/admin.html" 403)
+                             ("/admin" 403)
+                             ("/admin/report.txt" 403)
+                             ;; Other spellings of the guarded files.
+                             ("/%61dmin.html" 404)
+                             ("/%61dmin" 404)
+                             ("/admin%2Ehtml" 404)
+                             ("/%61dmin/report.txt" 404)
+                             ("/admin%2Freport.txt" 404)
+                             ;; A browser's spellings of unguarded files.
+                             ("/a%20b.txt" :served)
+                             ("/caf%C3%A9.txt" :served)
+                             ("/100%25.txt" :served)
+                             ("/icon@2x.txt" :served)
+                             ;; And spellings no browser sends.
+                             ("/caf%c3%a9.txt" 404)
+                             ("/icon%402x.txt" 404)
+                             ("/100%.txt" 404)))
+               (destructuring-bind (target expected) spec
+                 (check (format nil "static spelling: ~a" target)
+                        (attempt
+                          (outcome (app (parse-request
+                                         (format nil "GET ~a HTTP/1.1~aHost: x~a~a"
+                                                 target crlf crlf crlf)))))
+                        expected))))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil))))
+  ;; The decoder on its own: the one spelling decodes, every other is NIL.
+  (dolist (spec `(("/admin.html" "/admin.html")
+                  ("/a%20b.txt" "/a b.txt")
+                  ("/caf%C3%A9" ,(format nil "/caf~c" (code-char #xE9)))
+                  ("/a+b,c;d=e:f@g!h" "/a+b,c;d=e:f@g!h")
+                  ("/%61dmin.html" nil)
+                  ("/%2E%2E/x" nil)
+                  ("/caf%c3%a9" nil)
+                  ("/100%" nil)
+                  ("/100%2" nil)
+                  ("/a\"b" nil)
+                  ("/%FF" nil)))
+    (destructuring-bind (raw expected) spec
+      (check (format nil "static-path-spelling ~s" raw)
+             (web-skeleton::static-path-spelling raw)
+             expected))))
+
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
 
@@ -11384,6 +11475,7 @@
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
+  (test-static-serves-what-the-router-sees)
   (test-static-etag)
   (test-static-range)
   (test-static-date)

@@ -87,6 +87,27 @@ Register both your project and web-skeleton with ASDF, then load and start:
                 :ws-handler #'handle-ws-message))
 ```
 
+### Routes in front of static files
+
+A handler that guards a path, such as a login check on `/admin`, and falls
+back to `serve-static` relies on the router and the static server reading a
+request's path the same way. They do:
+
+- `http-request-path` is the path as it arrived, escapes and all.
+- `match-path` compares a pattern's literal segments with that spelling
+  under the default `*match-path-literals*` of `:exact` (with its decoding
+  under `:decoded`), and decodes captures.
+- `serve-static` serves a file at one spelling of its path, the one a
+  browser sends. A byte is escaped where a browser escapes it (space, `"`,
+  `#`, `%`, `<`, `>`, `?`, `` ` ``, `{`, `}`, controls and non-ASCII), with
+  uppercase hex, and written as itself everywhere else. `/%61dmin.html`,
+  `/admin%2Ehtml`, `/admin%2Freport.txt` and `/caf%c3%a9.html` name no file.
+
+So a request that reaches a file was spelled the way the router saw it, and
+a guard written in that spelling covers it. A guard must also cover the
+file's aliases. `serve-static` answers `/x` for `x.html`, and both `/dir`
+and `/dir/` for `dir/index.html`.
+
 ### Configuration
 
 Tune parameters before calling `start-server`:

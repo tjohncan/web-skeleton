@@ -736,6 +736,63 @@
 ;;; Request serving
 ;;; ---------------------------------------------------------------------------
 
+(defun static-escape-required-p (byte)
+  "T for a byte a path spells as %XX, never as itself.
+
+   These are what a browser escapes when it writes a path, the WHATWG URL
+   path percent-encode set: controls, DEL, space, \", #, <, >, ?, `, {, }
+   and every byte of a non-ASCII character. % is here too, because a %
+   that stood for itself would be a second spelling of an escape.
+   Every other byte is written as itself."
+  (or (<= byte #x20)
+      (>= byte #x7F)
+      (member byte '(#x22 #x23 #x25 #x3C #x3E #x3F #x60 #x7B #x7D))))
+
+(defun static-path-spelling (raw)
+  "The file path RAW names, decoded, or NIL when RAW is not its one
+   spelling.
+
+   A static file is reachable at one spelling of its path, the one a
+   browser sends. Each byte is either escaped or written as itself, as
+   STATIC-ESCAPE-REQUIRED-P says, and an escape uses uppercase hex digits.
+   Any other spelling — an escaped byte that could have been written as
+   itself (%61, %2E, %2F, %40), lowercase hex, a % that starts no escape,
+   or a byte written as itself that has to be escaped — names no file.
+
+   That is what lets SERVE-STATIC sit behind a router. URL-DECODE maps
+   /admin.html, /%61dmin.html and /admin%2Ehtml to one file, and a
+   MATCH-PATH guard under :EXACT sees three different paths. A guard on
+   the one spelling would be bypassed by the other two, and SERVE-STATIC
+   would then serve the guarded file. With one spelling per file, every
+   request that reaches a file was spelled as the router saw it."
+  (let ((out (make-array (length raw) :element-type '(unsigned-byte 8)
+                                      :fill-pointer 0))
+        (len (length raw)))
+    (flet ((upper-hex (c)
+             (cond ((char<= #\0 c #\9) (- (char-code c) 48))
+                   ((char<= #\A c #\F) (- (char-code c) 55)))))
+      (loop with i = 0
+            while (< i len)
+            do (let ((c (char-code (char raw i))))
+                 (cond
+                   ((= c #x25)
+                    (let ((hi (and (< (+ i 2) len) (upper-hex (char raw (1+ i)))))
+                          (lo (and (< (+ i 2) len) (upper-hex (char raw (+ i 2))))))
+                      (unless (and hi lo)
+                        (return-from static-path-spelling nil))
+                      (let ((b (logior (ash hi 4) lo)))
+                        (unless (static-escape-required-p b)
+                          (return-from static-path-spelling nil))
+                        (vector-push b out))
+                      (incf i 3)))
+                   ((static-escape-required-p c)
+                    (return-from static-path-spelling nil))
+                   (t
+                    (vector-push c out)
+                    (incf i))))))
+    (handler-case (sb-ext:octets-to-string out :external-format :utf-8)
+      (sb-int:character-decoding-error () nil))))
+
 (defun serve-static (request)
   "Look up the request path in the static file cache.
    Returns a response ready to return from a handler or a fetch :THEN, or
@@ -747,16 +804,20 @@
    Honors If-None-Match (RFC 7232) — a cached ETag match returns the
    pre-built 304 Not Modified response instead of the full body.
    Rejects paths containing '..'. Directories (paths ending in /)
-   try index.html as a fallback."
+   try index.html as a fallback.
+
+   A file is served at the one spelling of its path a browser sends,
+   and at no other: see STATIC-PATH-SPELLING. Its other names are the
+   aliases LOAD-STATIC-FILES registers — /x for x.html, /dir for
+   dir/index.html — and /dir/, which falls back to dir/index.html. A
+   route guarding a file has to cover each of those."
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
-      ;; Decode percent-encoding so /foo%20bar hits a cached /foo bar
-      ;; and %2e%2e cannot slip past the traversal check below. The
-      ;; cache is keyed on decoded filesystem paths, so this is the
-      ;; form that can actually match. Malformed encoding → NIL, which
-      ;; falls through to the app handler for a clean 404.
-      (let ((path (handler-case (url-decode (http-request-path request))
-                    (error () nil))))
+      ;; Decoded so /foo%20bar hits a cached /foo bar: the cache is keyed
+      ;; on decoded filesystem paths. Any spelling but the file's own is
+      ;; NIL, which falls through to the app handler for a clean 404, and
+      ;; that includes %2E%2E, which cannot slip past the traversal check.
+      (let ((path (static-path-spelling (http-request-path request))))
         (when (and path (> (length path) 0))
           (unless (or (search "/../" path)
                       (and (>= (length path) 3)
