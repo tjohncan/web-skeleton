@@ -1292,6 +1292,156 @@
            (first (car final)) nil)
     (check "truncated-chunked: :then fires exactly once" (car fires) 1)))
 
+(defun %relay-corpus (chunks size)
+  "CHUNKS chunks of SIZE bytes each, chunk I filled with the letter I mod
+   26, as a list of strings. Distinct letters make a lost, repeated or
+   reordered chunk show in the relayed text, where a byte count would not."
+  (loop for i below chunks
+        collect (make-string size :initial-element
+                             (code-char (+ 97 (mod i 26))))))
+
+(defun test-harness-fetch-on-body-relays-past-the-cap-e2e ()
+  "An :ON-BODY fetch relays a chunked response many times the size of
+   *MAX-OUTBOUND-RESPONSE-SIZE*, with the read buffer held to the cap.
+
+   A relay hands each chunk on as its framing is proved, so the chunks
+   it has handed on are freed. Kept, they would hold the whole upstream
+   in memory, and the read would fail at the cap however steadily the
+   stream flowed: a feed relayed into a stream or a WebSocket, which is
+   what :ON-BODY is for, would die once it had carried the cap's worth.
+
+   The cap is lowered to 64 KiB for the run and the upstream sends five
+   times that, so the claim is about the cap and not about a size."
+  (format t "~%Harness: an :on-body relay carries more than the cap~%")
+  (let* ((saved-cap web-skeleton:*max-outbound-response-size*)
+         (corpus (%relay-corpus 40 8192))
+         (expected (apply #'concatenate 'string corpus))
+         (listener (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (thread nil)
+         (received (make-string-output-stream))
+         (peak (list 0))
+         (final (list :never)))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread
+                   (%canned-upstream
+                    listener
+                    (concatenate 'string
+                                 (%crlf "HTTP/1.1 200 OK"
+                                        "Transfer-Encoding: chunked" "")
+                                 (apply #'%crlf
+                                        (append
+                                         (loop for c in corpus
+                                               append (list (format nil "~x" (length c))
+                                                            c))
+                                         (list "0" ""))))
+                    :name "relay-upstream"))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (http-fetch
+                     :get (format nil "http://127.0.0.1:~d/feed" upstream-port)
+                     :on-body (lambda (out chunk)
+                                (setf (car peak)
+                                      (max (car peak)
+                                           (length (web-skeleton::connection-read-buf
+                                                    out))))
+                                (write-string (sb-ext:octets-to-string
+                                               chunk :external-format :latin-1)
+                                              received)
+                                nil)
+                     :then (lambda (status headers body)
+                             (declare (ignore headers))
+                             (setf (car final) (list status body))
+                             (make-text-response 200 "relayed")))))
+               (let ((status (handler-case (test-http-request :get "/relay")
+                               (error () nil))))
+                 (check "relay past the cap: the client is answered 200" status 200)))))
+      (setf web-skeleton:*max-outbound-response-size* saved-cap)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))
+    (let ((got (get-output-stream-string received)))
+      (check "relay past the cap: every chunk was relayed, in order"
+             (string= got expected) t)
+      (check "relay past the cap: five times the cap went through"
+             (length got) (* 5 64 1024)))
+    (check "relay past the cap: :then fired 200 with a NIL body"
+           (car final) (list 200 nil))
+    (check "relay past the cap: the read buffer stayed within the cap"
+           (<= (car peak) (* 64 1024)) t)))
+
+(defun test-harness-fetch-into-relays-past-the-cap-e2e ()
+  "FETCH-INTO relays a stream many times *MAX-OUTBOUND-RESPONSE-SIZE* into
+   a client's own stream, end to end.
+
+   The detached relay DEPLOYMENT.md documents, at a size the cap would end:
+   five times a 64 KiB cap, from the framework's own chunked stream through
+   FETCH-INTO into the client's. The relayed body is decoded and compared
+   whole, so a relay cut off at the cap fails here as a short body."
+  (format t "~%Harness: a fetch-into relay carries more than the cap~%")
+  (let* ((saved-cap web-skeleton:*max-outbound-response-size*)
+         (corpus (%relay-corpus 40 8192))
+         (port-box (list nil))
+         (then-status (list :never)))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (if (search "/up" (http-request-path req))
+                      (make-stream-response
+                       :on-open (lambda (c)
+                                  (dolist (piece corpus)
+                                    (stream-send c (%ascii piece)))
+                                  (stream-close c)))
+                      (make-stream-response
+                       :on-open
+                       (lambda (client)
+                         (fetch-into
+                          client
+                          (http-fetch
+                           :get (format nil "http://127.0.0.1:~d/up"
+                                        (first port-box))
+                           :on-body (lambda (out chunk)
+                                      (declare (ignore out))
+                                      (stream-send client chunk)
+                                      nil)
+                           :then (lambda (status headers body)
+                                   (declare (ignore headers body))
+                                   (setf (car then-status) status)
+                                   (stream-close client)
+                                   nil))))))))
+             (setf (first port-box) *test-port*)
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (%send-raw-get stream "/relay" :extra
+                                     (format nil "Connection: close~c~c"
+                                             #\Return #\Newline))
+                      (let* ((buf (read-until-bounded stream))
+                             (raw (subseq buf 0 (fill-pointer buf))))
+                        (check "fetch-into past the cap: the whole body arrived, framed"
+                               (equal (%decode-streamed-body raw)
+                                      (apply #'concatenate 'string corpus))
+                               t)))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))
+             (check "fetch-into past the cap: :then saw the upstream's 200"
+                    (car then-status) 200)))
+      (setf web-skeleton:*max-outbound-response-size* saved-cap))))
+
 (defun test-harness-fetch-on-body-stop-parked-e2e ()
   "A :STOP from a handler-returned fetch answers the parked client 502.
 
@@ -5451,6 +5601,8 @@
   (test-fetch-ok-eof-walks-the-bytes)
   (test-harness-fetch-on-body-eof-together-e2e)
   (test-harness-fetch-on-body-truncated-chunked-e2e)
+  (test-harness-fetch-on-body-relays-past-the-cap-e2e)
+  (test-harness-fetch-into-relays-past-the-cap-e2e)
   (test-harness-fetch-on-body-stop-parked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)

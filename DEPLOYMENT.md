@@ -807,8 +807,13 @@ buffered, so a large response can be processed without being held:
 
 `status` is tested rather than ignored, and `EQL` rather than `=` because
 the cleanup sentinel passes `NIL`. Answering `200` with a count from a
-fetch that never completed is the failure this section was rewritten to
-stop describing.
+fetch that never completed is the failure that test exists to stop.
+
+**A relay holds one chunk at a time.** Each chunk is freed once `:on-body`
+has it, so a stream of any length passes through a buffer the size of the
+response head plus its largest chunk. `*max-outbound-response-size*` bounds
+that buffer, not the stream. A single chunk larger than the cap still fails
+the fetch with a `502`.
 
 **Copying an upstream's headers onto your response takes a filter.**
 `:then` receives the body decoded and whole, while `headers` still

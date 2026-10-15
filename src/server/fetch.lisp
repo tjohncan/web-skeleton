@@ -2219,6 +2219,31 @@
           (let ((*epoll-fd* epoll-fd))
             (fetch-resume out)))))))
 
+(defun drop-delivered-chunks (conn body-start next-scan)
+  "Free the chunks :ON-BODY has been handed: shift CONN's read buffer
+   down over BUF[BODY-START, NEXT-SCAN), keeping the head before it and
+   the bytes after it, and move the read and walk cursors with them.
+
+   A relay hands each chunk on as its framing is proved, and nothing
+   reads those bytes again: COMPLETE-FETCH answers :THEN with a NIL body
+   once the walk has reached the terminator. Kept, they would hold the
+   whole upstream in memory for the life of the fetch, and a stream
+   longer than *MAX-OUTBOUND-RESPONSE-SIZE* would fail at the cap however
+   steadily it flowed. Dropped, the buffer holds the head and one
+   unfinished chunk, and the cap bounds a chunk instead of the stream.
+
+   The head stays because COMPLETE-FETCH reads the status and headers
+   from it. NEXT-SCAN is a chunk boundary, so what is left begins with a
+   chunk-size line and the walk resumes on it."
+  (let* ((buf (connection-read-buf conn))
+         (pos (connection-read-pos conn))
+         (gone (- next-scan body-start)))
+    (when (plusp gone)
+      (replace buf buf :start1 body-start :start2 next-scan :end2 pos)
+      (setf (connection-read-pos conn) (- pos gone)
+            (connection-chunk-scan-pos conn) body-start)
+      (connection-shrink-read-buf conn))))
+
 (defun handle-outbound-read (conn epoll-fd)
   "Read the outbound HTTP response. When complete, deliver to the inbound connection."
   (let ((result (connection-read-available conn)))
@@ -2231,11 +2256,11 @@
        ;; :OK-EOF is the same end of stream with the last bytes attached,
        ;; and it reads below rather than here: those bytes still have to
        ;; be walked and handed to ON-BODY before the fetch completes.
-       ;; Sharing this arm skipped that walk, and a chunked response whose
-       ;; last bytes and FIN landed in one read reached the app as a 200
-       ;; with no body at all — not truncated, absent. Telling the two
-       ;; verdicts apart is the entire reason CONNECTION-READ-AVAILABLE
-       ;; reports them separately.
+       ;; Sharing this arm would skip that walk, and a chunked response
+       ;; whose last bytes and FIN landed in one read would reach the app
+       ;; as a 200 with no body at all — not truncated, absent. Telling
+       ;; the two verdicts apart is the entire reason
+       ;; CONNECTION-READ-AVAILABLE reports them separately.
        (complete-fetch conn epoll-fd))
       (:full
        ;; Buffer hit *MAX-OUTBOUND-RESPONSE-SIZE*. Route through
@@ -2262,19 +2287,24 @@
        ;; rescanned from the top on every wake-up.
        ;;
        ;; Completion follows the framing, not the socket's lifetime.
-       ;; Waiting for EOF worked only because outbound requests default to
-       ;; Connection: close, and even then it cost a round trip — the
-       ;; whole response sits in our buffer while we wait for the
-       ;; upstream's FIN. An app that overrides Connection to keep-alive
-       ;; got an upstream that never closes, and the fetch hung until the
-       ;; :awaiting reaper dropped the inbound with no response at all.
+       ;; Waiting for EOF would work only because outbound requests
+       ;; default to Connection: close, and even then it would cost a
+       ;; round trip, with the whole response sitting in our buffer while
+       ;; we waited for the upstream's FIN. An app that overrides
+       ;; Connection to keep-alive would get an upstream that never
+       ;; closes, and the fetch would hang until the :awaiting reaper
+       ;; dropped the inbound with no response at all.
        ;;
        ;; Close-delimited responses (no CL, no TE) never satisfy this
        ;; test: for those, EOF genuinely is the framing, so they complete
        ;; from the :OK-EOF clause below or the :EOF arm above.
        (let ((pause nil)
-             (stop nil))
-         (multiple-value-bind (complete next-scan)
+             (stop nil)
+             ;; The drain stopped because the buffer reached the cap, not
+             ;; because the transport ran dry, so more may be waiting — see
+             ;; the T arm below.
+             (cut (>= (connection-read-pos conn) (connection-read-cap conn))))
+         (multiple-value-bind (complete next-scan chunked-body-start)
              (outbound-response-complete-p
               (connection-read-buf conn)
               (connection-read-pos conn)
@@ -2311,6 +2341,13 @@
                     (when (eq verdict :stop)
                       (setf stop t))))))
            (setf (connection-chunk-scan-pos conn) next-scan)
+           ;; A relay that is still reading frees what it has handed on;
+           ;; a fetch ending in this pass needs nothing freed.
+           (when (and chunked-body-start
+                      (connection-fetch-on-body conn)
+                      (not complete)
+                      (not stop))
+             (drop-delivered-chunks conn chunked-body-start next-scan))
            (cond
              ;; Ahead of COMPLETE, and so ahead of :OK-EOF as well.
              ;;
@@ -2357,6 +2394,17 @@
              ;; Bytes arrived, then the transport asked to send. The
              ;; response is incomplete, so this same read is re-issued.
              ((eq result :ok-want-write) (invert-interest conn epoll-fd))
+             ;; A drain cut short by the cap has to run again, and nothing
+             ;; else would wake it. Bytes still in the kernel raise no new
+             ;; edge, and under TLS OpenSSL can hold decrypted bytes the
+             ;; socket knows nothing of. Writability is the wake-up: the
+             ;; request is sent, so the socket is writable at once, and
+             ;; the :OUT-READ dispatcher re-issues the read on an inverted
+             ;; interest. A relay has freed what it handed on, so the read
+             ;; finds room. A buffered fetch finds none and answers :FULL,
+             ;; a prompt 502 rather than a wait for bytes that may never
+             ;; come.
+             (cut (invert-interest conn epoll-fd))
              (t (restore-interest conn epoll-fd)))))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -2375,10 +2423,17 @@
                      (header-has-token-p value "chunked"))))
 
 (defun outbound-response-complete-p (buf end method &optional (chunk-scan 0) on-data)
-  "Return (values COMPLETE-P NEXT-CHUNK-SCAN) for the outbound HTTP
-   response accumulated in BUF[0..END), given the request METHOD. Thread
-   NEXT-CHUNK-SCAN back in on the following call so a chunked body is
-   walked once across a growing buffer (see CHUNKED-BODY-COMPLETE-P).
+  "Return (values COMPLETE-P NEXT-CHUNK-SCAN CHUNKED-BODY-START) for the
+   outbound HTTP response accumulated in BUF[0..END), given the request
+   METHOD. Thread NEXT-CHUNK-SCAN back in on the following call so a
+   chunked body is walked once across a growing buffer (see
+   CHUNKED-BODY-COMPLETE-P).
+
+   CHUNKED-BODY-START is where the body begins, given only when the
+   response's Transfer-Encoding is exactly chunked, the one framing the
+   walk is sure of. BUF[CHUNKED-BODY-START, NEXT-CHUNK-SCAN) is then
+   chunks the walk has proved whole and ON-DATA has been handed, which a
+   caller relaying them no longer needs: DROP-DELIVERED-CHUNKS frees it.
 
    One definition of 'the response is done', reached through
    HANDLE-OUTBOUND-READ for every outbound response, http:// and https://
@@ -2452,7 +2507,8 @@
                         (response-chunked-p
                          (parse-response-headers buf start header-end))
                         t)
-                   next)))
+                   next
+                   (when (eq te-present :chunked) body-start))))
         (content-length
          (values (>= (- end body-start) content-length) chunk-scan))
         (t
@@ -2721,6 +2777,20 @@
       (deliver-fetch-error out-conn epoll-fd
                            (format nil "short body: ~d of ~d bytes"
                                    (- pos body-start) content-length))
+      (return-from complete-fetch))
+    ;; A relayed body cut short. Under :ON-BODY the chunks were handed on
+    ;; as they arrived and DROP-DELIVERED-CHUNKS freed them, so decoding
+    ;; what is left cannot judge the body: what is left may be nothing,
+    ;; which would read as an empty body and a success. FRAMING-COMPLETE
+    ;; NIL means the walk never reached the terminator, so the body ended
+    ;; early, and it gets the 502 every other truncation here gets.
+    (when (and (connection-fetch-on-body out-conn)
+               chunked-p
+               (not framing-complete)
+               (not (or (= status 204) (= status 304)))
+               (not (eq (connection-fetch-method out-conn) :HEAD)))
+      (deliver-fetch-error out-conn epoll-fd
+                           "chunked body ended before its terminator")
       (return-from complete-fetch))
     ;; BODY-START is unconditionally (+ header-end 4) past the
     ;; header-end gate above — it is always a positive fixnum at

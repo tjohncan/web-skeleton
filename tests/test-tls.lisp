@@ -28,6 +28,7 @@
         (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
+        (test-https-on-body-relays-past-the-cap)
         (test-https-close-without-close-notify-ends-the-body)
         (test-https-a-dirty-error-queue-does-not-fail-a-read)
         (test-https-does-not-hold-the-worker)
@@ -1150,6 +1151,94 @@ printf 'TAIL-MARKER\\n' >> body.txt
                 (check "https on-body: :then fires exactly once" fires 1)))
             :relay-file (format nil "~a/chunked.txt" dir)))
       (setf web-skeleton::*dns-lookup-fn* saved-dns)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-on-body-relays-past-the-cap ()
+  "An :ON-BODY fetch over TLS relays a chunked response five times
+   *MAX-OUTBOUND-RESPONSE-SIZE*, with the read buffer held to the cap.
+
+   The TLS half of TEST-HARNESS-FETCH-ON-BODY-RELAYS-PAST-THE-CAP-E2E,
+   and it covers the reason HANDLE-OUTBOUND-READ re-issues a drain the
+   cap cut short instead of waiting for readability. SSL_read hands back
+   one record at a time from what OpenSSL has already decrypted, so a
+   drain stopped by a full buffer can leave bytes there with nothing on
+   the socket to wake the connection again."
+  (format t "~%HTTPS: an :on-body relay carries more than the cap~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (saved-dns web-skeleton::*dns-lookup-fn*)
+        (saved-cap web-skeleton:*max-outbound-response-size*)
+        (corpus (%relay-corpus 40 8192)))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "https relay past the cap: fixture generated" nil t)
+             (return-from test-https-on-body-relays-past-the-cap))
+           (with-open-file (out (format nil "~a/chunked.txt" dir)
+                                :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+             (write-sequence
+              (sb-ext:string-to-octets
+               (concatenate 'string
+                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" "")
+                            (apply #'%crlf
+                                   (append (loop for c in corpus
+                                                 append (list (format nil "~x" (length c))
+                                                              c))
+                                           (list "0" ""))))
+               :external-format :ascii)
+              out))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           ;; SETF globally, not bound: the worker is another thread.
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet))
+                 web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (port)
+              (let ((received (make-string-output-stream))
+                    (peak 0)
+                    (final :never))
+                (check "https relay past the cap: the peer is listening"
+                       (%wait-for-listener port) t)
+                (with-test-server
+                    (:handler
+                     (lambda (req)
+                       (declare (ignore req))
+                       (http-fetch
+                        :get (format nil "https://right.test:~d/" port)
+                        :on-body (lambda (out chunk)
+                                   (setf peak (max peak (length (web-skeleton::connection-read-buf
+                                                                 out))))
+                                   (write-string (sb-ext:octets-to-string
+                                                  chunk :external-format :latin-1)
+                                                 received)
+                                   nil)
+                        :then (lambda (status headers body)
+                                (declare (ignore headers))
+                                (setf final (list status body))
+                                (make-text-response 200 "relayed")))))
+                  (check "https relay past the cap: the client is answered 200"
+                         (attempt (nth-value 0 (test-http-request :get "/relay")))
+                         200))
+                (check "https relay past the cap: every chunk, in order"
+                       (string= (get-output-stream-string received)
+                                (apply #'concatenate 'string corpus))
+                       t)
+                (check "https relay past the cap: :then got 200 and no body"
+                       final (list 200 nil))
+                (check "https relay past the cap: the buffer stayed within the cap"
+                       (<= peak (* 64 1024)) t)))
+            :relay-file (format nil "~a/chunked.txt" dir)))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns
+            web-skeleton:*max-outbound-response-size* saved-cap)
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
