@@ -497,6 +497,10 @@ fires **exactly once per fetch** with one of two argument shapes:
 - **`(status headers body)`** on the happy path — `status` is an integer HTTP status,
   `headers` is an alist of lowercase-name string pairs,
   `body` is a byte vector (or `NIL` for empty bodies).
+  A header value is decoded as UTF-8 when it is valid UTF-8, and as
+  Latin-1, one character per byte, when it is not, so a legacy server's
+  Latin-1 filename arrives as text rather than failing the fetch. A
+  request header that is not UTF-8 is still refused with `400`.
   The closure's return value becomes the response
   delivered to the original inbound client.
 - **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal teardown path:

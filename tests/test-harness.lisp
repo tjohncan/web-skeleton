@@ -896,7 +896,10 @@
 
    Reads only to the request's CRLFCRLF, never to EOF. A fetch sends its
    request and then waits, so no end of stream is coming until this
-   answers: draining to EOF here deadlocks both sides."
+   answers: draining to EOF here deadlocks both sides.
+
+   RESPONSE goes out one byte per character, as Latin-1, so a test can
+   put any byte on the wire by writing the character with that code."
   (sb-thread:make-thread
    (lambda ()
      (handler-case
@@ -910,7 +913,7 @@
                  do (vector-push-extend byte b)
                  until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
            (write-sequence
-            (sb-ext:string-to-octets response :external-format :ascii) st)
+            (sb-ext:string-to-octets response :external-format :latin-1) st)
            (force-output st)
            (sb-bsd-sockets:socket-close s))
        (error () nil)))
@@ -995,6 +998,70 @@
                      ;; a wrong answer.
                      (check "close-delimited: completes on the close, promptly"
                             (< secs 5.0) t)))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-fetch-latin-1-header-e2e ()
+  "An upstream header in Latin-1 reaches the fetch's :THEN, and so does
+   the response it came with.
+
+   The byte is E9: é in ISO-8859-1, and not UTF-8 on its own. It sits in
+   a Content-Disposition filename, which is where legacy servers send it.
+   Read strictly, that one header would fail the whole fetch — a 502 and
+   the cleanup sentinel — over a value the application may never read."
+  (format t "~%Harness: an upstream's Latin-1 header does not fail the fetch~%")
+  (let* ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (thread nil)
+         (disposition (format nil "attachment; filename=\"r~csum.pdf\""
+                              (code-char #xE9))))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread
+                   (%canned-upstream
+                    listener
+                    (concatenate 'string
+                                 (%crlf "HTTP/1.1 200 OK"
+                                        (format nil "Content-Disposition: ~a"
+                                                disposition)
+                                        "Content-Length: 2"
+                                        "")
+                                 "ok")
+                    :name "latin-1-upstream"))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (defer-to-fetch :GET
+                      (format nil "http://127.0.0.1:~d/file" upstream-port)
+                      :then (lambda (status headers body)
+                              (let ((value (cdr (assoc "content-disposition"
+                                                       headers
+                                                       :test #'string-equal))))
+                                (make-text-response
+                                 200
+                                 (format nil "~a|~a|~a"
+                                         status
+                                         (equal value disposition)
+                                         (if body
+                                             (sb-ext:octets-to-string
+                                              body :external-format :utf-8)
+                                             "(none)"))))))))
+               (multiple-value-bind (status headers body)
+                   (handler-case (test-http-request :get "/proxy")
+                     (error (e) (values nil nil (princ-to-string e))))
+                 (declare (ignore headers))
+                 (check "latin-1 header: the client is answered 200" status 200)
+                 (check "latin-1 header: :THEN got the status, the value and the body"
+                        body "200|T|ok")))))
       (ignore-errors (sb-bsd-sockets:socket-close listener))
       (when thread
         (handler-case (sb-thread:join-thread thread :timeout 5)
@@ -5357,6 +5424,7 @@
   (test-harness-fetch-callback-connection-close-honored-e2e)
   (test-harness-awaiting-timeout-answers-504-e2e)
   (test-harness-close-delimited-fetch-e2e)
+  (test-harness-fetch-latin-1-header-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)

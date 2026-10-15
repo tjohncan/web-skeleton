@@ -1802,51 +1802,31 @@
   ;; would parse as status 200 and masquerade as an HTTP response —
   ;; same shape as the parse-request-bytes version check on the inbound
   ;; side.
+  ;; One parser reads every status line, buffered and streaming, so this
+  ;; list is the whole acceptance set for both.
   (dolist (prefix '("FOOBAR 200 OK"          ; not HTTP
+                    "NOT-HTTP 418 Z"         ; another non-HTTP masquerade
                     "HTTP/2.0 200 OK"        ; wrong major
                     "HTTP/1.2 200 OK"        ; wrong minor
                     "HTTP/1.1  200 OK"       ; double space (missing SP after 1.1)
                     "http/1.1 200 OK"        ; wrong case
                     "HTTP/1.1"               ; no status
+                    "HTTP/1.1 20"            ; two digits
+                    "HTTP/1.1 99 OK"         ; two digits + junk
+                    "HTTP/1.1 600 OK"        ; out of 100-599
+                    "HTTP/1.1 099 OK"        ; out of 100-599
+                    "HTTP/1.1 2OO OK"        ; non-digit
                     ""))
     (let ((buf (sb-ext:string-to-octets
                 (concatenate 'string prefix *crlf*)
                 :external-format :ascii)))
       (check (format nil "status reject ~s" prefix)
              (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
-
-  ;; String-level twin PARSE-STATUS-LINE-STRING is what the streaming
-  ;; path (stream-response-lines, over either transport) delegates to.
-  ;; Its acceptance set MUST match the buffered byte-level parse —
-  ;; without the prefix check, a non-HTTP upstream whose first line
-  ;; contains '<junk> 200' masquerades as HTTP status 200 on the
-  ;; streaming paths only, a parser-disagreement smuggling primitive.
-  ;; Cases parallel the buffered block above — if one parser drifts,
-  ;; both test groups should catch it.
-  (check "string status 200"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 200 OK") 200)
-  (check "string status 404"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 404 Not Found") 404)
-  (check "string status 302 http/1.0"
-         (web-skeleton::parse-status-line-string "HTTP/1.0 302 Found") 302)
-  (check "string status 204 no reason"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 204") 204)
-  (dolist (line '("FUBAR 200 OK"             ; non-HTTP masquerade
-                  "NOT-HTTP 418 Z"           ; another non-HTTP masquerade
-                  "HTTP/2.0 200 OK"          ; wrong major
-                  "HTTP/1.2 200 OK"          ; wrong minor
-                  "HTTP/1.1  200 OK"         ; double space
-                  "http/1.1 200 OK"          ; wrong case
-                  "HTTP/1.1"                 ; no status digits
-                  "HTTP/1.1 20"              ; two digits
-                  "HTTP/1.1 99 OK"           ; two digits + junk
-                  "HTTP/1.1 600 OK"          ; out of 100-599
-                  "HTTP/1.1 099 OK"          ; out of 100-599
-                  "HTTP/1.1 2OO OK"          ; non-digit
-                  ""
-                  nil))
-    (check (format nil "string status reject ~s" line)
-           (web-skeleton::parse-status-line-string line) nil))
+  (let ((buf (sb-ext:string-to-octets
+              (concatenate 'string "HTTP/1.1 204" *crlf*)
+              :external-format :ascii)))
+    (check "status 204 with no reason phrase"
+           (web-skeleton::parse-response-status buf 0 (length buf)) 204))
 
   ;; defer-to-fetch is a thin readability wrapper over http-fetch; check
   ;; that it returns the same continuation the framework recognizes as
@@ -2709,6 +2689,161 @@
                        name)
                (%run-line-reader raw method chunk)
                expected)))))
+
+(defun %latin-1-bytes (&rest parts)
+  "PARTS concatenated and encoded one byte per character, so a test can
+   write any byte as the character with that code."
+  (sb-ext:string-to-octets (apply #'concatenate 'string parts)
+                           :external-format :latin-1))
+
+(defun %attempt (thunk)
+  "THUNK's value, or (:RAISED text) if it signals. A check over a raise
+   then fails as a check, with the message, instead of ending the suite."
+  (handler-case (funcall thunk)
+    (error (e) (list :raised (princ-to-string e)))))
+
+(defun test-upstream-field-values ()
+  "An upstream's field value that is not UTF-8 is read as Latin-1, where a
+   request's is refused.
+
+   Obs-text is legal in a field value (RFC 9110 §5.5), and a Latin-1
+   Content-Disposition is the shape legacy servers send. Both sides keep
+   refusing what the policy is not about: a CTL in a value and a separator
+   in a name are framing, not charset."
+  (format t "~%Upstream field values: UTF-8, else Latin-1~%")
+  (let* ((crlf (format nil "~c~c" #\Return #\Newline))
+         (e9 (string (code-char #xE9)))
+         (filename (concatenate 'string "attachment; filename=\"r" e9
+                                "sum.pdf\""))
+         (field (%latin-1-bytes "Content-Disposition: " filename crlf crlf)))
+    (labels ((response-headers (buf)
+               (%attempt (lambda ()
+                           (web-skeleton::parse-headers-bytes
+                            buf 0 (length buf) :invalid-utf-8 :latin-1))))
+             (value-of (result name)
+               ;; NIL for a refusal, so a raise fails the check that reads
+               ;; it rather than the ASSOC.
+               (unless (eq (first result) :raised)
+                 (cdr (assoc name result :test #'string=)))))
+      ;; The request side, unchanged: the same byte is refused.
+      (check "request field: a byte that is not UTF-8 is refused"
+             (let ((r (%attempt (lambda ()
+                                  (web-skeleton::parse-headers-bytes
+                                   field 0 (length field))))))
+               (and (consp r) (eq (first r) :raised)
+                    (search "invalid UTF-8 in request" (second r))
+                    t))
+             t)
+      (let ((value (value-of (response-headers field) "content-disposition")))
+        (check "response field: a Latin-1 byte reads as its character"
+               value filename)
+        (check "response field: the Latin-1 reading gives the bytes back"
+               (and (stringp value)
+                    (equalp (sb-ext:string-to-octets
+                             value :external-format :latin-1)
+                            (subseq field 21 (- (length field) 4))))
+               t))
+      ;; Valid UTF-8 is read as UTF-8: C3 A9 is one é, not two characters.
+      (check "response field: valid UTF-8 reads as UTF-8, not byte by byte"
+             (value-of (response-headers
+                        (%latin-1-bytes "X-Name: caf" (string (code-char #xC3))
+                                        (string (code-char #xA9)) crlf crlf))
+                       "x-name")
+             (concatenate 'string "caf" e9))
+      (check "response field: a CTL in a value is still refused"
+             (first (response-headers
+                     (%latin-1-bytes "X-Name: a" (string (code-char 1)) "b"
+                                     crlf crlf)))
+             :raised)
+      (check "response field: a separator in a name is still refused"
+             (first (response-headers
+                     (%latin-1-bytes "X(Name): v" crlf crlf)))
+             :raised)
+      ;; The function both outbound paths read a head with.
+      (check "response head: status, the Latin-1 value and the framing"
+             (%attempt
+              (lambda ()
+                (let ((head (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                            "Content-Disposition: " filename
+                                            crlf "Content-Length: 2" crlf crlf)))
+                  (multiple-value-bind (status headers chunked-p te cl)
+                      (web-skeleton::parse-response-head
+                       head 0 (- (length head) 4))
+                    (list status
+                          (cdr (assoc "content-disposition" headers
+                                      :test #'string=))
+                          chunked-p te cl)))))
+             (list 200 filename nil nil 2)))))
+
+(defun test-streaming-fetch-reads-the-buffered-head ()
+  "The streaming fetch reads a response head the way the buffered fetch
+   does, by handing it to the function COMPLETE-FETCH calls.
+
+   Each head below is answered alike by both paths, where a line-by-line
+   string reader would answer each one differently: it would end a line
+   at a bare LF, pass a CTL or a separator in a field it does not
+   inspect, take a head cut off by end of stream as finished, deliver the
+   body of a response whose status line is not HTTP's before refusing it,
+   and fail a Latin-1 value outright. Each case is run whole and at one
+   byte per fill, because READER-READ-HEAD finds the CRLFCRLF across
+   fills."
+  (format t "~%Streaming fetch reads the head the buffered fetch reads~%")
+  (let* ((cr (string #\Return))
+         (lf (string #\Newline))
+         (crlf (concatenate 'string cr lf))
+         (e9 (string (code-char #xE9))))
+    ;; (NAME BYTES STREAMED BUFFERED). STREAMED is %RUN-LINE-READER's
+    ;; (STATUS LINES RAISED-P). BUFFERED is the buffered path's view of
+    ;; the same bytes: the status of a head it finds and reads, :NO-HEAD
+    ;; for one it never finds — COMPLETE-FETCH answers that 502 at end of
+    ;; stream — or :REFUSED.
+    (dolist (spec
+             (list
+              (list "a Latin-1 value is read, not refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "Content-Disposition: r" e9 "sum" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(200 ("ok") nil) 200)
+              (list "a head of bare LFs never ends"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" lf
+                                    "Content-Type: text/plain" lf lf "ok" lf)
+                    '(nil nil t) :no-head)
+              (list "a CTL in a value is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "X-A: a" (string (code-char 1)) "b" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(nil nil t) :refused)
+              (list "a separator in a name is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf "X(A): v" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(nil nil t) :refused)
+              (list "a head cut off by end of stream is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "Content-Type: text/plain" crlf)
+                    '(nil nil t) :no-head)
+              (list "a status line that is not HTTP's is refused first"
+                    (%latin-1-bytes "FOO 200 OK" crlf crlf "body" lf)
+                    '(nil nil t) :refused)))
+      (destructuring-bind (name raw streamed buffered) spec
+        (dolist (chunk '(nil 1))
+          (check (format nil "streaming head [~a]: ~a"
+                         (if chunk "byte by byte" "whole") name)
+                 (%run-line-reader raw :GET chunk)
+                 streamed))
+        (check (format nil "buffered head: ~a" name)
+               (let ((header-end (web-skeleton::scan-crlf-crlf
+                                  raw 0 (length raw))))
+                 (if (null header-end)
+                     :no-head
+                     (let ((r (%attempt
+                               (lambda ()
+                                 (multiple-value-list
+                                  (web-skeleton::parse-response-head
+                                   raw 0 header-end))))))
+                       (if (or (eq (first r) :raised) (null (first r)))
+                           :refused
+                           (first r)))))
+               buffered)))))
 
 (defun test-streaming-fetch ()
   (format t "~%Streaming Fetch~%")
@@ -11143,6 +11278,7 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-upstream-field-values)
   (test-transfer-encoding-rules)
   (test-chunked-request-body)
   (test-unfinishable-request-closes)
@@ -11173,6 +11309,7 @@
   (test-query-string)
   (test-match-path)
   (test-streaming-fetch)
+  (test-streaming-fetch-reads-the-buffered-head)
   (test-line-reader-over-read-fn)
   (test-interim-responses)
   (test-decode-chunked-body)

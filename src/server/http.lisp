@@ -488,11 +488,40 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun bytes-to-string (buf start end)
-  "Convert BUF[START..END) to a UTF-8 string. Single allocation."
+  "Convert BUF[START..END) to a UTF-8 string. Single allocation.
+
+   Strict: bytes that are not UTF-8 raise HTTP-PARSE-ERROR. That is the
+   request side's answer, for every piece of a request head this decodes.
+   An upstream's field values take BYTES-TO-STRING-OR-LATIN-1 instead."
   (handler-case
       (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8)
     (sb-int:character-decoding-error ()
       (http-parse-error "invalid UTF-8 in request"))))
+
+(defun bytes-to-string-or-latin-1 (buf start end)
+  "Convert BUF[START..END) to a string: as UTF-8 when the bytes are valid
+   UTF-8, and otherwise as ISO-8859-1, one character per byte.
+
+   For field values in an upstream's response. RFC 9110 §5.5 allows
+   obs-text (%x80-FF) in a field value and tells a recipient to treat it
+   as opaque, and servers still send Latin-1: a Content-Disposition
+   filename with é as the single byte E9. Refusing that would fail the
+   whole response over one header the application may never read. The
+   request side stays strict, because there a refused byte costs a client
+   its own malformed request, where here it would cost the application an
+   upstream it does not control. The checks that protect framing — tchar
+   names, no CTLs in values — hold on both sides either way.
+
+   Nothing is lost. A value read as Latin-1 gives its bytes back through
+   (sb-ext:string-to-octets value :external-format :latin-1), and a value
+   that is valid UTF-8 reads exactly as BYTES-TO-STRING reads it. The two
+   spellings of é, C3 A9 and E9, both read as é, which is what each
+   means in the charset it can be."
+  (handler-case
+      (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8)
+    (sb-int:character-decoding-error ()
+      (sb-ext:octets-to-string buf :start start :end end
+                                   :external-format :latin-1))))
 
 (defun bytes-to-lowercase-string (buf start end)
   "Convert BUF[START..END) to a lowercase ASCII string. Single allocation."
@@ -579,18 +608,29 @@
 ;;; Byte-level header parser (single-pass)
 ;;; ---------------------------------------------------------------------------
 
-(defun parse-headers-bytes (buf start end)
+(defun parse-headers-bytes (buf start end &key (invalid-utf-8 :refuse))
   "Parse headers from BUF[START..END) into an alist of (lowercase-name . value).
    Single-pass, handles obsolete line folding (RFC 7230 §3.2.4).
    Stops at the first empty line (CRLFCRLF boundary). Enforces
    *MAX-TOTAL-HEADER-BYTES* as a running-total guard — per-line and
    per-count caps alone permit worst-case 800 KiB of header-string
    allocation per request; the running total makes the actual bound
-   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB)."
+   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB).
+
+   INVALID-UTF-8 is what a field value that is not valid UTF-8 becomes.
+   :REFUSE, the default and the request side's answer, raises
+   HTTP-PARSE-ERROR. :LATIN-1 reads it one character per byte, which is
+   the response side's answer — see BYTES-TO-STRING-OR-LATIN-1. Either
+   way names are held to tchar and values refuse CTLs: those checks are
+   about framing, not charset, and one parser keeps them the same in both
+   directions."
   (let ((headers nil)
         (count 0)
         (total 0)
-        (pos start))
+        (pos start)
+        (decode-value (ecase invalid-utf-8
+                        (:refuse #'bytes-to-string)
+                        (:latin-1 #'bytes-to-string-or-latin-1))))
     (loop
       (let ((crlf (scan-crlf buf pos end)))
         (unless crlf (return))          ; no more complete lines
@@ -656,7 +696,7 @@
                         (http-reject 431 "too many headers (~d, max ~d)"
                                           count *max-header-count*))
                       (push (cons name (if (= vs ve) ""
-                                           (bytes-to-string buf vs ve)))
+                                           (funcall decode-value buf vs ve)))
                             headers)))))))
         (setf pos (+ crlf 2))))
     (nreverse headers)))

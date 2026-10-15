@@ -626,40 +626,17 @@
      all-headers body-bytes))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Parse response status line
+;;; Parse a response head
+;;;
+;;; One reading of an upstream's head for every outbound path: COMPLETE-FETCH
+;;; and OUTBOUND-RESPONSE-COMPLETE-P over the buffer the event loop fills,
+;;; and STREAM-RESPONSE-LINES over the bytes READER-READ-HEAD collects. The
+;;; streaming path reads the head as bytes for exactly this reason. A second
+;;; reader of the same head, line by line over strings, would be a second
+;;; answer to where a line ends, which bytes a value may hold and whether a
+;;; repeated Content-Length conflicts, and a response one path took and the
+;;; other refused is the disagreement this file is written against.
 ;;; ---------------------------------------------------------------------------
-
-(defun parse-status-line-string (line)
-  "String-level twin of PARSE-RESPONSE-STATUS. LINE is the first
-   response line with CRLF already stripped (how the streaming
-   readers hand it over). Used by STREAM-RESPONSE-LINES, over either
-   transport, so its acceptance set is identical to
-   the buffered path's byte-level check — without this, a non-HTTP
-   upstream whose first line is '<junk> 200 OK' ('FUBAR 200 OK',
-   'NOT-HTTP 418 Z') parses as status 200 on the streaming paths
-   while the buffered path correctly rejects, a parser-disagreement
-   smuggling primitive. Requires a literal 'HTTP/1.0 ' or 'HTTP/1.1 '
-   prefix (9 chars), then three digits in 100-599, then SP or
-   end-of-line. Returns the status integer or NIL."
-  (when (and line (>= (length line) 12))
-    (let ((c0 (char line 0)) (c1 (char line 1)) (c2 (char line 2))
-          (c3 (char line 3)) (c4 (char line 4)) (c5 (char line 5))
-          (c6 (char line 6)) (c7 (char line 7)) (c8 (char line 8)))
-      (when (and (char= c0 #\H) (char= c1 #\T) (char= c2 #\T)
-                 (char= c3 #\P) (char= c4 #\/) (char= c5 #\1)
-                 (char= c6 #\.) (or (char= c7 #\0) (char= c7 #\1))
-                 (char= c8 #\Space))
-        (let ((d1 (char line 9))
-              (d2 (char line 10))
-              (d3 (char line 11)))
-          (when (and (digit-char-p d1) (digit-char-p d2) (digit-char-p d3)
-                     (or (= (length line) 12)
-                         (char= (char line 12) #\Space)))
-            (let ((status (+ (* (digit-char-p d1) 100)
-                             (* (digit-char-p d2) 10)
-                             (digit-char-p d3))))
-              (when (<= 100 status 599)
-                status))))))))
 
 (defun parse-response-status (buf start end)
   "Extract the integer status code from a response line in BUF[START..END).
@@ -701,6 +678,43 @@
             (let ((status (+ (* d1 100) (* d2 10) d3)))
               (when (<= 100 status 599)
                 status))))))))
+
+(defun parse-response-headers (buf start header-end)
+  "The header alist of the response head in BUF whose status line begins
+   at START and whose CRLFCRLF is at HEADER-END, or NIL when the head is a
+   status line alone.
+
+   An upstream's field value that is not valid UTF-8 is read as Latin-1
+   rather than refused; BYTES-TO-STRING-OR-LATIN-1 says why the response
+   side differs from the request side. Every other check is
+   PARSE-HEADERS-BYTES' own, the same as a request head gets."
+  (let ((first-crlf (scan-crlf buf start header-end)))
+    (when first-crlf
+      (parse-headers-bytes buf (+ first-crlf 2) (+ header-end 4)
+                           :invalid-utf-8 :latin-1))))
+
+(defun parse-response-head (buf start header-end)
+  "Read the final response head in BUF that begins at START and whose
+   CRLFCRLF is at HEADER-END. Returns
+   (values STATUS HEADERS CHUNKED-P TE-PRESENT CONTENT-LENGTH).
+
+   STATUS is NIL for a status line that is not HTTP's. TE-PRESENT is
+   SCAN-TRANSFER-ENCODING's classification, and CONTENT-LENGTH is NIL
+   whenever it is present: RFC 7230 §3.3.3 has any Transfer-Encoding
+   override Content-Length. Signals for what PARSE-HEADERS-BYTES refuses
+   and for conflicting Content-Lengths.
+
+   What COMPLETE-FETCH and STREAM-RESPONSE-LINES both call, so the two
+   cannot take different views of one head."
+  (let* ((status (parse-response-status buf start (+ header-end 4)))
+         (headers (parse-response-headers buf start header-end))
+         (te-present (scan-transfer-encoding buf header-end start)))
+    (values status
+            headers
+            (response-chunked-p headers)
+            te-present
+            (unless te-present
+              (scan-content-length buf header-end start)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Interim (1xx) responses
@@ -1039,11 +1053,12 @@
    READER-READ-BYTES call and mis-align the byte count against
    framing bytes. Returns a string, or NIL at EOF with no pending
    bytes; EOF mid-line flushes the partial line once.
-   MAX-SIZE bounds the accumulated line length. Defaults to
-   *MAX-STREAMING-LINE-SIZE* for body lines; header-phase callers
-   pass a tighter *MAX-HEADER-LINE-LENGTH* so a 1 MiB attacker-
-   framed 'header' is rejected on the same budget as the buffered
-   parse-headers-bytes path rather than the body-line budget."
+   MAX-SIZE bounds the accumulated line length, *MAX-STREAMING-LINE-SIZE*
+   by default.
+
+   For body lines only. A response head is never read with this: its
+   line endings are HTTP's, not EventStream's, and READER-READ-HEAD reads
+   it as bytes for the buffered path's readers."
   (let ((line-buf (make-array 256 :element-type '(unsigned-byte 8)
                                   :fill-pointer 0 :adjustable t)))
     (loop
@@ -1089,6 +1104,46 @@
                              max-size))
                     (vector-push-extend (aref buf i) line-buf))
            (setf (stream-reader-pos r) end)))))))
+
+(defun reader-read-head (r)
+  "Read one response head from R: the bytes from its status line through
+   the CRLFCRLF that ends its header block, terminator included. Returns
+   them as a fresh vector, or NIL at a clean end of stream before any
+   byte.
+
+   Bytes and not lines, so STREAM-RESPONSE-LINES can hand the head to the
+   readers the buffered path uses; see \"Parse a response head\". The head
+   ends where the buffered path says it ends, at the first CRLFCRLF, so a
+   bare CR or LF ends no line here either.
+
+   Signals at end of stream inside a head, which the buffered path also
+   refuses, and once the head is longer than any those readers accept: a
+   status line of *MAX-HEADER-LINE-LENGTH*, *MAX-TOTAL-HEADER-BYTES* of
+   field lines and the CRLFs around them. The exact caps are
+   PARSE-HEADERS-BYTES' to enforce. This bound only stops an upstream that
+   never ends its head from growing the vector without limit."
+  (let ((head (make-array 512 :element-type '(unsigned-byte 8)
+                              :fill-pointer 0 :adjustable t))
+        (limit (+ *max-header-line-length* *max-total-header-bytes*
+                  (* 2 (+ *max-header-count* 2)))))
+    (loop
+      (when (>= (stream-reader-pos r) (stream-reader-end r))
+        (when (zerop (reader-fill r))
+          (if (zerop (fill-pointer head))
+              (return nil)
+              (error "streaming response: end of stream inside the ~
+                      response head"))))
+      (let ((b (aref (stream-reader-buf r) (stream-reader-pos r)))
+            (n (fill-pointer head)))
+        (incf (stream-reader-pos r))
+        (when (>= n limit)
+          (error "streaming response: head longer than ~d bytes" limit))
+        (vector-push-extend b head)
+        (when (and (= b 10) (>= n 3)
+                   (= (aref head (- n 1)) 13)
+                   (= (aref head (- n 2)) 10)
+                   (= (aref head (- n 3)) 13))
+          (return (subseq head 0 (1+ n))))))))
 
 (defun reader-expect-crlf (r)
   "Consume exactly two bytes from R and raise if they are not
@@ -1218,7 +1273,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun stream-response-lines (stream on-line &key (method :GET) read-fn)
-  "Read an HTTP response from a byte stream. Skip headers, call
+  "Read an HTTP response from a byte stream. Read the head, then call
    ON-LINE per body line. Handles chunked transfer encoding.
    Returns the status code.
 
@@ -1255,83 +1310,37 @@
         (te-present nil)
         (content-length nil)
         (interims 0))
-    ;; Read status line + headers. Tighter MAX-SIZE for header lines
-    ;; matches the buffered parse-headers-bytes budget so a 1 MiB
-    ;; attacker-framed "header" can't coast on the body-line cap.
-    ;; TOTAL-HEADER-BYTES enforces the aggregate cap symmetrically
-    ;; with parse-headers-bytes' running-total guard.
+    ;; Each head is read as bytes and handed to the readers the buffered
+    ;; path uses — see "Parse a response head" — so the two paths cannot
+    ;; disagree about a head, its limits included: PARSE-HEADERS-BYTES
+    ;; enforces the per-line, per-count and total caps here as it does
+    ;; there.
     ;;
-    ;; The whole header phase repeats over any 1xx interim block
-    ;; (RFC 7231 §6.2): an interim is terminated by its own empty line
-    ;; and carries no body, so the final response's status line is the
-    ;; very next line. Without this the header loop would stop at the
-    ;; interim's blank line, report 103 as the status, take the
-    ;; bodiless branch, and never call ON-LINE at all. Per-block
-    ;; state is reset each pass so an interim's headers cannot leak
-    ;; into the final response's framing decision.
+    ;; The head is read again over any 1xx interim block (RFC 7231 §6.2):
+    ;; an interim ends at its own CRLFCRLF and carries no body, so the
+    ;; final response's head is the very next one. Without this the
+    ;; interim's blank line would end the header phase, 103 would be
+    ;; reported as the status, and ON-LINE would never be called. As in
+    ;; SKIP-INTERIM-RESPONSES, an interim's fields are stepped over
+    ;; unread, so nothing in one can reach the final response's framing.
     (loop
-      (setf status nil chunked nil te-present nil content-length nil)
-      (let ((header-count 0)
-          (total-header-bytes 0))
-      (loop for line = (reader-read-line r :max-size *max-header-line-length*)
-            for first = t then nil
-            while (and line (> (length line) 0))
-            do (incf header-count)
-               (when (> header-count *max-header-count*)
-                 (error "streaming response: too many headers (~d)" header-count))
-               (incf total-header-bytes (length line))
-               (when (> total-header-bytes *max-total-header-bytes*)
-                 (error "streaming response: total header bytes exceed ~d"
-                        *max-total-header-bytes*))
-               ;; RFC 7230 §3.2.4 — obsolete line folding. Buffered
-               ;; parse-headers-bytes rejects; streaming mirrors so
-               ;; the acceptance set doesn't drift. Skip the check on
-               ;; the status line (it would have failed
-               ;; parse-status-line-string anyway).
-               (when (and (not first)
-                          (or (char= (char line 0) #\Space)
-                              (char= (char line 0) #\Tab)))
-                 (error "streaming response: obsolete line folding not accepted"))
-               (when first
-                 (setf status (parse-status-line-string line)))
-               (when (and (>= (length line) 18)
-                          (string-equal line "transfer-encoding:"
-                                        :end1 18))
-                 (setf te-present t)
-                 (let ((value (string-trim '(#\Space #\Tab) (subseq line 18))))
-                   (when (header-has-token-p value "chunked")
-                     (setf chunked t))))
-               (when (and (>= (length line) 15)
-                          (string-equal line "content-length:"
-                                        :end1 15))
-                 ;; Strict digits-only parse, symmetric with the
-                 ;; inbound SCAN-CONTENT-LENGTH byte scanner so a
-                 ;; future edit can't let one path accept a value
-                 ;; the other rejects.
-                 (let ((value (string-trim '(#\Space #\Tab) (subseq line 15))))
-                   (unless (and (> (length value) 0)
-                                (every (lambda (c) (char<= #\0 c #\9)) value))
-                     (error "streaming response: malformed Content-Length ~s"
-                            value))
-                   (unless (<= (length value) 10)
-                     (error "streaming response: Content-Length too many digits"))
-                   (let ((n (parse-integer value)))
-                     (when (and content-length (/= n content-length))
-                       (error "streaming response: conflicting Content-Length ~
-                               ~d vs ~d"
-                              content-length n))
-                     (setf content-length n))))))
-      ;; Interim block — its empty line just ended, so go around and read
-      ;; the next status line. A NIL status (unparseable, or EOF before
-      ;; any line) is not an interim: fall through and let the post-loop
-      ;; "no parseable status line" check report it.
-      (if (and status (<= 100 status 199))
-          (progn
-            (incf interims)
-            (when (> interims *max-interim-responses*)
-              (error "streaming response: more than ~d interim responses"
-                     *max-interim-responses*)))
-          (return)))
+      (let ((head (reader-read-head r)))
+        (setf status (and head (parse-response-status head 0 (length head))))
+        ;; Refused before any body is read, as the buffered path refuses
+        ;; it: the bytes after a status line that is not HTTP's are not
+        ;; a body of anything.
+        (unless status
+          (error "streaming response: no parseable status line"))
+        (unless (<= 100 status 199)
+          (multiple-value-bind (final headers chunked-p te cl)
+              (parse-response-head head 0 (- (length head) 4))
+            (declare (ignore final headers))
+            (setf chunked chunked-p te-present te content-length cl))
+          (return))
+        (incf interims)
+        (when (> interims *max-interim-responses*)
+          (error "streaming response: more than ~d interim responses"
+                 *max-interim-responses*))))
     ;; Stream body lines
     (cond
       ;; Bodiless FINAL responses — RFC 7230 §3.3.3 rule 1, RFC 7232
@@ -1344,11 +1353,11 @@
       ;; a 304 with chunked framing would either raise "short body"
       ;; or block forever waiting for framing that will never arrive.
       ;;
-      ;; 1xx is deliberately absent: the header loop above only exits
-      ;; on a NIL status or a status >= 200, so an interim can never
-      ;; reach here. Testing for it would be dead code that reads as
-      ;; though a 1xx were a legitimate final status — which is the
-      ;; belief that produced the interim-response defect.
+      ;; 1xx is deliberately absent: the header loop above exits only
+      ;; on a status >= 200, so an interim can never reach here. Testing
+      ;; for it would be dead code that reads as though a 1xx were a
+      ;; legitimate final status, which is the belief that lets an
+      ;; interim stand in for the response.
       ((or (eq method :HEAD)
            (and status (or (= status 204) (= status 304))))
        nil)
@@ -1378,8 +1387,6 @@
        (loop for line = (reader-read-line r)
              while line
              do (when on-line (funcall on-line line)))))
-    (unless status
-      (error "streaming response: no parseable status line"))
     status))
 
 (defun parse-chunked-size-line (size-line)
@@ -2442,12 +2449,9 @@
            ;; The header parse only runs on the read that actually
            ;; completes — the cheap framing walk gates it.
            (values (and complete
-                        (let ((first-crlf (scan-crlf buf start header-end)))
-                          (and first-crlf
-                               (response-chunked-p
-                                (parse-headers-bytes buf (+ first-crlf 2)
-                                                     (+ header-end 4)))
-                               t)))
+                        (response-chunked-p
+                         (parse-response-headers buf start header-end))
+                        t)
                    next)))
         (content-length
          (values (>= (- end body-start) content-length) chunk-scan))
@@ -2675,18 +2679,10 @@
       (deliver-fetch-error out-conn epoll-fd
                            "upstream response has no parseable headers")
       (return-from complete-fetch))
-    (let* ((status (parse-response-status buf start pos))
-           (body-start (+ header-end 4))
-           (headers (let ((first-crlf (scan-crlf buf start header-end)))
-                      (when first-crlf
-                        (parse-headers-bytes buf (+ first-crlf 2)
-                                             (+ header-end 4)))))
-           (chunked-p (response-chunked-p headers))
-           ;; RFC 7230 §3.3.3 rule 3: any TE present means CL is
-           ;; ignored — read-until-close, not CL-framed.
-           (te-present (scan-transfer-encoding buf header-end start))
-           (content-length (unless te-present
-                             (scan-content-length buf header-end start))))
+    (multiple-value-bind (status headers chunked-p te-present content-length)
+        (parse-response-head buf start header-end)
+      (declare (ignore te-present))
+    (let ((body-start (+ header-end 4)))
     ;; Status line must parse too. PARSE-RESPONSE-STATUS returns
     ;; NIL on a malformed status line ('HTTP/1.1 ABC OK', status
     ;; digits out of range, missing version, etc.) — same 'never
@@ -2854,7 +2850,7 @@
             ;; sentinel so app state gets released — we can't deliver
             ;; a response anywhere but the contract is still
             ;; "callback fires once per fetch lifetime".
-            (finish-fetch callback :aborted)))))))
+            (finish-fetch callback :aborted))))))))
 
 (defun deliver-fetch-error (out-conn epoll-fd message)
   "Deliver a 502 error to the inbound connection and clean up."
