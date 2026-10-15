@@ -1067,6 +1067,44 @@
         (handler-case (sb-thread:join-thread thread :timeout 5)
           (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
 
+(defun test-harness-accept-failure-is-retried-e2e ()
+  "A connection queued behind a failed accept is answered without another
+   connection arriving.
+
+   The listener is edge-triggered: its event fires when a connection
+   arrives, not while one waits. Once the server is up, the next
+   SOCKET-ACCEPT is made to fail as EMFILE would, and one client
+   connects. The kernel has queued it, the accept that should take it
+   fails, and nothing else will ever raise an edge for it. Only the
+   maintenance tick's retry answers it, so it is answered within a few
+   seconds or, without the retry, not until the client gives up."
+  (format t "~%Harness: a backlog left by a failed accept is retried~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "ok")))
+    (let ((failed nil))
+      (sb-int:encapsulate 'sb-bsd-sockets:socket-accept 'fail-once
+                          (lambda (f &rest args)
+                            (if failed
+                                (apply f args)
+                                (progn (setf failed t)
+                                       (error "simulated EMFILE")))))
+      (unwind-protect
+           (let ((start (get-internal-real-time)))
+             (multiple-value-bind (status headers body)
+                 (attempt (test-http-request :get "/"))
+               (declare (ignore headers))
+               (check "accept retry: the queued client is answered"
+                      (list status body) (list 200 "ok"))
+               (check "accept retry: within a few seconds, by the tick"
+                      (< (/ (- (get-internal-real-time) start)
+                            internal-time-units-per-second)
+                         5)
+                      t))
+             (check "control: the accept did fail first" failed t))
+        (sb-int:unencapsulate 'sb-bsd-sockets:socket-accept 'fail-once)))))
+
 (defparameter *chunked-corpus* '("aa" "bbb" "cccc")
   "The chunk payloads the :ON-BODY framing tests assert on.
 
@@ -5575,6 +5613,7 @@
   (test-harness-awaiting-timeout-answers-504-e2e)
   (test-harness-close-delimited-fetch-e2e)
   (test-harness-fetch-latin-1-header-e2e)
+  (test-harness-accept-failure-is-retried-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)

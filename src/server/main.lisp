@@ -941,16 +941,36 @@
              (cdr report) 0))
       (t (incf (cdr report))))))
 
+(defun accept-pending (listener-socket epoll-fd)
+  "Accept every connection waiting on the listener. Returns NIL once the
+   backlog is drained, and T when an accept failed first, so the caller
+   knows to try again.
+
+   The listener is edge-triggered, so its event fires when a connection
+   arrives and not while connections wait. An accept that fails partway
+   through the backlog — out of descriptors, typically — leaves the rest
+   queued with nothing to report them again: freeing descriptors raises no
+   edge, and the next one comes only when another client happens to
+   connect. On a quiet server those clients would wait out their own
+   timeouts after the server had recovered. RUN-EVENT-LOOP retries on its
+   maintenance tick for as long as this answers T."
+  (loop
+    (let ((result (accept-connection listener-socket epoll-fd)))
+      (cond ((null result) (return nil))
+            ((eq result :failed) (return t))))))
+
 (defun accept-connection (listener-socket epoll-fd)
   "Accept a pending connection and register it with epoll.
-   Returns T if a connection was accepted, NIL if none pending (EAGAIN).
+   Returns T if a connection was accepted, NIL if none pending (EAGAIN),
+   and :FAILED if the accept itself failed — EMFILE, ENFILE, ENOMEM —
+   with connections possibly still queued behind it; see ACCEPT-PENDING.
    Refuses the connection with a 503 if the per-worker limit is reached."
   (let ((client-socket (handler-case
                           (sb-bsd-sockets:socket-accept listener-socket)
                         (error (e)
                           (log-error "socket-accept failed: ~a" e)
                           (sleep 0.1) ; backoff to avoid log-spin on EMFILE
-                          (return-from accept-connection nil)))))
+                          (return-from accept-connection :failed)))))
     (unless client-socket
       (return-from accept-connection nil))
     ;; Enforce per-worker connection limit
@@ -1792,6 +1812,9 @@
         (last-sweep-time (get-universal-time))
         (tick-errors     0)
         (tick-error-at   0)
+        ;; T while an accept has failed with the backlog possibly not
+        ;; drained; the maintenance tick retries. See ACCEPT-PENDING.
+        (accept-retry    nil)
         (event-buf (make-epoll-event-buf +max-events+)))
     (loop
       (when (worker-stopping-p)
@@ -1806,9 +1829,10 @@
                      (cond
                        ;; New connection on the listener
                        ((= fd listener-fd)
-                        ;; Edge-triggered: accept in a loop until none pending
-                        (loop (unless (accept-connection listener-socket epoll-fd)
-                                (return))))
+                        ;; Edge-triggered: accept until none pending, or
+                        ;; until an accept fails and the tick has to retry.
+                        (setf accept-retry
+                              (accept-pending listener-socket epoll-fd)))
                        ;; Event on a connection (inbound or outbound)
                        (t
                         (let ((conn (lookup-connection fd)))
@@ -1870,6 +1894,11 @@
           ;; since their lookups ended. A second is soon enough for a
           ;; process that is only waiting to be collected.
           (reap-dns-children)
+          ;; And so does retrying a backlog an accept failure left
+          ;; queued: no edge will report it, and a second is soon
+          ;; enough for a server that has run out of descriptors.
+          (when accept-retry
+            (setf accept-retry (accept-pending listener-socket epoll-fd)))
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)

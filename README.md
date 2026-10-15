@@ -590,7 +590,10 @@ read about here.
     same worker.
   - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
     keep `EMFILE` from spinning the log. Under fd exhaustion that is a
-    worker doing nothing else, 100 ms at a time.
+    worker doing nothing else, 100 ms at a time. The connections still
+    queued behind the failure are retried on the worker's one-second tick
+    until the backlog drains, since an edge-triggered listener reports no
+    event for connections that are already waiting.
 - **TLS renegotiation mid-transfer is handled but not exercised.** OpenSSL
   can answer a read with "I need to write first" and a write with "I need
   to read first" — a renegotiation or a post-handshake message. The state
