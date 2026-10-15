@@ -1613,8 +1613,14 @@
        (if (connection-body-complete-p conn)
            :dispatch
            (funcall unfinished)))
+      ;; The second value says the peer's FIN has arrived. Frames already
+      ;; buffered are still the peer's to have answered, so this does not
+      ;; close; HANDLE-CLIENT-READ does, once they are processed, because
+      ;; nothing can follow a FIN and a frame left unfinished never will
+      ;; be. Without it, a socket at end of stream stays readable, and
+      ;; every wake-up finds the same partial frame again.
       (:websocket
-       :websocket))))
+       (values :websocket (and (member read-result '(:eof :ok-eof)) t))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parse the buffered request

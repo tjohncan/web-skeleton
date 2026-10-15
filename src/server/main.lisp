@@ -1431,7 +1431,7 @@
              )))
         ;; WebSocket frame processing
         (:websocket
-         (let ((result (connection-on-read conn)))
+         (multiple-value-bind (result peer-finished) (connection-on-read conn)
            (case result
              (:websocket
               (multiple-value-bind (response close-frame)
@@ -1484,6 +1484,22 @@
                                (connection-fd conn))
                      (connection-append-write conn (build-ws-close 1009))
                      (setf (connection-state conn) :closing))))
+                ;; The peer has sent its FIN, so every frame it will ever
+                ;; send has been read, and whatever is left in the buffer is
+                ;; a frame that cannot be finished. The replies to the
+                ;; frames that did arrive go out first, through :CLOSING's
+                ;; flush-then-close, and with none queued it closes now.
+                ;; Waiting instead would spin the worker: the socket stays
+                ;; readable at end of stream, so each wake-up would find the
+                ;; same partial frame, re-arm and wake again at once, until
+                ;; the ping sweep gave up on a peer that cannot answer.
+                (when (and peer-finished
+                           (eq (connection-state conn) :websocket))
+                  (if (plusp (connection-write-pending conn))
+                      (setf (connection-state conn) :closing)
+                      (progn
+                        (close-connection conn epoll-fd)
+                        (return-from handle-client-read))))
                 ;; One arming decision for all of them. What is pending
                 ;; now decides the interest, not which branch ran: the
                 ;; handler's own WS-SEND calls may have flushed everything

@@ -9533,6 +9533,100 @@
 ;;; criterion, a claim without a detector.
 ;;; ---------------------------------------------------------------------------
 
+(defun %ws-half-close-pass (client-bytes &key reply)
+  "Send CLIENT-BYTES on a :WEBSOCKET connection, half-close the client, and
+   wake the connection as the event loop would — HANDLE-CLIENT-WRITE while
+   something is queued, HANDLE-CLIENT-READ otherwise — for at most fifty
+   wake-ups or until it is closed. REPLY, when given, is what the
+   ws-handler answers each complete frame with.
+
+   Returns (values WAKE-UPS CLOSED RECEIVED): how many wake-ups ran, whether
+   the connection was closed, and what the client read before end of
+   stream, which is read only once the server has closed and so cannot
+   block."
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (get-universal-time)))
+                  (stream (sb-bsd-sockets:socket-make-stream
+                           client :input t :output t
+                           :element-type '(unsigned-byte 8)))
+                  (wake-ups 0))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd
+                                      (logior web-skeleton::+epollin+
+                                              web-skeleton::+epollet+))
+             (write-sequence client-bytes stream)
+             (force-output stream)
+             (sb-bsd-sockets:socket-shutdown client :direction :output)
+             (sleep 0.1)
+             (loop while (and (< wake-ups 50)
+                              (>= (web-skeleton::connection-fd conn) 0))
+                   do (incf wake-ups)
+                      (if (plusp (web-skeleton::connection-write-pending conn))
+                          (web-skeleton::handle-client-write conn epfd)
+                          (web-skeleton::handle-client-read
+                           conn epfd nil
+                           (lambda (c f) (declare (ignore c f)) reply))))
+             (let ((closed (< (web-skeleton::connection-fd conn) 0)))
+               (values wake-ups
+                       closed
+                       (when closed
+                         (let ((got (make-array 0 :element-type '(unsigned-byte 8)
+                                                  :adjustable t :fill-pointer 0)))
+                           (loop for b = (read-byte stream nil nil)
+                                 while b do (vector-push-extend b got))
+                           (coerce got '(simple-array (unsigned-byte 8) (*))))))))
+        (ignore-errors (sb-bsd-sockets:socket-close client))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (web-skeleton::%close epfd))))))
+
+(defun test-websocket-peer-that-leaves-mid-frame ()
+  "A WebSocket whose peer half-closes with a frame unfinished is closed,
+   not woken forever.
+
+   Nothing can follow the peer's FIN, so a partial frame left in the buffer
+   can never complete. The socket stays readable at end of stream, and a
+   read path that only waits for more re-arms EPOLLIN and is woken again at
+   once: a busy loop on the worker, which held until the ping sweep gave up
+   on a peer that cannot answer — a minute and a half with the defaults.
+
+   Two partial shapes, and a control: a complete frame followed by the FIN,
+   whose reply still has to reach the half-closed peer before the close."
+  (format t "~%WebSocket: a peer that leaves mid-frame is closed~%")
+  (let ((whole (make-test-ws-frame "hello")))
+    (multiple-value-bind (wake-ups closed)
+        (%ws-half-close-pass (make-array 1 :element-type '(unsigned-byte 8)
+                                           :initial-element #x81))
+      (check "ws half-close: one header byte, then FIN, is closed"
+             closed t)
+      (check "ws half-close: one header byte, in at most two wake-ups"
+             (<= wake-ups 2) t))
+    (multiple-value-bind (wake-ups closed)
+        (%ws-half-close-pass (subseq whole 0 (1- (length whole))))
+      (check "ws half-close: a frame one byte short, then FIN, is closed"
+             closed t)
+      (check "ws half-close: a frame one byte short, in at most two wake-ups"
+             (<= wake-ups 2) t))
+    ;; Control: the reply to a frame that did arrive is delivered first.
+    (let ((reply (web-skeleton::build-ws-frame
+                  web-skeleton::+ws-op-text+
+                  (sb-ext:string-to-octets "bye" :external-format :utf-8))))
+      (multiple-value-bind (wake-ups closed received)
+          (%ws-half-close-pass whole :reply reply)
+        (declare (ignore wake-ups))
+        (check "ws half-close: control: a whole frame, then FIN, is closed"
+               closed t)
+        (check "ws half-close: control: and its reply reached the peer first"
+               (and received (equalp received reply))
+               t)))))
+
 (defun %ws-fanout-pass ()
   "Run the documented fan-out shape and report what got armed.
 
@@ -11495,6 +11589,7 @@
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)
+  (test-websocket-peer-that-leaves-mid-frame)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-ws-ping-flush)
