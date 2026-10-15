@@ -1105,6 +1105,67 @@
              (check "control: the accept did fail first" failed t))
         (sb-int:unencapsulate 'sb-bsd-sockets:socket-accept 'fail-once)))))
 
+(defun test-harness-client-errors-log-once-a-minute-e2e ()
+  "A flood of requests a client gets wrong logs a line, not a flood.
+
+   Every log line holds *LOG-LOCK*, the one lock all workers share, across
+   a format and a flush, and a malformed request costs a client one write.
+   LOG-THROTTLED logs the first of a kind at once and then at most once a
+   minute per worker, with a count of the ones held back. The first half
+   drives it directly; the second sends twenty requests with an unknown
+   method to a real server and counts the lines its worker wrote."
+  (format t "~%Harness: a flood of bad requests logs a line, not a flood~%")
+  (let ((out (make-string-output-stream)))
+    (let ((web-skeleton::*log-stream* out)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* (make-hash-table :test #'eq)))
+      (dotimes (i 5)
+        (web-skeleton::log-throttled :warn :test-kind "bad thing ~d" i))
+      (web-skeleton::log-throttled :warn :other-kind "other thing")
+      ;; A minute on, as far as the throttle can tell.
+      (decf (car (gethash :test-kind web-skeleton::*log-throttle*)) 61)
+      (web-skeleton::log-throttled :warn :test-kind "bad thing ~d" 5))
+    (let ((text (get-output-stream-string out)))
+      (check "throttle: the first of a kind logs"
+             (and (search "bad thing 0" text) t) t)
+      (check "throttle: the four after it do not"
+             (search "bad thing 1" text) nil)
+      (check "throttle: another kind logs on its own"
+             (and (search "other thing" text) t) t)
+      (check "throttle: a minute on, one line carries the count"
+             (and (search "bad thing 5 (and 4 more like it" text) t) t)))
+  (let ((out (make-string-output-stream)))
+    (let ((web-skeleton::*log-stream* out)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* nil))
+      (dotimes (i 3) (web-skeleton::log-throttled :warn :k "line ~d" i)))
+    (check "throttle: outside a worker every line logs"
+           (count #\Newline (get-output-stream-string out)) 3))
+  (let ((saved web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           ;; SETF, not bound: the worker that logs is another thread.
+           (setf web-skeleton::*log-stream* log)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (dotimes (i 20)
+               (push (attempt (values (test-http-request :bogus "/")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved))
+    (let ((text (get-output-stream-string log)))
+      (check "control: every request was refused with 501"
+             (every (lambda (s) (eql s 501)) statuses) t)
+      (check "twenty malformed requests log one parse-error line"
+             (loop with n = 0 and start = 0
+                   for at = (search "parse error fd" text :start2 start)
+                   while at do (incf n) (setf start (1+ at))
+                   finally (return n))
+             1))))
+
 (defparameter *chunked-corpus* '("aa" "bbb" "cccc")
   "The chunk payloads the :ON-BODY framing tests assert on.
 
@@ -5614,6 +5675,7 @@
   (test-harness-close-delimited-fetch-e2e)
   (test-harness-fetch-latin-1-header-e2e)
   (test-harness-accept-failure-is-retried-e2e)
+  (test-harness-client-errors-log-once-a-minute-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)

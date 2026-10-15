@@ -565,12 +565,12 @@
             ;; branches below. A client keying a retry policy on 1009 was
             ;; told 1002 for one of the two shapes.
             (ws-frame-too-large (e)
-              (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
+              (log-throttled :warn :ws-frame-error "ws frame error fd ~d: ~a" (connection-fd conn) e)
               (return-from websocket-on-read (close-with 1009)))
             (error (e)
               ;; Protocol errors (RSV bits, unmasked, bad opcode, etc.)
               ;; → close with 1002 per RFC 6455 7.1.7
-              (log-warn "ws frame error fd ~d: ~a" (connection-fd conn) e)
+              (log-throttled :warn :ws-frame-error "ws frame error fd ~d: ~a" (connection-fd conn) e)
               (return-from websocket-on-read (close-with 1002))))
         (unless frame
           ;; No complete frame — shift unconsumed bytes to start of buffer
@@ -591,7 +591,7 @@
              ;; RFC 6455 §5.4: new data frame while fragmentation in progress
              ;; is a protocol error
              (when (connection-ws-frag-buf conn)
-               (log-warn "ws new data frame mid-fragment fd ~d"
+               (log-throttled :warn :ws-fragment "ws new data frame mid-fragment fd ~d"
                          (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
@@ -605,7 +605,7 @@
                          (sb-ext:octets-to-string (ws-frame-payload frame)
                                                    :external-format :utf-8)
                        (error ()
-                         (log-warn "ws invalid UTF-8 in text frame fd ~d"
+                         (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in text frame fd ~d"
                                    (connection-fd conn))
                          (return-from websocket-on-read (close-with 1007)))))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
@@ -630,7 +630,7 @@
                  (let ((len (length (ws-frame-payload frame))))
                    (if (> len *max-ws-message-size*)
                        (progn
-                         (log-warn "ws fragmented message too large ~
+                         (log-throttled :warn :ws-fragment "ws fragmented message too large ~
                                     on first fragment (~d bytes) fd ~d"
                                    len (connection-fd conn))
                          (return-from websocket-on-read (close-with 1009)))
@@ -644,14 +644,14 @@
             ;; Continuation frame
             ((= opcode +ws-op-continuation+)
              (unless (connection-ws-frag-buf conn)
-               (log-warn "ws continuation without start fd ~d"
+               (log-throttled :warn :ws-fragment "ws continuation without start fd ~d"
                          (connection-fd conn))
                (return-from websocket-on-read (close-with 1002)))
              ;; Accumulate fragment — O(1) running total instead of re-scanning
              (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
              (incf (connection-ws-frag-total conn) (length (ws-frame-payload frame)))
              (when (> (connection-ws-frag-total conn) *max-ws-message-size*)
-               (log-warn "ws fragmented message too large (~d bytes) fd ~d"
+               (log-throttled :warn :ws-fragment "ws fragmented message too large (~d bytes) fd ~d"
                          (connection-ws-frag-total conn) (connection-fd conn))
                (setf (connection-ws-frag-buf conn) nil
                      (connection-ws-frag-total conn) 0)
@@ -675,7 +675,7 @@
                    (handler-case
                        (sb-ext:octets-to-string payload :external-format :utf-8)
                      (error ()
-                       (log-warn "ws invalid UTF-8 in reassembled text fd ~d"
+                       (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in reassembled text fd ~d"
                                  (connection-fd conn))
                        (return-from websocket-on-read (close-with 1007)))))
                  (setf (connection-last-active conn) (get-universal-time))
@@ -697,7 +697,7 @@
              (log-debug "ws pong fd ~d" (connection-fd conn))
              (setf (connection-missed-pongs conn) 0))
             ((= opcode +ws-op-close+)
-             (log-info "ws close requested on fd ~d" (connection-fd conn))
+             (log-debug "ws close requested on fd ~d" (connection-fd conn))
              (setf (connection-ws-frag-buf conn) nil
                    (connection-ws-frag-total conn) 0)
              (let* ((payload (ws-frame-payload frame))
@@ -705,7 +705,7 @@
                     (raw-code (cond
                                 ((zerop (length payload)) 1000)
                                 ((= (length payload) 1)
-                                 (log-warn "ws close with 1-byte body fd ~d"
+                                 (log-throttled :warn :ws-close "ws close with 1-byte body fd ~d"
                                            (connection-fd conn))
                                  (return-from websocket-on-read
                                    (close-with 1002)))
@@ -718,7 +718,7 @@
                      (sb-ext:octets-to-string payload :start 2
                                                :external-format :utf-8)
                    (error ()
-                     (log-warn "ws invalid UTF-8 in close reason fd ~d"
+                     (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in close reason fd ~d"
                                (connection-fd conn))
                      (return-from websocket-on-read (close-with 1007)))))
                ;; Normal client-initiated close: the replies to earlier
@@ -727,6 +727,6 @@
                (return-from websocket-on-read (close-with code))))
             (t
              ;; RFC 6455 §5.2: unknown opcodes MUST fail the connection
-             (log-warn "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
+             (log-throttled :warn :ws-opcode "ws unknown opcode ~d fd ~d" opcode (connection-fd conn))
              (return-from websocket-on-read (close-with 1002)))))))
       nil)))

@@ -18,9 +18,11 @@
    across both the FORMAT and the FORCE-OUTPUT.
 
    At the :INFO default that costs nothing measurable: a request that
-   parses and dispatches cleanly logs nothing at all. At :DEBUG it is
-   several acquisitions per request, with every worker serialized behind
-   them.
+   parses and dispatches cleanly logs nothing at all, and neither does a
+   WebSocket's upgrade or close. What a client can cause at will, such as
+   a malformed request or a bad frame, goes through LOG-THROTTLED, which
+   logs once a minute per worker. At :DEBUG it is several acquisitions
+   per request, with every worker serialized behind them.
 
    Two consequences worth knowing before building on it. An access log
    would put this on the hot path by construction — one line per request,
@@ -96,6 +98,39 @@
                      (string-upcase (symbol-name level))
                      format-string args)
              (force-output *error-output*))))))))
+
+(defvar *log-throttle* nil
+  "This worker's throttled log lines, a hash table from a kind to
+   (LAST-LOGGED-AT . HELD-BACK). Bound per worker by RUN-WORKER; NIL
+   outside one, where LOG-THROTTLED logs every line.")
+
+(defun log-throttled (level kind format-string &rest args)
+  "Log a line a client can cause at will — a malformed request, a bad
+   WebSocket frame. The first of KIND logs at once, and after it at most
+   one a minute per worker, carrying a count of the lines held back.
+
+   Every line holds *LOG-LOCK*, the one lock every worker contends for,
+   across a format and a flush, and these cost a client one write each. A
+   flood of them logged line by line would serialize every worker on
+   logging, and a stalled log pipe would stop them all. The census already
+   counts each refusal, so the log need only say they are happening.
+   REPORT-REFUSAL and the :ON-TICK error report are throttled the same way
+   with lines of their own."
+  (let ((table *log-throttle*))
+    (if (null table)
+        (apply #'log-msg level format-string args)
+        (let ((entry (gethash kind table))
+              (now (get-universal-time)))
+          (cond
+            ((null entry)
+             (setf (gethash kind table) (cons now 0))
+             (apply #'log-msg level format-string args))
+            ((>= (- now (car entry)) 60)
+             (log-msg level "~? (and ~d more like it in the last ~d seconds)"
+                      format-string args (cdr entry) (- now (car entry)))
+             (setf (car entry) now
+                   (cdr entry) 0))
+            (t (incf (cdr entry))))))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))

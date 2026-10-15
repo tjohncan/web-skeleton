@@ -17,9 +17,9 @@ services:
     # nothing else: no restart policy acts on health. Watch the status, or run
     # something that does act on it.
     restart: unless-stopped
-    # Capped, because the default json-file driver never rotates. Every
-    # WebSocket upgrade logs a line at INFO, and on a box shared with another
-    # site an unbounded log is a slow way to fill its disk.
+    # Capped, because the default json-file driver never rotates. The server
+    # logs little at INFO, but nothing bounds a log over months, and on a box
+    # shared with another site an unbounded one is a slow way to fill its disk.
     logging:
       driver: json-file
       options:

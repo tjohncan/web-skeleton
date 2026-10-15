@@ -781,7 +781,7 @@
       ((eq response :upgrade)
        (if (websocket-upgrade-p request)
            (progn
-             (log-info "~a ~a -> 101 upgrade"
+             (log-debug "~a ~a -> 101 upgrade"
                        (http-request-method request)
                        (http-request-path request))
              (values (make-websocket-handshake-response request) t))
@@ -1584,7 +1584,7 @@
          (log-debug "stale EPOLLIN fd ~d in state ~a — ignoring"
                     (connection-fd conn) (connection-state conn))))
     (http-parse-error (e)
-      (log-warn "parse error fd ~d: ~a" (connection-fd conn)
+      (log-throttled :warn :parse-error "parse error fd ~d: ~a" (connection-fd conn)
                 (http-parse-error-message e))
       ;; Answer before closing so the client gets a proper HTTP response.
       ;; The status comes from the condition: 400 unless the raise site
@@ -1997,6 +1997,7 @@
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
               (*refusal-report* (cons 0 0))
+              (*log-throttle* (make-hash-table :test #'eq))
               (*stream-drain-buf*
                 (make-array 4096 :element-type '(unsigned-byte 8)))
               ;; CAR is the second the string was built for. 0 can never
