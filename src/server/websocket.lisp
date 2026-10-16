@@ -48,19 +48,20 @@
          (digest (sha1 (sb-ext:string-to-octets combined :external-format :ascii))))
     (base64-encode digest)))
 
-(defun clamp-close-code (raw-code)
-  "Map a client-supplied WebSocket close code to the code we echo
-   back (RFC 6455 §7.4.1 / §7.4.2). Allowed ranges: 1000-1003,
-   1007-1014, 3000-4999. Everything else (< 1000, reserved
-   1004/1005/1006/1015, unassigned 1016-2999, undefined >= 5000)
-   is clamped to 1000. Lifted out of WEBSOCKET-ON-READ so the
-   reserved-code logic has a single definition."
-  (if (or (< raw-code 1000)
-          (member raw-code '(1004 1005 1006 1015))
-          (and (>= raw-code 1016) (<= raw-code 2999))
-          (> raw-code 4999))
-      1000
-      raw-code))
+(defun ws-close-code-valid-p (code)
+  "T for a status code a close frame may carry (RFC 6455 §7.4): 1000-1003,
+   1007-1014 and 3000-4999.
+
+   The rest are not codes either end may put in a frame: below 1000 is
+   unused, 1004 is reserved, 1005, 1006 and 1015 stand for a missing code,
+   an abnormal close and a TLS failure and are never sent, 1016-2999 are
+   unassigned, and 5000 and up are outside the range. One definition for
+   both directions. BUILD-WS-CLOSE refuses to send any other code, and
+   WEBSOCKET-ON-READ answers a peer's close frame carrying one with 1002,
+   as it answers every other malformed frame."
+  (or (<= 1000 code 1003)
+      (<= 1007 code 1014)
+      (<= 3000 code 4999)))
 
 (defun websocket-upgrade-p (request)
   "Check if REQUEST is a valid WebSocket upgrade request.
@@ -273,18 +274,14 @@
                   (sb-ext:string-to-octets text :external-format :utf-8)))
 
 (defun build-ws-close (&optional (code 1000))
-  "Build a close frame with a status code. CODE must be in the
-   server-sendable set per RFC 6455 §7.4.1: 1000-1003, 1007-1014,
-   or 3000-4999. Codes < 1000, the reserved 1004/1005/1006/1015,
-   the unassigned 1016-2999, and 5000+ are rejected here — the
-   stricter counterpart to CLAMP-CLOSE-CODE on the receive path,
-   which accepts any out-of-range peer code by clamping it to
-   1000. A silent u16 truncation on out-of-range input (values
-   > 65535) would put bytes on the wire the application never
+  "Build a close frame with a status code. CODE must be one
+   WS-CLOSE-CODE-VALID-P accepts: 1000-1003, 1007-1014, or 3000-4999.
+   Codes < 1000, the reserved 1004/1005/1006/1015, the unassigned
+   1016-2999, and 5000+ are rejected here, as the receive path refuses
+   them from a peer. A silent u16 truncation on out-of-range input
+   (values > 65535) would put bytes on the wire the application never
    asked for."
-  (unless (or (<= 1000 code 1003)
-              (<= 1007 code 1014)
-              (<= 3000 code 4999))
+  (unless (ws-close-code-valid-p code)
     (error "build-ws-close: code ~a not allowed to be sent per RFC 6455 §7.4.1 ~
             (use 1000-1003, 1007-1014, or 3000-4999)" code))
   (let ((payload (make-array 2 :element-type '(unsigned-byte 8))))
@@ -725,7 +722,13 @@
                                    (close-with 1002)))
                                 (t (logior (ash (aref payload 0) 8)
                                            (aref payload 1)))))
-                    (code (clamp-close-code raw-code)))
+                    (code raw-code))
+               ;; A status code no close frame may carry is a malformed
+               ;; frame, like the 1-byte body above, and gets the same 1002.
+               (unless (ws-close-code-valid-p code)
+                 (log-throttled :warn :ws-close "ws close with invalid status code ~d fd ~d"
+                                code (connection-fd conn))
+                 (return-from websocket-on-read (close-with 1002)))
                ;; RFC 6455 §5.5.1: close reason text must be valid UTF-8
                (when (> (length payload) 2)
                  (handler-case

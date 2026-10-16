@@ -3832,10 +3832,10 @@
                (error () :error)))
            :sent))
 
-  ;; build-ws-close only accepts the send-allowed set per RFC 6455
-  ;; §7.4.1: 1000-1003, 1007-1014, 3000-4999. Clamp-on-receive is
-  ;; interop-friendly; send-strict is symmetric with the RFC's MUST
-  ;; NOT on 1004/1005/1006/1015.
+  ;; build-ws-close only accepts the set a close frame may carry, per RFC
+  ;; 6455 §7.4.1: 1000-1003, 1007-1014, 3000-4999 — the same set the
+  ;; receive path holds a peer to, and the RFC's MUST NOT on
+  ;; 1004/1005/1006/1015.
   (flet ((raises-p (thunk)
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
@@ -4152,34 +4152,38 @@
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
            t)
 
-    ;; Reserved close code handling on the receive side: clients can
-    ;; send any code and the server CLAMPS (not fails) on receive for
-    ;; interop. BUILD-WS-CLOSE on the send side is strict and rejects
-    ;; reserved codes — see the test-websocket section that covers
-    ;; BUILD-WS-CLOSE's allowed set directly. The clamp tests below
-    ;; exercise the receive classifier.
-    (check "close code 1004 clamped"
-           (web-skeleton::clamp-close-code 1004) 1000)
-    (check "close code 1005 clamped"
-           (web-skeleton::clamp-close-code 1005) 1000)
-    (check "close code 1006 clamped"
-           (web-skeleton::clamp-close-code 1006) 1000)
-    (check "close code 1015 clamped"
-           (web-skeleton::clamp-close-code 1015) 1000)
-    (check "close code 999 clamped"
-           (web-skeleton::clamp-close-code 999) 1000)
-    (check "close code 1000 passes"
-           (web-skeleton::clamp-close-code 1000) 1000)
-    (check "close code 1001 passes"
-           (web-skeleton::clamp-close-code 1001) 1001)
-    (check "close code 3000 passes"
-           (web-skeleton::clamp-close-code 3000) 3000)
-    (check "close code 5000 clamped"
-           (web-skeleton::clamp-close-code 5000) 1000)
-    (check "close code 65535 clamped"
-           (web-skeleton::clamp-close-code 65535) 1000)
-    (check "close code 4999 passes"
-           (web-skeleton::clamp-close-code 4999) 4999)
+    ;; A peer's close frame is answered by its status code. A code a
+    ;; close frame may carry is echoed; any other makes the frame
+    ;; malformed, and the answer is 1002, as for a 1-byte body. One code
+    ;; from each band on either side of every boundary, through
+    ;; WEBSOCKET-ON-READ, since the answer is what a peer sees.
+    (flet ((answer-to-close (code)
+             (let* ((payload (make-array 2 :element-type '(unsigned-byte 8)
+                                           :initial-contents
+                                           (list (ldb (byte 8 8) code)
+                                                 (ldb (byte 8 0) code))))
+                    (conn (web-skeleton::make-connection
+                           :fd -1 :state :websocket :last-active 0))
+                    (buf (copy-seq (make-masked-frame t 8 payload))))
+               (setf (web-skeleton::connection-read-buf conn) buf
+                     (web-skeleton::connection-read-pos conn) (length buf))
+               (multiple-value-bind (action response)
+                   (web-skeleton::websocket-on-read conn nil)
+                 (list action
+                       (when (and response (>= (length response) 4))
+                         (logior (ash (aref response 2) 8) (aref response 3))))))))
+      (dolist (code '(1000 1001 1003 1007 1011 1014 3000 4999))
+        (check (format nil "close code ~d is echoed" code)
+               (answer-to-close code) (list :close code)))
+      (dolist (code '(0 999 1004 1005 1006 1015 1016 2999 5000 65535))
+        (check (format nil "close code ~d is answered 1002" code)
+               (answer-to-close code) (list :close 1002))))
+    (dolist (code '(1000 1003 1007 1014 3000 4999))
+      (check (format nil "close code ~d is valid" code)
+             (web-skeleton::ws-close-code-valid-p code) t))
+    (dolist (code '(999 1004 1005 1006 1015 1016 2999 5000))
+      (check (format nil "close code ~d is not" code)
+             (web-skeleton::ws-close-code-valid-p code) nil))
 
     ;; Close frame with invalid UTF-8 reason — must fail with 1007
     ;; (RFC 6455 §5.5.1: reason text after the 2-byte code must be valid UTF-8)
