@@ -7478,6 +7478,46 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-a-stale-event-skips-the-fd-s-next-connection ()
+  "An event taken in a batch for a connection that has since closed is
+   not applied to the connection that took its fd later in the batch.
+
+   Built directly, since arranging a close and a reuse inside one live
+   epoll_wait batch is a race. OLD is the connection the hang-up was
+   reported for, closed since; NEW holds the same fd on the table. The
+   control is the same hang-up with NEW as its owner, which does close
+   NEW, so the first check is the owner comparison and not an event that
+   does nothing."
+  (format t "~%Event loop: a stale event and a reused fd~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (web-skeleton::*connections* (make-hash-table :test #'eql)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (old (web-skeleton::make-connection
+                        :fd -1 :state :closing :last-active 0))
+                  (new (web-skeleton::make-connection
+                        :fd fd :socket server :state :read-http
+                        :last-active (get-universal-time))))
+             (web-skeleton::register-connection new)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (web-skeleton::dispatch-connection-event
+              fd web-skeleton::+epollhup+ old epfd nil nil)
+             (check "stale event: the fd's next connection stays open"
+                    (list (eq (web-skeleton::lookup-connection fd) new)
+                          (web-skeleton::connection-fd new))
+                    (list t fd))
+             (web-skeleton::dispatch-connection-event
+              fd web-skeleton::+epollhup+ new epfd nil nil)
+             (check "stale event: the hang-up closes the connection it was for"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd new))
+                    (list nil -1)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The ping sweep flushes inline
 ;;;
@@ -11869,6 +11909,7 @@
   (test-websocket-peer-that-leaves-mid-frame)
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
+  (test-a-stale-event-skips-the-fd-s-next-connection)
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
   (test-ws-send-arms-from-a-fetch-callback)

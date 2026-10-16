@@ -1803,6 +1803,48 @@
 ;;; Event loop
 ;;; ---------------------------------------------------------------------------
 
+(defun dispatch-connection-event (fd flags owner epoll-fd handler ws-handler)
+  "Apply one epoll event to the connection on FD, if that is still OWNER:
+   the connection FD belonged to when the batch was taken.
+
+   A batch is read from epoll before any of it is handled, and handling
+   one event can close a connection that has an event later in the same
+   batch. CLOSE-CONNECTION takes an :AWAITING inbound's outbound down with
+   it, and a detached fetch's orphans. The closed fd is then the lowest
+   free number, so an accept later in the batch, or a handler's fetch, is
+   handed it, and the old connection's event would land on the new one:
+   an EPOLLHUP closing a client that has sent nothing, or stale flags run
+   against a fresh outbound. Comparing against the owner drops such an
+   event. A connection opened during the batch has no event in it, so an
+   fd that had no owner has nothing to apply either.
+
+   Within one event the connection is asked for again before each later
+   step, for the same reason: reading can close it, and the write and
+   hang-up steps are its own only while it is still on the table."
+  (let ((conn (lookup-connection fd)))
+    (when (and conn (eq conn owner))
+      (if (connection-outbound-p conn)
+          (handle-outbound-event conn epoll-fd flags)
+          ;; Inbound. EPOLLIN before EPOLLHUP, so a fire-and-close HTTP/1.0
+          ;; client — it sends its request and FINs at once — has the
+          ;; request processed instead of losing it to the hang-up arm.
+          (flet ((still-here-p () (eq (lookup-connection fd) conn)))
+            (when (logtest flags +epollin+)
+              (handle-client-read conn epoll-fd handler ws-handler))
+            (when (and (logtest flags +epollout+) (still-here-p))
+              (when (and (eq (handle-client-write conn epoll-fd) :keep-alive)
+                         (still-here-p))
+                ;; Keep-alive reset: read at once, in case the next request
+                ;; is already buffered, since edge-triggered epoll will not
+                ;; report it again.
+                (handle-client-read conn epoll-fd handler ws-handler)))
+            ;; Error or hang-up, unless the read or write path already tore
+            ;; the connection down.
+            (when (and (or (logtest flags +epollerr+)
+                           (logtest flags +epollhup+))
+                       (still-here-p))
+              (close-connection conn epoll-fd)))))))
+
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler on-tick)
   "Main event loop. Runs until WORKER-STOPPING-P: *SHUTDOWN* is set, or a
    later START-SERVER has begun. Either way it drains first, so a response
@@ -1815,62 +1857,31 @@
         ;; T while an accept has failed with the backlog possibly not
         ;; drained; the maintenance tick retries. See ACCEPT-PENDING.
         (accept-retry    nil)
-        (event-buf (make-epoll-event-buf +max-events+)))
+        (event-buf (make-epoll-event-buf +max-events+))
+        ;; The connection each event in a batch was reported for, taken
+        ;; before any of them is handled. See DISPATCH-CONNECTION-EVENT.
+        (owners (make-array +max-events+ :initial-element nil)))
     (loop
       (when (worker-stopping-p)
         (drain-connections listener-socket epoll-fd event-buf)
         (return))
       (let ((n (epoll-wait epoll-fd event-buf +max-events+
                            (max 10 (round (* *worker-wake-interval* 1000))))))
-        (loop for i from 0 below n
-              do (block handle-event
-                   (let ((fd    (epoll-event-fd event-buf i))
-                         (flags (epoll-event-flags event-buf i)))
-                     (cond
-                       ;; New connection on the listener
-                       ((= fd listener-fd)
-                        ;; Edge-triggered: accept until none pending, or
-                        ;; until an accept fails and the tick has to retry.
-                        (setf accept-retry
-                              (accept-pending listener-socket epoll-fd)))
-                       ;; Event on a connection (inbound or outbound)
-                       (t
-                        (let ((conn (lookup-connection fd)))
-                          (when conn
-                            (if (connection-outbound-p conn)
-                                ;; Outbound fetch connection
-                                (handle-outbound-event conn epoll-fd flags)
-                                ;; Inbound client connection. Process
-                                ;; EPOLLIN before EPOLLHUP so a
-                                ;; fire-and-close HTTP/1.0 client
-                                ;; (sends request, immediately FINs)
-                                ;; gets the request processed instead
-                                ;; of losing it to the HUP arm.
-                                (progn
-                                  ;; Readable
-                                  (when (logtest flags +epollin+)
-                                    (handle-client-read conn epoll-fd handler ws-handler))
-                                  ;; Writable (rebind from table — fd may
-                                  ;; have been reused since the batch start)
-                                  (when (logtest flags +epollout+)
-                                    (let ((live (lookup-connection fd)))
-                                      (when live
-                                        (when (eq (handle-client-write live epoll-fd)
-                                                  :keep-alive)
-                                          ;; Keep-alive reset — read immediately in case
-                                          ;; the next request is already buffered
-                                          ;; (edge-triggered epoll won't re-notify)
-                                          (when (lookup-connection fd)
-                                            (handle-client-read live epoll-fd
-                                                                handler ws-handler))))))
-                                  ;; Error/hangup — close only if the
-                                  ;; read/write path didn't already
-                                  ;; tear the connection down.
-                                  (when (or (logtest flags +epollerr+)
-                                           (logtest flags +epollhup+))
-                                    (let ((live (lookup-connection fd)))
-                                      (when live
-                                        (close-connection live epoll-fd))))))))))))))
+        (dotimes (i n)
+          (setf (svref owners i)
+                (lookup-connection (epoll-event-fd event-buf i))))
+        (dotimes (i n)
+          (let ((fd    (epoll-event-fd event-buf i))
+                (flags (epoll-event-flags event-buf i)))
+            (if (= fd listener-fd)
+                ;; Edge-triggered: accept until none pending, or until an
+                ;; accept fails and the tick has to retry.
+                (setf accept-retry (accept-pending listener-socket epoll-fd))
+                (dispatch-connection-event fd flags (svref owners i)
+                                           epoll-fd handler ws-handler))))
+        ;; Held past the batch, a closed connection would wait here for the
+        ;; next batch as large before it could be collected.
+        (fill owners nil :end n))
       ;; Periodic maintenance — both scans gated on elapsed wall
       ;; clock so a busy epoll loop doesn't walk the connection
       ;; table multiple times per second. 1 s is fine: idle
