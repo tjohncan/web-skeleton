@@ -440,17 +440,49 @@
             (setf ssl (tls-client-ssl
                        hostname
                        (sb-bsd-sockets:socket-file-descriptor socket)))
-            ;; TLS handshake
-            (let ((result (%ssl-connect ssl)))
-              (unless (= result 1)
-                (error "SSL_connect failed: error ~d"
-                       (%ssl-get-error ssl result))))
+            ;; The handshake, re-issued after an interruption. SSL_connect
+            ;; resumes where it stopped, on a blocking socket as on a
+            ;; non-blocking one.
+            (call-retrying-eintr
+             (lambda ()
+               (let* ((result (%ssl-connect ssl))
+                      ;; Before SSL_get_error, which can set errno itself.
+                      (errno (if (= result 1) 0 (get-errno))))
+                 (if (= result 1)
+                     :done
+                     (let ((err (%ssl-get-error ssl result)))
+                       (if (or (= err +ssl-error-want-read+)
+                               (= err +ssl-error-want-write+))
+                           (blocking-want-or-raise "SSL_connect" errno)
+                           (error "SSL_connect failed: error ~d" err)))))))
             (values ssl socket))
         (error (e)
           (when ssl
             (ignore-errors (%ssl-free ssl)))
           (ignore-errors (sb-bsd-sockets:socket-close socket))
           (error "tls-connect ~a:~d failed: ~a" hostname port e))))))
+
+(defun blocking-want-or-raise (operation errno)
+  "Answer a WANT_READ or WANT_WRITE that OPERATION reported on a blocking
+   socket carrying SO_RCVTIMEO and SO_SNDTIMEO: :RETRY when ERRNO is EINTR,
+   and otherwise the timeout.
+
+   OpenSSL's socket BIO counts EINTR as retryable, beside EAGAIN, so an
+   interrupted read(2) or write(2) reaches SSL_get_error as the same WANT
+   code a timeout does, and errno is all that tells the two apart. The
+   interruption is ordinary. SBCL stops every other thread with a signal
+   for each garbage collection, and each DNS lookup's getent child ends
+   with a SIGCHLD; per signal(7) a socket call with a timeout installed
+   fails with EINTR when a handler interrupts it, whatever SA_RESTART says.
+   Taken for a timeout, a collection on any worker would end a fetch on
+   another one a few milliseconds into its budget.
+
+   CALL-RETRYING-EINTR acts on :RETRY, and it bounds the sequence by
+   *FETCH-TIMEOUT*, since the socket timeouts restart with every call."
+  (if (= errno +eintr+)
+      :retry
+      (error "~a: timed out (no progress within *fetch-timeout*, ~a s)"
+             operation *fetch-timeout*)))
 
 (defun ssl-write-retry-or-raise (ssl n &optional
                                        (errno (get-errno))
@@ -467,8 +499,10 @@
    SSL-BLOCKING-READ-EOF-OR-RAISE gives for WANT_READ on the read side,
    and as WANT_READ when the write had to read first and that timed out;
    some OpenSSL paths report it as SSL_ERROR_SYSCALL with EAGAIN instead.
-   All three are the timeout here. TLS-WRITE-ALL is the only caller, and
-   its socket blocks; the event loop's writer has its own classifier.
+   All three are the timeout here, and the WANT codes are an interruption
+   instead when errno is EINTR, as BLOCKING-WANT-OR-RAISE explains.
+   TLS-WRITE-ALL is the only caller, and its socket blocks; the event
+   loop's writer has its own classifier.
 
    ERRNO before ERR, and the ordering is load-bearing: &OPTIONAL defaults
    evaluate left to right, so errno is taken before SSL_get_error runs.
@@ -477,8 +511,7 @@
    and errno is the entire basis of the split below."
   (cond
     ((or (= err +ssl-error-want-write+) (= err +ssl-error-want-read+))
-     (error "SSL_write: timed out (no progress within *fetch-timeout*, ~a s)"
-            *fetch-timeout*))
+     (blocking-want-or-raise "SSL_write" errno))
     ((= err +ssl-error-syscall+)
      (cond
        ((= errno +eintr+) :retry)
@@ -577,23 +610,10 @@
                                   here delivers it as success. Loud
                                   raise, always.
 
-   EINTR IS REACHABLE, and not by the route a reader will assume. It is
-   *un*reachable on the event loop's sockets: those are non-blocking, so
-   a read answers EAGAIN rather than entering the interruptible sleep
-   where EINTR is generated. The blocking fetch path is three things at
-   once. BLOCKING-CONNECT restores blocking mode deliberately, so the
-   call can sleep. SET-SOCKET-TIMEOUT installs SO_RCVTIMEO so
-   *FETCH-TIMEOUT* bounds it, and per signal(7) a blocking socket call
-   carrying a receive timeout fails with EINTR when interrupted
-   *regardless of SA_RESTART* — the handler flag that would otherwise
-   restart it does not apply. And the framework supplies the signal
-   itself: DNS resolution spawns a getent child per lookup, so SIGCHLD is
-   ordinary on a path that has just resolved a name.
-
-   Blocking socket, receive timeout installed, and a signal this process
-   generates for itself. Do not delete this arm on the grounds that
-   non-blocking sockets never see EINTR: that is true, and is not where
-   this one comes from.
+   OpenSSL's socket BIO reports an interrupted read as WANT_READ with
+   errno EINTR rather than as SYSCALL, so the blocking path meets its
+   interruptions in BLOCKING-WANT-OR-RAISE. The EINTR arm answers the same
+   way, because an interrupted call is one however it is reported.
 
    WANT_READ and WANT_WRITE reaching here is a caller bug: both are
    continuable and belong to whoever knows how to continue them."
@@ -619,22 +639,20 @@
 
    The difference is what a would-block means there, and it is not a
    difference of degree: a blocking read does not return would-block
-   unless the receive timeout expired, so it is the timeout and gets the
-   loud error DEPLOYMENT.md promises.
+   unless the receive timeout expired or a signal interrupted the wait.
+   The timeout gets the loud error DEPLOYMENT.md promises, and the
+   interruption is issued again.
 
-   OpenSSL reports that expiry as SSL_ERROR_WANT_READ, not as
-   SSL_ERROR_SYSCALL with EAGAIN: its socket BIO sees read(2) fail with
-   EAGAIN, marks the call retryable, and SSL_read returns -1 with the
-   continuable code. On the event loop's sockets that code is the
-   caller's to continue, which is why the shared classifier refuses it;
-   on this socket nothing will continue it, because the wait it asks for
-   is the one that just ran out. So WANT_READ is the receive timeout here,
-   and so is WANT_WRITE, which a read reports when it had to send first —
-   a renegotiation — and the send timed out. Measured against an
-   s_server that takes the request and never answers: WANT_READ, after
-   one *FETCH-TIMEOUT*. SYSCALL with EAGAIN, which some OpenSSL paths
-   report for the same event, still reaches the same error through
-   :AGAIN.
+   OpenSSL reports both as SSL_ERROR_WANT_READ, not as SSL_ERROR_SYSCALL:
+   its socket BIO sees read(2) fail with EAGAIN or EINTR, marks the call
+   retryable, and SSL_read returns -1 with the continuable code. On the
+   event loop's sockets that code is the caller's to continue, which is
+   why the shared classifier refuses it; on this socket nothing will
+   continue it, because the wait it asks for is the one that just ended.
+   WANT_WRITE means the same thing, from a read that had to send first —
+   a renegotiation. BLOCKING-WANT-OR-RAISE tells the two causes apart by
+   errno. SYSCALL with EAGAIN, which some OpenSSL paths report for the
+   timeout, reaches the same error through :AGAIN.
 
    :RETRY passes straight through. An interrupted call means the same
    thing on either kind of socket, and the caller's CALL-RETRYING-EINTR
@@ -644,8 +662,8 @@
    the transport reported, this one answers what it means on this kind of
    socket, and neither has to know the other's business."
   (when (or (= err +ssl-error-want-read+) (= err +ssl-error-want-write+))
-    (error "SSL_read: timed out (no progress within *fetch-timeout*, ~a s)"
-           *fetch-timeout*))
+    (return-from ssl-blocking-read-eof-or-raise
+      (blocking-want-or-raise "SSL_read" errno)))
   (let ((verdict (ssl-read-eof-or-raise ssl n errno err)))
     (if (eq verdict :again)
         (error "SSL_read: timed out (~a)" (errno-string errno))

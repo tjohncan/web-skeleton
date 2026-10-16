@@ -890,10 +890,10 @@
    that answer.
 
    :RETRY is what the blocking byte sources report for EINTR —
-   PLAIN-BYTE-READER and PLAIN-WRITE-ALL here, and the SSL classifiers in
-   tls.lisp: the call was interrupted before it moved any bytes, so
-   re-issuing it unchanged is the whole of the correction. Nothing was
-   lost and nothing is done twice.
+   PLAIN-BYTE-READER and PLAIN-WRITE-ALL here, and the SSL classifiers and
+   handshake in tls.lisp: the call was interrupted before it moved any
+   bytes, so re-issuing it unchanged is the whole of the correction.
+   Nothing was lost and nothing is done twice.
 
    Bounded by *FETCH-TIMEOUT* across the whole sequence, and deliberately
    not by a count of retries. The difference is the whole of it. A counter
@@ -902,12 +902,13 @@
    deadline fails only a fetch that has already outrun the budget the
    caller set, which is what setting that budget asked for.
 
-   Leaving it unbounded would be wrong, for a reason specific to this
-   framework. SO_RCVTIMEO restarts per syscall,
-   so it bounds each call and never the sequence — and this process
-   generates SIGCHLD by design, one getent child per DNS lookup. That is
-   the same fact SSL-READ-EOF-OR-RAISE uses to argue that EINTR is
-   reachable at all, and it cuts both ways.
+   Leaving it unbounded would be wrong, because SO_RCVTIMEO restarts per
+   syscall, so it bounds each call and never the sequence, and the
+   signals here are routine: SBCL stops every other thread with one for
+   each garbage collection, and each getent child ends with a SIGCHLD.
+   Under steady collection a stalled upstream retried without a deadline
+   would never time out. BLOCKING-WANT-OR-RAISE in tls.lisp has the same
+   facts, and they are why EINTR reaches the TLS path at all.
 
    The deadline is taken on the first interruption rather than up front:
    the ordinary path never retries, and should not pay a clock read per

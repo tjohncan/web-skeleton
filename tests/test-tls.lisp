@@ -20,6 +20,7 @@
         (test-tls-client-ssl)
         (test-tls-end-to-end)
         (test-tls-blocking-read-timeout-is-reported-as-one)
+        (test-https-stream-survives-collections)
         (test-tls-ssl-pending)
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
@@ -400,6 +401,111 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                     (search "SSL_read: timed out" outcome)
                                     t)
                                t))))
+               (ignore-errors (close (sb-ext:process-input proc)))
+               (ignore-errors (sb-ext:process-kill proc 15))
+               (ignore-errors (sb-ext:process-wait proc)))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-stream-survives-collections ()
+  "HTTP-FETCH-STREAM over https:// reads a slow body to its end while
+   another thread collects garbage throughout.
+
+   Each collection stops every other thread with a signal, and a blocking
+   read carrying SO_RCVTIMEO fails with EINTR when one lands in it, which
+   OpenSSL reports with the WANT_READ a receive timeout gets. Taken for
+   the timeout, the stream ends at the first collection to land in a
+   wait. The peer spaces its lines so that every read waits, and the
+   collector runs far more often than the lines arrive, so each wait is
+   interrupted many times over.
+
+   The handshake gets the same treatment. The peer is stopped before the
+   fetch connects and resumed a moment later, so SSL_connect waits on a
+   peer that cannot answer yet, and collections land in that wait too.
+
+   The peer is s_server in relay mode, fed from this process: a head
+   framed by the close, then the lines, then the end of its input, which
+   it answers with close_notify."
+  (format t "~%TLS: a blocking stream outlasts collections on another thread~%")
+  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+        (expected (loop for i below 6 collect (format nil "line ~d" i))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "gc stream: fixture certificates generated" nil t)
+             (return-from test-https-stream-survives-collections))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir)
+                    nil)
+           (let* ((port (%pick-free-port))
+                  (proc (sb-ext:run-program
+                         "openssl"
+                         (list "s_server" "-accept" (princ-to-string port)
+                               "-cert" (format nil "~a/right.pem" dir)
+                               "-key"  (format nil "~a/right.key" dir)
+                               "-quiet" "-naccept" "1")
+                         :wait nil :output nil :error nil
+                         :directory dir :search t :input :stream))
+                  (stop nil)
+                  (threads nil))
+             (unwind-protect
+                  (progn
+                    (check "gc stream: the peer is listening"
+                           (%wait-for-listener port) t)
+                    ;; Stopped, the peer's kernel still completes the TCP
+                    ;; connect, and the ClientHello waits unanswered.
+                    (sb-ext:process-kill proc 19)
+                    (push (sb-thread:make-thread
+                           (lambda ()
+                             ;; The peer may be gone early when the fetch
+                             ;; fails, and a write into its closed input
+                             ;; must not end the run.
+                             (ignore-errors
+                              (sleep 0.4)
+                              (sb-ext:process-kill proc 18)
+                              (let ((in (sb-ext:process-input proc)))
+                                (format in "HTTP/1.1 200 OK~a~
+                                            Connection: close~a~a"
+                                        *crlf* *crlf* *crlf*)
+                                (finish-output in)
+                                (dolist (line expected)
+                                  (sleep 0.15)
+                                  (write-line line in)
+                                  (finish-output in))
+                                (close in))))
+                           :name "gc-stream-feeder")
+                          threads)
+                    (push (sb-thread:make-thread
+                           (lambda ()
+                             (loop until stop
+                                   do (sb-ext:gc)
+                                      (sleep 0.005)))
+                           :name "gc-stream-collector")
+                          threads)
+                    (let* ((lines nil)
+                           (outcome
+                             (let ((web-skeleton::*dns-resolve-blocking-fn*
+                                     (lambda (host)
+                                       (declare (ignore host))
+                                       (values #(127 0 0 1) :inet)))
+                                   (web-skeleton:*fetch-timeout* 10))
+                               (handler-case
+                                   (http-fetch-stream
+                                    :get (format nil "https://right.test:~d/" port)
+                                    :on-line (lambda (line) (push line lines)))
+                                 (error (e) (princ-to-string e))))))
+                      (check "gc stream: the stream ended with its status"
+                             outcome 200)
+                      (check "gc stream: and delivered every line"
+                             (reverse lines) expected)))
+               (setf stop t)
+               (ignore-errors (sb-ext:process-kill proc 18))
+               (dolist (thread threads)
+                 (ignore-errors (sb-thread:join-thread thread :timeout 5)))
                (ignore-errors (close (sb-ext:process-input proc)))
                (ignore-errors (sb-ext:process-kill proc 15))
                (ignore-errors (sb-ext:process-wait proc)))))
@@ -891,27 +997,20 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (when sock (ignore-errors (sb-bsd-sockets:socket-close sock))))))
 
 (defun test-ssl-eintr-retry ()
-  "EINTR is a retry, not a transport failure, on both classifiers — and
-   the loop that acts on it actually loops.
+  "EINTR is a retry, not a transport failure or a timeout, on every
+   blocking classifier — and the loop that acts on it actually loops.
 
    An interrupted call moved no bytes and left the connection intact, so
-   reporting it as a transport error fails a fetch that nothing is wrong
-   with. It reached the application as a 502 with the callback's cleanup
-   sentinel.
+   reporting it as an error fails a fetch that nothing is wrong with.
 
-   Reachable on the blocking fetch path specifically, and not by the
-   route a reader assumes. Those sockets are blocking by BLOCKING-CONNECT's
-   deliberate choice and carry SO_RCVTIMEO so *FETCH-TIMEOUT* bounds them,
-   and per signal(7) a blocking socket call carrying a receive timeout
-   fails with EINTR when interrupted regardless of SA_RESTART. The
-   framework then supplies the signal: a getent child per DNS lookup, on a
-   path that has just resolved a name.
-
-   Asserted directly rather than provoked, for the same reason the
-   ECONNRESET branch above is: arranging a real signal to land inside an
-   in-flight SSL_read is not something this fixture can do reliably, and a
-   test that only sometimes reaches its branch only sometimes catches a
-   regression in it. Stated rather than implied.
+   The pair that matters is the one OpenSSL produces: its socket BIO
+   counts EINTR as retryable, so an interrupted read or write arrives as
+   WANT_READ or WANT_WRITE with errno EINTR — the same codes a blocking
+   socket's timeout gets, told apart only by errno. SYSCALL with EINTR is
+   asserted too, since the classifiers answer it the same way.
+   TEST-HTTPS-STREAM-SURVIVES-COLLECTIONS provokes the real thing; these
+   pin each classifier's answer, including the ones that test cannot
+   steer a signal into.
 
    The count in the loop check is the assertion with teeth. A helper that
    called its thunk once and returned whatever it got would satisfy the
@@ -920,11 +1019,38 @@ printf 'TAIL-MARKER\\n' >> body.txt
   (let ((classify (tls-sym "SSL-READ-EOF-OR-RAISE"))
         (blocking (tls-sym "SSL-BLOCKING-READ-EOF-OR-RAISE"))
         (wclass   (tls-sym "SSL-WRITE-RETRY-OR-RAISE"))
+        (want     (tls-sym "BLOCKING-WANT-OR-RAISE"))
         (retrying (tls-sym "CALL-RETRYING-EINTR"))
         (syscall  (symbol-value (tls-sym "+SSL-ERROR-SYSCALL+")))
+        (want-read  (symbol-value (tls-sym "+SSL-ERROR-WANT-READ+")))
+        (want-write (symbol-value (tls-sym "+SSL-ERROR-WANT-WRITE+")))
         (eagain   (symbol-value (find-symbol "+EAGAIN+" :web-skeleton)))
         (eintr    (symbol-value (find-symbol "+EINTR+" :web-skeleton)))
         (econnreset 104))
+    (flet ((timed-out-p (answer)
+             (and (stringp answer) (search "timed out" answer) t)))
+      ;; The WANT codes with EINTR, on each blocking classifier, and their
+      ;; neighbours with EAGAIN, which must stay the timeout.
+      (check "eintr: a blocking read's WANT_READ with EINTR is a retry"
+             (attempt (funcall blocking nil -1 eintr want-read)) :retry)
+      (check "eintr: a blocking read's WANT_WRITE with EINTR is a retry"
+             (attempt (funcall blocking nil -1 eintr want-write)) :retry)
+      (check "eintr: a blocking read's WANT_READ with EAGAIN is the timeout"
+             (timed-out-p (attempt (funcall blocking nil -1 eagain want-read)))
+             t)
+      (check "eintr: a blocking write's WANT_WRITE with EINTR is a retry"
+             (attempt (funcall wclass nil -1 eintr want-write)) :retry)
+      (check "eintr: a blocking write's WANT_READ with EINTR is a retry"
+             (attempt (funcall wclass nil -1 eintr want-read)) :retry)
+      (check "eintr: a blocking write's WANT_WRITE with EAGAIN is the timeout"
+             (timed-out-p (attempt (funcall wclass nil -1 eagain want-write)))
+             t)
+      (check "eintr: a handshake step interrupted is a retry"
+             (attempt (funcall want "SSL_connect" eintr)) :retry)
+      (check "eintr: a handshake step that waited out the timeout says so"
+             (let ((answer (attempt (funcall want "SSL_connect" eagain))))
+               (and (timed-out-p answer) (search "SSL_connect" answer) t))
+             t))
     ;; Read side, and the blocking wrapper must pass it through rather
     ;; than convert it into the loud receive-timeout error — reporting a
     ;; blown 30-second deadline milliseconds into the budget is the
@@ -945,9 +1071,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
            (stringp (attempt (funcall wclass nil -1 econnreset syscall))) t)
     ;; The send timeout as OpenSSL reports it on a blocking socket: WANT_WRITE.
     (check "SSL_write with WANT_WRITE is the send timeout"
-           (let ((text (attempt (funcall wclass nil -1 0
-                                         (symbol-value
-                                          (tls-sym "+SSL-ERROR-WANT-WRITE+"))))))
+           (let ((text (attempt (funcall wclass nil -1 0 want-write))))
              (and (stringp text) (search "timed out" text) t))
            t)
     ;; And the loop.
