@@ -415,10 +415,19 @@
    the stream permanently different.
 
    Signals if CONN is not on this worker's connection table — an app
-   reaching across workers, which was silent before and appended to an
+   reaching across workers, whose frame would otherwise be appended to an
    unsynchronised queue. FETCH-INTO refuses the same misuse for the same
    reason, and the two agree: both refuse every cross-worker call, not
    only the ones that happen to leave a remainder.
+
+   Signals if CONN is not an open WebSocket, :CLOSING included. A close
+   frame is queued or sent by then, the echo of the peer's or the drain's
+   own, and RFC 6455 §5.5.1 allows no data frame after it. The connection
+   stays on the table until the write path flushes that frame and closes,
+   so the ownership check passes, and an application keeping its own
+   registry meets one on the pass its client closed. This refusal is what
+   README tells such a registry to prune on. MAP-WORKER-WEBSOCKETS visits
+   open WebSockets only, so a walk through it never sees one.
 
    The wrong worker, not the wrong thread. Asking whether an fd is on this
    worker's table takes a worker to ask from, so a call off the event loop
@@ -474,6 +483,11 @@
               else touches it, so appending here would corrupt it and the ~
               flush would call send(2) from the wrong thread."
              (connection-fd conn))))
+  (unless (eq (connection-state conn) :websocket)
+    (error "ws-send: fd ~d is ~s, not an open WebSocket. A frame after a ~
+            close frame is refused (RFC 6455 §5.5.1), and a connection that ~
+            is not a WebSocket takes no frames."
+           (connection-fd conn) (connection-state conn)))
   (unless (connection-append-write conn frame-bytes)
     (error "ws-send: fd ~d is at *max-write-backlog* (~d bytes pending, ~
             frame is ~d); the peer is not draining."

@@ -3810,7 +3810,8 @@
   ;; a full backlog forever. An empty frame is used so no fd is touched
   ;; and the guard is the only thing that can signal: without it, 0 with
   ;; nothing to write would return normally.
-  (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+  (let ((conn (web-skeleton::make-connection :fd -1 :state :websocket
+                                             :last-active 0))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (check "ws-send: zero timeout refused"
            (let ((*write-stall-timeout* 0))
@@ -11098,6 +11099,90 @@
       (setf (aref out (+ 6 i)) (logxor (aref bytes i) (aref mask (mod i 4)))))
     out))
 
+(defun test-ws-send-refuses-a-closing-websocket ()
+  "WS-SEND refuses a WebSocket whose close frame is queued, so no data
+   frame follows a close frame onto the wire (RFC 6455 §5.5.1).
+
+   The live shape is the one README's fan-out notes describe: an
+   application keeps its own registry and prunes it on the refusal.
+   :ON-TICK runs at the end of every pass, after the pass that queued the
+   close echo and before the write that flushes it, so a broadcast from
+   the hook meets the closing connection while it is still on the table.
+   The client reads to the end of the connection, and any frame after
+   the close frame is the failure. The ticks that arrive before the close
+   are the control that the broadcast reaches an open connection."
+  (format t "~%ws-send: a closing WebSocket takes no frame~%")
+  (let ((conn (web-skeleton::make-connection :fd -1 :state :closing
+                                             :last-active 0)))
+    ;; On the message: fd -1 fails any write, so a raise alone could be
+    ;; the flush failing after the frame was queued.
+    (check "closing ws: ws-send refuses a :closing connection"
+           (handler-case (progn (web-skeleton::ws-send
+                                 conn (web-skeleton:build-ws-text "late"))
+                                nil)
+             (error (e) (and (search "not an open WebSocket" (princ-to-string e))
+                             t)))
+           t)
+    (check "closing ws: and queues nothing"
+           (web-skeleton::connection-write-pending conn) 0))
+  (let ((registry nil))
+    (with-test-server
+        (:workers 1
+         :handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (conn frame)
+                       (declare (ignore frame))
+                       (pushnew conn registry)
+                       nil)
+         :on-tick (lambda (worker-id)
+                    (declare (ignore worker-id))
+                    (dolist (conn registry)
+                      (handler-case
+                          (web-skeleton::ws-send
+                           conn (web-skeleton:build-ws-text "tick"))
+                        (error ()
+                          (setf registry (remove conn registry)))))))
+      (flet ((frames (buf)
+               ;; The opcodes of the whole frames in BUF, in order, and where
+               ;; the last of them ends. Server frames are unmasked and these
+               ;; are short, so a frame is two header bytes and its payload.
+               (let ((pos 0) (fill (fill-pointer buf)) (opcodes nil))
+                 (loop while (< (1+ pos) fill)
+                       do (let ((len (logand (aref buf (1+ pos)) #x7F)))
+                            (when (> (+ pos 2 len) fill) (return))
+                            (push (logand (aref buf pos) #x0F) opcodes)
+                            (incf pos (+ 2 len))))
+                 (values (nreverse opcodes) pos))))
+        (let* ((sock (connect-to-test-server))
+               (stream (sb-bsd-sockets:socket-make-stream
+                        sock :input t :output t :element-type '(unsigned-byte 8))))
+          (unwind-protect
+               (let ((buf (make-array 256 :element-type '(unsigned-byte 8)
+                                          :fill-pointer 0 :adjustable t)))
+                 (%ws-client-upgrade stream)
+                 (write-sequence (%ws-client-frame 1 "join") stream)
+                 (force-output stream)
+                 (read-until-bounded stream :seconds 3 :into buf
+                                            :until (lambda (b fill)
+                                                     (declare (ignore b))
+                                                     (>= fill 6)))
+                 (check "closing ws: the broadcast reached the open connection"
+                        (first (frames buf)) 1)
+                 (write-sequence (%ws-client-frame 8 #(3 232)) stream)
+                 (force-output stream)
+                 (multiple-value-bind (all reason)
+                     (read-until-bounded stream :seconds 3 :into buf)
+                   (multiple-value-bind (opcodes end) (frames all)
+                     (check "closing ws: the server's close frame arrived"
+                            (and (member 8 opcodes) t) t)
+                     (check "closing ws: no frame follows the close frame"
+                            (list (rest (member 8 opcodes))
+                                  (- (fill-pointer all) end))
+                            (list nil 0))
+                     (check "closing ws: and the server closed the connection"
+                            reason :eof))))
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close sock))))))))
+
 (defun test-ws-handler-reply-of-the-wrong-type ()
   "A ws-handler that returns something other than a frame's bytes — a
    string, the commonest slip — has its connection closed, however many
@@ -11773,6 +11858,7 @@
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-send-refuses-a-foreign-connection)
+  (test-ws-send-refuses-a-closing-websocket)
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)
