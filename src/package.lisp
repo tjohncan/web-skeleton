@@ -155,6 +155,7 @@
            #:*stream-keepalive-interval*
            ;; Connection lifecycle
            #:*idle-timeout*
+           #:*linger-timeout*
            #:*ws-idle-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*

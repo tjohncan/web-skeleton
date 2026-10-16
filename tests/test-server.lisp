@@ -2267,6 +2267,34 @@
 ;;; Peer address formatter — both families
 ;;; ---------------------------------------------------------------------------
 
+(defun test-documented-settings-are-exported ()
+  "Every variable README's configuration table lists is external in
+   WEB-SKELETON and bound.
+
+   The table tells an application to SETF these before START-SERVER, and
+   one the package does not export is a reader error when the
+   application loads, under the single colon an application writes. The
+   rows are read from README.md itself, so a row added without its export
+   fails here."
+  (format t "~%Configuration table against the package~%")
+  (let ((names nil))
+    (with-open-file (in (asdf:system-relative-pathname "web-skeleton" "README.md")
+                        :external-format :utf-8)
+      (loop for line = (read-line in nil nil)
+            while line
+            do (when (and (> (length line) 4) (string= "| `*" line :end2 4))
+                 (let ((close (position #\` line :start 3)))
+                   (when close
+                     (pushnew (subseq line 3 close) names :test #'string=))))))
+    (check "settings: the configuration table was read"
+           (> (length names) 20) t)
+    (dolist (name (reverse names))
+      (multiple-value-bind (symbol status)
+          (find-symbol (string-upcase name) :web-skeleton)
+        (check (format nil "settings: ~a is exported and bound" name)
+               (and (eq status :external) (boundp symbol) t)
+               t)))))
+
 (defun test-format-peer-addr ()
   (format t "~%format-peer-addr~%")
   (check "v4 localhost"
@@ -11700,6 +11728,7 @@
   (test-dns-child-closed-only-once-dead)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
+  (test-documented-settings-are-exported)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
