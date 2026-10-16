@@ -4842,6 +4842,76 @@
              (web-skeleton::static-path-spelling raw)
              expected))))
 
+(defun test-static-names-with-pathname-syntax ()
+  "A file whose name holds pathname syntax is cached under the name the
+   filesystem gives it, and served at a browser's spelling of that name.
+
+   [ ] * ? and \\ mean something to a Lisp pathname — wildcards, and the
+   escape that keeps one literal — and NAMESTRING writes them escaped.
+   A key built from it reads /a\\[1].txt for the file a[1].txt, and no
+   request names that. Bundlers put brackets in route chunk names
+   ([slug], [id]), so this is ordinary build output.
+
+   The key set is compared whole, so an escaped key fails the check
+   rather than sitting beside the right one unnoticed."
+  (format t "~%Static: names that are pathname syntax~%")
+  (let* ((dir (format nil "/tmp/ws-static-syntax-~36r/" (random (expt 36 10))))
+         (saved-cache web-skeleton::*static-cache*)
+         (crlf (format nil "~c~c" #\Return #\Newline)))
+    (flet ((write-file (name text)
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string dir name))))
+               (ensure-directories-exist path)
+               (with-open-file (s path :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+                 (write-sequence (sb-ext:string-to-octets
+                                  text :external-format :utf-8)
+                                 s))))
+           (body-at (target)
+             (let ((response
+                     (attempt
+                       (serve-static
+                        (parse-request
+                         (format nil "GET ~a HTTP/1.1~aHost: x~a~a"
+                                 target crlf crlf crlf))))))
+               (cond ((null response) :not-served)
+                     ((stringp response) response)
+                     (t (let ((text (sb-ext:octets-to-string
+                                     (%response-octets response)
+                                     :external-format :latin-1)))
+                          (subseq text (+ 4 (search (format nil "~a~a" crlf crlf)
+                                                    text)))))))))
+      (unwind-protect
+           (progn
+             (write-file "a[1].txt" "bracketed")
+             (write-file "b*c.txt" "starred")
+             (write-file "q?.txt" "questioned")
+             (write-file "back\\slash.txt" "backslashed")
+             (write-file "[slug]/page-1a2b.js" "chunk")
+             (write-file "plain.txt" "plain")
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (web-skeleton::load-static-files dir)
+             (check "static syntax: every file is keyed by its own name"
+                    (sort (loop for key being the hash-keys
+                                  of web-skeleton::*static-cache*
+                                collect key)
+                          #'string<)
+                    (sort (list "/a[1].txt" "/b*c.txt" "/q?.txt"
+                                "/back\\slash.txt" "/[slug]/page-1a2b.js"
+                                "/plain.txt")
+                          #'string<))
+             (dolist (spec '(("/a[1].txt" "bracketed")
+                             ("/b*c.txt" "starred")
+                             ("/q%3F.txt" "questioned")
+                             ("/[slug]/page-1a2b.js" "chunk")
+                             ("/plain.txt" "plain")))
+               (destructuring-bind (target expected) spec
+                 (check (format nil "static syntax: ~a is served" target)
+                        (body-at target) expected))))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil)))))
+
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
 
@@ -11656,6 +11726,7 @@
   (test-websocket-fragmentation)
   (test-static-helpers)
   (test-static-serves-what-the-router-sees)
+  (test-static-names-with-pathname-syntax)
   (test-static-etag)
   (test-static-range)
   (test-static-range-copies-nothing)

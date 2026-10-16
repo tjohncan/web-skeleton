@@ -366,14 +366,20 @@
     (unless dir-path
       (log-warn "static: directory not found: ~a" directory)
       (return-from load-static-files))
-    (let ((base (namestring dir-path)))
+    ;; Native namestrings, here and for each file, because a URL path is a
+    ;; filesystem name. NAMESTRING escapes what a Lisp pathname reads as
+    ;; syntax — [ ] * ? and \ — so a[1].txt would be keyed /a\[1].txt, a
+    ;; path no request names. Nothing parses those strings back as
+    ;; pathnames: the walk starts from BASE parsed as a native name, and
+    ;; each file is opened through the pathname DIRECTORY gave it.
+    (let ((base (sb-ext:native-namestring dir-path)))
       ;; Ensure trailing /
       (unless (char= (char base (1- (length base))) #\/)
         (setf base (concatenate 'string base "/")))
       (let ((wild (merge-pathnames
                    (make-pathname :directory '(:relative :wild-inferiors)
                                   :name :wild :type :wild)
-                   base))
+                   (sb-ext:parse-native-namestring base)))
             (count 0)
             (total-bytes 0))
         ;; First pass: load all files (skip directories)
@@ -381,7 +387,7 @@
           (when (and (pathname-name file)
                      (> (length (pathname-name file)) 0)
                      (not (char= (char (pathname-name file) 0) #\.)))
-            (let ((fs-path (namestring file)))
+            (let ((fs-path (sb-ext:native-namestring file)))
               ;; SBCL's DIRECTORY resolves symlinks by default — a symlink
               ;; inside the tree that points outside (demo/static/leak ->
               ;; /etc/passwd) returns the resolved target path, which
@@ -400,7 +406,7 @@
                    ;; HIDDEN-PATH-COMPONENT-P.
                    (unless (hidden-path-component-p relative)
                      (let* ((url-path (concatenate 'string "/" relative))
-                            (raw-content (read-file-bytes fs-path))
+                            (raw-content (read-file-bytes file))
                             (rules (and subs-table (gethash url-path subs-table)))
                             (content (if rules
                                          (apply-substitutions raw-content rules)
