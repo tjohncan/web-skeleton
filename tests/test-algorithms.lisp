@@ -381,7 +381,7 @@
    The pure-Lisp verifier is called by name, so this holds whichever
    implementation ECDSA-VERIFY-P256 is swapped to.
 
-   Measured against the Jacobian verifier: a JACOBIAN-ADD that answers
+   Against the Jacobian verifier, a JACOBIAN-ADD that answers
    infinity for P + P fails the two Q = G entries, where Shamir's table
    builds G + Q by doubling, and a verifier without its point-at-infinity
    check fails the entry whose sum is infinity. The entry whose halves

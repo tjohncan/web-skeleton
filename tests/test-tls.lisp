@@ -83,7 +83,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    One command per line, no backslash continuations. A backslash before a
    newline inside a Common Lisp string escapes the newline and is consumed,
    so the shell never receives the continuation and each command silently
-   splits in two — which is how the first version of this failed.")
+   splits in two.")
 
 (defun %pick-free-port ()
   "Bind port 0, read the number, close, return it.
@@ -183,10 +183,10 @@ printf 'TAIL-MARKER\\n' >> body.txt
    which relay mode sends to the client as-is — the way to arrange a
    response bigger than one TLS record, and bigger than the read buffer.
 
-   Not -HTTP, which looked like the obvious way to serve a large file and
-   is not: measured, it truncates at around 10 KB against a reader that
-   consumes in 4 KiB steps driven by epoll, while delivering the whole file
-   to s_client. The cause is s_server's, not ours — a clean close_notify
+   Not -HTTP, which looks like the obvious way to serve a large file and
+   is not: it truncates at around 10 KB against a reader that consumes in
+   4 KiB steps driven by epoll, while delivering the whole file to
+   s_client. The cause is s_server's, not ours — a clean close_notify
    arrives mid-body — but a fixture that stops early for reasons belonging
    to the fixture cannot support an assertion about our drain loop."
   (let* ((port (%pick-free-port))
@@ -345,12 +345,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
   "HTTP-FETCH-STREAM over https:// to a peer that takes the request and
    never answers gives up after *FETCH-TIMEOUT*, and says it timed out.
 
-   The bound always held; the report did not. OpenSSL reports a blocking
-   socket's receive-timeout expiry as SSL_ERROR_WANT_READ, and the shared
-   classifier answers that code with an error calling it a caller bug, so
-   an operator facing a slow upstream was sent to read tls.lisp. The
-   classifier tests asserted the timeout with SYSCALL and EAGAIN, a pair
-   OpenSSL does not produce for this; this one provokes the real pair.
+   The report is the point as much as the bound. OpenSSL reports a
+   blocking socket's receive-timeout expiry as SSL_ERROR_WANT_READ, which
+   the shared classifier answers as a caller bug, so unless the blocking
+   wrapper calls it the timeout, an operator facing a slow upstream is
+   sent to read tls.lisp. The classifier checks assert the pairs they are
+   handed; this one provokes the real pair.
 
    The peer is s_server in relay mode with a stdin that never speaks: it
    completes the handshake, reads the request, and has nothing to relay."
@@ -518,8 +518,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
    CONNECTION-READ-AVAILABLE over an SSL byte source, driven only by
    edge-triggered epoll.
 
-   This is the trap most likely to bite, and until now it was an argument
-   rather than a test. SSL_read returns at most one record
+   This is the trap most likely to bite, and it is a test here rather than
+   an argument. SSL_read returns at most one record
    per call and hands back already-decrypted bytes before it touches the
    socket. Consume part of a record and the remainder sits in OpenSSL's
    buffer with nothing left on the fd, so an edge-triggered epoll has no
@@ -679,15 +679,15 @@ printf 'TAIL-MARKER\\n' >> body.txt
    than a race. A stopped process cannot read, so its receive buffer fills
    and stays full; and unlike a peer that has finished or exited, it cannot
    close the connection underneath the retry. Racing a live peer instead
-   produced exactly that — SSL_write failing with SSL_ERROR_SYSCALL because
+   risks exactly that — SSL_write failing with SSL_ERROR_SYSCALL because
    the far end had gone away mid-test.
 
    Small vectors, not one large one: a full GC is free to relocate a 1 KiB
    vector and would leave a multi-megabyte one where it is.
 
-   Measured: with staging removed, the retry raises \"SSL_write failed:
-   error 1\" — SSL_ERROR_SSL, OpenSSL's bad-write-retry — three runs of
-   three. That is this ruling demonstrated rather than argued."
+   With staging removed, the retry raises \"SSL_write failed: error 1\" —
+   SSL_ERROR_SSL, OpenSSL's bad-write-retry. That is this ruling
+   demonstrated rather than argued."
   (format t "~%TLS write retry across a GC~%")
   (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
     (unwind-protect
@@ -1101,8 +1101,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
       ;; STRINGP before SEARCH, and that guard is load-bearing. With the
       ;; deadline removed the loop returns 7, and SEARCH against a fixnum
       ;; raises a type error *outside* ATTEMPT — ending the run with no
-      ;; failure list rather than reporting one. Measured: that is exactly
-      ;; what the first version of this check did.
+      ;; failure list rather than reporting one.
       (let ((answer (attempt (funcall retrying
                                       (lambda ()
                                         (incf calls)
@@ -1201,11 +1200,11 @@ printf 'TAIL-MARKER\\n' >> body.txt
    definition is the point: two literals can agree and later drift apart
    without either test noticing.
 
-   Measured, this does *not* reach the :OK-EOF branch. s_server's
-   close_notify arrives as its own wake-up, so the walk completes on :OK
-   while the stream is still open — confirmed by removing the :OK-EOF
-   arm, which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
-   where that branch is pinned. This one covers the boundaries."
+   This does *not* reach the :OK-EOF branch. s_server's close_notify
+   arrives as its own wake-up, so the walk completes on :OK while the
+   stream is still open, and removing the :OK-EOF arm leaves this test
+   green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is where that branch is
+   pinned. This one covers the boundaries."
   (format t "~%HTTPS fetch :on-body chunk boundaries~%")
   (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
         (saved-dns web-skeleton::*dns-lookup-fn*))
@@ -1755,7 +1754,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
 (defun test-ssl-ctx-init ()
   ;; Smoke the shared-context init path for real. Registration checks
   ;; alone can't catch an FFI-level mistake — a binding that names the
-  ;; wrong libssl entry point (the historical SSL_ctrl / SSL_CTX_ctrl
+  ;; wrong libssl entry point (SSL_ctrl for SSL_CTX_ctrl is the easy
   ;; mixup) or passes the wrong struct type loads cleanly and only
   ;; misbehaves when the call executes. ENSURE-SSL-CTX runs the whole
   ;; init sequence (OPENSSL_init_ssl, SSL_CTX_new, TLS 1.2 floor via

@@ -674,9 +674,9 @@
    from, and appending it costs an entry on the queue rather than a
    rebuild of anything."
   ;; The prefixes were serialized at startup, so nothing downstream of here
-  ;; passes through FORMAT-RESPONSE and nothing counted these. Static files
-  ;; are most of a page's requests: uncounted, the census reported one
-  ;; response for a page load that made a dozen.
+  ;; passes through FORMAT-RESPONSE, and this is the one place to count
+  ;; them. Static files are most of a page's requests: uncounted, the
+  ;; census would report one response for a page load that made a dozen.
   (note-response (if (eq kind :not-modified) 304 200))
   (let ((prefix (ecase kind
                   ((:get :head) (static-entry-head-prefix entry))

@@ -1611,10 +1611,10 @@
     (check "ipv6 host rebracketed default port"
            (not (null (search "host: [2001:db8::1]" text))) t))
   ;; SCHEME exists in this builder for one observable reason: which port
-  ;; counts as default and is therefore left out of the Host header. It
-  ;; had no test, which is how a revert that stopped passing :SCHEME from
-  ;; the async fetch path went unnoticed — the fixture there binds an
-  ;; ephemeral port, where both schemes agree.
+  ;; counts as default and is therefore left out of the Host header. It is
+  ;; asserted here because the async fetch path's fixture binds an
+  ;; ephemeral port, where both schemes agree, so a caller that stopped
+  ;; passing :SCHEME would go unnoticed there.
   (let* ((bytes (web-skeleton::build-outbound-request
                  :GET "example.test" "/" :scheme :https :port 443))
          (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
@@ -2774,9 +2774,9 @@
    READER-READ-LINE to join a CRLF split across two fills, and the head,
    where every line ends in CRLF, is READER-READ-HEAD's. The CRLF body
    case after the corpus is what does. Its expectation is stated rather
-   than recorded. Measured: disabling the CRLF-straddle refill in
-   READER-READ-LINE leaves the whole corpus and the rest of the suite
-   green, and fails that case at :CHUNK 7 and :CHUNK 1."
+   than recorded. Disabling the CRLF-straddle refill in READER-READ-LINE
+   leaves the whole corpus and the rest of the suite green, and fails
+   that case at :CHUNK 7 and :CHUNK 1."
   (format t "~%Shared line reader over a byte-source function~%")
   (dolist (chunk '(nil 7 1))
     (dolist (entry (%response-corpus))
@@ -3785,9 +3785,8 @@
            nil)
     ;; The key is base64 over 16 fixed bytes, so its shape is fully
     ;; determined: 22 data characters then exactly "==". A flat alphabet
-    ;; sweep across all 24 admits '=' at any position, which accepted 24
-    ;; of them — while the comment above the loop claimed the positional
-    ;; strictness the loop did not have.
+    ;; sweep across all 24 admits '=' at any position, so it would accept
+    ;; 24 of them.
     (check "ws-upgrade: all-padding key rejected"
            (web-skeleton::websocket-upgrade-p
             (ws-req "========================"))
@@ -5942,11 +5941,11 @@
 
    The drain discipline is the part worth having. Edge-triggered epoll
    reports a transition, so readability must be drained in one pass —
-   stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
-   and until now not assertable without a real socket and a real partial
-   read. A scripted byte source makes it deterministic, which matters
-   because the whole SSL_pending argument rests on this loop behaving
-   exactly this way."
+   stated in CONNECTION-READ-AVAILABLE's docstring, and not assertable
+   against a real socket without arranging a real partial read. A
+   scripted byte source makes it deterministic, which matters because the
+   whole SSL_pending argument rests on this loop behaving exactly this
+   way."
   (format t "~%Connection transport seam~%")
   ;; ---- reads ----
   (let* ((calls (list 0))
@@ -8412,8 +8411,8 @@
     ;; value than PARSE-HEADERS-BYTES will. Each of these four moves a
     ;; different way against its CR-free twin — less refusing, more
     ;; refusing, and twice not at all — which is why the arm rests on the
-    ;; disagreement and not on a direction. SCAN-TRANSFER-ENCODING carries
-    ;; the measured table.
+    ;; disagreement and not on a direction, as SCAN-TRANSFER-ENCODING's
+    ;; bare-CR arm says.
     ;;
     ;; The no-space case is the one that distinguishes this arm. The spaced
     ;; case is here because it is what a natural probe writes, and the fold
@@ -8620,8 +8619,7 @@
     ;; second request pipelined behind, REQUEST-END has to land exactly on
     ;; its first byte. Computed from the pieces rather than written as a
     ;; number — a hand-counted offset is a second implementation of the
-    ;; arithmetic this slot exists to delete, and the first draft of this
-    ;; assertion got it wrong by five bytes.
+    ;; arithmetic this slot exists to delete, and an easy one to get wrong.
     (let* ((first-req (req (format nil "3~a123~a0~a~a"
                                    *crlf* *crlf* *crlf* *crlf*)))
            (both (concatenate '(vector (unsigned-byte 8))
@@ -9363,11 +9361,11 @@
 
    Driven here rather than end to end, and that is a deliberate retreat.
    The e2e version has to make a real client stop reading until the
-   target's socket refuses a write, and loopback will not cooperate:
-   measured, 768 KiB went through with the target's pending bytes never
-   leaving 0, and 5 MiB made the test slow without making it reliable. A
-   test that cannot provoke the state it names is worse than one that
-   drives the edge directly — it passes for the wrong reason.
+   target's socket refuses a write, and loopback will not cooperate: its
+   buffers absorb a large write with the target's pending bytes never
+   leaving 0, and writing more makes the test slow without making it
+   reliable. A test that cannot provoke the state it names is worse than
+   one that drives the edge directly — it passes for the wrong reason.
 
    So the edge is driven: a target holding a backlog and a paused outbound
    behind it, flushed until :DONE, with the outbound's interest checked
@@ -9564,8 +9562,7 @@
    the whole design of this test. Copying WS-SEND's fixture would be the
    natural instinct and would pin nothing: a five-byte terminator flushes
    completely on any socket with room, so WRITE-PENDING is 0 wherever the
-   guard sits. That is the vacuous shape the WS-SEND fixture had to be
-   rebuilt to escape, and it would be rebuilt here for the same reason.
+   guard sits.
 
    What cannot be undone is the notification. NOTIFY-STREAM-CLOSED nulls
    the slot before calling so the callback fires exactly once — so a
@@ -9589,20 +9586,12 @@
    detector with an ENOTSOCK it was never about.
 
    Exactly one of the last two assertions is a control. \"a connection
-   this worker owns still closes\" is: registering is the only change and
-   it passes on both sides. \"and that one did tell the app\" is not, and
-   should not be read as one — against main's source the *foreign* close
-   is accepted and fires the callback too, so the counter reaches 2 and
-   this fails as a cascade from the defect rather than independently of
-   it. Four of this test's five assertions fail there and there is one
-   defect behind them; only \"still closes\" survives. The sibling
-   FETCH-INTO ownership test carries the same note for the same reason,
-   which is how this one came to be checked.
-
-   Three is the number under the *mutation* — the guard relocated to just
-   before the arm — where assertion 1 also survives because a five-byte
-   terminator flushes whatever the guard's position. Two measurements,
-   two counts, and this paragraph is about the matrix."
+   this worker owns still closes\" is: registering is the only change,
+   and it passes with the guard or without it. \"and that one did tell
+   the app\" is not, and should not be read as one: without the guard the
+   *foreign* close is accepted and fires the callback too, so the counter
+   reaches 2, and this fails as a cascade from the one defect rather than
+   on its own. The sibling FETCH-INTO ownership test reads the same way."
   (format t "~%stream-close: a connection this worker does not own~%")
   (multiple-value-bind (fserver fclient) (%loopback-pair)
     (multiple-value-bind (oserver oclient) (%loopback-pair)
@@ -9661,10 +9650,11 @@
 ;;; The remainder a fetch callback leaves behind
 ;;;
 ;;; WS-SEND's second caller is a fetch callback on a :WEBSOCKET target, and
-;;; it runs on the outbound connection's read path. HANDLE-CLIENT-READ —
-;;; the site that did all of a WebSocket's arming — does not run for the
-;;; target there at all, so a remainder was left with nothing subscribed to
-;;; writability, waiting for an event no longer coming.
+;;; it runs on the outbound connection's read path. HANDLE-CLIENT-READ,
+;;; which arms a WebSocket after its handler returns, does not run for the
+;;; target there at all, so without WS-SEND's own arming a remainder would
+;;; sit with nothing subscribed to writability, waiting for an event that
+;;; is not coming.
 ;;;
 ;;; Driven at the seam: DELIVER-DETACHED with a callback that sends, which
 ;;; is what FETCH-INTO's :THEN reduces to. End to end it would reach the
@@ -9974,9 +9964,8 @@
    obvious tidy-up, and someone will try it — and the fourth check still
    passes, because WS-SEND arms B itself. The seam stops being crossed
    and nothing says so. That is the *pre-arranged* mode, reachable only
-   because WS-SEND arms, and this check is the thing that catches it:
-   measured, that drift fails check three alone and leaves the other three
-   green.
+   because WS-SEND arms, and this check is the thing that catches it: that
+   drift fails check three alone and leaves the other three green.
 
    EPOLLIN is what A gets, not EPOLLOUT: its handler returned NIL, so A has
    nothing pending. Hence the asymmetry between the third check and the
@@ -10001,18 +9990,18 @@
 
    RFC 6455 7.4.1 has 1009 (Message Too Big) for the data case, and the
    oversized fragmented *message* — the same complaint one layer up —
-   already closed 1009 in two places. The single frame raised out of
-   TRY-PARSE-WS-FRAME as a generic error, took WEBSOCKET-ON-READ's
-   catch-all, and closed 1002. One file, two answers to one question.
+   closes 1009 in two places. A single frame raised out of
+   TRY-PARSE-WS-FRAME as a generic error would take WEBSOCKET-ON-READ's
+   catch-all and close 1002: one file, two answers to one question.
 
    The control frame is the other half, and it wants the other code.
    *MAX-WS-PAYLOAD-SIZE* is a limit this endpoint chose, so exceeding it
    is 1009 — 'too big for me'. §5.5 caps every control frame at 125 bytes
    for everyone, so exceeding *that* is malformed rather than inconvenient
-   and earns 1002. Introducing WS-FRAME-TOO-LARGE above the §5.5 check
-   meant a ping declaring more than 64 KiB took the size check first and
-   was told its message was too big for us, when what was wrong with it is
-   that no endpoint may send it.
+   and earns 1002. With the size check ahead of the §5.5 one, a ping
+   declaring more than 64 KiB would take the size check first and be told
+   its message was too big for us, when what is wrong with it is that no
+   endpoint may send it.
 
    Driven through WEBSOCKET-ON-READ rather than by asserting the condition
    type, because the code on the wire is the claim and the condition is
@@ -10854,10 +10843,9 @@
 
    The fan-out the demo is built on, end to end on a live server: a real
    handshake, a hook that walks the worker's WebSockets and sends each a
-   frame, and that frame read back off the client's own socket. This replaces
-   a test that showed only that the walk could run inside the hook — over an
-   empty table — and left delivery resting on two halves proven apart,
-   because the suite had no handshake helper then. %WS-CLIENT-UPGRADE is one.
+   frame, and that frame read back off the client's own socket. A walk run
+   inside the hook over an empty table would show only that the hook can
+   call it, and leave delivery resting on two halves proven apart.
 
    The hook sends once, when the test arms it, after the client has read its
    101. An upgrade the client has seen is one the worker has recorded: the
@@ -11291,10 +11279,10 @@
    prompted them were segmented.
 
    The handler returns its reply to \"first\" and pushes its reply to
-   \"second\". Sent in separate writes the two always came back in order;
-   sent in one write, the returned reply was held to the end of the batch
-   while the pushed one went out at once, and the peer read them reversed.
-   Both shapes are asserted, the separate writes as the control."
+   \"second\". Sent in separate writes the two come back in order however
+   replies are queued. Sent in one write, a returned reply held to the end
+   of the batch while the pushed one goes out at once would reach the peer
+   reversed. Both shapes are asserted, the separate writes as the control."
   (format t "~%ws: replies keep the order they were made in~%")
   (with-test-server
       (:handler (lambda (req) (declare (ignore req)) :upgrade)
@@ -11356,9 +11344,8 @@
    Three call sites and one exclusion, each asserted as a delta so a revert of
    any one site reddens its own line: WS-SEND, a ws-handler's reply to a
    single frame, and its reply to a fragmented message, which completes on a
-   different path. The first version of the counter counted only WS-SEND, and
-   the suite passed with it deleted outright, because the only test called
-   NOTE-WS-FRAME directly.
+   different path. A test that called NOTE-WS-FRAME directly would pass with
+   every call site deleted.
 
    The last delta sends a ping beside a reply. The framework answers the ping
    with a pong of its own, which is not the application's traffic and must not
@@ -11661,11 +11648,9 @@
    did not resolve.
 
    Both still return NIL, and both still answer the client 502: which of the
-   two happened is not the client's business, and the docstring has said so
-   for longer than this second value has existed. An operator is a different
+   two happened is not the client's business. An operator is a different
    audience. Told `DNS lookup failed` when getent answered perfectly well and
-   their own filter said no, they go and debug a resolver — which is what
-   happened, and is why this exists.
+   their own filter said no, they go and debug a resolver.
 
    The two controls are the point of the test. Without them a second value
    that always returned zero, or always returned one, would pass whichever

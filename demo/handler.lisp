@@ -24,10 +24,10 @@
    competing with the real one, which is the same argument that keeps a
    metrics format out of the framework. So the application mints it, and
    demo/deploy lets WS_INSTANCE override it with whatever the deployment
-   already calls this box.
+   already calls this host.
 
    Fresh on every start when it is random, which is what makes it useful
-   across a restart: the codes differ, so two runs of the same box are two
+   across a restart: the codes differ, so two runs on the same host are two
    names. That is also why a start time is not in the handle below — it would
    be answering a question this already answers.")
 
@@ -495,17 +495,16 @@
   "Microseconds of wall time: for timing a handler, refilling a post budget,
    and stamping a bulletin line.
 
-   Not GET-INTERNAL-REAL-TIME: on SBCL 2.6 it does not advance between
-   adjacent calls, and two hundred FORMATs between two reads still measured
-   zero. Every lab request reported itself as instantaneous, which reads as
-   a broken field rather than as a fast server.
+   Not GET-INTERNAL-REAL-TIME: its clock ticks too coarsely to time a
+   handler, so every lab request would report itself as instantaneous,
+   which reads as a broken field rather than as a fast server.
 
-   This was CLOCK_MONOTONIC, which is the right clock and was the wrong
-   call. SB-UNIX:CLOCK-GETTIME is external on some SBCLs and internal on
-   others, so the demo compiled on the machine it was written on and failed
-   to READ on a Debian image — not a worse number, a build that stopped
-   before it started. Reaching into another package's internals to measure
-   microseconds on a demo page was not a trade worth making.
+   Not CLOCK_MONOTONIC through SB-UNIX:CLOCK-GETTIME either, though it is
+   the right clock. That symbol is external on some SBCLs and internal on
+   others, so code naming it fails to READ where it is internal — not a
+   worse number, a build that stops before it starts. Reaching into
+   another package's internals to measure microseconds on a demo page is
+   not a trade worth making.
 
    GET-TIME-OF-DAY is external, has been for over a decade, and has the
    resolution. What it costs is that it is wall time, so an interval

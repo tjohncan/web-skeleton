@@ -80,11 +80,10 @@
     (22  "EINVAL")
     ;; asm-generic/errno-base.h: ENFILE is 23 ("file table overflow",
     ;; system-wide) and EMFILE is 24 ("too many open files", per-process).
-    ;; These were transposed, which mattered because the two have
-    ;; different remedies: EMFILE says raise this process's RLIMIT_NOFILE,
-    ;; ENFILE says the box is out of file handles entirely. An operator
-    ;; reading "ENFILE (24)" out of an accept loop reaches for fs.file-max
-    ;; when the ulimit is what ran out.
+    ;; Easy to transpose, and the two have different remedies: EMFILE says
+    ;; raise this process's RLIMIT_NOFILE, ENFILE says the host is out of
+    ;; file handles entirely. An operator reading "ENFILE (24)" out of an
+    ;; accept loop reaches for fs.file-max when the ulimit is what ran out.
     (23  "ENFILE")
     (24  "EMFILE")
     (32  "EPIPE")

@@ -783,8 +783,8 @@
                 ;; Sampled here, before SSL_get_error. errno belongs to the
                 ;; call that just returned, and SSL_get_error is itself a
                 ;; foreign call that may set it — reading errno afterwards
-                ;; reports whatever that did, which is how a plain EAGAIN
-                ;; came back looking like EBADF.
+                ;; reports whatever that did, and a plain EAGAIN can come
+                ;; back looking like EBADF.
                 (errno (if (> w 0) 0 (get-errno))))
            (if (> w 0)
                (progn (setf pending 0) w)
@@ -800,8 +800,8 @@
                    ;; OpenSSL reports a would-block on some paths as
                    ;; SSL_ERROR_SYSCALL with errno EAGAIN rather than as
                    ;; WANT_WRITE. It is the same condition and the same
-                   ;; answer; treating it as an error made a full socket
-                   ;; buffer look like a transport failure.
+                   ;; answer; treated as an error, a full socket buffer
+                   ;; would look like a transport failure.
                    ((and (= err +ssl-error-syscall+)
                          (or (= errno +eagain+) (= errno +ewouldblock+)))
                     (setf pending n)

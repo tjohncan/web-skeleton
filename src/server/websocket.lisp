@@ -31,10 +31,10 @@
 
     Its own condition because RFC 6455 7.4.1 has 1009 (Message Too Big) for
     it, and every other parse failure in TRY-PARSE-WS-FRAME is a protocol
-    error answered 1002. Without the distinction the oversized *frame* took
-    WEBSOCKET-ON-READ's catch-all and closed 1002, while the oversized
-    fragmented *message* — the same complaint one layer up — correctly
-    closed 1009 in two places. One file, two answers to one question,
+    error answered 1002. Without the distinction the oversized *frame*
+    would take WEBSOCKET-ON-READ's catch-all and close 1002, while the
+    oversized fragmented *message* — the same complaint one layer up —
+    closes 1009 in two places. One file, two answers to one question,
     which is the disagreement this codebase is organised against."))
 
 ;;; ---------------------------------------------------------------------------
@@ -87,9 +87,8 @@
               ;; over 16 random bytes, so the shape is fully determined —
               ;; 22 data characters and then exactly "==". Checked
               ;; positionally: a flat alphabet sweep across all 24 admits
-              ;; '=' anywhere, which accepted a key of 24 '=' characters
-              ;; while this comment claimed the positional strictness the
-              ;; loop did not have.
+              ;; '=' anywhere, so it would accept a key of 24 '='
+              ;; characters.
               (string= key "==" :start1 22)
               (loop for i from 0 below 22
                     for c = (char key i)
@@ -155,10 +154,10 @@
         (error "WebSocket: non-zero RSV bits"))
       ;; RFC 6455 §5.1: every client-to-server frame is masked. The mask
       ;; bit is byte 1, so this is decidable from the two bytes already
-      ;; in hand — no reason to wait. Checked below the availability test
-      ;; it meant an unmasked frame was buffered to completion before
-      ;; being refused, which is a peer choosing how much of our memory
-      ;; to occupy with something we had already decided to reject.
+      ;; in hand — no reason to wait. Checked after the availability test,
+      ;; an unmasked frame would be buffered to completion before being
+      ;; refused, which is a peer choosing how much of our memory to
+      ;; occupy with something we had already decided to reject.
       (unless masked
         (error "WebSocket: received unmasked client frame"))
       ;; Determine payload length and header size
@@ -199,12 +198,12 @@
       ;; WS-FRAME-TOO-LARGE closes 1009, which is the right answer for a
       ;; data frame this endpoint will not buffer — a limit we chose. A
       ;; control frame over 125 bytes is not a limit we chose: §5.5 makes
-      ;; it malformed for anyone, so 1002 is what it earns. Below the size
-      ;; check, a ping declaring a megabyte got 1009 and told the peer its
-      ;; message was too big for us rather than that its frame was
-      ;; illegal. Both checks read the declared length out of the header,
-      ;; so nothing is buffered either way and the early reject survives
-      ;; the reordering.
+      ;; it malformed for anyone, so 1002 is what it earns. Checked after
+      ;; the size check, a ping declaring a megabyte would get 1009 and
+      ;; tell the peer its message was too big for us rather than that its
+      ;; frame was illegal. Both checks read the declared length out of
+      ;; the header, so nothing is buffered either way, and either order
+      ;; rejects early.
       (when (>= opcode 8)
         (when (> payload-length 125)
           (error "WebSocket: control frame payload too large (~d bytes, max 125)"
@@ -342,18 +341,18 @@
 ;;; exactly this and NIL outside a worker — so the check is a check and
 ;;; not an assumption.
 ;;;
-;;; Leaving it to HANDLE-CLIENT-READ was correct for one caller and wrong
-;;; for the other. That site arms after a handler returns, and WS-SEND is
-;;; also reachable from a fetch callback on a :WEBSOCKET target, which
-;;; runs on the *outbound* connection's read path — where
+;;; Leaving it to HANDLE-CLIENT-READ would be right for one caller and
+;;; wrong for the other. That site arms after a handler returns, and
+;;; WS-SEND is also reachable from a fetch callback on a :WEBSOCKET
+;;; target, which runs on the *outbound* connection's read path — where
 ;;; HANDLE-OUTBOUND-READ arms the outbound and nothing arms the target.
 ;;; HANDLE-CLIENT-READ does not run for it unless its peer happens to
-;;; send something. Measured on that path: a 512 KiB frame, 444 KiB still
-;;; queued, and not one epoll_ctl against the target. The tail of the last
-;;; frame then waits for an event that is not coming, and
-;;; *WRITE-STALL-TIMEOUT* closes the connection rather than flushing it.
-;;; Every send had reported success and the peer got a truncated message,
-;;; which is the failure this codebase refuses everywhere else.
+;;; send something. A frame larger than the socket takes would leave its
+;;; tail queued with no epoll_ctl against the target, waiting for an event
+;;; that is not coming, until *WRITE-STALL-TIMEOUT* closed the connection
+;;; rather than flushing it. Every send would have reported success and
+;;; the peer would get a truncated message, which is the failure this
+;;; codebase refuses everywhere else.
 ;;;
 ;;; EPOLLOUT alone, not EPOLLIN with it. That is what HANDLE-CLIENT-READ
 ;;; arms for a :WEBSOCKET connection carrying a backlog, and
@@ -366,12 +365,13 @@
 ;;; requested — epoll_ctl(2) says so — so a full close arrives as
 ;;; OUT|ERR|HUP under this mask and the next write raises ECONNRESET.
 ;;;
-;;; A peer that *half-closes* while we are behind is not noticed: measured,
-;;; zero events, and it waits for *WRITE-STALL-TIMEOUT*. That is a real
-;;; exception and it is stated rather than rounded off — but it is not one
-;;; this widens, because HANDLE-CLIENT-READ already arms EPOLLOUT alone for
-;;; a backlogged :WEBSOCKET connection, and a WebSocket peer that half-
-;;; closes without a close frame is violating RFC 6455 5.5.1 already.
+;;; A peer that *half-closes* while we are behind is not noticed: the mask
+;;; reports no event for it, and it waits for *WRITE-STALL-TIMEOUT*. That
+;;; is a real exception and it is stated rather than rounded off — but it
+;;; is not one this widens, because HANDLE-CLIENT-READ already arms
+;;; EPOLLOUT alone for a backlogged :WEBSOCKET connection, and a WebSocket
+;;; peer that half-closes without a close frame is violating RFC 6455
+;;; 5.5.1 already.
 ;;;
 ;;; Adding EPOLLIN would instead let a handler be re-entered against a full
 ;;; queue, which is where WS-SEND signals — turning a slow peer into a dead
@@ -572,9 +572,9 @@
               (try-parse-ws-frame buf pos end)
             ;; Ahead of the catch-all, and the only reason it is a separate
             ;; clause: RFC 6455 7.4.1 answers an oversized frame 1009, the
-            ;; same code the oversized fragmented message already used two
-            ;; branches below. A client keying a retry policy on 1009 was
-            ;; told 1002 for one of the two shapes.
+            ;; same code the oversized fragmented message gets two branches
+            ;; below, so a client keying a retry policy on 1009 sees it for
+            ;; both shapes.
             (ws-frame-too-large (e)
               (log-throttled :warn :ws-frame-error "ws frame error fd ~d: ~a" (connection-fd conn) e)
               (return-from websocket-on-read (close-with 1009)))

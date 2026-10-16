@@ -255,7 +255,7 @@
   ;; the ordinary path.
   (paused-outbound-fd -1 :type fixnum)
   ;; On an *outbound* connection: where its result goes.
-  ;;   :INBOUND   the historical path — an inbound is parked in :AWAITING
+  ;;   :INBOUND   a handler's fetch — an inbound is parked in :AWAITING
   ;;              and the callback's return value becomes its response.
   ;;   :DETACHED  the caller already owns a connection it is writing to, so
   ;;              nothing is parked and the callback's return is discarded.
@@ -672,16 +672,15 @@
 
    Neither is rescued by epoll. A TCP peer calling close(2) does not set
    EPOLLHUP — that flag means both directions are down, and a FIN alone
-   does not qualify; measured, not assumed. The pipe does set it, and the
-   :OUT-DNS branch of HANDLE-OUTBOUND-EVENT dispatches without looking at
-   flags. So the one fd type that gets the signal is the one that ignores
-   it.
+   does not qualify. The pipe does set it, and the :OUT-DNS branch of
+   HANDLE-OUTBOUND-EVENT dispatches without looking at flags. So the one
+   fd type that gets the signal is the one that ignores it.
 
    Subscribing to EPOLLRDHUP (0x2000) is the obvious alternative and is
    the wrong shape: it would mean re-registering every fd's event mask, it
    does nothing for the pipe, and it asks the kernel to tell us something
    we already know. The EOF is in hand at the moment this function
-   returns. The defect is that the return value had nowhere to put it."
+   returns, so the return value carries it."
   (let ((any-read nil)
         (max-size (connection-read-cap conn)))
     (loop
@@ -987,8 +986,8 @@
          (cond
            ;; A bare CR makes this reader see a different value than
            ;; PARSE-HEADERS-BYTES will see, and this is the reader that
-           ;; decides how the body is framed. Measured, the disagreement
-           ;; runs both ways depending on where the CR sits — the same value
+           ;; decides how the body is framed. The disagreement runs both
+           ;; ways depending on where the CR sits — the same value
            ;; can be refused less or refused more — so the direction is
            ;; incidental and the disagreement itself is the fault. Same
            ;; argument the fold arm rests on, which is why the two sit

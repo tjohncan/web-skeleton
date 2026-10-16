@@ -132,10 +132,10 @@
                 the only framing left is the one the end of the
                 connection provides.
 
-   Close-delimited framing is the shape whose *reading* side was broken
-   until :OK-EOF landed — a peer's FIN arriving in the same read as the
-   last data was swallowed, and the response hung. Named here because
-   this is the function that decides to start producing them."
+   Close-delimited framing is the shape whose *reading* side depends on
+   :OK-EOF — a peer's FIN arriving in the same read as the last data is
+   the end of the response, and a reader that drops it hangs. Named here
+   because this is the function that decides to start producing them."
   (if (string= (http-request-version request) "1.1")
       :chunked
       :close))
@@ -402,12 +402,12 @@
 
    The one place a stream's framing is applied, because there is more
    than one writer and they land in the same body. The keepalive sweep
-   is the other, and it appended raw bytes until it was found doing so —
-   on a chunked stream that put a comment line where the peer's decoder
-   expects a chunk-size, which kills the stream the keepalive exists to
-   keep alive. Two writers deciding framing separately is the same
-   hazard as two readers deciding acceptance separately, and this
-   codebase already names that one."
+   is the other, and raw bytes from it would put a comment line on a
+   chunked stream where the peer's decoder expects a chunk-size, which
+   kills the stream the keepalive exists to keep alive. Two writers
+   deciding framing separately is the same hazard as two readers
+   deciding acceptance separately, and this codebase already names that
+   one."
   (ecase (connection-stream-framing conn)
     (:chunked (encode-chunk bytes))
     ;; Copied, not passed through. The queue holds vectors by reference
@@ -546,16 +546,16 @@
   ;; it is where a keep-alive connection resets to :READ-HTTP and where a
   ;; close-delimited one closes — so the event has to be armed whether or
   ;; not the flush completed, and STREAM-FLUSH arms only when it did not.
-  ;; The ordinary close is the one that completes. Measured on the wire:
-  ;; the client receives a complete, correctly terminated response, and the
+  ;; The ordinary close is the one that completes. Left unarmed, the
+  ;; client receives a complete, correctly terminated response, and the
   ;; connection is then unusable — its next request met by
   ;; HANDLE-CLIENT-READ's permissive arm and answered with nothing until
   ;; the idle sweep.
   ;;
-  ;; START-STREAM already does this for the one caller it owns: its
+  ;; START-STREAM does the same for the one caller it owns: its
   ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally, saying the
-  ;; ordinary write path takes it from here. Every *later* caller had no
-  ;; counterpart — a fetch :THEN, a timer, a second event.
+  ;; ordinary write path takes it from here. This covers every later
+  ;; caller — a fetch :THEN, a timer, a second event.
   ;;
   ;; EPOLLOUT alone, and not by calling STREAM-FLUSH, because that
   ;; function's mask is argued for a connection that is still streaming:

@@ -163,7 +163,7 @@
 ;;; The framework supplies the mechanism and the app supplies the policy:
 ;;; getent reports no TTL, so *there is no honest expiry the framework
 ;;; could pick on the app's behalf*. Hence *DNS-CACHE-TTL* defaults to 0
-;;; (caching off, historical behavior, every fetch re-resolves) and an app
+;;; (caching off, every fetch re-resolves) and an app
 ;;; that wants caching names the number of seconds it is willing to trust
 ;;; a resolution for. That number is a real trade — how fast an upstream's
 ;;; failover must be noticed — and it belongs to whoever owns the upstream.
@@ -176,9 +176,8 @@
 (defparameter *dns-cache-ttl* 0
   "Seconds a successful hostname → address resolution is cached per
    worker. 0 (the default) disables caching entirely: every fetch to a
-   hostname re-runs getent, which is the framework's historical behavior
-   and the only one that is correct without knowing the app's tolerance
-   for stale addresses.
+   hostname re-runs getent, the only behavior that is correct without
+   knowing the app's tolerance for stale addresses.
 
    Set it to the number of seconds you are willing to keep dialing a
    remembered address after DNS has changed. Small values (30-60) suit an
@@ -364,21 +363,21 @@
              (epoll-add epoll-fd out-fd (logior +epollin+ +epollet+))
              ;; Only an :INBOUND fetch parks, exactly as in
              ;; INITIATE-HTTP-FETCH-TO-ADDRESS — the two are the same
-             ;; decision made at two points on one path, and this one used
-             ;; to make it unconditionally.
+             ;; decision made at two points on one path, and they have to
+             ;; make it the same way.
              ;;
              ;; A detached fetch is dialing on behalf of a connection the
              ;; application already owns and is still writing to. Moving
              ;; that connection to :AWAITING takes its state away, and
              ;; nothing hands it back: DNS resumes through
              ;; INITIATE-HTTP-FETCH-TO-ADDRESS, whose :DETACHED arm
-             ;; correctly touches no state at all. So the connection stayed
-             ;; :AWAITING for the rest of its life — STREAM-SEND signalling
-             ;; on it, WEBSOCKET-ON-READ never running for it, and the
-             ;; :AWAITING sweep serializing a whole HTTP/1.1 504 into the
-             ;; middle of an established chunked body a *FETCH-TIMEOUT*
-             ;; later. The IP-literal fast path escaped it only because it
-             ;; skips this function.
+             ;; correctly touches no state at all. Parked here, the
+             ;; connection would stay :AWAITING for the rest of its life —
+             ;; STREAM-SEND signalling on it, WEBSOCKET-ON-READ never
+             ;; running for it, and the :AWAITING sweep serializing a whole
+             ;; HTTP/1.1 504 into the middle of an established chunked body
+             ;; a *FETCH-TIMEOUT* later. An IP-literal fetch never comes
+             ;; here, since its fast path skips this function.
              (ecase (http-fetch-continuation-sink fetch-req)
                (:inbound
                 (setf (connection-state conn) :awaiting
@@ -408,14 +407,14 @@
    abort sentinel and DELIVER-DETACHED's disposition, and CLOSE-OUTBOUND
    reaps the getent child either way.
 
-   Delegates rather than restating. The two were the same six lines, and
-   the copy here had drifted: it knew only about a parked inbound, so a
-   FETCH-INTO to a name that would not resolve left the target's
-   FETCH-OUTSTANDING set for the rest of that connection's life — refusing
-   every later fetch on it — and never applied the failure disposition the
-   caller chose. A dns-conn is an outbound connection like any other; what
-   is particular about its failure is only where in the lookup it
-   happened, and all three of its callers already log that."
+   Delegates rather than restating. A copy that knew only about a parked
+   inbound would leave a FETCH-INTO to a name that does not resolve with
+   the target's FETCH-OUTSTANDING set for the rest of that connection's
+   life — refusing every later fetch on it — and would never apply the
+   failure disposition the caller chose. A dns-conn is an outbound
+   connection like any other; what is particular about its failure is
+   only where in the lookup it happened, and all three of its callers
+   already log that."
   (deliver-fetch-error dns-conn epoll-fd reason))
 
 (defun handle-dns-ready (dns-conn epoll-fd)

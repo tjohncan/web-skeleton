@@ -76,9 +76,9 @@
    :INET or :INET6, HOST is the hostname or IP literal from the URL.
    Returning NIL refuses the address.
 
-   NIL — the default — allows every address. That is the historical
-   behavior and the right one when fetch URLs come from config rather
-   than from users (a fixed upstream, a self-fetch to 127.0.0.1).
+   NIL — the default — allows every address. That is the right setting
+   when fetch URLs come from config rather than from users (a fixed
+   upstream, a self-fetch to 127.0.0.1).
 
    Set it when an app builds fetch URLs from user input. The framework
    resolves hostnames itself, so an app that resolves a name, approves
@@ -1643,9 +1643,8 @@
    No caller reaches it: every route that closes an :AWAITING inbound goes
    through CLOSE-CONNECTION, which tears the paired outbound down with it.
    But that is a property of the callers rather than of these functions,
-   which is the reasoning CONNECTION-QUEUE-WRITE's own guard
-   rejects, and the window widens with every long-lived parked state the
-   roadmap adds.
+   which is the reasoning CONNECTION-QUEUE-WRITE's own guard rejects, and
+   any long-lived parked state added later would widen the window.
 
    Refusing costs a delay, never a wrong delivery: an inbound this
    declines to answer is left parked, and the :AWAITING sweeper answers it
@@ -1785,9 +1784,8 @@
   ;; is per-worker while fds are unique across the process, so that lookup
   ;; answers NIL. The marker is then set and never cleared, refusing every
   ;; later fetch on that connection for the rest of its life, and the
-  ;; failure disposition never applies — which is the same defect
-  ;; DELIVER-DNS-ERROR had before it delegated, reached from another
-  ;; direction.
+  ;; failure disposition never applies — the outcome DELIVER-DNS-ERROR
+  ;; avoids by delegating, reached from another direction.
   ;;
   ;; EQ against the table, not a comparison on the fd number: an fd
   ;; reissued to a different connection on this worker would satisfy the

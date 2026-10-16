@@ -46,8 +46,8 @@
    a worker. Without that, one bad read would poison the binding for
    the worker's whole life — the stream stays bound, so every later
    call fails too, and RANDOM-TOKEN feeds session IDs and CSRF tokens.
-   Per-call opens were the behaviour before the cache existed, so
-   falling back to them is a return to something known to work."
+   A per-call open is what a call off a worker always does, so the
+   fallback is a path every such call already takes."
   (let ((buf (make-array n :element-type '(unsigned-byte 8))))
     (flet ((read-fresh ()
              (with-open-file (s "/dev/urandom"

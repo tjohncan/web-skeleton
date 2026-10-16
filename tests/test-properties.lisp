@@ -59,11 +59,11 @@
    methods, spaces and CRLFs and reach the header parser, which is where
    the interesting surface is.
 
-   Measured rather than assumed: across 400 cases (half random, half
-   from here) the verdicts land as ~204 request-line, ~121 version, ~37
-   fully accepted, ~17 header, ~10 method, ~10 path. If a change to this
-   generator pushes nearly everything into request-line, the property
-   above is still passing but has stopped testing the parser."
+   Its cases spread across every verdict: most stop at the request line
+   or the version, and the rest reach the header, method and path checks
+   or are accepted whole. If a change to this generator pushes nearly
+   everything into request-line, the property above is still passing but
+   has stopped testing the parser."
   (let ((parts (list (nth (random 8) '("GET" "POST" "PUT" "DELETE"
                                        "HEAD" "OPTIONS" "PATCH" "PRI"))
                      " "

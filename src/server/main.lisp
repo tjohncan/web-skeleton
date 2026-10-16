@@ -720,8 +720,8 @@
   "Maximum events to process per epoll_wait call. Internal — not a
    tunable. A larger batch increases worst-case latency for the
    tail of the batch without meaningfully improving throughput; a
-   smaller batch adds syscall overhead. 64 is the historical sweet
-   spot that epoll-oriented servers have converged on.")
+   smaller batch adds syscall overhead. 64 is the size epoll-oriented
+   servers commonly converge on.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; User-extensible cleanup hooks
@@ -2139,10 +2139,11 @@
 ;;;
 ;;; How many workers the machine can actually run, which inside a container
 ;;; is not how many CPUs the machine has. /sys/devices/system/cpu/online is
-;;; the host's topology and a container sees all of it, so a process limited
-;;; to half a core on a 16-core box read 16 and started sixteen event loops,
-;;; sixteen epoll instances and sixteen listener sockets to time-slice half a
-;;; core between them — each running its own maintenance sweep every second.
+;;; the host's topology and a container sees all of it, so read alone it
+;;; would give a process limited to half a core on a 16-core host sixteen
+;;; event loops, sixteen epoll instances and sixteen listener sockets to
+;;; time-slice half a core between them — each running its own maintenance
+;;; sweep every second.
 ;;;
 ;;; The answer nearest the truth is asked for first:
 ;;;
@@ -2226,9 +2227,9 @@
 
    Handles the simple '0-N' shape and the multi-range 'A-B,C,D-E' shape that
    hotplugged or heterogeneous topologies produce — Intel E-cores offline, a
-   VM with a non-contiguous mask. A one-shot dash-and-parse-integer parser
-   fell back to 1 on any comma, wasting cores on exactly the machines where
-   parallelism mattered most."
+   VM with a non-contiguous mask. A parser that reads one dash and one
+   integer falls back to 1 on any comma, wasting cores on exactly the
+   machines where parallelism matters most."
   (when line
     (handler-case
         (loop with total = 0
@@ -2376,10 +2377,9 @@
    A caller that binds port 0 itself, closes, and passes the number here
    has a race. Every listener sets SO_REUSEPORT, so a second process
    handed that number in the gap does not fail its bind: both hold the
-   port and the kernel splits traffic between them, silently — measured
-   on this repo at 40 requests split 17/23, with nothing in either log.
-   Resolving here means the port is never free between being chosen and
-   being served."
+   port and the kernel splits traffic between them, silently, with
+   nothing in either log. Resolving here means the port is never free
+   between being chosen and being served."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))

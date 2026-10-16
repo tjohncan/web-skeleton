@@ -28,9 +28,8 @@ jobs:
       # The Lisp suite cannot see a JavaScript syntax error, and the demo page
       # is served from this repo. A corrupt app.js is a dead page — no socket,
       # no census, no tab switching — behind a totals line reading ALL TESTS
-      # PASSED, because none of those tests are in the browser. That happened:
-      # escape sequences were eaten out of a regex literal, the file stopped
-      # parsing, and the whole demo went inert with a green gate.
+      # PASSED, because none of those tests are in the browser. A regex
+      # literal that loses its escapes is enough to do it.
       #
       # node --check is a real parse, not a lint, and the runner already has
       # node, so this costs a second and installs nothing.
@@ -92,11 +91,11 @@ jobs:
           fi
 
       # The demo is a consumer of the framework, and the test system depends
-      # on the framework and the harness rather than on it — so nothing in
-      # this job had ever compiled demo/. It reached a deployment before it
-      # reached a runner and stopped there, on a symbol that is external in
-      # one SBCL and internal in another: a READ error, not a warning, so the
-      # build ended before it began.
+      # on the framework and the harness rather than on it — so without this
+      # step nothing in this job compiles demo/. A symbol that is external in
+      # one SBCL and internal in another is a READ error where it is
+      # internal, not a warning, and only loading the demo system finds it
+      # before a deployment does.
       #
       # Loading the system is most of the check: a demo that does not compile
       # has no behaviour to test. The one behaviour checked here is the Origin
@@ -106,15 +105,15 @@ jobs:
       # sentinel either.
       #
       # Success is a file, not a word in the log, and that is not fussiness.
-      # The first version of this printed DEMO COMPILED and grepped for it —
-      # and passed on a failing build, because SBCL prints its --eval list in
-      # the backtrace, so the log of the failure contained the exact string
-      # that was supposed to prove success. A sentinel the failure can quote
-      # back is not a sentinel. This one exists only if the form ran.
+      # A step that printed DEMO COMPILED and grepped for it would pass on a
+      # failing build, because SBCL prints its --eval list in the backtrace,
+      # so the log of the failure contains the exact string that was
+      # supposed to prove success. A sentinel the failure can quote back is
+      # not a sentinel. This one exists only if the form ran.
       #
-      # The suite's own totals-line check above is safe from this for the
-      # reason this one was not: run-tests.lisp arrives through --load, so
-      # the string it prints is nowhere on the command line.
+      # The suite's own totals-line check above is safe from this because
+      # run-tests.lisp arrives through --load, so the string it prints is
+      # nowhere on the command line.
       - name: Compile the demo system, and check its Origin table
         run: |
           set -o pipefail

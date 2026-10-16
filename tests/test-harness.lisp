@@ -1350,12 +1350,12 @@
   "A chunked upstream whose entire response and FIN arrive in one read
    still delivers every chunk to :ON-BODY.
 
-   :OK-EOF means \"read some bytes, and then hit end of stream\". Sharing
-   an arm with :EOF — read *nothing*, already at end of stream — meant
-   the bytes it carried were never walked, so :ON-BODY never fired; and
-   COMPLETE-FETCH then nulled the buffered body on the strength of an
-   :ON-BODY callback merely being installed. The app got 200 with no body
-   at all. Not truncated, absent.
+   :OK-EOF means \"read some bytes, and then hit end of stream\". An arm
+   shared with :EOF — read *nothing*, already at end of stream — would
+   never walk the bytes it carried, so :ON-BODY would never fire, and
+   COMPLETE-FETCH would then null the buffered body on the strength of an
+   :ON-BODY callback merely being installed. The app would get 200 with
+   no body at all. Not truncated, absent.
 
    TEST-HARNESS-FETCH-ON-BODY-E2E cannot catch this and is not weaker for
    it: its upstream streams over time, so the FIN reliably arrives as its
@@ -1364,7 +1364,7 @@
    The canned upstream writes and closes back to back, which makes the
    coalesced read the usual outcome and not a guaranteed one — the
    framework can still be scheduled between the write and the close, read
-   the bytes as :OK, and take the ordinary path. Measured: this catches a
+   the bytes as :OK, and take the ordinary path. So this catches a
    reintroduced defect on most runs and not all.
    TEST-FETCH-OK-EOF-WALKS-THE-BYTES pins the branch itself, every run.
    This test is the end-to-end shape around it, and the pair is the
@@ -1705,8 +1705,8 @@
    bytes come back :OK, the exit arrives as a separate event, and a branch
    taking only :EOF handles it. Only when getent finishes first do the two
    coalesce, and that is the ordering that needs the arm. A race, not a
-   certainty, which is how a missing arm could survive a suite that covers
-   the parser it sits behind.
+   certainty, so a missing arm can survive a suite that covers the parser
+   it sits behind.
 
    What the test does assert is the promise: a name whose every resolved
    address *FETCH-ADDRESS-FILTER* refuses fails the fetch promptly with a
@@ -1802,11 +1802,10 @@
    control: two hundred real
    lookups through the whole path, and nothing left behind. On an older
    SBCL it is a detector, and not a perfect one. A zombie needs getent to
-   be still running at the moment its lookup ends, which is a race: on
-   2.2.9, closing early left between two and fourteen in two hundred over
-   the runs that were counted, so a broken build can come through a lucky
-   run clean. TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child alive
-   on purpose and is the check that never misses, on any SBCL.
+   be still running at the moment its lookup ends, which is a race, so a
+   build that closes early can come through a lucky run clean.
+   TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child alive on purpose
+   and is the check that never misses, on any SBCL.
 
    Any answer is accepted from the fetch itself. What is under test is the
    child, and a lookup that resolved and then failed to connect ended the
@@ -2096,7 +2095,7 @@
    them reports a spurious failure whenever the read does.
 
    The two are separate failures and easy to conflate. The undercount
-   above is seq_file resume, measured directly. A read that fails
+   above is seq_file resume. A read that fails
    outright is not: EBADF on a descriptor nothing here closed means
    something else closed it, which is the shape CONNECTION-CLOSE's
    comment describes, a finalizer closing a reissued fd number under its
@@ -2773,14 +2772,14 @@
           ;; still NIL at the end, fails as NIL-against-3 rather than
           ;; being counted as zero listeners.
           ;;
-          ;; The budget is slack for a loaded CI box and nothing more:
-          ;; measured, all three listeners are present on the first read,
+          ;; The budget is slack for a loaded CI runner and nothing more:
+          ;; all three listeners are normally present on the first read,
           ;; because MAKE-THREAD plus a bind is microseconds. Only a
           ;; failing run spends the whole budget, and a failing check
           ;; should not also be the suite's longest sleep.
-          ;; Highest count seen, not the last one. Measured: a read of
-          ;; /proc/net/tcp intermittently returns 2, and once 1, while
-          ;; three healthy workers are demonstrably on the port, because a
+          ;; Highest count seen, not the last one. A read of
+          ;; /proc/net/tcp can return fewer listeners than there are,
+          ;; while three healthy workers are on the port, because a
           ;; seq_file resume can land late and skip records. Overcounting
           ;; is ruled out by %LISTEN-SOCKET-COUNT counting distinct socket
           ;; inodes — the same resume can land early and re-emit a row, so
@@ -3367,22 +3366,21 @@
    which runs with this worker's table bound, is the only place an
    application can look at one.
 
-   Keyed on the connection object, and that is load-bearing. The first
-   version recorded (fd . serial) pairs deduplicated by EQUAL, so a server
-   handing every connection the same serial collapsed them to one pair per fd
-   — and the control counting observations went red with the property it was
-   meant to be independent of. A mutation that turns the control red cannot
-   be read: it says the observation broke, not that the property did. Here
-   the count of connections seen does not depend on the serials at all.
+   Keyed on the connection object, and that is load-bearing. Pairs of
+   (fd . serial) deduplicated by EQUAL would collapse a server handing every
+   connection the same serial to one pair per fd, and turn the control
+   counting observations red with the property it is meant to be
+   independent of. A mutation that turns the control red cannot be read: it
+   says the observation broke, not that the property did. Here the count of
+   connections seen does not depend on the serials at all.
 
    The fd is captured when the connection is seen rather than read back
    later, because CONNECTION-CLOSE sets it to -1. The serial it leaves alone.
 
-   There is no assertion that the serials increase. There was one, and it
-   compared a sorted list with a sorted copy of itself, which is true of any
-   list whatever. Distinct serials, and a highest serial no lower than the
-   number of connections, are the claims a repeating or constant counter
-   actually fails."
+   There is no assertion that the serials increase: comparing a sorted list
+   with a sorted copy of itself is true of any list whatever. Distinct
+   serials, and a highest serial no lower than the number of connections,
+   are the claims a repeating or constant counter actually fails."
   (format t "~%server: a connection number that is not an fd~%")
   (let ((seen nil)
         (lock (sb-thread:make-mutex))
@@ -3563,8 +3561,7 @@
    — two GETs — cannot tell a boundary that forgets the body from one that
    does not.
 
-   What each assertion catches, measured against three sabotaged
-   boundaries rather than reasoned about:
+   What each assertion catches, against three sabotaged boundaries:
 
      never set, so 0    the whole request stays buffered and is re-parsed
                         forever. The server never closes, and `server
@@ -3642,8 +3639,8 @@
                    ;; then GET, the keep-alive reset is its only writer.
                    ;; Left stale, CONNECTION-PARSE-REQUEST attaches five
                    ;; bytes of whatever follows /b's headers to a request
-                   ;; the client sent no body with. The handler has always
-                   ;; printed this value; only the assertion was missing.
+                   ;; the client sent no body with. The handler prints this
+                   ;; value, and this is the assertion that reads it.
                    (check "pipelined body: /b carried no body of its own"
                           (not (null (search "path=/b body=-" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
@@ -3661,8 +3658,8 @@
    Sized so it cannot: the first body is one 200-byte chunk, leaving the
    cursor near 270, while the second request's body begins near 84. With
    the clear neutered the second walk starts well past its own body, finds
-   no framing there, and the connection never answers — measured:
-   this test's `server closed the connection` and `second request
+   no framing there, and the connection never answers, which fails this
+   test's `server closed the connection` and `second request
    dispatched`.
 
    That holds because the cursor has one clear. With a second — the
@@ -4349,7 +4346,7 @@
    listener binds whatever RESOLVE-HOST-BLOCKING answers for the same name
    the fetch will dial, and CONNECT-TO-TEST-SERVER dispatches the client
    socket on that vector's length exactly as MAKE-TCP-LISTENER dispatches
-   the bind. So the family is whatever this machine's resolver prefers, and
+   the bind. So the family is whatever the host's resolver prefers, and
    agreement is by construction rather than by assumption: a host whose
    /etc/hosts orders `::1 localhost` first binds and dials v6, one that
    orders IPv4 first binds and dials v4, and neither can reach a listener
@@ -5606,10 +5603,10 @@
    window is 8, which is what keeps the deadline sweeper from passing this
    test on the stop's behalf.
 
-   :THEN must see the abort sentinel, and which wrong implementation that
-   catches was measured rather than reasoned about. COMPLETE-FETCH with
-   :FRAMING-COMPLETE T — a copy of the arm directly above it in the cond,
-   and so the likeliest mistake — suppresses the body decode, delivers a
+   :THEN must see the abort sentinel, which is what catches this wrong
+   implementation: COMPLETE-FETCH with :FRAMING-COMPLETE T — a copy of the
+   arm directly above it in the cond, and so the likeliest mistake —
+   suppresses the body decode, delivers a
    200, and passes every other check here: the disposition leaves the
    target alone, the stream survives, the second fetch runs. Only this
    check fails, on exactly the report the verdict exists to prevent.
@@ -5758,10 +5755,9 @@
    assertion would hold just as well against a census that counted
    nothing.
 
-   The first draft of this test read the count from :THEN and measured a
-   peak of 0, because COMPLETE-FETCH tears the outbound down before it
-   invokes the callback. The non-vacuity check is the only reason that was
-   noticed rather than shipped as a passing test of nothing."
+   The count is not read from :THEN. COMPLETE-FETCH tears the outbound
+   down before it invokes the callback, so a peak read there is 0, and
+   only the non-vacuity check would say so rather than pass on nothing."
   (format t "~%Harness: census, outbound returns to zero after a fetch~%")
   (let ((port-box (list nil))
         (peak 0))

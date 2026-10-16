@@ -236,11 +236,10 @@
       ;; overflow IEEE 754 double. SBCL's reader signals a
       ;; floating-point-overflow from inside READ-FROM-STRING before
       ;; control returns — earlier than the post-read infinity check
-      ;; could see it — so the friendly 'number out of range' error
-      ;; never fired and apps got a raw SB-KERNEL:FLOATING-POINT-
-      ;; EXCEPTION with 'an error of type FLOATING-POINT-OVERFLOW'.
-      ;; Catch the arithmetic condition family and remap to the same
-      ;; clean overflow error the infinity branch produces.
+      ;; could see it — so uncaught, an app would get a raw
+      ;; SB-KERNEL:FLOATING-POINT-EXCEPTION rather than the 'number out
+      ;; of range' error. Catch the arithmetic condition family and remap
+      ;; to the same clean overflow error the infinity branch produces.
       (values (if (or (find #\. num-str) (find #\e num-str) (find #\E num-str))
                   (let* ((*read-default-float-format* 'double-float)
                          (*read-eval* nil)

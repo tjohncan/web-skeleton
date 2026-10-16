@@ -783,8 +783,7 @@
         ;; both checks, and in practice that set has one member: the
         ;; HTTP/2 prior-knowledge preface, "PRI * HTTP/2.0". Its method
         ;; is PRI, so a method-first parser answers 501 and never looks
-        ;; at the version — which is how this read 501 while three
-        ;; comments and a table row claimed 505.
+        ;; at the version, where the answer it deserves is 505.
         (let ((method (match-method-bytes buf start sp1))
               ;; Version — match "HTTP/1.0" or "HTTP/1.1" byte-by-byte
               (version
@@ -1094,11 +1093,9 @@
    Defaults to the current time when called with no argument.
 
    The no-argument call is cached per worker for the current second,
-   because it is on every dynamic response and it is most of what building
-   one costs: measured at 1.26 us against FORMAT-RESPONSE's 1.76 us total,
-   so roughly seventy percent of serializing a small response went on
-   rebuilding a string that changes once a second. The cached read is
-   0.02 us. DECODE-UNIVERSAL-TIME and a seven-directive FORMAT are simply
+   because it is on every dynamic response and formatting it is most of
+   what serializing a small one costs, for a string that changes once a
+   second. DECODE-UNIVERSAL-TIME and a seven-directive FORMAT are simply
    not cheap, and neither is needed twice in the same second.
 
    An explicit UNIVERSAL-TIME bypasses the cache entirely — that call is
@@ -1143,10 +1140,11 @@
 
    The vector is shared by every response sent in that second and is
    never mutated: a new one is built when the second turns, rather than
-   the old one being patched in place. Patching would be cheaper and
-   wrong — the queue can still be draining a vector into a slow peer
-   while the next request is served, and a Date rewritten underneath a
-   half-sent response is a torn header with nothing to catch it."
+   the previous second's being patched in place. Patching would be
+   cheaper and wrong — the queue can still be draining a vector into a
+   slow peer while the next request is served, and a Date rewritten
+   underneath a half-sent response is a torn header with nothing to
+   catch it."
   (let ((now (get-universal-time))
         (cache *http-date-line-cache*))
     (flet ((build ()
