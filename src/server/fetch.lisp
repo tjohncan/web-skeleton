@@ -2519,23 +2519,23 @@
                       same way, and an upstream that keeps the connection
                       open would otherwise be waited on for a body it
                       will never send, until the fetch timed out.
-     Transfer-Encoding present — TE wins over Content-Length. Done at the
-                      zero-size chunk header, but only once the encoding
-                      is confirmed to actually be chunked: a TE that is
-                      not chunked is framed by EOF, and completing early
-                      there would truncate.
+     Transfer-Encoding present — TE wins over Content-Length. Chunked, as
+                      RESPONSE-CHUNKED-P reads the headers: done at the
+                      zero-size chunk header. Any other coding is framed
+                      by EOF (RFC 9112 §6.3), so NIL, and the bytes are
+                      not walked at all: their first is not a chunk size,
+                      and reading it as one would refuse a body that was
+                      never chunk-framed. COMPLETE-FETCH and
+                      STREAM-RESPONSE-LINES ask RESPONSE-CHUNKED-P the
+                      same question, so all three agree on the framing.
      Content-Length — done when that many body bytes have landed.
      Neither        — close-delimited. NIL forever: EOF *is* the framing,
                       and the caller's EOF branch completes it.
 
-   Known corner, deliberately not optimized: if an upstream sends a
-   Transfer-Encoding that is *not* chunked (already malformed — RFC 7230
-   §3.3.1 requires chunked to be the final encoding) and its body bytes
-   happen to walk as complete chunk framing, the confirming header parse
-   re-runs on every subsequent read until EOF, because nothing remembers
-   that the answer was already 'not chunked'. The cost is one header parse
-   per read on a response that is broken anyway, and remembering the
-   answer would mean a connection slot to carry it. Not worth the state."
+   A Transfer-Encoding that is not the single token chunked has its
+   headers parsed on every read to ask that question, since nothing
+   remembers the answer between reads. Such a response is rare and usually
+   malformed, and remembering would take a connection slot."
   ;; Step over any 1xx interim blocks first. This has to happen HERE and
   ;; not only in COMPLETE-FETCH: the framing decision below reads
   ;; Transfer-Encoding / Content-Length out of the header region, and an
@@ -2564,17 +2564,17 @@
         ;; final or unparseable.
         ((and status (or (= status 204) (= status 304)))
          (values t chunk-scan))
+        ((and te-present
+              (not (eq te-present :chunked))
+              (not (response-chunked-p
+                    (parse-response-headers buf start header-end))))
+         (values nil chunk-scan))
         (te-present
          (multiple-value-bind (complete next)
              (chunked-body-complete-p buf body-start end
                                       chunk-scan
                                       on-data)
-           ;; The header parse only runs on the read that actually
-           ;; completes — the cheap framing walk gates it.
-           (values (and complete
-                        (response-chunked-p
-                         (parse-response-headers buf start header-end))
-                        t)
+           (values (and complete t)
                    next
                    (when (eq te-present :chunked) body-start))))
         (content-length

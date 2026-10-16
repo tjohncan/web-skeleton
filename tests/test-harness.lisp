@@ -2636,6 +2636,74 @@
                  (check (format nil "~a: at the blank line, not the close" name)
                         (< secs 2.5) t))))))))))
 
+(defun test-harness-fetch-non-chunked-coding-e2e ()
+  "A response whose Transfer-Encoding does not include chunked is framed
+   by the close, and HTTP-FETCH hands :THEN its bytes as they came, as
+   HTTP-FETCH-STREAM reads the same response.
+
+   RFC 9112 §6.3 frames such a response by the connection's close, and the
+   Transfer-Encoding overrides any Content-Length. There is no chunk size
+   to find: a reader that walks the body as chunks refuses it at its first
+   byte. Neither coding is decoded here, so the body arrives unchanged.
+
+   The buffered predicate is asked on its own as well, about a gzip body's
+   first bytes, which the ASCII scripts below cannot send."
+  (format t "~%Harness: a transfer coding other than chunked ends at the close~%")
+  (let ((buf (concatenate '(vector (unsigned-byte 8))
+                          (sb-ext:string-to-octets
+                           (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                                  "Connection: close" "")
+                           :external-format :ascii)
+                          #(#x1F #x8B #x08 #x00))))
+    (check "non-chunked coding: a gzip body waits for the close"
+           (attempt (web-skeleton::outbound-response-complete-p
+                     buf (length buf) :get))
+           nil))
+  (dolist (case (list (list "gzip"
+                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                                   "Connection: close" "")
+                            "{\"a\":1}")
+                      (list "identity beside a Content-Length"
+                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: identity"
+                                   "Content-Length: 5" "Connection: close" "")
+                            "hello")))
+    (destructuring-bind (name head body) case
+      (%call-with-scripted-upstream
+       (list head body)
+       (lambda (port)
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (declare (ignore req))
+                (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                  :then (lambda (s h b)
+                          (declare (ignore h))
+                          (make-text-response
+                           200 (format nil "~a ~a" s
+                                       (if b
+                                           (sb-ext:octets-to-string
+                                            b :external-format :latin-1)
+                                           "")))))))
+           (multiple-value-bind (code headers reply)
+               (handler-case (test-http-request :get "/relay")
+                 (error (e) (values nil nil (princ-to-string e))))
+             (declare (ignore headers))
+             (check (format nil "~a: http-fetch delivers the body read to the close"
+                            name)
+                    (list code reply)
+                    (list 200 (format nil "200 ~a" body)))))))
+      (%call-with-scripted-upstream
+       (list head body)
+       (lambda (port)
+         (let* ((lines nil)
+                (status (%timed 10 (lambda ()
+                                     (http-fetch-stream
+                                      :get (format nil "http://127.0.0.1:~d/x" port)
+                                      :on-line (lambda (line) (push line lines)))))))
+           (check (format nil "~a: http-fetch-stream reads it the same way" name)
+                  (list status (reverse lines))
+                  (list 200 (list body)))))))))
+
 (defun test-harness-fetch-stream-plain-write-timeout-e2e ()
   "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
    the request, after *FETCH-TIMEOUT*.
@@ -5796,6 +5864,7 @@
   (test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e)
   (test-harness-fetch-stream-plain-write-timeout-e2e)
   (test-harness-fetch-bodiless-status-kept-alive-e2e)
+  (test-harness-fetch-non-chunked-coding-e2e)
   (test-harness-a-worker-left-behind-stays-with-its-run)
   (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
