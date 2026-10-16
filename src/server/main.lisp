@@ -1406,10 +1406,10 @@
                   ;; explicitly asks to close the socket would advertise
                   ;; 'Connection: close' on the wire while the server
                   ;; happily held the socket open — framing mismatch vs
-                  ;; the client's expectation. Shared helper with the
-                  ;; fetch-callback path (fetch.lisp / tls.lisp) walks
-                  ;; every 'connection' header via GET-HEADERS-equivalent,
-                  ;; symmetric with the inbound-side walk ten lines up.
+                  ;; the client's expectation. The helper is the one
+                  ;; COMPLETE-FETCH calls for a fetch's :THEN, over either
+                  ;; scheme, and it walks every 'connection' header,
+                  ;; symmetric with the inbound-side walk above.
                   ;; A stream's Connection header lives on the response it
                   ;; carries, not on the wrapper — an app that asks to
                   ;; close after a stream has to be heard the same way as

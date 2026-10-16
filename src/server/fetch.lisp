@@ -180,8 +180,8 @@
    a stream starts its fetch with FETCH-INTO from the stream's ON-OPEN.
 
    ON-BODY, if given, is called as (CONN BYTES) with each chunk of a
-   chunked response as it arrives, on the async http:// path — CONN is
-   the outbound connection, for FETCH-RESUME. The framing walk already
+   chunked response as it arrives, over either scheme — CONN is the
+   outbound connection, for FETCH-RESUME. The framing walk already
    proves each chunk whole, so this hands those bytes over instead of
    only stepping past them. THEN still fires exactly once at the end,
    with a NIL body: the bytes went out incrementally rather than being
@@ -1528,10 +1528,11 @@
                  on the wire is meaningful (HTTP/1.1's default is
                  keep-alive, so the header would be redundant).
      NIL         otherwise (typical HTTP/1.1 keep-alive).
-   Used by COMPLETE-FETCH / DELIVER-FETCH-ERROR / the TLS happy and
-   error paths / DELIVER-DNS-ERROR / HANDLE-CLIENT-READ so every
-   response site echoes a consistent Connection header regardless
-   of which path delivers."
+   Used by QUEUE-FINAL-RESPONSE, INITIATE-FETCH, COMPLETE-FETCH,
+   DELIVER-FETCH-ERROR, DELIVER-AWAITING-TIMEOUT and START-STREAM, so
+   every response site echoes a consistent Connection header whichever
+   path delivers. A DNS failure and either scheme's fetch reach it
+   through COMPLETE-FETCH or DELIVER-FETCH-ERROR."
   (let ((req (and inbound (connection-request inbound))))
     (cond ((not req) nil)
           ((connection-close-after-p inbound) :close)

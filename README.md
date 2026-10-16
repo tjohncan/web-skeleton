@@ -132,6 +132,7 @@ src/
   tls.lisp         libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
     word32.lisp      32-bit unsigned word ops (shared by SHA-1, SHA-256)
+    octets.lisp      Byte-vector input contract shared by the digests, HMAC and ECDSA
     hex.lisp         Hex encoding utilities
     sha1.lisp        SHA-1 digest (FIPS 180-4)
     sha256.lisp      SHA-256 digest (FIPS 180-4)
@@ -159,6 +160,7 @@ tests/
   package.lisp           Test package declaration
   run.lisp               Test utilities and combined runner
   harness.lisp           Ephemeral-port live server and request/frame builders
+  ecdsa-corpus.lisp      P-256 verify cases with OpenSSL's verdicts, for the ECDSA tests
   test-algorithms.lisp   SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
@@ -618,18 +620,6 @@ read about here.
   a connection slot and its backlog, not unbounded growth. This is the
   deliberate trade for `ws-send` not holding the worker: a total deadline
   would bound the frame rather than the stall.
-- **A stream can only be written from the worker that owns it.**
-  `stream-send` touches an unsynchronized write queue, and the connection
-  belonging to exactly one event loop is what lets that queue exist
-  without a lock. So the framework holds connections open and writes
-  bytes; deciding *who* receives an event is the app's, and its registry
-  has to push from the owning worker. Delivering to a connection this
-  thread does not own is a designed-for next step, not part of the
-  framework. Fan-out is per worker, as the top of this list says: each
-  worker delivers to the connections it owns, from `:on-tick` with
-  `map-worker-websockets`. What the framework does not provide is the
-  subscriber registry, deliberately — a framework that owned it would own
-  per-process state and become the horizontal-scaling limit.
 
 ## Configuration
 
