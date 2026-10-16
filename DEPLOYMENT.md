@@ -666,13 +666,20 @@ Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs
 are resolved asynchronously: the framework spawns `getent ahosts <host>`
 via `sb-ext:run-program`, registers the subprocess's stdout pipe
 with the worker's epoll, and parks the inbound connection in an `:out-dns` state
-until the address lands. The first TCP-compatible line (`<address> STREAM`) wins.
-IPv4 and IPv6 are both supported, with `AI_ADDRCONFIG` filtering
-so addresses for unreachable families never appear.
+until the address lands. The first TCP-compatible line (`<address> STREAM`)
+that `*fetch-address-filter*` accepts is the address dialed, and the only
+one: a connect refused or unanswered there fails the fetch, with no
+fallback to the next address `getent` printed. IPv4 and IPv6 are both
+supported. `AI_ADDRCONFIG` drops a family only when this host has no
+address of it configured, so on a host with IPv6 a name can sort first
+an IPv6 address the upstream does not listen on. `localhost` resolving to
+`::1` while the service binds `127.0.0.1` is the common case, and it
+answers `502`. Fetch such a service by its IP literal, or bind it on both
+families.
 Numeric literals (including bracketed IPv6 forms like `http://[::1]:8080/`)
 skip the subprocess entirely via the numeric fast path.
 
-`http-fetch-stream` and the HTTPS paths use the same `getent` subprocess
+`http-fetch-stream`, over either scheme, uses the same `getent` subprocess
 synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
 The only difference from the async path is that the subprocess

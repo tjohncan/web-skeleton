@@ -30,9 +30,15 @@
 ;;; fresh memory and fresh locks.
 ;;;
 ;;; IPv4 and IPv6: `getent ahosts` returns both families in the
-;;; system's preferred order, already filtered by AI_ADDRCONFIG so
-;;; addresses for an unreachable family never appear. First STREAM
-;;; line wins. The socket family is picked to match the address.
+;;; system's preferred order (RFC 6724). AI_ADDRCONFIG drops a family
+;;; only when this host has no address of it configured; it knows
+;;; nothing of whether the destination answers on that family. The
+;;; first STREAM line the address filter accepts is dialed, and only
+;;; that one: a refused or unanswered connect fails the fetch rather
+;;; than moving on to the next address. So on a host with IPv6, a name
+;;; that sorts an IPv6 address first — localhost as ::1 — fails against
+;;; a service bound to IPv4 alone. The socket family is picked to match
+;;; the address.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
