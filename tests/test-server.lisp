@@ -3786,6 +3786,46 @@
     (check "ws-upgrade: valid base64 key accepted"
            (not (null (web-skeleton::websocket-upgrade-p
                        (ws-req "dGhlIHNhbXBsZSBub25jZQ==")))) t)
+    ;; Repeated fields. Connection and Upgrade are one comma list across
+    ;; every field of the name, so a proxy's own Connection: keep-alive
+    ;; ahead of the client's Connection: Upgrade still upgrades. The key
+    ;; and the version must be single: with two keys, which one the accept
+    ;; is computed from depends on the reader.
+    (flet ((with-headers (headers)
+             (web-skeleton::websocket-upgrade-p
+              (make-test-request :method :GET :headers headers))))
+      (let ((key '("sec-websocket-key" . "dGhlIHNhbXBsZSBub25jZQ=="))
+            (version '("sec-websocket-version" . "13")))
+        (check "ws-upgrade: Connection: Upgrade in a later field is read"
+               (and (with-headers (list '("host" . "localhost")
+                                        '("connection" . "keep-alive")
+                                        '("connection" . "Upgrade")
+                                        '("upgrade" . "websocket")
+                                        key version))
+                    t)
+               t)
+        (check "ws-upgrade: so is Upgrade: websocket in a later field"
+               (and (with-headers (list '("host" . "localhost")
+                                        '("connection" . "Upgrade")
+                                        '("upgrade" . "h2c")
+                                        '("upgrade" . "websocket")
+                                        key version))
+                    t)
+               t)
+        (check "ws-upgrade: a second Sec-WebSocket-Key refuses the upgrade"
+               (with-headers (list '("host" . "localhost")
+                                   '("connection" . "Upgrade")
+                                   '("upgrade" . "websocket")
+                                   key
+                                   '("sec-websocket-key" . "AAAAAAAAAAAAAAAAAAAAAA==")
+                                   version))
+               nil)
+        (check "ws-upgrade: so does a second Sec-WebSocket-Version"
+               (with-headers (list '("host" . "localhost")
+                                   '("connection" . "Upgrade")
+                                   '("upgrade" . "websocket")
+                                   key version version))
+               nil)))
     ;; 24 chars including one non-ASCII — passes the length check so
     ;; the charset check is actually exercised (not short-circuited).
     (check "ws-upgrade: non-ASCII in key rejected"
@@ -11487,6 +11527,92 @@
             (ignore-errors (close stream))
             (ignore-errors (sb-bsd-sockets:socket-close sock))))))))
 
+(defun test-ws-close ()
+  "WS-CLOSE ends a WebSocket from the server's side: a close frame with the
+   code asked for, then the connection goes. A peer at *MAX-WRITE-BACKLOG*
+   has no room for the frame and is closed at once. An application whose
+   own events outran a peer has this as its answer, the one DEPLOYMENT.md
+   gives, where before it could only drop frames and keep the socket.
+
+   Driven over a loopback pair, so the client reads the frame off a real
+   socket and the close is the event loop's own write path finishing."
+  (format t "~%ws-close: closing a WebSocket from the server's side~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (check "ws-close: answers T" (web-skeleton:ws-close conn 1013) t)
+             (check "ws-close: the connection is closing"
+                    (web-skeleton::connection-state conn) :closing)
+             (check "ws-close: and takes no further frame"
+                    (handler-case
+                        (progn (web-skeleton:ws-send
+                                conn (web-skeleton:build-ws-text "late"))
+                               :sent)
+                      (error () :refused))
+                    :refused)
+             (check "ws-close: a second close is refused, not doubled"
+                    (handler-case (progn (web-skeleton:ws-close conn) :closed)
+                      (error () :refused))
+                    :refused)
+             ;; The write path the arming hands it to: the frame goes out
+             ;; and the connection with it.
+             (web-skeleton::handle-client-write conn epfd)
+             (check "ws-close: once written, the connection is gone"
+                    (web-skeleton::lookup-connection fd) nil)
+             (let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
+               (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive client buf nil)
+                 (declare (ignore b))
+                 (check "ws-close: the client read a close frame with the code"
+                        (list n (aref buf 0)
+                              (logior (ash (aref buf 2) 8) (aref buf 3)))
+                        (list 4 #x88 1013)))))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+  ;; At the bound: no room for the frame, so the connection goes at once.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*max-write-backlog* 64)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (get-universal-time))))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd web-skeleton::+epollet+)
+             (web-skeleton::connection-append-write
+              conn (make-array 64 :element-type '(unsigned-byte 8)
+                                  :initial-element 65))
+             (web-skeleton:ws-close conn)
+             (check "ws-close at the bound: closed at once"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd conn))
+                    (list nil -1)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+  ;; Off a worker there is no loop to carry the close out.
+  (check "ws-close: refused off a worker"
+         (let ((web-skeleton::*epoll-fd* nil))
+           (handler-case
+               (progn (web-skeleton:ws-close
+                       (web-skeleton::make-connection :fd -1 :state :websocket))
+                      :closed)
+             (error () :refused)))
+         :refused))
+
 (defun test-ws-handler-reply-of-the-wrong-type ()
   "A ws-handler that returns something other than a frame's bytes — a
    string, the commonest slip — has its connection closed, however many
@@ -12161,6 +12287,7 @@
   (test-ws-send-queues)
   (test-ws-send-refuses-a-foreign-connection)
   (test-ws-send-refuses-a-closing-websocket)
+  (test-ws-close)
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)

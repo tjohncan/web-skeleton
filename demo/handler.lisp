@@ -1006,10 +1006,15 @@
          (lambda (conn)
            ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone
            ;; behind it the batch. MAP-WORKER-WEBSOCKETS deliberately
-           ;; does not decide this; an application that broadcasts does.
+           ;; does not decide this; an application that broadcasts does,
+           ;; and this one closes that peer. Its view of the bulletin
+           ;; would otherwise skip the lines it missed with nothing to say
+           ;; so. 1013 asks it to try again later; a page that reconnects
+           ;; sees what is posted from then on, as any new one does.
            (handler-case
                (dolist (p payloads) (ws-send conn p))
-             (error () nil))))
+             (error ()
+               (ignore-errors (ws-close conn 1013))))))
         (setf (aref *fanned* worker-id)
               (reduce #'max new :key #'first))))))
 

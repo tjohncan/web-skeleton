@@ -111,6 +111,7 @@
            #:build-ws-frame
            #:build-ws-close
            #:ws-send
+           #:ws-close
            ;; Static files
            #:load-static-files
            #:serve-static

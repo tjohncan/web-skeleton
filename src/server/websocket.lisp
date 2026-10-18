@@ -69,35 +69,46 @@
    the length test alone accepts any 24-character string, including
    strings containing non-ASCII bytes that would later trip
    WEBSOCKET-ACCEPT-KEY's :external-format :ascii conversion and
-   surface as 500 instead of the 400 a malformed key deserves."
+   surface as 500 instead of the 400 a malformed key deserves.
+
+   Connection and Upgrade are read across every field of that name, as
+   the keep-alive decision reads Connection: RFC 7230 §3.2.2 makes
+   repeated fields one comma list, and a proxy that writes its own
+   Connection: keep-alive beside the client's Connection: Upgrade would
+   otherwise fail the upgrade on whichever came first. Sec-WebSocket-Key
+   and Sec-WebSocket-Version must each appear exactly once (RFC 6455
+   §11.3.1, §11.3.5). With two keys, the accept value would be computed
+   from whichever this reader picked, and any reader that picked the
+   other would disagree."
   (and (eq (http-request-method request) :GET)
        (string= (http-request-version request) "1.1")
-       (let ((upgrade    (get-header request "upgrade"))
-             (connection (get-header request "connection"))
-             (key        (get-header request "sec-websocket-key"))
-             (version    (get-header request "sec-websocket-version")))
-         (and upgrade
-              (header-has-token-p upgrade "websocket")
-              connection
-              (header-has-token-p connection "upgrade")
-              key
-              (= (length key) 24)  ; base64(16 bytes) per RFC 6455 §4.2.2
-              ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+' / '/'
-              ;; with '=' padding. Sec-WebSocket-Key is a fixed-size base64
-              ;; over 16 random bytes, so the shape is fully determined —
-              ;; 22 data characters and then exactly "==". Checked
-              ;; positionally: a flat alphabet sweep across all 24 admits
-              ;; '=' anywhere, so it would accept a key of 24 '='
-              ;; characters.
-              (string= key "==" :start1 22)
-              (loop for i from 0 below 22
-                    for c = (char key i)
-                    always (or (char<= #\A c #\Z)
-                               (char<= #\a c #\z)
-                               (char<= #\0 c #\9)
-                               (char= c #\+) (char= c #\/)))
-              version
-              (string= version "13")))))
+       (let ((upgrades    (get-headers request "upgrade"))
+             (connections (get-headers request "connection"))
+             (keys        (get-headers request "sec-websocket-key"))
+             (versions    (get-headers request "sec-websocket-version")))
+         (and (some (lambda (v) (header-has-token-p v "websocket")) upgrades)
+              (some (lambda (v) (header-has-token-p v "upgrade")) connections)
+              (= (length keys) 1)
+              (= (length versions) 1)
+              (let ((key (first keys))
+                    (version (first versions)))
+                (and
+                 (= (length key) 24) ; base64(16 bytes) per RFC 6455 §4.2.2
+                 ;; RFC 4648 standard base64 alphabet: A-Z / a-z / 0-9 / '+'
+                 ;; / '/' with '=' padding. Sec-WebSocket-Key is a
+                 ;; fixed-size base64 over 16 random bytes, so the shape is
+                 ;; fully determined — 22 data characters and then exactly
+                 ;; "==". Checked positionally: a flat alphabet sweep across
+                 ;; all 24 admits '=' anywhere, so it would accept a key of
+                 ;; 24 '=' characters.
+                 (string= key "==" :start1 22)
+                 (loop for i from 0 below 22
+                       for c = (char key i)
+                       always (or (char<= #\A c #\Z)
+                                  (char<= #\a c #\z)
+                                  (char<= #\0 c #\9)
+                                  (char= c #\+) (char= c #\/)))
+                 (string= version "13")))))))
 
 (defun make-websocket-handshake-response (request)
   "Build the 101 Switching Protocols response for a WebSocket upgrade.
@@ -502,6 +513,44 @@
       (epoll-modify *epoll-fd* (connection-fd conn)
                     (logior +epollout+ +epollet+)))
     done))
+
+(defun ws-close (conn &optional (code 1000))
+  "Close the WebSocket CONN from the application's side. Queues a close
+   frame carrying CODE and closes the connection once it has gone out.
+   Returns T.
+
+   The answer DEPLOYMENT.md gives an application whose own events have
+   outrun a peer: a dropped event is invisible to the client, so its view
+   and the server's would part for good, and the connection should go. A
+   peer at *MAX-WRITE-BACKLOG* has no room for the close frame either, and
+   is not reading, so it is closed at once rather than waited on.
+
+   Refused, as WS-SEND refuses, for a connection this worker does not own
+   and for one that is not an open WebSocket, :CLOSING included: a close
+   frame is already on its way there. Refused too off a worker, since the
+   close is the event loop's to carry out. CODE must be one a close frame
+   may carry; BUILD-WS-CLOSE says which."
+  (unless *epoll-fd*
+    (error "ws-close: not on a worker; the close is carried out by the event ~
+            loop that owns the connection"))
+  (unless (eq (lookup-connection (connection-fd conn)) conn)
+    (error "ws-close: fd ~d is not on this worker's connection table"
+           (connection-fd conn)))
+  (unless (eq (connection-state conn) :websocket)
+    (error "ws-close: fd ~d is ~s, not an open WebSocket"
+           (connection-fd conn) (connection-state conn)))
+  (let ((frame (build-ws-close code)))
+    (if (connection-append-write conn frame)
+        (progn
+          ;; :CLOSING is what HANDLE-CLIENT-WRITE closes on once the queue
+          ;; drains, and what WS-SEND refuses meanwhile. Armed whatever the
+          ;; queue holds, so the close happens even when this frame is the
+          ;; only thing in it.
+          (setf (connection-state conn) :closing)
+          (epoll-modify *epoll-fd* (connection-fd conn)
+                        (logior +epollout+ +epollet+)))
+        (close-connection conn *epoll-fd*)))
+  t)
 
 (defun check-ws-reply (reply)
   "REPLY, a ws-handler's return value, if it is one the write queue can

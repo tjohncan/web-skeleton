@@ -317,7 +317,8 @@ tests/
   dispatch an event it never wrote
 - **WebSocket server push** — `ws-send` queues a frame and flushes what the
   socket takes immediately, so a handler can stream without returning and
-  without a slow peer holding the worker
+  without a slow peer holding the worker. `ws-close` ends a WebSocket from
+  the server's side, with a close frame when the peer has room for one
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
   A file is served at the spellings of its path a browser sends, which the
