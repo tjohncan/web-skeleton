@@ -14,13 +14,18 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Read-only token: this job builds and tests, it never writes to the repo.
+# Read-only token: these jobs build and test, they never write to the repo.
 permissions:
   contents: read
 
+# Two jobs, one at each end of the SBCLs this supports. cold-build runs the
+# oldest: Ubuntu 24.04's packaged SBCL is 2.2.9, the version README
+# requires, so the image is named rather than left to ubuntu-latest, which
+# would raise the floor without saying so when it moves. latest-sbcl runs
+# Debian testing's packaged SBCL, the newest a distribution ships.
 jobs:
   cold-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -56,6 +61,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sbcl
           sbcl --version
+          # The floor is the point of this job, so a different SBCL fails it
+          # rather than passing in its place.
+          sbcl --version | grep -q '^SBCL 2\.2\.9' || {
+            echo "::error::expected SBCL 2.2.9 here, the supported floor"; exit 1; }
 
       # One step, one run, and it must be a COLD build.
       # ASDF compiles to ~/.cache/common-lisp and reuses the fasls on any later run.
@@ -114,6 +123,66 @@ jobs:
       # The suite's own totals-line check above is safe from this because
       # run-tests.lisp arrives through --load, so the string it prints is
       # nowhere on the command line.
+      - name: Compile the demo system, and check its Origin table
+        run: |
+          set -o pipefail
+          rm -f /tmp/demo.ok
+          sbcl --non-interactive \
+               --eval '(require :asdf)' \
+               --eval '(push *default-pathname-defaults* asdf:*central-registry*)' \
+               --eval '(asdf:load-system "web-skeleton-demo")' \
+               --load demo/test-origin.lisp \
+               --eval '(with-open-file (f "/tmp/demo.ok" :direction :output) (write-line "ok" f))' \
+               2>&1 | tee /tmp/demo.log
+          if [ ! -f /tmp/demo.ok ]; then
+            echo "::error::the demo system did not load, or its Origin table failed"
+            tail -40 /tmp/demo.log
+            exit 1
+          fi
+          if grep -qiE 'caught (warning|style-warning)' /tmp/demo.log; then
+            echo "::error::the demo emitted compile warnings"
+            grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/demo.log
+            exit 1
+          fi
+
+  # The same suite and demo checks on the newest packaged SBCL. Debian
+  # testing's image is Debian's own, from Debian's mirrors, so it is as
+  # reliable a source as the runner's. The checks are cold-build's, step for
+  # step, and their reasons are written there.
+  latest-sbcl:
+    runs-on: ubuntu-latest
+    container: debian:testing-slim
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # openssl brings libssl, and its CLI is what the TLS tests generate
+      # their certificates with. getent comes with the image's glibc.
+      - name: Install SBCL and libssl
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends sbcl openssl ca-certificates
+          sbcl --version
+
+      - name: Run test suite (cold build, fail on compile warnings)
+        run: |
+          set -o pipefail
+          rm -rf ~/.cache/common-lisp
+          sbcl --non-interactive --load run-tests.lisp 2>&1 | tee /tmp/build.log
+          if ! grep -qE '=== (ALL TESTS PASSED|SOME TESTS FAILED) ===' /tmp/build.log; then
+            echo "::error::the suite did not run — no totals line in the log"
+            tail -20 /tmp/build.log
+            exit 1
+          fi
+          if grep -qiE 'caught (warning|style-warning)' /tmp/build.log; then
+            echo "::error::compile emitted warnings"
+            grep -iE -B2 -A6 'caught (warning|style-warning)' /tmp/build.log
+            exit 1
+          fi
+
       - name: Compile the demo system, and check its Origin table
         run: |
           set -o pipefail
