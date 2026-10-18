@@ -2100,13 +2100,32 @@
     ;; SERIOUS-CONDITION, not ERROR, because :ON-BODY runs inside this: see
     ;; HANDLE-CLIENT-READ's last catch in main.lisp.
     (serious-condition (e)
-      (log-error "outbound error fd ~d: ~a" (connection-fd conn) e)
-      ;; Skip the error-delivery if the connection was already torn
-      ;; down (e.g. complete-fetch ran earlier in this call and
-      ;; close-outbound unregistered the fd). Avoids double-delivery
-      ;; of a 502 on top of an already-queued real response.
-      (when (lookup-connection (connection-fd conn))
-        (deliver-fetch-error conn epoll-fd "outbound request failed")))))
+      (let ((target (lookup-connection (connection-inbound-fd conn))))
+        (if (and target
+                 (typep e 'fd-io-error)
+                 (eql (fd-io-error-fd e) (connection-fd target)))
+            ;; :ON-BODY wrote to the connection it relays into, and that
+            ;; connection's own descriptor failed: the client has gone, not
+            ;; the upstream. Blamed on the upstream, a stream's ON-CLOSE
+            ;; would hear :UPSTREAM-FAILED and the log would carry an ERROR
+            ;; for a reset any client can cause. Closed as :DISCONNECTED
+            ;; instead, which tears this outbound down with it, the way any
+            ;; client leaving mid-relay does.
+            (progn
+              (log-debug "fd ~d: ~a — the relay's client is gone, closing"
+                         (connection-fd target) e)
+              (close-connection target epoll-fd :disconnected)
+              (when (lookup-connection (connection-fd conn))
+                (close-outbound conn epoll-fd)))
+            (progn
+              (log-error "outbound error fd ~d: ~a" (connection-fd conn) e)
+              ;; Skip the error-delivery if the connection was already torn
+              ;; down (e.g. complete-fetch ran earlier in this call and
+              ;; close-outbound unregistered the fd). Avoids double-delivery
+              ;; of a 502 on top of an already-queued real response.
+              (when (lookup-connection (connection-fd conn))
+                (deliver-fetch-error conn epoll-fd
+                                     "outbound request failed"))))))))
 
 (defun natural-interest (conn)
   "The epoll interest CONN's state implies: read when it is reading, write

@@ -1808,8 +1808,21 @@
           ;; :continue — more bytes to write
           (:continue nil)))
     (error (e)
-      (log-error "write error fd ~d: ~a" (connection-fd conn) e)
-      (close-connection conn epoll-fd))))
+      ;; A failure on this connection's own descriptor is its peer going
+      ;; away, a reset mid-download that any client can cause at will.
+      ;; HANDLE-CLIENT-READ reads the same fact the same way: DEBUG, and a
+      ;; stream hears :DISCONNECTED. Logged at ERROR, every client that
+      ;; closed early would be one line in the log nobody can act on. Any
+      ;; other failure here is the server's own, and stays an ERROR.
+      (if (and (typep e 'fd-io-error)
+               (eql (fd-io-error-fd e) (connection-fd conn)))
+          (progn
+            (log-debug "fd ~d: ~a — the peer is gone, closing"
+                       (connection-fd conn) e)
+            (close-connection conn epoll-fd :disconnected))
+          (progn
+            (log-error "write error fd ~d: ~a" (connection-fd conn) e)
+            (close-connection conn epoll-fd))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Event loop

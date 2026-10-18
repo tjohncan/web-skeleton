@@ -7586,6 +7586,114 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-a-client-reset-is-a-disconnect ()
+  "A client that resets its connection is a client leaving, on the write
+   path as on the read path: its stream hears :DISCONNECTED and nothing is
+   logged as an ERROR — whether the failed write was the event loop's own,
+   or a relay's :ON-BODY writing into it.
+
+   Any client can reset at will, so an ERROR per reset is a log nobody can
+   act on, and blaming it on the upstream sends an operator to look at the
+   wrong end. The relay half is driven at the seam: a stub transport hands
+   HANDLE-OUTBOUND-EVENT one chunk, and :ON-BODY's STREAM-SEND into the
+   reset client is what fails."
+  (format t "~%A client reset, on the write path and mid-relay~%")
+  (flet ((reset-stream (on-close)
+           ;; A streaming connection whose client has reset: the next write
+           ;; on it fails with the connection's own descriptor.
+           (multiple-value-bind (server client) (%loopback-pair)
+             (let ((conn (web-skeleton::make-connection
+                          :fd (web-skeleton::socket-fd server) :socket server
+                          :state :streaming :stream-framing :chunked
+                          :stream-on-close on-close
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
+               (%reset-socket client)
+               (sleep 0.05)
+               conn)))
+         (log-of (thunk)
+           (let ((web-skeleton:*log-stream* (make-string-output-stream)))
+             (funcall thunk)
+             (get-output-stream-string web-skeleton:*log-stream*))))
+    ;; --- The event loop's own write ---
+    (let* ((reason :never)
+           (epfd (web-skeleton::epoll-create))
+           (web-skeleton::*connections* (make-hash-table :test #'eql))
+           (conn (reset-stream (lambda (c r) (declare (ignore c)) (setf reason r)))))
+      (unwind-protect
+           (progn
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
+                                      (logior web-skeleton::+epollout+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::connection-append-write
+              conn (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :initial-element 65))
+             (let ((log (log-of (lambda ()
+                                  (web-skeleton::handle-client-write conn epfd)))))
+               (check "client reset: the stream heard :disconnected" reason :disconnected)
+               (check "client reset: and nothing was logged as an ERROR"
+                      (search "[ERROR]" log) nil)))
+        (ignore-errors (web-skeleton::%close epfd))))
+    ;; --- A relay's :ON-BODY writing into it ---
+    (let* ((reason :never)
+           (status :never)
+           (epfd (web-skeleton::epoll-create))
+           (web-skeleton::*connections* (make-hash-table :test #'eql))
+           (target (reset-stream (lambda (c r) (declare (ignore c)) (setf reason r))))
+           (bytes (sb-ext:string-to-octets
+                   (concatenate 'string
+                                "HTTP/1.1 200 OK" *crlf*
+                                "Transfer-Encoding: chunked" *crlf* *crlf*
+                                "5" *crlf* "hello" *crlf*)
+                   :external-format :ascii))
+           (pos 0)
+           (socket (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+           (out (web-skeleton::make-connection
+                 :fd (web-skeleton::socket-fd socket) :socket socket
+                 :state :out-read :outbound-p t
+                 :fetch-sink :detached
+                 :inbound-fd (web-skeleton::connection-fd target)
+                 :fetch-method :GET
+                 :last-active (get-universal-time)
+                 :fetch-on-body (lambda (c chunk)
+                                  (declare (ignore c))
+                                  (web-skeleton:stream-send target chunk)
+                                  nil)
+                 :fetch-callback (lambda (s h b)
+                                   (declare (ignore h b))
+                                   (setf status s)
+                                   nil)
+                 ;; The bytes once, then nothing more for now.
+                 :read-fn (lambda (buf start max)
+                            (if (>= pos (length bytes))
+                                :again
+                                (let ((n (min max (- (length bytes) pos))))
+                                  (replace buf bytes :start1 start
+                                                     :start2 pos :end2 (+ pos n))
+                                  (incf pos n)
+                                  n))))))
+      (unwind-protect
+           (progn
+             (setf (web-skeleton::connection-fetch-outstanding target) t)
+             (web-skeleton::register-connection target)
+             (web-skeleton::register-connection out)
+             (let ((log (log-of
+                         (lambda ()
+                           (web-skeleton::handle-outbound-event
+                            out epfd web-skeleton::+epollin+)))))
+               (check "relay into a reset client: the stream heard :disconnected"
+                      reason :disconnected)
+               (check "relay into a reset client: the fetch ended on the abort sentinel"
+                      status nil)
+               (check "relay into a reset client: both connections are gone"
+                      (hash-table-count web-skeleton::*connections*) 0)
+               (check "relay into a reset client: nothing was logged as an ERROR"
+                      (search "[ERROR]" log) nil)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The ping sweep flushes inline
 ;;;
@@ -11968,6 +12076,7 @@
   (test-ws-write-stall-sweep)
   (test-ws-handler-push-and-return)
   (test-a-stale-event-skips-the-fd-s-next-connection)
+  (test-a-client-reset-is-a-disconnect)
   (test-ws-ping-flush)
   (test-detached-pause-auto-resumes)
   (test-ws-send-arms-from-a-fetch-callback)
