@@ -2590,6 +2590,25 @@
          (match-path "/caf%C3%A9" "/caf%C3%A9") t)
   (check "literals :exact: and its decoded spelling does not match"
          (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") nil)
+  ;; The punctuation a page's encodeURIComponent escapes reads either way,
+  ;; on both sides, as CANONICAL-PATH says — and only that punctuation, in
+  ;; uppercase hex.
+  (check "literals :exact: an escaped bracket matches the literal one"
+         (match-path "/chunks/[id].js" "/chunks/%5Bid%5D.js") t)
+  (check "literals :exact: and a pattern may be written escaped"
+         (match-path "/chunks/%5Bid%5D.js" "/chunks/[id].js") t)
+  (check "literals :exact: every sub-delim and : @ read either way"
+         (match-path "/a!$&'()*+,;=:@b" "/a%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40b") t)
+  (check "literals :exact: lowercase hex is not a second spelling"
+         (match-path "/chunks/[id].js" "/chunks/%5bid%5d.js") nil)
+  (check "literals :exact: an escaped slash stays inside its segment"
+         (match-path "/a/b" "/a%2Fb") nil)
+  (check "canonical-path: decodes only that punctuation"
+         (web-skeleton:canonical-path "/%5Bx%5D/%61%2F%25%20%3a")
+         "/[x]/%61%2F%25%20%3a")
+  (check "canonical-path: a path with no escape is returned as is"
+         (let ((p "/plain/path")) (eq (web-skeleton:canonical-path p) p))
+         t)
   (check "literals :exact: an escape that is not UTF-8 fails, not raises"
          (attempt (match-path "/admin" "/%FF")) nil)
   (check "literals :exact: a capture is still decoded"
@@ -4788,8 +4807,10 @@
 
    The documented shape — routes first, SERVE-STATIC as the fallback —
    is only safe when the two read a path alike. MATCH-PATH under :EXACT
-   compares the spelling that arrived, so SERVE-STATIC serves a file at
-   one spelling only, the one a browser sends. Every other spelling of a
+   compares the spelling that arrived through CANONICAL-PATH, and
+   SERVE-STATIC serves a file only at the spellings that reads as one.
+   So the bracketed file is guarded at both of its spellings, the escaped
+   one a page's script sends included, and every other spelling of a
    guarded file is a 404 here, not the file.
 
    Requests go through PARSE-REQUEST, so the path is the parser's."
@@ -4812,7 +4833,8 @@
              (let ((path (http-request-path request)))
                (if (or (match-path "/admin" path)
                        (match-path "/admin.html" path)
-                       (match-path "/admin/:file" path))
+                       (match-path "/admin/:file" path)
+                       (match-path "/vault[1].txt" path))
                    (make-error-response 403)
                    (or (serve-static request) (make-error-response 404)))))
            (outcome (response)
@@ -4828,25 +4850,32 @@
              (write-file (concatenate 'string "caf" e-acute ".txt") "accented")
              (write-file "100%.txt" "percent")
              (write-file "icon@2x.txt" "at sign")
+             (write-file "vault[1].txt" "locked")
              (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
              (web-skeleton::load-static-files dir)
              (dolist (spec '(("/admin.html" 403)
                              ("/admin" 403)
                              ("/admin/report.txt" 403)
-                             ;; Other spellings of the guarded files.
+                             ("/vault[1].txt" 403)
+                             ;; Other spellings of the guarded files. The
+                             ;; bracketed one is a spelling a page's script
+                             ;; sends, so it reaches the file, and the guard
+                             ;; covers it there.
                              ("/%61dmin.html" 404)
                              ("/%61dmin" 404)
                              ("/admin%2Ehtml" 404)
                              ("/%61dmin/report.txt" 404)
                              ("/admin%2Freport.txt" 404)
+                             ("/vault%5B1%5D.txt" 403)
                              ;; A browser's spellings of unguarded files.
                              ("/a%20b.txt" :served)
                              ("/caf%C3%A9.txt" :served)
                              ("/100%25.txt" :served)
                              ("/icon@2x.txt" :served)
+                             ("/icon%402x.txt" :served)
                              ;; And spellings no browser sends.
                              ("/caf%c3%a9.txt" 404)
-                             ("/icon%402x.txt" 404)
+                             ("/vault%5b1%5d.txt" 404)
                              ("/100%.txt" 404)))
                (destructuring-bind (target expected) spec
                  (check (format nil "static spelling: ~a" target)
@@ -4862,6 +4891,9 @@
                   ("/a%20b.txt" "/a b.txt")
                   ("/caf%C3%A9" ,(format nil "/caf~c" (code-char #xE9)))
                   ("/a+b,c;d=e:f@g!h" "/a+b,c;d=e:f@g!h")
+                  ("/a%2Bb%2Cc%3Bd%3De%3Af%40g%21h" "/a+b,c;d=e:f@g!h")
+                  ("/%5Bid%5D-abc.js" "/[id]-abc.js")
+                  ("/%5bid%5d-abc.js" nil)
                   ("/%61dmin.html" nil)
                   ("/%2E%2E/x" nil)
                   ("/caf%c3%a9" nil)
@@ -4937,7 +4969,12 @@
                              ("/b*c.txt" "starred")
                              ("/q%3F.txt" "questioned")
                              ("/[slug]/page-1a2b.js" "chunk")
-                             ("/plain.txt" "plain")))
+                             ("/plain.txt" "plain")
+                             ;; As a page's encodeURIComponent writes them,
+                             ;; which is what Next.js puts in its asset URLs.
+                             ("/a%5B1%5D.txt" "bracketed")
+                             ("/b%2Ac.txt" "starred")
+                             ("/%5Bslug%5D/page-1a2b.js" "chunk")))
                (destructuring-bind (target expected) spec
                  (check (format nil "static syntax: ~a is served" target)
                         (body-at target) expected))))

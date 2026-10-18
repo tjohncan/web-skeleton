@@ -320,9 +320,9 @@ tests/
   without a slow peer holding the worker
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
-  A file is served at the one spelling of its path a browser sends and at no
-  other, so a route in front of it sees what it serves (DEPLOYMENT.md, "Routes
-  in front of static files").
+  A file is served at the spellings of its path a browser sends, which the
+  router reads as one, and at no other, so a route in front of it sees what
+  it serves (DEPLOYMENT.md, "Routes in front of static files").
   MIME detection (including `application/wasm`, without which browsers refuse
   `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),
@@ -657,7 +657,7 @@ All configurable via `setf` before calling `start-server`.
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
 | `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
-| `*match-path-literals*`        | `:exact`  | How `match-path` compares a pattern's literal segments. `:exact` matches the path as it arrived, the spelling `http-request-path` shows, so `/%61dmin` does not match `/admin`. `:decoded` percent-decodes the segment first (RFC 3986 §6.2.2.2), and then access decisions belong on the matched route, never on the raw path. Captures are decoded either way. Validated when the server starts |
+| `*match-path-literals*`        | `:exact`  | How `match-path` compares a pattern's literal segments. `:exact` matches the path as it arrived, the spelling `http-request-path` shows, read through `canonical-path`: `/%61dmin` does not match `/admin`, and `/a%5B1%5D` does match `/a[1]`. `:decoded` percent-decodes the segment first (RFC 3986 §6.2.2.2), and then access decisions belong on the matched route, never on the raw path. Captures are decoded either way. Validated when the server starts |
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes |
 

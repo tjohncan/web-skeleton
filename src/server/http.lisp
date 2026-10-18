@@ -427,26 +427,74 @@
             (setf start (1+ slash))
             (return (nreverse segments)))))))
 
+(defun path-either-spelling-byte-p (byte)
+  "T for a byte a path may carry either as itself or as an uppercase %XX
+   escape, naming the same path both ways.
+
+   These are [ ] : @ and the RFC 3986 sub-delims ! $ & ' ( ) * + , ; =. A
+   browser writes them as themselves in a path it builds, but a page that
+   builds its URLs with encodeURIComponent escapes them — Next.js does, for
+   its asset paths from 14.2 on — and the browser sends what the page
+   wrote. None of them can spell a letter, a digit, '.' or '/', so neither
+   spelling reaches a different file or route than the other."
+  (and (member byte '(#x21 #x24 #x26 #x27 #x28 #x29 #x2A #x2B #x2C
+                      #x3A #x3B #x3D #x40 #x5B #x5D))
+       t))
+
+(defun canonical-path (path)
+  "PATH with each uppercase %XX escape of a byte PATH-EITHER-SPELLING-BYTE-P
+   accepts replaced by the byte itself, and nothing else changed. This is
+   the form in which MATCH-PATH, under :EXACT, and SERVE-STATIC compare a
+   path, so the two read every request the same way.
+
+   Every other escape, and every byte written as itself, is left as it
+   arrived. So /a%5B1%5D and /a[1] are one path, while /%61dmin stays
+   apart from /admin, %2F stays inside its segment, and lowercase hex is
+   not a second spelling of an escape. An application checking the raw
+   path against a literal compares CANONICAL-PATH of it, which is the
+   router's reading."
+  (if (not (find #\% path))
+      path
+      (flet ((upper-hex (c)
+               (cond ((char<= #\0 c #\9) (- (char-code c) 48))
+                     ((char<= #\A c #\F) (- (char-code c) 55)))))
+        (with-output-to-string (out)
+          (let ((len (length path))
+                (i 0))
+            (loop while (< i len)
+                  do (let* ((c (char path i))
+                            (hi (and (char= c #\%) (< (+ i 2) len)
+                                     (upper-hex (char path (1+ i)))))
+                            (lo (and hi (upper-hex (char path (+ i 2)))))
+                            (byte (and lo (logior (ash hi 4) lo))))
+                       (if (and byte (path-either-spelling-byte-p byte))
+                           (progn (write-char (code-char byte) out)
+                                  (incf i 3))
+                           (progn (write-char c out)
+                                  (incf i))))))))))
+
 (defparameter *match-path-literals* :exact
   "How MATCH-PATH compares a pattern's literal segments with a path's.
 
      :EXACT    the default. A literal matches the segment as it arrived,
-               so /%61dmin does not match /admin.
+               read through CANONICAL-PATH, so /%61dmin does not match
+               /admin while /a%5B1%5D does match /a[1].
      :DECODED  the segment is percent-decoded first, so /%61dmin does
                match /admin — RFC 3986 §6.2.2.2 counts the two as one
                URI.
 
    A choice for the project, made once. :EXACT keeps a route matching
-   the spelling HTTP-REQUEST-PATH shows the application, so a check on
-   the raw path and the router read the same bytes the same way. Under
-   :DECODED, make access decisions on the matched route and never on the
-   raw path: a prefix test for \"/admin\" passes /%61dmin, which the
-   router then sends to the admin route.
+   the spelling HTTP-REQUEST-PATH shows the application, up to the
+   punctuation CANONICAL-PATH reads either way, so a check on the raw
+   path that goes through CANONICAL-PATH and the router read the same
+   bytes the same way. Under :DECODED, make access decisions on the
+   matched route and never on the raw path: a prefix test for \"/admin\"
+   passes /%61dmin, which the router then sends to the admin route.
 
    Captured :param values are percent-decoded under both. Under :EXACT a
-   literal outside unreserved ASCII is written in the pattern the way it
-   arrives, percent-encoded: /caf%C3%A9, not /café. START-SERVER refuses
-   any other value.")
+   literal outside unreserved ASCII and that punctuation is written in the
+   pattern the way it arrives, percent-encoded: /caf%C3%A9, not /café.
+   START-SERVER refuses any other value.")
 
 (defun match-path (pattern path)
   "Match PATH against PATTERN with :param segment captures.
@@ -454,10 +502,11 @@
    Empty segments are not captured (e.g. /users/ does not match /users/:id).
    Captured values are percent-decoded. Literals are compared as
    *MATCH-PATH-LITERALS* says: with the segment as it arrived (:EXACT,
-   the default), or with the segment percent-decoded (:DECODED). Under
-   :EXACT a literal comparison decodes nothing, so a segment whose
-   escapes are not UTF-8 fails a literal instead of raising; a capture
-   decodes under both, and raises for one.
+   the default), both sides read through CANONICAL-PATH, or with the
+   segment percent-decoded (:DECODED). Under :EXACT a literal comparison
+   decodes only that punctuation, so a segment whose escapes are not
+   UTF-8 fails a literal instead of raising; a capture decodes under
+   both, and raises for one.
 
    Return contract is a deliberate tri-state:
      NIL      — PATH does not match PATTERN
@@ -487,9 +536,10 @@
                                (push (cons (subseq pat 1) (url-decode seg))
                                      bindings)
                                t)
-                             (string= pat (if decode-literals
-                                              (url-decode seg)
-                                              seg))))
+                             (if decode-literals
+                                 (string= pat (url-decode seg))
+                                 (string= (canonical-path pat)
+                                          (canonical-path seg)))))
         (if bindings (nreverse bindings) t)))))
 
 ;;; ---------------------------------------------------------------------------
