@@ -431,11 +431,14 @@
                ;; an upstream — and a paused one is subscribed to no epoll
                ;; events at all, so no wake-up is coming either. Without
                ;; this arm a hung upstream strands the outbound socket and
-               ;; the app's callback never fires.
+               ;; the app's callback never fires. A pause whose target is
+               ;; still draining is the target's stall timeout's to bound,
+               ;; not this one's — see PAUSED-BEHIND-A-BACKLOG-P.
                (when (and (connection-outbound-p conn)
                           (eq (connection-fetch-sink conn) :detached)
                           (plusp (connection-fetch-deadline conn))
-                          (> now (connection-fetch-deadline conn)))
+                          (> now (connection-fetch-deadline conn))
+                          (not (paused-behind-a-backlog-p conn)))
                  (push conn detached-expired))
                ;; Every other outbound is cleaned up via its paired
                ;; inbound's :awaiting timeout — see close-connection
@@ -467,8 +470,17 @@
                         ;; producer stopped — the conflation
                         ;; WRITE-PROGRESS-AT exists to break, one level
                         ;; up and in another knob.
+                        ;;
+                        ;; A queue still moving counts as well. A producer
+                        ;; that sent a burst and waits on it — a paused
+                        ;; relay among them — has not gone quiet, its peer
+                        ;; is reading. A queue that stops moving is the
+                        ;; stall arm's, which is checked first.
                         (since (if (eq state :streaming)
-                                   (connection-stream-produced-at conn)
+                                   (if (plusp (connection-write-pending conn))
+                                       (max (connection-stream-produced-at conn)
+                                            (connection-write-progress-at conn))
+                                       (connection-stream-produced-at conn))
                                    (connection-last-active conn))))
                    (cond
                      ;; Stall is checked first: a connection can be both,

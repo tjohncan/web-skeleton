@@ -551,7 +551,9 @@ read about here.
   event loop's write path, so a pause taken while the target's queue was
   empty has no drain coming and needs an explicit `fetch-resume`. An app
   that pauses with neither condition arranged strands that fetch until
-  `*fetch-timeout*`.
+  `*fetch-timeout*`. Pausing when `stream-send` or `ws-send` answers `NIL`
+  — part of the chunk still queued — is the shape that always has a drain
+  coming (DEPLOYMENT.md, "Backpressure is a return value").
 - **A failed detached fetch takes a `:streaming` target with it, and on
   that path there is no opt-out.** The connection closes without its
   chunked terminator, so the peer sees truncation rather than a failed

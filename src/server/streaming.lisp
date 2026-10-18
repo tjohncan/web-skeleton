@@ -733,9 +733,11 @@
   (stream-send conn (sse-comment-bytes text)))
 
 (defun stream-full-p (conn)
-  "True when CONN's queue is at *MAX-WRITE-BACKLOG* and STREAM-SEND
-   would signal. A producer that can pause should ask before generating
-   an expensive payload — but this is a hint about bytes already queued,
-   not a promise about the next send, which only STREAM-SEND's own
-   return can give. See CONNECTION-WRITE-FULL-P."
+  "True when CONN's queue is at *MAX-WRITE-BACKLOG*. A producer that can
+   pause should ask before generating an expensive payload — but this is a
+   hint about bytes already queued, not a promise about the next send,
+   which only STREAM-SEND's own return can give: a send is refused as soon
+   as it would cross the bound, which is before the queue reaches it. A
+   relay pauses on STREAM-SEND answering NIL instead (DEPLOYMENT.md has the
+   recipe). See CONNECTION-WRITE-FULL-P."
   (connection-write-full-p conn))

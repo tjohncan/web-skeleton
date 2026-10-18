@@ -982,9 +982,12 @@ you are given if you want lines.
 **Backpressure is a return value, and resuming it is yours to do.**
 Return `:pause` from `:on-body` to stop reading the upstream — its send
 window fills and the pressure propagates back without anything being
-dropped or buffered. Call `fetch-resume` on the connection `:on-body` was
-handed to start reading again; it is idempotent, so a producer that calls
-it on every pass rather than tracking state is not punished for it.
+dropped or buffered. The pause takes effect at that chunk: no later chunk
+is handed over, however many the last read brought, until the fetch
+resumes, and then those are handed over first. Call `fetch-resume` on the
+connection `:on-body` was handed to start again; it is idempotent, and a
+no-op once the fetch has ended, so a producer that calls it on every pass
+rather than tracking state is not punished for it.
 
 **A relay's pause ends by itself, and the condition is narrower than it
 sounds.** Reading resumes when the connection being relayed into drains
@@ -994,29 +997,40 @@ inline, and a flush that completes never reaches the event loop's write
 path, so a pause taken while the target's queue was empty has no drain
 coming, and only an explicit `fetch-resume` restarts it.
 
-The shape that avoids the question is to ask before pausing. `stream-full-p`
-is exported for exactly this — it runs the same test `connection-append-write`
-runs internally — so a producer can give the verdict only when there is a drain
-that will end it:
+So pause on what the send said. `stream-send` answers `T` when the chunk
+went straight to the kernel and `NIL` when part of it is still queued, and
+`NIL` is exactly the case with a drain coming:
 
 ```lisp
 :on-body (lambda (out chunk)
            (declare (ignore out))
-           (stream-send client chunk)
-           ;; :pause only when the target has actually backed up. Pausing
-           ;; on an empty queue has no drain coming and strands the fetch
-           ;; until *fetch-timeout*, on an upstream that was healthy.
-           (when (stream-full-p client) :pause))
+           ;; NIL: part of this chunk is queued, the client is behind, and
+           ;; its queue draining is what resumes the fetch.
+           (unless (stream-send client chunk) :pause))
 ```
 
-The same shape works for a `:websocket` target through
-`connection-write-pending`, which is exported for the same reason. What you
-must not do is return `:pause` unconditionally and rely on something to lift
-it: nothing will, unless the queue was non-empty when you said it.
+Because the pause stops at that chunk, the client's queue never holds more
+than one chunk's remainder, and `stream-send` never meets
+`*max-write-backlog*` — unless a single chunk is larger than the backlog
+by itself, which it refuses. Size `*max-write-backlog*` above the largest
+chunk the upstream sends. `stream-full-p` is not this test: it reports a
+queue already at the bound, and a send can be refused before the queue gets
+there.
+
+The same shape works for a `:websocket` target, since `ws-send` answers the
+same way: `(unless (ws-send client (build-ws-frame +ws-op-binary+ chunk))
+:pause)`. What you must not do is return `:pause` unconditionally and rely
+on something to lift it: nothing will, unless the queue was non-empty when
+you said it.
 
 The deadline runs on unpaused time: `fetch-resume` pushes it out by the
 interval spent paused, so a relay is not killed for applying the
-backpressure it was told to apply.
+backpressure it was told to apply. While the client is still draining, the
+pause is bounded by the client's `*write-stall-timeout*` rather than by the
+deadline: a slow link draining a full queue can take longer than
+`*fetch-timeout*`, and that time is the client's. A queue that stops
+moving closes the client, which ends the fetch with it. A pause over an
+empty queue has nothing coming to end it, and the deadline still applies.
 
 **Outside a relay, resuming is yours to do, and forgetting is fatal to
 that request.** `:pause` is what stops `:on-body` firing, so the callback
@@ -1050,21 +1064,11 @@ application's own to do, and it is in a position to: a stop can only
 originate inside a callback of the fetch being stopped, so the code that
 returns `:stop` can set its own flag on the way.
 
-**It ends the fetch, not the pass.** Like `:pause`, the chunks already
-read are still handed to `:on-body` first, and a pass can carry many.
-Unlike `:pause`, it is remembered once given — a later chunk returning
-NIL does not retract it — and it is not advisory about the next read, so
-a response that completed in the same pass does not override it. What
-`:then` is told never depends on where the upstream's bytes happened to
-be split.
-
-One consequence of that is worth seeing before you meet it. If you stop on
-chunk three of five and the upstream's terminator happens to land in the
-same read, your `:then` receives the abort sentinel while `:on-body` has
-already handed you every byte of the response. That is correct — you asked
-to stop, and the answer to "did this fetch deliver" is no — but it does
-mean a NIL status is not proof you are missing anything. If you care, count
-what you consumed; the sentinel is about the fetch, not about your data.
+**It takes effect at that chunk.** As with `:pause`, no later chunk is
+handed over, however many the last read brought, and a response whose
+terminator had already arrived does not override it. What `:then` is told
+never depends on where the upstream's bytes happened to be split: a pass in
+which `:on-body` returned `:stop` ends the fetch as stopped.
 
 **Closing the target is the other way to end one, and it costs the
 connection.** `close-connection` walks for detached outbounds and reaps
@@ -1099,22 +1103,17 @@ caller carries on; it is a blocking call, so there is a stack to leave. A
 detached fetch has no call to exit from, and `:stop` is what it has
 instead.
 
-**One shape where `:pause` does nothing at all.** A response that arrives
-complete in a single read is delivered before the pause is consulted, so
-the flag is set and never read. Whether that happens is not something an
-app controls — it depends on how the upstream's bytes land — so treat
-`:pause` as advisory about the *next* read rather than as a guarantee that
-one is outstanding.
-
 A value rather than a condition, for the same reason
 `connection-append-write` refuses by return: applying backpressure is
 ordinary control flow and should not unwind through the middle of a read
 loop.
 
-`fetch-resume`'s re-arm works for a reason worth knowing. Elsewhere the
-docs warn that an `EPOLL_CTL_MOD` will not re-fire for data already
-sitting in user space; the bytes a paused fetch has not read are still in
-the kernel, so the edge does fire.
+`fetch-resume` does not wait for more bytes to arrive. A pause can leave
+chunks already read in user space, where no readability edge will report
+them — the warning elsewhere in these docs about `EPOLL_CTL_MOD` not
+re-firing for buffered data is about exactly this. So the resume wakes the
+fetch through writability, which its socket has at once, hands those
+chunks over first, and then reads.
 
 `*fetch-timeout*` stays a **total** on this path, not an inactivity
 bound. It is the only end-to-end network deadline the framework has, and

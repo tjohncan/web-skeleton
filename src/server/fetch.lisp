@@ -212,14 +212,15 @@
    backpressure is ordinary control flow and should not unwind through
    the middle of a read loop.
 
-   :PAUSE stops the upstream, not the current pass. Whatever was already
-   read stays in the read buffer and every chunk of it is still handed
-   over before EPOLLIN is dropped — CONNECTION-READ-AVAILABLE drains to
-   EAGAIN, so that can be a lot. This is deliberate and load-bearing: if
-   the walk stopped early, the undelivered bytes would sit in user space
-   where an EPOLL_CTL_MOD does not re-fire, and FETCH-RESUME could not be
-   a simple re-arm. The last answer in a pass is the one that counts, so
-   a caller may pause on one chunk and continue on a later one.
+   :PAUSE takes effect at that chunk. No later chunk is handed over until
+   the fetch resumes, however many the last read brought —
+   CONNECTION-READ-AVAILABLE drains to EAGAIN, so that can be a lot. What
+   the read brought stays in the buffer and is handed over first on the
+   resume. A relay needs exactly this: it pauses because its own queue is
+   behind, and every chunk delivered after that answer would land in the
+   queue it is protecting. The recipe is to pause when STREAM-SEND or
+   WS-SEND answers NIL, part of the chunk still queued, which is the one
+   moment a drain is certain to come and resume the fetch.
 
    Return :STOP from ON-BODY to end the fetch. The outbound is closed,
    the connection being fetched into is left untouched, and THEN receives
@@ -228,12 +229,9 @@
    be silent truncation: a partial body presented as a whole one. There is
    no resume; a stopped fetch is over.
 
-   :STOP ends the fetch, not the pass, so like :PAUSE it does not stop
-   the chunks already in hand from reaching ON-BODY. It differs in the
-   two places that matter. It is remembered once given, so a later chunk
-   returning NIL does not retract it. And it outranks a response that
-   completed in the same pass, so what THEN is told does not depend on
-   where the upstream's bytes happened to be split.
+   :STOP takes effect at that chunk too, and it outranks a response whose
+   terminator arrived in the same read, so what THEN is told does not
+   depend on where the upstream's bytes happened to be split.
 
    Only useful for a fetch started by FETCH-INTO, which is the one with a
    connection worth keeping. On the handler-returned path a client is
@@ -2046,6 +2044,12 @@
         ;; forward reference to dns.lisp.
         ((eq (connection-state conn) :out-dns)
          (funcall *handle-dns-ready-fn* conn epoll-fd))
+        ;; Paused: subscribed to nothing, but epoll reports an error or a
+        ;; hang-up whatever the interest. Acting on one here would walk the
+        ;; chunks the pause is holding back and hand them over while the
+        ;; consumer is still behind. FETCH-RESUME's re-arm brings any such
+        ;; condition back as an event, and it is handled then.
+        ((connection-fetch-paused conn) nil)
         (t
          ;; 1. Drain readable bytes first so a batched IN+HUP sees
          ;;    the bytes before the HUP is treated as fatal.
@@ -2211,17 +2215,21 @@
       (t (restore-interest conn epoll-fd)))))
 
 (defun fetch-resume (conn)
-  "Resume reading an outbound response that ON-BODY paused.
+  "Resume an outbound response that ON-BODY paused.
 
-   Re-arms EPOLLIN on the outbound connection. The bytes that arrived
-   while it was paused are in the kernel, not in user space, so the
-   edge-triggered re-arm does fire — which is exactly the case the
-   framework documents as *not* holding for buffered user-space data.
+   The chunks the pause left in the buffer are handed over first, then
+   reading goes on. The outbound is woken through writability, which its
+   socket has at once — the request went out before the response began —
+   so the resume does not wait on more bytes arriving. That matters
+   twice. The chunks already read raise no readability edge of their own,
+   and nor do bytes OpenSSL has decrypted and not yet handed over.
+   HANDLE-OUTBOUND-READ walks the buffer, then reads.
 
    CONN is the outbound connection ON-BODY was called for. A no-op if it
-   was never paused, so a producer that calls this on every pass rather
-   than tracking state is not punished for it."
-  (when (connection-fetch-paused conn)
+   is not paused, and once it is closed, so a producer that calls this on
+   every pass rather than tracking state is not punished for it."
+  (when (and (connection-fetch-paused conn)
+             (>= (connection-fd conn) 0))
     ;; The total runs on unpaused time. A relay applying backpressure is
     ;; deliberately not reading, so a deadline that kept running while
     ;; paused would kill a correct app for taking the framework's own
@@ -2245,8 +2253,7 @@
                        (connection-fd conn)))
         (setf (connection-paused-outbound-fd in) -1)))
     (when *epoll-fd*
-      (epoll-modify *epoll-fd* (connection-fd conn)
-                    (logior +epollin+ +epollet+))))
+      (invert-interest conn *epoll-fd*)))
   (values))
 
 (defun resume-paused-outbound (conn epoll-fd)
@@ -2272,6 +2279,22 @@
                    (= (connection-inbound-fd out) (connection-fd conn)))
           (let ((*epoll-fd* epoll-fd))
             (fetch-resume out)))))))
+
+(defun paused-behind-a-backlog-p (out)
+  "T while the outbound OUT is paused and the connection it relays into
+   still has bytes queued.
+
+   That pause has a drain under way, and the drain is what ends it: the
+   target's queue empties and RESUME-PAUSED-OUTBOUND resumes the fetch.
+   The fetch's own deadline is the wrong bound on it, because the time is
+   the client's to take — a slow link draining a full backlog legitimately
+   outlasts *FETCH-TIMEOUT*. *WRITE-STALL-TIMEOUT* on the target is the
+   right one: a queue that stops moving closes the target, and closing the
+   target reaps OUT. A pause over an empty queue has no drain coming, so
+   it is stranded rather than waiting, and the deadline still applies."
+  (and (connection-fetch-paused out)
+       (let ((target (lookup-connection (connection-inbound-fd out))))
+         (and target (plusp (connection-write-pending target)) t))))
 
 (defun drop-delivered-chunks (conn body-start next-scan)
   "Free the chunks :ON-BODY has been handed: shift CONN's read buffer
@@ -2299,7 +2322,19 @@
       (connection-shrink-read-buf conn))))
 
 (defun handle-outbound-read (conn epoll-fd)
-  "Read the outbound HTTP response. When complete, deliver to the inbound connection."
+  "Read the outbound HTTP response. When complete, deliver to the inbound
+   connection.
+
+   Chunks a pause left in the buffer are walked first, before anything
+   more is read (see FETCH-REWALK). A pause halts the walk at the chunk it
+   was given for, so the rest of that read is still here. Nothing would
+   report it again — no readability edge fires for bytes already in user
+   space — and a buffer they fill to the cap would answer the next read
+   :FULL, a 502 for a relay doing what it was told."
+  (when (connection-fetch-rewalk conn)
+    (setf (connection-fetch-rewalk conn) nil)
+    (unless (eq (walk-outbound-response conn epoll-fd :buffered) :reading)
+      (return-from handle-outbound-read)))
   (let ((result (connection-read-available conn)))
     (case result
       (:eof
@@ -2334,134 +2369,120 @@
       ;; Nothing read; the transport wants to send first.
       (:want-write (invert-interest conn epoll-fd))
       ((:ok :ok-eof :ok-want-write)
-       ;; Got data — is the response framed-complete yet? OUTBOUND-
-       ;; RESPONSE-COMPLETE-P is the one definition of "done", shared with
-       ;; the TLS path. CHUNK-SCAN-POS carries the chunked walk's resume
-       ;; offset across reads so a dribbling upstream is walked once, not
-       ;; rescanned from the top on every wake-up.
-       ;;
-       ;; Completion follows the framing, not the socket's lifetime.
-       ;; Waiting for EOF would work only because outbound requests
-       ;; default to Connection: close, and even then it would cost a
-       ;; round trip, with the whole response sitting in our buffer while
-       ;; we waited for the upstream's FIN. An app that overrides
-       ;; Connection to keep-alive would get an upstream that never
-       ;; closes, and the fetch would hang until the :awaiting reaper
-       ;; dropped the inbound with no response at all.
-       ;;
-       ;; Close-delimited responses (no CL, no TE) never satisfy this
-       ;; test: for those, EOF genuinely is the framing, so they complete
-       ;; from the :OK-EOF clause below or the :EOF arm above.
-       (let ((pause nil)
-             (stop nil)
-             ;; The drain stopped because the buffer reached the cap, not
-             ;; because the transport ran dry, so more may be waiting — see
-             ;; the T arm below.
-             (cut (>= (connection-read-pos conn) (connection-read-cap conn))))
-         (multiple-value-bind (complete next-scan chunked-body-start)
-             (outbound-response-complete-p
-              (connection-read-buf conn)
-              (connection-read-pos conn)
-              (connection-fetch-method conn)
-              (connection-chunk-scan-pos conn)
-              (when (connection-fetch-on-body conn)
-                (lambda (buf start end)
-                  ;; SUBSEQ rather than the shared buffer: the app keeps
-                  ;; whatever it is handed, and the read buffer is reused
-                  ;; on the next wake-up.
-                  (let ((verdict (funcall (connection-fetch-on-body conn)
-                                          conn (subseq buf start end))))
-                    ;; The two verdicts are captured differently, because
-                    ;; they are different kinds of claim.
-                    ;;
-                    ;; Last answer in a pass wins for :PAUSE. A caller that
-                    ;; pauses on one chunk and continues on the next ends
-                    ;; the pass reading, which is the useful reading of a
-                    ;; producer that drained its own backlog partway
-                    ;; through: :PAUSE describes the backlog now, so the
-                    ;; last chunk's answer is the current one.
-                    ;;
-                    ;; :STOP is sticky, because it describes the fetch
-                    ;; rather than the moment and nothing retracts it —
-                    ;; there is no un-stop verdict for a later chunk to
-                    ;; carry. Under last-wins an app that stopped on the
-                    ;; second of five chunks would have its stop erased by
-                    ;; the NIL it returns for the third, and the fetch
-                    ;; would run to completion with the cancel silently
-                    ;; dropped. A pass carrying one chunk cannot tell the
-                    ;; two rules apart, which is the arrangement a detector
-                    ;; for this has to avoid.
-                    (setf pause (eq verdict :pause))
-                    (when (eq verdict :stop)
-                      (setf stop t)))))
-              ;; Found incrementally; see OUTBOUND-RESPONSE-HEAD.
-              (outbound-response-head conn))
-           (setf (connection-chunk-scan-pos conn) next-scan)
-           ;; A relay that is still reading frees what it has handed on;
-           ;; a fetch ending in this pass needs nothing freed.
-           (when (and chunked-body-start
-                      (connection-fetch-on-body conn)
-                      (not complete)
-                      (not stop))
-             (drop-delivered-chunks conn chunked-body-start next-scan))
-           (cond
-             ;; Ahead of COMPLETE, and so ahead of :OK-EOF as well.
-             ;;
-             ;; The opposite precedence from PAUSE below, which loses to
-             ;; both — deliberately, and for a reason that does not carry
-             ;; over. A pause is advisory about the *next* read, so a
-             ;; response that finished in this one has nothing left for it
-             ;; to govern and dropping it costs nothing. A stop governs
-             ;; what the application is told, and that is reported either
-             ;; way.
-             ;;
-             ;; Ordered the other way, the same app against the same
-             ;; upstream would get the abort sentinel or a 200 depending on
-             ;; whether the terminator happened to land in the pass it
-             ;; stopped on — segmentation it cannot see or control,
-             ;; choosing the outcome its :THEN reads. One rule instead: a
-             ;; pass in which :ON-BODY returned :STOP ends the fetch as
-             ;; stopped.
-             (stop (stop-fetch conn epoll-fd))
-             (complete (complete-fetch conn epoll-fd :framing-complete t))
-             ;; Bytes walked and delivered, then end of stream.
-             ;;
-             ;; Ahead of PAUSE deliberately. A peer that is gone has
-             ;; nothing left to un-pause, so a pause recorded here would
-             ;; strand the fetch until *FETCH-TIMEOUT* with its body
-             ;; already sitting in the app — the same stranding :OK-EOF
-             ;; exists to prevent, rebuilt one branch lower.
-             ((eq result :ok-eof) (complete-fetch conn epoll-fd))
-             ;; Backpressure: leave the bytes in the kernel and let the
-             ;; upstream's window fill, which is the disposition a relay
-             ;; wants — the client has not misbehaved, it is on a slower
-             ;; link. FETCH-RESUME has why the re-arm works.
-             (pause
-              (setf (connection-fetch-paused conn) t
-                    (connection-fetch-paused-at conn) (get-universal-time))
-              (setf (connection-interest-inverted conn) nil)
-              (epoll-modify epoll-fd (connection-fd conn) +epollet+)
-              ;; The back-link RESUME-PAUSED-OUTBOUND reads; its docstring
-              ;; has why the edge exists.
-              (let ((in (lookup-connection (connection-inbound-fd conn))))
-                (when in
-                  (setf (connection-paused-outbound-fd in)
-                        (connection-fd conn)))))
-             ;; Bytes arrived, then the transport asked to send. The
-             ;; response is incomplete, so this same read is re-issued.
-             ((eq result :ok-want-write) (invert-interest conn epoll-fd))
-             ;; A drain cut short by the cap has to run again, and nothing
-             ;; else would wake it. Bytes still in the kernel raise no new
-             ;; edge, and under TLS OpenSSL can hold decrypted bytes the
-             ;; socket knows nothing of. Writability is the wake-up: the
-             ;; request is sent, so the socket is writable at once, and
-             ;; the :OUT-READ dispatcher re-issues the read on an inverted
-             ;; interest. A relay has freed what it handed on, so the read
-             ;; finds room. A buffered fetch finds none and answers :FULL,
-             ;; a prompt 502 rather than a wait for bytes that may never
-             ;; come.
-             (cut (invert-interest conn epoll-fd))
-             (t (restore-interest conn epoll-fd)))))))))
+       (walk-outbound-response conn epoll-fd result)))))
+
+(defun walk-outbound-response (conn epoll-fd result)
+  "Walk the response in CONN's read buffer, hand :ON-BODY its chunks, and
+   act on what the walk and the verdicts decided. RESULT is what
+   CONNECTION-READ-AVAILABLE answered for the read that brought the bytes,
+   or :BUFFERED for chunks a pause left behind, walked with no read since.
+   Answers :READING when the fetch reads on, :PAUSED, or :ENDED.
+
+   Is the response framed-complete yet? OUTBOUND-RESPONSE-COMPLETE-P is
+   the one definition of \"done\", shared with the TLS path. CHUNK-SCAN-POS
+   carries the chunked walk's resume offset across reads, so a dribbling
+   upstream is walked once, not rescanned from the top on every wake-up.
+
+   Completion follows the framing, not the socket's lifetime. Waiting for
+   EOF would work only because outbound requests default to Connection:
+   close, and even then it would cost a round trip, with the whole
+   response sitting in our buffer while we waited for the upstream's FIN.
+   An app that overrides Connection to keep-alive would get an upstream
+   that never closes, and the fetch would hang until the :awaiting reaper
+   dropped the inbound with no response at all. Close-delimited responses
+   (no CL, no TE) never satisfy the test: for those, EOF genuinely is the
+   framing, so they complete from the :OK-EOF arm below or from
+   HANDLE-OUTBOUND-READ's :EOF arm.
+
+   A verdict takes effect at the chunk it was given for. :PAUSE or :STOP
+   halts the walk there, so no later chunk is handed over in the same
+   pass — however many the read brought. A pass's chunks are bounded only
+   by the read cap, and a consumer applying backpressure has to be able to
+   stop at the chunk it decided on, or its own queue fills behind its
+   back. What a pause leaves in the buffer is walked first when the fetch
+   resumes."
+  (let ((pause nil)
+        (stop nil)
+        ;; The drain stopped because the buffer reached the cap, not
+        ;; because the transport ran dry, so more may be waiting — see the
+        ;; CUT arm below.
+        (cut (>= (connection-read-pos conn) (connection-read-cap conn))))
+    (multiple-value-bind (complete next-scan chunked-body-start)
+        (outbound-response-complete-p
+         (connection-read-buf conn)
+         (connection-read-pos conn)
+         (connection-fetch-method conn)
+         (connection-chunk-scan-pos conn)
+         (when (connection-fetch-on-body conn)
+           (lambda (buf start end)
+             ;; SUBSEQ rather than the shared buffer: the app keeps
+             ;; whatever it is handed, and the read buffer is reused on
+             ;; the next wake-up.
+             (case (funcall (connection-fetch-on-body conn)
+                            conn (subseq buf start end))
+               (:pause (setf pause t) :halt)
+               (:stop  (setf stop t)  :halt)
+               (t nil))))
+         ;; Found incrementally; see OUTBOUND-RESPONSE-HEAD.
+         (outbound-response-head conn))
+      (setf (connection-chunk-scan-pos conn) next-scan)
+      ;; A relay that is still reading frees what it has handed on; a fetch
+      ;; ending in this pass needs nothing freed.
+      (when (and chunked-body-start
+                 (connection-fetch-on-body conn)
+                 (not complete)
+                 (not stop))
+        (drop-delivered-chunks conn chunked-body-start next-scan))
+      (cond
+        ;; A halted walk is never complete, so at most one of the first
+        ;; three holds.
+        (stop (stop-fetch conn epoll-fd) :ended)
+        (complete (complete-fetch conn epoll-fd :framing-complete t) :ended)
+        ;; Ahead of :OK-EOF. A pause halts the walk with chunks still in
+        ;; the buffer, and completing on the end of stream would judge a
+        ;; body the app has not been handed yet. The resume walks them, and
+        ;; reaches the terminator or the end of stream from there.
+        (pause (pause-outbound conn epoll-fd) :paused)
+        ;; Bytes walked and delivered, then end of stream.
+        ((eq result :ok-eof) (complete-fetch conn epoll-fd) :ended)
+        ;; Bytes arrived, then the transport asked to send. The response is
+        ;; incomplete, so this same read is re-issued.
+        ((eq result :ok-want-write) (invert-interest conn epoll-fd) :reading)
+        ;; Buffered chunks walked with nothing halting them: the caller
+        ;; reads next, in the same wake-up.
+        ((eq result :buffered) :reading)
+        ;; A drain cut short by the cap has to run again, and nothing else
+        ;; would wake it. Bytes still in the kernel raise no new edge, and
+        ;; under TLS OpenSSL can hold decrypted bytes the socket knows
+        ;; nothing of. Writability is the wake-up: the request is sent, so
+        ;; the socket is writable at once, and the :OUT-READ dispatcher
+        ;; re-issues the read on an inverted interest. A relay has freed
+        ;; what it handed on, so the read finds room. A buffered fetch
+        ;; finds none and answers :FULL, a prompt 502 rather than a wait
+        ;; for bytes that may never come.
+        (cut (invert-interest conn epoll-fd) :reading)
+        (t (restore-interest conn epoll-fd) :reading)))))
+
+(defun pause-outbound (conn epoll-fd)
+  "Stop CONN reading: the backpressure ON-BODY asked for.
+
+   Every event is dropped from the interest, so the upstream's bytes stay
+   in the kernel and its send window fills — the disposition a relay
+   wants, since the client has not misbehaved, it is on a slower link.
+   HANDLE-OUTBOUND-EVENT ignores the error and hang-up reports epoll sends
+   regardless, so nothing is handed over until FETCH-RESUME. FETCH-REWALK
+   is set because the walk halted at a chunk and what followed it in the
+   read is still in the buffer."
+  (setf (connection-fetch-paused conn) t
+        (connection-fetch-paused-at conn) (get-universal-time)
+        (connection-fetch-rewalk conn) t
+        (connection-interest-inverted conn) nil)
+  (epoll-modify epoll-fd (connection-fd conn) +epollet+)
+  ;; The back-link RESUME-PAUSED-OUTBOUND reads; its docstring has why the
+  ;; edge exists.
+  (let ((in (lookup-connection (connection-inbound-fd conn))))
+    (when in
+      (setf (connection-paused-outbound-fd in) (connection-fd conn)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked body decoding (for buffered responses)
@@ -3036,6 +3057,10 @@
    is logged at warn level and must not block teardown."
   (let ((fd (connection-fd conn)))
     (when (>= fd 0)
+      ;; A closed fetch is not a paused one, so FETCH-RESUME on it is the
+      ;; no-op its contract promises rather than an epoll_ctl on a dead fd.
+      (setf (connection-fetch-paused conn) nil
+            (connection-fetch-rewalk conn) nil)
       (finish-fetch (claim-fetch-callback conn) :aborted)
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)

@@ -239,13 +239,18 @@
   ;; (CONN BYTES) per chunk as an outbound response arrives, or NIL to
   ;; buffer the whole body. Set from the continuation by INITIATE-FETCH.
   (fetch-on-body   nil :type (or null function))
-  ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
-  ;; the upstream's send window fills. FETCH-RESUME re-arms.
+  ;; T while ON-BODY has asked for backpressure: no chunk is handed over,
+  ;; no event is acted on, and the upstream's send window fills.
+  ;; FETCH-RESUME ends it.
   (fetch-paused    nil :type boolean)
   ;; When the current pause began, or 0. Read by FETCH-RESUME to push the
   ;; deadline out by the interval spent paused, so the total is on unpaused
   ;; time rather than wall clock.
   (fetch-paused-at 0 :type integer)
+  ;; T when the read buffer may hold chunks a pause left there, read but not
+  ;; yet handed over. HANDLE-OUTBOUND-READ walks them before reading more:
+  ;; no readability edge will report bytes already in user space.
+  (fetch-rewalk    nil :type boolean)
   ;; On an *inbound* connection: the fd of an outbound that paused while
   ;; relaying into it, or -1. The back-link exists because the pause is
   ;; recorded on the outbound and the event that should end it — this

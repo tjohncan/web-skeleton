@@ -123,7 +123,14 @@
    ON-DATA, when supplied, is called (BUF START END) once per chunk whose
    framing this walk has just proved whole — the same visit, handing the
    bytes back instead of only stepping over them. Never called twice for
-   a chunk, because RESUME means the walk never revisits one."
+   a chunk, because RESUME means the walk never revisits one.
+
+   ON-DATA's value is ignored unless it is :HALT, which ends the walk at
+   that chunk: COMPLETE-P is NIL and NEXT-RESUME is the following chunk's
+   boundary, so a later call resumes there and nothing past the halting
+   chunk has been handed over. That is how a consumer applies backpressure
+   at the chunk it decided on, rather than after every chunk the buffer
+   happened to hold."
   (let ((pos (max start resume))
         (data-bytes 0))
     (loop
@@ -183,8 +190,12 @@
           (incf data-bytes size)
           ;; The walk has already proved this chunk whole; ON-DATA is how
           ;; the bytes leave without a second pass over them.
-          (when on-data
-            (funcall on-data buf data-start (+ data-start size))))))))
+          (when (and on-data
+                     (eq (funcall on-data buf data-start (+ data-start size))
+                         :halt))
+            ;; POS is the next chunk's boundary, everything before it
+            ;; validated, so it is where a later call resumes.
+            (return (values nil pos 0 data-bytes 0))))))))
 
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).

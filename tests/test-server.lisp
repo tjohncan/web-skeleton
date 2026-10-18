@@ -5802,10 +5802,12 @@
    paused and had nothing else to run had removed its own way back.
 
    Asserted against epoll rather than against a flag. Clearing
-   FETCH-PAUSED without re-arming EPOLLIN would look identical from the
-   struct and would leave the connection waiting for an event nobody is
-   going to send — which is exactly the mistake the re-arm test was
-   rewritten to catch."
+   FETCH-PAUSED without re-arming would look identical from the struct and
+   would leave the connection waiting for an event nobody is going to
+   send. And with nothing sent to the outbound: the resume has to wake it
+   through writability, because the chunks a pause leaves are already in
+   user space, and a readability re-arm would wait on bytes that may never
+   come."
   (format t "~%Automatic inbound-to-outbound resume~%")
   (multiple-value-bind (in-server in-client) (%loopback-pair)
     (multiple-value-bind (out-server out-client) (%loopback-pair)
@@ -5842,12 +5844,8 @@
                       (web-skeleton::connection-fetch-paused outbound) nil)
                (check "resume edge: the back-link is cleared with it"
                       (web-skeleton::connection-paused-outbound-fd inbound) -1)
-               ;; The assertion that matters: EPOLLIN is actually back.
-               (sb-bsd-sockets:socket-send out-client
-                                           (sb-ext:string-to-octets
-                                            "hi" :external-format :ascii)
-                                           nil)
-               (sleep 0.05)
+               ;; The assertion that matters: the outbound is woken, with
+               ;; nothing new sent to it.
                (check "resume edge: and epoll reports the outbound again"
                       (plusp (web-skeleton::epoll-wait epfd evbuf 4 100)) t)
                (check "resume edge: it is the outbound fd"
@@ -6581,6 +6579,28 @@
         (check "on-data: a byte-at-a-time upstream delivers each chunk once"
                (nreverse seen) '("alpha" "beta" "gamma")))
 
+      ;; --- :HALT ends the walk at that chunk; the next call resumes after it ---
+      ;; The whole body is in the buffer, so a walk that carried on past
+      ;; the verdict would hand over gamma and report the body complete.
+      (let ((seen nil))
+        (multiple-value-bind (complete resume)
+            (web-skeleton::chunked-body-complete-p
+             framed 0 n 0
+             (lambda (buf s e)
+               (push (str (subseq buf s e)) seen)
+               (when (equal (first seen) "beta") :halt)))
+          (check "on-data halt: the walk stops at the halting chunk"
+                 (list complete (reverse seen))
+                 (list nil '("alpha" "beta")))
+          (multiple-value-bind (complete2 resume2)
+              (web-skeleton::chunked-body-complete-p
+               framed 0 n resume
+               (lambda (buf s e) (push (str (subseq buf s e)) seen) nil))
+            (declare (ignore resume2))
+            (check "on-data halt: a later call resumes after it, and finishes"
+                   (list complete2 (reverse seen))
+                   (list t '("alpha" "beta" "gamma"))))))
+
       ;; --- A partial chunk is never handed over ---
       ;; The walk returns before ON-DATA when the data or its trailing
       ;; CRLF has not landed, so an app is never given bytes whose
@@ -6596,14 +6616,16 @@
 ;;; :on-body backpressure
 ;;;
 ;;; Over a real socket and a real epoll fd, because the whole mechanism
-;;; is an epoll interest change: :PAUSE drops EPOLLIN so the upstream's
-;;; send window fills, and FETCH-RESUME puts it back. Nothing about that
-;;; is observable from a struct.
+;;; is an epoll interest change: :PAUSE drops every event so the upstream's
+;;; send window fills, and FETCH-RESUME wakes the fetch again. Nothing
+;;; about that is observable from a struct.
 ;;;
-;;; The property that makes the simple re-arm correct is that a pause
-;;; stops the *upstream*, not the current pass — everything already read
-;;; is still handed over, so no undelivered bytes are left in user space
-;;; where an EPOLL_CTL_MOD would not re-fire.
+;;; A pause halts the walk at its chunk, so what the read brought after it
+;;; is left in user space, where no readability edge will report it. The
+;;; resume therefore wakes through writability and walks the buffer before
+;;; it reads, and the checks below are arranged so that only that wake-up
+;;; can deliver the chunks: nothing new reaches the socket until the last
+;;; round.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-fetch-on-body-pause ()
@@ -6652,8 +6674,8 @@
              (sleep 0.1)
              (web-skeleton::handle-outbound-read conn epfd)
 
-             (check "pause: the callback saw every chunk already read"
-                    (nreverse seen) '("aa" "bb" "cc"))
+             (check "pause: the walk stopped at the chunk it paused on"
+                    (reverse seen) '("aa"))
              (check "pause: the connection is marked paused"
                     (web-skeleton::connection-fetch-paused conn) t)
              ;; The response is unterminated, so the fetch has not
@@ -6662,49 +6684,59 @@
              (check "pause: the fetch has not completed"
                     (hash-table-count web-skeleton::*connections*) 1)
 
-             ;; Resume clears the flag and re-arms. The re-arm is what
-             ;; makes the pause recoverable rather than a one-way door.
-             (web-skeleton::fetch-resume conn)
-             (check "resume: the paused flag is cleared"
-                    (web-skeleton::connection-fetch-paused conn) nil)
-             (check "resume: a second resume is a no-op, not an error"
-                    (progn (web-skeleton::fetch-resume conn)
-                           (web-skeleton::connection-fetch-paused conn))
-                    nil)
-
-             ;; The re-arm has to be asserted against epoll, not against a
-             ;; read. HANDLE-OUTBOUND-READ calls the socket directly, so
-             ;; it delivers bytes whatever the interest mask says — the
-             ;; mask only decides whether the event loop is ever woken to
-             ;; call it. Reverting the re-arm and re-running showed
-             ;; exactly that: a delivery check passed with the pause
-             ;; never lifted.
+             ;; Asserted against epoll, not against a read.
+             ;; HANDLE-OUTBOUND-READ delivers whatever the interest mask
+             ;; says, so only the event shows whether the loop would ever
+             ;; be woken to call it.
              (let ((evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
                                       :element-type '(unsigned-byte 8))))
-               ;; Fresh bytes with the interest re-armed: the loop wakes.
-               (sb-bsd-sockets:socket-send
-                client
-                (web-skeleton::encode-chunk
-                 (sb-ext:string-to-octets "dd" :external-format :ascii))
-                nil)
-               (sleep 0.1)
-               (check "resume: epoll reports the fd once the interest is back"
-                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
-               ;; And it really is our fd, not a stray wake-up.
-               (check "resume: and it is the outbound fd"
-                      (web-skeleton::epoll-event-fd evbuf 0) out-fd)
-               ;; Paused again, the same bytes produce no wake-up at all.
-               (web-skeleton::handle-outbound-read conn epfd)
-               (check "pause: a paused fd is not reported, with data waiting"
-                      (progn
-                        (sb-bsd-sockets:socket-send
-                         client
-                         (web-skeleton::encode-chunk
-                          (sb-ext:string-to-octets "ee" :external-format :ascii))
-                         nil)
-                        (sleep 0.1)
-                        (web-skeleton::epoll-wait epfd evbuf 4 50))
-                      0)))
+               (flet ((resume-and-dispatch ()
+                        ;; One resume, then the one event it must produce,
+                        ;; handed to the dispatcher the loop would use.
+                        (web-skeleton::fetch-resume conn)
+                        (let ((n (web-skeleton::epoll-wait epfd evbuf 4 50)))
+                          (when (plusp n)
+                            (web-skeleton::handle-outbound-event
+                             conn epfd (web-skeleton::epoll-event-flags evbuf 0)))
+                          (and (plusp n)
+                               (web-skeleton::epoll-event-fd evbuf 0)))))
+                 ;; Nothing new is sent before these two rounds, so the
+                 ;; chunks can only come from the buffer the pause left.
+                 (check "resume: woken at once, with no new bytes"
+                        (resume-and-dispatch) out-fd)
+                 (check "resume: the next buffered chunk, and only it"
+                        (reverse seen) '("aa" "bb"))
+                 (check "resume: paused again by its own verdict"
+                        (web-skeleton::connection-fetch-paused conn) t)
+                 (resume-and-dispatch)
+                 (check "resume: the last buffered chunk"
+                        (reverse seen) '("aa" "bb" "cc"))
+                 ;; Paused, bytes in the kernel produce no wake-up at all.
+                 (sb-bsd-sockets:socket-send
+                  client
+                  (web-skeleton::encode-chunk
+                   (sb-ext:string-to-octets "dd" :external-format :ascii))
+                  nil)
+                 (sleep 0.1)
+                 (check "pause: a paused fd is not reported, with data waiting"
+                        (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+                 ;; With the buffer walked dry, the resume goes on to read.
+                 (check "resume: and then reads what arrived meanwhile"
+                        (progn (resume-and-dispatch) (reverse seen))
+                        '("aa" "bb" "cc" "dd"))))
+             (check "resume: a second resume is a no-op, not an error"
+                    (progn (web-skeleton::fetch-resume conn)
+                           (web-skeleton::fetch-resume conn)
+                           :ok)
+                    :ok)
+             ;; A fetch that ends while paused is not paused any more, and
+             ;; resuming it is the no-op the contract promises rather than
+             ;; an epoll_ctl on a descriptor that is gone.
+             (web-skeleton::close-outbound conn epfd)
+             (check "resume: on a closed fetch, a no-op"
+                    (handler-case (progn (web-skeleton::fetch-resume conn) :ok)
+                      (error (e) (princ-to-string e)))
+                    :ok))
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
@@ -9326,13 +9358,16 @@
                     ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
                     ;; leaves one: subscribed to no events at all, so
                     ;; nothing but a resume can ever wake it.
+                    ;; Started ten seconds ago and paused for the last
+                    ;; five, so the resume has a known interval to add.
                     (out (web-skeleton::make-connection
                           :fd out-fd :socket out-server :state :out-read
                           :outbound-p t
                           :fetch-sink :detached
                           :fetch-paused t
-                          :fetch-paused-at (get-universal-time)
-                          :fetch-deadline (+ (get-universal-time) 30)
+                          :fetch-paused-at (- (get-universal-time) 5)
+                          :fetch-started-at (- (get-universal-time) 10)
+                          :fetch-deadline (+ (get-universal-time) 20)
                           :inbound-fd tgt-fd
                           :last-active (get-universal-time)))
                     ;; The target: a streaming connection with the
@@ -9368,11 +9403,12 @@
                       (web-skeleton::connection-paused-outbound-fd tgt) -1)
                ;; The deadline moved by the time spent paused, so a relay
                ;; is not killed for applying the backpressure it was told
-               ;; to apply.
-               (check (format nil "~a: the deadline is not still the original" label)
+               ;; to apply. Compared with the deadline the fixture set:
+               ;; start plus thirty, then at least the five paused seconds.
+               (check (format nil "~a: the deadline moved by the paused time" label)
                       (>= (web-skeleton::connection-fetch-deadline out)
                           (+ (web-skeleton::connection-fetch-started-at out)
-                             30))
+                             30 5))
                       t))
           (ignore-errors (web-skeleton::%close epfd))
           (ignore-errors (sb-bsd-sockets:socket-close out-server))
