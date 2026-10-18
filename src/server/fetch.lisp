@@ -1587,7 +1587,9 @@
                       for HEAD
      list of segments byte vectors and WRITE-SPANs, written in order —
                       SERVE-STATIC's shape — whose producer has already
-                      decided what HEAD gets
+                      decided what HEAD gets, with CONN's Connection line
+                      added ahead of the head's blank line (see
+                      WITH-CONNECTION-LINE)
 
    Anything else signals, naming those shapes, rather than reaching a
    struct accessor inside FORMAT-RESPONSE and raising a type error about
@@ -1623,11 +1625,43 @@
                      (or (typep segment '(simple-array (unsigned-byte 8) (*)))
                          (write-span-p segment)))
                    response))
-       (connection-queue-segments conn response))
+       (connection-queue-segments
+        conn (with-connection-line response (connection-hint-for conn))))
       (t
        (error "~a is not a response: expected an HTTP-RESPONSE, a byte ~
                vector, or a list of segments (what SERVE-STATIC returns)"
               (type-of response))))))
+
+(defun with-connection-line (segments hint)
+  "SEGMENTS with the Connection header HINT calls for placed just ahead of
+   their blank line, or SEGMENTS unchanged when HINT is NIL or there is no
+   blank line to find.
+
+   The blank line is the shared +HEADER-TERMINATOR+, which every head
+   SERVE-STATIC builds ends with, so finding it is an EQ test and not a
+   parse. A static head is built before anyone knows which connection it
+   will go out on, so this is where the answer HTTP/1.0 keep-alive needs
+   (keep-alive) and the one a closing connection owes (close) reach it,
+   the same answer FORMAT-RESPONSE gives a dynamic response through
+   CONNECTION-HINT-FOR. The lines are shared vectors, never written into,
+   like the terminator itself."
+  (let ((line (case hint
+                (:close (load-time-value
+                         (sb-ext:string-to-octets
+                          (format nil "connection: close~c~c" #\Return #\Newline)
+                          :external-format :ascii)
+                         t))
+                (:keep-alive (load-time-value
+                              (sb-ext:string-to-octets
+                               (format nil "connection: keep-alive~c~c"
+                                       #\Return #\Newline)
+                               :external-format :ascii)
+                              t)))))
+    (if (and line (member +header-terminator+ segments :test #'eq))
+        (loop for segment in segments
+              when (eq segment +header-terminator+) collect line
+              collect segment)
+        segments)))
 
 (defun awaiting-inbound-for (inbound-fd out-fd)
   "Return the inbound connection parked on OUT-FD, or NIL.

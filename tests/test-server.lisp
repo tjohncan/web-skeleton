@@ -4704,11 +4704,10 @@
          (progn
            (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
            (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
-           ;; SERVE-STATIC answers either as one vector (the 416, built per
-           ;; request) or as segments: a pre-built response's pieces, or a
-           ;; 206's head and the span of the file it covers. What a client
-           ;; sees is the concatenation either way, and that is what these
-           ;; assertions are about.
+           ;; SERVE-STATIC answers as segments: a pre-built response's
+           ;; pieces, a 206's head and the span of the file it covers, or a
+           ;; 416's head. What a client sees is the concatenation, and that
+           ;; is what these assertions are about.
            (flet ((fetch (&rest headers)
                     (let ((r (serve-static
                               (make-test-request :method :GET
@@ -4980,6 +4979,98 @@
                         (body-at target) expected))))
         (setf web-skeleton::*static-cache* saved-cache)
         (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil)))))
+
+(defun test-static-responses-carry-the-connection-line ()
+  "A static response tells its client what the connection will do, as a
+   dynamic one does: Connection: keep-alive to an HTTP/1.0 client that
+   asked to keep it, and Connection: close ahead of a close.
+
+   A static head is built at load time, before anyone knows which
+   connection it will go out on, so the line is added where it is queued.
+   Without it an HTTP/1.0 keep-alive client takes the response for the
+   last one and drops a connection the server was holding open for it.
+   Asserted over a live socket: the second request on the same connection
+   is the proof the keep-alive was honoured, and the 206 is there because
+   its head is built per request, by a different function."
+  (format t "~%Static: the Connection line a static response carries~%")
+  (let ((saved web-skeleton::*static-cache*))
+    (flet ((read-response (stream)
+             ;; One whole response: the head, then Content-Length bytes.
+             (sb-ext:octets-to-string
+              (read-until-bounded
+               stream :seconds 3
+               :until (lambda (b fill)
+                        (let ((hend (web-skeleton::scan-crlf-crlf b 0 fill)))
+                          (and hend
+                               (let* ((head (string-downcase
+                                             (sb-ext:octets-to-string
+                                              b :end hend :external-format :latin-1)))
+                                      (at (search "content-length: " head))
+                                      (len (if at
+                                               (parse-integer head :start (+ at 16)
+                                                                   :junk-allowed t)
+                                               0)))
+                                 (>= fill (+ hend 4 len)))))))
+              :external-format :latin-1))
+           (send (stream text)
+             (write-sequence (sb-ext:string-to-octets text :external-format :ascii)
+                             stream)
+             (force-output stream))
+           (raw-connect ()
+             (let ((socket (connect-to-test-server)))
+               (values socket
+                       (sb-bsd-sockets:socket-make-stream
+                        socket :input t :output t
+                        :element-type '(unsigned-byte 8))))))
+      (unwind-protect
+           (progn
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (setf (gethash "/a.txt" web-skeleton::*static-cache*)
+                   (web-skeleton::build-static-response
+                    "text/plain" (sb-ext:string-to-octets "0123456789"
+                                                          :external-format :ascii)
+                    0))
+             (with-test-server
+                 (:handler (lambda (req)
+                             (or (serve-static req) (make-error-response 404))))
+               (multiple-value-bind (socket stream) (raw-connect)
+                 (unwind-protect
+                      (let ((ask (format nil "GET /a.txt HTTP/1.0~aConnection: keep-alive~a~a"
+                                         *crlf* *crlf* *crlf*)))
+                        (send stream ask)
+                        (let ((first (read-response stream)))
+                          (check "static: an HTTP/1.0 keep-alive client is told keep-alive"
+                                 (and (search "connection: keep-alive"
+                                              (string-downcase first))
+                                      t)
+                                 t))
+                        (send stream (format nil "GET /a.txt HTTP/1.0~aConnection: ~
+                                                  keep-alive~aRange: bytes=0-3~a~a"
+                                             *crlf* *crlf* *crlf* *crlf*))
+                        (let ((second (read-response stream)))
+                          (check "static: and the connection served a second request"
+                                 (and (search "206" second) t) t)
+                          (check "static: whose 206 head says keep-alive as well"
+                                 (and (search "connection: keep-alive"
+                                              (string-downcase second))
+                                      t)
+                                 t)))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))
+               (multiple-value-bind (socket stream) (raw-connect)
+                 (unwind-protect
+                      (progn
+                        (send stream (format nil "GET /a.txt HTTP/1.1~aHost: x~a~
+                                                  Connection: close~a~a"
+                                             *crlf* *crlf* *crlf* *crlf*))
+                        (check "static: a closing connection's response says close"
+                               (and (search "connection: close"
+                                            (string-downcase (read-response stream)))
+                                    t)
+                               t))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+        (setf web-skeleton::*static-cache* saved)))))
 
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
@@ -12051,6 +12142,7 @@
   (test-static-helpers)
   (test-static-serves-what-the-router-sees)
   (test-static-names-with-pathname-syntax)
+  (test-static-responses-carry-the-connection-line)
   (test-static-etag)
   (test-static-range)
   (test-static-range-copies-nothing)

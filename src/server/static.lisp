@@ -111,6 +111,21 @@
 ;;; Pre-build complete HTTP response bytes
 ;;; ---------------------------------------------------------------------------
 
+(defun static-head-prefix (status-line headers)
+  "STATUS-LINE and HEADERS serialized as a head without the blank line
+   that ends it, which every static response then supplies as the shared
+   +HEADER-TERMINATOR+.
+
+   Going through SERIALIZE-HTTP-MESSAGE rather than building the bytes
+   here keeps one implementation of header validation: the names and
+   values get the same tchar and CTL checks every other response gets.
+   Ending every static head at that one terminator vector gives the
+   framework one place to add what a head built ahead of time cannot know:
+   the Date line, and the Connection line QUEUE-FINAL-RESPONSE answers for
+   the connection it is sent on."
+  (let ((b (serialize-http-message status-line headers nil)))
+    (subseq b 0 (- (length b) 2))))
+
 (defun build-static-response (mime-type content file-mtime
                               &optional (cache-control "public, max-age=3600"))
   "Build pre-built 200 GET, 200 HEAD, and 304 Not Modified response
@@ -144,19 +159,9 @@
           (list (cons "etag" etag)
                 (cons "cache-control" cache-control)
                 (cons "last-modified" (http-date file-mtime))))
-         ;; Serialize the whole message, then drop the two bytes of the
-         ;; blank line that ends the header block. What is left is a
-         ;; prefix a date line can be appended to. Going through
-         ;; SERIALIZE-HTTP-MESSAGE rather than building the bytes here
-         ;; keeps one implementation of header validation — the header
-         ;; names and values still get the same tchar and CTL checks
-         ;; every other response gets.
-         (head-prefix (let ((b (serialize-http-message "HTTP/1.1 200 OK"
-                                                       full-headers nil)))
-                        (subseq b 0 (- (length b) 2))))
-         (nm-prefix (let ((b (serialize-http-message "HTTP/1.1 304 Not Modified"
-                                                     not-modified-headers nil)))
-                      (subseq b 0 (- (length b) 2)))))
+         (head-prefix (static-head-prefix "HTTP/1.1 200 OK" full-headers))
+         (nm-prefix (static-head-prefix "HTTP/1.1 304 Not Modified"
+                                        not-modified-headers)))
     (make-static-entry
      :head-prefix head-prefix
      :not-modified-prefix nm-prefix
@@ -688,8 +693,8 @@
 
 (defun range-response (entry first last)
   "Build a 206 Partial Content response covering the inclusive byte range
-   FIRST..LAST of ENTRY, as segments: the serialized head, then the range
-   as a WRITE-SPAN over the stored content.
+   FIRST..LAST of ENTRY, as segments: the serialized head, its blank line,
+   then the range as a WRITE-SPAN over the stored content.
 
    The span is the point. The file lives in memory once, and a range of it
    is a window on those bytes, not a copy: a SUBSEQ would cost the range per
@@ -714,15 +719,16 @@
     ;; in these headers can be refused, but a response counted before its
     ;; serialize would be counted even when the serialize raised: a phantom
     ;; 206 in the response counts.
-    (prog1 (list (serialize-http-message "HTTP/1.1 206 Partial Content"
-                                         headers nil)
+    (prog1 (list (static-head-prefix "HTTP/1.1 206 Partial Content" headers)
+                 +header-terminator+
                  body)
       (note-response 206))))
 
 (defun range-not-satisfiable-response (entry)
-  "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4). The
-   Content-Range header reports the resource's true length with '*' as the
-   range, which is how a client learns what it should have asked for.
+  "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4), as segments:
+   the head, then its blank line. The Content-Range header reports the
+   resource's true length with '*' as the range, which is how a client
+   learns what it should have asked for.
 
    Built per request rather than cached on the entry: 416 answers
    malformed client input, so it is a rare path and not worth a slot on
@@ -730,20 +736,22 @@
   (let ((etag (static-entry-etag entry)))
     ;; Counted once the bytes exist, as in RANGE-RESPONSE above.
     (prog1
-        (serialize-http-message
-         "HTTP/1.1 416 Range Not Satisfiable"
-         (append
-          (list (cons "date" (http-date))
-                (cons "content-range"
-                      (format nil "bytes */~d" (static-entry-content-length entry)))
-                (cons "content-length" "0")
-                (cons "accept-ranges" "bytes"))
-          ;; Omit the validator rather than emit an empty one: ETag's grammar
-          ;; has no empty form, so `etag: ""` would be malformed. Unreachable
-          ;; (every entry is built with one), but a header that can only
-          ;; ever be well-formed is better than one that depends on that.
-          (when etag (list (cons "etag" etag))))
-         nil)
+        (list
+         (static-head-prefix
+          "HTTP/1.1 416 Range Not Satisfiable"
+          (append
+           (list (cons "date" (http-date))
+                 (cons "content-range"
+                       (format nil "bytes */~d" (static-entry-content-length entry)))
+                 (cons "content-length" "0")
+                 (cons "accept-ranges" "bytes"))
+           ;; Omit the validator rather than emit an empty one: ETag's
+           ;; grammar has no empty form, so `etag: ""` would be malformed.
+           ;; Unreachable (every entry is built with one), but a header that
+           ;; can only ever be well-formed is better than one that depends
+           ;; on that.
+           (when etag (list (cons "etag" etag)))))
+         +header-terminator+)
       (note-response 416))))
 
 ;;; ---------------------------------------------------------------------------
@@ -817,9 +825,10 @@
    NIL if the path is not cached. A 200, a HEAD and a 304 are a list of
    byte vectors, the pre-built message in segments with a current Date. A
    206 is a list too: its head, then a WRITE-SPAN over the cached file for
-   the range. A 416 is a single byte vector. Each is a whole message; a
-   caller hands it on rather than taking it apart. Serves GET and HEAD
-   requests.
+   the range. So is a 416. Every head ends at the shared
+   +HEADER-TERMINATOR+, where QUEUE-FINAL-RESPONSE adds the Connection
+   line the connection calls for. Each is a whole message; a caller hands
+   it on rather than taking it apart. Serves GET and HEAD requests.
    Honors If-None-Match (RFC 7232) — a cached ETag match returns the
    pre-built 304 Not Modified response instead of the full body.
    Rejects paths containing '..'. Directories (paths ending in /)
