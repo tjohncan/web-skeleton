@@ -190,8 +190,12 @@ That is what stops a client that drips a request from keeping its slot,
 and it also cuts off an honest upload that is merely slow —
 at 20 KiB/s, ten seconds is about 200 KiB —
 with a close and no response.
-Behind a streaming proxy, either have the proxy buffer bodies
-or raise `*idle-timeout*` to cover the slowest upload you accept.
+Behind a streaming proxy, have the proxy buffer bodies,
+or accept the bodies you expect from a body handler
+(see "Request bodies, decided at the head"):
+an accepted body is timed by `*body-stall-timeout*` on its progress,
+so an upload that keeps arriving is not cut off for its size,
+and one that stops is still closed.
 
 ### Status codes the framework itself sends
 
@@ -201,7 +205,7 @@ specific status, not a blanket 400:
 | Code | Sent when |
 |------|-----------|
 | `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and malformed chunked framing — a size line outside the grammar, chunk data not followed by its CRLF — which the completion walk refuses as soon as the bytes that show it have arrived, the decoder and the walk accepting exactly the same framing |
-| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
+| `413 Payload Too Large` | Body over its cap — `*max-body-size*`, or the one a body handler chose for the request — `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
@@ -456,7 +460,8 @@ pair. Only a bare final `chunked` is accepted. `gzip, chunked` is 501,
 legal and unimplemented; `chunked, gzip`, a repeated Transfer-Encoding
 header, an obs-folded value, and `Transfer-Encoding` on HTTP/1.0 are 400.
 
-**`*max-body-size*` for a chunked request.** The Content-Length path checks
+**The body cap for a chunked request.** The cap is `*max-body-size*`, or
+the one a body handler chose. The Content-Length path checks
 the declared length once, before allocating. A chunked request declares
 nothing, so the same limit is applied as the decoded total grows, and also
 to any single chunk header that declares more than the cap on its own —
@@ -469,7 +474,7 @@ different limits: `chunked body too large` is the body cap, `request too
 large (buffer full)` is the read buffer. Neither is redundant. The wire
 carries framing the decoded body does not — a 1-byte chunk costs six wire
 bytes — so a body made of very small chunks fills the buffer well before
-its decoded total reaches `*max-body-size*`, and a body made of large ones
+its decoded total reaches the cap, and a body made of large ones
 does the opposite. If you alert on 413s, the reason string is the part
 that tells you which knob to turn.
 
@@ -1727,6 +1732,59 @@ If a handler needs multiple parameters, parse once and reuse:
     ...))
 ```
 
+### Request bodies, decided at the head
+
+A handler is called with a whole request, and for most requests that is
+the right shape. It comes too late for two things: a cap that should
+differ by route, and a refusal that should happen before the body is read.
+`:body-handler` is asked at the head:
+
+```lisp
+(defun decide-body (request)
+  (let ((path (http-request-path request)))
+    (cond ((string= path "/api/import")
+           (buffer-body :max-size (* 16 1024 1024)))
+          ((string= path "/upload")
+           (if (signed-in-p request)
+               (buffer-body :max-size (* 64 1024 1024))
+               (make-error-response 401)))
+          (t nil))))
+
+(start-server :handler #'handle-request
+              :body-handler #'decide-body)
+```
+
+- **When it is asked.** Once the head of a request with a body — a
+  `Content-Length` above zero, or chunked — has arrived, on the worker, with
+  the request parsed and its body `nil`. A request without a body never
+  reaches it. The framing checks come first, `Transfer-Encoding` with
+  `Content-Length` and an unknown `Expect` among them, so it is never shown
+  a request the framework is about to refuse.
+- **`nil`** reads the body as it would be read without a body handler:
+  under `*max-body-size*`, timed by `*idle-timeout*`.
+- **`(buffer-body :max-size n)`** reads it whole under `n`, which may be
+  above or below `*max-body-size*`, and then `:handler` gets the whole
+  request as usual. Buffering means holding: up to `n` bytes per connection
+  doing this at once, so a large `n` is memory a request may really use.
+- **An `http-response`** is sent before the body is read, and the
+  connection closes after it, whatever the response's own `Connection`
+  header says: the body was never read, so there is no telling where a next
+  request would begin. A client that sent `Expect: 100-continue` gets the
+  answer instead of a `100 Continue` and never sends the body. One that
+  sends it anyway has it read and thrown away until it stops or
+  `*linger-timeout*` runs out, so the answer is followed by a FIN rather
+  than a reset.
+- **`100 Continue`** goes out only once the body is accepted.
+- **Accepted bodies are timed on progress.** A body a body handler accepted
+  with `buffer-body` is closed when `*body-stall-timeout*` passes without a
+  byte of it, rather than by `*idle-timeout*`'s budget for the whole
+  request, so an upload takes as long as it keeps arriving. A body the
+  handler answered `nil` for stays on `*idle-timeout*`.
+- **Per request.** The next request on a keep-alive connection starts from
+  the defaults again — its own head, its own question.
+- **Failure.** A body handler that raises, or answers anything other than
+  the three shapes, fails the request with a 500, as a handler would.
+
 ### Form body decoding
 
 `parse-query-string` and `get-query-param` decode `+` as space
@@ -1770,7 +1828,7 @@ binds `*test-port*` for the body, and tears it down on scope exit
 (signal shutdown, bounded join, fallback to `terminate-thread`).
 Shutdown hooks registered inside the body are isolated to that server's teardown —
 they do not leak into the caller's state.
-Besides `:handler` it takes `:ws-handler` and `:host`, as `start-server` does;
+Besides `:handler` it takes `:ws-handler`, `:body-handler` and `:host`, as `start-server` does;
 `:workers`, which defaults to one, so a test can reason about a single connection table;
 and `:on-tick`, passed to `start-server` unchanged, for a test of work that runs on a worker's own loop.
 

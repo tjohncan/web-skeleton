@@ -143,6 +143,7 @@ src/
     connection.lisp    Connection state machine, read/write buffers
     http.lisp          HTTP request parser, response builder, URL/query/routing
     chunked.lisp       Chunked transfer coding decoders, shared by both directions
+    body.lisp          Request bodies decided at the head: body plans, per-request caps
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
@@ -249,7 +250,19 @@ tests/
   chunked bodies alike. Prevents 1-3s invisible latency with curl, Go,
   Python, and Java HTTP clients on large POSTs. The interim is skipped when
   the body has already arrived: a client that did not wait is not listening
-  for it, and sending it would only add a round trip
+  for it, and sending it would only add a round trip. With a body handler
+  it goes out only once the body handler has accepted the body
+- **Request bodies decided at the head** — `start-server`'s `:body-handler`
+  is asked about a request's body once the head has arrived and before any
+  of the body is read. `nil` reads it as usual. `(buffer-body :max-size n)`
+  reads it under a cap of that request's own, above or below
+  `*max-body-size*`, before `:handler` gets the whole request as usual. An
+  `http-response` is the answer, sent before the body: an upload that fails
+  a login check is refused before its first byte is read, and a client that
+  sent `Expect: 100-continue` is never told to send it. A body the body
+  handler accepted is timed on its progress, by `*body-stall-timeout*`,
+  rather than as a whole, so a large upload takes as long as it keeps
+  arriving. The `:handler` contract does not change
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -498,7 +511,8 @@ read about here.
   wire bytes accumulate, and the body is decoded once when the terminator
   arrives. So `curl -T -` is served, and "chunked requests are supported"
   does *not* mean a 4 GiB upload: the whole body is buffered before your
-  handler is called, and `*max-body-size*` is enforced incrementally as
+  handler is called, and the body's cap — `*max-body-size*`, or the one a
+  body handler chose — is enforced incrementally as
   the decoded total grows — plus on a chunk header that declares more than
   the cap on its own, which is refused the moment it arrives rather than
   after its bytes fail to turn up. Streaming a request body into a handler
@@ -508,8 +522,8 @@ read about here.
   (buffer full)`. Both are reachable for a chunked request and neither is
   redundant: the wire carries framing the decoded body does not, and a
   1-byte chunk costs six wire bytes, so a body made of very small chunks
-  fills the buffer well before its decoded total reaches
-  `*max-body-size*`. Which one fires depends on the chunk sizes, not on
+  fills the buffer well before its decoded total reaches the body's
+  cap. Which one fires depends on the chunk sizes, not on
   the amount of data — so read the reason, not just the code.
 - **Trailers on a request are refused with 400.** A non-empty trailer
   section after the zero-size chunk gets a 400, not a silent discard.
@@ -636,7 +650,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-count*`           | `100`     | Max number of headers per request                                                                                                                                                                                                                  |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes)                                                                                                                                                                                                                     |
 | `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431      |
-| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB)                                                                                                                                                                                                              |
+| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB). A body handler can choose another cap for a request, above or below this one, with `buffer-body`                                                                                                           |
 | `*max-outbound-response-size*` | `8388608` | Max bytes an outbound response holds in the read buffer, headers included, either scheme (default 8MB). A buffered `http-fetch` holds the whole response, so this caps its size. An `:on-body` relay of a chunked response frees each chunk once it is handed on, so here it caps the head plus one chunk and the stream itself can be any length. Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected |
 | `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound)                 |
 | `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value                                    |
@@ -649,7 +663,8 @@ All configurable via `setf` before calling `start-server`.
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |
 | `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |
 | `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice |
-| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end. It is also the whole budget for one request to arrive, body included — partial reads do not extend it, which is what stops a client dripping a request — so an upload slower than that is cut off: raise it, or have the proxy buffer bodies (see DEPLOYMENT.md) |
+| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end. It is also the whole budget for one request to arrive, body included — partial reads do not extend it, which is what stops a client dripping a request — so an upload slower than that is cut off: accept the body from a body handler, which then times it by `*body-stall-timeout*` instead, or have the proxy buffer bodies (see DEPLOYMENT.md) |
+| `*body-stall-timeout*`         | `30`      | Seconds the body of a request a body handler accepted may go without a byte arriving before the connection is closed. Measured from the last bytes of it, not from the request's start, so an upload is bounded by its stalls and not by its size. The head is still `*idle-timeout*`'s, and so is a body no body handler accepted. Must be positive; validated when the server starts, since it is the only time bound on an accepted body. A client sending a byte per interval is never closed by it — the proxy is where a client that slow belongs |
 | `*linger-timeout*`             | `2`       | Seconds a connection closed after an early error response (a 413 for a body over the cap, a 431, any refusal of a request still arriving) keeps reading and discarding what its client is still sending, so the response is followed by a FIN. Closed at once, Linux sends a reset instead, which discards response bytes not yet sent and reads as a failure to a peer that treats resets as one. `0` closes at once |
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
@@ -664,8 +679,8 @@ All configurable via `setf` before calling `start-server`.
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes |
 
-The `host`, `port`, `workers`, `handler`, `ws-handler`, `on-listen`, and
-`on-tick` are passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, `body-handler`,
+`on-listen`, and `on-tick` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)

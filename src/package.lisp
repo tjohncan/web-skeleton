@@ -143,6 +143,8 @@
            #:*max-ws-message-size*
            #:*max-connections*
            #:*max-write-backlog*
+           ;; Request bodies, decided at the head
+           #:buffer-body
            ;; Streaming responses
            #:make-stream-response
            #:stream-send
@@ -157,6 +159,7 @@
            #:*stream-keepalive-interval*
            ;; Connection lifecycle
            #:*idle-timeout*
+           #:*body-stall-timeout*
            #:*linger-timeout*
            #:*ws-idle-timeout*
            #:*ws-ping-interval*

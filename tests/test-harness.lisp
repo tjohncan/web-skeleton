@@ -5240,6 +5240,313 @@
       (check "malformed upstream: no outbound left behind"
              (census-await :outbound 0) 0))))
 
+(defun %raw-exchange (bytes &key (seconds 5) (half-close t))
+  "Send BYTES on a fresh connection to the test server and return all it
+   answered before closing, as a latin-1 string. HALF-CLOSE NIL keeps the
+   write side open, for a client that is still owed something — the one
+   that sent Expect: 100-continue and is waiting to be told to go on."
+  (multiple-value-bind (socket stream) (%raw-connect)
+    (unwind-protect
+         (progn
+           (write-sequence bytes stream)
+           (force-output stream)
+           (when half-close
+             (ignore-errors
+              (sb-bsd-sockets:socket-shutdown socket :direction :output)))
+           (let ((buf (read-until-bounded stream :seconds seconds)))
+             (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                      :external-format :latin-1)))
+      (ignore-errors (close stream))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun %post-bytes (path body &key (headers '()) chunked (version "1.1"))
+  "A POST of BODY to PATH, framed by Content-Length, or as one chunk and
+   the terminator when CHUNKED, with HEADERS added. Bytes, ready to send."
+  (%ascii
+   (with-output-to-string (s)
+     (format s "POST ~a HTTP/~a~aHost: localhost~a" path version *crlf* *crlf*)
+     (if chunked
+         (format s "Transfer-Encoding: chunked~a" *crlf*)
+         (format s "Content-Length: ~d~a" (length body) *crlf*))
+     (dolist (h headers) (format s "~a~a" h *crlf*))
+     (format s "~a" *crlf*)
+     (if chunked
+         (format s "~x~a~a~a0~a~a" (length body) *crlf* body *crlf* *crlf* *crlf*)
+         (format s "~a" body)))))
+
+(defun test-harness-body-handler-e2e ()
+  "A body handler, end to end: asked at the head with the body not yet
+   read, and obeyed — the default, a cap of the request's own either side
+   of *MAX-BODY-SIZE*, or an answer before the body.
+
+   *MAX-BODY-SIZE* is 16 for the run, so a 40-byte body is over the
+   default and under the 64 /big chooses. The handler answers the path and
+   the body's length, which says both which request it was handed and how
+   much of it arrived.
+
+   SETF rather than LET for *MAX-BODY-SIZE*: the worker reads it, and
+   dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: body handler, end to end~%")
+  (let ((saved web-skeleton:*max-body-size*)
+        (lock (sb-thread:make-mutex :name "body-handler-seen"))
+        (seen nil))
+    (setf web-skeleton:*max-body-size* 16)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (make-text-response
+                 200 (format nil "~a:~d" (http-request-path req)
+                             (length (or (http-request-body req) #())))))
+              :body-handler
+              (lambda (req)
+                (sb-thread:with-mutex (lock)
+                  (push (list (http-request-path req)
+                              (http-request-body req)
+                              (get-header req "x-probe"))
+                        seen))
+                (let ((path (http-request-path req)))
+                  (cond ((string= path "/big") (buffer-body :max-size 64))
+                        ((string= path "/small") (buffer-body :max-size 4))
+                        ((string= path "/deny") (make-text-response 401 "no"))
+                        ((string= path "/raise") (error "deliberate: body handler"))
+                        ((string= path "/junk") 42)
+                        (t nil)))))
+           (let ((forty (make-string 40 :initial-element #\x))
+                 (ten (make-string 10 :initial-element #\y)))
+             ;; ---- what the body handler is handed ----
+             (check "body handler: NIL reads the body as without one"
+                    (and (search "/plain:10" (%raw-exchange
+                                              (%post-bytes "/plain" ten
+                                                           :headers '("X-Probe: p1"))))
+                         t)
+                    t)
+             (check "body handler: handed the parsed head, and no body"
+                    (sb-thread:with-mutex (lock)
+                      (find "p1" seen :key #'third :test #'equal))
+                    '("/plain" nil "p1"))
+             (check "body handler: not asked about a request without a body"
+                    (progn
+                      (%raw-exchange (%ascii (format nil "GET /nobody HTTP/1.1~a~
+                                                          Host: x~aConnection: close~a~a"
+                                                     *crlf* *crlf* *crlf* *crlf*)))
+                      (sb-thread:with-mutex (lock)
+                        (find "/nobody" seen :key #'first :test #'equal)))
+                    nil)
+             ;; ---- caps either side of the default ----
+             (check "buffer-body: a cap above *max-body-size* takes a larger body"
+                    (and (search "200 OK" (%raw-exchange (%post-bytes "/big" forty)))
+                         (search "/big:40" (%raw-exchange (%post-bytes "/big" forty)))
+                         t)
+                    t)
+             (check "buffer-body: and a chunked one"
+                    (and (search "/big:40" (%raw-exchange
+                                            (%post-bytes "/big" forty :chunked t)))
+                         t)
+                    t)
+             (check "control: the same body without the plan is over the default"
+                    (and (search "413" (%raw-exchange (%post-bytes "/plain" forty)))
+                         t)
+                    t)
+             (check "buffer-body: a cap below *max-body-size* refuses, with 413"
+                    (and (search "413" (%raw-exchange (%post-bytes "/small" ten)))
+                         t)
+                    t)
+             (check "buffer-body: and refuses a chunked body as it arrives"
+                    (and (search "413" (%raw-exchange
+                                        (%post-bytes "/small" ten :chunked t)))
+                         t)
+                    t)
+             ;; ---- an answer before the body ----
+             ;; The client asked to be told whether to send its body and was
+             ;; told no: the answer arrives with the body never sent, without
+             ;; a 100 Continue ahead of it, and the server closes after it.
+             (let ((answer (%raw-exchange
+                            (%ascii (format nil "POST /deny HTTP/1.1~aHost: x~a~
+                                                 Content-Length: 4096~a~
+                                                 Expect: 100-continue~a~a"
+                                            *crlf* *crlf* *crlf* *crlf* *crlf*))
+                            :half-close nil)))
+               (check "answered before the body: the client is told 401, first"
+                      (search "HTTP/1.1 401" answer) 0)
+               (check "answered before the body: no 100 Continue invited it"
+                      (search "100 Continue" answer) nil)
+               (check "answered before the body: and the connection closes after it"
+                      (and (search "connection: close" answer) t) t))
+             (check "answered before the body: a body sent anyway changes nothing"
+                    (and (search "HTTP/1.1 401" (%raw-exchange (%post-bytes "/deny" ten)))
+                         t)
+                    t)
+             ;; ---- a body handler that fails ----
+             (check "body handler raising: the request is answered 500"
+                    (and (search "HTTP/1.1 500" (%raw-exchange (%post-bytes "/raise" ten)))
+                         t)
+                    t)
+             (check "body handler answering nonsense: 500"
+                    (and (search "HTTP/1.1 500" (%raw-exchange (%post-bytes "/junk" ten)))
+                         t)
+                    t)
+             ;; ---- Expect: 100-continue, accepted ----
+             ;; The head arrives alone, so the interim really is waited for:
+             ;; it goes out once the body handler has accepted the body.
+             (let ((answer (%raw-http-split-send
+                            (%ascii (format nil "POST /big HTTP/1.1~aHost: x~a~
+                                                 Content-Length: 40~a~
+                                                 Expect: 100-continue~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+                            (%ascii forty))))
+               (check "accepted with Expect: 100 Continue, then the answer"
+                      (let ((interim (search "HTTP/1.1 100 Continue" answer))
+                            (final (search "/big:40" answer)))
+                        (and interim final (< interim final) t))
+                      t))
+             ;; ---- the decision is the request's, not the connection's ----
+             ;; Two requests on one connection: /big's cap admits its forty
+             ;; bytes, and the request after it, which no plan covers, is held
+             ;; to the default again.
+             (let ((answer (%raw-exchange
+                            (concatenate '(vector (unsigned-byte 8))
+                                         (%post-bytes "/big" forty)
+                                         (%post-bytes "/plain" (subseq forty 0 20))))))
+               (check "keep-alive: the first request had its plan's cap"
+                      (and (search "/big:40" answer) t) t)
+               (check "keep-alive: the next one is held to the default again"
+                      (and (search "413" answer)
+                           (< (search "/big:40" answer) (search "413" answer))
+                           t)
+                      t))))
+      (setf web-skeleton:*max-body-size* saved))))
+
+(defun test-harness-body-stall-e2e ()
+  "A body a body handler accepted is timed on its progress, by
+   *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
+   a budget for the whole request.
+
+   *IDLE-TIMEOUT* is 1 and *BODY-STALL-TIMEOUT* 2 for the run. A body
+   arriving four bytes every 0.7 s takes about 3.5 s, well past the idle
+   budget and never 2 s without a byte: accepted, it is served; not
+   accepted, it is cut off. A body that stops arriving is closed by the
+   stall clock, and not before the idle budget would have — the test
+   that the clock really is a different one.
+
+   SETF for both timeouts, for the reason TEST-HARNESS-BODY-HANDLER-E2E
+   gives."
+  (format t "~%Harness: an accepted body is timed on its progress~%")
+  (let ((saved-idle web-skeleton:*idle-timeout*)
+        (saved-stall web-skeleton:*body-stall-timeout*))
+    (setf web-skeleton:*idle-timeout* 1
+          web-skeleton:*body-stall-timeout* 2)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (make-text-response
+                 200 (format nil "~a:~d" (http-request-path req)
+                             (length (or (http-request-body req) #())))))
+              :body-handler
+              (lambda (req)
+                (when (string= (http-request-path req) "/accepted")
+                  (buffer-body :max-size 64))))
+           (flet ((trickle (path)
+                    ;; Head first, then the body four bytes every 0.7 s.
+                    ;; Writes after the server has closed fail, and that is
+                    ;; one of the outcomes under test, so they are let fail.
+                    (multiple-value-bind (socket stream) (%raw-connect)
+                      (unwind-protect
+                           (progn
+                             (write-sequence
+                              (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~
+                                                   Content-Length: 20~a~
+                                                   Connection: close~a~a"
+                                              path *crlf* *crlf* *crlf* *crlf* *crlf*))
+                              stream)
+                             (force-output stream)
+                             (ignore-errors
+                              (dotimes (i 5)
+                                (sleep 0.7)
+                                (write-sequence (%ascii "abcd") stream)
+                                (force-output stream)))
+                             (let ((buf (read-until-bounded stream :seconds 5)))
+                               (sb-ext:octets-to-string
+                                (subseq buf 0 (fill-pointer buf))
+                                :external-format :latin-1)))
+                        (ignore-errors (close stream))
+                        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+             (check "accepted: a slow body that keeps arriving is served"
+                    (and (search "/accepted:20" (trickle "/accepted")) t)
+                    t)
+             (check "control: the same body nobody accepted is cut off"
+                    (search "/plain:20" (trickle "/plain"))
+                    nil)
+             ;; The clock is the request's. On a connection whose first
+             ;; request had its body accepted, the next one — which nobody
+             ;; accepted — is back on the whole-request budget. Kept, the
+             ;; first request's clock would let the second trickle a body
+             ;; past *IDLE-TIMEOUT*, a slow-drip budget handed to a request
+             ;; that never asked for one.
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (write-sequence
+                       (%ascii (format nil "POST /accepted HTTP/1.1~aHost: x~a~
+                                            Content-Length: 4~a~aabcd"
+                                       *crlf* *crlf* *crlf* *crlf*))
+                       stream)
+                      (force-output stream)
+                      (let ((first-answer
+                              (read-until-bounded
+                               stream :seconds 5
+                                      :until (lambda (buf fill)
+                                               (search (%ascii "/accepted:4") buf
+                                                       :end2 fill)))))
+                        (check "keep-alive: the first request, accepted, is served"
+                               (and (search (%ascii "/accepted:4") first-answer) t)
+                               t))
+                      (write-sequence
+                       (%ascii (format nil "POST /plain HTTP/1.1~aHost: x~a~
+                                            Content-Length: 20~a~a"
+                                       *crlf* *crlf* *crlf* *crlf*))
+                       stream)
+                      (force-output stream)
+                      (ignore-errors
+                       (dotimes (i 5)
+                         (sleep 0.7)
+                         (write-sequence (%ascii "abcd") stream)
+                         (force-output stream)))
+                      (let ((rest (read-until-bounded stream :seconds 5)))
+                        (check "keep-alive: the next, not accepted, is cut off"
+                               (search (%ascii "/plain:20") rest)
+                               nil)))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+           ;; Four bytes, then nothing. Closed by the stall clock: after
+           ;; *BODY-STALL-TIMEOUT* of quiet and not at the idle budget.
+           (multiple-value-bind (socket stream) (%raw-connect)
+             (unwind-protect
+                  (let ((start (get-internal-real-time)))
+                    (write-sequence
+                     (%ascii (format nil "POST /accepted HTTP/1.1~aHost: x~a~
+                                          Content-Length: 20~a~aabcd"
+                                     *crlf* *crlf* *crlf* *crlf*))
+                     stream)
+                    (force-output stream)
+                    (multiple-value-bind (buf reason)
+                        (read-until-bounded stream :seconds 8)
+                      (let ((elapsed (/ (- (get-internal-real-time) start)
+                                        internal-time-units-per-second)))
+                        (check "stalled: the connection is closed, with nothing sent"
+                               (list (and (member reason '(:eof :error)) t)
+                                     (fill-pointer buf))
+                               '(t 0))
+                        (check "stalled: not at the idle budget, but after the stall"
+                               (and (>= elapsed 1.9) (< elapsed 6) t)
+                               t))))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+      (setf web-skeleton:*idle-timeout* saved-idle
+            web-skeleton:*body-stall-timeout* saved-stall))))
+
 (defun test-harness-fetch-into-target-closed-e2e ()
   "A client that leaves mid-relay tears the outbound down, once.
 
@@ -6064,6 +6371,8 @@
 
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-refuses-malformed-chunks-e2e)
+  (test-harness-body-handler-e2e)
+  (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)
   (test-fetch-stop-ignores-the-failure-disposition)

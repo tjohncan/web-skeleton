@@ -146,7 +146,8 @@
 ;;; Live test server
 ;;; ---------------------------------------------------------------------------
 
-(defmacro with-test-server ((&key handler ws-handler host on-tick (workers 1))
+(defmacro with-test-server ((&key handler ws-handler body-handler host on-tick
+                                  (workers 1))
                             &body body)
   "Spin a server on an ephemeral port, bind *TEST-PORT* for BODY, tear down
    on scope exit (signal + bounded join + fallback terminate).
@@ -156,8 +157,9 @@
    Raise it only for a property that is about workers rather than about
    connections — ON-TICK firing on each of them, say.
 
-   ON-TICK is passed through to START-SERVER unchanged, including NIL.
-   Shutdown hooks are isolated: REGISTER-CLEANUP calls made from inside
+   ON-TICK and BODY-HANDLER are passed through to START-SERVER unchanged,
+   including NIL. Shutdown hooks are isolated: REGISTER-CLEANUP calls made
+   from inside
    BODY (directly or via a handler) fire during this server's teardown
    and do not leak into the caller's framework state. The outer
    *SHUTDOWN-HOOKS* list is saved on entry and restored on exit.
@@ -170,10 +172,11 @@
    reader thread has to pass the address and port into that thread rather
    than read the specials from inside it."
   `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host
-                          ,on-tick ,workers))
+                          ,on-tick ,workers ,body-handler))
 
 (defun call-with-test-server (handler ws-handler thunk &optional host
-                                                        on-tick (workers 1))
+                                                        on-tick (workers 1)
+                                                        body-handler)
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
         (saved-poll  web-skeleton:*worker-wake-interval*)
@@ -215,6 +218,7 @@
                                    :port 0
                                    :workers workers
                                    :on-tick on-tick
+                                   :body-handler body-handler
                                    :on-listen
                                    (lambda (p)
                                      (setf bound-port p)

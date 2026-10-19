@@ -410,7 +410,9 @@
 
 (defun sweep-idle-connections (epoll-fd now)
   "Close connections that have been idle too long.
-   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*.
+   HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*. A request
+   body a body handler accepted uses *BODY-STALL-TIMEOUT*, measured from
+   the last of its bytes to arrive rather than from the request's start.
    An :AWAITING connection is answered 504 first — see
    DELIVER-AWAITING-TIMEOUT.
 
@@ -422,6 +424,7 @@
    on exactly the long-lived states most likely to build a backlog."
   (let ((idle nil)
         (stalled nil)
+        (body-stalled nil)
         (detached-expired nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
@@ -444,7 +447,14 @@
                ;; inbound's :awaiting timeout — see close-connection
                (unless (connection-outbound-p conn)
                  (let* ((state (connection-state conn))
+                        ;; A body a body handler accepted, still arriving:
+                        ;; timed on its progress rather than from the start
+                        ;; of the request. See *BODY-STALL-TIMEOUT*.
+                        (body-clock
+                          (and (member state '(:read-body :sending-100-continue))
+                               (plusp (connection-body-progress-at conn))))
                         (timeout (cond
+                                   (body-clock *body-stall-timeout*)
                                    ((eq state :websocket) *ws-idle-timeout*)
                                    ;; A stream and a parked inbound are
                                    ;; different judgments. *FETCH-TIMEOUT*
@@ -476,12 +486,14 @@
                         ;; relay among them — has not gone quiet, its peer
                         ;; is reading. A queue that stops moving is the
                         ;; stall arm's, which is checked first.
-                        (since (if (eq state :streaming)
-                                   (if (plusp (connection-write-pending conn))
-                                       (max (connection-stream-produced-at conn)
-                                            (connection-write-progress-at conn))
-                                       (connection-stream-produced-at conn))
-                                   (connection-last-active conn))))
+                        (since (cond
+                                 ((eq state :streaming)
+                                  (if (plusp (connection-write-pending conn))
+                                      (max (connection-stream-produced-at conn)
+                                           (connection-write-progress-at conn))
+                                      (connection-stream-produced-at conn)))
+                                 (body-clock (connection-body-progress-at conn))
+                                 (t (connection-last-active conn)))))
                    (cond
                      ;; Stall is checked first: a connection can be both,
                      ;; and closing it for the reason that is actually
@@ -514,7 +526,9 @@
                       (push conn stalled))
                      ((and (> timeout 0)
                            (> (- now since) timeout))
-                      (push conn idle))))))
+                      (if body-clock
+                          (push conn body-stalled)
+                          (push conn idle)))))))
              *connections*)
     (dolist (conn detached-expired)
       (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
@@ -534,6 +548,11 @@
                 *write-stall-timeout* (connection-fd conn)
                 (connection-state conn)
                 (connection-write-pending conn))
+      (close-connection conn epoll-fd :stalled))
+    (dolist (conn body-stalled)
+      (log-info "request body stalled ~ds fd ~d (~d bytes buffered) — closing"
+                *body-stall-timeout* (connection-fd conn)
+                (connection-read-pos conn))
       (close-connection conn epoll-fd :stalled))
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
@@ -1362,6 +1381,130 @@
                     (connection-state conn) status)
         (close-connection conn epoll-fd :error))))
 
+(defun answer-request (conn epoll-fd handler)
+  "CONN's request is complete: parse it, hand it to HANDLER, and set out
+   whatever HANDLER answers — a fetch to park on, a stream to start, or a
+   response to queue."
+  (setf (connection-last-active conn) (get-universal-time))
+  (let ((request (connection-parse-request conn)))
+    (log-debug "~a ~a~@[?~a~] HTTP/~a ~a"
+               (http-request-method request)
+               (http-request-path request)
+               (http-request-query request)
+               (http-request-version request)
+               (or (connection-remote-addr conn) ""))
+    ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
+    ;; HTTP/1.0 default is close. Connection header overrides.
+    ;; RFC 7230 §6.1 + §3.2.2: Connection is a list-valued
+    ;; header, and multiple occurrences are semantically
+    ;; equivalent to one comma-joined value. Walk
+    ;; GET-HEADERS rather than GET-HEADER so a split
+    ;; Connection: keep-alive / Connection: close pair
+    ;; from a cooperating proxy is read as "close" instead
+    ;; of silently dropping the second value.
+    (let ((conn-values (get-headers request "connection")))
+      (setf (connection-close-after-p conn)
+            (cond
+              ((some (lambda (v)
+                       (header-has-token-p v "close"))
+                     conn-values)
+               t)
+              ((some (lambda (v)
+                       (header-has-token-p v "keep-alive"))
+                     conn-values)
+               nil)
+              ((string= (http-request-version request) "1.0") t)
+              (t nil))))
+    (multiple-value-bind (response upgrade-p)
+        (dispatch-request request handler)
+      ;; Sync close-after-p from a handler-set Connection: close
+      ;; header. Without this step an HTTP/1.1 handler that
+      ;; explicitly asks to close the socket would advertise
+      ;; 'Connection: close' on the wire while the server
+      ;; happily held the socket open — framing mismatch vs
+      ;; the client's expectation. The helper is the one
+      ;; COMPLETE-FETCH calls for a fetch's :THEN, over either
+      ;; scheme, and it walks every 'connection' header,
+      ;; symmetric with the inbound-side walk above.
+      ;; A stream's Connection header lives on the response it
+      ;; carries, not on the wrapper — an app that asks to
+      ;; close after a stream has to be heard the same way as
+      ;; one asking after an ordinary response.
+      (sync-close-after-p-from-response
+       conn (if (typep response 'stream-response)
+                (stream-response-response response)
+                response))
+      (cond
+        ;; Outbound fetch — park and initiate
+        ((typep response 'http-fetch-continuation)
+         (initiate-fetch conn epoll-fd response))
+        ;; Streaming response — send the head, hand over
+        ((typep response 'stream-response)
+         (start-stream conn epoll-fd request response))
+        ;; A complete response, in any of its shapes, through
+        ;; the function COMPLETE-FETCH shares, so a fetch's
+        ;; :THEN can answer with whatever a handler can.
+        (t
+         (queue-final-response conn response)
+         (setf (connection-state conn)
+               (if upgrade-p :ws-upgrade :write-response))
+         (epoll-modify epoll-fd (connection-fd conn)
+                       (logior +epollout+ +epollet+)))))))
+
+(defun answer-before-body (conn epoll-fd request response)
+  "Send RESPONSE, a body handler's answer, as CONN's whole answer to
+   REQUEST, whose body has not been read, and close after it.
+
+   Closed rather than kept, whatever RESPONSE's own Connection header
+   says. The body has not been read and may still be arriving — or, from
+   a client that sent Expect: 100-continue, may never be sent — so there
+   is no telling where a next request would begin. The close lingers, as
+   every early refusal's does, so the answer is followed by a FIN rather
+   than torn off by a reset (see BEGIN-LINGERING-CLOSE)."
+  (log-debug "~a ~a -> ~d before its body"
+             (http-request-method request)
+             (http-request-path request)
+             (http-response-status response))
+  (setf (connection-close-after-p conn) t
+        (connection-linger conn) t)
+  (queue-final-response conn response)
+  (setf (connection-state conn) :write-response)
+  (epoll-modify epoll-fd (connection-fd conn) (logior +epollout+ +epollet+)))
+
+(defun decide-request-body (conn epoll-fd handler peer-finished)
+  "Ask *BODY-HANDLER* what becomes of the body of CONN's request, whose
+   head has arrived, and carry it out. Returns the verdict
+   CONNECTION-BEGIN-BODY gave, once acted on, or :ANSWERED when the body
+   handler answered before the body. PEER-FINISHED is
+   CONNECTION-ON-READ's second value.
+
+   The head is parsed here, so the body handler is handed a request with
+   everything but its body, and the head is not parsed again at dispatch.
+   Whatever the body handler raises is the request's failure, as a
+   handler's is: HANDLE-CLIENT-READ's catch answers it, and the state is
+   :READ-BODY, so the answer is the lingering error response a request
+   still being read gets."
+  (let* ((request (connection-parse-head conn))
+         (decision (funcall *body-handler* request)))
+    (cond
+      ((null decision))
+      ((body-plan-p decision)
+       (apply-body-plan conn decision))
+      ((typep decision 'http-response)
+       (answer-before-body conn epoll-fd request decision)
+       (return-from decide-request-body :answered))
+      (t
+       (error "body handler returned ~a; expected NIL, a plan from ~
+               BUFFER-BODY, or an HTTP-RESPONSE to answer before the body"
+              (type-of decision))))
+    (let ((verdict (connection-begin-body conn peer-finished)))
+      (case verdict
+        (:dispatch (answer-request conn epoll-fd handler))
+        (:flush-queued (epoll-modify epoll-fd (connection-fd conn)
+                                     (logior +epollout+ +epollet+)))
+        (:close (close-connection conn epoll-fd)))
+      verdict)))
+
 (defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection.
    State dispatch is permissive: a stale EPOLLIN for a connection
@@ -1377,75 +1520,24 @@
       (case (connection-state conn)
         ;; HTTP request accumulation
         ((:read-http :read-body)
-         (let ((result (connection-on-read conn)))
+         (multiple-value-bind (result peer-finished) (connection-on-read conn)
            (case result
              (:dispatch
-              ;; Full request — parse and dispatch
-              (setf (connection-last-active conn) (get-universal-time))
-              (let ((request (connection-parse-request conn)))
-                (log-debug "~a ~a~@[?~a~] HTTP/~a ~a"
-                           (http-request-method request)
-                           (http-request-path request)
-                           (http-request-query request)
-                           (http-request-version request)
-                           (or (connection-remote-addr conn) ""))
-                ;; Determine keep-alive: HTTP/1.1 default is keep-alive,
-                ;; HTTP/1.0 default is close. Connection header overrides.
-                ;; RFC 7230 §6.1 + §3.2.2: Connection is a list-valued
-                ;; header, and multiple occurrences are semantically
-                ;; equivalent to one comma-joined value. Walk
-                ;; GET-HEADERS rather than GET-HEADER so a split
-                ;; Connection: keep-alive / Connection: close pair
-                ;; from a cooperating proxy is read as "close" instead
-                ;; of silently dropping the second value.
-                (let ((conn-values (get-headers request "connection")))
-                  (setf (connection-close-after-p conn)
-                        (cond
-                          ((some (lambda (v)
-                                   (header-has-token-p v "close"))
-                                 conn-values)
-                           t)
-                          ((some (lambda (v)
-                                   (header-has-token-p v "keep-alive"))
-                                 conn-values)
-                           nil)
-                          ((string= (http-request-version request) "1.0") t)
-                          (t nil))))
-                (multiple-value-bind (response upgrade-p)
-                    (dispatch-request request handler)
-                  ;; Sync close-after-p from a handler-set Connection: close
-                  ;; header. Without this step an HTTP/1.1 handler that
-                  ;; explicitly asks to close the socket would advertise
-                  ;; 'Connection: close' on the wire while the server
-                  ;; happily held the socket open — framing mismatch vs
-                  ;; the client's expectation. The helper is the one
-                  ;; COMPLETE-FETCH calls for a fetch's :THEN, over either
-                  ;; scheme, and it walks every 'connection' header,
-                  ;; symmetric with the inbound-side walk above.
-                  ;; A stream's Connection header lives on the response it
-                  ;; carries, not on the wrapper — an app that asks to
-                  ;; close after a stream has to be heard the same way as
-                  ;; one asking after an ordinary response.
-                  (sync-close-after-p-from-response
-                   conn (if (typep response 'stream-response)
-                            (stream-response-response response)
-                            response))
-                  (cond
-                    ;; Outbound fetch — park and initiate
-                    ((typep response 'http-fetch-continuation)
-                     (initiate-fetch conn epoll-fd response))
-                    ;; Streaming response — send the head, hand over
-                    ((typep response 'stream-response)
-                     (start-stream conn epoll-fd request response))
-                    ;; A complete response, in any of its shapes, through
-                    ;; the function COMPLETE-FETCH shares, so a fetch's
-                    ;; :THEN can answer with whatever a handler can.
-                    (t
-                     (queue-final-response conn response)
-                     (setf (connection-state conn)
-                           (if upgrade-p :ws-upgrade :write-response))
-                     (epoll-modify epoll-fd (connection-fd conn)
-                                   (logior +epollout+ +epollet+)))))))
+              (answer-request conn epoll-fd handler))
+             ;; The head of a request with a body, held for *BODY-HANDLER*
+             ;; before any of the body is read.
+             (:decide-body
+              ;; :CONTINUE after a decision means read again now, in this
+              ;; wake-up. The decision can raise the read cap above the one
+              ;; the last read stopped at, and bytes left in the kernel then
+              ;; raise no new edge: a client that had sent its whole body
+              ;; would wait for an event that is not coming. One more read
+              ;; finds them, or finds :AGAIN and costs a syscall. The second
+              ;; pass cannot come back here — the state is :READ-BODY now.
+              (when (eq (decide-request-body conn epoll-fd handler
+                                             peer-finished)
+                        :continue)
+                (handle-client-read conn epoll-fd handler ws-handler)))
              (:flush-queued
               ;; connection-on-read queued response bytes that must flush
               ;; before further reads happen. Covers two cases:
@@ -1726,6 +1818,10 @@
                           (connection-header-end conn) 0
                           (connection-request-end conn) 0
                           (connection-body-framing conn) :length
+                          ;; What a body handler decided was this request's
+                          ;; and no later one's; see the slots.
+                          (connection-body-limit conn) nil
+                          (connection-body-progress-at conn) 0
                           (connection-close-after-p conn) nil
                           (connection-state conn) :read-http
                           (connection-last-active conn) (get-universal-time))
@@ -1751,6 +1847,8 @@
                       (connection-header-end conn) 0
                       (connection-request-end conn) 0
                       (connection-body-framing conn) :length
+                      (connection-body-limit conn) nil
+                      (connection-body-progress-at conn) 0
                       ;; Cleared for the same reason the keep-alive reset
                       ;; two arms up clears it, so the two otherwise-
                       ;; identical resets agree on every field.
@@ -1980,9 +2078,13 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun run-worker (host port worker-id handler ws-handler on-tick
-                   &optional listener)
+                   body-handler &optional listener)
   "Run a single worker: own listener, own epoll fd, own connections.
    Automatically restarts on unhandled errors (with backoff).
+
+   BODY-HANDLER is bound as *BODY-HANDLER* for the worker's life rather
+   than passed down the event loop beside HANDLER; that variable says
+   why.
 
    LISTENER, when supplied, is an already-bound socket this worker
    adopts instead of binding one of its own. START-SERVER hands one to
@@ -2010,6 +2112,7 @@
               ;; share-nothing slots, because owning the slot outright is
               ;; what lets the publish be lock-free.
               (*worker-id* worker-id)
+              (*body-handler* body-handler)
               ;; *CONNECTION-SERIAL* is not bound here. Everything in this
               ;; LET a crash may throw away and begin again; a serial may
               ;; not, so it is bound by the thread START-SERVER spawns,
@@ -2338,7 +2441,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler on-listen on-tick)
+                          handler ws-handler body-handler on-listen on-tick)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -2349,6 +2452,10 @@
    IPv4-only.
    HANDLER: function (request) -> response or :UPGRADE.
    WS-HANDLER: function (connection frame) -> bytes or NIL.
+   BODY-HANDLER: function (request) -> NIL, a body plan, or an
+     HTTP-RESPONSE; a symbol naming one; or NIL. Called once the head of
+     a request with a body has arrived, before any of the body is read —
+     see src/server/body.lisp.
    ON-TICK: function (worker-id), a symbol naming one, or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
@@ -2485,6 +2592,27 @@
             (a route's literals match a path as it arrived) or :DECODED ~
             (they match it percent-decoded)."
            *match-path-literals*))
+  ;; Sixth, :ON-TICK's rule and its reason: a body handler that cannot be
+  ;; funcalled would fail every request with a body, each with a 500.
+  (unless (or (null body-handler)
+              (functionp body-handler)
+              (and (symbolp body-handler)
+                   (fboundp body-handler)
+                   (not (macro-function body-handler))
+                   (not (special-operator-p body-handler))))
+    (error "start-server: :body-handler is ~s; it must be a function of one ~
+            argument (the request, without its body), a symbol naming one, ~
+            or NIL."
+           body-handler))
+  ;; Seventh, *WRITE-STALL-TIMEOUT*'s argument: once a body handler has
+  ;; accepted a body, this is the only time bound on it, and at zero a
+  ;; client that stops sending would hold its connection for good.
+  (unless (and (realp *body-stall-timeout*) (plusp *body-stall-timeout*))
+    (error "start-server: *body-stall-timeout* is ~s; it must be positive. ~
+            It is the only deadline on a request body a body handler has ~
+            accepted — such a body is timed on its progress, not by ~
+            *idle-timeout*."
+           *body-stall-timeout*))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
@@ -2565,7 +2693,8 @@
                                               (*worker-census* census))
                                           (run-worker host port id
                                                       handler ws-handler
-                                                      on-tick adopted)))
+                                                      on-tick body-handler
+                                                      adopted)))
                                       :name (format nil "web-skeleton-~d" i))
                                      threads)
                                ;; Ownership passes to the thread only once

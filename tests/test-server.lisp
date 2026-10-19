@@ -9238,6 +9238,254 @@
 ;;; A request that can never be finished does not keep its slot
 ;;; ---------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; A body handler is asked at the head
+;;; ---------------------------------------------------------------------------
+
+(defun test-body-handler-at-the-head ()
+  "With a body handler installed, the head of a request with a body stops
+   CONNECTION-ON-READ before anything that needs the body's cap: no size
+   check, no walk over a chunked body, and no 100 Continue, which would
+   invite a body the handler may refuse. CONNECTION-BEGIN-BODY does all
+   three once the decision is made, under the cap it made.
+
+   State-machine level, over a read-fn that answers :AGAIN, so every
+   verdict is the state machine's and none is a socket's. The body handler
+   itself is never called here — CONNECTION-ON-READ only asks whether
+   there is one — which is why a bare function stands in for it."
+  (format t "~%Body handler: the head is held for it~%")
+  (labels ((req (lines body)
+             (sb-ext:string-to-octets
+              (with-output-to-string (s)
+                (format s "POST /u HTTP/1.1~a" *crlf*)
+                (dolist (h lines) (format s "~a~a" h *crlf*))
+                (format s "~a~a" *crlf* body))
+              :external-format :ascii))
+           (conn-for (bytes read-result)
+             (let ((conn (web-skeleton::make-connection
+                          :fd -1
+                          :read-fn (lambda (buffer start max-bytes)
+                                     (declare (ignore buffer start max-bytes))
+                                     read-result))))
+               (setf (web-skeleton::connection-read-buf conn) bytes
+                     (web-skeleton::connection-read-pos conn) (length bytes))
+               conn))
+           (drive (bytes &key (body-handler #'identity) (read-result :again))
+             ;; (values VERDICTS CONN): every value the read returned, or the
+             ;; status of what it raised.
+             (let ((conn (conn-for bytes read-result))
+                   (web-skeleton::*body-handler* body-handler))
+               (values (handler-case
+                           (multiple-value-list
+                            (web-skeleton::connection-on-read conn))
+                         (web-skeleton:http-parse-error (e)
+                           (web-skeleton::http-parse-error-status e)))
+                       conn)))
+           (begin (conn &key plan)
+             (when plan (web-skeleton::apply-body-plan conn plan))
+             (handler-case (web-skeleton::connection-begin-body conn nil)
+               (web-skeleton:http-parse-error (e)
+                 (list (web-skeleton::http-parse-error-status e)
+                       (web-skeleton::http-parse-error-message e))))))
+    (let ((web-skeleton::*max-body-size* 4))
+      ;; ---- held: nothing the cap governs happens before the decision ----
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Content-Length: 10") "0123456789"))
+        (check "held: a Content-Length head goes to the body handler"
+               v '(:decide-body nil))
+        (check "held: before its size check — ten bytes over a cap of four"
+               (web-skeleton::connection-state conn) :read-body)
+        ;; Decided under a cap above the default, the same body goes through.
+        (check "begun under a plan's cap above *max-body-size*: dispatched"
+               (begin conn :plan (buffer-body :max-size 100)) :dispatch)
+        (check "and the read buffer's ceiling follows the plan"
+               (web-skeleton::connection-read-cap conn)
+               (+ 100 (web-skeleton::request-head-budget)))
+        (check "and the body is timed on its progress from the decision"
+               (plusp (web-skeleton::connection-body-progress-at conn)) t))
+      ;; The plan's cap binds below the default as well as above it.
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Content-Length: 3") "abc"))
+        (declare (ignore v))
+        (check "begun under a plan's cap below the body: 413, naming the cap"
+               (begin conn :plan (buffer-body :max-size 2))
+               '(413 "body too large (3 bytes, max 2)")))
+      ;; Expect: 100-continue — the interim waits for the decision.
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Content-Length: 3" "Expect: 100-continue") ""))
+        (check "held: before the 100 Continue"
+               (list v (web-skeleton::connection-write-pending conn))
+               '((:decide-body nil) 0))
+        (check "begun: the 100 Continue is queued once the body is accepted"
+               (list (begin conn)
+                     (web-skeleton::connection-state conn)
+                     (plusp (web-skeleton::connection-write-pending conn)))
+               '(:flush-queued :sending-100-continue t)))
+      ;; Chunked: the walk is what enforces the cap, so it waits too.
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Transfer-Encoding: chunked")
+                      (format nil "a~a0123456789~a0~a~a"
+                              *crlf* *crlf* *crlf* *crlf*)))
+        (check "held: a chunked head goes to the body handler before its walk"
+               (list v
+                     (web-skeleton::connection-body-decoded conn)
+                     (web-skeleton::connection-chunk-scan-pos conn))
+               '((:decide-body nil) 0 0))
+        (check "begun under a plan's cap: the walk completes the body"
+               (begin conn :plan (buffer-body :max-size 10)) :dispatch))
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Transfer-Encoding: chunked")
+                      (format nil "a~a0123456789~a0~a~a"
+                              *crlf* *crlf* *crlf* *crlf*)))
+        (declare (ignore v))
+        (check "begun under a smaller cap: the walk refuses it, naming the cap"
+               (begin conn :plan (buffer-body :max-size 9))
+               '(413 "chunked body too large (10 bytes, max 9)")))
+      ;; The peer's FIN rides along, for the verdict the decision leads to.
+      (check "held: a FIN that came with the head is the second value"
+             (values (drive (req '("Host: x" "Content-Length: 3") "a")
+                            :read-result :eof))
+             '(:decide-body t))
+      ;; ---- not held ----
+      (check "not held: a request without a body dispatches"
+             (values (drive (sb-ext:string-to-octets
+                             (format nil "GET / HTTP/1.1~aHost: x~a~a"
+                                     *crlf* *crlf* *crlf*)
+                             :external-format :ascii)))
+             '(:dispatch))
+      ;; The framing is the framework's to settle, and comes first: a body
+      ;; handler is never shown a request about to be refused.
+      (check "framing first: Transfer-Encoding with Content-Length is 400"
+             (values (drive (req '("Host: x" "Transfer-Encoding: chunked"
+                                   "Content-Length: 3")
+                                 "")))
+             400)
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Content-Length: 3" "Expect: x-other") "abc"))
+        (check "framing first: an unknown Expect is answered 417"
+               (list v (web-skeleton::connection-state conn))
+               '((:flush-queued) :write-response)))
+      ;; And without a body handler, nothing about the head changes.
+      (multiple-value-bind (v conn)
+          (drive (req '("Host: x" "Content-Length: 3" "Expect: 100-continue") "")
+                 :body-handler nil)
+        (check "no body handler: the interim goes out at once, as before"
+               (list v (web-skeleton::connection-state conn))
+               '((:flush-queued) :sending-100-continue)))
+      (check "no body handler: the default cap refuses at the head, as before"
+             (values (drive (req '("Host: x" "Content-Length: 10") "")
+                            :body-handler nil))
+             413))
+    ;; ---- the plan's own checks ----
+    (check "buffer-body: a negative cap is refused"
+           (and (stringp (attempt (buffer-body :max-size -1))) t) t)
+    (check "buffer-body: a cap that is not a number of bytes is refused"
+           (and (stringp (attempt (buffer-body :max-size "1MB"))) t) t)
+    (check "buffer-body: the default cap is *max-body-size* at the call"
+           (let ((web-skeleton::*max-body-size* 7))
+             (web-skeleton::body-plan-max-size (buffer-body)))
+           7)))
+
+(defun test-body-decision-rereads-under-its-cap ()
+  "A decision that raises the read cap is followed by a read in the same
+   wake-up.
+
+   The read that brought the head stopped at the cap the head was read
+   under, with the rest of the body already in the kernel. An
+   edge-triggered descriptor raises no new edge for bytes already there,
+   so a client that had sent everything would wait on an event that is
+   not coming, until the stall clock closed it. Over a real loopback pair,
+   because the bytes have to be in the kernel and not in a read-fn for
+   that to be the situation; the whole request is written, and has
+   landed, before the server reads any of it.
+
+   The head budgets are shrunk so the default read cap is a couple of KiB
+   and below the 4 KiB the read buffer starts at: the first read stops
+   with the buffer full and part of the body unread, which is the shape
+   that needs the second read."
+  (format t "~%Body handler: the read after a raised cap~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (handed nil))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton::*max-total-header-bytes* 1024)
+                  (web-skeleton::*max-request-line-length* 1024)
+                  (web-skeleton::*max-header-count* 10)
+                  (web-skeleton::*max-body-size* 16)
+                  (web-skeleton::*body-handler*
+                    (lambda (req)
+                      (declare (ignore req))
+                      (buffer-body :max-size 8192)))
+                  (head (sb-ext:string-to-octets
+                         (format nil "POST /u HTTP/1.1~aHost: x~a~
+                                      Content-Length: 4096~a~a"
+                                 *crlf* *crlf* *crlf* *crlf*)
+                         :external-format :ascii))
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server
+                         :last-active (get-universal-time))))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (let ((out (sb-bsd-sockets:socket-make-stream
+                         client :output t :element-type '(unsigned-byte 8))))
+               (write-sequence head out)
+               (write-sequence (make-array 4096 :element-type '(unsigned-byte 8)
+                                                :initial-element 66)
+                               out)
+               (finish-output out))
+             (sleep 0.1)
+             (check "precondition: the default read cap is below the request"
+                    (< (web-skeleton::connection-read-cap conn) (+ (length head) 4096))
+                    t)
+             (web-skeleton::handle-client-read
+              conn epfd
+              (lambda (req)
+                (setf handed (length (http-request-body req)))
+                (make-text-response 200 "ok"))
+              nil)
+             (check "decided: the whole body is read in that wake-up, under the raised cap"
+                    handed 4096))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-body-handler-validated-at-boot ()
+  "START-SERVER refuses a :BODY-HANDLER it could not call, and a
+   *BODY-STALL-TIMEOUT* that would leave an accepted body with no time
+   bound, before it binds.
+
+   :HOST is deliberately invalid, as in TEST-ON-TICK-VALIDATED-AT-BOOT, so
+   a revert fails these at MAKE-TCP-LISTENER instead of starting a server."
+  (format t "~%start-server: the body handler's boot invariants~%")
+  (flet ((boot (&rest args)
+           (attempt (apply #'web-skeleton:start-server
+                           :host #(1 2 3) :port 0 :workers 1 args))))
+    (check "boot: a non-function :body-handler is refused by name"
+           (let ((msg (boot :body-handler 42)))
+             (and (stringp msg) (search ":body-handler" msg) t))
+           t)
+    (check "boot: a symbol naming a macro is refused"
+           (let ((msg (boot :body-handler 'when)))
+             (and (stringp msg) (search ":body-handler" msg) t))
+           t)
+    (check "boot: a symbol naming a function is accepted"
+           (let ((msg (boot :body-handler 'identity)))
+             (and (stringp msg) (not (search ":body-handler" msg)) t))
+           t)
+    (check "boot: *body-stall-timeout* 0 is refused by name"
+           (let ((msg (let ((web-skeleton:*body-stall-timeout* 0)) (boot))))
+             (and (stringp msg) (search "*body-stall-timeout*" msg) t))
+           t)
+    (check "control: the default *body-stall-timeout* passes the check"
+           (let ((msg (boot)))
+             (and (stringp msg) (not (search "*body-stall-timeout*" msg)) t))
+           t)))
+
 (defun test-unfinishable-request-closes ()
   (format t "~%Unfinishable request + peer FIN~%")
   (labels ((drive (raw eof-verdict)
@@ -12310,6 +12558,8 @@
   (test-upstream-field-values)
   (test-transfer-encoding-rules)
   (test-chunked-request-body)
+  (test-body-handler-at-the-head)
+  (test-body-decision-rereads-under-its-cap)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)
@@ -12407,6 +12657,7 @@
   (test-a-raise-after-the-response-began)
   (test-a-worker-crash-closes-its-streams-with-on-close)
   (test-on-tick-validated-at-boot)
+  (test-body-handler-validated-at-boot)
   (test-map-worker-websockets-visits-only-websockets)
   (test-map-worker-websockets-skips-what-a-callback-closed)
   (test-map-worker-websockets-refuses-off-a-worker)

@@ -84,6 +84,9 @@
                                                            "src/epoll"
                                                            "src/server/http"
                                                            "src/server/connection"))
+               (:file "src/server/body" :depends-on ("src/package"
+                                                      "src/server/http"
+                                                      "src/server/connection"))
                (:file "src/server/main"  :depends-on ("src/counters" "src/package"
                                                        "src/log"
                                                        "src/epoll"
@@ -100,7 +103,8 @@
                                                        "src/server/static"
                                                        "src/server/fetch"
                                                        "src/server/dns"
-                                                       "src/server/streaming"))
+                                                       "src/server/streaming"
+                                                       "src/server/body"))
                (:file "src/store" :depends-on ("src/package"
                                                 "src/log"
                                                 "src/server/main"))))
