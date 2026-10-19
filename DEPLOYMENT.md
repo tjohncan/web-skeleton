@@ -200,7 +200,7 @@ specific status, not a blanket 400:
 
 | Code | Sent when |
 |------|-----------|
-| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing either the completion walk or the decoder rejects — the walk decides a chunk-size line it can already tell is invalid, the decoder decides everything else |
+| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and malformed chunked framing — a size line outside the grammar, chunk data not followed by its CRLF — which the completion walk refuses as soon as the bytes that show it have arrived, the decoder and the walk accepting exactly the same framing |
 | `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
@@ -971,6 +971,14 @@ to take the bytes from `:on-body` when they arrive there and from
 `:on-body` behaves identically over `https://`: both schemes take the same
 path, so there is no second implementation to differ from. It is the
 framing that decides, not the transport.
+
+**As strict as the buffered path.** A relayed body is never decoded after
+the fact — its chunks were handed on as they arrived — so the walk that
+hands them over is the only reader the body meets, and it refuses every
+framing `decode-chunked-body` refuses, before the chunk concerned reaches
+`:on-body`. A malformed upstream body fails the relay where a buffered
+fetch of it would answer 502: `:then` gets the abort sentinel and the
+target its failure disposition.
 
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
