@@ -30,8 +30,11 @@
                                                  "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/counters" "src/package"
                                                        "src/algorithms/hex"))
+               ;; src/server/http for *MAX-HEADER-LINE-LENGTH*, which also
+               ;; caps a chunk-size line.
                (:file "src/server/chunked" :depends-on ("src/package"
-                                                          "src/algorithms/hex"))
+                                                          "src/algorithms/hex"
+                                                          "src/server/http"))
                (:file "src/server/connection" :depends-on ("src/package"
                                                             "src/log"
                                                             "src/epoll"

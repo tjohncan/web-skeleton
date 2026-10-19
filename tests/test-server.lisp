@@ -3727,8 +3727,9 @@
           '(("transfer-encoding" . "gzip")
             ("transfer-encoding" . "identity"))) nil)
 
-  ;; parse-chunked-size-line — shared by stream-chunked-lines and the
-  ;; buffered decode-chunked-body. Strict hex,
+  ;; parse-chunked-size-line — the size parser stream-chunked-lines uses;
+  ;; the buffered readers share parse-chunk-size-bytes, which reads the
+  ;; same grammar. Strict hex,
   ;; strips chunk-extensions from ';' onwards, raises on garbage.
   ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
   ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
@@ -8071,7 +8072,77 @@
       (check "control: a boundary with nothing past it yet only waits"
              (raises-p (format nil "5~a~ahello~a~a" #\Return #\Newline
                                #\Return #\Newline))
-             nil))
+             nil)
+      ;; The walk accepts what DECODE-CHUNKED-BODY accepts and nothing
+      ;; more, because a consumer of its ON-DATA has no decoder behind it.
+      ;; Each of these is a framing the decoder refuses; each raises here
+      ;; as soon as the byte that decides it has arrived.
+      (check "decided: chunk data followed by something other than CRLF raises"
+             (raises-p (format nil "5~a~ahelloXX0~a~a~a~a" #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: a CR after the data with a stray byte behind it raises"
+             (raises-p (format nil "5~a~ahello~aX" #\Return #\Newline #\Return))
+             t)
+      (check "control: a CR after the data with nothing behind it only waits"
+             (raises-p (format nil "5~a~ahello~a" #\Return #\Newline #\Return))
+             nil)
+      (check "decided: a size line ended by a bare LF raises"
+             (raises-p (format nil "5~ahello~a~a0~a~a~a~a" #\Newline
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: junk after the chunk-size raises"
+             (raises-p (format nil "5g~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: junk after the whitespace that follows a size raises"
+             (raises-p (format nil "5 x~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: a bare CR inside a chunk-extension raises"
+             (raises-p (format nil "5;a~ab~a~ahello~a~a0~a~a~a~a" #\Return
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      ;; The line cap, the same one READER-READ-CRLF-LINE applies, so a
+      ;; size line that never ends is refused at the cap rather than
+      ;; waited on until the read buffer fills.
+      (let ((web-skeleton::*max-header-line-length* 8))
+        (check "decided: a size line past *max-header-line-length* raises"
+               (raises-p "5;aaaaaaaaaa")
+               t)
+        (check "control: a size line at the cap is accepted"
+               (complete-p (format nil "0;aaaaaa~a~a~a~a" #\Return #\Newline
+                                   #\Return #\Newline))
+               t)
+        (check "control: a size line one byte past the cap raises"
+               (raises-p (format nil "0;aaaaaaa~a~a~a~a" #\Return #\Newline
+                                 #\Return #\Newline))
+               t))
+      ;; An extension's bytes are skipped, not interpreted, and RFC 7230
+      ;; admits obs-text in a quoted value.
+      (check "complete: an extension byte above 0x7F is skipped"
+             (complete-p (format nil "5;q=\"~a\"~a~ahello~a~a0~a~a~a~a"
+                                 (code-char #xE9)
+                                 #\Return #\Newline #\Return #\Newline
+                                 #\Return #\Newline #\Return #\Newline))
+             t))
+    ;; And the refusal comes before the handover: a chunk whose CRLF is
+    ;; wrong is not given to ON-DATA first and refused afterwards.
+    (let ((seen nil)
+          (buf (sb-ext:string-to-octets
+                (format nil "5~a~ahelloXX0~a~a~a~a" #\Return #\Newline
+                        #\Return #\Newline #\Return #\Newline)
+                :external-format :latin-1)))
+      (handler-case
+          (web-skeleton::chunked-body-complete-p
+           buf 0 (length buf) 0
+           (lambda (b s e) (push (subseq b s e) seen) nil))
+        (web-skeleton::chunked-framing-error () nil))
+      (check "on-data: a chunk with a wrong CRLF is never handed over"
+             seen nil))
     ;; The streaming path's size parser agrees: BWS may follow the digits,
     ;; nothing precedes them.
     (check "size line: leading whitespace refused on the streaming path too"
@@ -8971,26 +9042,42 @@
 
     (check "chunked: an empty chunked body decodes to nothing"
            (body-of (format nil "0~a~a" *crlf* *crlf*)) "")
-    ;; `5g`, a size with junk after its digit. The walk accepts it as framing:
-    ;; it reads one hex digit, stops at a byte that is not one, finds the
-    ;; line's LF and skips five bytes, exactly as a well-formed header
-    ;; would have it do. The decoder is what refuses, on the byte between
-    ;; the size and the CRLF, and that is the split working rather than
-    ;; failing — the walk defers what it cannot decide on sight.
+    ;; `5g`, a size with junk after its digit. The walk refuses it on
+    ;; arrival, as the decoder would: no later byte makes `g` a size, an
+    ;; extension or a line end, so waiting would only hold the request.
     (check "chunked: a junk byte after the chunk-size is 400"
-           (body-of (format nil "5g~ahello~a0~a~a"
+           (verdict (format nil "5g~ahello~a0~a~a"
                             *crlf* *crlf* *crlf* *crlf*))
            400)
 
-    ;; The framing walk is deliberately lax — it answers "do we have it
-    ;; all yet", and a too-strict predicate would hang instead of refusing.
-    ;; DECODE-CHUNKED-BODY is the validator, and its error has to become
-    ;; the client's 400 rather than the 500 an unhandled error becomes.
-    ;; Broken state: the decode error escapes CONNECTION-PARSE-REQUEST and
-    ;; HANDLE-CLIENT-READ's generic arm answers 500 — the server blamed
-    ;; for a malformed request.
-    (check "chunked: a size line the decoder rejects is 400, not 500"
-           (body-of (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)) 400)
+    ;; Data followed by something other than its CRLF. Refused by the walk
+    ;; before the request completes, so a body the decoder would refuse is
+    ;; never dispatched — and never handed to a consumer of the walk, who
+    ;; would have nothing behind it to refuse it later.
+    (check "chunked: chunk data not followed by CRLF is 400"
+           (verdict (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)) 400)
+
+    ;; The decoder's own refusal still becomes the client's 400. The walk
+    ;; and the decoder accept the same bodies, so no request reaches this
+    ;; through the state machine; the boundary is set by hand, over bytes
+    ;; the walk never saw. Broken state: the decode error escapes
+    ;; CONNECTION-PARSE-REQUEST and HANDLE-CLIENT-READ's generic arm
+    ;; answers 500 — the server blamed for a malformed request.
+    (let* ((bytes (req (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)))
+           (conn (web-skeleton::make-connection :fd -1))
+           (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+      (setf (web-skeleton::connection-read-buf conn) bytes
+            (web-skeleton::connection-read-pos conn) (length bytes)
+            (web-skeleton::connection-header-end conn) header-end
+            (web-skeleton::connection-body-framing conn) :chunked
+            (web-skeleton::connection-request-end conn) (length bytes))
+      (check "chunked: a body the decoder rejects is 400, not 500"
+             (handler-case
+                 (progn (web-skeleton::connection-parse-request conn) :parsed)
+               (web-skeleton:http-parse-error (e)
+                 (web-skeleton::http-parse-error-status e))
+               (error (e) (princ-to-string e)))
+             400))
 
 
 
@@ -9068,23 +9155,28 @@
              (attempt (web-skeleton::connection-on-read conn)) :continue)
       ;; Second pass: a buffer at its cap holding framing that is
       ;; *incomplete* rather than invalid, so this reaches the :FULL arm
-      ;; and not one of the refusals above it. `1;` opens a chunk-size
-      ;; line with an extension and the rest of the buffer never
-      ;; terminates it, so the walk finds no LF and answers keep reading
-      ;; with nothing pending — the body cap sees 0 and declines, which is
-      ;; the only way to isolate the buffer's 413 from the body's.
+      ;; and not one of the refusals above it. The filler is legal chunks
+      ;; of one byte each, every size line carrying a long extension, and
+      ;; the last one cut off wherever the cap falls. The buffer fills
+      ;; while the decoded total stays far below the body cap and no byte
+      ;; is a fault, so the walk answers keep reading with nothing that
+      ;; projects past the cap, and the buffer's 413 is the only answer
+      ;; left.
       ;;
-      ;; The filler must not look like a chunk-size line. An earlier draft
-      ;; used a size header and left the rest as `a` bytes, which are hex
-      ;; digits: the walk read tens of thousands of them, tripped its
-      ;; sixteen-digit cap, and answered 400 — a correct answer to a
-      ;; different question, and this assertion failed for the right
-      ;; reason with the wrong subject.
-      (let ((big (make-array cap :element-type '(unsigned-byte 8)
-                                 :initial-element 97)))   ; #\a
+      ;; The obvious fillers each reach a different refusal first, which
+      ;; is a correct answer to a different question. A size line that
+      ;; never ends is refused at *MAX-HEADER-LINE-LENGTH*, and a run of
+      ;; hex digits at sixteen, both with a 400; one-byte chunks without
+      ;; extensions reach the body cap's 413, one decoded byte for every
+      ;; six on the wire, long before the buffer is full.
+      (let ((unit (sb-ext:string-to-octets
+                   (concatenate 'string "1;" (make-string 4000 :initial-element #\a)
+                                *crlf* "x" *crlf*)
+                   :external-format :ascii))
+            (big (make-array cap :element-type '(unsigned-byte 8))))
         (replace big head)
-        (replace big (sb-ext:string-to-octets "1;" :external-format :ascii)
-                 :start1 (length head))
+        (loop for at from (length head) below cap by (length unit)
+              do (replace big unit :start1 at))
         (setf (web-skeleton::connection-read-buf conn) big
               (web-skeleton::connection-read-pos conn) cap)
         (check "chunked: a body past the read cap is 413, not a stall"

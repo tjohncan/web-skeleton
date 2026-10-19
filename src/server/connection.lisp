@@ -1134,15 +1134,15 @@
       (:chunked
        (multiple-value-bind (complete resume after-size-line
                              data-bytes pending-size)
-           ;; The walk signals CHUNKED-FRAMING-ERROR on a chunk-size line
-           ;; it can already tell is invalid, which for a *request* is 400:
-           ;; the client's framing is malformed, not the server. Caught by
+           ;; The walk signals CHUNKED-FRAMING-ERROR on framing it can
+           ;; already tell is invalid, which for a *request* is 400: the
+           ;; client's framing is malformed, not the server. Caught by
            ;; condition rather than by ERROR, because ERROR would also
            ;; catch a defect in the walk and answer 400 for it — telling a
            ;; client their bytes were at fault when the bug was ours, in
            ;; the middle of the one file whose job is deciding exactly
            ;; that. Same conversion CONNECTION-PARSE-REQUEST does for
-           ;; DECODE-CHUNKED-BODY, at the other end of the same split.
+           ;; DECODE-CHUNKED-BODY.
            (handler-case
                (chunked-body-complete-p (connection-read-buf conn)
                                         body-start end
@@ -1641,14 +1641,13 @@
                (subseq (connection-read-buf conn) body-start
                        (+ body-start content-length)))))
       (:chunked
-       ;; The framing walk that got us here is deliberately lax — it
-       ;; answers "do we have it all yet", and a too-strict predicate
-       ;; would hang rather than refuse. DECODE-CHUNKED-BODY is the
-       ;; validator, so a body the walk waved through can still be
-       ;; rejected here, and its CHUNKED-FRAMING-ERROR becomes the
-       ;; client's 400: the request is malformed, not the server. Any
-       ;; other condition out of the decoder is a defect in the decoder
-       ;; and is deliberately left to become a 500.
+       ;; The framing walk that got us here accepts exactly what
+       ;; DECODE-CHUNKED-BODY accepts, so for a body it completed the
+       ;; decode cannot refuse. The conversion stays all the same: should
+       ;; the two ever disagree, the decoder's CHUNKED-FRAMING-ERROR is
+       ;; still a malformed request and the client's 400, not the
+       ;; server's 500. Any other condition out of the decoder is a
+       ;; defect in the decoder and is deliberately left to become a 500.
        (let ((decoded (handler-case
                           (decode-chunked-body (connection-read-buf conn)
                                                body-start

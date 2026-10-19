@@ -5174,6 +5174,72 @@
                   (census-await :outbound 0) 0))
       (setf web-skeleton:*fetch-timeout* saved))))
 
+(defun test-harness-fetch-into-refuses-malformed-chunks-e2e ()
+  "A relay refuses an upstream body that a buffered fetch refuses.
+
+   :ON-BODY is handed each chunk as the walk proves it, and nothing reads
+   a relayed body after that: COMPLETE-FETCH does not decode what has
+   already been delivered. The walk is the only judge such a body meets,
+   so it has to refuse what DECODE-CHUNKED-BODY refuses — here, chunk data
+   followed by two bytes that are not its CRLF. Accepted, the relay would
+   forward `hello` as a whole body, terminator and all, where a buffered
+   fetch of the same upstream answers 502, and it would drop the two bytes
+   it took for a CRLF.
+
+   The upstream is a byte-vector response from the test server itself, so
+   the framing reaches the wire exactly as written."
+  (format t "~%Harness: fetch-into refuses framing the decoder refuses~%")
+  (let ((port-box (list nil))
+        (handed nil)
+        (outcome nil))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (%ascii (format nil "HTTP/1.1 200 OK~a~
+                                    Transfer-Encoding: chunked~a~
+                                    Connection: close~a~a~
+                                    5~ahelloXX0~a~a"
+                               *crlf* *crlf* *crlf* *crlf*
+                               *crlf* *crlf* *crlf*))
+               (make-stream-response
+                :on-open
+                (lambda (client)
+                  (fetch-into
+                   client
+                   (http-fetch
+                    :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                    :on-body (lambda (out chunk)
+                               (declare (ignore out))
+                               (push chunk handed)
+                               (stream-send client chunk)
+                               nil)
+                    :then (lambda (status headers body)
+                            (declare (ignore headers body))
+                            (setf outcome (if status :delivered :aborted))
+                            nil))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~a" *crlf*))
+               (let* ((buf (read-until-bounded stream :seconds 5))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "malformed upstream: none of its body reached the client"
+                        (search "hello" (sb-ext:octets-to-string
+                                         raw :external-format :latin-1))
+                        nil)
+                 (check "malformed upstream: the client's body does not decode"
+                        (string= (%decode-streamed-body raw) "hello")
+                        nil)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "malformed upstream: :on-body was handed nothing" handed nil)
+      (check "malformed upstream: :then saw the abort sentinel" outcome :aborted)
+      (check "malformed upstream: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
 (defun test-harness-fetch-into-target-closed-e2e ()
   "A client that leaves mid-relay tears the outbound down, once.
 
@@ -5997,6 +6063,7 @@
   (test-harness-ipv6-listener-e2e)
 
   (test-harness-fetch-into-upstream-stalls-e2e)
+  (test-harness-fetch-into-refuses-malformed-chunks-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)
   (test-fetch-stop-ignores-the-failure-disposition)

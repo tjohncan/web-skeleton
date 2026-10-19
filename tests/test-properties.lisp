@@ -415,6 +415,194 @@
                       complete resume (- (length framed) term-len)))))))
     bad))
 
+(defparameter *size-line-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (concatenate 'string "aZ=\"x5;g" (list #\Space #\Tab #\Return #\Newline
+                                              (code-char 0) (code-char #xE9))))
+  "Bytes a generated chunk-size line is salted with: the separators the
+   grammar names, the line terminators taken apart, a NUL, a byte above
+   0x7F, and letters that are and are not hex digits.")
+
+(defun gen-size-line ()
+  "Bytes that may or may not be a chunk-size line, always followed by a
+   CRLF so every reader finds an end. Built from the grammar's own parts
+   — hex digits, whitespace, an extension — and then salted, so most
+   cases sit one byte away from valid rather than nowhere near it."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0)))
+    (flet ((emit (b) (vector-push-extend b out))
+           (salt () (aref *size-line-bytes* (random (length *size-line-bytes*)))))
+      (when (zerop (random 8)) (emit (salt)))
+      (dotimes (i (if (zerop (random 20)) 17 (random 5)))
+        (declare (ignorable i))
+        (emit (char-code (char "0123456789abcdefABCDEF" (random 22)))))
+      (dotimes (i (random 3))
+        (declare (ignorable i))
+        (emit (if (zerop (random 2)) 32 9)))
+      (when (zerop (random 2))
+        (emit 59)
+        (dotimes (i (random 7))
+          (declare (ignorable i))
+          (emit (salt))))
+      (when (zerop (random 6))
+        (let ((at (random (1+ (fill-pointer out)))))
+          (emit 0)
+          (replace out out :start1 (1+ at) :start2 at :end2 (1- (fill-pointer out)))
+          (setf (aref out at) (salt))))
+      (emit 13)
+      (emit 10))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun prop-chunk-size-line-parity (seed)
+  "Every chunked reader reads a size line the same way.
+
+   PARSE-CHUNK-SIZE-BYTES reads the line for the walk and the buffered
+   decoder; READER-READ-CRLF-LINE and PARSE-CHUNKED-SIZE-LINE read it for
+   the blocking stream. Both are written to one grammar, and a line one
+   accepts and the other refuses — or reads as a different size — is two
+   readers framing the same bytes two ways. The line cap is part of the
+   grammar, so each case runs under a small *MAX-HEADER-LINE-LENGTH* of
+   its own and the cap is reached as often as not."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((line (gen-size-line))
+             (web-skeleton::*max-header-line-length* (+ 4 (random 12)))
+             (buffered (handler-case
+                           (let ((size (web-skeleton::parse-chunk-size-bytes
+                                        line 0 (length line))))
+                             (or size :incomplete))
+                         (web-skeleton::chunked-framing-error () :refused)))
+             (streamed (handler-case
+                           (let ((text (web-skeleton::reader-read-crlf-line
+                                        (web-skeleton::make-stream-reader
+                                         (make-mock-stream line)))))
+                             (if text
+                                 (web-skeleton::parse-chunked-size-line text)
+                                 :eof))
+                         (error () :refused))))
+        (unless (eql buffered streamed)
+          (unless bad
+            (setf bad :disagreement)
+            (fuzz-report nil seed line)
+            (format t "    cap ~d: buffered ~s, streamed ~s~%"
+                    web-skeleton::*max-header-line-length* buffered streamed)))))
+    bad))
+
+(defparameter *framing-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (concatenate 'string "01fgX;" (list #\Space #\Tab #\Return #\Newline
+                                            (code-char 0))))
+  "What a mutation writes into chunked framing: the bytes the framing is
+   made of, and a few that are wrong in every position.")
+
+(defun mutate-framing (bytes)
+  "BYTES with one byte replaced, inserted or removed at a random place,
+   the new byte drawn from *FRAMING-BYTES*."
+  (let* ((n (length bytes))
+         (at (random (1+ n)))
+         (b (aref *framing-bytes* (random (length *framing-bytes*)))))
+    (coerce
+     (ecase (if (zerop n) 1 (random 3))
+       (0 (let ((v (copy-seq bytes)))
+            (setf (aref v (min at (1- n))) b)
+            v))
+       (1 (concatenate '(vector (unsigned-byte 8))
+                       (subseq bytes 0 at) (vector b) (subseq bytes at)))
+       (2 (concatenate '(vector (unsigned-byte 8))
+                       (subseq bytes 0 (min at (1- n)))
+                       (subseq bytes (1+ (min at (1- n)))))))
+     '(simple-array (unsigned-byte 8) (*)))))
+
+(defun walk-verdict (buf start end resume collect)
+  "Run CHUNKED-BODY-COMPLETE-P over BUF[START..END) from RESUME, handing
+   each chunk to COLLECT. Returns (values VERDICT NEXT): :COMPLETE,
+   :INCOMPLETE or :REFUSED, and where a later call resumes."
+  (handler-case
+      (multiple-value-bind (complete next)
+          (web-skeleton::chunked-body-complete-p
+           buf start end resume
+           (lambda (b s e) (funcall collect (subseq b s e)) nil))
+        (values (if complete :complete :incomplete) next))
+    (web-skeleton::chunked-framing-error () (values :refused nil))))
+
+(defun prop-chunk-walk-matches-decoder (seed)
+  "CHUNKED-BODY-COMPLETE-P accepts exactly what DECODE-CHUNKED-BODY
+   accepts, and ON-DATA hands over exactly what the decoder decodes.
+
+   A consumer of ON-DATA — a relay forwarding a response as it arrives —
+   is given each chunk once the walk has proved it, and the decoder never
+   runs after that. So the walk is the only reader such a body meets, and
+   a framing it waves through that the decoder refuses is a body a relay
+   forwards and a buffered fetch answers 502.
+
+   Valid bodies from the encoder are mutated by a byte, most of the time,
+   so the corpus lives at the boundary of the grammar. Three claims:
+
+     the whole buffer      walk complete exactly when the decoder succeeds,
+                           and then ON-DATA's bytes are the decoded body; a
+                           walk that refuses or waits faces a decoder that
+                           refuses, waiting being truncation to a decoder
+                           handed the whole body
+     every split point     the walk run on a prefix and then on the whole
+                           buffer from where it stopped hands over the same
+                           bytes and reaches the same verdict as one pass
+     refusal is final      a prefix the walk refuses is a body it refuses"
+  (let ((bad nil))
+    (flet ((report (kind framed fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed framed)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+               (framed (if (zerop (random 4))
+                           valid
+                           (let ((m (mutate-framing valid)))
+                             (if (zerop (random 3)) (mutate-framing m) m))))
+               (n (length framed))
+               (decoded (handler-case
+                            (web-skeleton::decode-chunked-body framed 0 n)
+                          (web-skeleton::chunked-framing-error () :refused)))
+               (one-shot (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0)))
+          (flet ((into (acc) (lambda (v) (loop for b across v
+                                               do (vector-push-extend b acc)))))
+            (let ((verdict (walk-verdict framed 0 n 0 (into one-shot))))
+              (cond
+                ((eq verdict :complete)
+                 (unless (and (not (eq decoded :refused))
+                              (equalp (coerce one-shot '(vector (unsigned-byte 8)))
+                                      (coerce decoded '(vector (unsigned-byte 8)))))
+                   (report :whole framed "    walk complete, ~s handed over; decoder ~s~%"
+                           one-shot decoded)))
+                ((not (eq decoded :refused))
+                 (report :whole framed "    walk ~s; decoder accepted ~s~%"
+                         verdict decoded)))
+              (loop for k from 0 to n
+                    until bad
+                    do (let ((split (make-array 0 :element-type '(unsigned-byte 8)
+                                                  :adjustable t :fill-pointer 0)))
+                         (multiple-value-bind (first next)
+                             (walk-verdict framed 0 k 0 (into split))
+                           (cond
+                             ((eq first :refused)
+                              (unless (eq verdict :refused)
+                                (report :final framed
+                                        "    prefix ~d refused, whole buffer ~s~%"
+                                        k verdict)))
+                             (t
+                              (let ((second (walk-verdict framed 0 n next
+                                                          (into split))))
+                                (unless (and (eq second verdict)
+                                             (equalp (coerce split '(vector (unsigned-byte 8)))
+                                                     (coerce one-shot '(vector (unsigned-byte 8)))))
+                                  (report :split framed
+                                          "    split at ~d: ~s ~s, one pass ~s ~s~%"
+                                          k second split verdict one-shot)))))))))))))
+    bad))
+
 (defun drive-request-incrementally (bytes step)
   "Feed BYTES to a fresh connection STEP bytes per wake-up.
    Returns (values CALLS VERDICT CONN) — how many CONNECTION-ON-READ calls
@@ -846,6 +1034,10 @@
                             #'prop-chunked-encoder-roundtrip)
                       (cons "chunked corpus through the request path"
                             #'prop-chunked-inbound-parity)
+                      (cons "chunk-size lines read alike"
+                            #'prop-chunk-size-line-parity)
+                      (cons "chunk walk accepts what the decoder accepts"
+                            #'prop-chunk-walk-matches-decoder)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

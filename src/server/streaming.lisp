@@ -14,15 +14,15 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked transfer encoding — the producing side
 ;;;
-;;; Encode to the intersection of what the three readers require, not to
-;;; what any one of them forgives. DECODE-CHUNKED-BODY demands strict CRLF
-;;; after both the size line and the data ("Lax trailing CRLF is a smuggling
-;;; primitive"); PARSE-CHUNKED-SIZE-LINE tolerates BWS around the hex and
-;;; strips chunk-extensions; CHUNKED-BODY-COMPLETE-P is lax on purpose and
-;;; validates nothing. Their tolerances exist to survive other people's
-;;; output. They are not a licence for ours, so what goes on the wire is
-;;; bare lowercase hex, CRLF, data, CRLF — no extensions, no whitespace,
-;;; nothing any strict downstream re-parser could read differently.
+;;; Encode to what every reader requires, not to what the readers forgive.
+;;; The three readers demand strict CRLF after both the size line and the
+;;; data ("Lax trailing CRLF is a smuggling primitive"), and they tolerate
+;;; whitespace after the hex and skip chunk-extensions — PARSE-CHUNK-SIZE-
+;;; BYTES and PARSE-CHUNKED-SIZE-LINE have the grammar. Those tolerances
+;;; exist to survive other people's output. They are not a licence for
+;;; ours, so what goes on the wire is bare lowercase hex, CRLF, data,
+;;; CRLF — no extensions, no whitespace, nothing any strict downstream
+;;; re-parser could read differently.
 ;;; ---------------------------------------------------------------------------
 
 (defun chunked-terminator ()

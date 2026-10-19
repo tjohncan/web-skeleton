@@ -1225,7 +1225,13 @@
    stripped), or NIL on clean EOF before any bytes. MAX-SIZE
    defaults to *MAX-HEADER-LINE-LENGTH*, mirroring the header-line
    budget — chunk-size lines with chunk-extensions rarely exceed
-   this in practice."
+   this in practice.
+
+   The line is read one character per byte. A chunk-extension may carry
+   any byte but CR and LF (a quoted value admits obs-text, RFC 7230
+   §3.2.6), and PARSE-CHUNK-SIZE-BYTES skips such a byte on the buffered
+   readers; a decoding that refused it would make this reader the one
+   that disagrees."
   (let ((line-buf (make-array 64 :element-type '(unsigned-byte 8)
                                  :fill-pointer 0 :adjustable t))
         (saw-any nil))
@@ -1249,7 +1255,7 @@
                (error "chunked stream: bare CR in chunk-size line"))
              (incf (stream-reader-pos r))
              (return (sb-ext:octets-to-string
-                      line-buf :external-format :ascii))))
+                      line-buf :external-format :latin-1))))
           ((= byte 10)
            (error "chunked stream: bare LF in chunk-size line"))
           (t
@@ -1445,15 +1451,18 @@
    final chunk).
 
    The streaming path's parser, reached from stream-chunked-lines over
-   either transport. DECODE-CHUNKED-BODY scans the buffered path's
-   sizes itself, deliberately symmetric with this one down to the digit
-   cap and the bytes it will accept after the digits: two implementations
-   kept in step rather than one shared. Strict rejection matters because a
-   permissive parse ('xyz' → NIL, '-5' → -5) would silently exit
-   the decoder loop as if the stream were complete — a parser-
-   disagreement smuggling primitive against any stricter
-   downstream that re-parses the body. The 16-digit cap mirrors
-   decode-chunked-body's buffered-path guard: without it, a 1 MiB
+   either transport. The buffered readers, DECODE-CHUNKED-BODY and
+   CHUNKED-BODY-COMPLETE-P, read their size lines through
+   PARSE-CHUNK-SIZE-BYTES instead, and accept the same lines this and
+   READER-READ-CRLF-LINE accept together: one grammar in two
+   implementations, one over a byte buffer and one over a line already
+   read, and PROP-CHUNK-SIZE-LINE-PARITY holds them to it.
+
+   Strict rejection matters because a permissive parse ('xyz' → NIL,
+   '-5' → -5) would silently exit the decoder loop as if the stream
+   were complete — a parser-disagreement smuggling primitive against
+   any stricter downstream that re-parses the body. The 16-digit cap
+   mirrors PARSE-CHUNK-SIZE-BYTES's: without it, a 1 MiB
    attacker-framed hex string lands in parse-integer, which is
    super-linear in digit count."
   ;; Trailing whitespace only: BWS may follow the digits, before a ';'
