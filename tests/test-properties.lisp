@@ -603,6 +603,94 @@
                                           k second split verdict one-shot)))))))))))))
     bad))
 
+(defun feed-in-pieces (framed cuts)
+  "Feed FRAMED to CHUNKED-BODY-FEED as a receiving connection would: in
+   the pieces CUTS marks, appended to a buffer from which every call's
+   walked bytes are dropped. Returns (values VERDICT BYTES CALLS): the
+   walk's :COMPLETE, :INCOMPLETE or :REFUSED once the input or the body
+   ends, the data handed over, concatenated, and how many calls it took."
+  (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (got (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (owed 0)
+        (calls 0)
+        (at 0))
+    (dolist (cut (append cuts (list (length framed))))
+      (loop for i from at below cut do (vector-push-extend (aref framed i) buf))
+      (setf at cut)
+      (incf calls)
+      (handler-case
+          (multiple-value-bind (complete next new-owed)
+              (web-skeleton::chunked-body-feed
+               buf 0 (fill-pointer buf) owed
+               (lambda (b from to rest)
+                 (declare (ignore rest))
+                 (loop for i from from below to
+                       do (vector-push-extend (aref b i) got))
+                 nil))
+            (when complete
+              (return-from feed-in-pieces (values :complete got calls)))
+            ;; Drop what the call walked, as the read path does.
+            (replace buf buf :start2 next)
+            (setf (fill-pointer buf) (- (fill-pointer buf) next)
+                  owed new-owed))
+        (web-skeleton::chunked-framing-error ()
+          (return-from feed-in-pieces (values :refused got calls)))))
+    (values :incomplete got calls)))
+
+(defun prop-chunk-feed-matches-decoder (seed)
+  "CHUNKED-BODY-FEED, which hands a received body over before its chunks
+   have all landed, accepts exactly what DECODE-CHUNKED-BODY accepts and
+   hands over exactly what it decodes — whatever pieces the body arrives
+   in, and with each call's walked bytes dropped before the next.
+
+   The feed is the reader a received request body meets and no decoder
+   runs after it, so its verdict is where the request ends. The corpus is
+   PROP-CHUNK-WALK-MATCHES-DECODER's — encoder output mutated by a byte or
+   two — cut into random pieces, one byte at a time on some cases so a
+   size line or a CRLF is split at every place it can be. The single-piece
+   feed is checked against the decoder; every other cutting against the
+   single piece."
+  (let ((bad nil))
+    (flet ((report (kind framed fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed framed)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+               (framed (if (zerop (random 4))
+                           valid
+                           (let ((m (mutate-framing valid)))
+                             (if (zerop (random 3)) (mutate-framing m) m))))
+               (n (length framed))
+               (decoded (handler-case
+                            (web-skeleton::decode-chunked-body framed 0 n)
+                          (web-skeleton::chunked-framing-error () :refused))))
+          (multiple-value-bind (verdict got) (feed-in-pieces framed nil)
+            (cond
+              ((eq verdict :complete)
+               (unless (and (not (eq decoded :refused)) (equalp got decoded))
+                 (report :whole framed "    feed complete, ~s; decoder ~s~%"
+                         got decoded)))
+              ((not (eq decoded :refused))
+               (report :whole framed "    feed ~s; decoder accepted ~s~%"
+                       verdict decoded)))
+            (let ((cuts (if (zerop (random 4))
+                            (loop for k from 1 below n collect k)
+                            (sort (remove-duplicates
+                                   (loop repeat (random 6)
+                                         collect (random (max 1 n))))
+                                  #'<))))
+              (multiple-value-bind (verdict2 got2) (feed-in-pieces framed cuts)
+                (unless (and (eq verdict2 verdict) (equalp got2 got))
+                  (report :pieces framed
+                          "    cut at ~s: ~s ~s, one piece ~s ~s~%"
+                          cuts verdict2 got2 verdict got))))))))
+    bad))
+
 (defun drive-request-incrementally (bytes step)
   "Feed BYTES to a fresh connection STEP bytes per wake-up.
    Returns (values CALLS VERDICT CONN) — how many CONNECTION-ON-READ calls
@@ -1038,6 +1126,8 @@
                             #'prop-chunk-size-line-parity)
                       (cons "chunk walk accepts what the decoder accepts"
                             #'prop-chunk-walk-matches-decoder)
+                      (cons "chunk feed, in any pieces, matches the decoder"
+                            #'prop-chunk-feed-matches-decoder)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

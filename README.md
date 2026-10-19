@@ -143,7 +143,7 @@ src/
     connection.lisp    Connection state machine, read/write buffers
     http.lisp          HTTP request parser, response builder, URL/query/routing
     chunked.lisp       Chunked transfer coding decoders, shared by both directions
-    body.lisp          Request bodies decided at the head: body plans, per-request caps
+    body.lisp          Request bodies decided at the head: per-request caps, receiving as they arrive
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
@@ -256,13 +256,18 @@ tests/
   is asked about a request's body once the head has arrived and before any
   of the body is read. `nil` reads it as usual. `(buffer-body :max-size n)`
   reads it under a cap of that request's own, above or below
-  `*max-body-size*`, before `:handler` gets the whole request as usual. An
-  `http-response` is the answer, sent before the body: an upload that fails
-  a login check is refused before its first byte is read, and a client that
-  sent `Expect: 100-continue` is never told to send it. A body the body
-  handler accepted is timed on its progress, by `*body-stall-timeout*`,
-  rather than as a whole, so a large upload takes as long as it keeps
-  arriving. The `:handler` contract does not change
+  `*max-body-size*`, before `:handler` gets the whole request as usual.
+  `(receive-body :on-data … :on-end … :on-abort …)` hands the body to the
+  application as it arrives, a read at a time, and lets `:on-end` answer the
+  request: the body is never held whole, so an upload of any size costs the
+  head and one 64 KiB window of buffer, chunked or not, whatever its chunk
+  sizes. `:on-abort` hears, exactly once, why a body that did not complete
+  ended. An `http-response` is the answer, sent before the body: an upload
+  that fails a login check is refused before its first byte is read, and a
+  client that sent `Expect: 100-continue` is never told to send it. A body
+  the body handler accepted is timed on its progress, by
+  `*body-stall-timeout*`, rather than as a whole, so a large upload takes as
+  long as it keeps arriving. The `:handler` contract does not change
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -505,18 +510,19 @@ read about here.
   supported — `web-skeleton-tls` gives `https://` fetches — so the
   feature list above can read as if the inbound case were covered too. It
   isn't.
-- **Chunked request bodies are accepted, but not streamed to a handler.**
-  `Transfer-Encoding: chunked` is decoded and the handler receives the
-  whole body exactly as it does for a `Content-Length` request — the
-  wire bytes accumulate, and the body is decoded once when the terminator
-  arrives. So `curl -T -` is served, and "chunked requests are supported"
-  does *not* mean a 4 GiB upload: the whole body is buffered before your
-  handler is called, and the body's cap — `*max-body-size*`, or the one a
-  body handler chose — is enforced incrementally as
-  the decoded total grows — plus on a chunk header that declares more than
-  the cap on its own, which is refused the moment it arrives rather than
-  after its bytes fail to turn up. Streaming a request body into a handler
-  would change the handler contract and is out.
+- **A body reaches `:handler` whole, or not at all.** `Transfer-Encoding:
+  chunked` is decoded and the handler receives the whole body exactly as it
+  does for a `Content-Length` request — the wire bytes accumulate, and the
+  body is decoded once when the terminator arrives. So `curl -T -` is
+  served, and "chunked requests are supported" does *not* mean a 4 GiB
+  upload *to the handler*: the whole body is buffered before it is called,
+  and the body's cap — `*max-body-size*`, or the one a body handler chose —
+  is enforced incrementally as the decoded total grows, plus on a chunk
+  header that declares more than the cap on its own, which is refused the
+  moment it arrives rather than after its bytes fail to turn up. A body
+  that should not be held belongs to a body handler's `receive-body`, which
+  hands it to the application as it arrives and answers the request from
+  its `:on-end`; the handler is never called for it.
 - **Two different 413s, and they say which.** The body cap above answers
   `chunked body too large`; the read buffer answers `request too large
   (buffer full)`. Both are reachable for a chunked request and neither is
@@ -650,7 +656,7 @@ All configurable via `setf` before calling `start-server`.
 | `*max-header-count*`           | `100`     | Max number of headers per request                                                                                                                                                                                                                  |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes)                                                                                                                                                                                                                     |
 | `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431      |
-| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB). A body handler can choose another cap for a request, above or below this one, with `buffer-body`                                                                                                           |
+| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB). A body handler can choose another cap for a request, above or below this one, with `buffer-body` or `receive-body` — the latter's can be `nil`, since a received body is never held                     |
 | `*max-outbound-response-size*` | `8388608` | Max bytes an outbound response holds in the read buffer, headers included, either scheme (default 8MB). A buffered `http-fetch` holds the whole response, so this caps its size. An `:on-body` relay of a chunked response frees each chunk once it is handed on, so here it caps the head plus one chunk and the stream itself can be any length. Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected |
 | `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound)                 |
 | `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value                                    |

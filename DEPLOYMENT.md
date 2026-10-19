@@ -205,7 +205,7 @@ specific status, not a blanket 400:
 | Code | Sent when |
 |------|-----------|
 | `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and malformed chunked framing — a size line outside the grammar, chunk data not followed by its CRLF — which the completion walk refuses as soon as the bytes that show it have arrived, the decoder and the walk accepting exactly the same framing |
-| `413 Payload Too Large` | Body over its cap — `*max-body-size*`, or the one a body handler chose for the request — `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
+| `413 Payload Too Large` | Body over its cap — `*max-body-size*`, or the one a body handler chose for the request — `Content-Length` over fifteen digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
@@ -1766,6 +1766,9 @@ differ by route, and a refusal that should happen before the body is read.
   above or below `*max-body-size*`, and then `:handler` gets the whole
   request as usual. Buffering means holding: up to `n` bytes per connection
   doing this at once, so a large `n` is memory a request may really use.
+- **`(receive-body :on-data … :on-end … :on-abort … :max-size n)`** hands
+  the body to the application as it arrives instead of holding it, and its
+  `:on-end` answers the request; see "Receiving a body as it arrives".
 - **An `http-response`** is sent before the body is read, and the
   connection closes after it, whatever the response's own `Connection`
   header says: the body was never read, so there is no telling where a next
@@ -1776,14 +1779,83 @@ differ by route, and a refusal that should happen before the body is read.
   than a reset.
 - **`100 Continue`** goes out only once the body is accepted.
 - **Accepted bodies are timed on progress.** A body a body handler accepted
-  with `buffer-body` is closed when `*body-stall-timeout*` passes without a
-  byte of it, rather than by `*idle-timeout*`'s budget for the whole
-  request, so an upload takes as long as it keeps arriving. A body the
-  handler answered `nil` for stays on `*idle-timeout*`.
+  with `buffer-body` or `receive-body` is closed when `*body-stall-timeout*`
+  passes without a byte of it, rather than by `*idle-timeout*`'s budget for
+  the whole request, so an upload takes as long as it keeps arriving. A body
+  the handler answered `nil` for stays on `*idle-timeout*`.
 - **Per request.** The next request on a keep-alive connection starts from
   the defaults again — its own head, its own question.
 - **Failure.** A body handler that raises, or answers anything other than
-  the three shapes, fails the request with a 500, as a handler would.
+  these shapes, fails the request with a 500, as a handler would.
+
+### Receiving a body as it arrives
+
+A buffered body is held whole before anyone sees it, which makes its size
+a memory question. `receive-body` hands it over a read at a time instead,
+and answers the request from `:on-end`:
+
+```lisp
+(defun save-upload (path)
+  (let ((out nil))
+    (receive-body
+     :max-size (* 4 1024 1024 1024)            ; 4 GiB
+     :on-data (lambda (conn bytes)
+                (declare (ignore conn))
+                (unless out
+                  (setf out (open path :direction :output
+                                       :element-type '(unsigned-byte 8))))
+                (write-sequence bytes out)
+                nil)
+     :on-end (lambda (conn)
+               (declare (ignore conn))
+               (when out (close out))
+               (make-text-response 201 "stored"))
+     :on-abort (lambda (conn reason)
+                 (declare (ignore conn reason))
+                 (when out (close out :abort t))))))
+```
+
+- **`:on-data (conn bytes)`** gets the next run of the body, decoded, in a
+  fresh vector it may keep. The runs are the size reads happen to be, not
+  the client's chunks. Its value is ignored unless it is an
+  `http-response`, which refuses the rest of the body: the response is sent
+  and the connection closes after it.
+- **`:on-end (conn)`** runs once the body is complete and returns the
+  answer, in any shape `:handler` may answer with but `:upgrade` — a fetch
+  included, so a body can be stored and then announced to an upstream
+  before the client hears back.
+- **`:on-abort (conn reason)`** runs once if the body ends any other way,
+  and never once `:on-end` has returned: `:disconnected`, `:stalled`
+  (`*body-stall-timeout*`), `:too-large` (answered 413), `:malformed`
+  (chunked framing, answered 400), `:refused` (`:on-data` answered),
+  `:error` (`:on-data` or `:on-end` raised; answered 500), `:shutdown`, or
+  `:closed` for any other close. It is the one place to release what
+  `:on-data` has been building.
+- **`:max-size`** caps the decoded body, `*max-body-size*` by default, or
+  `nil` for no cap. A `Content-Length` over it is refused before any of the
+  body is read; a chunked body is refused the moment its total, or a chunk
+  header, would pass it, with none of that chunk handed over. A declared
+  length of up to fifteen digits is parsed, so a large upload's length
+  reaches the cap rather than being refused at the head.
+- **One window of buffer.** The read buffer holds the head and 64 KiB of
+  body, whatever the body's size and whatever its chunk sizes — a chunk is
+  handed over as it lands, not once it has all arrived. The first run can
+  be larger: whatever arrived with the head before the body handler was
+  asked.
+- **Provisional until `:on-end`.** A body cut short, or found malformed
+  partway, has had some of its bytes handed over by the time `:on-abort`
+  says so — a chunk's bytes reach `:on-data` before the CRLF that ends the
+  chunk has been seen. Clean up in `:on-abort`.
+- **The callbacks hold the worker.** Writing what `:on-data` is handed
+  somewhere synchronous, as above, is backpressure for free: nothing more is
+  read until it returns, the kernel's receive window fills, and the client
+  slows. It is also every other connection on that worker waiting, so
+  `:on-data` should do what a handler should and nothing slower.
+- **Fair to the rest of the worker.** A client that sends faster than the
+  worker hands its body over is read a mebibyte at a time, sixteen windows,
+  and then waits its turn behind the other events on the loop.
+- **The handler never sees a received body.** The request is the one the
+  body handler was given; close over it if `:on-data` or `:on-end` need it.
 
 ### Form body decoding
 

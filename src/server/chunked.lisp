@@ -274,6 +274,93 @@
               ;; validated, so it is where a later call resumes.
               (return (values nil pos 0 data-bytes 0)))))))))
 
+(defun chunked-body-feed (buf start end owed on-data)
+  "Walk the chunked body in BUF[START..END) for a consumer that takes its
+   data as it arrives — a chunk's bytes before the whole chunk has landed
+   — and hand them to ON-DATA, called (BUF FROM TO REST) once per run of
+   data. REST is the data of the same chunk still to come after the run,
+   as its size line declared: what a cap on the body needs in order to
+   refuse a chunk before any of it is handed on.
+
+   CHUNKED-BODY-COMPLETE-P hands over a chunk only once all of it is
+   here, which needs a buffer as large as the largest chunk; a body
+   received into an application cannot ask that of the client, since one
+   chunk can be the whole upload. This hands over what is here and
+   remembers what is owed, so a buffer the size of one read will do
+   whatever the chunk sizes.
+
+   OWED is what the previous call returned: the bytes of the current chunk
+   still to come, its data and then the CRLF after it, or 0 at a chunk
+   boundary. START is where those bytes resume — everything before it was
+   walked by an earlier call, and the caller may have dropped it. A first
+   call passes the body's start and 0.
+
+   Returns (values COMPLETE-P NEXT OWED DATA-BYTES PENDING AFTER-SIZE-LINE):
+
+     COMPLETE-P       T once the zero-size chunk's line has arrived.
+     NEXT             where the next call starts. BUF[START, NEXT) has been
+                      walked and handed over; the caller may drop it. When
+                      COMPLETE-P, the start of the zero-size line, so that a
+                      call made again while the trailer section is still
+                      arriving reads that line again rather than past it.
+     OWED             the next call's OWED.
+     DATA-BYTES       data handed to ON-DATA by this call.
+     PENDING          data of the current chunk still to come, which the
+                      size line has already declared: what a cap on the
+                      body can refuse before the bytes turn up.
+     AFTER-SIZE-LINE  when COMPLETE-P, where the trailer section begins,
+                      for CHUNKED-TRAILER-STATUS; otherwise 0.
+
+   The framing is the decoder's, as CHUNKED-BODY-COMPLETE-P's is: size
+   lines through PARSE-CHUNK-SIZE-BYTES, and the CRLF after each chunk's
+   data checked a byte at a time as it lands. A fault raises
+   CHUNKED-FRAMING-ERROR once the bytes that show it are here and never
+   before, so this neither waits on a body that can no longer become valid
+   nor refuses one still arriving.
+
+   What it cannot promise is the walk's: a chunk is handed over before the
+   CRLF after it has been seen, so a body that turns out malformed has had
+   some of its bytes delivered already. A consumer holds what it is given
+   as provisional until the body completes, the same as for a
+   Content-Length body cut short by its client.
+
+   ON-DATA's value is ignored unless it is :HALT, which ends the walk
+   there: NEXT is just past the bytes handed over, and a later call
+   resumes from it with nothing handed over twice."
+  (let ((pos start)
+        (data-bytes 0))
+    (flet ((pending () (max 0 (- owed 2))))
+      (loop
+        (if (plusp owed)
+            ;; Inside a chunk: as much of its data as is here, then its CRLF.
+            (let ((take (min (pending) (- end pos))))
+              (when (plusp take)
+                (let ((from pos))
+                  (incf pos take)
+                  (decf owed take)
+                  (incf data-bytes take)
+                  (when (and on-data
+                             (eq (funcall on-data buf from pos (pending)) :halt))
+                    (return (values nil pos owed data-bytes (pending) 0)))))
+              ;; The CRLF, each byte judged as it lands.
+              (loop while (and (<= 1 owed 2) (< pos end))
+                    do (unless (= (aref buf pos) (if (= owed 2) 13 10))
+                         (chunked-error "chunked: expected CRLF after chunk-data"))
+                       (incf pos)
+                       (decf owed))
+              (when (plusp owed)
+                ;; The bytes ran out inside this chunk.
+                (return (values nil pos owed data-bytes (pending) 0))))
+            ;; At a chunk boundary: its size line.
+            (let ((boundary pos))
+              (multiple-value-bind (size next) (parse-chunk-size-bytes buf pos end)
+                (unless size
+                  (return (values nil boundary 0 data-bytes 0 0)))
+                (when (zerop size)
+                  (return (values t boundary 0 data-bytes 0 next)))
+                (setf pos next
+                      owed (+ size 2)))))))))
+
 (defun decode-chunked-body (buf start end)
   "Decode chunked transfer encoding from BUF[START..END).
    Returns a byte vector with the chunk framing stripped.

@@ -17,6 +17,30 @@
 (declaim (special *max-outbound-response-size*))
 
 ;;; ---------------------------------------------------------------------------
+;;; Body plan
+;;;
+;;; What a body handler decided for a request's body. Defined here rather
+;;; than beside the constructors in body.lisp because the read path follows
+;;; it, and the read path is this file.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (body-plan (:constructor %make-body-plan))
+  "What a body handler decided for a request's body. Built by BUFFER-BODY
+   or RECEIVE-BODY, never by hand, so every plan has been through its
+   constructor's checks.
+
+     KIND      :BUFFER, read whole and handed to :HANDLER; or :RECEIVE,
+               handed to ON-DATA as it arrives
+     MAX-SIZE  the cap on the body's decoded bytes
+     ON-DATA, ON-END, ON-ABORT
+               a :RECEIVE plan's callbacks; see RECEIVE-BODY"
+  (kind :buffer :type keyword)
+  (max-size 0 :type (integer 0))
+  (on-data nil)
+  (on-end nil)
+  (on-abort nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
 
@@ -222,6 +246,24 @@
   ;; of CONNECTION-ON-READ write it before anything reads it, so neither
   ;; reset has to.
   (expect-continue nil :type boolean)
+  ;; The :RECEIVE plan whose ON-DATA this request's body is being handed
+  ;; to, or NIL. Taken off the connection — set back to NIL — at the moment
+  ;; the body ends, however it ends: by ON-END on completion, or by
+  ;; NOTIFY-BODY-ABORTED otherwise, which is how the plan's callbacks fire
+  ;; exactly once between them. Being NIL is also what every reset relies
+  ;; on: a body that ended left nothing to clear.
+  (body-receiver nil :type (or null body-plan))
+  ;; Bytes of a received body handed to ON-DATA so far, decoded. The total
+  ;; the cap is held to, and on a Content-Length body what tells the read
+  ;; path how much of it is still to come.
+  ;;
+  ;; This and BODY-OWED are zeroed by APPLY-BODY-PLAN when a :RECEIVE plan
+  ;; is installed and read only while one is, so no reset clears them: a
+  ;; value left from an earlier body is never looked at.
+  (body-received 0 :type unsigned-byte)
+  ;; CHUNKED-BODY-FEED's OWED between reads: the bytes of the current chunk
+  ;; still to come, its data and its CRLF, or 0 at a chunk boundary.
+  (body-owed 0 :type unsigned-byte)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
   (missed-pongs  0 :type fixnum)
@@ -562,11 +604,60 @@
    request, or *MAX-BODY-SIZE*."
   (or (connection-body-limit conn) *max-body-size*))
 
+(defconstant +receive-window+ 65536
+  "Bytes of a received body the read buffer holds at once, past the head.
+   What one read can bring, and so the most ON-DATA is handed in one call
+   after the first — that one carries whatever arrived with the head before
+   the body handler was asked. The body itself can be any size: each window
+   is handed over and dropped before the next is read.")
+
+(defconstant +receive-rounds+ 16
+  "Windows of a received body read and handed over in one wake-up before
+   the connection yields, a mebibyte at the window's size. A client that
+   sends faster than the worker can hand its body over would otherwise be
+   read for as long as it kept sending, every other connection on the
+   worker waiting behind it. Yielding arms writability, which is at once
+   true, so the read resumes on the next pass of the loop, after the
+   events already waiting.")
+
+(defun claim-body-receiver (conn)
+  "Take CONN's receiving plan off the connection and return it, or NIL if
+   there is none. Whoever claims it is the only one who can fire its
+   callbacks, which is how ON-END and ON-ABORT come to fire at most once
+   between them — the discipline CLAIM-FETCH-CALLBACK keeps for a fetch."
+  (let ((plan (connection-body-receiver conn)))
+    (when plan
+      (setf (connection-body-receiver conn) nil))
+    plan))
+
+(defun abort-received-body (plan conn reason)
+  "Fire PLAN's ON-ABORT with REASON, once PLAN has been claimed. A raise
+   inside it is logged rather than propagated: the callback is the
+   application's cleanup, and a failed cleanup must not stop the
+   framework's own."
+  (let ((fn (body-plan-on-abort plan)))
+    (when fn
+      (handler-case (funcall fn conn reason)
+        ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+        (serious-condition (e)
+          (log-warn "body on-abort signalled on fd ~d (~a): ~a"
+                    (connection-fd conn) reason e))))))
+
+(defun notify-body-aborted (conn reason)
+  "If CONN is receiving a body, end that with REASON: claim the plan and
+   fire its ON-ABORT. A no-op otherwise, and after the first call, so every
+   path that can end a body may call it, and the framework's own refusals
+   call it where they are raised, with the reason only they know."
+  (let ((plan (claim-body-receiver conn)))
+    (when plan
+      (abort-received-body plan conn reason))))
+
 (defun connection-read-cap (conn)
   "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
      :out-dns           → 8 KiB
      outbound response  → *max-outbound-response-size* (8 MiB default)
+     received body      → the head and +RECEIVE-WINDOW+
      inbound request    → every inbound budget summed (~1.07 MiB default),
                           the body's share being CONNECTION-MAX-BODY
 
@@ -590,6 +681,10 @@
      8192)
     ((connection-outbound-p conn)
      *max-outbound-response-size*)
+    ;; A body being received is handed over a window at a time, so the
+    ;; buffer holds the head and one window and never the body.
+    ((connection-body-receiver conn)
+     (+ (connection-header-end conn) 4 +receive-window+))
     ;; The inbound cap is the sum of the budgets that actually apply, not
     ;; *max-body-size* alone. Aliasing them would make one knob quietly
     ;; move two: a JSON API tightening the body cap to 32 KiB would also
@@ -845,23 +940,22 @@
                  ;; Parse decimal digits
                  (let ((value 0) (found nil) (digits 0))
                    (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
-                         ;; 10 decimal digits caps at 9_999_999_999 ≈ 9.3 GB
-                         ;; which is still four orders of magnitude past
-                         ;; any sensible *MAX-BODY-SIZE* default. A looser
-                         ;; cap, 15 digits, would admit values up to
-                         ;; 10^15 ~ 900 TB that the *MAX-BODY-SIZE* check
-                         ;; always rejects anyway — a cosmetic per-digit
-                         ;; cap, under which 'Content-Length:
-                         ;; 999999999999999' would force a bignum
-                         ;; accumulator for free. At 10 the per-digit cap
-                         ;; does real work.
+                         ;; Fifteen decimal digits, so under 10^15 bytes:
+                         ;; past any body worth sending, and a fixnum, so
+                         ;; the accumulator never grows into a bignum on
+                         ;; a run of digits. The cap is about the number
+                         ;; being representable, not about the body's
+                         ;; size — that is the body cap's, checked once the
+                         ;; value has parsed, against the request's own
+                         ;; cap. A body a body handler receives is never
+                         ;; held, so a cap of many gigabytes is a real one,
+                         ;; and a declared length has to be able to say so.
                          do (incf digits)
-                            (when (> digits 10)
-                              ;; An 11-digit length is >= 10 GB, which is
-                              ;; over any *max-body-size* worth setting —
-                              ;; 413 rather than 400, same as the body
-                              ;; check that would have caught it if we
-                              ;; had let the number finish parsing.
+                            (when (> digits 15)
+                              ;; Sixteen digits is 10^15 bytes or more,
+                              ;; past any cap — 413 rather than 400, the
+                              ;; answer the body check would have given had
+                              ;; the number been let finish.
                               (http-reject 413 "Content-Length too large"))
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
@@ -1249,6 +1343,13 @@
 ;;;                    peer's FIN has arrived. The caller calls the
 ;;;                    handler, then CONNECTION-BEGIN-BODY for the verdict
 ;;;                    this function would otherwise have given.
+;;;   :RECEIVED      — a body being received is complete: its plan's
+;;;                    ON-END is to answer the request
+;;;   :REFUSED       — a body being received was refused by its ON-DATA;
+;;;                    second value: the response to send
+;;;   :YIELD         — a body being received has more in the kernel than
+;;;                    one wake-up hands over; the caller arms
+;;;                    writability so the read resumes next pass
 ;;;   :CLOSE         — connection should be closed
 ;;; ---------------------------------------------------------------------------
 
@@ -1298,6 +1399,161 @@
        (http-reject 413 "request too large (buffer full)"))
       (t :continue))))
 
+(defun connection-drop-read-bytes (conn from to)
+  "Remove BUF[FROM, TO) from CONN's read buffer, moving what follows down
+   to FROM. A received body's bytes are dropped once ON-DATA has them, so
+   the buffer holds what is still to be handed over and nothing else.
+
+   A buffer grown before the body was received — a read can fill it to the
+   default cap while the head waits for the body handler — is replaced by
+   one the size of CONNECTION-READ-CAP once what it holds fits, so the
+   window really is what a received body costs."
+  (let* ((buf (connection-read-buf conn))
+         (end (connection-read-pos conn))
+         (held (- end (- to from))))
+    (replace buf buf :start1 from :start2 to :end2 end)
+    (setf (connection-read-pos conn) held)
+    (let ((cap (connection-read-cap conn)))
+      (when (and (> (length buf) cap) (<= held cap))
+        (let ((fresh (make-array cap :element-type '(unsigned-byte 8))))
+          (replace fresh buf :end2 held)
+          (setf (connection-read-buf conn) fresh))))))
+
+(defun connection-deliver-body (conn)
+  "Hand what has arrived of CONN's received body to its plan's ON-DATA,
+   and drop it from the read buffer. Returns:
+
+     :RECEIVED   the body is complete, and REQUEST-END says where it
+                 ended, for the keep-alive reset
+     :REFUSED    ON-DATA answered; the second value is its response, and
+                 nothing more of the body was handed over
+     NIL         keep reading
+
+   Raises what the body has earned instead — 413 past its cap, 400 for
+   malformed framing or a trailer section — having first ended the body
+   with that reason through NOTIFY-BODY-ABORTED. The reason is known here
+   and nowhere else: the catch that answers the raise sees only a status.
+
+   A chunked body is held to its cap before its bytes are handed over: a
+   run is handed to ON-DATA only if the chunk it belongs to, as declared,
+   keeps the total within the cap, and a size line declaring more is
+   refused on arrival with none of its chunk delivered."
+  (let* ((plan (connection-body-receiver conn))
+         (buf (connection-read-buf conn))
+         (body-start (+ (connection-header-end conn) 4))
+         (end (connection-read-pos conn))
+         (limit (body-plan-max-size plan))
+         (answer nil)
+         (over nil))
+    (flet ((hand-over (from to)
+             (incf (connection-body-received conn) (- to from))
+             (let ((verdict (funcall (body-plan-on-data plan)
+                                     conn (subseq buf from to))))
+               (when (typep verdict 'http-response)
+                 (setf answer verdict)
+                 :halt)))
+           (refuse (reason status format-string &rest args)
+             (notify-body-aborted conn reason)
+             (apply #'http-reject status format-string args)))
+      (ecase (connection-body-framing conn)
+        (:length
+         (let ((take (min (- (connection-body-expected conn)
+                             (connection-body-received conn))
+                          (- end body-start))))
+           (when (plusp take)
+             (hand-over body-start (+ body-start take))
+             (connection-drop-read-bytes conn body-start (+ body-start take)))
+           (cond
+             (answer (values :refused answer))
+             ((= (connection-body-received conn) (connection-body-expected conn))
+              ;; What is left after the body is the next request's.
+              (setf (connection-request-end conn) body-start)
+              :received)
+             (t nil))))
+        (:chunked
+         (multiple-value-bind (complete next owed data-bytes pending
+                               after-size-line)
+             (handler-case
+                 (chunked-body-feed
+                  buf body-start end (connection-body-owed conn)
+                  (lambda (b from to rest)
+                    (declare (ignore b))
+                    ;; This run and the rest of its chunk, as declared,
+                    ;; against the cap — before ON-DATA sees any of it.
+                    (let ((projected (+ (connection-body-received conn)
+                                        (- to from) rest)))
+                      (if (> projected limit)
+                          (progn (setf over projected) :halt)
+                          (hand-over from to)))))
+               (chunked-framing-error (e)
+                 (refuse :malformed 400 "malformed chunked framing: ~a" e)))
+           (declare (ignore data-bytes))
+           (when over
+             (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
+                     over limit))
+           (let ((projected (+ (connection-body-received conn) pending)))
+             (when (> projected limit)
+               (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
+                       projected limit)))
+           (setf (connection-body-owed conn) owed)
+           (cond
+             (answer
+              (connection-drop-read-bytes conn body-start next)
+              (values :refused answer))
+             (complete
+              (multiple-value-bind (status offset)
+                  (chunked-trailer-status buf after-size-line end)
+                (ecase status
+                  ;; The empty trailer's CRLF has not arrived: keep the
+                  ;; zero-size line, which the next call reads again.
+                  (:incomplete
+                   (connection-drop-read-bytes conn body-start next)
+                   nil)
+                  (:present
+                   (refuse :malformed 400 "trailer section not accepted"))
+                  (:malformed
+                   (refuse :malformed 400
+                           "malformed chunked framing after terminator"))
+                  (:empty
+                   (connection-drop-read-bytes conn body-start offset)
+                   (setf (connection-request-end conn) body-start)
+                   :received))))
+             (t
+              (connection-drop-read-bytes conn body-start next)
+              nil))))))))
+
+(defun connection-receive (conn peer-finished)
+  "Hand CONN's received body over as it arrives, reading again for as long
+   as each read filled the window and the body is still owed, up to
+   +RECEIVE-ROUNDS+ windows in one wake-up. Returns CONNECTION-DELIVER-
+   BODY's :RECEIVED or :REFUSED (with its response), or:
+
+     :CONTINUE  the kernel has nothing more yet
+     :CLOSE     the peer's FIN has arrived and the body is not complete
+     :YIELD     the rounds are spent with the window still filling; the
+                caller arms writability so the read resumes next pass
+
+   The read has to be repeated here because the drain that filled the
+   window stopped with bytes still in the kernel, and an edge-triggered
+   descriptor reports no new edge for those."
+  (loop with rounds = 0
+        do (let ((full (>= (connection-read-pos conn)
+                           (length (connection-read-buf conn)))))
+             (multiple-value-bind (verdict response)
+                 (connection-deliver-body conn)
+               (when verdict
+                 (return (values verdict response))))
+             (cond
+               (peer-finished (return :close))
+               ((not full) (return :continue))
+               ((>= (incf rounds) +receive-rounds+) (return :yield))
+               (t
+                (let ((result (connection-read-available conn)))
+                  (setf peer-finished (and (member result '(:eof :ok-eof)) t))
+                  (when (member result '(:ok :ok-eof :ok-want-write))
+                    (setf (connection-body-progress-at conn)
+                          (get-universal-time)))))))))
+
 (defun connection-begin-body (conn peer-finished)
   "Start reading the body of CONN's request, whose head has arrived and
    whose framing CONNECTION-ON-READ has recorded. Returns the verdict
@@ -1311,9 +1567,31 @@
    checks, which need the cap, not the walk over a chunked body, which
    enforces it, and not the 100 Continue, which invites a body the handler
    may refuse. Without a body handler this runs at once, in the same call
-   that read the head."
+   that read the head.
+
+   A body being received is handed over from here as it is for every read
+   after: what arrived with the head goes to ON-DATA at once. The read
+   cap does not bound it, the window does, so the only size check is the
+   cap's own."
   (let* ((body-start (+ (connection-header-end conn) 4))
          (buf (connection-read-buf conn)))
+    (when (connection-body-receiver conn)
+      (let ((limit (connection-max-body conn)))
+        (when (and (eq (connection-body-framing conn) :length)
+                   (> (connection-body-expected conn) limit))
+          (notify-body-aborted conn :too-large)
+          (http-reject 413 "body too large (~d bytes, max ~d)"
+                       (connection-body-expected conn) limit)))
+      (return-from connection-begin-body
+        (cond
+          ((and (connection-expect-continue conn)
+                (= (connection-read-pos conn) body-start))
+           (connection-queue-write conn *http-100-continue-bytes*)
+           (setf (connection-state conn) :sending-100-continue)
+           :flush-queued)
+          (t
+           (setf (connection-state conn) :read-body)
+           (connection-receive conn peer-finished)))))
     (ecase (connection-body-framing conn)
       (:length
        (let ((content-length (connection-body-expected conn))
@@ -1440,7 +1718,12 @@
          ;; complete while :READ-BODY kept waiting for a terminator no
          ;; further read could deliver.
          ((and (eq (connection-state conn) :read-body)
-               (connection-body-complete-p conn))
+               ;; A body being received is handed over from the buffer by
+               ;; the state machine below, which is what makes room in it;
+               ;; the walk that asks whether a buffered body is complete is
+               ;; not its reader.
+               (or (connection-body-receiver conn)
+                   (connection-body-complete-p conn)))
           nil)
          (t
           ;; The buffer is at CONNECTION-READ-CAP with no complete
@@ -1701,9 +1984,11 @@
        (when (and (plusp (connection-body-progress-at conn))
                   (member read-result '(:ok :ok-eof :ok-want-write)))
          (setf (connection-body-progress-at conn) (get-universal-time)))
-       (if (connection-body-complete-p conn)
-           :dispatch
-           (funcall unfinished)))
+       (cond
+         ((connection-body-receiver conn)
+          (connection-receive conn peer-finished))
+         ((connection-body-complete-p conn) :dispatch)
+         (t (funcall unfinished))))
       ;; The second value says the peer's FIN has arrived. Frames already
       ;; buffered are still the peer's to have answered, so this does not
       ;; close; HANDLE-CLIENT-READ does, once they are processed, because

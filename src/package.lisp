@@ -145,6 +145,7 @@
            #:*max-write-backlog*
            ;; Request bodies, decided at the head
            #:buffer-body
+           #:receive-body
            ;; Streaming responses
            #:make-stream-response
            #:stream-send

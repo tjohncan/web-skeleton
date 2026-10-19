@@ -400,26 +400,34 @@
     (check-error "Content-Length: +10 rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
 
-  ;; Content-Length digit cap is 10 decimal digits ≈ 9.3 GB, still
-  ;; orders of magnitude past any real *MAX-BODY-SIZE*. The cap
-  ;; cannot be reached via a legitimate value but bails early on
-  ;; attacker-supplied padding like 'Content-Length: 999999999999999'.
+  ;; Content-Length digit cap is 15 decimal digits, under 10^15 bytes:
+  ;; a fixnum, and past any body. A received body is never held, so a
+  ;; length in the tens of gigabytes is one a cap can admit; the digit
+  ;; cap bails early on a run of digits rather than on a size.
   (let* ((raw (concatenate 'string
                 "GET / HTTP/1.1" *crlf*
-                "Content-Length: 12345678901" *crlf*  ; 11 digits
+                "Content-Length: 1234567890123456" *crlf*  ; 16 digits
                 *crlf*))
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
-    (check-error "Content-Length 11 digits rejected"
+    (check-error "Content-Length 16 digits rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
   (let* ((raw (concatenate 'string
                 "GET / HTTP/1.1" *crlf*
-                "Content-Length: 9999999999" *crlf*  ; 10 digits — allowed
+                "Content-Length: 999999999999999" *crlf*  ; 15 digits — allowed
                 *crlf*))
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
-    (check "Content-Length 10 digits accepted"
-           (web-skeleton::scan-content-length bytes header-end) 9999999999))
+    (check "Content-Length 15 digits accepted"
+           (web-skeleton::scan-content-length bytes header-end) 999999999999999))
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: 21474836480" *crlf*  ; 20 GiB, 11 digits
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check "Content-Length of a 20 GiB upload parses, for its cap to judge"
+           (web-skeleton::scan-content-length bytes header-end) 21474836480))
 
   ;; Content-Length parser agreement. scan-content-length is the fast
   ;; byte scanner used for pre-allocation; parse-headers-bytes populates
@@ -8836,7 +8844,7 @@
            400)
     (check "TE + oversized Content-Length is 400, not 413"
            (on-read '("Host: x" "Transfer-Encoding: chunked"
-                      "Content-Length: 99999999999"))
+                      "Content-Length: 9999999999999999"))
            400)
 
     (check "TE on HTTP/1.0 is 400"
@@ -9453,6 +9461,103 @@
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-received-body-window-and-yield ()
+  "A received body costs one window of buffer, and a client with more in
+   the kernel than one wake-up hands over is yielded to and read again.
+
+   Driven through HANDLE-CLIENT-READ and HANDLE-CLIENT-WRITE over a read-fn
+   that serves a queue of bytes standing in for the kernel, with
+   EPOLL-MODIFY recorded rather than called. A socket cannot be told what
+   to hold — how much a peer's writes leave queued is the kernel's choice
+   — and both properties turn on exactly that.
+
+     the window   The head arrives with half a mebibyte behind it, which
+                  the read that finds the head pulls in under the default
+                  cap. The body handler then receives it; once that first
+                  piece is handed over, the buffer goes back to the head
+                  and one window, and the pieces after it are read into
+                  that.
+     the yield    A mebibyte and more then waits in the kernel. One
+                  wake-up hands over +RECEIVE-ROUNDS+ windows and yields,
+                  arming writability; the write side's :READ-BODY arm,
+                  woken by it, answers :KEEP-ALIVE, which reads again — and
+                  nothing else would, since no new bytes arrive to raise an
+                  edge."
+  (format t "~%Received body: the window and the yield~%")
+  (let* ((kernel (make-array 0 :element-type '(unsigned-byte 8)
+                               :adjustable t :fill-pointer 0))
+         (taken 0)
+         (pieces nil)
+         (widths nil)
+         (masks nil)
+         (answered nil)
+         (real (symbol-function 'web-skeleton::epoll-modify))
+         (window web-skeleton::+receive-window+)
+         (rounds web-skeleton::+receive-rounds+))
+    (flet ((supply (bytes) (loop for b across bytes do (vector-push-extend b kernel)))
+           (body-bytes (n) (make-array n :element-type '(unsigned-byte 8)
+                                         :initial-element 98)))
+      (unwind-protect
+           (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*body-handler*
+                    (lambda (req)
+                      (declare (ignore req))
+                      (receive-body
+                       :max-size nil
+                       :on-data (lambda (conn bytes)
+                                  (push (length bytes) pieces)
+                                  (push (length (web-skeleton::connection-read-buf conn))
+                                        widths)
+                                  nil)
+                       :on-end (lambda (conn) (declare (ignore conn))
+                                 (setf answered t)
+                                 (make-text-response 200 "ok")))))
+                  (total (+ (* 512 1024) (* (1+ rounds) window) 100))
+                  (conn (web-skeleton::make-connection
+                         :fd -1 :last-active (get-universal-time)
+                         :read-fn (lambda (buffer start max-bytes)
+                                    (let ((n (min max-bytes (- (fill-pointer kernel) taken))))
+                                      (if (zerop n)
+                                          :again
+                                          (progn
+                                            (replace buffer kernel :start1 start
+                                                     :start2 taken :end2 (+ taken n))
+                                            (incf taken n)
+                                            n)))))))
+             (setf (symbol-function 'web-skeleton::epoll-modify)
+                   (lambda (efd fd mask) (declare (ignore efd fd)) (push mask masks)))
+             ;; ---- the window ----
+             (supply (sb-ext:string-to-octets
+                      (format nil "POST /u HTTP/1.1~aHost: x~aContent-Length: ~d~a~a"
+                              *crlf* *crlf* total *crlf* *crlf*)
+                      :external-format :ascii))
+             (supply (body-bytes (* 512 1024)))
+             (web-skeleton::handle-client-read conn -1 nil nil)
+             (check "window: the first piece is what came with the head"
+                    (and pieces (> (first pieces) window) t) t)
+             (supply (body-bytes window))
+             (web-skeleton::handle-client-read conn -1 nil nil)
+             (check "window: after it, the buffer is the head and one window"
+                    (<= (first widths) (+ window 100)) t)
+             ;; ---- the yield ----
+             (setf masks nil)
+             (let ((before (length pieces)))
+               (supply (body-bytes (* rounds window)))
+               (supply (body-bytes (- total (* 512 1024) window (* rounds window))))
+               (web-skeleton::handle-client-read conn -1 nil nil)
+               (check "yield: one wake-up hands over its rounds and no more"
+                      (- (length pieces) before) rounds)
+               (check "yield: and arms writability to come back"
+                      (and (some (lambda (m) (logtest m web-skeleton::+epollout+)) masks)
+                           t)
+                      t)
+               (check "yield: the writable wake-up asks for a read"
+                      (web-skeleton::handle-client-write conn -1) :keep-alive)
+               (web-skeleton::handle-client-read conn -1 nil nil)
+               (check "yield: and the read finishes the body"
+                      (list answered (reduce #'+ pieces)) (list t total))))
+        (setf (symbol-function 'web-skeleton::epoll-modify) real)))))
 
 (defun test-body-handler-validated-at-boot ()
   "START-SERVER refuses a :BODY-HANDLER it could not call, and a
@@ -12560,6 +12665,7 @@
   (test-chunked-request-body)
   (test-body-handler-at-the-head)
   (test-body-decision-rereads-under-its-cap)
+  (test-received-body-window-and-yield)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)

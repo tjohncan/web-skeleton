@@ -5418,6 +5418,303 @@
                       t))))
       (setf web-skeleton:*max-body-size* saved))))
 
+(defun %pseudo-random-bytes (n seed)
+  "N bytes from a fixed linear-congruential sequence: the same body every
+   run, and no run of it that looks like chunked framing by design."
+  (let ((v (make-array n :element-type '(unsigned-byte 8)))
+        (x seed))
+    (dotimes (i n v)
+      (setf x (mod (+ (* x 1103515245) 12345) 2147483648)
+            (aref v i) (ldb (byte 8 16) x)))))
+
+(defun %sha256-hex (bytes)
+  (bytes-to-hex (sha256 (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+
+(defun test-harness-receive-body-e2e ()
+  "A received body, end to end: handed to ON-DATA as it arrives, answered
+   by ON-END, ended by ON-ABORT exactly once on every way it can fail.
+
+   The body handler receives every path that starts /recv, accumulating
+   what ON-DATA is handed and answering with its length and SHA-256, so a
+   body that arrives reordered, short or doubled answers wrongly. The
+   other paths each fail one way, and ON-ABORT records the path and the
+   reason, so each failure is checked against the request that caused it.
+
+   The large bodies are what the window is for. A 4 MiB Content-Length
+   body is more than a wake-up hands over, so it goes through the yield; a
+   3 MiB body sent as a single chunk can only arrive whole if chunks are
+   handed over before they have landed. Both are checked for the read
+   buffer staying at the head and one window."
+  (format t "~%Harness: received bodies, end to end~%")
+  (let* ((lock (sb-thread:make-mutex :name "receive-e2e"))
+         (aborts nil)
+         (handed (make-hash-table :test #'equal))
+         (widest (make-hash-table :test #'equal))
+         (port-box (list nil)))
+    (flet ((note (table path value fn)
+             (sb-thread:with-mutex (lock)
+               (setf (gethash path table) (funcall fn (gethash path table 0) value))))
+           (aborted (path)
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r)))
+           (await-abort (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (make-text-response 200 (format nil "handler:~a" (http-request-path req))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (flet ((recv (&key (max-size (* 64 1024 1024)) data end)
+                        (let ((acc (make-array 0 :element-type '(unsigned-byte 8)
+                                                 :adjustable t :fill-pointer 0))
+                              (calls 0))
+                          (receive-body
+                           :max-size max-size
+                           :on-data
+                           (lambda (conn bytes)
+                             ;; From the second piece on, the buffer is the
+                             ;; head and one window.
+                             (when (> (incf calls) 1)
+                               (note widest path
+                                     (length (web-skeleton::connection-read-buf conn))
+                                     #'max))
+                             (note handed path (length bytes) #'+)
+                             (loop for b across bytes do (vector-push-extend b acc))
+                             (when data (funcall data bytes)))
+                           :on-end
+                           (lambda (conn)
+                             (declare (ignore conn))
+                             (if end
+                                 (funcall end acc)
+                                 (make-text-response
+                                  200 (format nil "~a:~d:~a" path (length acc)
+                                              (%sha256-hex acc)))))
+                           :on-abort
+                           (lambda (conn reason)
+                             (declare (ignore conn))
+                             (sb-thread:with-mutex (lock)
+                               (push (cons path reason) aborts)))))))
+                 (cond
+                   ((string= path "/cap") (recv :max-size 1000))
+                   ((string= path "/refuse")
+                    (recv :data (lambda (b) (declare (ignore b))
+                                  (make-text-response 415 "not this"))))
+                   ((string= path "/raise-data")
+                    (recv :data (lambda (b) (declare (ignore b))
+                                  (error "deliberate: on-data"))))
+                   ((string= path "/raise-end")
+                    (recv :end (lambda (acc) (declare (ignore acc))
+                                 (error "deliberate: on-end"))))
+                   ((string= path "/unbounded") (recv :max-size nil))
+                   ((string= path "/fetch")
+                    (recv :end (lambda (acc)
+                                 (http-fetch
+                                  :get (format nil "http://127.0.0.1:~d/plain"
+                                               (first port-box))
+                                  :then (lambda (status headers body)
+                                          (declare (ignore headers))
+                                          (make-text-response
+                                           200 (format nil "fetched:~d:~a:~d" status
+                                                       (sb-ext:octets-to-string
+                                                        body :external-format :ascii)
+                                                       (length acc))))))))
+                   ((eql 0 (search "/recv" path)) (recv))
+                   (t nil))))))
+        (setf (first port-box) *test-port*)
+        (labels ((head (path &rest lines)
+                   (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~{~a~a~}~a"
+                                   path *crlf* *crlf*
+                                   (loop for l in lines append (list l *crlf*))
+                                   *crlf*)))
+                 (bytes (&rest parts)
+                   (apply #'concatenate '(vector (unsigned-byte 8)) parts))
+                 (answer-of (&rest parts)
+                   (%raw-exchange (apply #'bytes parts) :seconds 15)))
+          ;; ---- received whole, in order, through every window ----
+          (let* ((body (%pseudo-random-bytes (* 4 1024 1024) 7))
+                 (answer (answer-of (head "/recv-cl" "Content-Length: 4194304"
+                                          "Connection: close")
+                                    body)))
+            (check "received: a 4 MiB body arrives whole and in order"
+                   (and (search (format nil "/recv-cl:4194304:~a" (%sha256-hex body))
+                                answer)
+                        t)
+                   t)
+            (check "received: the buffer held the head and one window"
+                   (<= (gethash "/recv-cl" widest 0)
+                       (+ 200 web-skeleton::+receive-window+))
+                   t))
+          (let* ((body (%pseudo-random-bytes (* 3 1024 1024) 11))
+                 (answer (answer-of (head "/recv-one-chunk"
+                                          "Transfer-Encoding: chunked"
+                                          "Connection: close")
+                                    (%ascii (format nil "~x~a" (length body) *crlf*))
+                                    body
+                                    (%ascii (format nil "~a0~a~a" *crlf* *crlf* *crlf*)))))
+            (check "received: one 3 MiB chunk is handed over as it lands"
+                   (and (search (format nil "/recv-one-chunk:3145728:~a"
+                                        (%sha256-hex body))
+                                answer)
+                        t)
+                   t)
+            (check "received: and the buffer still held one window"
+                   (<= (gethash "/recv-one-chunk" widest 0)
+                       (+ 200 web-skeleton::+receive-window+))
+                   t))
+          ;; ---- Expect: 100-continue, and keep-alive after ----
+          (let ((answer (%raw-http-split-send
+                         (head "/recv-continue" "Content-Length: 5"
+                               "Expect: 100-continue" "Connection: close")
+                         (%ascii "hello"))))
+            (check "received: the interim, then ON-END's answer"
+                   (let ((interim (search "100 Continue" answer))
+                         (final (search "/recv-continue:5:" answer)))
+                     (and interim final (< interim final) t))
+                   t))
+          (let ((answer (answer-of (head "/recv-keep" "Content-Length: 3")
+                                   (%ascii "abc")
+                                   (%ascii (format nil "GET /after HTTP/1.1~aHost: x~a~
+                                                        Connection: close~a~a"
+                                                   *crlf* *crlf* *crlf* *crlf*)))))
+            (check "received: the request after a received body is served"
+                   (and (search "/recv-keep:3:" answer)
+                        (search "handler:/after" answer)
+                        t)
+                   t))
+          ;; ---- ON-END answering with a fetch ----
+          (check "received: ON-END may answer with a fetch"
+                 (and (search "fetched:200:handler:/plain:4"
+                              (answer-of (head "/fetch" "Content-Length: 4"
+                                               "Connection: close")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          ;; ---- refused, each with its reason ----
+          (check "cap: a declared length over it is 413"
+                 (and (search "HTTP/1.1 413"
+                              (answer-of (head "/cap" "Content-Length: 1001")
+                                         (%ascii (make-string 1001 :initial-element #\c))))
+                      t)
+                 t)
+          (check "cap: ON-ABORT heard :too-large, once" (aborted "/cap") '(:too-large))
+          (sb-thread:with-mutex (lock) (setf aborts nil))
+          (check "cap: a chunked body passing it is 413"
+                 (and (search "HTTP/1.1 413"
+                              (answer-of (head "/cap" "Transfer-Encoding: chunked")
+                                         (%ascii (format nil "3e8~a~a~a3e8~a~a~a0~a~a"
+                                                         *crlf* (make-string 1000 :initial-element #\c)
+                                                         *crlf* *crlf*
+                                                         (make-string 1000 :initial-element #\d)
+                                                         *crlf* *crlf* *crlf*))))
+                      t)
+                 t)
+          (check "cap: and nothing past the cap was handed over"
+                 (<= (gethash "/cap" handed 0) 1000) t)
+          (check "cap: ON-ABORT heard :too-large, once" (aborted "/cap") '(:too-large))
+          (check "refused: ON-DATA's answer is the client's"
+                 (and (search "HTTP/1.1 415"
+                              (answer-of (head "/refuse" "Content-Length: 4")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "refused: ON-ABORT heard :refused" (aborted "/refuse") '(:refused))
+          (check "raised in ON-DATA: 500"
+                 (and (search "HTTP/1.1 500"
+                              (answer-of (head "/raise-data" "Content-Length: 4")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "raised in ON-DATA: ON-ABORT heard :error" (aborted "/raise-data")
+                 '(:error))
+          (check "raised in ON-END: 500"
+                 (and (search "HTTP/1.1 500"
+                              (answer-of (head "/raise-end" "Content-Length: 4"
+                                               "Connection: close")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "raised in ON-END: ON-ABORT heard :error" (aborted "/raise-end")
+                 '(:error))
+          (check "malformed: chunked framing that is wrong is 400"
+                 (and (search "HTTP/1.1 400"
+                              (answer-of (head "/recv-malformed"
+                                               "Transfer-Encoding: chunked")
+                                         (%ascii (format nil "5~ahelloXX" *crlf*))))
+                      t)
+                 t)
+          (check "malformed: ON-ABORT heard :malformed" (aborted "/recv-malformed")
+                 '(:malformed))
+          ;; ---- the client leaving ----
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (write-sequence (bytes (head "/recv-gone" "Content-Length: 1000")
+                                   (%ascii "0123456789"))
+                            stream)
+            (force-output stream)
+            (sleep 0.2)
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (await-abort "/recv-gone")
+          (check "gone: ON-ABORT heard :disconnected" (aborted "/recv-gone")
+                 '(:disconnected))
+          (check "gone: what had arrived was handed over"
+                 (gethash "/recv-gone" handed 0) 10)
+          ;; A declared length no buffer could hold is no reason to refuse a
+          ;; body that is never buffered.
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (write-sequence (bytes (head "/unbounded" "Content-Length: 21474836480")
+                                   (%ascii "0123456789"))
+                            stream)
+            (force-output stream)
+            (sleep 0.2)
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (await-abort "/unbounded")
+          (check "unbounded: a 20 GiB declaration is received, not refused"
+                 (list (gethash "/unbounded" handed 0) (aborted "/unbounded"))
+                 '(10 (:disconnected)))
+          ;; ---- exactly once ----
+          (check "once: no body that ended well heard ON-ABORT"
+                 (loop for path in '("/recv-cl" "/recv-one-chunk" "/recv-continue"
+                                     "/recv-keep" "/fetch")
+                       always (null (aborted path)))
+                 t)))
+      ;; A body still arriving when the server drains: the drain closes it,
+      ;; and ON-ABORT hears :SHUTDOWN. The connection is opened inside the
+      ;; server's extent and the check made once WITH-TEST-SERVER's
+      ;; teardown has drained it.
+      (let ((socket nil) (stream nil))
+        (unwind-protect
+             (progn
+               (with-test-server
+                   (:handler (lambda (req) (declare (ignore req))
+                               (make-text-response 200 "ok"))
+                    :body-handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (receive-body
+                       :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                       :on-end (lambda (conn) (declare (ignore conn))
+                                 (make-text-response 200 "done"))
+                       :on-abort (lambda (conn reason)
+                                   (declare (ignore conn))
+                                   (sb-thread:with-mutex (lock)
+                                     (push (cons "/drain" reason) aborts))))))
+                 (multiple-value-setq (socket stream) (%raw-connect))
+                 (write-sequence (%ascii (format nil "POST /drain HTTP/1.1~aHost: x~a~
+                                                      Content-Length: 1000~a~a0123"
+                                                 *crlf* *crlf* *crlf* *crlf*))
+                                 stream)
+                 (force-output stream)
+                 (sleep 0.2))
+               (check "shutdown: a body still arriving hears :shutdown"
+                      (aborted "/drain") '(:shutdown)))
+          (when stream (ignore-errors (close stream)))
+          (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
+
 (defun test-harness-body-stall-e2e ()
   "A body a body handler accepted is timed on its progress, by
    *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
@@ -5434,7 +5731,8 @@
    gives."
   (format t "~%Harness: an accepted body is timed on its progress~%")
   (let ((saved-idle web-skeleton:*idle-timeout*)
-        (saved-stall web-skeleton:*body-stall-timeout*))
+        (saved-stall web-skeleton:*body-stall-timeout*)
+        (received-abort nil))
     (setf web-skeleton:*idle-timeout* 1
           web-skeleton:*body-stall-timeout* 2)
     (unwind-protect
@@ -5446,8 +5744,17 @@
                              (length (or (http-request-body req) #())))))
               :body-handler
               (lambda (req)
-                (when (string= (http-request-path req) "/accepted")
-                  (buffer-body :max-size 64))))
+                (let ((path (http-request-path req)))
+                  (cond
+                    ((string= path "/accepted") (buffer-body :max-size 64))
+                    ((string= path "/received")
+                     (receive-body
+                      :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                      :on-end (lambda (conn) (declare (ignore conn))
+                                (make-text-response 200 "done"))
+                      :on-abort (lambda (conn reason) (declare (ignore conn))
+                                  (setf received-abort reason))))
+                    (t nil)))))
            (flet ((trickle (path)
                     ;; Head first, then the body four bytes every 0.7 s.
                     ;; Writes after the server has closed fail, and that is
@@ -5542,6 +5849,22 @@
                         (check "stalled: not at the idle budget, but after the stall"
                                (and (>= elapsed 1.9) (< elapsed 6) t)
                                t))))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket))))
+           ;; A received body is timed the same way, and its ON-ABORT is
+           ;; told why it ended.
+           (multiple-value-bind (socket stream) (%raw-connect)
+             (unwind-protect
+                  (progn
+                    (write-sequence
+                     (%ascii (format nil "POST /received HTTP/1.1~aHost: x~a~
+                                          Content-Length: 20~a~aabcd"
+                                     *crlf* *crlf* *crlf* *crlf*))
+                     stream)
+                    (force-output stream)
+                    (read-until-bounded stream :seconds 8)
+                    (check "stalled: a received body's ON-ABORT hears :stalled"
+                           received-abort :stalled))
                (ignore-errors (close stream))
                (ignore-errors (sb-bsd-sockets:socket-close socket)))))
       (setf web-skeleton:*idle-timeout* saved-idle
@@ -6372,6 +6695,7 @@
   (test-harness-fetch-into-upstream-stalls-e2e)
   (test-harness-fetch-into-refuses-malformed-chunks-e2e)
   (test-harness-body-handler-e2e)
+  (test-harness-receive-body-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)
