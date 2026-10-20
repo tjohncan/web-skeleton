@@ -148,6 +148,18 @@
            #:receive-body
            #:body-resume
            #:body-refuse
+           ;; multipart/form-data
+           #:form-part
+           #:form-part-name
+           #:form-part-filename
+           #:form-part-content-type
+           #:form-part-headers
+           #:form-part-body
+           #:parse-multipart
+           #:receive-multipart
+           #:find-form-part
+           #:find-form-parts
+           #:form-part-text
            ;; Streaming responses
            #:make-stream-response
            #:stream-send

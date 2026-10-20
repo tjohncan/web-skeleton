@@ -21,6 +21,10 @@
 ;;;;                        at a time, and answered by its :ON-END; the
 ;;;;                        body is never held whole, so its size is the
 ;;;;                        cap's business and not memory's
+;;;;   (RECEIVE-MULTIPART ...)
+;;;;                        the same for a multipart/form-data body, parsed
+;;;;                        as it arrives into the parts of a form; see
+;;;;                        src/server/multipart.lisp
 ;;;;   an HTTP-RESPONSE     the answer, sent before the body is read
 ;;;;
 ;;;; The handler contract does not change. :HANDLER is still called with a
@@ -176,7 +180,10 @@
            max-size))
   (%make-body-plan :kind :receive
                    :max-size (or max-size most-positive-fixnum)
-                   :on-data on-data
+                   ;; ON-DATA takes every run whole, so a pause is taken at
+                   ;; the run's end.
+                   :feed (lambda (conn buf from to)
+                           (values (funcall on-data conn (subseq buf from to)) to))
                    :on-end on-end
                    :on-abort on-abort))
 

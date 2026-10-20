@@ -88,6 +88,10 @@
                                                       "src/epoll"
                                                       "src/server/http"
                                                       "src/server/connection"))
+               (:file "src/server/multipart" :depends-on ("src/package"
+                                                           "src/server/http"
+                                                           "src/server/connection"
+                                                           "src/server/body"))
                (:file "src/server/main"  :depends-on ("src/counters" "src/package"
                                                        "src/log"
                                                        "src/epoll"

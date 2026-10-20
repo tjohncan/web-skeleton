@@ -25,18 +25,27 @@
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (body-plan (:constructor %make-body-plan))
-  "What a body handler decided for a request's body. Built by BUFFER-BODY
-   or RECEIVE-BODY, never by hand, so every plan has been through its
-   constructor's checks.
+  "What a body handler decided for a request's body. Built by BUFFER-BODY,
+   RECEIVE-BODY or RECEIVE-MULTIPART, never by hand, so every plan has been
+   through its constructor's checks.
 
      KIND      :BUFFER, read whole and handed to :HANDLER; or :RECEIVE,
-               handed to ON-DATA as it arrives
+               handed to FEED as it arrives
      MAX-SIZE  the cap on the body's decoded bytes
-     ON-DATA, ON-END, ON-ABORT
+     FEED      a :RECEIVE plan's reader, called (CONN BUF FROM TO) with the
+               next run of the body where it lies, BUF[FROM, TO) of the read
+               buffer, and returning (values VERDICT UPTO). VERDICT is NIL,
+               :PAUSE or an HTTP-RESPONSE, as RECEIVE-BODY's ON-DATA answers.
+               With :PAUSE, UPTO is how far into the run the reader got: the
+               bytes from there stay buffered and begin its next run, after
+               BODY-RESUME. Any other verdict has taken the whole run.
+               RECEIVE-BODY's copies the run for ON-DATA; RECEIVE-MULTIPART's
+               parses it in place, and a pause can fall inside it.
+     ON-END, ON-ABORT
                a :RECEIVE plan's callbacks; see RECEIVE-BODY"
   (kind :buffer :type keyword)
   (max-size 0 :type (integer 0))
-  (on-data nil)
+  (feed nil)
   (on-end nil)
   (on-abort nil))
 
@@ -246,16 +255,16 @@
   ;; of CONNECTION-ON-READ write it before anything reads it, so neither
   ;; reset has to.
   (expect-continue nil :type boolean)
-  ;; The :RECEIVE plan whose ON-DATA this request's body is being handed
+  ;; The :RECEIVE plan whose FEED this request's body is being handed
   ;; to, or NIL. Taken off the connection — set back to NIL — at the moment
   ;; the body ends, however it ends: by ON-END on completion, or by
   ;; NOTIFY-BODY-ABORTED otherwise, which is how the plan's callbacks fire
   ;; exactly once between them. Being NIL is also what every reset relies
   ;; on: a body that ended left nothing to clear.
   (body-receiver nil :type (or null body-plan))
-  ;; Bytes of a received body handed to ON-DATA so far, decoded. The total
-  ;; the cap is held to, and on a Content-Length body what tells the read
-  ;; path how much of it is still to come.
+  ;; Bytes of a received body its plan's FEED has taken so far, decoded.
+  ;; The total the cap is held to, and on a Content-Length body what tells
+  ;; the read path how much of it is still to come.
   ;;
   ;; This and BODY-OWED are zeroed by APPLY-BODY-PLAN when a :RECEIVE plan
   ;; is installed and read only while one is, so no reset clears them: a
@@ -264,7 +273,7 @@
   ;; CHUNKED-BODY-FEED's OWED between reads: the bytes of the current chunk
   ;; still to come, its data and its CRLF, or 0 at a chunk boundary.
   (body-owed 0 :type unsigned-byte)
-  ;; T while a received body's ON-DATA has asked for a pause: nothing is
+  ;; T while a received body's FEED has asked for a pause: nothing is
   ;; handed over, the connection is subscribed to no events, and the
   ;; client's bytes wait in the kernel until BODY-RESUME. Cleared there,
   ;; and by APPLY-BODY-PLAN for the next body, so it is never read stale.
@@ -611,10 +620,10 @@
 
 (defconstant +receive-window+ 65536
   "Bytes of a received body the read buffer holds at once, past the head.
-   What one read can bring, and so the most ON-DATA is handed in one call
-   after the first — that one carries whatever arrived with the head before
-   the body handler was asked. The body itself can be any size: each window
-   is handed over and dropped before the next is read.")
+   What one read can bring, and so the most a plan's FEED is handed in one
+   call after the first — that one carries whatever arrived with the head
+   before the body handler was asked. The body itself can be any size: each
+   window is handed over and dropped before the next is read.")
 
 (defconstant +receive-rounds+ 16
   "Windows of a received body read and handed over in one wake-up before
@@ -649,7 +658,7 @@
                     (connection-fd conn) reason e))))))
 
 (defun receiving-body-p (conn)
-  "True while CONN's request body is being received into a plan's ON-DATA:
+  "True while CONN's request body is being received into a plan's FEED:
    the body has been accepted and has not yet ended."
   (and (member (connection-state conn) '(:read-body :sending-100-continue))
        (connection-body-receiver conn)
@@ -1357,10 +1366,12 @@
 ;;;                    this function would otherwise have given.
 ;;;   :RECEIVED      — a body being received is complete: its plan's
 ;;;                    ON-END is to answer the request
-;;;   :REFUSED       — a body being received was refused by its ON-DATA;
+;;;   :REFUSED       — a body being received was refused by its plan's FEED;
 ;;;                    second value: the response to send
-;;;   :PAUSED        — a body being received was paused by its ON-DATA; the
-;;;                    caller unsubscribes it until BODY-RESUME
+;;;   :PAUSED        — a body being received was paused by its plan's FEED;
+;;;                    the caller unsubscribes it until BODY-RESUME
+;;;   :ENDED         — a body being received was ended, and answered, from
+;;;                    inside its plan's FEED; the caller has nothing to do
 ;;;   :YIELD         — a body being received has more in the kernel than
 ;;;                    one wake-up hands over; the caller arms
 ;;;                    writability so the read resumes next pass
@@ -1415,8 +1426,9 @@
 
 (defun connection-drop-read-bytes (conn from to)
   "Remove BUF[FROM, TO) from CONN's read buffer, moving what follows down
-   to FROM. A received body's bytes are dropped once ON-DATA has them, so
-   the buffer holds what is still to be handed over and nothing else.
+   to FROM. A received body's bytes are dropped once its plan's FEED has
+   taken them, so the buffer holds what is still to be handed over and
+   nothing else.
 
    A buffer grown before the body was received — a read can fill it to the
    default cap while the head waits for the body handler — is replaced by
@@ -1434,19 +1446,24 @@
           (setf (connection-read-buf conn) fresh))))))
 
 (defun connection-deliver-body (conn)
-  "Hand what has arrived of CONN's received body to its plan's ON-DATA,
-   and drop it from the read buffer. Returns:
+  "Hand what has arrived of CONN's received body to its plan's FEED, and
+   drop what the feed took from the read buffer. Returns:
 
      :RECEIVED   the body is complete, and REQUEST-END says where it
                  ended, for the keep-alive reset
-     :REFUSED    ON-DATA answered; the second value is its response, and
+     :REFUSED    the feed answered; the second value is its response, and
                  nothing more of the body was handed over
-     :PAUSED     ON-DATA asked for a pause; nothing more was handed over,
-                 and what is still in the buffer waits there for
+     :PAUSED     the feed asked for a pause; nothing more was handed over,
+                 and what is still in the buffer — the rest of the run the
+                 pause fell in, and whatever followed it — waits there for
                  BODY-RESUME. A pause that comes with the body's last
                  bytes holds ON-END back too: an application pausing has
                  said it is not ready, and the end of the body is
                  something it must be ready for
+     :ENDED      the body was ended from inside the feed: an application
+                 callback called BODY-REFUSE rather than returning its
+                 response. That answered the request, so nothing is left
+                 to do, and nothing more of the body is handed over
      NIL         keep reading
 
    Raises what the body has earned instead — 413 past its cap, 400 for
@@ -1455,7 +1472,7 @@
    and nowhere else: the catch that answers the raise sees only a status.
 
    A chunked body is held to its cap before its bytes are handed over: a
-   run is handed to ON-DATA only if the chunk it belongs to, as declared,
+   run is handed to the feed only if the chunk it belongs to, as declared,
    keeps the total within the cap, and a size line declaring more is
    refused on arrival with none of its chunk delivered."
   (let* ((plan (connection-body-receiver conn))
@@ -1464,18 +1481,31 @@
          (end (connection-read-pos conn))
          (limit (body-plan-max-size plan))
          (answer nil)
-         (over nil))
+         (over nil)
+         (ended nil))
     (flet ((hand-over (from to)
+             ;; (values HALT UPTO): BUF[FROM, TO) to the feed, which took it
+             ;; to UPTO. The run is counted before the feed sees it and what
+             ;; a pause left untaken is counted back out, so the total is
+             ;; always the bytes taken.
              (incf (connection-body-received conn) (- to from))
-             (let ((verdict (funcall (body-plan-on-data plan)
-                                     conn (subseq buf from to))))
+             (multiple-value-bind (verdict upto)
+                 (funcall (body-plan-feed plan) conn buf from to)
                (cond
+                 ((not (eq (connection-body-receiver conn) plan))
+                  (setf ended t)
+                  (values :halt to))
                  ((typep verdict 'http-response)
                   (setf answer verdict)
-                  :halt)
+                  (values :halt to))
                  ((eq verdict :pause)
+                  (unless (and (integerp upto) (<= from upto to))
+                    (error "body feed paused at ~s, outside its run [~d, ~d)"
+                           upto from to))
+                  (decf (connection-body-received conn) (- to upto))
                   (setf (connection-body-paused conn) t)
-                  :halt))))
+                  (values :halt upto))
+                 (t (values nil to)))))
            (refuse (reason status format-string &rest args)
              (notify-body-aborted conn reason)
              (apply #'http-reject status format-string args)))
@@ -1485,8 +1515,10 @@
                              (connection-body-received conn))
                           (- end body-start))))
            (when (plusp take)
-             (hand-over body-start (+ body-start take))
-             (connection-drop-read-bytes conn body-start (+ body-start take)))
+             (let ((upto (nth-value 1 (hand-over body-start (+ body-start take)))))
+               (when ended
+                 (return-from connection-deliver-body :ended))
+               (connection-drop-read-bytes conn body-start upto)))
            (cond
              (answer (values :refused answer))
              ((connection-body-paused conn) :paused)
@@ -1504,7 +1536,7 @@
                   (lambda (b from to rest)
                     (declare (ignore b))
                     ;; This run and the rest of its chunk, as declared,
-                    ;; against the cap — before ON-DATA sees any of it.
+                    ;; against the cap — before the feed sees any of it.
                     (let ((projected (+ (connection-body-received conn)
                                         (- to from) rest)))
                       (if (> projected limit)
@@ -1513,6 +1545,8 @@
                (chunked-framing-error (e)
                  (refuse :malformed 400 "malformed chunked framing: ~a" e)))
            (declare (ignore data-bytes))
+           (when ended
+             (return-from connection-deliver-body :ended))
            (when over
              (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
                      over limit))
@@ -1525,8 +1559,9 @@
              (answer
               (connection-drop-read-bytes conn body-start next)
               (values :refused answer))
-             ;; A halt, so not COMPLETE: the chunks after the paused run
-             ;; stay in the buffer, and BODY-RESUME's read walks them first.
+             ;; A halt, so not COMPLETE: what the pause left of its run and
+             ;; the chunks after it stay in the buffer, and BODY-RESUME's
+             ;; read walks them first.
              ((connection-body-paused conn)
               (connection-drop-read-bytes conn body-start next)
               :paused)
@@ -1556,7 +1591,7 @@
   "Hand CONN's received body over as it arrives, reading again for as long
    as each read filled the window and the body is still owed, up to
    +RECEIVE-ROUNDS+ windows in one wake-up. Returns CONNECTION-DELIVER-
-   BODY's :RECEIVED, :REFUSED (with its response) or :PAUSED, or:
+   BODY's :RECEIVED, :REFUSED (with its response), :PAUSED or :ENDED, or:
 
      :CONTINUE  the kernel has nothing more yet
      :CLOSE     the peer's FIN has arrived and the body is not complete
@@ -1600,9 +1635,9 @@
    that read the head.
 
    A body being received is handed over from here as it is for every read
-   after: what arrived with the head goes to ON-DATA at once. The read
-   cap does not bound it, the window does, so the only size check is the
-   cap's own."
+   after: what arrived with the head goes to its plan's FEED at once. The
+   read cap does not bound it, the window does, so the only size check is
+   the cap's own."
   (let* ((body-start (+ (connection-header-end conn) 4))
          (buf (connection-read-buf conn)))
     (when (connection-body-receiver conn)

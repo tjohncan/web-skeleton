@@ -499,9 +499,14 @@
 (defun mutate-framing (bytes)
   "BYTES with one byte replaced, inserted or removed at a random place,
    the new byte drawn from *FRAMING-BYTES*."
+  (mutate-bytes bytes *framing-bytes*))
+
+(defun mutate-bytes (bytes alphabet)
+  "BYTES with one byte replaced, inserted or removed at a random place,
+   the new byte drawn from ALPHABET."
   (let* ((n (length bytes))
          (at (random (1+ n)))
-         (b (aref *framing-bytes* (random (length *framing-bytes*)))))
+         (b (aref alphabet (random (length alphabet)))))
     (coerce
      (ecase (if (zerop n) 1 (random 3))
        (0 (let ((v (copy-seq bytes)))
@@ -689,6 +694,325 @@
                   (report :pieces framed
                           "    cut at ~s: ~s ~s, one piece ~s ~s~%"
                           cuts verdict2 got2 verdict got))))))))
+    bad))
+
+(defun chunk-feed-in-partial-halts (framed cuts)
+  "FEED-IN-PIECES, but with a consumer that takes each run only partway
+   and halts there, as a received body's feed does when a pause falls
+   inside a run: half of every run of two bytes or more, and the next
+   call is handed the rest first. Returns (values VERDICT BYTES)."
+  (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (got (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (owed 0)
+        (at 0))
+    (dolist (cut (append cuts (list (length framed))))
+      (loop for i from at below cut do (vector-push-extend (aref framed i) buf))
+      (setf at cut)
+      ;; Called until a call makes no progress, since every call halts.
+      (loop
+        (let ((progress nil))
+          (handler-case
+              (multiple-value-bind (complete next new-owed)
+                  (web-skeleton::chunked-body-feed
+                   buf 0 (fill-pointer buf) owed
+                   (lambda (b from to rest)
+                     (declare (ignore rest))
+                     (let ((upto (if (>= (- to from) 2) (+ from (floor (- to from) 2)) to)))
+                       (loop for i from from below upto
+                             do (vector-push-extend (aref b i) got))
+                       (setf progress t)
+                       (values :halt upto))))
+                (when complete
+                  (return-from chunk-feed-in-partial-halts (values :complete got)))
+                (when (plusp next) (setf progress t))
+                (replace buf buf :start2 next)
+                (setf (fill-pointer buf) (- (fill-pointer buf) next)
+                      owed new-owed))
+            (web-skeleton::chunked-framing-error ()
+              (return-from chunk-feed-in-partial-halts (values :refused got))))
+          (unless progress (return)))))
+    (values :incomplete got)))
+
+(defun prop-chunk-feed-halts-short-of-a-run (seed)
+  "A consumer of CHUNKED-BODY-FEED that halts partway into a run, with the
+   UPTO it took the run to, is handed the rest of that run first by the
+   next call, and nothing twice: the bytes it takes, in any pieces, are
+   the decoded body, and its verdict is the one-pass feed's.
+
+   That is what a received body's pause inside a run rests on, a
+   multipart body paused at a part's end in the middle of a read."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+             (framed (if (zerop (random 4)) (mutate-framing valid) valid))
+             (n (length framed))
+             (cuts (sort (remove-duplicates
+                          (loop repeat (random 6) collect (random (max 1 n))))
+                         #'<)))
+        (multiple-value-bind (verdict got) (feed-in-pieces framed nil)
+          (multiple-value-bind (verdict2 got2) (chunk-feed-in-partial-halts framed cuts)
+            (unless (and (eq verdict verdict2) (equalp got got2))
+              (unless bad
+                (setf bad :partial)
+                (fuzz-report nil seed framed)
+                (format t "    cut at ~s, halting halfway: ~s ~s; whole runs ~s ~s~%"
+                        cuts verdict2 got2 verdict got)))))))
+    bad))
+
+;;; ---------------------------------------------------------------------------
+;;; multipart/form-data
+;;; ---------------------------------------------------------------------------
+
+(defparameter *boundary-alphabet*
+  "abcXYZ019'()+_,-./:=? "
+  "Characters a generated boundary is drawn from: all of RFC 2046's
+   punctuation, a few letters and digits, and the space it allows inside.")
+
+(defun gen-boundary ()
+  "A boundary RFC 2046 allows. Short ones half the time, since a boundary
+   of a character or two is the one a part's content collides with by
+   chance, and the collisions are the parser's hard cases."
+  (let* ((n (if (zerop (random 2)) (1+ (random 3)) (+ 4 (random 67))))
+         (s (make-string n)))
+    (dotimes (i n)
+      (setf (char s i) (char *boundary-alphabet* (random (length *boundary-alphabet*)))))
+    (when (char= (char s (1- n)) #\Space)
+      (setf (char s (1- n)) #\z))
+    s))
+
+(defun ascii-octets (string)
+  (sb-ext:string-to-octets string :external-format :utf-8))
+
+(defun octets-contain-p (bytes needle &key (start 0))
+  (and (search needle bytes :start2 start) t))
+
+(defun gen-part-content (boundary)
+  "Content for a part that a valid body can carry: built from the pieces a
+   delimiter is made of — CRLF, dashes, prefixes of the boundary — and
+   random bytes, then refused and drawn again if it holds a line that
+   begins with the boundary, which RFC 2046 forbids content to."
+  (let* ((dash-boundary (ascii-octets (format nil "--~a" boundary)))
+         (delimiter (concatenate '(vector (unsigned-byte 8)) #(13 10) dash-boundary)))
+    (loop repeat 20
+          do (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                                      :adjustable t :fill-pointer 0)))
+               (dotimes (i (random 12))
+                 (declare (ignorable i))
+                 (let ((piece (ecase (random 6)
+                                (0 #(13 10))
+                                (1 #(45 45))
+                                (2 (subseq delimiter 0 (random (length delimiter))))
+                                (3 (subseq dash-boundary 0 (random (length dash-boundary))))
+                                (4 (vector (random 256)))
+                                (5 (gen-bytes (random 40))))))
+                   (loop for b across piece do (vector-push-extend b out))))
+               (let ((v (coerce out '(simple-array (unsigned-byte 8) (*)))))
+                 (unless (or (octets-contain-p v delimiter)
+                             (and (>= (length v) (length dash-boundary))
+                                  (equalp (subseq v 0 (length dash-boundary)) dash-boundary)))
+                   (return-from gen-part-content v)))))
+    (ascii-octets "plain")))
+
+(defparameter *form-names*
+  '("title" "file" "a b" "C:\\path\\x.txt" "café" "" "x;y" "photos[]" "tab	here")
+  "Names and filenames a generated part may carry: the backslash a Windows
+   path has, a space, a ;, a tab and an empty name, all of which a quoted
+   value holds as sent.")
+
+(defun gen-param-value (value)
+  "VALUE as a Content-Disposition parameter value: quoted, or bare when it
+   is a token and the coin says so."
+  (if (and (plusp (length value))
+           (every #'web-skeleton::%token-char-p value)
+           (zerop (random 2)))
+      value
+      (format nil "\"~a\"" value)))
+
+(defun gen-multipart-form ()
+  "A valid multipart/form-data body and what it says. Returns
+   (values BOUNDARY PARTS BODY): PARTS a list of (NAME FILENAME
+   CONTENT-TYPE CONTENT), in order.
+
+   Every way the format lets the same parts be written turns up: a
+   preamble, transport padding after a boundary, header names in any case,
+   whitespace around a parameter's =, a bare or a quoted value, an extra
+   header, a Content-Transfer-Encoding that leaves the content alone, an
+   empty part written without a line of its own, and an epilogue."
+  (let* ((boundary (gen-boundary))
+         (crlf (format nil "~c~c" #\Return #\Newline))
+         (parts (loop repeat (random 5)
+                      collect (list (nth (random (length *form-names*)) *form-names*)
+                                    (and (zerop (random 2))
+                                         (nth (random (length *form-names*)) *form-names*))
+                                    (and (zerop (random 3))
+                                         (nth (random 3) '("text/plain" "image/png"
+                                                           "application/octet-stream; x=\"y\"")))
+                                    (if (zerop (random 4))
+                                        (make-array 0 :element-type '(unsigned-byte 8))
+                                        (gen-part-content boundary)))))
+         (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (flet ((emit (thing)
+             (loop for b across (if (stringp thing) (ascii-octets thing) thing)
+                   do (vector-push-extend b out)))
+           (padding () (subseq "  	 " 0 (if (zerop (random 3)) (random 4) 0))))
+      (when (zerop (random 4))
+        ;; A preamble, held to what content is held to, and the CRLF
+        ;; before the first boundary.
+        (emit (gen-part-content boundary))
+        (emit crlf))
+      (emit (format nil "--~a" boundary))
+      (dolist (part parts)
+        (destructuring-bind (name filename content-type content) part
+          (emit (format nil "~a~a" (padding) crlf))
+          (emit (format nil "~a: form-data;~a~a~a=~a~a~a"
+                        (nth (random 3) '("Content-Disposition" "content-disposition"
+                                          "CONTENT-DISPOSITION"))
+                        (if (zerop (random 3)) "" " ")
+                        "name"
+                        (if (zerop (random 5)) " " "")
+                        (gen-param-value name)
+                        (if filename (format nil "; filename=~a" (gen-param-value filename)) "")
+                        crlf))
+          (when content-type
+            (emit (format nil "Content-Type: ~a~a" content-type crlf)))
+          (when (zerop (random 6))
+            (emit (format nil "Content-Transfer-Encoding: ~a~a"
+                          (nth (random 3) '("binary" "8bit" "7BIT")) crlf)))
+          (when (zerop (random 6))
+            (emit (format nil "X-Extra: ignored~a" crlf)))
+          (if (and (zerop (length content)) (zerop (random 2)))
+              ;; No line of content: the blank line is the delimiter's CRLF.
+              (emit crlf)
+              (progn (emit crlf) (emit content) (emit crlf)))
+          (emit (format nil "--~a" boundary))))
+      (emit "--")
+      (emit (padding))
+      (case (random 3)
+        (0)
+        (1 (emit crlf))
+        (2 (emit crlf) (emit (gen-bytes (random 30))))))
+    (values boundary
+            (mapcar (lambda (p) (list (first p) (second p) (third p)
+                                      (coerce (fourth p) 'list)))
+                    parts)
+            (coerce out '(simple-array (unsigned-byte 8) (*))))))
+
+(defun multipart-in-pieces (body boundary cuts)
+  "Parse BODY through MULTIPART-STEP in the pieces CUTS marks, as a body
+   received a read at a time is parsed: each piece appended to what the
+   last step left, and what a step read dropped. Returns (:PARTS list) of
+   (NAME FILENAME CONTENT-TYPE CONTENT), or (:REFUSED status)."
+  (handler-case
+      (let ((parser (web-skeleton::make-multipart-parser
+                     (ascii-octets boundary) :max-parts 1000))
+            (buf (make-array 0 :element-type '(unsigned-byte 8)))
+            (at 0)
+            (parts '())
+            (content nil))
+        (dolist (cut (append cuts (list (length body))))
+          (setf buf (concatenate '(simple-array (unsigned-byte 8) (*))
+                                 buf (subseq body at cut))
+                at cut)
+          (let ((pos 0))
+            (loop
+              (multiple-value-bind (event next source from to)
+                  (web-skeleton::multipart-step parser buf pos (length buf))
+                (setf pos next)
+                (ecase event
+                  (:more (return))
+                  (:part (setf content '()))
+                  (:data (loop for i from from below to do (push (aref source i) content)))
+                  (:part-end
+                   (let ((part (web-skeleton::multipart-parser-part parser)))
+                     (push (list (form-part-name part) (form-part-filename part)
+                                 (form-part-content-type part) (reverse content))
+                           parts))))))
+            (setf buf (subseq buf pos))))
+        (if (web-skeleton::multipart-parser-done-p parser)
+            (list :parts (nreverse parts))
+            (list :refused 400)))
+    (http-parse-error (e) (list :refused (http-parse-error-status e)))
+    (error (e) (list :escaped (type-of e)))))
+
+(defun multipart-whole (body boundary)
+  "PARSE-MULTIPART's reading of BODY, in MULTIPART-IN-PIECES' terms."
+  (handler-case
+      (list :parts
+            (mapcar (lambda (p) (list (form-part-name p) (form-part-filename p)
+                                      (form-part-content-type p)
+                                      (coerce (form-part-body p) 'list)))
+                    (parse-multipart
+                     (web-skeleton::make-http-request
+                      :method :post :path "/"
+                      :headers (list (cons "content-type"
+                                           (format nil "multipart/form-data; boundary=\"~a\""
+                                                   boundary)))
+                      :body body))))
+    (http-parse-error (e) (list :refused (http-parse-error-status e)))))
+
+(defparameter *multipart-mutation-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (format nil "~c~c-:;=\" a~c" #\Return #\Newline (code-char 0)))
+  "What a mutation writes into a multipart body: the bytes its framing is
+   made of, and a NUL.")
+
+(defun prop-multipart-reads-alike-in-any-pieces (seed)
+  "MULTIPART-STEP reads a multipart/form-data body the same however it
+   arrives, and reads a valid one as what was sent.
+
+     what was sent    a generated body parses to exactly its parts —
+                      names, filenames, types and content, in order
+     any pieces       the body cut anywhere, or a byte at a time, parses
+                      as the whole body does
+     a broken body    with a byte or two changed, inserted or removed, the
+                      body is refused or read alike whole and in pieces,
+                      and nothing but HTTP-PARSE-ERROR escapes
+
+   A received form is parsed a read at a time, so where the reads fall
+   is the client's choice. A body that reads one way in one piece and
+   another way in two is a body whose fields depend on the network."
+  (let ((bad nil))
+    (flet ((report (kind body fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed body)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (multiple-value-bind (boundary expected body) (gen-multipart-form)
+          (let* ((broken (if (zerop (random 3))
+                             (let ((m (mutate-bytes body *multipart-mutation-bytes*)))
+                               (if (zerop (random 3)) (mutate-bytes m *multipart-mutation-bytes*) m))
+                             body))
+                 (n (length broken))
+                 (whole (handler-case (multipart-whole broken boundary)
+                          (error (e) (list :escaped (type-of e))))))
+            (when (eq broken body)
+              (unless (equal whole (list :parts expected))
+                (report :sent body "    boundary ~s: read ~s, sent ~s~%"
+                        boundary whole expected)))
+            (when (eq (first whole) :escaped)
+              (report :escaped broken "    boundary ~s: ~s escaped~%" boundary whole))
+            (let ((cutting (case (random 8)
+                             (0 (loop for k from 1 below n collect k))
+                             (1 (and (< n 600) :every))
+                             (t (sort (remove-duplicates
+                                       (loop repeat (random 6) collect (random (max 1 n))))
+                                      #'<)))))
+              (if (eq cutting :every)
+                  (loop for k from 0 to n
+                        for got = (multipart-in-pieces broken boundary (list k))
+                        unless (equal got whole)
+                          do (report :split broken "    boundary ~s, split at ~d: ~s; whole ~s~%"
+                                     boundary k got whole)
+                             (return))
+                  (let ((got (multipart-in-pieces broken boundary cutting)))
+                    (unless (equal got whole)
+                      (report :pieces broken "    boundary ~s, cut at ~s: ~s; whole ~s~%"
+                              boundary cutting got whole)))))))))
     bad))
 
 (defun drive-request-incrementally (bytes step)
@@ -1128,6 +1452,10 @@
                             #'prop-chunk-walk-matches-decoder)
                       (cons "chunk feed, in any pieces, matches the decoder"
                             #'prop-chunk-feed-matches-decoder)
+                      (cons "chunk feed halted inside a run hands the rest over next"
+                            #'prop-chunk-feed-halts-short-of-a-run)
+                      (cons "multipart reads alike in any pieces"
+                            #'prop-multipart-reads-alike-in-any-pieces)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

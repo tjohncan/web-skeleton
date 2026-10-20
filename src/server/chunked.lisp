@@ -326,7 +326,10 @@
 
    ON-DATA's value is ignored unless it is :HALT, which ends the walk
    there: NEXT is just past the bytes handed over, and a later call
-   resumes from it with nothing handed over twice."
+   resumes from it with nothing handed over twice. A second value UPTO,
+   short of the run's end, says the consumer took the run only that far:
+   NEXT is UPTO and the rest of the run is owed again, so the next call
+   hands it over first."
   (let ((pos start)
         (data-bytes 0))
     (flet ((pending () (max 0 (- owed 2))))
@@ -339,9 +342,16 @@
                   (incf pos take)
                   (decf owed take)
                   (incf data-bytes take)
-                  (when (and on-data
-                             (eq (funcall on-data buf from pos (pending)) :halt))
-                    (return (values nil pos owed data-bytes (pending) 0)))))
+                  (when on-data
+                    (multiple-value-bind (verdict upto)
+                        (funcall on-data buf from pos (pending))
+                      (when (eq verdict :halt)
+                        (when (and upto (< upto pos))
+                          (let ((untaken (- pos (max from upto))))
+                            (decf pos untaken)
+                            (incf owed untaken)
+                            (decf data-bytes untaken)))
+                        (return (values nil pos owed data-bytes (pending) 0)))))))
               ;; The CRLF, each byte judged as it lands.
               (loop while (and (<= 1 owed 2) (< pos end))
                     do (unless (= (aref buf pos) (if (= owed 2) 13 10))

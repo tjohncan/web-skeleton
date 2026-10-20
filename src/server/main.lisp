@@ -1592,7 +1592,8 @@
        (return-from decide-request-body :answered))
       (t
        (error "body handler returned ~a; expected NIL, a plan from ~
-               BUFFER-BODY or RECEIVE-BODY, or an HTTP-RESPONSE to answer ~
+               BUFFER-BODY, RECEIVE-BODY or RECEIVE-MULTIPART, or an ~
+               HTTP-RESPONSE to answer ~
                before the body"
               (type-of decision))))
     (connection-begin-body conn peer-finished)))
@@ -1649,6 +1650,9 @@
                 (log-debug "fd ~d: received body paused at ~d bytes"
                            (connection-fd conn) (connection-body-received conn))
                 (epoll-modify epoll-fd (connection-fd conn) +epollet+))
+               ;; A received body ended from inside its plan's feed, by a
+               ;; BODY-REFUSE called there, which answered it.
+               (:ended nil)
                (:flush-queued
                 ;; connection-on-read queued response bytes that must flush
                 ;; before further reads happen. Covers two cases:
@@ -2607,7 +2611,8 @@
    BODY-HANDLER: function (request) -> NIL, a body plan, or an
      HTTP-RESPONSE; a symbol naming one; or NIL. Called once the head of
      a request with a body has arrived, before any of the body is read —
-     see src/server/body.lisp.
+     see src/server/body.lisp, and src/server/multipart.lisp for a form
+     received as it arrives.
    ON-TICK: function (worker-id), a symbol naming one, or NIL.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.

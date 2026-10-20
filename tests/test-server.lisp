@@ -9617,6 +9617,653 @@
                 t)
            t)))
 
+;;; ---------------------------------------------------------------------------
+;;; multipart/form-data
+;;; ---------------------------------------------------------------------------
+
+(defun %form (&rest lines)
+  "LINES joined by CRLF, as a multipart body's lines are."
+  (format nil (concatenate 'string "~{~a~^" *crlf* "~}") lines))
+
+(defun %multipart-outcome (body &key (boundary "XyZ") content-type
+                                     (max-parts 1000) (max-part-head-size 16384))
+  "PARSE-MULTIPART's reading of BODY, in terms a CHECK can compare: each
+   part as (NAME FILENAME CONTENT-TYPE CONTENT), the content read as
+   Latin-1 so any byte survives, or (:REFUSED status message)."
+  (handler-case
+      (mapcar (lambda (p)
+                (list (form-part-name p) (form-part-filename p)
+                      (form-part-content-type p)
+                      (sb-ext:octets-to-string (form-part-body p)
+                                               :external-format :latin-1)))
+              (parse-multipart
+               (make-test-request
+                :method :post :path "/form"
+                :headers (list (cons "content-type"
+                                     (or content-type
+                                         (format nil "multipart/form-data; boundary=~a"
+                                                 boundary))))
+                :body body)
+               :max-parts max-parts :max-part-head-size max-part-head-size))
+    (http-parse-error (e)
+      (list :refused (http-parse-error-status e) (http-parse-error-message e)))))
+
+(defun %refused-with (outcome)
+  "The status of a refused %MULTIPART-OUTCOME, or the outcome itself."
+  (if (and (consp outcome) (eq (first outcome) :refused))
+      (second outcome)
+      outcome))
+
+(defun test-multipart-content-type ()
+  "The boundary comes from the request's Content-Type: one boundary
+   parameter, of RFC 2046's characters, one to seventy of them and not
+   ending in a space. A Content-Type that is not multipart/form-data is
+   415 — the request is in a format this does not read — and one that is,
+   without a usable boundary, is 400."
+  (format t "~%multipart: the Content-Type and its boundary~%")
+  (let ((body (%form "--b" "Content-Disposition: form-data; name=x" "" "1" "--b--")))
+    (flet ((with-type (type)
+             (%refused-with (%multipart-outcome body :content-type type))))
+      (check "content-type: a bare boundary"
+             (with-type "multipart/form-data; boundary=b") '(("x" nil nil "1")))
+      (check "content-type: a quoted boundary"
+             (with-type "multipart/form-data; boundary=\"b\"") '(("x" nil nil "1")))
+      (check "content-type: type and parameter names in any case, other parameters ignored"
+             (with-type "Multipart/Form-Data; charset=utf-8; BOUNDARY=b")
+             '(("x" nil nil "1")))
+      (check "content-type: no Content-Type is 415"
+             (%refused-with
+              (handler-case (parse-multipart (make-test-request :method :post :body body))
+                (http-parse-error (e) (list :refused (http-parse-error-status e)))))
+             415)
+      (check "content-type: another media type is 415"
+             (with-type "application/x-www-form-urlencoded") 415)
+      (check "content-type: multipart/mixed is 415" (with-type "multipart/mixed; boundary=b") 415)
+      (check "content-type: no boundary is 400" (with-type "multipart/form-data") 400)
+      (check "content-type: an empty boundary is 400"
+             (with-type "multipart/form-data; boundary=\"\"") 400)
+      (check "content-type: a boundary given twice is 400"
+             (with-type "multipart/form-data; boundary=b; boundary=c") 400)
+      (check "content-type: a boundary with a character RFC 2046 does not allow is 400"
+             (with-type "multipart/form-data; boundary=\"b@\"") 400)
+      (check "content-type: a boundary ending in a space is 400"
+             (with-type "multipart/form-data; boundary=\"b \"") 400)
+      (check "content-type: a boundary of 71 characters is 400"
+             (with-type (format nil "multipart/form-data; boundary=~a"
+                                (make-string 71 :initial-element #\b)))
+             400)
+      (check "content-type: an unterminated quoted value is 400"
+             (with-type "multipart/form-data; boundary=\"b") 400)
+      (check "content-type: two Content-Type fields are 400"
+             (%refused-with
+              (handler-case
+                  (parse-multipart
+                   (make-test-request :method :post
+                                      :headers '(("content-type" . "multipart/form-data; boundary=b")
+                                                 ("content-type" . "multipart/form-data; boundary=c"))
+                                      :body body))
+                (http-parse-error (e) (list :refused (http-parse-error-status e)))))
+             400))
+    ;; Seventy characters, every punctuation mark RFC 2046 allows and the
+    ;; space it allows inside, is a boundary.
+    (let ((long (concatenate 'string "'()+_,-./:=? " (make-string 57 :initial-element #\Z))))
+      (check "content-type: seventy of the allowed characters are a boundary"
+             (%multipart-outcome (%form (format nil "--~a" long)
+                                        "Content-Disposition: form-data; name=x" "" "1"
+                                        (format nil "--~a--" long))
+                                 :content-type (format nil "multipart/form-data; boundary=\"~a\""
+                                                       long))
+             '(("x" nil nil "1"))))))
+
+(defun test-multipart-parse ()
+  "PARSE-MULTIPART reads what a browser sends, every way RFC 2046 lets the
+   same parts be written, and refuses a body that leaves room for two
+   readings."
+  (format t "~%multipart: parsing a body~%")
+  ;; ---- what a browser sends ----
+  (check "parse: a text field and a file, as a browser sends them"
+         (%multipart-outcome
+          (%form "--XyZ"
+                 "Content-Disposition: form-data; name=\"title\""
+                 ""
+                 "hello"
+                 "--XyZ"
+                 "Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\""
+                 "Content-Type: text/plain"
+                 ""
+                 (format nil "line one~aline two" *crlf*)
+                 "--XyZ--"
+                 ""))
+         `(("title" nil nil "hello")
+           ("file" "notes.txt" "text/plain" ,(format nil "line one~aline two" *crlf*))))
+  (check "parse: a file input with no file chosen has filename \"\" and no content"
+         (%multipart-outcome
+          (%form "--XyZ"
+                 "Content-Disposition: form-data; name=\"f\"; filename=\"\""
+                 "Content-Type: application/octet-stream"
+                 ""
+                 ""
+                 "--XyZ--"))
+         '(("f" "" "application/octet-stream" "")))
+  (check "parse: a form with no fields is the close delimiter alone"
+         (%multipart-outcome (%form "--XyZ--" "")) nil)
+  (check "parse: and without the CRLF after it"
+         (%multipart-outcome "--XyZ--") nil)
+  (check "parse: a name sent twice is two parts, in order"
+         (mapcar #'first (%multipart-outcome
+                          (%form "--XyZ" "Content-Disposition: form-data; name=p" "" "1"
+                                 "--XyZ" "Content-Disposition: form-data; name=p" "" "2"
+                                 "--XyZ--")))
+         '("p" "p"))
+  ;; ---- values as browsers write them ----
+  (check "parse: a backslash in a quoted value is an ordinary character"
+         (second (first (%multipart-outcome
+                         (%form "--XyZ"
+                                "Content-Disposition: form-data; name=f; filename=\"C:\\dir\\a.txt\""
+                                "" "x" "--XyZ--"))))
+         "C:\\dir\\a.txt")
+  (check "parse: a folder upload's relative path is passed as sent"
+         (second (first (%multipart-outcome
+                         (%form "--XyZ"
+                                "Content-Disposition: form-data; name=f; filename=\"photos/2026/a.jpg\""
+                                "" "x" "--XyZ--"))))
+         "photos/2026/a.jpg")
+  (check "parse: a quoted value keeps the ; and spaces inside it"
+         (first (first (%multipart-outcome
+                        (%form "--XyZ" "Content-Disposition: form-data; name=\"a; b\"" "" "x"
+                               "--XyZ--"))))
+         "a; b")
+  (check "parse: UTF-8 in a filename"
+         (second (first (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=f; filename=\"café.txt\""
+                                "" "x" "--XyZ--"))))
+         "café.txt")
+  (check "parse: header names in any case, whitespace around =, bare values"
+         (%multipart-outcome
+          (%form "--XyZ"
+                 "CONTENT-DISPOSITION: Form-Data;name = a ;filename= b.bin"
+                 "content-type: image/png"
+                 "" "x" "--XyZ--"))
+         '(("a" "b.bin" "image/png" "x")))
+  ;; ---- what the format says to ignore ----
+  (check "parse: a preamble, transport padding and an epilogue are ignored"
+         (%multipart-outcome
+          (%form "a preamble"
+                 (format nil "--XyZ ~c " #\Tab)
+                 "Content-Disposition: form-data; name=a"
+                 "" "A"
+                 "--XyZ--  "
+                 "an epilogue, --XyZ and all"))
+         '(("a" nil nil "A")))
+  (check "parse: a header field other than the three is kept and ignored"
+         (let ((parts (handler-case
+                          (parse-multipart
+                           (make-test-request
+                            :method :post
+                            :headers '(("content-type" . "multipart/form-data; boundary=XyZ"))
+                            :body (%form "--XyZ" "Content-Disposition: form-data; name=a"
+                                         "X-Note: kept" "" "A" "--XyZ--")))
+                        (http-parse-error () nil))))
+           (form-part-headers (first parts)))
+         '(("content-disposition" . "form-data; name=a") ("x-note" . "kept")))
+  (check "parse: Content-Transfer-Encoding binary, 8bit and 7bit leave the content as sent"
+         (loop for cte in '("binary" "8bit" "7BIT")
+               collect (fourth (first (%multipart-outcome
+                                       (%form "--XyZ" "Content-Disposition: form-data; name=a"
+                                              (format nil "Content-Transfer-Encoding: ~a" cte)
+                                              "" "QQ==" "--XyZ--")))))
+         '("QQ==" "QQ==" "QQ=="))
+  ;; ---- content near the boundary ----
+  (check "parse: content holding what a delimiter begins with is content"
+         (fourth (first (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=a" ""
+                                "x" "--Xy" "-XyZ" "XyZ" "--XyZ--"))))
+         (%form "x" "--Xy" "-XyZ" "XyZ"))
+  (check "parse: any byte in content, the ones a delimiter is made of included"
+         (fourth (first (%multipart-outcome
+                         (concatenate '(simple-array (unsigned-byte 8) (*))
+                                      (sb-ext:string-to-octets
+                                       (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "")
+                                       :external-format :ascii)
+                                      (coerce (loop for i below 256 collect i)
+                                              '(simple-array (unsigned-byte 8) (*)))
+                                      (sb-ext:string-to-octets (format nil "~a--XyZ--" *crlf*)
+                                                               :external-format :ascii)))))
+         (coerce (loop for i below 256 collect (code-char i)) 'string))
+  ;; RFC 2046's grammar lets a part with no content have no line of it:
+  ;; its head's blank line is then the delimiter's CRLF.
+  (check "parse: an empty part written with no line of content"
+         (%multipart-outcome
+          (%form "--XyZ" "Content-Disposition: form-data; name=a" ""
+                 "--XyZ" "Content-Disposition: form-data; name=b" "" "B"
+                 "--XyZ--"))
+         '(("a" nil nil "") ("b" nil nil "B")))
+  (check "parse: and one written with an empty line of content"
+         (%multipart-outcome
+          (%form "--XyZ" "Content-Disposition: form-data; name=a" "" ""
+                 "--XyZ--"))
+         '(("a" nil nil "")))
+  ;; ---- refused: two readings, or none ----
+  (check "refused: a line beginning with the boundary that is not a delimiter"
+         (%refused-with (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "A"
+                                "--XyZnot-a-delimiter" "--XyZ--")))
+         400)
+  ;; One stray byte between the boundary and its CRLF, with a well-formed
+  ;; part after it: read as transport padding, this would be two parts.
+  (check "refused: a boundary with one stray byte before its CRLF, a part after it"
+         (%refused-with (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "A"
+                                "--XyZ!" "Content-Disposition: form-data; name=b" "" "B"
+                                "--XyZ--")))
+         400)
+  (check "refused: a part's content beginning with the boundary"
+         (%refused-with (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=a" ""
+                                "--XyZX" "--XyZ--")))
+         400)
+  (check "refused: bare LF line ends"
+         (%refused-with (%multipart-outcome
+                         (format nil "--XyZ~aContent-Disposition: form-data; name=a~a~aA~a--XyZ--"
+                                 #\Newline #\Newline #\Newline #\Newline)))
+         400)
+  (check "refused: a body ended before its close delimiter"
+         (%refused-with (%multipart-outcome
+                         (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "A")))
+         400)
+  (check "refused: a body with no boundary at all"
+         (%refused-with (%multipart-outcome "name=a&b=c")) 400)
+  (check "refused: an empty body" (%refused-with (%multipart-outcome "")) 400)
+  (check "refused: bytes after the close delimiter that do not end its line"
+         (%refused-with (%multipart-outcome (%form "--XyZ--x"))) 400)
+  (check "refused: a CR after the close delimiter with no LF"
+         (%refused-with (%multipart-outcome
+                         (concatenate 'string "--XyZ--" (string #\Return))))
+         400)
+  ;; ---- refused: a part's head ----
+  (flet ((head (&rest fields)
+           (%refused-with (%multipart-outcome
+                           (apply #'%form "--XyZ" (append fields (list "" "A" "--XyZ--")))))))
+    (check "head: no header fields" (head) 400)
+    (check "head: no Content-Disposition" (head "Content-Type: text/plain") 400)
+    (check "head: two Content-Disposition fields"
+           (head "Content-Disposition: form-data; name=a" "Content-Disposition: form-data; name=b")
+           400)
+    (check "head: a disposition other than form-data"
+           (head "Content-Disposition: attachment; name=a") 400)
+    (check "head: no name" (head "Content-Disposition: form-data; filename=a") 400)
+    (check "head: name given twice" (head "Content-Disposition: form-data; name=a; name=b") 400)
+    (check "head: filename given twice"
+           (head "Content-Disposition: form-data; name=a; filename=b; filename=c") 400)
+    (check "head: filename* (RFC 7578 4.2 forbids it)"
+           (head "Content-Disposition: form-data; name=a; filename*=utf-8''b.txt") 400)
+    (check "head: name* too" (head "Content-Disposition: form-data; name*=utf-8''a") 400)
+    (check "head: two Content-Type fields"
+           (head "Content-Disposition: form-data; name=a" "Content-Type: a/b" "Content-Type: c/d")
+           400)
+    (check "head: Content-Transfer-Encoding base64"
+           (head "Content-Disposition: form-data; name=a" "Content-Transfer-Encoding: base64")
+           400)
+    (check "head: Content-Transfer-Encoding quoted-printable"
+           (head "Content-Disposition: form-data; name=a"
+                 "Content-Transfer-Encoding: quoted-printable")
+           400)
+    (check "head: a field with no colon" (head "Content-Disposition: form-data; name=a" "junk") 400)
+    (check "head: a parameter with no value" (head "Content-Disposition: form-data; name") 400)
+    (check "head: a value that is not UTF-8"
+           (%refused-with
+            (%multipart-outcome
+             (concatenate '(simple-array (unsigned-byte 8) (*))
+                          (sb-ext:string-to-octets
+                           (format nil "--XyZ~aContent-Disposition: form-data; name=\"" *crlf*)
+                           :external-format :ascii)
+                          #(#xE9)
+                          (sb-ext:string-to-octets (format nil "\"~a~aA~a--XyZ--" *crlf* *crlf* *crlf*)
+                                                   :external-format :ascii))))
+           400))
+  ;; ---- limits, refused 413 ----
+  (let ((two (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "A"
+                    "--XyZ" "Content-Disposition: form-data; name=b" "" "B" "--XyZ--")))
+    (check "limit: more parts than :max-parts" (%refused-with (%multipart-outcome two :max-parts 1))
+           413)
+    (check "limit: as many as :max-parts is within it"
+           (length (%multipart-outcome two :max-parts 2)) 2)
+    (check "limit: :max-parts NIL is no limit" (length (%multipart-outcome two :max-parts nil)) 2))
+  (let ((body (%form "--XyZ" "Content-Disposition: form-data; name=a" "" "A" "--XyZ--")))
+    ;; The head here is the field's 38 bytes, its CRLF and the blank line: 42.
+    (check "limit: a part's head over :max-part-head-size"
+           (%refused-with (%multipart-outcome body :max-part-head-size 41)) 413)
+    (check "limit: a head exactly :max-part-head-size is within it"
+           (length (%multipart-outcome body :max-part-head-size 42)) 1))
+  (check "limit: more than sixteen header fields in a part"
+         (%refused-with
+          (%multipart-outcome
+           (apply #'%form "--XyZ" "Content-Disposition: form-data; name=a"
+                  (append (loop for i below 16 collect (format nil "X-~d: v" i))
+                          (list "" "A" "--XyZ--")))))
+         413)
+  (check "limit: the arguments are checked"
+         (list (and (stringp (attempt (parse-multipart (make-test-request) :max-parts -1))) t)
+               (and (stringp (attempt (parse-multipart (make-test-request) :max-part-head-size 0))) t))
+         '(t t))
+  ;; ---- the helpers ----
+  (let ((parts (handler-case
+                   (parse-multipart
+                    (make-test-request
+                     :method :post
+                     :headers '(("content-type" . "multipart/form-data; boundary=XyZ"))
+                     :body (concatenate '(simple-array (unsigned-byte 8) (*))
+                                        (sb-ext:string-to-octets
+                                         (%form "--XyZ" "Content-Disposition: form-data; name=n"
+                                                "" "Zoë"
+                                                "--XyZ" "Content-Disposition: form-data; name=m"
+                                                "" "1"
+                                                "--XyZ" "Content-Disposition: form-data; name=m"
+                                                "" "2"
+                                                "--XyZ" "Content-Disposition: form-data; name=bad"
+                                                "" "")
+                                         :external-format :utf-8)
+                                        #(#xFF)
+                                        (sb-ext:string-to-octets (format nil "~a--XyZ--" *crlf*)
+                                                                 :external-format :ascii))))
+                 (http-parse-error () nil))))
+    (check "form-part-text: a field's content as UTF-8"
+           (form-part-text (find-form-part parts "n")) "Zoë")
+    (check "find-form-part: the first of a name"
+           (form-part-text (find-form-part parts "m")) "1")
+    (check "find-form-parts: all of a name, in order"
+           (mapcar #'form-part-text (find-form-parts parts "m")) '("1" "2"))
+    (check "find-form-part: a name not sent" (find-form-part parts "nope") nil)
+    (check "form-part-text: content that is not UTF-8 is 400"
+           (handler-case (form-part-text (find-form-part parts "bad"))
+             (http-parse-error (e) (http-parse-error-status e)))
+           400)
+    (check "form-part-text: a part with no body, as a streamed one has, is NIL"
+           (form-part-text (web-skeleton::%make-form-part :name "s")) nil)))
+
+(defun test-receive-multipart-contract ()
+  "RECEIVE-MULTIPART checks its arguments when it is called, and reads the
+   request's Content-Type there too: a request that is not
+   multipart/form-data is refused at the head, from the body handler,
+   before any of its body is read."
+  (format t "~%receive-multipart: the contract~%")
+  (let ((form (make-test-request :method :post
+                                 :headers '(("content-type" . "multipart/form-data; boundary=b"))))
+        (end (lambda (conn parts) (declare (ignore conn parts)) (make-text-response 200 "ok"))))
+    (check "contract: a plan, for a body handler to return"
+           (web-skeleton::body-plan-p (receive-multipart form :on-end end)) t)
+    (check "contract: its cap is :max-size, and NIL is none"
+           (list (web-skeleton::body-plan-max-size (receive-multipart form :on-end end :max-size 9))
+                 (web-skeleton::body-plan-max-size (receive-multipart form :on-end end :max-size nil)))
+           (list 9 most-positive-fixnum))
+    (flet ((refused (&rest args)
+             (and (stringp (attempt (apply #'receive-multipart form args))) t)))
+      (check "contract: :on-end is required" (refused) t)
+      (check "contract: a callback that is not a function"
+             (refused :on-end end :on-part 42) t)
+      (check "contract: a symbol naming a macro is not a function"
+             (refused :on-end end :on-part-data 'when) t)
+      (check "contract: :max-size negative" (refused :on-end end :max-size -1) t)
+      (check "contract: :max-parts not a count" (refused :on-end end :max-parts "10") t)
+      (check "contract: :max-part-head-size zero" (refused :on-end end :max-part-head-size 0) t)
+      (check "contract: :max-collected-size negative" (refused :on-end end :max-collected-size -1) t))
+    (check "contract: a request that is not multipart/form-data is 415, at the head"
+           (handler-case (receive-multipart (make-test-request :method :post
+                                                               :headers '(("content-type" . "text/plain")))
+                                            :on-end end)
+             (http-parse-error (e) (http-parse-error-status e)))
+           415)
+    (check "contract: multipart/form-data without a boundary is 400, at the head"
+           (handler-case (receive-multipart (make-test-request :method :post
+                                                               :headers '(("content-type" . "multipart/form-data")))
+                                            :on-end end)
+             (http-parse-error (e) (http-parse-error-status e)))
+           400)))
+
+(defmacro with-read-fn-connection ((conn kernel &key (fd 2000000000)) &body body)
+  "Run BODY with CONN, a connection whose reads come from KERNEL, an
+   adjustable byte vector standing in for the socket's receive queue, on a
+   connection table and epoll fd of its own, with EPOLL-MODIFY recorded
+   rather than called.
+
+   FD is one no process has open, so the table can hold the connection —
+   BODY-RESUME refuses one that is not this worker's — while a close, if a
+   failure leads to one, closes nothing. EPOLL-MASKS is bound in BODY to the
+   masks recorded, newest first."
+  (let ((taken (gensym "TAKEN")) (real (gensym "REAL")))
+    `(let* ((,taken 0)
+            (epoll-masks nil)
+            (,real (symbol-function 'web-skeleton::epoll-modify))
+            (web-skeleton::*connections* (make-hash-table :test #'eql))
+            (web-skeleton::*epoll-fd* 999)
+            (,conn (web-skeleton::make-connection
+                    :fd ,fd :last-active (get-universal-time)
+                    :read-fn (lambda (buffer start max-bytes)
+                               (let ((n (min max-bytes (- (fill-pointer ,kernel) ,taken))))
+                                 (if (zerop n)
+                                     :again
+                                     (progn
+                                       (replace buffer ,kernel :start1 start
+                                                :start2 ,taken :end2 (+ ,taken n))
+                                       (incf ,taken n)
+                                       n)))))))
+       (declare (ignorable epoll-masks))
+       (web-skeleton::register-connection ,conn)
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'web-skeleton::epoll-modify)
+                    (lambda (efd fd mask) (declare (ignore efd fd)) (push mask epoll-masks)))
+              ,@body)
+         (setf (symbol-function 'web-skeleton::epoll-modify) ,real)))))
+
+(defun %supply (kernel bytes)
+  "Append BYTES, a string or bytes, to KERNEL."
+  (loop for b across (if (stringp bytes)
+                         (sb-ext:string-to-octets bytes :external-format :latin-1)
+                         bytes)
+        do (vector-push-extend b kernel)))
+
+(defun %kernel ()
+  (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+
+(defun %resume-and-read (conn)
+  "What the loop does after BODY-RESUME: the writable wake-up it armed,
+   whose :READ-BODY arm asks for a read, and the read."
+  (when (eq (web-skeleton::handle-client-write conn 999) :keep-alive)
+    (web-skeleton::handle-client-read conn 999 nil nil)))
+
+(defun test-received-body-pause-within-a-run ()
+  "A plan's feed that takes a run only partway and pauses there leaves the
+   rest of the run buffered, and the read after BODY-RESUME hands it over
+   first: every byte reaches the feed once and in order, a Content-Length
+   body and a chunked one alike, and while the pause holds nothing more is
+   handed over. A pause short of the body's last byte holds ON-END back,
+   since the body has not all been taken.
+
+   The feed is built by hand. RECEIVE-BODY's own takes every run whole;
+   RECEIVE-MULTIPART's is where a pause inside a run comes from in
+   practice, but the mechanism is the read path's, and is tested as that."
+  (format t "~%Received body: a pause inside a run~%")
+  (dolist (framing '(:length :chunked))
+    (let* ((body (let ((v (make-array 3000 :element-type '(unsigned-byte 8))))
+                   (dotimes (i 3000 v) (setf (aref v i) (mod (* i 7) 251)))))
+           (taken (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+           (calls 0)
+           (while-paused 0)
+           (paused nil)
+           (ended nil)
+           (kernel (%kernel))
+           (name (string-downcase (symbol-name framing))))
+      (with-read-fn-connection (conn kernel)
+        (let ((web-skeleton::*body-handler*
+                (lambda (req)
+                  (declare (ignore req))
+                  (web-skeleton::%make-body-plan
+                   :kind :receive :max-size most-positive-fixnum
+                   :feed (lambda (c buf from to)
+                           (declare (ignore c))
+                           (when paused (incf while-paused))
+                           (incf calls)
+                           ;; Half of every run of two bytes or more, and a
+                           ;; pause there; a run of one is taken whole.
+                           (let ((upto (if (>= (- to from) 2)
+                                           (+ from (floor (- to from) 2))
+                                           to)))
+                             (loop for i from from below upto
+                                   do (vector-push-extend (aref buf i) taken))
+                             (if (< upto to)
+                                 (progn (setf paused t) (values :pause upto))
+                                 (values nil to))))
+                   :on-end (lambda (c) (declare (ignore c))
+                             (setf ended t)
+                             (make-text-response 200 "ok"))))))
+          (%supply kernel (format nil "POST /u HTTP/1.1~aHost: x~a~a~a"
+                                  *crlf* *crlf*
+                                  (if (eq framing :length)
+                                      (format nil "Content-Length: ~d~a" (length body) *crlf*)
+                                      (format nil "Transfer-Encoding: chunked~a" *crlf*))
+                                  *crlf*))
+          (%supply kernel (if (eq framing :length)
+                              body
+                              (concatenate '(vector (unsigned-byte 8))
+                                           (sb-ext:string-to-octets
+                                            (format nil "~x~a" (length body) *crlf*)
+                                            :external-format :ascii)
+                                           body
+                                           (sb-ext:string-to-octets
+                                            (format nil "~a0~a~a" *crlf* *crlf* *crlf*)
+                                            :external-format :ascii))))
+          (web-skeleton::handle-client-read conn 999 nil nil)
+          (check (format nil "~a: the first run, halved, and then a pause" name)
+                 (list calls (fill-pointer taken) (web-skeleton::connection-body-paused conn))
+                 (list 1 (floor (length body) 2) t))
+          (check (format nil "~a: paused, it is subscribed to nothing" name)
+                 (first epoll-masks) web-skeleton::+epollet+)
+          ;; A stale event changes nothing while the pause holds.
+          (web-skeleton::handle-client-read conn 999 nil nil)
+          (check (format nil "~a: nothing is handed over while paused" name)
+                 (list calls while-paused) '(1 0))
+          ;; Resume until done: each resume hands over the rest of the run the
+          ;; pause fell in, first.
+          (loop repeat 40
+                until ended
+                do (setf paused nil)
+                   (body-resume conn)
+                   (%resume-and-read conn))
+          (check (format nil "~a: every byte, once, in order" name)
+                 (equalp (coerce taken '(simple-array (unsigned-byte 8) (*))) body) t)
+          (check (format nil "~a: ON-END only once all of it was taken" name)
+                 (list ended (web-skeleton::connection-body-received conn))
+                 (list t (length body)))
+          (check (format nil "~a: never called while a pause held" name)
+                 while-paused 0))))))
+
+(defun test-receive-multipart-pauses-where-it-falls ()
+  "A received form's pause holds the body at the event that asked for it,
+   inside a read as well as at its end: nothing more of the body is parsed
+   and no callback is called until BODY-RESUME, and then the parse goes on
+   from that event.
+
+   The whole form arrives in one read, so every pause falls inside it. The
+   first part's :ON-PART-END pauses with the second part in the same
+   buffer; the streamed part's first run pauses; and the last part's
+   :ON-PART-END pauses with the close delimiter's CRLF still unread, which
+   holds :ON-END back."
+  (format t "~%receive-multipart: a pause holds where it falls~%")
+  (let* ((events '())
+         (paused nil)
+         (while-paused 0)
+         (answered nil)
+         (aborted '())
+         (kernel (%kernel))
+         (file (let ((v (make-array 2000 :element-type '(unsigned-byte 8))))
+                 (dotimes (i 2000 v) (setf (aref v i) (mod (* i 13) 256)))))
+         (got-file (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+         (form (concatenate '(vector (unsigned-byte 8))
+                            (sb-ext:string-to-octets
+                             (%form "--B0und"
+                                    "Content-Disposition: form-data; name=\"token\""
+                                    "" "t0k"
+                                    "--B0und"
+                                    "Content-Disposition: form-data; name=\"up\"; filename=\"x.bin\""
+                                    "" "")
+                             :external-format :latin-1)
+                            file
+                            (sb-ext:string-to-octets
+                             (%form "" "--B0und"
+                                    "Content-Disposition: form-data; name=\"note\""
+                                    "" "last"
+                                    "--B0und--"
+                                    "")
+                             :external-format :latin-1))))
+    (flet ((note (&rest event)
+             (when paused (incf while-paused))
+             (push event events)))
+      (with-read-fn-connection (conn kernel)
+        (let ((web-skeleton::*body-handler*
+                (lambda (req)
+                  (receive-multipart
+                   req
+                   :on-part (lambda (c part)
+                              (declare (ignore c))
+                              (note :part (form-part-name part))
+                              (if (form-part-filename part) :stream nil))
+                   :on-part-data (lambda (c part bytes)
+                                   (declare (ignore c part))
+                                   (note :data (length bytes))
+                                   (loop for b across bytes do (vector-push-extend b got-file))
+                                   ;; The first run of the file pauses.
+                                   (when (= (fill-pointer got-file) (length bytes))
+                                     (setf paused t)
+                                     :pause))
+                   :on-part-end (lambda (c part)
+                                  (declare (ignore c))
+                                  (note :part-end (form-part-name part))
+                                  (when (member (form-part-name part) '("token" "note")
+                                                :test #'string=)
+                                    (setf paused t)
+                                    :pause))
+                   :on-end (lambda (c parts)
+                             (declare (ignore c))
+                             (note :end (mapcar #'form-part-text parts))
+                             (setf answered t)
+                             (make-text-response 200 "stored"))
+                   :on-abort (lambda (c reason) (declare (ignore c)) (push reason aborted))))))
+          (%supply kernel (format nil "POST /f HTTP/1.1~aHost: x~a~
+                                       Content-Type: multipart/form-data; boundary=B0und~a~
+                                       Content-Length: ~d~a~a"
+                                  *crlf* *crlf* *crlf* (length form) *crlf* *crlf*))
+          (%supply kernel form)
+          (web-skeleton::handle-client-read conn 999 nil nil)
+          (check "paused: the first part's end pauses, the second part still unread"
+                 (reverse events) '((:part "token") (:part-end "token")))
+          (web-skeleton::handle-client-read conn 999 nil nil)
+          (check "paused: a stale read changes nothing" (length events) 2)
+          (setf paused nil)
+          (body-resume conn)
+          (%resume-and-read conn)
+          (check "paused: resumed, the file's head and its first run, and a pause"
+                 (mapcar #'first (subseq (reverse events) 2)) '(:part :data))
+          (setf paused nil)
+          (body-resume conn)
+          (%resume-and-read conn)
+          (check "paused: resumed, the rest to the last part's end, which pauses"
+                 (list (car events) answered)
+                 '((:part-end "note") nil))
+          (check "paused: with the close delimiter's line still unread, ON-END waits"
+                 (< (web-skeleton::connection-body-received conn) (length form)) t)
+          (setf paused nil)
+          (body-resume conn)
+          (%resume-and-read conn)
+          (check "paused: resumed once more, ON-END answers"
+                 (list answered (first (car events))) '(t :end))
+          (check "paused: the file arrived whole and in order"
+                 (equalp (coerce got-file '(simple-array (unsigned-byte 8) (*))) file) t)
+          (check "paused: ON-END had the collected fields, and not the streamed file"
+                 (second (find :end events :key #'first)) '("t0k" "last"))
+          (check "paused: no callback ran while a pause held" while-paused 0)
+          (check "paused: and nothing was aborted" aborted nil))))))
+
 (defun test-body-handler-validated-at-boot ()
   "START-SERVER refuses a :BODY-HANDLER it could not call, and a
    *BODY-STALL-TIMEOUT* that would leave an accepted body with no time
@@ -12725,6 +13372,11 @@
   (test-body-decision-rereads-under-its-cap)
   (test-received-body-window-and-yield)
   (test-body-resume-and-refuse-contract)
+  (test-received-body-pause-within-a-run)
+  (test-multipart-content-type)
+  (test-multipart-parse)
+  (test-receive-multipart-contract)
+  (test-receive-multipart-pauses-where-it-falls)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)

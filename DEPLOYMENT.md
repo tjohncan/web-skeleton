@@ -206,6 +206,7 @@ specific status, not a blanket 400:
 |------|-----------|
 | `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and malformed chunked framing — a size line outside the grammar, chunk data not followed by its CRLF — which the completion walk refuses as soon as the bytes that show it have arrived, the decoder and the walk accepting exactly the same framing |
 | `413 Payload Too Large` | Body over its cap — `*max-body-size*`, or the one a body handler chose for the request — `Content-Length` over fifteen digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
+| `400`, `413`, `415` from a form | `parse-multipart` or `receive-multipart` reading a request the application asked it to: `415 Unsupported Media Type` for a `Content-Type` that is not `multipart/form-data` — from a body handler, before any of the body is read — `400` for a body that is not one as the parser reads it, `413` past one of its limits. See "Forms and file uploads" |
 | `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
@@ -1892,6 +1893,175 @@ and answers the request from `:on-end`:
   with a fetch too, for the last part or the call that completes the
   upload.
 
+### Forms and file uploads
+
+A form with a file input is sent as `multipart/form-data`: a run of
+parts, each a few header fields and its content, divided by a boundary the
+browser chose and named in the `Content-Type`. There are two ways to read
+one, and they are one parser.
+
+**Read whole, from the handler.** The body is buffered under its request's
+cap, and `parse-multipart` returns the parts:
+
+```lisp
+(defun handle-request (request)
+  (let* ((parts (parse-multipart request))
+         (title (form-part-text (find-form-part parts "title")))
+         (photo (find-form-part parts "photo")))
+    (store-photo (form-part-body photo))
+    (make-text-response 201 title)))
+```
+
+- **A part** is a `form-part`. `form-part-name` is the field's name.
+  `form-part-filename` is `nil` for a text field, and `""` for a file
+  input with no file chosen. `form-part-content-type` is the part's type as
+  sent, or `nil`. `form-part-headers` holds every field of the part's head,
+  and `form-part-body` its content.
+- **`form-part-text`** decodes a part as UTF-8, which is what a browser
+  sends from a page served as UTF-8, and raises 400 for bytes that are not.
+  `find-form-part` finds the first part of a name, and `find-form-parts`
+  all of them, for a file input that takes several files.
+- **It raises `http-parse-error`.** The status is 415 for a `Content-Type`
+  that is not `multipart/form-data`, 400 for a body that is not one, and
+  413 past a limit. Let it go and the framework answers with that status.
+  Catch it to answer otherwise.
+- **The cost is the body twice.** The body is held under the request's cap
+  — `*max-body-size*`, or `buffer-body`'s from a body handler — and the
+  parts are copied out of it. `:max-parts` (1000) and `:max-part-head-size`
+  (16 KiB) bound the rest.
+
+**Read as it arrives, from a body handler.** `receive-multipart` parses the
+body a read at a time: the fields you collect are held and handed to
+`:on-end`, and the files you stream go to `:on-part-data` and are never
+held.
+
+```lisp
+(defun decide-body (request)
+  (when (string= (http-request-path request) "/upload")
+    (let ((out nil))
+      (receive-multipart
+       request
+       :max-size (* 4 1024 1024 1024)                       ; the whole body
+       :on-part (lambda (conn part)
+                  (declare (ignore conn))
+                  (cond ((null (form-part-filename part)) nil) ; a field: collect it
+                        ((string= (form-part-name part) "file")
+                         (setf out (open (fresh-upload-path) :direction :output
+                                                             :element-type '(unsigned-byte 8)))
+                         :stream)
+                        (t (make-error-response 400))))        ; nothing else is wanted
+       :on-part-data (lambda (conn part bytes)
+                       (declare (ignore conn part))
+                       (write-sequence bytes out)
+                       nil)
+       :on-part-end (lambda (conn part)
+                      (declare (ignore conn))
+                      (when (form-part-filename part)
+                        (close out)
+                        (setf out nil))
+                      nil)
+       :on-end (lambda (conn parts)
+                 (declare (ignore conn))
+                 (make-text-response
+                  201 (form-part-text (find-form-part parts "title"))))
+       :on-abort (lambda (conn reason)
+                   (declare (ignore conn reason))
+                   (when out (close out :abort t)))))))
+```
+
+- **`:on-part (conn part)`** is called when a part's head has arrived, with
+  no body yet. It answers `nil` to collect the part, `:stream` to have its
+  content handed to `:on-part-data`, or a response to refuse the body,
+  which is sent with the connection closed after it. Anything else is an
+  error, so a misspelt `:stream` does not quietly collect a file. Without
+  `:on-part`, every part is collected.
+- **`:on-part-data (conn part bytes)`** gets the next run of a streamed
+  part, in a fresh vector. It answers as `receive-body`'s `:on-data` does:
+  `:pause`, a response, or anything else to go on.
+- **`:on-part-end (conn part)`** is called for every part, a collected one
+  with its body set. A field sent before the file — a CSRF token, the id of
+  the record the file belongs to — can refuse the body here, before any of
+  the file is read. It answers as `:on-part-data` does.
+- **`:on-end (conn parts)`** gets the collected parts in the order they
+  were sent, and answers the request in any shape `:handler` may.
+- **`:on-abort (conn reason)`** is `receive-body`'s, heard once. `:malformed`
+  (400) covers a body that is not `multipart/form-data` as the parser reads
+  it, and `:too-large` (413) covers every limit.
+- **Its limits.** `:max-size` caps the whole body, as `receive-body`'s
+  does. `:max-parts` (1000) and `:max-part-head-size` (16 KiB) are
+  `parse-multipart`'s. `:max-collected-size` caps what is held for
+  `:on-end`, the heads and content of the collected parts, at
+  `*max-body-size*` by default. That last one keeps the memory a received
+  form costs known, whatever `:max-size` allows. A part's head is also held
+  to sixteen fields.
+- **Refused at the head.** `receive-multipart` reads the `Content-Type`
+  when the body handler calls it, and raises there for a request that is
+  not a form. The request is answered 415 before any of its body is read,
+  and a client that sent `Expect: 100-continue` is never told to send it.
+- **A pause holds where it falls.** `:pause` from `:on-part-data` or
+  `:on-part-end` stops the parse at that event, even partway through a
+  read: no more of the body is parsed and no callback runs until
+  `body-resume`. A pause on the last part's end holds `:on-end` back. This
+  is how a file goes on to object storage a piece at a time:
+
+  ```lisp
+  :on-part-data (lambda (conn part bytes)
+                  (declare (ignore part))
+                  (collect bytes)                     ; into the next piece
+                  (when (piece-full-p)
+                    (fetch-into conn
+                                (http-fetch :put (next-piece-url) :body (take-piece)
+                                            :then (lambda (status headers body)
+                                                    (declare (ignore headers body))
+                                                    (if (eql status 200)
+                                                        (body-resume conn)
+                                                        (body-refuse conn (make-error-response 502))))))
+                    :pause))
+  ```
+
+  `:on-part-end` sends the file's last piece the same way, and `:on-end`
+  can answer with the fetch that completes the upload. A `:then` that finds
+  another full piece already collected can send it at once with another
+  `fetch-into` before it resumes. The fetch's own marker is released before
+  `:then` runs.
+
+**What is accepted, and what is refused.** One parser serves both
+functions. Where the format leaves room for two readings, it refuses the
+body rather than choosing one, because a filter in front of the
+application that chose the other reading would see different fields.
+
+- A line that begins with the boundary is a delimiter, or the body is
+  refused. It is never content. RFC 2046 matches the boundary against the
+  start of a line, so `--BOUNDARYxyz` is a malformed delimiter, not data.
+- Every line the format defines ends in CRLF.
+- A part has exactly one `Content-Disposition`, of type `form-data`, with
+  one name and at most one filename. It has at most one `Content-Type`.
+  The extended `filename*` is refused: RFC 7578 §4.2 forbids it, and beside
+  a `filename` it would be two names for one file.
+- A `Content-Transfer-Encoding` other than `7bit`, `8bit` or `binary` is
+  refused. None of those three changes the bytes, and RFC 7578 §4.7 says
+  no deployed sender uses another.
+- What the format says to ignore is ignored: a preamble before the first
+  boundary, transport padding after one, an epilogue after the last. A
+  part's other header fields are kept in its headers and otherwise
+  ignored.
+- A form with no fields is the close delimiter alone, which is what
+  browsers send for one, and it reads as no parts.
+
+**Names and filenames are returned as the browser sent them.** A quoted
+value is the characters between its quotes, and a backslash is an ordinary
+character, as in a Windows path. Browsers write a quote as `%22`, CR as
+`%0D` and LF as `%0A`, but leave `%` itself alone, so those escapes cannot
+be undone reliably and are not undone.
+
+**A filename is a label, not a path.** Browsers send a file's base name.
+For a folder upload (`<input type=file webkitdirectory>`) they send the
+path below the chosen folder, `photos/2026/a.jpg`. Either way the text is
+the client's. Name the stored file yourself. Where the client's path
+matters, check every segment of it before any of it names something on
+disk: no empty segment, no `.` or `..`, no backslash, no NUL, nothing that
+reads as a drive.
+
 ### Form body decoding
 
 `parse-query-string` and `get-query-param` decode `+` as space
@@ -1907,6 +2077,8 @@ For POST bodies with this content type, parse directly:
 
 Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path decoding).
 The form-aware decoding is in `parse-query-string` and `form-decode`.
+A form with a file input sends `multipart/form-data` instead; see
+"Forms and file uploads".
 
 ### Testing your handlers
 

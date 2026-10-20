@@ -5947,6 +5947,470 @@
         (handler-case (sb-thread:join-thread thread :timeout 10)
           (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
 
+(defun %multipart-body (boundary parts &key (close t))
+  "A multipart/form-data body as a browser writes one: PARTS, each
+   (NAME FILENAME CONTENT) with CONTENT a string or bytes and FILENAME NIL
+   for a text field, divided by BOUNDARY. CLOSE NIL leaves the close
+   delimiter off, for a body that ends too soon. Bytes."
+  (let ((pieces '()))
+    (flet ((emit (x)
+             (push (if (stringp x) (sb-ext:string-to-octets x :external-format :utf-8) x)
+                   pieces)))
+      (dolist (part parts)
+        (destructuring-bind (name filename content) part
+          (emit (format nil "--~a~a" boundary *crlf*))
+          (emit (format nil "Content-Disposition: form-data; name=\"~a\"~@[; filename=\"~a\"~]~a"
+                        name filename *crlf*))
+          (when filename
+            (emit (format nil "Content-Type: application/octet-stream~a" *crlf*)))
+          (emit *crlf*)
+          (emit content)
+          (emit *crlf*)))
+      (when close
+        (emit (format nil "--~a--~a" boundary *crlf*))))
+    (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) (nreverse pieces))))
+
+(defun %form-post (path boundary body &key chunk-size (headers '()))
+  "A POST of the multipart BODY to PATH: framed by Content-Length, or
+   chunked in CHUNK-SIZE pieces. Bytes, ready to send."
+  (concatenate
+   '(simple-array (unsigned-byte 8) (*))
+   (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~
+                        Content-Type: multipart/form-data; boundary=~a~a~
+                        ~:[Content-Length: ~d~;Transfer-Encoding: chunked~*~]~a~
+                        ~{~a~a~}~a"
+                   path *crlf* *crlf* boundary *crlf*
+                   chunk-size (length body) *crlf*
+                   (loop for h in headers append (list h *crlf*))
+                   *crlf*))
+   (if chunk-size
+       (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+              (append
+               (loop for at from 0 below (length body) by chunk-size
+                     for to = (min (length body) (+ at chunk-size))
+                     collect (%ascii (format nil "~x~a" (- to at) *crlf*))
+                     collect (subseq body at to)
+                     collect (%ascii *crlf*))
+               (list (%ascii (format nil "0~a~a" *crlf* *crlf*)))))
+       body)))
+
+(defun test-harness-receive-multipart-e2e ()
+  "A form received as it arrives, end to end: its text fields collected
+   and handed to :ON-END, its file streamed and never held, and every way
+   such a body can be refused answered with its status and heard once by
+   :ON-ABORT with its reason.
+
+   The body handler receives every path that starts /form. :ON-PART
+   collects a part with no filename and streams one with a filename,
+   whose runs are kept and hashed at :ON-PART-END; :ON-END answers with
+   the fields and each file's name, length and SHA-256, so a file that
+   arrives reordered, short or doubled answers wrongly. The other paths
+   each fail one way, and :ON-ABORT records the path and the reason."
+  (format t "~%Harness: a form received as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "multipart-e2e"))
+         (aborts nil)
+         (seen nil)
+         (widest 0)
+         (boundary "----FormBoundary7MA4YWxkTrZu0gW")
+         (file (%pseudo-random-bytes (* 3 1024 1024) 41))
+         ;; The answer is UTF-8, and %RAW-EXCHANGE reads it as Latin-1.
+         (expected (sb-ext:octets-to-string
+                    (sb-ext:string-to-octets
+                     (format nil "fields:title=hello,note=Zoë;files:upload:~d:~a"
+                             (length file) (%sha256-hex file))
+                     :external-format :utf-8)
+                    :external-format :latin-1)))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r)))
+           (parts-seen (path)
+             (sb-thread:with-mutex (lock)
+               (reverse (loop for (p . n) in seen when (string= p path) collect n))))
+           (answer-of (bytes) (%raw-exchange bytes :seconds 20)))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (if (string= (http-request-path req) "/parsed")
+                 ;; The buffered path: the body read whole, then parsed.
+                 ;; A raise is the request's answer, with its status.
+                 (make-text-response
+                  200 (format nil "parsed:~{~a~^,~}"
+                              (mapcar (lambda (p) (format nil "~a=~a" (form-part-name p)
+                                                          (length (form-part-body p))))
+                                      (parse-multipart req))))
+                 (make-text-response 200 (format nil "handler:~a" (http-request-path req)))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (when (eql 0 (search "/form" path))
+                 (let ((files '())
+                       (current nil)
+                       (runs 0))
+                   (receive-multipart
+                    req
+                    :max-size (* 64 1024 1024)
+                    :max-parts (if (string= path "/form-few") 2 1000)
+                    :max-collected-size (if (string= path "/form-small") 100 (* 1024 1024))
+                    :on-part
+                    (lambda (conn part)
+                      (declare (ignore conn))
+                      (sb-thread:with-mutex (lock) (push (cons path (form-part-name part)) seen))
+                      (cond
+                        ((and (string= path "/form-strict")
+                              (string= (form-part-name part) "evil"))
+                         (make-text-response 422 "unexpected field"))
+                        ((form-part-filename part)
+                         (setf current (make-array 0 :element-type '(unsigned-byte 8)
+                                                     :adjustable t :fill-pointer 0))
+                         :stream)
+                        (t nil)))
+                    :on-part-data
+                    (lambda (conn part bytes)
+                      (declare (ignore part))
+                      ;; From the second run on, the buffer is the head and
+                      ;; one window; the first can arrive in the buffer a
+                      ;; read filled before the plan was decided.
+                      (when (> (incf runs) 1)
+                        (sb-thread:with-mutex (lock)
+                          (setf widest (max widest (length (web-skeleton::connection-read-buf conn))))))
+                      (loop for b across bytes do (vector-push-extend b current))
+                      nil)
+                    :on-part-end
+                    (lambda (conn part)
+                      (declare (ignore conn))
+                      (cond
+                        ((form-part-filename part)
+                         (push (format nil "~a:~d:~a" (form-part-name part)
+                                       (fill-pointer current) (%sha256-hex current))
+                               files)
+                         nil)
+                        ;; A field that decides whether the rest is wanted.
+                        ((and (string= (form-part-name part) "token")
+                              (not (equal (form-part-text part) "good")))
+                         (make-text-response 403 "bad token"))
+                        (t nil)))
+                    :on-end
+                    (lambda (conn parts)
+                      (declare (ignore conn))
+                      (make-text-response
+                       200 (format nil "fields:~{~a~^,~};files:~{~a~^,~}"
+                                   (mapcar (lambda (p) (format nil "~a=~a" (form-part-name p)
+                                                               (form-part-text p)))
+                                           parts)
+                                   (reverse files))))
+                    :on-abort
+                    (lambda (conn reason)
+                      (declare (ignore conn))
+                      (sb-thread:with-mutex (lock) (push (cons path reason) aborts)))))))))
+        (let ((form (%multipart-body boundary `(("title" nil "hello")
+                                                 ("upload" "data.bin" ,file)
+                                                 ("note" nil "Zoë")))))
+          ;; ---- received whole, in order, the file never held ----
+          (check "form: fields collected, the file streamed whole and in order"
+                 (and (search expected (answer-of (%form-post "/form" boundary form
+                                                              :headers '("Connection: close"))))
+                      t)
+                 t)
+          (check "form: the read buffer held the head and one window"
+                 (<= widest (+ 400 web-skeleton::+receive-window+)) t)
+          (check "form: and chunked, in pieces that cut the parts anywhere"
+                 (and (search expected (answer-of (%form-post "/form" boundary form
+                                                              :chunk-size 50003
+                                                              :headers '("Connection: close"))))
+                      t)
+                 t)
+          (check "form: nothing aborted the bodies that ended well" (aborted "/form") nil))
+        ;; ---- keep-alive after a received form ----
+        (let ((answer (answer-of
+                       (concatenate '(simple-array (unsigned-byte 8) (*))
+                                    (%form-post "/form-keep" boundary
+                                                (%multipart-body boundary '(("a" nil "1"))))
+                                    (%ascii (format nil "GET /after HTTP/1.1~aHost: x~a~
+                                                         Connection: close~a~a"
+                                                    *crlf* *crlf* *crlf* *crlf*))))))
+          (check "form: the request after a received form is served"
+                 (and (search "fields:a=1;files:" answer) (search "handler:/after" answer) t)
+                 t))
+        ;; ---- refused, each with its reason ----
+        (check "few: more parts than :max-parts is 413"
+               (and (search "HTTP/1.1 413"
+                            (answer-of (%form-post "/form-few" boundary
+                                                   (%multipart-body boundary '(("a" nil "1") ("b" nil "2")
+                                                                               ("c" nil "3"))))))
+                    t)
+               t)
+        (check "few: :on-abort heard :too-large" (aborted "/form-few") '(:too-large))
+        (check "small: collected fields past :max-collected-size are 413"
+               (and (search "HTTP/1.1 413"
+                            (answer-of (%form-post "/form-small" boundary
+                                                   (%multipart-body
+                                                    boundary `(("a" nil ,(make-string 200 :initial-element #\a)))))))
+                    t)
+               t)
+        (check "small: :on-abort heard :too-large" (aborted "/form-small") '(:too-large))
+        (check "strict: :on-part's answer refuses the body"
+               (and (search "HTTP/1.1 422"
+                            (answer-of (%form-post "/form-strict" boundary
+                                                   (%multipart-body boundary '(("token" nil "good")
+                                                                               ("evil" nil "x"))))))
+                    t)
+               t)
+        (check "strict: :on-abort heard :refused" (aborted "/form-strict") '(:refused))
+        (check "token: a field's :on-part-end refuses the body before the file"
+               (and (search "HTTP/1.1 403"
+                            (answer-of (%form-post "/form-token" boundary
+                                                   (%multipart-body boundary
+                                                                    `(("token" nil "bad")
+                                                                      ("upload" "big.bin" ,file))))))
+                    t)
+               t)
+        (check "token: :on-abort heard :refused" (aborted "/form-token") '(:refused))
+        (check "token: and the file part was never begun"
+               (parts-seen "/form-token") '("token"))
+        (check "malformed: a line beginning with the boundary that is not a delimiter is 400"
+               (and (search "HTTP/1.1 400"
+                            (answer-of (%form-post "/form-bad" boundary
+                                                   (concatenate
+                                                    '(simple-array (unsigned-byte 8) (*))
+                                                    (%multipart-body boundary '(("a" nil "1")) :close nil)
+                                                    (%ascii (format nil "--~aX~a" boundary *crlf*))))))
+                    t)
+               t)
+        (check "malformed: :on-abort heard :malformed" (aborted "/form-bad") '(:malformed))
+        (check "truncated: a body that ends before its close delimiter is 400"
+               (and (search "HTTP/1.1 400"
+                            (answer-of (%form-post "/form-short" boundary
+                                                   (%multipart-body boundary '(("a" nil "1")) :close nil))))
+                    t)
+               t)
+        (check "truncated: :on-abort heard :malformed" (aborted "/form-short") '(:malformed))
+        ;; ---- not a form: refused at the head ----
+        (let ((answer (%raw-exchange
+                       (%ascii (format nil "POST /form-type HTTP/1.1~aHost: x~a~
+                                            Content-Type: text/plain~a~
+                                            Content-Length: 4096~aExpect: 100-continue~a~a"
+                                       *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+                       :half-close nil)))
+          (check "type: a body that is not multipart/form-data is 415, before it is read"
+                 (list (search "HTTP/1.1 415" answer) (search "100 Continue" answer))
+                 '(0 nil)))
+        (check "type: no plan was accepted, so :on-abort heard nothing"
+               (sb-thread:with-mutex (lock) (assoc "/form-type" aborts :test #'string=))
+               nil)
+        ;; ---- buffered, and parsed by :handler ----
+        (check "parsed: a buffered form, parsed in :handler"
+               (and (search "parsed:a=1,f=4"
+                            (%raw-exchange (%form-post "/parsed" boundary
+                                                       (%multipart-body boundary '(("a" nil "1")
+                                                                                   ("f" "f.txt" "four")))
+                                                       :headers '("Connection: close"))))
+                    t)
+               t)
+        (check "parsed: a body that is not a form is answered 415 from the raise"
+               (and (search "HTTP/1.1 415" (%raw-exchange (%post-bytes "/parsed" "a=1"
+                                                                       :headers '("Content-Type: text/plain"))))
+                    t)
+               t)
+        (check "parsed: a malformed form is answered 400 from the raise"
+               (and (search "HTTP/1.1 400"
+                            (%raw-exchange (%form-post "/parsed" boundary
+                                                       (%multipart-body boundary '(("a" nil "1"))
+                                                                        :close nil))))
+                    t)
+               t)))))
+
+(defun test-harness-receive-multipart-paused-e2e ()
+  "A form whose file is forwarded upstream a piece at a time as it
+   arrives, the shape of a file ferried on to object storage: when a full
+   piece has been collected, a fetch carries it with FETCH-INTO and the
+   body pauses. The fetch's :THEN sends the next full piece if one is
+   already collected, and otherwise resumes the body; the file's
+   :ON-PART-END sends what is left. A text field after the file is read
+   once that last piece is stored. However the reads cut the body, the
+   pieces fall on the same boundaries, and a read that brings several of
+   them pauses inside itself.
+
+   The upstream is the test server's own /store. What is checked: every
+   piece arrives, in order, together the file; the field after the file
+   reaches :ON-END; and no callback is called while a pause holds."
+  (format t "~%Harness: a form's file forwarded upstream as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "multipart-paused-e2e"))
+         (stored nil)
+         (paused nil)
+         (while-paused 0)
+         (port-box (list nil))
+         (piece-size (* 128 1024))
+         (boundary "x7YqL")
+         (file (%pseudo-random-bytes (+ (* 5 piece-size) 777) 43)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/store")
+               (progn
+                 (sb-thread:with-mutex (lock)
+                   (push (copy-seq (http-request-body req)) stored))
+                 (make-text-response 200 "stored"))
+               (make-error-response 404)))
+         :body-handler
+         (lambda (req)
+           (when (string= (http-request-path req) "/upload")
+             (let ((piece (make-array 0 :element-type '(unsigned-byte 8)
+                                        :adjustable t :fill-pointer 0))
+                   (file-ended nil)
+                   (pieces 0))
+               (labels ((take (k)
+                          ;; The first K bytes collected, removed.
+                          (let ((head (subseq piece 0 k))
+                                (rest (subseq piece k)))
+                            (setf (fill-pointer piece) 0)
+                            (loop for b across rest do (vector-push-extend b piece))
+                            (coerce head '(simple-array (unsigned-byte 8) (*)))))
+                        (next-piece ()
+                          ;; A full piece, or once the file has ended what is left.
+                          (let ((n (fill-pointer piece)))
+                            (cond ((>= n piece-size) (take piece-size))
+                                  ((and file-ended (plusp n)) (take n)))))
+                        (send (conn bytes)
+                          (incf pieces)
+                          (fetch-into conn
+                                      (http-fetch :put (format nil "http://127.0.0.1:~d/store"
+                                                               (first port-box))
+                                                  :body bytes
+                                                  :then (lambda (status headers b)
+                                                          (declare (ignore headers b))
+                                                          (if (eql status 200)
+                                                              (let ((more (next-piece)))
+                                                                (if more
+                                                                    (send conn more)
+                                                                    (progn (setf paused nil)
+                                                                           (body-resume conn))))
+                                                              (progn (setf paused nil)
+                                                                     (body-refuse conn (make-error-response 502))))
+                                                          nil))))
+                        (send-if-due (conn)
+                          (let ((due (next-piece)))
+                            (when due
+                              (setf paused t)
+                              (send conn due)
+                              :pause)))
+                        (note-call ()
+                          (when paused (incf while-paused))))
+                 (receive-multipart
+                  req
+                  :max-size nil
+                  :on-part (lambda (conn part)
+                             (declare (ignore conn))
+                             (note-call)
+                             (if (form-part-filename part) :stream nil))
+                  :on-part-data (lambda (conn part bytes)
+                                  (declare (ignore part))
+                                  (note-call)
+                                  (loop for b across bytes do (vector-push-extend b piece))
+                                  (send-if-due conn))
+                  :on-part-end (lambda (conn part)
+                                 (note-call)
+                                 (when (form-part-filename part)
+                                   (setf file-ended t)
+                                   (send-if-due conn)))
+                  :on-end (lambda (conn parts)
+                            (declare (ignore conn))
+                            (note-call)
+                            (make-text-response
+                             200 (format nil "pieces:~d;fields:~{~a~^,~}" pieces
+                                         (mapcar #'form-part-text parts))))))))))
+      (setf (first port-box) *test-port*)
+      (let* ((form (%multipart-body boundary `(("before" nil "1")
+                                                ("file" "f.bin" ,file)
+                                                ("after" nil "2"))))
+             (answer (%raw-exchange (%form-post "/upload" boundary form
+                                                :headers '("Connection: close"))
+                                    :seconds 20)))
+        (check "paused form: answered after the file's last piece, with the field after it"
+               (and (search "pieces:6;fields:1,2" answer) t) t)
+        (let ((pieces (reverse (sb-thread:with-mutex (lock) stored))))
+          (check "paused form: every piece reached the upstream" (length pieces) 6)
+          (check "paused form: in order, together the file"
+                 (%sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
+                 (%sha256-hex file)))
+        (check "paused form: no callback was called while a pause held" while-paused 0)))))
+
+(defun test-harness-body-refused-from-inside-its-callback-e2e ()
+  "A callback that calls BODY-REFUSE itself, where returning its response
+   was the documented way, ends the body there: the client gets that
+   response, :ON-ABORT hears :REFUSED once, and nothing more of the body is
+   handed over — RECEIVE-BODY's :ON-DATA and RECEIVE-MULTIPART's
+   :ON-PART-DATA alike, the second with more parts in the same read."
+  (format t "~%Harness: a body refused from inside its own callback~%")
+  (let ((lock (sb-thread:make-mutex :name "refuse-inside-e2e"))
+        (aborts nil)
+        (calls nil))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (flet ((abort-note (conn reason)
+                        (declare (ignore conn))
+                        (sb-thread:with-mutex (lock) (push (cons path reason) aborts)))
+                      (call-note (what)
+                        (sb-thread:with-mutex (lock) (push (cons path what) calls))))
+                 (if (string= path "/raw")
+                     (receive-body
+                      :on-data (lambda (conn bytes)
+                                 (declare (ignore bytes))
+                                 (call-note :data)
+                                 (body-refuse conn (make-text-response 403 "refused inside"))
+                                 nil)
+                      :on-end (lambda (conn) (declare (ignore conn))
+                                (call-note :end)
+                                (make-text-response 200 "unexpected"))
+                      :on-abort #'abort-note)
+                     (receive-multipart
+                      req
+                      :on-part (lambda (conn part) (declare (ignore conn))
+                                 (call-note (form-part-name part))
+                                 :stream)
+                      :on-part-data (lambda (conn part bytes)
+                                      (declare (ignore part bytes))
+                                      (body-refuse conn (make-text-response 403 "refused inside"))
+                                      nil)
+                      :on-end (lambda (conn parts) (declare (ignore conn parts))
+                                (call-note :end)
+                                (make-text-response 200 "unexpected"))
+                      :on-abort #'abort-note))))))
+        (check "inside, receive-body: the client gets the callback's response"
+               (and (search "HTTP/1.1 403" (%raw-exchange (%post-bytes "/raw" "abcdef")))
+                    t)
+               t)
+        (check "inside, receive-body: :on-abort heard :refused, once" (aborted "/raw") '(:refused))
+        (check "inside, receive-body: nothing was handed over after it"
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . w) in calls when (string= p "/raw") collect w))
+               '(:data))
+        (let ((boundary "b0"))
+          (check "inside, receive-multipart: the client gets the callback's response"
+                 (and (search "HTTP/1.1 403"
+                              (%raw-exchange (%form-post "/mp" boundary
+                                                         (%multipart-body boundary
+                                                                          '(("one" "1.txt" "first")
+                                                                            ("two" "2.txt" "second"))))))
+                      t)
+                 t))
+        (check "inside, receive-multipart: :on-abort heard :refused, once" (aborted "/mp") '(:refused))
+        (check "inside, receive-multipart: the next part in the same read was never begun"
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . w) in calls when (string= p "/mp") collect w))
+               '("one"))))))
+
 (defun test-harness-body-stall-e2e ()
   "A body a body handler accepted is timed on its progress, by
    *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
@@ -6931,6 +7395,9 @@
   (test-harness-receive-body-paused-e2e)
   (test-harness-receive-body-refused-from-a-callback-e2e)
   (test-harness-paused-body-waits-on-its-fetch-e2e)
+  (test-harness-receive-multipart-e2e)
+  (test-harness-receive-multipart-paused-e2e)
+  (test-harness-body-refused-from-inside-its-callback-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)

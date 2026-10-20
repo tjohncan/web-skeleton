@@ -144,6 +144,7 @@ src/
     http.lisp          HTTP request parser, response builder, URL/query/routing
     chunked.lisp       Chunked transfer coding decoders, shared by both directions
     body.lisp          Request bodies decided at the head: per-request caps, receiving as they arrive
+    multipart.lisp     multipart/form-data: forms and file uploads, buffered or as they arrive
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
@@ -272,6 +273,20 @@ tests/
   the body handler accepted is timed on its progress, by
   `*body-stall-timeout*`, rather than as a whole, so a large upload takes as
   long as it keeps arriving. The `:handler` contract does not change
+- **Forms and file uploads** — `multipart/form-data`, read whole by
+  `parse-multipart` from `:handler`, or as it arrives by a body handler's
+  `receive-multipart`: text fields collected and handed to its `:on-end`,
+  files streamed to `:on-part-data` a run at a time and never held, so an
+  upload's size is the cap's business and the memory a form costs is
+  bounded by `:max-collected-size`. A part can be refused at its head, and a
+  field sent before a file — a token — can refuse the body before the file
+  is read. A pause from any part's callbacks holds the body where it falls,
+  which is how a file is forwarded to an upstream a piece at a time with
+  `fetch-into`. One parser serves both, and it is strict where the format
+  leaves room for two readings: a line beginning with the boundary is a
+  delimiter or a 400, never content; CRLF only; one `Content-Disposition`
+  per part with one name; no `filename*`; no `Content-Transfer-Encoding`
+  that changes the bytes. Names and filenames are returned as sent
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -551,10 +566,16 @@ read about here.
   value, and `Transfer-Encoding` on an HTTP/1.0 request are 400.
 - **No response compression.** No gzip, no `Content-Encoding`
   negotiation. Compressing static assets is the proxy's job.
-- **No HTTP/2, no multipart.** A request whose version token is not
-  HTTP/1.0 or HTTP/1.1 gets 505. Form bodies are
-  `application/x-www-form-urlencoded` only — `multipart/form-data`, and
-  therefore file upload, is unimplemented.
+- **No HTTP/2.** A request whose version token is not HTTP/1.0 or
+  HTTP/1.1 gets 505.
+- **`multipart/form-data`, and not the rest of MIME.** A
+  `Content-Transfer-Encoding` that changes the bytes and an RFC 2231
+  `filename*` are each refused with 400: reading either would mean reading
+  a body one way while a filter in front of the application may read it
+  another, and no browser sends one. A part whose own type is
+  `multipart/mixed` — how RFC 2388 sent several files under one name,
+  which RFC 7578 §4.3 retired — is not parsed into its files: it arrives as
+  one part, with that type and its content as sent.
 - **Static files are served from memory only.** `load-static-files` reads
   the tree into the heap at startup and pre-builds each response; there
   is no serve-from-disk path, so every file you serve is resident for the
