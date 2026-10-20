@@ -146,6 +146,8 @@
            ;; Request bodies, decided at the head
            #:buffer-body
            #:receive-body
+           #:body-resume
+           #:body-refuse
            ;; Streaming responses
            #:make-stream-response
            #:stream-send

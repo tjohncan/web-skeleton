@@ -85,6 +85,7 @@
                                                            "src/server/http"
                                                            "src/server/connection"))
                (:file "src/server/body" :depends-on ("src/package"
+                                                      "src/epoll"
                                                       "src/server/http"
                                                       "src/server/connection"))
                (:file "src/server/main"  :depends-on ("src/counters" "src/package"

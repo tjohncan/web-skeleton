@@ -264,6 +264,11 @@
   ;; CHUNKED-BODY-FEED's OWED between reads: the bytes of the current chunk
   ;; still to come, its data and its CRLF, or 0 at a chunk boundary.
   (body-owed 0 :type unsigned-byte)
+  ;; T while a received body's ON-DATA has asked for a pause: nothing is
+  ;; handed over, the connection is subscribed to no events, and the
+  ;; client's bytes wait in the kernel until BODY-RESUME. Cleared there,
+  ;; and by APPLY-BODY-PLAN for the next body, so it is never read stale.
+  (body-paused nil :type boolean)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
   (missed-pongs  0 :type fixnum)
@@ -642,6 +647,13 @@
         (serious-condition (e)
           (log-warn "body on-abort signalled on fd ~d (~a): ~a"
                     (connection-fd conn) reason e))))))
+
+(defun receiving-body-p (conn)
+  "True while CONN's request body is being received into a plan's ON-DATA:
+   the body has been accepted and has not yet ended."
+  (and (member (connection-state conn) '(:read-body :sending-100-continue))
+       (connection-body-receiver conn)
+       t))
 
 (defun notify-body-aborted (conn reason)
   "If CONN is receiving a body, end that with REASON: claim the plan and
@@ -1347,6 +1359,8 @@
 ;;;                    ON-END is to answer the request
 ;;;   :REFUSED       — a body being received was refused by its ON-DATA;
 ;;;                    second value: the response to send
+;;;   :PAUSED        — a body being received was paused by its ON-DATA; the
+;;;                    caller unsubscribes it until BODY-RESUME
 ;;;   :YIELD         — a body being received has more in the kernel than
 ;;;                    one wake-up hands over; the caller arms
 ;;;                    writability so the read resumes next pass
@@ -1427,6 +1441,12 @@
                  ended, for the keep-alive reset
      :REFUSED    ON-DATA answered; the second value is its response, and
                  nothing more of the body was handed over
+     :PAUSED     ON-DATA asked for a pause; nothing more was handed over,
+                 and what is still in the buffer waits there for
+                 BODY-RESUME. A pause that comes with the body's last
+                 bytes holds ON-END back too: an application pausing has
+                 said it is not ready, and the end of the body is
+                 something it must be ready for
      NIL         keep reading
 
    Raises what the body has earned instead — 413 past its cap, 400 for
@@ -1449,9 +1469,13 @@
              (incf (connection-body-received conn) (- to from))
              (let ((verdict (funcall (body-plan-on-data plan)
                                      conn (subseq buf from to))))
-               (when (typep verdict 'http-response)
-                 (setf answer verdict)
-                 :halt)))
+               (cond
+                 ((typep verdict 'http-response)
+                  (setf answer verdict)
+                  :halt)
+                 ((eq verdict :pause)
+                  (setf (connection-body-paused conn) t)
+                  :halt))))
            (refuse (reason status format-string &rest args)
              (notify-body-aborted conn reason)
              (apply #'http-reject status format-string args)))
@@ -1465,6 +1489,7 @@
              (connection-drop-read-bytes conn body-start (+ body-start take)))
            (cond
              (answer (values :refused answer))
+             ((connection-body-paused conn) :paused)
              ((= (connection-body-received conn) (connection-body-expected conn))
               ;; What is left after the body is the next request's.
               (setf (connection-request-end conn) body-start)
@@ -1500,6 +1525,11 @@
              (answer
               (connection-drop-read-bytes conn body-start next)
               (values :refused answer))
+             ;; A halt, so not COMPLETE: the chunks after the paused run
+             ;; stay in the buffer, and BODY-RESUME's read walks them first.
+             ((connection-body-paused conn)
+              (connection-drop-read-bytes conn body-start next)
+              :paused)
              (complete
               (multiple-value-bind (status offset)
                   (chunked-trailer-status buf after-size-line end)
@@ -1526,7 +1556,7 @@
   "Hand CONN's received body over as it arrives, reading again for as long
    as each read filled the window and the body is still owed, up to
    +RECEIVE-ROUNDS+ windows in one wake-up. Returns CONNECTION-DELIVER-
-   BODY's :RECEIVED or :REFUSED (with its response), or:
+   BODY's :RECEIVED, :REFUSED (with its response) or :PAUSED, or:
 
      :CONTINUE  the kernel has nothing more yet
      :CLOSE     the peer's FIN has arrived and the body is not complete
@@ -1985,6 +2015,11 @@
                   (member read-result '(:ok :ok-eof :ok-want-write)))
          (setf (connection-body-progress-at conn) (get-universal-time)))
        (cond
+         ;; Paused: what this read brought waits in the buffer, within the
+         ;; window, for BODY-RESUME. Only a stale event can get here — a
+         ;; paused body is subscribed to none.
+         ((and (connection-body-receiver conn) (connection-body-paused conn))
+          :continue)
          ((connection-body-receiver conn)
           (connection-receive conn peer-finished))
          ((connection-body-complete-p conn) :dispatch)

@@ -889,8 +889,10 @@ the fetch ended, and the two kinds are not treated alike:
 | `:streaming` | delivered | `stream-close`, terminator written |
 | `:streaming` | failed | closed without a terminator, so the peer's decoder sees truncation rather than being told a failed body was complete |
 | `:websocket` | delivered | nothing; you own your framing |
-| `:websocket` | failed | a `1011` close frame, then the connection goes — the one row you can override, with `:failure-disposition :keep` |
-| either | stopped | nothing; you asked for the ending, so what follows is yours |
+| `:websocket` | failed | a `1011` close frame, then the connection goes — a row you can override, with `:failure-disposition :keep` |
+| receiving a body | delivered | nothing; your `:then` resumes or refuses the body |
+| receiving a body | failed | closed, the body's `:on-abort` hearing `:upstream-failed` — overridable with `:keep` too, leaving `:then` to refuse it (see "Receiving a body as it arrives") |
+| any | stopped | nothing; you asked for the ending, so what follows is yours |
 
 It decides rather than leaving it to you because a handler written for the
 happy path will not have a failure path, and a `:then` that only closes on
@@ -923,7 +925,7 @@ connection alone when the fetch fails:
 ;; the default, unchanged
 (fetch-into conn continuation :failure-disposition :close)
 
-;; :websocket targets only
+;; :websocket targets and bodies being received; never :streaming
 (fetch-into conn continuation :failure-disposition :keep)
 ```
 
@@ -1856,6 +1858,39 @@ and answers the request from `:on-end`:
   and then waits its turn behind the other events on the loop.
 - **The handler never sees a received body.** The request is the one the
   body handler was given; close over it if `:on-data` or `:on-end` need it.
+- **An asynchronous sink pauses.** When what `:on-data` is handed goes
+  somewhere that answers later — an upstream, a part at a time — it starts
+  that work and returns `:pause`. Nothing more is handed over, the
+  connection is subscribed to no events, and the client's bytes wait in
+  the kernel until `(body-resume conn)`; a pause taken on the body's last
+  bytes holds `:on-end` back until then. `(body-refuse conn response)` ends
+  the body from outside `:on-data` instead. Both are calls on the worker
+  that owns the connection, and both are no-ops once the body has ended or
+  the client has gone, so a late callback need not check first.
+- **The fetch is `fetch-into` on the receiving connection.** The
+  connection bounds it — a client that leaves takes the fetch down — and
+  its result goes to `:then`, which resumes or refuses:
+
+  ```lisp
+  :on-data (lambda (conn bytes)
+             (fetch-into conn
+                         (http-fetch :put (part-url) :body bytes
+                                     :then (lambda (status headers body)
+                                             (declare (ignore headers body))
+                                             (if (eql status 200)
+                                                 (body-resume conn)
+                                                 (body-refuse conn (make-error-response 502)))))
+                         :failure-disposition :keep)
+             :pause)
+  ```
+
+  A body paused on a fetch it started is bounded by that fetch's
+  deadline, not by `*body-stall-timeout*`; a pause waiting on anything
+  else is ended as a stall once that long has passed. A real part is
+  usually larger than one read — collect `:on-data`'s runs to the size
+  the upstream wants, and pause when one is full. `:on-end` may answer
+  with a fetch too, for the last part or the call that completes the
+  upload.
 
 ### Form body decoding
 

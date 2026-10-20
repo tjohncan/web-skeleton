@@ -453,6 +453,15 @@
                         (body-clock
                           (and (member state '(:read-body :sending-100-continue))
                                (plusp (connection-body-progress-at conn))))
+                        ;; A received body paused on a fetch it started into
+                        ;; this connection: the application is waiting on that
+                        ;; fetch, whose own deadline bounds it and whose
+                        ;; failure disposition ends the body. The stall clock
+                        ;; resumes when the fetch is over, from the pause.
+                        (waiting-on-fetch
+                          (and body-clock
+                               (connection-body-paused conn)
+                               (connection-fetch-outstanding conn)))
                         (timeout (cond
                                    (body-clock *body-stall-timeout*)
                                    ((eq state :websocket) *ws-idle-timeout*)
@@ -524,6 +533,7 @@
                            (> (- now (connection-write-progress-at conn))
                               *write-stall-timeout*))
                       (push conn stalled))
+                     (waiting-on-fetch nil)
                      ((and (> timeout 0)
                            (> (- now since) timeout))
                       (if body-clock
@@ -1517,9 +1527,45 @@
              (http-response-status response))
   (setf (connection-close-after-p conn) t
         (connection-linger conn) t)
-  (queue-final-response conn response)
+  (if (plusp (connection-write-pending conn))
+      ;; A 100 Continue is still going out — BODY-REFUSE can be called
+      ;; between its queueing and its flush — and the answer follows it, an
+      ;; interim and then a final response being an ordinary exchange.
+      (connection-append-write
+       conn (format-response response
+                             :connection-hint :close
+                             :head-only-p (eq (http-request-method request) :HEAD)))
+      (queue-final-response conn response))
   (setf (connection-state conn) :write-response)
   (epoll-modify epoll-fd (connection-fd conn) (logior +epollout+ +epollet+)))
+
+(defun body-refuse (conn response)
+  "Refuse the rest of a received body with RESPONSE, from wherever on the
+   worker that owns CONN the decision is made — a fetch's :THEN, an
+   :ON-TICK — as ON-DATA refuses it by returning a response. RESPONSE is
+   sent, the connection closes after it, and the plan's ON-ABORT hears
+   :REFUSED.
+
+   Returns T, or NIL when CONN is not receiving a body: the body has ended
+   or the connection has closed, as either can have by the time a callback
+   that was waiting on something else runs. A paused body may be refused;
+   nothing of it is read again.
+
+   Signals, before anything is touched, if RESPONSE is not an
+   HTTP-RESPONSE, and off a worker or on a connection another worker owns,
+   as BODY-RESUME does."
+  (unless (typep response 'http-response)
+    (error "body-refuse: ~s is not an HTTP-RESPONSE" response))
+  (when (and (>= (connection-fd conn) 0) (connection-body-receiver conn))
+    (unless *epoll-fd*
+      (error "body-refuse: no event loop on this thread. A received body is ~
+              refused from the worker that owns its connection."))
+    (unless (eq (lookup-connection (connection-fd conn)) conn)
+      (error "body-refuse: fd ~d is not on this worker's connection table."
+             (connection-fd conn)))
+    (answer-before-body conn *epoll-fd* (connection-request conn) response)
+    (notify-body-aborted conn :refused)
+    t))
 
 (defun decide-request-body (conn epoll-fd peer-finished)
   "Ask *BODY-HANDLER* what becomes of the body of CONN's request, whose
@@ -1595,6 +1641,14 @@
                (:yield
                 (epoll-modify epoll-fd (connection-fd conn)
                               (logior +epollin+ +epollout+ +epollet+)))
+               ;; A received body's ON-DATA paused it: subscribed to nothing,
+               ;; so the client's bytes stay in the kernel and its window
+               ;; fills, until BODY-RESUME. Errors and hang-ups are reported
+               ;; whatever the interest, and close it as the peer gone.
+               (:paused
+                (log-debug "fd ~d: received body paused at ~d bytes"
+                           (connection-fd conn) (connection-body-received conn))
+                (epoll-modify epoll-fd (connection-fd conn) +epollet+))
                (:flush-queued
                 ;; connection-on-read queued response bytes that must flush
                 ;; before further reads happen. Covers two cases:
@@ -1980,7 +2034,10 @@
              ;; Continue above. A buffered :READ-BODY has nothing to read on
              ;; an EPOLLOUT and is let fall to the stale arm instead.
              (:read-body
-              (if (connection-body-receiver conn)
+              (if (and (connection-body-receiver conn)
+                       ;; A pause taken after the yield, in the same batch,
+                       ;; is not ended by the yield's wake-up.
+                       (not (connection-body-paused conn)))
                   (progn
                     (epoll-modify epoll-fd (connection-fd conn)
                                   (logior +epollin+ +epollet+))
@@ -2053,11 +2110,14 @@
                 ;; report it again.
                 (handle-client-read conn epoll-fd handler ws-handler)))
             ;; Error or hang-up, unless the read or write path already tore
-            ;; the connection down.
+            ;; the connection down. Either is the peer gone, which is what a
+            ;; stream's ON-CLOSE and a received body's ON-ABORT are told. It
+            ;; is also the one event a paused body still gets, subscribed as
+            ;; it is to nothing, so a client that resets mid-pause is heard.
             (when (and (or (logtest flags +epollerr+)
                            (logtest flags +epollhup+))
                        (still-here-p))
-              (close-connection conn epoll-fd)))))))
+              (close-connection conn epoll-fd :disconnected)))))))
 
 (defun run-event-loop (listener-socket epoll-fd handler ws-handler on-tick)
   "Main event loop. Runs until WORKER-STOPPING-P: *SHUTDOWN* is set, or a

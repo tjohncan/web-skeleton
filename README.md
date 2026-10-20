@@ -262,7 +262,11 @@ tests/
   request: the body is never held whole, so an upload of any size costs the
   head and one 64 KiB window of buffer, chunked or not, whatever its chunk
   sizes. `:on-abort` hears, exactly once, why a body that did not complete
-  ended. An `http-response` is the answer, sent before the body: an upload
+  ended. `:on-data` can answer `:pause`, and the body waits in the kernel
+  until `body-resume` — for a sink that answers later, such as a part
+  forwarded upstream by a `fetch-into` on the receiving connection, whose
+  `:then` resumes, or ends the body with `body-refuse`. An
+  `http-response` is the answer, sent before the body: an upload
   that fails a login check is refused before its first byte is read, and a
   client that sent `Expect: 100-continue` is never told to send it. A body
   the body handler accepted is timed on its progress, by
@@ -320,7 +324,8 @@ tests/
   keep the connection — the outbound closes, the target is left untouched, and
   `:then` gets the abort sentinel. A *failed* fetch closes the connection by
   default; `:failure-disposition :keep` leaves a WebSocket to the app that
-  has its own error frame to send. `:then` fires once at the end, its
+  has its own error frame to send, and a body being received — a target
+  too, for an upload forwarded as it arrives — to the app that refuses it. `:then` fires once at the end, its
   return value discarded — there is no parked request for it to answer. Chunked
   framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of

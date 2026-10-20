@@ -5715,6 +5715,238 @@
           (when stream (ignore-errors (close stream)))
           (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
 
+(defun test-harness-receive-body-paused-e2e ()
+  "A received body forwarded a part at a time: ON-DATA collects a part,
+   starts a fetch carrying it with FETCH-INTO, and pauses; the fetch's
+   :THEN resumes the body with BODY-RESUME; ON-END answers with one last
+   fetch for the remainder. The shape of an upload ferried on to object
+   storage as it arrives.
+
+   The upstream is the test server's own /store, which records each part.
+   What is checked is what the shape depends on: every part arrives, in
+   order, the parts together are the body, and while the body is paused
+   ON-DATA is never called — the pause holds."
+  (format t "~%Harness: a received body paused on the fetches it starts~%")
+  (let* ((lock (sb-thread:make-mutex :name "paused-e2e"))
+         (stored nil)
+         (pauses 0)
+         (while-paused 0)
+         (paused nil)
+         (port-box (list nil))
+         (part-size (* 256 1024))
+         (body (%pseudo-random-bytes (+ (* 4 part-size) 100) 23)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/store")
+               (progn
+                 (sb-thread:with-mutex (lock)
+                   (push (copy-seq (http-request-body req)) stored))
+                 (make-text-response 200 "stored"))
+               (make-error-response 404)))
+         :body-handler
+         (lambda (req)
+           (when (string= (http-request-path req) "/upload")
+             (let ((part (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0))
+                   (parts 0))
+               (flet ((store (bytes then)
+                        (http-fetch :put (format nil "http://127.0.0.1:~d/store"
+                                                 (first port-box))
+                                    :body (coerce bytes '(simple-array (unsigned-byte 8) (*)))
+                                    :then then)))
+                 (receive-body
+                  :max-size nil
+                  :on-data
+                  (lambda (conn bytes)
+                    (when paused (incf while-paused))
+                    (loop for b across bytes do (vector-push-extend b part))
+                    (when (>= (fill-pointer part) part-size)
+                      (let ((whole (subseq part 0 part-size))
+                            (rest (subseq part part-size)))
+                        (setf (fill-pointer part) 0)
+                        (loop for b across rest do (vector-push-extend b part))
+                        (incf parts)
+                        (incf pauses)
+                        (setf paused t)
+                        (fetch-into conn
+                                    (store whole
+                                           (lambda (status headers b)
+                                             (declare (ignore headers b))
+                                             (setf paused nil)
+                                             (if (eql status 200)
+                                                 (body-resume conn)
+                                                 (body-refuse conn (make-error-response 502)))
+                                             nil)))
+                        :pause)))
+                  :on-end
+                  ;; What is left is stored a part at a time too, each part's
+                  ;; :THEN chaining the next, so the parts fall on the same
+                  ;; boundaries however the reads happened to cut the body.
+                  (lambda (conn)
+                    (declare (ignore conn))
+                    (labels ((next (from)
+                               (let ((to (min (fill-pointer part) (+ from part-size))))
+                                 (incf parts)
+                                 (store (subseq part from to)
+                                        (lambda (status headers b)
+                                          (declare (ignore headers b))
+                                          (if (and (eql status 200)
+                                                   (< to (fill-pointer part)))
+                                              (next to)
+                                              (make-text-response
+                                               (or status 502)
+                                               (format nil "parts:~d" parts))))))))
+                      (next 0)))))))))
+      (setf (first port-box) *test-port*)
+      (let ((answer (%raw-exchange
+                     (concatenate '(vector (unsigned-byte 8))
+                                  (%ascii (format nil "POST /upload HTTP/1.1~aHost: x~a~
+                                                       Content-Length: ~d~a~
+                                                       Connection: close~a~a"
+                                                  *crlf* *crlf* (length body) *crlf*
+                                                  *crlf* *crlf*))
+                                  body)
+                     :seconds 20)))
+        (check "paused: the upload is answered after its last part is stored"
+               (and (search "parts:5" answer) t) t)
+        (let ((parts (reverse (sb-thread:with-mutex (lock) stored))))
+          (check "paused: every part reached the upstream"
+                 (length parts) 5)
+          (check "paused: in order, together the body"
+                 (%sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) parts))
+                 (%sha256-hex body)))
+        (check "paused: the body paused for the parts it forwarded"
+               (<= 1 pauses 4) t)
+        (check "paused: ON-DATA was not called while a pause held"
+               while-paused 0)))))
+
+(defun test-harness-receive-body-refused-from-a-callback-e2e ()
+  "A received body ended from outside ON-DATA: by BODY-REFUSE from a
+   fetch's :THEN, and by a failed fetch under each failure disposition.
+
+   The fetches go to a port with nothing listening, so each one fails
+   to connect. Under :CLOSE, the default, the body is ended and ON-ABORT
+   hears :UPSTREAM-FAILED; under :KEEP the body is left paused, its :THEN
+   sees the abort sentinel and answers with BODY-REFUSE, and ON-ABORT
+   hears :REFUSED."
+  (format t "~%Harness: a received body refused from a fetch's :then~%")
+  (let* ((lock (sb-thread:make-mutex :name "refuse-e2e"))
+         (aborts nil)
+         (dead-port (let ((s (make-instance 'sb-bsd-sockets:inet-socket
+                                            :type :stream :protocol :tcp)))
+                      (sb-bsd-sockets:socket-bind s #(127 0 0 1) 0)
+                      (prog1 (nth-value 1 (sb-bsd-sockets:socket-name s))
+                        (sb-bsd-sockets:socket-close s)))))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (receive-body
+                :on-data
+                (lambda (conn bytes)
+                  (declare (ignore bytes))
+                  (fetch-into
+                   conn
+                   (http-fetch :get (format nil "http://127.0.0.1:~d/" dead-port)
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers b))
+                                       (when (and (null status)
+                                                  (string= path "/keep"))
+                                         (body-refuse conn (make-text-response
+                                                            503 "upstream down")))
+                                       nil))
+                   :failure-disposition (if (string= path "/keep") :keep :close))
+                  :pause)
+                :on-end (lambda (conn) (declare (ignore conn))
+                          (make-text-response 200 "unexpected"))
+                :on-abort (lambda (conn reason)
+                            (declare (ignore conn))
+                            (sb-thread:with-mutex (lock)
+                              (push (cons path reason) aborts)))))))
+        (%raw-exchange (%post-bytes "/close" "abcd") :seconds 5)
+        (check "failed fetch, :close: the body is ended as :upstream-failed"
+               (aborted "/close") '(:upstream-failed))
+        (let ((answer (%raw-exchange (%post-bytes "/keep" "abcd") :seconds 5)))
+          (check "failed fetch, :keep: :then's BODY-REFUSE answers the client"
+                 (and (search "HTTP/1.1 503" answer) t) t))
+        (check "failed fetch, :keep: and ON-ABORT hears :refused"
+               (aborted "/keep") '(:refused))))))
+
+(defun test-harness-paused-body-waits-on-its-fetch-e2e ()
+  "A received body paused on a fetch it started is bounded by that fetch,
+   not by the stall clock.
+
+   *BODY-STALL-TIMEOUT* is 1 for the run and the upstream takes three
+   seconds to answer, so a stall clock still running through the pause
+   would close the body before the part was stored. The body is answered
+   instead, once the part is stored and the body resumed — which also
+   restarts the clock, so the rest of the body is timed afresh."
+  (format t "~%Harness: a paused body waits on its fetch~%")
+  (let ((saved web-skeleton:*body-stall-timeout*)
+        (listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (setf web-skeleton:*body-stall-timeout* 1)
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (let ((port (nth-value 1 (sb-bsd-sockets:socket-name listener))))
+             (setf thread (%piecemeal-upstream
+                           listener
+                           (list (format nil "HTTP/1.1 200 OK~c~cContent-Length: 2~c~c~
+                                              Connection: close~c~c~c~c"
+                                         #\Return #\Newline #\Return #\Newline
+                                         #\Return #\Newline #\Return #\Newline)
+                                 "ok")
+                           :pause 3 :hold 0))
+             (with-test-server
+                 (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                  :body-handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (let ((sent nil))
+                      (receive-body
+                       :on-data
+                       (lambda (conn bytes)
+                         (declare (ignore bytes))
+                         (unless sent
+                           (setf sent t)
+                           (fetch-into
+                            conn
+                            (http-fetch :get (format nil "http://127.0.0.1:~d/" port)
+                                        :then (lambda (status headers b)
+                                                (declare (ignore status headers b))
+                                                (body-resume conn)
+                                                nil)))
+                           :pause))
+                       :on-end (lambda (conn) (declare (ignore conn))
+                                 (make-text-response 200 "stored"))))))
+               (let* ((start (get-internal-real-time))
+                      (answer (%raw-exchange (%post-bytes "/u" "abcd"
+                                                          :headers '("Connection: close"))
+                                             :seconds 10))
+                      (elapsed (/ (- (get-internal-real-time) start)
+                                  internal-time-units-per-second)))
+                 (check "waits: the body outlasted the stall clock on its fetch"
+                        (and (search "stored" answer) t) t)
+                 (check "precondition: the fetch took longer than the stall timeout"
+                        (> elapsed 2) t)))))
+      (setf web-skeleton:*body-stall-timeout* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
 (defun test-harness-body-stall-e2e ()
   "A body a body handler accepted is timed on its progress, by
    *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
@@ -6696,6 +6928,9 @@
   (test-harness-fetch-into-refuses-malformed-chunks-e2e)
   (test-harness-body-handler-e2e)
   (test-harness-receive-body-e2e)
+  (test-harness-receive-body-paused-e2e)
+  (test-harness-receive-body-refused-from-a-callback-e2e)
+  (test-harness-paused-body-waits-on-its-fetch-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)

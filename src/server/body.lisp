@@ -100,10 +100,18 @@
             vector the application may keep. Called once per read that
             brought some of it, so the pieces are the size reads happen to
             be and not the sender's chunks. Its value is ignored unless it
-            is an HTTP-RESPONSE: that refuses the rest of the body, the
-            response is sent, and the connection closes after it, its
-            close lingering as every refusal of a request still arriving
-            does.
+            is :PAUSE or an HTTP-RESPONSE.
+              :PAUSE stops the body being handed over, from this run on,
+              until BODY-RESUME: the connection is subscribed to nothing,
+              the client's bytes wait in the kernel, and its send window
+              fills. For an application whose sink is asynchronous — each
+              part forwarded by a fetch it starts with FETCH-INTO, whose
+              :THEN resumes. A pause taken on the body's last bytes holds
+              ON-END back until the resume.
+              An HTTP-RESPONSE refuses the rest of the body: the response
+              is sent, and the connection closes after it, its close
+              lingering as every refusal of a request still arriving does.
+              BODY-REFUSE does the same from outside ON-DATA.
    ON-END   (CONN) — the body is complete. Returns the request's response,
             in any shape :HANDLER may answer with but :UPGRADE: an
             HTTP-RESPONSE, a STREAM-RESPONSE, a fetch continuation, a byte
@@ -114,8 +122,12 @@
               :STALLED       *BODY-STALL-TIMEOUT* passed without a byte
               :TOO-LARGE     the body passed MAX-SIZE; answered 413
               :MALFORMED     its chunked framing was wrong; answered 400
-              :REFUSED       ON-DATA answered with a response
+              :REFUSED       ON-DATA answered with a response, or
+                             BODY-REFUSE was called
               :ERROR         ON-DATA or ON-END raised; answered 500
+              :UPSTREAM-FAILED
+                             a fetch started into the connection failed,
+                             under its default :FAILURE-DISPOSITION
               :SHUTDOWN      the server drained
               :CLOSED        the connection closed for any other reason
             The one place to release what ON-DATA has been building — a
@@ -177,5 +189,46 @@
   (when (eq (body-plan-kind plan) :receive)
     (setf (connection-body-receiver conn) plan
           (connection-body-received conn) 0
-          (connection-body-owed conn) 0)))
+          (connection-body-owed conn) 0
+          (connection-body-paused conn) nil)))
+
+(defun body-resume (conn)
+  "Resume a received body that its ON-DATA paused.
+
+   What the pause left in the read buffer is handed over first, then
+   reading goes on — or, when the pause came with the body's last bytes,
+   ON-END runs. The connection is woken through writability, which its
+   socket has at once, so the resume does not wait on more bytes
+   arriving: the ones already buffered raise no readability edge of their
+   own.
+
+   CONN is what ON-DATA was called with. Returns T, or NIL when there is
+   nothing to resume — the body is not paused, it has ended, or the
+   connection has closed — so a caller that resumes from a callback that
+   may run after the client left is not punished for it.
+
+   Signals, before anything is touched, off a worker or on a connection
+   another worker owns, as WS-SEND and STREAM-CLOSE do: the resume arms
+   the owning worker's epoll interest, and only that worker may.
+
+   A resume restarts the stall clock. A pause is the application not
+   reading, so the body was not stalled while it lasted — though a pause
+   longer than *BODY-STALL-TIMEOUT* is ended as a stall, unless what the
+   application is waiting on is a fetch started into this connection,
+   which its own deadline bounds."
+  (when (>= (connection-fd conn) 0)
+    (unless *epoll-fd*
+      (error "body-resume: no event loop on this thread. A received body is ~
+              resumed from the worker that owns its connection — a fetch's ~
+              :THEN, an :ON-TICK, another callback on that worker."))
+    (unless (eq (lookup-connection (connection-fd conn)) conn)
+      (error "body-resume: fd ~d is not on this worker's connection table. ~
+              Only the worker that owns a connection may resume its body."
+             (connection-fd conn)))
+    (when (and (connection-body-receiver conn) (connection-body-paused conn))
+      (setf (connection-body-paused conn) nil
+            (connection-body-progress-at conn) (get-universal-time))
+      (epoll-modify *epoll-fd* (connection-fd conn)
+                    (logior +epollin+ +epollout+ +epollet+))
+      t)))
 

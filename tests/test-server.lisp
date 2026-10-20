@@ -9559,6 +9559,64 @@
                       (list answered (reduce #'+ pieces)) (list t total))))
         (setf (symbol-function 'web-skeleton::epoll-modify) real)))))
 
+(defun test-body-resume-and-refuse-contract ()
+  "BODY-RESUME and BODY-REFUSE do nothing to a body that has ended or a
+   connection that has closed, answering NIL, and refuse to touch a live
+   one from anywhere but the worker that owns it.
+
+   The NILs are what let a callback that was waiting on something else —
+   a fetch's :THEN, most often — resume or refuse without first asking
+   whether the client is still there. The refusals come before anything
+   is touched, as WS-SEND's and STREAM-CLOSE's do."
+  (format t "~%body-resume and body-refuse: the contract~%")
+  (let ((plan (receive-body :on-data (lambda (c b) (declare (ignore c b)) nil)
+                            :on-end (lambda (c) (declare (ignore c))
+                                      (make-text-response 200 "ok"))))
+        (ok (make-text-response 200 "no")))
+    ;; ---- closed, or not receiving: NIL, whatever thread ----
+    (let ((closed (web-skeleton::make-connection :fd -1 :state :read-body)))
+      (setf (web-skeleton::connection-body-receiver closed) plan
+            (web-skeleton::connection-body-paused closed) t)
+      (check "resume: a closed connection is a no-op" (body-resume closed) nil)
+      (check "refuse: a closed connection is a no-op" (body-refuse closed ok) nil))
+    (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+           (web-skeleton::*epoll-fd* 999)
+           (idle (web-skeleton::make-connection :fd 5 :state :read-body)))
+      (web-skeleton::register-connection idle)
+      (check "resume: a connection receiving no body is a no-op"
+             (body-resume idle) nil)
+      (check "refuse: a connection receiving no body is a no-op"
+             (body-refuse idle ok) nil)
+      ;; Receiving, but not paused: nothing to resume, and no epoll call.
+      (setf (web-skeleton::connection-body-receiver idle) plan)
+      (check "resume: a body that is not paused is a no-op"
+             (body-resume idle) nil))
+    ;; ---- live, but not this worker's: refused before anything moves ----
+    (let ((live (web-skeleton::make-connection :fd 5 :state :read-body)))
+      (setf (web-skeleton::connection-body-receiver live) plan
+            (web-skeleton::connection-body-paused live) t)
+      (let ((web-skeleton::*epoll-fd* nil))
+        (check "resume: refused off a worker"
+               (and (stringp (attempt (body-resume live))) t) t)
+        (check "refuse: refused off a worker"
+               (and (stringp (attempt (body-refuse live ok))) t) t))
+      (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+            (web-skeleton::*epoll-fd* 999))
+        (check "resume: refused on a connection another worker owns"
+               (and (stringp (attempt (body-resume live))) t) t)
+        (check "refuse: refused on a connection another worker owns"
+               (and (stringp (attempt (body-refuse live ok))) t) t))
+      (check "and the refusals touched nothing: still paused, still receiving"
+             (list (web-skeleton::connection-body-paused live)
+                   (not (null (web-skeleton::connection-body-receiver live))))
+             '(t t)))
+    (check "refuse: a response that is not an HTTP-RESPONSE is refused"
+           (and (stringp (attempt (body-refuse
+                                   (web-skeleton::make-connection :fd -1)
+                                   "nope")))
+                t)
+           t)))
+
 (defun test-body-handler-validated-at-boot ()
   "START-SERVER refuses a :BODY-HANDLER it could not call, and a
    *BODY-STALL-TIMEOUT* that would leave an accepted body with no time
@@ -12666,6 +12724,7 @@
   (test-body-handler-at-the-head)
   (test-body-decision-rereads-under-its-cap)
   (test-received-body-window-and-yield)
+  (test-body-resume-and-refuse-contract)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)
