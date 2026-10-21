@@ -424,19 +424,16 @@
   ;; only be a second place to get the ordering wrong.
   (let ((ssl nil)
         (socket nil))
-    (multiple-value-bind (ip family)
+    (multiple-value-bind (ip family fallbacks)
         (funcall *dns-resolve-blocking-fn* hostname)
       (unless ip
         (error "tls-connect: failed to resolve ~a" hostname))
-      (setf socket (make-instance (if (eq family :inet)
-                                      'sb-bsd-sockets:inet-socket
-                                      'sb-bsd-sockets:inet6-socket)
-                                  :type :stream :protocol :tcp))
       (handler-case
           (progn
-            (set-socket-timeout (sb-bsd-sockets:socket-file-descriptor socket)
-                                *fetch-timeout*)
-            (blocking-connect socket ip port *fetch-timeout*)
+            (setf socket (blocking-connect-to-any
+                          (cons (cons ip family) fallbacks) port
+                          :socket-setup (lambda (fd)
+                                          (set-socket-timeout fd *fetch-timeout*))))
             (setf ssl (tls-client-ssl
                        hostname
                        (sb-bsd-sockets:socket-file-descriptor socket)))

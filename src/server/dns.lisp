@@ -13,8 +13,9 @@
 ;;; whose stdout pipe is registered with the event loop's epoll fd. The
 ;;; connection state machine gains a :out-dns state for the duration of
 ;;; the lookup. When the pipe becomes readable (getent wrote something or
-;;; exited), we drain and parse the first STREAM line's address, clean up
-;;; the process, and resume via INITIATE-HTTP-FETCH-TO-ADDRESS.
+;;; exited), we drain it, and once getent's output has ended we parse its
+;;; STREAM lines' addresses, clean up the process, and resume via
+;;; INITIATE-HTTP-FETCH-TO-ADDRESS.
 ;;;
 ;;; Why getent + subprocess instead of a pure-Lisp DNS client: semantic
 ;;; parity with blocking GET-HOST-BY-NAME. /etc/hosts, NSS modules,
@@ -32,13 +33,13 @@
 ;;; IPv4 and IPv6: `getent ahosts` returns both families in the
 ;;; system's preferred order (RFC 6724). AI_ADDRCONFIG drops a family
 ;;; only when this host has no address of it configured; it knows
-;;; nothing of whether the destination answers on that family. The
-;;; first STREAM line the address filter accepts is dialed, and only
-;;; that one: a refused or unanswered connect fails the fetch rather
-;;; than moving on to the next address. So on a host with IPv6, a name
-;;; that sorts an IPv6 address first — localhost as ::1 — fails against
-;;; a service bound to IPv4 alone. The socket family is picked to match
-;;; the address.
+;;; nothing of whether the destination answers on that family. So every
+;;; STREAM address the address filter accepts is kept, in that order. The
+;;; first is dialed, and a connect that is refused, unreachable, or
+;;; unanswered for *CONNECT-FALLBACK-DELAY* gives way to the next
+;;; (FALL-BACK-TO-NEXT-ADDRESS). A name that sorts an IPv6 address first,
+;;; localhost as ::1, still reaches a service bound to IPv4 alone. The
+;;; socket family is picked to match each address.
 ;;; ===========================================================================
 
 ;;; ---------------------------------------------------------------------------
@@ -63,8 +64,9 @@
 ;;;   <address> DGRAM
 ;;;   <address> RAW
 ;;; We only accept STREAM rows; DGRAM and RAW are redundant for our
-;;; TCP use case and pollute the answer set. First parseable STREAM
-;;; line wins — order respects system preference.
+;;; TCP use case and pollute the answer set. STREAM lines are kept in the
+;;; order printed, which is the system's preference, the first dialed and
+;;; the rest fallen back on.
 ;;; ---------------------------------------------------------------------------
 
 (defun %unspecified-address-p (bytes)
@@ -75,11 +77,16 @@
   (every #'zerop bytes))
 
 (defun parse-getent-output (buf end &optional host)
-  "Scan BUF[0..END) for the first `<address> STREAM ...` line with a
-   parseable IPv4 or IPv6 address that policy accepts. Returns
-   (IP . FAMILY) where FAMILY is :INET or :INET6, or NIL if no complete
-   parseable line yet. Safe to call on partial buffers — returns NIL
-   until at least one line with a newline terminator has been received.
+  "Scan BUF[0..END) for `<address> STREAM ...` lines with a parseable IPv4
+   or IPv6 address that policy accepts. Returns (IP . FAMILY) for the first,
+   where FAMILY is :INET or :INET6, or NIL if no complete parseable line
+   yet. Safe to call on partial buffers: only lines ended by a newline are
+   read, so it returns NIL until one has been received.
+
+   Third value: every accepted address, (IP . FAMILY) in the order getent
+   printed them, the first included and each once. A connect that fails
+   moves on to the next of them (FALL-BACK-TO-NEXT-ADDRESS), so a caller
+   that wants them all waits for getent's output to end.
 
    Second value: how many parseable addresses policy refused. NIL with a
    positive count is a policy decision; NIL with zero is a name that did not
@@ -111,47 +118,52 @@
         ;; client must not learn which — but an operator reading a log is a
         ;; different audience, and sending them to debug a resolver when
         ;; their own filter said no costs an afternoon.
-        (refused 0))
-    (loop while (< line-start end) do
-      (let ((lf (position 10 buf :start line-start :end end)))
-        (unless lf (return (values nil refused)))
-        (let ((line (handler-case
-                        (sb-ext:octets-to-string
-                         buf :start line-start :end lf
-                             :external-format :ascii)
-                      (error () nil))))
-          (when line
-            (let* ((sp (position #\Space line))
-                   (addr-str (and sp (subseq line 0 sp)))
-                   ;; First non-whitespace token after the address.
-                   (tok-start
-                    (and sp (position-if-not
-                              (lambda (c)
-                                (or (char= c #\Space) (char= c #\Tab)))
-                              line :start sp)))
-                   (stream-token-p
-                    (and tok-start
-                         (>= (- (length line) tok-start) 6)
-                         (string= line "STREAM"
-                                  :start1 tok-start
-                                  :end1 (+ tok-start 6))
-                         (or (= (length line) (+ tok-start 6))
-                             (let ((after (char line (+ tok-start 6))))
-                               (or (char= after #\Space)
-                                   (char= after #\Tab)))))))
-              (when (and stream-token-p addr-str)
-                (let ((v4 (parse-ipv4-literal addr-str)))
-                  (when (and v4 (not (%unspecified-address-p v4)))
-                    (if (fetch-address-allowed-p v4 :inet (or host addr-str))
-                        (return (values (cons v4 :inet) refused))
-                        (incf refused))))
-                (let ((v6 (parse-ipv6-literal addr-str)))
-                  (when (and v6 (not (%unspecified-address-p v6)))
-                    (if (fetch-address-allowed-p v6 :inet6 (or host addr-str))
-                        (return (values (cons v6 :inet6) refused))
-                        (incf refused))))))))
-        (setf line-start (1+ lf)))
-          finally (return (values nil refused)))))
+        (refused 0)
+        (accepted '()))
+    (flet ((accept (address)
+             (unless (member address accepted :test #'equalp)
+               (push address accepted))))
+      (loop while (< line-start end) do
+        (let ((lf (position 10 buf :start line-start :end end)))
+          (unless lf (loop-finish))
+          (let ((line (handler-case
+                          (sb-ext:octets-to-string
+                           buf :start line-start :end lf
+                               :external-format :ascii)
+                        (error () nil))))
+            (when line
+              (let* ((sp (position #\Space line))
+                     (addr-str (and sp (subseq line 0 sp)))
+                     ;; First non-whitespace token after the address.
+                     (tok-start
+                      (and sp (position-if-not
+                                (lambda (c)
+                                  (or (char= c #\Space) (char= c #\Tab)))
+                                line :start sp)))
+                     (stream-token-p
+                      (and tok-start
+                           (>= (- (length line) tok-start) 6)
+                           (string= line "STREAM"
+                                    :start1 tok-start
+                                    :end1 (+ tok-start 6))
+                           (or (= (length line) (+ tok-start 6))
+                               (let ((after (char line (+ tok-start 6))))
+                                 (or (char= after #\Space)
+                                     (char= after #\Tab)))))))
+                (when (and stream-token-p addr-str)
+                  (let ((v4 (parse-ipv4-literal addr-str)))
+                    (when (and v4 (not (%unspecified-address-p v4)))
+                      (if (fetch-address-allowed-p v4 :inet (or host addr-str))
+                          (accept (cons v4 :inet))
+                          (incf refused))))
+                  (let ((v6 (parse-ipv6-literal addr-str)))
+                    (when (and v6 (not (%unspecified-address-p v6)))
+                      (if (fetch-address-allowed-p v6 :inet6 (or host addr-str))
+                          (accept (cons v6 :inet6))
+                          (incf refused))))))))
+          (setf line-start (1+ lf)))
+            finally (let ((all (reverse accepted)))
+                      (return (values (first all) refused all)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Optional per-worker resolution cache
@@ -205,15 +217,19 @@
    no-ops on a NIL table rather than reaching for a global.")
 
 (defstruct (dns-cache-entry
-            (:constructor make-dns-cache-entry (ip family expires-at)))
+            (:constructor make-dns-cache-entry (ip family expires-at
+                                                &optional fallbacks)))
   (ip     nil)
   (family :inet :type keyword)
-  (expires-at 0 :type integer))
+  (expires-at 0 :type integer)
+  ;; The name's other addresses, (IP . FAMILY) in order, to fall back on.
+  (fallbacks nil :type list))
 
 (defun dns-cache-lookup (host)
-  "Return (values IP FAMILY) for HOST from the per-worker cache, or NIL on
-   a miss, an expired entry, a disabled cache, or a thread with no cache
-   bound.
+  "Return (values IP FAMILY FALLBACKS) for HOST from the per-worker cache,
+   or NIL on a miss, an expired entry, a disabled cache, or a thread with
+   no cache bound. FALLBACKS are the name's other addresses that the
+   filter still accepts.
 
    A hit is re-gated on *FETCH-ADDRESS-FILTER* before it is handed back.
    This is the load-bearing part: without it, caching would be a DNS-
@@ -239,11 +255,17 @@
            (log-debug "dns: cache hit ~a -> ~a" host
                       (format-ip (dns-cache-entry-ip entry)))
            (values (dns-cache-entry-ip entry)
-                   (dns-cache-entry-family entry))))))))
+                   (dns-cache-entry-family entry)
+                   (remove-if-not (lambda (address)
+                                    (fetch-address-allowed-p (car address)
+                                                             (cdr address)
+                                                             host))
+                                  (dns-cache-entry-fallbacks entry)))))))))
 
-(defun dns-cache-store (host ip family)
-  "Record HOST → IP/FAMILY for *DNS-CACHE-TTL* seconds. No-op when
-   caching is disabled or no cache is bound.
+(defun dns-cache-store (host ip family &optional fallbacks)
+  "Record HOST → IP/FAMILY, and the name's other addresses FALLBACKS, for
+   *DNS-CACHE-TTL* seconds. No-op when caching is disabled or no cache is
+   bound.
 
    Successful resolutions only. A failed lookup is usually transient — a
    nameserver blip, a service still coming up — and caching the failure
@@ -263,7 +285,8 @@
           (clrhash *dns-cache*))))
     (setf (gethash host *dns-cache*)
           (make-dns-cache-entry ip family
-                                (+ (get-universal-time) *dns-cache-ttl*)))
+                                (+ (get-universal-time) *dns-cache-ttl*)
+                                fallbacks))
     (log-debug "dns: cached ~a -> ~a for ~ds"
                host (format-ip ip) *dns-cache-ttl*)))
 
@@ -288,12 +311,14 @@
    to the TCP phase on the remembered address, exactly as a numeric literal
    would. The hit has already been re-gated on *FETCH-ADDRESS-FILTER* by
    DNS-CACHE-LOOKUP."
-  (multiple-value-bind (cached-ip cached-family) (dns-cache-lookup host)
+  (multiple-value-bind (cached-ip cached-family cached-fallbacks)
+      (dns-cache-lookup host)
     (when cached-ip
       (return-from initiate-dns-lookup
         (initiate-http-fetch-to-address conn epoll-fd fetch-req
                                         host port path
-                                        cached-ip cached-family))))
+                                        cached-ip cached-family
+                                        :fallbacks cached-fallbacks))))
   ;; -- terminates getent's option parsing so a hostname that begins
   ;; with '-' cannot be misread as a flag. Numeric IP literals never
   ;; reach this path (parse-ipv4-literal / parse-ipv6-literal catch
@@ -354,10 +379,11 @@
                     ;; Carried so HANDLE-DNS-READY can name the host when
                     ;; it runs the getent output past the address filter.
                     :dns-host host
-                    :dns-then (lambda (ip family)
+                    :dns-then (lambda (ip family &optional fallbacks)
                                 (initiate-http-fetch-to-address
                                  conn epoll-fd fetch-req
-                                 host port path ip family))
+                                 host port path ip family
+                                 :fallbacks fallbacks))
                     :last-active (get-universal-time)))
              (set-nonblocking out-fd)
              (register-connection dns-conn)
@@ -427,13 +453,17 @@
   (let ((result (connection-read-available dns-conn)))
     (case result
       ((:ok :ok-eof :eof)
-       (multiple-value-bind (parsed refused)
+       (multiple-value-bind (parsed refused all)
            (parse-getent-output
             (connection-read-buf dns-conn)
             (connection-read-pos dns-conn)
             (connection-dns-host dns-conn))
          (cond
-           (parsed
+           ;; At the end of getent's output, so the addresses to fall back
+           ;; on are all there. getent writes its answer at once and ends
+           ;; it by exiting, so waiting for the end costs the exit and no
+           ;; more.
+           ((and parsed (member result '(:eof :ok-eof)))
             (let ((dns-then (connection-dns-then dns-conn))
                   (chained nil))
               ;; CHAINED is what separates "the lookup failed" from "the
@@ -450,10 +480,11 @@
                     ;; Remember the resolution before chaining to TCP: the
                     ;; name resolved, which is true regardless of whether
                     ;; the connect that follows succeeds. PARSE-GETENT-
-                    ;; OUTPUT already ran this address past the address
+                    ;; OUTPUT already ran these addresses past the address
                     ;; filter, so nothing refused ever enters the cache.
-                    (dns-cache-store (connection-dns-host dns-conn) ip family)
-                    (funcall dns-then ip family)
+                    (dns-cache-store (connection-dns-host dns-conn) ip family
+                                     (rest all))
+                    (funcall dns-then ip family (rest all))
                     (setf chained t))
                 (error (e)
                   ;; dns-then failed — callback still on dns-conn, so
@@ -511,7 +542,8 @@
                                (if (plusp refused)
                                    "address refused by policy"
                                    "DNS lookup failed")))
-           ;; :OK and incomplete — next epoll wake will bring more.
+           ;; :OK, its end still to come — the next epoll wake brings the
+           ;; rest, or the exit that ends it.
            )))
       (:again nil)
       (:full
@@ -534,8 +566,10 @@
 
 (defun resolve-host-blocking (host)
   "Synchronously resolve HOST via `getent ahosts`.
-   Returns (values IP FAMILY) on success or NIL on failure. FAMILY is
-   :INET or :INET6. Numeric IPv4 and IPv6 literals skip the subprocess
+   Returns (values IP FAMILY FALLBACKS) on success or NIL on failure.
+   FAMILY is :INET or :INET6, and FALLBACKS the name's other addresses,
+   (IP . FAMILY) in order, for BLOCKING-CONNECT-TO-ANY to fall back on.
+   Numeric IPv4 and IPv6 literals skip the subprocess
    via the same fast path as the async resolver. Used by the blocking
    fetch setup paths so there is a single DNS primitive across the
    framework.
@@ -567,9 +601,11 @@
   ;; HTTPS fetch can avoid the fork+exec: PARSE-URL refuses https:// with
   ;; an IP-literal host, so an app cannot hand us a pre-resolved address
   ;; the way it can for plain HTTP.
-  (multiple-value-bind (cached-ip cached-family) (dns-cache-lookup host)
+  (multiple-value-bind (cached-ip cached-family cached-fallbacks)
+      (dns-cache-lookup host)
     (when cached-ip
-      (return-from resolve-host-blocking (values cached-ip cached-family))))
+      (return-from resolve-host-blocking
+        (values cached-ip cached-family cached-fallbacks))))
   (handler-case
       (let ((process (sb-ext:run-program "getent"
                                           (list "ahosts" "--" host)
@@ -606,10 +642,12 @@
                           do (when (>= (fill-pointer buf) 8192)
                                (error "dns: getent output exceeds 8KB"))
                              (vector-push-extend byte buf))
-                    (let ((parsed (parse-getent-output buf (length buf) host)))
+                    (multiple-value-bind (parsed refused all)
+                        (parse-getent-output buf (length buf) host)
+                      (declare (ignore refused))
                       (when parsed
-                        (dns-cache-store host (car parsed) (cdr parsed))
-                        (values (car parsed) (cdr parsed))))))))
+                        (dns-cache-store host (car parsed) (cdr parsed) (rest all))
+                        (values (car parsed) (cdr parsed) (rest all))))))))
           (ignore-errors (sb-ext:process-close process))))
     (error () nil)))
 

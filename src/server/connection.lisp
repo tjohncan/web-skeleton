@@ -363,6 +363,12 @@
   ;; whole seam exists to remove.
   (fetch-started-at 0 :type integer)
   (fetch-deadline   0 :type integer)
+  ;; On an outbound still connecting: the addresses its name resolved to
+  ;; after the one being dialed, (IP . FAMILY) in order, which a connect
+  ;; that fails, or takes past CONNECT-DEADLINE, falls back to. See
+  ;; FALL-BACK-TO-NEXT-ADDRESS. CONNECT-DEADLINE is 0 when there are none.
+  (fallback-addresses nil :type list)
+  (connect-deadline 0 :type integer)
   ;; On an outbound or :OUT-DNS connection: the HTTP-FETCH-CONTINUATION it
   ;; carries, so that the fetch's life — a streamed body's state, whether it
   ;; has ended — is answered from the struct the application holds.
@@ -427,7 +433,8 @@
   (ws-message-at  0  :type integer)
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
-  (dns-then    nil :type (or null function))  ; (IP FAMILY) -> kick off TCP phase
+  (dns-then    nil :type (or null function))  ; (IP FAMILY &optional FALLBACKS)
+                                              ; -> kick off the TCP phase
   (dns-host    nil :type (or null string)))   ; hostname being resolved — carried
                                               ; so the address filter and the log
                                               ; lines can name it when the getent

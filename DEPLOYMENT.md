@@ -717,18 +717,28 @@ Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs
 are resolved asynchronously: the framework spawns `getent ahosts <host>`
 via `sb-ext:run-program`, registers the subprocess's stdout pipe
 with the worker's epoll, and parks the inbound connection in an `:out-dns` state
-until the address lands. The first TCP-compatible line (`<address> STREAM`)
-that `*fetch-address-filter*` accepts is the address dialed, and the only
-one: a connect refused or unanswered there fails the fetch, with no
-fallback to the next address `getent` printed. IPv4 and IPv6 are both
-supported. `AI_ADDRCONFIG` drops a family only when this host has no
-address of it configured, so on a host with IPv6 a name can sort first
-an IPv6 address the upstream does not listen on. `localhost` resolving to
-`::1` while the service binds `127.0.0.1` is the common case, and it
-answers `502`. Fetch such a service by its IP literal, or bind it on both
-families.
+until the address lands. Every TCP-compatible line (`<address> STREAM`)
+that `*fetch-address-filter*` accepts is kept, in the order `getent`
+printed them, which is the system's preference (RFC 6724). The first is
+dialed, and a connect that fails gives way to the next:
+- **Refused or unreachable** — the next address is dialed at once.
+- **Unanswered** — a connect that has not completed in
+  `*connect-fallback-delay*` seconds (2, RFC 8305's longest attempt delay)
+  gives way to the next while there is one. The last address has what is
+  left of `*fetch-timeout*`, which runs from the first attempt throughout.
+- **The request goes with it.** A streamed body's pieces sent while the
+  first attempt was connecting are sent on the next.
+
+So a name whose first address the upstream does not answer on still
+reaches it: `localhost` resolving to `::1` first while the service binds
+`127.0.0.1` alone, or a name whose IPv6 route goes nowhere.
+`AI_ADDRCONFIG` drops a family only when this host has none of its
+addresses, so such a name sorts IPv6 first on any host with IPv6. The
+unanswered case costs `*connect-fallback-delay*` before the next address
+answers, since attempts are made one at a time rather than raced.
 Numeric literals (including bracketed IPv6 forms like `http://[::1]:8080/`)
-skip the subprocess entirely via the numeric fast path.
+skip the subprocess entirely via the numeric fast path, and have no other
+address to fall back on.
 
 `http-fetch-stream`, over either scheme, uses the same `getent` subprocess
 synchronously via `resolve-host-blocking` — same parser,

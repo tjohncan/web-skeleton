@@ -189,6 +189,7 @@
            #:*ws-max-missed-pongs*
            #:*write-stall-timeout*
            #:*fetch-timeout*
+           #:*connect-fallback-delay*
            ;; DNS cache (opt-in — 0 disables)
            #:*dns-cache-ttl*
            #:*dns-cache-max-entries*

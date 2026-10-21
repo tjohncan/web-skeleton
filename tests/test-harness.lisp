@@ -7192,6 +7192,155 @@
                       '(t t)))))
       (setf web-skeleton:*worker-wake-interval* saved))))
 
+(defun %black-hole (port)
+  "A listener on 127.0.0.2:PORT that answers no connect. Its accept queue
+   is full, held by a connection never accepted, so the kernel drops each
+   SYN that arrives, and a connect to it waits as one to a black-holed
+   route does. Returns (values LISTENER FILLER), for the caller to close."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (filler (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 2) port)
+    (sb-bsd-sockets:socket-listen listener 0)
+    (sb-bsd-sockets:socket-connect filler #(127 0 0 2) port)
+    (values listener filler)))
+
+(defun test-harness-fetch-falls-back-to-the-next-address-e2e ()
+  "A name that resolves to more than one address is dialed at the next
+   when one does not answer: a fetch to a name whose first address is
+   127.0.0.2, where nothing answers, and whose second is the upstream's.
+
+   Refused, the next address is dialed at once, and so it is when the
+   connect fails in the call itself. Black-holed (%BLACK-HOLE),
+   it is dialed once *CONNECT-FALLBACK-DELAY* has passed, and an upload
+   streamed into the fetch meanwhile, queued on the first attempt, goes
+   with it and arrives whole. HTTP-FETCH-STREAM's blocking connect falls
+   back the same way.
+
+   The resolution is the test's: *DNS-LOOKUP-FN* and
+   *DNS-RESOLVE-BLOCKING-FN* answer every name with those two addresses,
+   in that order, as getent would for a name listed twice in /etc/hosts."
+  (format t "~%Harness: a fetch falls back to a name's next address~%")
+  (let ((saved-lookup web-skeleton::*dns-lookup-fn*)
+        (saved-blocking web-skeleton::*dns-resolve-blocking-fn*)
+        (next-addresses (list (cons (coerce #(127 0 0 1)
+                                            '(simple-array (unsigned-byte 8) (*)))
+                                    :inet)))
+        ;; A cell, so a case can change what the name resolves to first.
+        (first-address (list (coerce #(127 0 0 2) '(simple-array (unsigned-byte 8) (*)))))
+        (upstream-port (list nil))
+        (body (%pseudo-random-bytes (* 256 1024) 101)))
+    (setf web-skeleton::*dns-lookup-fn*
+          (lambda (conn epoll-fd fetch-req host port path)
+            (web-skeleton::initiate-http-fetch-to-address
+             conn epoll-fd fetch-req host port path (car first-address) :inet
+             :fallbacks next-addresses))
+          web-skeleton::*dns-resolve-blocking-fn*
+          (lambda (host)
+            (declare (ignore host))
+            (values (car first-address) :inet next-addresses)))
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (if (string= (http-request-path req) "/plain")
+                             (make-text-response 200 "plain")
+                             (http-fetch :put (format nil "http://dual.test:~d/up"
+                                                      (first upstream-port))
+                                         :body "hello"
+                                         :then (lambda (status headers b)
+                                                 (declare (ignore headers))
+                                                 (make-text-response
+                                                  (or status 502)
+                                                  (if b (sb-ext:octets-to-string
+                                                         b :external-format :latin-1)
+                                                      "none"))))))
+              :body-handler
+              (lambda (req)
+                (when (string= (http-request-path req) "/upload")
+                  (forward-body
+                   (http-fetch :put (format nil "http://dual.test:~d/up" (first upstream-port))
+                               :body :stream
+                               :content-length (length body)
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers))
+                                       (make-text-response
+                                        (or status 502)
+                                        (if b (sb-ext:octets-to-string
+                                               b :external-format :latin-1)
+                                            "none"))))
+                   :max-size nil))))
+           ;; ---- refused: the next address at once ----
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why
+                            (%ascii (format nil "GET /fetch HTTP/1.1~aHost: x~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf*))
+                            :seconds 10)))
+               (sb-thread:join-thread thread :timeout 10 :default nil)
+               (check "refused: answered from the name's next address"
+                      (and (search "HTTP/1.1 200" answer)
+                           (search (format nil "got:5:~a" (%sha256-hex (%ascii "hello")))
+                                   answer)
+                           t)
+                      t)))
+           ;; ---- unreachable at once: the next address, from the same call ----
+           ;; A TCP connect to a broadcast address fails in the connect
+           ;; itself, with ENETUNREACH, so no connection is ever made for it.
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port
+                   (car first-address) (coerce #(255 255 255 255)
+                                               '(simple-array (unsigned-byte 8) (*))))
+             (let ((answer (%exchange-or-why
+                            (%ascii (format nil "GET /fetch HTTP/1.1~aHost: x~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf*))
+                            :seconds 10)))
+               (sb-thread:join-thread thread :timeout 10 :default nil)
+               (setf (car first-address) (coerce #(127 0 0 2)
+                                                 '(simple-array (unsigned-byte 8) (*))))
+               (check "unreachable at once: answered from the name's next address"
+                      (and (search "HTTP/1.1 200" answer) t)
+                      t)))
+           ;; ---- black-holed: the next address once its budget is spent ----
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (multiple-value-bind (listener filler) (%black-hole port)
+               (unwind-protect
+                    (let* ((start (get-internal-real-time))
+                           (answer (%exchange-or-why
+                                    (%form-post-bytes "/upload" body
+                                                      :headers '("Connection: close"))
+                                    :seconds 20))
+                           (secs (/ (float (- (get-internal-real-time) start))
+                                    internal-time-units-per-second))
+                           (seen (sb-thread:join-thread thread :timeout 10 :default nil)))
+                      (check "black hole: the upload reached the next address whole"
+                             (and seen (equalp (second seen) body)) t)
+                      (check "black hole: and the client heard its answer"
+                             (and (search (format nil "got:~d:~a" (length body)
+                                                  (%sha256-hex body))
+                                          answer)
+                                  t)
+                             t)
+                      (check "black hole: once the attempt's budget had passed, not the fetch's"
+                             (< (float web-skeleton::*connect-fallback-delay*) secs 10.0)
+                             t))
+                 (ignore-errors (sb-bsd-sockets:socket-close filler))
+                 (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+           ;; ---- the blocking path falls back the same way ----
+           (check "blocking: http-fetch-stream answered from the next address"
+                  (handler-case
+                      (http-fetch-stream :get (format nil "http://dual.test:~d/plain"
+                                                      *test-port*)
+                                         :on-line #'identity)
+                    (error (e) (princ-to-string e)))
+                  200))
+      (setf web-skeleton::*dns-lookup-fn* saved-lookup
+            web-skeleton::*dns-resolve-blocking-fn* saved-blocking))))
+
 (defun %exchange-or-why (bytes &rest args)
   "%RAW-EXCHANGE, except that a connection reset or closed while the request
    was still being written answers as the text of that error, so a check
@@ -8214,6 +8363,7 @@
   (test-harness-then-answers-with-a-started-fetch-e2e)
   (test-harness-streamed-request-body-from-a-tick-e2e)
   (test-harness-answer-paused-while-the-request-goes-out-e2e)
+  (test-harness-fetch-falls-back-to-the-next-address-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)

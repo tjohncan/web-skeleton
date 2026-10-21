@@ -441,9 +441,18 @@
         (stalled nil)
         (body-stalled nil)
         (ws-late nil)
+        (connect-late nil)
         (detached-expired nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
+               ;; A connect given its *CONNECT-FALLBACK-DELAY* and not
+               ;; answered, with the name's other addresses still to try.
+               (when (and (connection-outbound-p conn)
+                          (eq (connection-state conn) :out-connecting)
+                          (connection-fallback-addresses conn)
+                          (plusp (connection-connect-deadline conn))
+                          (> now (connection-connect-deadline conn)))
+                 (push conn connect-late))
                ;; A detached outbound has no parked inbound, so the
                ;; :AWAITING reap that bounds every other fetch cannot see
                ;; it. Nothing else would: it is not idle — it is waiting on
@@ -601,6 +610,18 @@
           (log-warn "detached fetch timeout: could not abort fd ~d: ~a"
                     (connection-fd conn) e)
           (close-outbound conn epoll-fd))))
+    (dolist (conn connect-late)
+      ;; After the expired fetches, any of which may have been this one.
+      (when (and (eq (lookup-connection (connection-fd conn)) conn)
+                 (eq (connection-state conn) :out-connecting))
+        (let ((why (format nil "no connect in ~ds" *connect-fallback-delay*)))
+          (handler-case
+              (unless (fall-back-to-next-address conn epoll-fd why)
+                (deliver-fetch-error conn epoll-fd why))
+            (error (e)
+              (log-warn "fetch: could not move fd ~d to its next address: ~a"
+                        (connection-fd conn) e)
+              (close-outbound conn epoll-fd))))))
     (dolist (conn stalled)
       (log-info "write stalled ~ds fd ~d (~a, ~d bytes pending) — closing"
                 *write-stall-timeout* (connection-fd conn)

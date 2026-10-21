@@ -413,7 +413,11 @@ tests/
   subprocess whose stdout pipe is registered with the worker's epoll;
   the parked inbound resumes when the address lands.
   Numeric IPv4 and IPv6 literals (including `http://[::1]:8080/`) skip DNS entirely
-  via a fast path. Both families supported.
+  via a fast path. Both families supported. A name's addresses are dialed in
+  the system's order of preference, the next taken when one refuses or does
+  not answer within two seconds, so `localhost` reaches a service bound to
+  `127.0.0.1` alone, and an IPv6 route that goes nowhere costs that budget
+  rather than the fetch
   Optional per-worker resolution cache (`*dns-cache-ttl*`, off by default) —
   a hit skips the subprocess entirely, and is re-gated on the address filter
 - **Outbound address policy (SSRF)** — `*fetch-address-filter*` is consulted for
@@ -728,6 +732,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
 | `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. A **streamed** request body (`:body :stream`) is bounded by its progress while it goes out, every piece sent or taken moving the deadline, and its answer by this value from when the body has gone. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations |
+| `*connect-fallback-delay*`     | `2`       | Seconds a connect to one of a name's addresses is given, while the name has more, before the next is dialed instead: RFC 8305's longest Connection Attempt Delay. A refused or unreachable address gives way at once; this is for one that does not answer, a black-holed IPv6 route say. The last address has what is left of `*fetch-timeout*`. Both paths, parked and blocking |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |

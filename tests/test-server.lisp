@@ -8364,6 +8364,54 @@
 ;;; DNS cache (opt-in)
 ;;; ---------------------------------------------------------------------------
 
+(defun test-dns-keeps-every-address ()
+  "A name's addresses after the first are kept, to fall back on: by
+   PARSE-GETENT-OUTPUT as its third value, every accepted STREAM address
+   in the order getent printed it, each once; and by the DNS cache, which
+   hands them back still filtered."
+  (format t "~%DNS: every address a name resolves to is kept~%")
+  (let* ((out (format nil "::1             STREAM localhost~%~
+                           ::1             DGRAM~%~
+                           10.0.0.9        STREAM~%~
+                           127.0.0.1       STREAM~%~
+                           127.0.0.1       DGRAM~%~
+                           127.0.0.1       STREAM~%~
+                           127.0.0.2       STREA"))
+         (buf (sb-ext:string-to-octets out :external-format :ascii))
+         (web-skeleton:*fetch-address-filter*
+           (lambda (ip family host)
+             (declare (ignore family host))
+             ;; 10.0.0.9 is refused, as a policy might.
+             (not (equalp ip #(10 0 0 9))))))
+    (multiple-value-bind (first refused all)
+        (web-skeleton::parse-getent-output buf (length buf) "localhost")
+      (check "getent: the first accepted address, as before"
+             (list (coerce (car first) 'list) (cdr first))
+             '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6))
+      (check "getent: every accepted STREAM address, in order, each once"
+             (mapcar (lambda (a) (list (coerce (car a) 'list) (cdr a))) all)
+             '(((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) ((127 0 0 1) :inet)))
+      (check "getent: the refused one counted, and a line not yet ended not read"
+             refused 1)))
+  (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+        (web-skeleton::*dns-cache-ttl* 60)
+        (fallbacks (list (cons (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (*)))
+                               :inet)
+                         (cons (coerce #(10 0 0 9) '(simple-array (unsigned-byte 8) (*)))
+                               :inet))))
+    (web-skeleton::dns-cache-store "dual.test" (coerce #(127 0 0 2) '(simple-array (unsigned-byte 8) (*)))
+                                   :inet fallbacks)
+    (check "cache: the fallbacks come back with the address"
+           (length (nth-value 2 (web-skeleton::dns-cache-lookup "dual.test"))) 2)
+    (let ((web-skeleton:*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore family host))
+              (not (equalp ip #(10 0 0 9))))))
+      (check "cache: a fallback the filter now refuses is left out"
+             (mapcar (lambda (a) (coerce (car a) 'list))
+                     (nth-value 2 (web-skeleton::dns-cache-lookup "dual.test")))
+             '((127 0 0 1))))))
+
 (defun test-dns-cache ()
   (format t "~%DNS cache~%")
   (let ((v4 (make-array 4 :element-type '(unsigned-byte 8)
@@ -8687,6 +8735,45 @@
       (ignore-errors (web-skeleton::%close targetfd))
       (ignore-errors (web-skeleton::%close epfd)))))
 
+(defun test-dns-ready-hands-on-every-address ()
+  "HANDLE-DNS-READY, at the end of getent's output, calls DNS-THEN with the
+   first address and the rest to fall back on, in getent's order."
+  (format t "~%DNS: the lookup hands on every address~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (targetfd (web-skeleton::epoll-create))
+         (proc (sb-ext:run-program "/bin/true" nil :output :stream :wait t))
+         (got nil))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (out (sb-ext:string-to-octets
+                      (format nil "::1             STREAM localhost~%~
+                                   127.0.0.1       STREAM~%~
+                                   127.0.0.1       DGRAM~%")
+                      :external-format :ascii))
+                (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                (dns-conn (web-skeleton::make-connection
+                           :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
+                           :state :out-dns :outbound-p t :fetch-sink :detached
+                           :inbound-fd targetfd :dns-host "localhost"
+                           :dns-then (lambda (ip family &optional fallbacks)
+                                       (setf got (list (coerce ip 'list) family
+                                                       (mapcar (lambda (a)
+                                                                 (list (coerce (car a) 'list)
+                                                                       (cdr a)))
+                                                               fallbacks))))
+                           :last-active (get-universal-time))))
+           (replace buf out)
+           (setf (web-skeleton::connection-read-buf dns-conn) buf
+                 (web-skeleton::connection-read-pos dns-conn) (length out))
+           (web-skeleton::register-connection dns-conn)
+           (web-skeleton::handle-dns-ready dns-conn epfd)
+           (check "dns ready: the first address, and the rest to fall back on"
+                  got
+                  '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6 (((127 0 0 1) :inet)))))
+      (ignore-errors (sb-ext:process-close proc))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 (defun test-dns-chain-success-survives-a-failed-teardown ()
   "A resolution that succeeded is not undone by a failure to clean up
    after it.
@@ -8738,8 +8825,8 @@
                                       :fetch-sink :detached
                                       :inbound-fd targetfd
                                       :dns-host "localhost"
-                                      :dns-then (lambda (ip family)
-                                                  (declare (ignore ip family))
+                                      :dns-then (lambda (ip family &optional fallbacks)
+                                                  (declare (ignore ip family fallbacks))
                                                   (setf chained t))
                                       :fetch-callback
                                       (lambda (s h b)
@@ -13877,6 +13964,8 @@
   (test-is-public-address)
   (test-fetch-address-filter)
   (test-dns-cache)
+  (test-dns-keeps-every-address)
+  (test-dns-ready-hands-on-every-address)
   (test-dns-lookup-sink)
   (test-dns-child-closed-only-once-dead)
   (test-dns-error-ends-a-detached-fetch)

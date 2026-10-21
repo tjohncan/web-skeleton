@@ -1096,18 +1096,16 @@
    goes out through PLAIN-WRITE-ALL and the response comes back through
    PLAIN-BYTE-READER, read(2) and write(2) on the descriptor itself, for
    the reason this section's header gives."
-  (multiple-value-bind (ip family)
+  (multiple-value-bind (ip family fallbacks)
       (funcall *dns-resolve-blocking-fn* host)
     (unless ip
       (error "fetch-stream: failed to resolve ~a" host))
-    (let ((socket (make-instance (if (eq family :inet)
-                                     'sb-bsd-sockets:inet-socket
-                                     'sb-bsd-sockets:inet6-socket)
-                                 :type :stream :protocol :tcp)))
+    (let ((socket (blocking-connect-to-any
+                   (cons (cons ip family) fallbacks) port
+                   :socket-setup (lambda (fd)
+                                   (set-socket-timeout fd *fetch-timeout*)))))
       (unwind-protect
           (let ((fd (socket-fd socket)))
-            (set-socket-timeout fd *fetch-timeout*)
-            (blocking-connect socket ip port *fetch-timeout*)
             (plain-write-all fd (build-outbound-request
                                  method host path
                                  :port port
@@ -2042,16 +2040,111 @@
    when epoll reports EPOLLIN or EPOLLHUP on a :OUT-DNS connection.
    Second half of the DNS hook pair, mirroring *DNS-LOOKUP-FN*.")
 
-(defun initiate-http-fetch-to-address (conn epoll-fd fetch-req host port path ip family)
-  "Open a non-blocking TCP socket (FAMILY :INET or :INET6) to IP:PORT and
-   send the outbound HTTP request. CONN is the parked inbound connection.
-   HOST is the original hostname — used for the Host: header, not for
-   routing. Called from INITIATE-HTTP-FETCH's numeric-IP fast path and
-   from the DNS-ready callback in src/server/dns.lisp."
-  (let ((socket (make-instance (if (eq family :inet)
-                                   'sb-bsd-sockets:inet-socket
-                                   'sb-bsd-sockets:inet6-socket)
-                               :type :stream :protocol :tcp))
+(defparameter *connect-fallback-delay* 2
+  "Seconds a connect to one of a name's addresses is given while the name
+   has more, before the next is dialed instead. RFC 8305's longest
+   Connection Attempt Delay: an address that has not answered in that time
+   has lost a SYN at least once, and a black-holed one, such as an IPv6
+   route that goes nowhere, would otherwise hold the fetch to its whole
+   *FETCH-TIMEOUT*. The last address is given the rest of that.")
+
+(defun blocking-connect-to-any (addresses port &key socket-setup)
+  "Connect, blocking, to the first of ADDRESSES, (IP . FAMILY) in order,
+   that answers at PORT, and return its socket. The blocking paths'
+   counterpart of FALL-BACK-TO-NEXT-ADDRESS: an address that fails gives
+   way to the next, and so does one that has not answered within
+   *CONNECT-FALLBACK-DELAY* while more remain. The last is given what is
+   left of *FETCH-TIMEOUT*. Signals the last failure when none answers.
+
+   SOCKET-SETUP, when given, is called with each socket's descriptor
+   before its connect."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* *fetch-timeout* internal-time-units-per-second)))
+        (last-failure nil))
+    (loop for ((ip . family) . more) on addresses
+          for left = (/ (- deadline (get-internal-real-time))
+                        internal-time-units-per-second)
+          while (plusp left)
+          do (let ((socket (handler-case
+                               (make-instance (if (eq family :inet)
+                                                  'sb-bsd-sockets:inet-socket
+                                                  'sb-bsd-sockets:inet6-socket)
+                                              :type :stream :protocol :tcp)
+                             (error (e) (setf last-failure e) nil))))
+               (when socket
+                 (handler-case
+                     (progn
+                       (when socket-setup
+                         (funcall socket-setup (socket-fd socket)))
+                       (blocking-connect socket ip port
+                                         (if more
+                                             (min *connect-fallback-delay* left)
+                                             left))
+                       (return-from blocking-connect-to-any socket))
+                   (error (e)
+                     (setf last-failure e)
+                     (ignore-errors (sb-bsd-sockets:socket-close socket))
+                     (when more
+                       (log-info "fetch: connect to ~a: ~a; trying the next address"
+                                 (format-ip ip) e)))))))
+    (if last-failure
+        (error last-failure)
+        (error "connect: no address answered in ~a seconds" *fetch-timeout*))))
+
+(define-condition connect-failed-at-once (error)
+  ((address :initarg :address :reader connect-failed-at-once-address)
+   (why     :initarg :why     :reader connect-failed-at-once-why))
+  (:report (lambda (c stream)
+             (format stream "connect to ~a: ~a"
+                     (format-ip (connect-failed-at-once-address c))
+                     (connect-failed-at-once-why c))))
+  (:documentation
+   "An address could not be dialed at all: no socket of its family, or a
+    connect the kernel refused before it began. The next address the name
+    resolved to is tried; with none left, it fails the fetch as any setup
+    error does."))
+
+(defun initiate-http-fetch-to-address (conn epoll-fd fetch-req host port path ip family
+                                       &key fallbacks started-at)
+  "Open a non-blocking TCP connection to IP:PORT, FAMILY :INET or :INET6,
+   and send the outbound HTTP request. CONN is the connection the fetch is
+   for. HOST is the original hostname, for the Host: header and not for
+   routing. Called from INITIATE-HTTP-FETCH's numeric-IP fast path, the DNS
+   cache, and the DNS-ready callback in src/server/dns.lisp.
+
+   FALLBACKS are the name's other addresses, (IP . FAMILY) in order. An
+   address that cannot be dialed at all (CONNECT-FAILED-AT-ONCE) gives way
+   to the next here. One whose connect fails later, or outlasts
+   *CONNECT-FALLBACK-DELAY*, gives way to the next through
+   FALL-BACK-TO-NEXT-ADDRESS, which the rest are kept on the outbound for.
+   STARTED-AT is the first attempt's, so a fallback does not extend the
+   fetch's deadline."
+  (loop
+    (handler-case
+        (return (%dial-address conn epoll-fd fetch-req host port path ip family
+                               :fallbacks fallbacks :started-at started-at))
+      (connect-failed-at-once (e)
+        (unless fallbacks
+          (error e))
+        (log-info "fetch: ~a; dialing the next address for ~a" e host)
+        (destructuring-bind (next-ip . next-family) (pop fallbacks)
+          (setf ip next-ip
+                family next-family))))))
+
+(defun %dial-address (conn epoll-fd fetch-req host port path ip family
+                      &key fallbacks started-at)
+  "One attempt of INITIATE-HTTP-FETCH-TO-ADDRESS: open a non-blocking TCP
+   socket to IP:PORT and queue the request on a new outbound connection.
+   Signals CONNECT-FAILED-AT-ONCE when the address cannot be dialed."
+  (let ((socket (handler-case
+                    (make-instance (if (eq family :inet)
+                                       'sb-bsd-sockets:inet-socket
+                                       'sb-bsd-sockets:inet6-socket)
+                                   :type :stream :protocol :tcp)
+                  (error (e)
+                    (error 'connect-failed-at-once
+                           :address ip
+                           :why (format nil "no ~(~a~) socket: ~a" family e)))))
         (out-conn nil)
         (registered nil)
         (epoll-added nil)
@@ -2076,7 +2169,8 @@
                    (let ((errno (sb-bsd-sockets::socket-error-errno e)))
                      (unless (or (= errno +einprogress+)
                                  (= errno +eagain+))
-                       (error "connect: ~a" (errno-string errno))))))
+                       (error 'connect-failed-at-once
+                              :address ip :why (errno-string errno))))))
                (let* ((out-fd (socket-fd socket))
                       (scheme (http-fetch-continuation-scheme fetch-req))
                       (streamed (http-fetch-continuation-stream-body fetch-req))
@@ -2100,9 +2194,14 @@
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :fetch-sink (http-fetch-continuation-sink fetch-req)
-                                 :fetch-started-at (get-universal-time)
-                                 :fetch-deadline (+ (get-universal-time)
+                                 :fetch-started-at (or started-at (get-universal-time))
+                                 :fetch-deadline (+ (or started-at (get-universal-time))
                                                     *fetch-timeout*)
+                                 :fallback-addresses fallbacks
+                                 :connect-deadline (if fallbacks
+                                                       (+ (get-universal-time)
+                                                          *connect-fallback-delay*)
+                                                       0)
                                  :fetch-continuation fetch-req
                                  :last-active (get-universal-time)))
                  ;; Before the request is queued and before epoll is armed:
@@ -2369,16 +2468,68 @@
                                      +sol-socket+ +so-error+)))
     (cond
       ((not (zerop err))
-       (deliver-fetch-error conn epoll-fd
-                            (format nil "connect failed: errno ~d" err)))
+       (let ((why (format nil "connect failed: ~a" (errno-string err))))
+         (unless (fall-back-to-next-address conn epoll-fd why)
+           (deliver-fetch-error conn epoll-fd why))))
       ;; A transport with a handshake is not usable just because the TCP
       ;; connect landed. Writing the request here would put plaintext on a
       ;; socket the peer is expecting a ClientHello on.
       ((connection-handshake-fn conn)
-       (setf (connection-state conn) :out-handshake)
+       (setf (connection-state conn) :out-handshake
+             (connection-fallback-addresses conn) nil)
        (handle-outbound-handshake conn epoll-fd))
       ;; Connect succeeded — start writing the request, already queued.
-      (t (begin-request conn epoll-fd)))))
+      (t (setf (connection-fallback-addresses conn) nil)
+         (begin-request conn epoll-fd)))))
+
+(defun fall-back-to-next-address (out epoll-fd why)
+  "OUT's connect failed, for WHY, or took past its CONNECT-DEADLINE: dial
+   the next of the addresses its name resolved to, and hand the fetch to
+   it. Returns T when another connection has the fetch, and NIL when there
+   was no address left to dial, or no connection left for the fetch, for
+   the caller to end the fetch through OUT as it would have.
+
+   The fetch moves whole. The new connection gets its own request head,
+   and a streamed body's pieces queued behind OUT's head, none of them
+   written since nothing connected, are queued behind it in the same
+   order. A parked inbound is parked on the new connection, and the
+   fetch's deadline still runs from the first attempt. OUT is closed only
+   once the new connection exists, and closed without ending the fetch:
+   its callback is let go and the fetch's carrier is the new connection."
+  (let ((rest (connection-fallback-addresses out))
+        (fetch (connection-fetch-continuation out)))
+    (when (and rest fetch (eq (connection-state out) :out-connecting))
+      (let ((target (if (eq (connection-fetch-sink out) :inbound)
+                        (awaiting-inbound-for (connection-inbound-fd out)
+                                              (connection-fd out))
+                        (lookup-connection (connection-inbound-fd out))))
+            (streamed (http-fetch-continuation-stream-body fetch)))
+        (when target
+          (multiple-value-bind (scheme host port path)
+              (parse-url (http-fetch-continuation-url fetch))
+            (declare (ignore scheme))
+            (when streamed
+              (let ((pieces (copy-list (connection-write-queue out))))
+                (setf (http-fetch-continuation-pending fetch) pieces
+                      (http-fetch-continuation-pending-bytes fetch)
+                      (reduce #'+ pieces :key #'segment-length))))
+            (log-info "fetch: ~a to ~a; dialing the next address" why host)
+            (destructuring-bind ((ip . family) . more) rest
+              (handler-case
+                  (initiate-http-fetch-to-address
+                   target epoll-fd fetch host port path ip family
+                   :fallbacks more
+                   :started-at (connection-fetch-started-at out))
+                (error (e)
+                  (log-warn "fetch: no other address for ~a could be dialed: ~a"
+                            host e)
+                  (when streamed
+                    (setf (http-fetch-continuation-pending fetch) nil
+                          (http-fetch-continuation-pending-bytes fetch) 0))
+                  (return-from fall-back-to-next-address nil))))
+            (setf (connection-fetch-callback out) nil)
+            (close-outbound out epoll-fd)
+            t))))))
 
 (defun begin-request (conn epoll-fd)
   "CONN's transport is usable: send the request queued on it.
