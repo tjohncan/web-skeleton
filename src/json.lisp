@@ -290,7 +290,9 @@
                     (string= str "null" :start1 pos :end1 (+ pos 4)))
          (error "json: invalid literal at ~d" pos))
        (values :null (+ pos 4)))
-      ((or (digit-char-p ch) (char= ch #\-))
+      ;; ASCII digits only: DIGIT-CHAR-P is true of every Unicode digit,
+      ;; U+0663 among them, which JSON's grammar does not admit.
+      ((or (char<= #\0 ch #\9) (char= ch #\-))
        (json-parse-number str pos))
       (t (error "json: unexpected character '~a' at ~d" ch pos)))))
 
@@ -524,10 +526,14 @@
   (write-char #\" stream))
 
 (defun json-write-object (alist stream)
-  "Write an alist as a JSON object to STREAM."
+  "Write an alist as a JSON object to STREAM. Every key is a string, as
+   JSON-PARSE makes them. Any other key signals with a message naming it,
+   rather than a bare type error from inside JSON-WRITE-STRING."
   (write-char #\{ stream)
   (loop for (pair . rest) on alist
-        do (json-write-string (car pair) stream)
+        do (unless (stringp (car pair))
+             (error "json: an object key must be a string, not ~s" (car pair)))
+           (json-write-string (car pair) stream)
            (write-char #\: stream)
            (json-write-value (cdr pair) stream)
         when rest do (write-char #\, stream))

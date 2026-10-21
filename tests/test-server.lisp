@@ -673,6 +673,13 @@
            (serialize (resp 200 :body "hello"
                                 :headers '(("content-length" . "+5"))))
            :refused)
+    ;; DIGIT-CHAR-P and PARSE-INTEGER both take any Unicode digit, so ٥
+    ;; (U+0665) would read as 5 and go out on the wire as it is.
+    (check "a Content-Length in other digits is not a length"
+           (serialize (resp 200 :body "hello"
+                                :headers (list (cons "content-length"
+                                                     (string (code-char #x665))))))
+           :refused)
     (check "a bodiless GET answer cannot declare a length"
            (serialize (resp 200 :headers '(("content-length" . "1234"))))
            :refused)
@@ -1565,6 +1572,22 @@
                (web-skeleton::parse-url "http://host:99999/"))
   (check-error "parse-url: port 0 rejected"
                (web-skeleton::parse-url "http://host:0/"))
+  ;; A port is digits alone (RFC 3986 port = *DIGIT). PARSE-INTEGER takes
+  ;; a sign, which would read +80 as 80. It takes surrounding whitespace
+  ;; too, but a space never reaches it: PARSE-URL refuses every byte at
+  ;; or below 0x20 first, which the two space checks pin.
+  (check-error "parse-url: a signed port rejected"
+               (web-skeleton::parse-url "http://host:+80/"))
+  (check-error "parse-url: a space before the port rejected"
+               (web-skeleton::parse-url "http://host: 80/"))
+  (check-error "parse-url: a space after the port rejected"
+               (web-skeleton::parse-url "http://host:80 /"))
+  (check-error "parse-url: a signed port after a v6 literal rejected"
+               (web-skeleton::parse-url "http://[::1]:+80/"))
+  (check-error "parse-url: anything else after a v6 literal rejected"
+               (web-skeleton::parse-url "http://[::1]x/"))
+  (check "parse-url: a plain port still reads"
+         (nth-value 2 (web-skeleton::parse-url "http://host:80/")) 80)
 
   ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4) —
   ;; without this, 'http://host?q=1' would parse the whole
@@ -2563,6 +2586,24 @@
   (check "empty query"
          (parse-query-string "")
          nil)
+
+  ;; An empty segment is no pair, as the WHATWG form parser skips it;
+  ;; "=" is one, an empty name with an empty value.
+  (check "a trailing & adds nothing"
+         (parse-query-string "a=1&")
+         '(("a" . "1")))
+  (check "a doubled & adds nothing"
+         (parse-query-string "a=1&&b=2")
+         '(("a" . "1") ("b" . "2")))
+  (check "a leading & adds nothing"
+         (parse-query-string "&a=1")
+         '(("a" . "1")))
+  (check "& alone is no pairs"
+         (parse-query-string "&")
+         nil)
+  (check "= alone is an empty name and value"
+         (parse-query-string "=")
+         '(("" . "")))
 
   ;; get-query-param via a parsed request
   (let ((req (parse-request (crlf "GET /search?q=common%20lisp&page=3 HTTP/1.1"

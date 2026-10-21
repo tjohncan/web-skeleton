@@ -454,10 +454,16 @@
 (defun %parse-port (authority start)
   "Parse a decimal port number from AUTHORITY starting at START.
    Raises a clean error on non-numeric input instead of letting
-   parse-integer's SIMPLE-TYPE-ERROR leak out of parse-url."
-  (let ((p (handler-case (parse-integer authority :start start)
-             (error ()
-               (error "malformed URL authority: non-numeric port in ~a" authority)))))
+   parse-integer's SIMPLE-TYPE-ERROR leak out of parse-url.
+
+   Digits and nothing else, as RFC 3986's port = *DIGIT: PARSE-INTEGER
+   alone would take a sign and surrounding whitespace, so h:+80 and
+   h: 80 would both be port 80."
+  (let ((p (if (and (< start (length authority))
+                    (loop for i from start below (length authority)
+                          always (char<= #\0 (char authority i) #\9)))
+               (parse-integer authority :start start)
+               (error "malformed URL authority: non-numeric port in ~a" authority))))
     (unless (<= 1 p 65535)
       (error "malformed URL authority: port ~d out of range in ~a" p authority))
     p))
@@ -484,9 +490,11 @@
          (error "malformed URL authority: unclosed '[' in ~a" authority))
        (let ((host (subseq authority 1 close))
              (rest (subseq authority (1+ close))))
-         (if (and (> (length rest) 0) (char= (char rest 0) #\:))
-             (values host (%parse-port rest 1))
-             (values host default-port)))))
+         (cond ((zerop (length rest)) (values host default-port))
+               ((char= (char rest 0) #\:) (values host (%parse-port rest 1)))
+               ;; [::1]x: what follows the bracket is a port or nothing.
+               (t (error "malformed URL authority: ~s after ']' in ~a"
+                         rest authority))))))
     ;; Plain host or IPv4 literal
     (t
      (let ((colon (position #\: authority)))

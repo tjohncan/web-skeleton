@@ -113,6 +113,13 @@
   (flet ((signals-error-p (thunk)
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
+    ;; JSON's digits are ASCII. DIGIT-CHAR-P is true of every Unicode
+    ;; digit, so dispatching on it sent U+0663 to the number reader, which
+    ;; refused it as a number missing its digit.
+    (check "a non-ASCII digit is an unexpected character"
+           (handler-case (progn (json-parse (format nil "[1,~c]" (code-char #x663))) nil)
+             (error (e) (not (null (search "unexpected character" (princ-to-string e))))))
+           t)
     (check "leading zeros rejected"
            (signals-error-p (lambda () (json-parse "01"))) t)
     (check "negative leading zeros rejected"
@@ -179,6 +186,13 @@
   (check "ser nil is []" (json-serialize nil) "[]")
   (check "ser empty json-object is {}"
          (json-serialize (make-json-object nil)) "{}")
+  ;; Keys are strings, as JSON-PARSE makes them. Another key is refused by
+  ;; name, not with a type error from inside the string writer.
+  (check "ser a key that is not a string is refused by name"
+         (handler-case (progn (json-serialize (make-json-object '((:a . 1)))) nil)
+           (error (e) (not (null (search "object key must be a string"
+                                         (princ-to-string e))))))
+         t)
   (check "ser float" (json-serialize 3.14d0) "3.14")
   (check "ser float large" (json-serialize 1.0d7) "1.0e7")
   (check "ser float small" (json-serialize 1.0d-4) "1.0e-4")

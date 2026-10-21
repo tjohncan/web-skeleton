@@ -386,7 +386,10 @@
 (defun parse-query-string (query)
   "Parse a query string like \"a=1&b=2\" into an alist.
    Decodes per application/x-www-form-urlencoded (+ as space, %XX).
-   Keys with no = get empty string values."
+   Keys with no = get empty string values. An empty segment, as in
+   \"a=1&\" or \"a=1&&b=2\", is no pair at all, as the WHATWG URL
+   standard's form parser skips it; \"=\" is a pair, an empty name with
+   an empty value."
   (when (and query (> (length query) 0))
     (let ((pairs nil)
           (len (length query))
@@ -395,11 +398,12 @@
         (let* ((amp (or (position #\& query :start start) len))
                (segment-start start)
                (eq-pos (position #\= query :start segment-start :end amp)))
-          (push (if eq-pos
-                    (cons (form-decode (subseq query segment-start eq-pos))
-                          (form-decode (subseq query (1+ eq-pos) amp)))
-                    (cons (form-decode (subseq query segment-start amp)) ""))
-                pairs)
+          (when (> amp segment-start)
+            (push (if eq-pos
+                      (cons (form-decode (subseq query segment-start eq-pos))
+                            (form-decode (subseq query (1+ eq-pos) amp)))
+                      (cons (form-decode (subseq query segment-start amp)) ""))
+                  pairs))
           (if (>= amp len)
               (return (nreverse pairs))
               (setf start (1+ amp))))))))
@@ -1268,9 +1272,11 @@
             (when declared
               ;; 1*DIGIT, as the ingress parser requires of a request; a
               ;; sign or a space inside would pass PARSE-INTEGER and fail
-              ;; a strict reader downstream.
+              ;; a strict reader downstream. ASCII digits, since
+              ;; DIGIT-CHAR-P and PARSE-INTEGER both take any Unicode digit.
               (let ((value (string-trim '(#\Space #\Tab) (cdr (first declared)))))
-                (if (and (plusp (length value)) (every #'digit-char-p value))
+                (if (and (plusp (length value))
+                         (every (lambda (c) (char<= #\0 c #\9)) value))
                     (parse-integer value)
                     (error "format-response: the caller's Content-Length ~s ~
                             is not a length" (cdr (first declared))))))))
