@@ -1015,42 +1015,19 @@
             (return))))))
   (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
 
-(defvar *refusal-report* nil
-  "This worker's record of how the connection-limit warning was last
-   reported: a cons of (UNIVERSAL-TIME . REFUSALS-SINCE), the time 0 until
-   the first report. Bound per worker by RUN-WORKER; NIL off a worker,
-   where every refusal is reported.")
-
 (defun report-refusal ()
-  "Log a refusal at the connection limit — the first at once, then at most
-   once a minute per worker with a count of the ones in between.
+  "Log a refusal at the connection limit: the first at once, then at most
+   once a minute per worker with a count of the ones in between, through
+   LOG-THROTTLED.
 
    A refusal happens only when a worker is out of room, which is when a
-   flood of connections is likeliest, and every log line holds *LOG-LOCK*,
-   the one lock every worker contends for, across a format and a flush.
-   Logged per refusal, a flood would serialize every worker on logging,
-   and a stalled log pipe would stop them all. The :ON-TICK error report in
-   RUN-EVENT-LOOP is throttled the same way for the same reason. The line
-   says refusals are happening; CONNECTION-CENSUS counts every one of them
-   under :REFUSED."
-  (let ((report *refusal-report*)
-        (now (get-universal-time)))
-    (cond
-      ((null report)
-       (log-warn "connection limit reached (~d), refusing new accept"
+   flood of connections is likeliest, and a line per refusal would have
+   every worker queueing on the log lock in it. The line says refusals are
+   happening; CONNECTION-CENSUS counts every one of them under :REFUSED."
+  (log-throttled :warn :connection-limit
+                 "connection limit reached (~d), refusing new accepts; counted ~
+                  in full under :refused in the census"
                  *max-connections*))
-      ((zerop (car report))
-       (log-warn "connection limit reached (~d), refusing new accepts — ~
-                  reported at most once a minute from here, and counted ~
-                  under :refused in the census" *max-connections*)
-       (setf (car report) now))
-      ((>= (- now (car report)) 60)
-       (log-warn "connection limit reached (~d): ~d more refused in the ~
-                  last ~d seconds" *max-connections* (1+ (cdr report))
-                  (- now (car report)))
-       (setf (car report) now
-             (cdr report) 0))
-      (t (incf (cdr report))))))
 
 (defun accept-pending (listener-socket epoll-fd)
   "Accept every connection waiting on the listener. Returns NIL once the
@@ -2209,8 +2186,6 @@
   (let ((listener-fd    (socket-fd listener-socket))
         (last-ping-time  (get-universal-time))
         (last-sweep-time (get-universal-time))
-        (tick-errors     0)
-        (tick-error-at   0)
         ;; T while an accept has failed with the backlog possibly not
         ;; drained; the maintenance tick retries. See ACCEPT-PENDING.
         (accept-retry    nil)
@@ -2295,17 +2270,11 @@
             ;; demo wants — and every one of them takes *LOG-LOCK*, which
             ;; log.lisp documents as the one lock every worker contends
             ;; for. Silence would be worse: a hook that never runs looks
-            ;; exactly like a hook that was never installed. So report the
-            ;; first immediately, then at most once a minute with a count
-            ;; of what was suppressed.
-            (incf tick-errors)
-            (let ((now (get-universal-time)))
-              (when (>= (- now tick-error-at) 60)
-                (log-error ":on-tick raised on worker ~d: ~a ~
-                            (~d occurrence~:p since last reported)"
-                           *worker-id* e tick-errors)
-                (setf tick-errors 0
-                      tick-error-at now)))))))))
+            ;; exactly like a hook that was never installed. So the first
+            ;; is reported at once, and then at most one a minute with a
+            ;; count of the rest.
+            (log-throttled :error :on-tick ":on-tick raised on worker ~d: ~a"
+                           *worker-id* e)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Worker
@@ -2369,7 +2338,6 @@
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
-              (*refusal-report* (cons 0 0))
               (*log-throttle* (make-hash-table :test #'eq))
               (*stream-drain-buf*
                 (make-array 4096 :element-type '(unsigned-byte 8)))

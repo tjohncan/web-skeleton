@@ -114,8 +114,10 @@
    flood of them logged line by line would serialize every worker on
    logging, and a stalled log pipe would stop them all. The census already
    counts each refusal, so the log need only say they are happening.
-   REPORT-REFUSAL and the :ON-TICK error report are throttled the same way
-   with lines of their own."
+
+   The one throttle the framework's logging has: REPORT-REFUSAL's
+   connection-limit line and RUN-EVENT-LOOP's :ON-TICK error report come
+   through here too, each under its own KIND."
   (let ((table *log-throttle*))
     (if (null table)
         (apply #'log-msg level format-string args)
