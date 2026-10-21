@@ -71,12 +71,21 @@
     (sb-alien:* sb-alien:int))
 
 (defun errno-name (errno)
-  "Return a human-readable name for common errno values, or nil."
+  "Return a human-readable name for common errno values, or nil.
+
+   Linux's numbering, which x86-64 and arm64 share (asm-generic/errno.h),
+   the two architectures this file's structure layouts are checked for.
+   The set is the errnos this server's own calls can raise: the socket,
+   epoll and pipe calls, accept, and an outbound connect."
   (case errno
+    (1   "EPERM")
+    (2   "ENOENT")
     (4   "EINTR")
     (9   "EBADF")
     (11  "EAGAIN")
+    (12  "ENOMEM")
     (13  "EACCES")
+    (17  "EEXIST")
     (22  "EINVAL")
     ;; asm-generic/errno-base.h: ENFILE is 23 ("file table overflow",
     ;; system-wide) and EMFILE is 24 ("too many open files", per-process).
@@ -86,10 +95,19 @@
     ;; accept loop reaches for fs.file-max when the ulimit is what ran out.
     (23  "ENFILE")
     (24  "EMFILE")
+    (28  "ENOSPC")
     (32  "EPIPE")
+    (98  "EADDRINUSE")
+    (99  "EADDRNOTAVAIL")
+    (101 "ENETUNREACH")
+    (103 "ECONNABORTED")
     (104 "ECONNRESET")
+    (105 "ENOBUFS")
     (107 "ENOTCONN")
+    (110 "ETIMEDOUT")
     (111 "ECONNREFUSED")
+    (113 "EHOSTUNREACH")
+    (115 "EINPROGRESS")
     (t   nil)))
 
 (defun errno-string (errno)

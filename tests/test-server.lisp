@@ -2341,6 +2341,43 @@
                (and (eq status :external) (boundp symbol) t)
                t)))))
 
+(defun test-errno-names ()
+  "ERRNO-NAME's numbers are the C library's. Each is checked against
+   strerror's text for that number, the reference the platform itself
+   provides, so a transposed number, ENFILE's for EMFILE's say, cannot
+   name the wrong failure in a log line unnoticed."
+  (format t "~%errno names against strerror~%")
+  (dolist (case '((1 "EPERM" "Operation not permitted")
+                  (2 "ENOENT" "No such file or directory")
+                  (4 "EINTR" "Interrupted system call")
+                  (9 "EBADF" "Bad file descriptor")
+                  (11 "EAGAIN" "Resource temporarily unavailable")
+                  (12 "ENOMEM" "Cannot allocate memory")
+                  (13 "EACCES" "Permission denied")
+                  (17 "EEXIST" "File exists")
+                  (22 "EINVAL" "Invalid argument")
+                  (23 "ENFILE" "Too many open files in system")
+                  (24 "EMFILE" "Too many open files")
+                  (28 "ENOSPC" "No space left on device")
+                  (32 "EPIPE" "Broken pipe")
+                  (98 "EADDRINUSE" "Address already in use")
+                  (99 "EADDRNOTAVAIL" "Cannot assign requested address")
+                  (101 "ENETUNREACH" "Network is unreachable")
+                  (103 "ECONNABORTED" "Software caused connection abort")
+                  (104 "ECONNRESET" "Connection reset by peer")
+                  (105 "ENOBUFS" "No buffer space available")
+                  (107 "ENOTCONN" "Transport endpoint is not connected")
+                  (110 "ETIMEDOUT" "Connection timed out")
+                  (111 "ECONNREFUSED" "Connection refused")
+                  (113 "EHOSTUNREACH" "No route to host")
+                  (115 "EINPROGRESS" "Operation now in progress")))
+    (destructuring-bind (n name text) case
+      (check (format nil "errno ~d is ~a" n name)
+             (list (web-skeleton::errno-name n) (sb-int:strerror n))
+             (list name text))))
+  (check "errno: an unnamed one reads as its number"
+         (web-skeleton::errno-string 200) "errno 200"))
+
 (defun test-format-peer-addr ()
   (format t "~%format-peer-addr~%")
   (check "v4 localhost"
@@ -14333,6 +14370,7 @@
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-documented-settings-are-exported)
+  (test-errno-names)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)

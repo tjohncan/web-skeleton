@@ -740,17 +740,22 @@
                       (coerce (random-bytes 4) 'list) '(5 6 7 8))
                ;; Exhausted. The cached stream is an optimisation, not a
                ;; requirement, so a read that comes up short falls back
-               ;; to a per-call open rather than raising — otherwise one
-               ;; bad read poisons the binding for the worker's whole
-               ;; life, and RANDOM-TOKEN feeds session IDs and CSRF
-               ;; tokens. Matches how the open already degrades.
+               ;; to a per-call open rather than raising — RANDOM-TOKEN
+               ;; feeds session IDs and CSRF tokens. Matches how the open
+               ;; already degrades.
                (let ((bytes (random-bytes 8)))
                  (check "random-bytes: exhausted stream falls back"
                         (length bytes) 8)
                  ;; And the fallback really produced random bytes rather
                  ;; than the zeros a silently-unfilled buffer would hold.
                  (check "random-bytes: fallback bytes are not the empty buffer"
-                        (every #'zerop bytes) nil)))))
+                        (every #'zerop bytes) nil)
+                 ;; The failed stream is let go, so the calls after this one
+                 ;; open their own at once instead of failing on it first.
+                 (check "random-bytes: a stream that failed is unbound"
+                        web-skeleton::*urandom-stream* nil)
+                 (check "random-bytes: and closed"
+                        (open-stream-p s) nil)))))
       (ignore-errors (delete-file path))))
   ;; random-token: expected base64url length (unpadded)
   ;; 32 bytes -> ceil(32*4/3) = 43 chars
