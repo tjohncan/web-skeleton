@@ -596,11 +596,19 @@ printf 'TAIL-MARKER\\n' >> body.txt
                              ;; Reads happen only when epoll says so. If a
                              ;; drain ever leaves bytes inside OpenSSL, epoll
                              ;; goes quiet and this loop ends short.
+                             ;;
+                             ;; Quiet is five seconds without an event. Bytes
+                             ;; stranded inside OpenSSL raise no event ever,
+                             ;; so the stall is caught at any length of wait;
+                             ;; what a short one catches as well is s_server
+                             ;; pausing mid-body on a loaded host, which is
+                             ;; the peer being slow and not the read losing
+                             ;; bytes.
                              (loop repeat 200
                                    while (not (member (first verdicts)
                                                       '(:eof :ok-eof)))
                                    do (if (plusp (web-skeleton::epoll-wait
-                                                  epfd evbuf 4 1000))
+                                                  epfd evbuf 4 5000))
                                           ;; A raising read becomes a verdict
                                           ;; rather than the end of the suite;
                                           ;; the assertions below then report
