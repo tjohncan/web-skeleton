@@ -4148,6 +4148,32 @@
               (lambda ()
                 (web-skeleton::try-parse-ws-frame header-only 0 2)))
              t))
+    ;; A reserved opcode is refused from the header for the same reason:
+    ;; a masked frame with opcode 3 declaring 64 KiB, nothing of it here
+    ;; but its header, is refused rather than waited for. Opcode 11 too,
+    ;; which as a control frame would be held to 125 bytes, and the
+    ;; defined opcodes still wait for their payload.
+    (flet ((header-says (byte0)
+             ;; FIN, BYTE0's opcode, masked, 16-bit length 65535, a mask.
+             (let ((h (make-array 8 :element-type '(unsigned-byte 8)
+                                    :initial-contents (list byte0 (logior #x80 126)
+                                                            #xFF #xFF 1 2 3 4))))
+               (handler-case
+                   (multiple-value-bind (frame consumed)
+                       (web-skeleton::try-parse-ws-frame h 0 8)
+                     (list frame consumed))
+                 (error () :refused)))))
+      (check "reserved opcode 3 refused from its header"
+             (header-says #x83) :refused)
+      (check "reserved opcode 7 refused from its header"
+             (header-says #x87) :refused)
+      (check "a binary frame's header alone still waits for its payload"
+             (header-says #x82) '(nil 0)))
+    (let ((h (make-array 6 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x8B #x80 1 2 3 4))))
+      (check "reserved opcode 11 refused from its header"
+             (signals-error-p (lambda () (web-skeleton::try-parse-ws-frame h 0 6)))
+             t))
     ;; And a masked frame with the same shortfall still asks for more,
     ;; so the hoist did not turn incompleteness into an error.
     (let ((masked-short (make-array 2 :element-type '(unsigned-byte 8)
@@ -6802,6 +6828,85 @@
 ;;; message unfinished, and stopped when a data message completes; the
 ;;; sweep closes a message past it with 1008.
 ;;; ---------------------------------------------------------------------------
+
+(defun test-utf-8-well-formed-p ()
+  "UTF-8-WELL-FORMED-P, the check on a text message and a close reason,
+   answers as RFC 3629 does: the edges of each range, overlong forms,
+   surrogates, code points past U+10FFFF, leads that begin nothing, and
+   sequences cut short. Then against SBCL's decoder, which a text frame
+   was checked with before: every one- and two-byte sequence, and twenty
+   thousand built of pieces. A piece is a code point SBCL encodes, near a
+   range's edge as often as not, or one of the hard cases or a few random
+   bytes, so a sequence is often well formed but for the one piece that
+   decides it."
+  (format t "~%UTF-8: well-formed, read in place~%")
+  (flet ((ok (&rest bytes)
+           (web-skeleton::utf-8-well-formed-p
+            (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+    (dolist (case '(("empty" () t)
+                    ("ASCII" (#x41 #x7F) t)
+                    ("U+0080, the first two-byte" (#xC2 #x80) t)
+                    ("U+07FF, the last two-byte" (#xDF #xBF) t)
+                    ("U+0800, the first three-byte" (#xE0 #xA0 #x80) t)
+                    ("U+D7FF, below the surrogates" (#xED #x9F #xBF) t)
+                    ("U+E000, above them" (#xEE #x80 #x80) t)
+                    ("U+FFFF" (#xEF #xBF #xBF) t)
+                    ("U+10000, the first four-byte" (#xF0 #x90 #x80 #x80) t)
+                    ("U+10FFFF, the last" (#xF4 #x8F #xBF #xBF) t)
+                    ("overlong NUL" (#xC0 #x80) nil)
+                    ("overlong C1" (#xC1 #xBF) nil)
+                    ("overlong three-byte" (#xE0 #x9F #xBF) nil)
+                    ("overlong four-byte" (#xF0 #x8F #xBF #xBF) nil)
+                    ("surrogate U+D800" (#xED #xA0 #x80) nil)
+                    ("surrogate U+DFFF" (#xED #xBF #xBF) nil)
+                    ("past U+10FFFF" (#xF4 #x90 #x80 #x80) nil)
+                    ("lead F5" (#xF5 #x80 #x80 #x80) nil)
+                    ("lead FF" (#xFF) nil)
+                    ("a lone continuation" (#x80) nil)
+                    ("two-byte cut short" (#xC2) nil)
+                    ("three-byte cut short" (#xE2 #x82) nil)
+                    ("four-byte cut short" (#xF0 #x9F #x98) nil)
+                    ("a lead where a continuation belongs" (#xE2 #x41 #x80) nil)))
+      (destructuring-bind (name bytes expected) case
+        (check (format nil "utf-8: ~a" name) (apply #'ok bytes) expected))))
+  (let ((disagreements nil)
+        (state (sb-ext:seed-random-state 6455)))
+    (flet ((try (v)
+             (let ((ours (web-skeleton::utf-8-well-formed-p v))
+                   (sbcl (handler-case
+                             (progn (sb-ext:octets-to-string v :external-format :utf-8) t)
+                           (error () nil))))
+               (unless (eq ours sbcl)
+                 (push (coerce v 'list) disagreements)))))
+      (dotimes (a 256)
+        (try (coerce (list a) '(simple-array (unsigned-byte 8) (*))))
+        (dotimes (b 256)
+          (try (coerce (list a b) '(simple-array (unsigned-byte 8) (*))))))
+      (let ((edges '(#x7F #x80 #x7FF #x800 #xD7FF #xE000 #xFFFF #x10000 #x10FFFF))
+            (hard '((#xC0 #x80) (#xC1 #xBF) (#xE0 #x9F #xBF) (#xF0 #x8F #xBF #xBF)
+                    (#xED #xA0 #x80) (#xED #xBF #xBF) (#xF4 #x90 #x80 #x80)
+                    (#xF5 #x80 #x80 #x80) (#xFF) (#x80) (#xC2) (#xE2 #x82)
+                    (#xF0 #x9F #x98))))
+        (flet ((piece ()
+                 (case (random 4 state)
+                   ;; A code point, SBCL's encoding of it.
+                   ((0 1)
+                    (let ((cp (if (zerop (random 2 state))
+                                  (nth (random (length edges) state) edges)
+                                  (loop for c = (random #x110000 state)
+                                        unless (<= #xD800 c #xDFFF) return c))))
+                      (coerce (sb-ext:string-to-octets (string (code-char cp))
+                                                       :external-format :utf-8)
+                              'list)))
+                   (2 (nth (random (length hard) state) hard))
+                   (t (loop repeat (1+ (random 4 state))
+                            collect (random 256 state))))))
+          (dotimes (n 20000)
+            (try (coerce (loop repeat (1+ (random 5 state)) append (piece))
+                         '(simple-array (unsigned-byte 8) (*))))))))
+    (check "utf-8: agrees with SBCL's decoder on every case tried"
+           (subseq (reverse disagreements) 0 (min 5 (length disagreements)))
+           nil)))
 
 (defun test-ws-message-clock ()
   "WS-MESSAGE-AT through WEBSOCKET-ON-READ, a read at a time: a first
@@ -14427,6 +14532,7 @@
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)
   (test-websocket-peer-that-leaves-mid-frame)
   (test-ws-write-stall-sweep)
+  (test-utf-8-well-formed-p)
   (test-ws-message-clock)
   (test-ws-message-timeout-sweep)
   (test-ws-handler-push-and-return)

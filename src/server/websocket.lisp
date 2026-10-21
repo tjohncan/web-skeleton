@@ -224,6 +224,55 @@
 ;;;   Payload data
 ;;; ---------------------------------------------------------------------------
 
+(defun utf-8-well-formed-p (bytes &optional (start 0) (end (length bytes)))
+  "T when BYTES[START..END) is well-formed UTF-8 (RFC 3629, and the
+   Unicode Standard's table of well-formed byte sequences): no overlong
+   form, no surrogate code point, nothing past U+10FFFF, and no sequence
+   cut short. What RFC 6455 §8.1 asks of a text message and a close
+   reason.
+
+   Read in place. Decoding to check would build a string of up to four
+   bytes a character, a 4 MiB one for a 1 MiB message, only to drop it.
+   TEST-UTF-8-WELL-FORMED-P holds this to SBCL's decoder on the edge
+   cases and on random bytes."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (type fixnum start end))
+  (let ((i start))
+    (declare (type fixnum i))
+    (flet ((tail-p (j lo hi)
+             ;; Byte J is there, and in LO..HI.
+             (and (< j end) (<= lo (aref bytes j) hi))))
+      (declare (inline tail-p))
+      (loop
+        (when (>= i end) (return t))
+        (let ((b (aref bytes i)))
+          (cond
+            ((< b #x80) (incf i))
+            ;; C0 and C1 could only begin an overlong form of ASCII.
+            ((<= #xC2 b #xDF)
+             (unless (tail-p (+ i 1) #x80 #xBF) (return nil))
+             (incf i 2))
+            ;; E0's second byte from A0, or the form is overlong; ED's up
+            ;; to 9F, or it is a surrogate.
+            ((<= #xE0 b #xEF)
+             (unless (and (tail-p (+ i 1)
+                                  (if (= b #xE0) #xA0 #x80)
+                                  (if (= b #xED) #x9F #xBF))
+                          (tail-p (+ i 2) #x80 #xBF))
+               (return nil))
+             (incf i 3))
+            ;; F0's second byte from 90, or the form is overlong; F4's up to
+            ;; 8F, or it is past U+10FFFF. F5 and above begin nothing.
+            ((<= #xF0 b #xF4)
+             (unless (and (tail-p (+ i 1)
+                                  (if (= b #xF0) #x90 #x80)
+                                  (if (= b #xF4) #x8F #xBF))
+                          (tail-p (+ i 2) #x80 #xBF)
+                          (tail-p (+ i 3) #x80 #xBF))
+               (return nil))
+             (incf i 4))
+            (t (return nil))))))))
+
 (defun try-parse-ws-frame (buf start end)
   "Try to parse a WebSocket frame from BUF[START..END).
    Returns (values frame bytes-consumed) if complete, or (values NIL 0)."
@@ -250,6 +299,14 @@
       ;; occupy with something we had already decided to reject.
       (unless masked
         (error "WebSocket: received unmasked client frame"))
+      ;; RFC 6455 §5.2: opcodes 3-7 and 11-15 are reserved, and a frame
+      ;; carrying one fails the connection. Decidable from byte 0, so for
+      ;; the reason above it is refused here, before its payload is read:
+      ;; 3-7 count as data frames, and would otherwise be buffered and
+      ;; unmasked up to *MAX-WS-PAYLOAD-SIZE* only to be refused.
+      ;; WEBSOCKET-ON-READ's unknown-opcode arm stays as its own backstop.
+      (when (or (<= 3 opcode 7) (<= 11 opcode 15))
+        (error "WebSocket: reserved opcode ~d" opcode))
       ;; Determine payload length and header size
       (cond
         ((<= len7 125)
@@ -751,14 +808,11 @@
                  ;; Complete single-frame message
                  (progn
                    ;; RFC 6455 §5.6: text frames must contain valid UTF-8
-                   (when (= opcode +ws-op-text+)
-                     (handler-case
-                         (sb-ext:octets-to-string (ws-frame-payload frame)
-                                                   :external-format :utf-8)
-                       (error ()
-                         (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in text frame fd ~d"
-                                   (connection-fd conn))
-                         (return-from websocket-on-read (close-with 1007)))))
+                   (when (and (= opcode +ws-op-text+)
+                              (not (utf-8-well-formed-p (ws-frame-payload frame))))
+                     (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in text frame fd ~d"
+                                    (connection-fd conn))
+                     (return-from websocket-on-read (close-with 1007)))
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
@@ -823,13 +877,11 @@
                             (connection-ws-frag-opcode conn) total
                             (connection-fd conn))
                  ;; RFC 6455 §5.6: validate UTF-8 for reassembled text
-                 (when (= (connection-ws-frag-opcode conn) +ws-op-text+)
-                   (handler-case
-                       (sb-ext:octets-to-string payload :external-format :utf-8)
-                     (error ()
-                       (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in reassembled text fd ~d"
-                                 (connection-fd conn))
-                       (return-from websocket-on-read (close-with 1007)))))
+                 (when (and (= (connection-ws-frag-opcode conn) +ws-op-text+)
+                            (not (utf-8-well-formed-p payload)))
+                   (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in reassembled text fd ~d"
+                                  (connection-fd conn))
+                   (return-from websocket-on-read (close-with 1007)))
                  (setf (connection-last-active conn) (get-universal-time)
                        (connection-ws-message-at conn) 0)
                  (let ((complete (make-ws-frame
@@ -872,14 +924,10 @@
                                 code (connection-fd conn))
                  (return-from websocket-on-read (close-with 1002)))
                ;; RFC 6455 §5.5.1: close reason text must be valid UTF-8
-               (when (> (length payload) 2)
-                 (handler-case
-                     (sb-ext:octets-to-string payload :start 2
-                                               :external-format :utf-8)
-                   (error ()
-                     (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in close reason fd ~d"
-                               (connection-fd conn))
-                     (return-from websocket-on-read (close-with 1007)))))
+               (unless (utf-8-well-formed-p payload (min 2 (length payload)))
+                 (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in close reason fd ~d"
+                                (connection-fd conn))
+                 (return-from websocket-on-read (close-with 1007)))
                ;; Normal client-initiated close: the replies to earlier
                ;; frames in this batch are queued already, and CLOSE-WITH
                ;; shifts the buffer.
