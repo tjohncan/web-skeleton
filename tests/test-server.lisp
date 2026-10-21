@@ -13100,6 +13100,149 @@
                       (list nil :deadline '("hello"))))))
       (setf web-skeleton:*ws-message-timeout* saved))))
 
+(defun test-ws-upgrade-shapes-the-101 ()
+  "WS-UPGRADE, WS-CHOOSE-PROTOCOL and WS-OFFERED-PROTOCOLS, and the 101
+   CLASSIFY-RESPONSE makes of a WS-UPGRADE: the chosen subprotocol and the
+   application's headers on it, a subprotocol the client did not offer
+   refused, the handshake's own fields refused at WS-UPGRADE, and a request
+   that is not an upgrade answered 400 whatever the handler returned."
+  (format t "~%WebSocket: a handler shapes the 101~%")
+  (flet ((handshake (&rest extra)
+           (make-test-request
+            :path "/ws"
+            :headers (append '(("Upgrade" . "websocket") ("Connection" . "Upgrade")
+                               ("Sec-WebSocket-Version" . "13")
+                               ("Sec-WebSocket-Key" . "dGhlIHNhbXBsZSBub25jZQ=="))
+                             extra)))
+         (refused (&rest args)
+           (handler-case (progn (apply #'ws-upgrade args) :accepted)
+             (error (e) (princ-to-string e))))
+         (header (response name)
+           (cdr (assoc name (http-response-headers response) :test #'string-equal))))
+    (let ((offered (handshake '("Sec-WebSocket-Protocol" . "chat, superchat")
+                              '("Sec-WebSocket-Protocol" . " v2.json ,"))))
+      (check "offered: every field, split on commas and trimmed, in order"
+             (ws-offered-protocols offered) '("chat" "superchat" "v2.json"))
+      (check "choose: the first of ours the client offered, in our order"
+             (ws-choose-protocol offered '("superchat" "chat")) "superchat")
+      (check "choose: names compare exactly"
+             (ws-choose-protocol offered '("Chat")) nil)
+      (check "choose: none in common is NIL"
+             (ws-choose-protocol (handshake) '("chat")) nil)
+      (multiple-value-bind (response upgrade-p)
+          (web-skeleton::classify-response
+           offered (ws-upgrade :protocol "superchat"
+                               :headers '(("Set-Cookie" . "a=1") ("Set-Cookie" . "b=2")
+                                          ("X-Trace" . "t-1"))))
+        (check "101: an upgrade, with the subprotocol chosen"
+               (list upgrade-p (http-response-status response)
+                     (header response "sec-websocket-protocol")
+                     (and (header response "sec-websocket-accept") t))
+               '(t 101 "superchat" t))
+        (check "101: and the application's headers, a repeated name kept twice"
+               (list (count "set-cookie" (http-response-headers response)
+                            :key #'car :test #'string-equal)
+                     (header response "x-trace"))
+               '(2 "t-1")))
+      (check "101: a plain :upgrade names no subprotocol"
+             (header (web-skeleton::classify-response offered :upgrade)
+                     "sec-websocket-protocol")
+             nil)
+      (check "a subprotocol the client did not offer is refused, by name"
+             (handler-case (progn (web-skeleton::classify-response
+                                   offered (ws-upgrade :protocol "mqtt"))
+                                  :accepted)
+               (error (e) (and (search "\"mqtt\"" (princ-to-string e)) :refused)))
+             :refused)
+      (check "and so is any subprotocol when the client offered none"
+             (handler-case (progn (web-skeleton::classify-response
+                                   (handshake) (ws-upgrade :protocol "chat"))
+                                  :accepted)
+               (error () :refused))
+             :refused))
+    (check "a request that is not an upgrade is answered 400 all the same"
+           (multiple-value-list
+            (let ((r (web-skeleton::classify-response
+                      (make-test-request :path "/ws") (ws-upgrade :protocol "chat"))))
+              (http-response-status r)))
+           '(400))
+    (dolist (name '("Upgrade" "connection" "Sec-WebSocket-Accept" "sec-websocket-protocol"
+                    "Sec-WebSocket-Extensions" "Content-Length" "transfer-encoding"))
+      (check (format nil "ws-upgrade: ~a is the handshake's, refused" name)
+             (let ((why (refused :headers (list (cons name "x")))))
+               (and (stringp why) (search (string-downcase name) (string-downcase why)) t))
+             t))
+    (check "ws-upgrade: a header that is not a pair of strings is refused"
+           (list (stringp (refused :headers '(("x-a" . 1))))
+                 (stringp (refused :headers '("x-a")))
+                 (stringp (refused :protocol 'chat)))
+           '(t t t))
+    (check "ws-upgrade: with nothing given, it is a plain upgrade"
+           (multiple-value-bind (response upgrade-p)
+               (web-skeleton::classify-response (handshake) (ws-upgrade))
+             (list upgrade-p (http-response-status response)
+                   (header response "sec-websocket-protocol")))
+           '(t 101 nil))))
+
+(defun test-ws-upgrade-subprotocol-e2e ()
+  "A browser-shaped handshake offering subprotocols, answered live: the
+   101 names the one chosen and carries the handler's header, and the
+   WebSocket then works as any other."
+  (format t "~%WebSocket: a subprotocol chosen, end to end~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (let ((p (ws-choose-protocol req '("superchat" "chat"))))
+                    (if p
+                        (ws-upgrade :protocol p :headers '(("x-trace" . "t-9")))
+                        (make-error-response 400))))
+       :ws-handler (lambda (conn frame)
+                     (declare (ignore conn))
+                     (build-ws-text (format nil "echo:~a"
+                                            (sb-ext:octets-to-string
+                                             (ws-frame-payload frame)
+                                             :external-format :utf-8)))))
+    (let* ((sock (connect-to-test-server))
+           (stream (sb-bsd-sockets:socket-make-stream
+                    sock :input t :output t :element-type '(unsigned-byte 8))))
+      (unwind-protect
+           (progn
+             (write-sequence (sb-ext:string-to-octets
+                              (crlf "GET /ws HTTP/1.1" "Host: localhost"
+                                    "Upgrade: websocket" "Connection: Upgrade"
+                                    "Sec-WebSocket-Version: 13"
+                                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+                                    "Sec-WebSocket-Protocol: chat, superchat")
+                              :external-format :ascii)
+                             stream)
+             (force-output stream)
+             (let ((head (sb-ext:octets-to-string
+                          (read-until-bounded
+                           stream :seconds 3
+                           :until (lambda (buf fill)
+                                    (and (>= fill 4)
+                                         (= (aref buf (- fill 4)) 13) (= (aref buf (- fill 3)) 10)
+                                         (= (aref buf (- fill 2)) 13) (= (aref buf (- fill 1)) 10))))
+                          :external-format :latin-1)))
+               (check "e2e: 101, naming the subprotocol the server preferred"
+                      (list (and (search "HTTP/1.1 101" head) t)
+                            (and (search "sec-websocket-protocol: superchat" head
+                                         :test #'char-equal)
+                                 t)
+                            (and (search "x-trace: t-9" head :test #'char-equal) t))
+                      '(t t t)))
+             (write-sequence (%ws-client-frame 1 "hi") stream)
+             (force-output stream)
+             (let ((reply (read-until-bounded stream :seconds 3
+                                              :until (lambda (buf fill)
+                                                       (declare (ignore buf))
+                                                       (>= fill 9)))))
+               (check "e2e: and the WebSocket answers as any other"
+                      (sb-ext:octets-to-string (subseq reply 2 (fill-pointer reply))
+                                               :external-format :latin-1)
+                      "echo:hi")))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+
 (defun test-ws-handler-reply-of-the-wrong-type ()
   "A ws-handler that returns something other than a frame's bytes — a
    string, the commonest slip — has its connection closed, however many
@@ -13787,6 +13930,8 @@
   (test-ws-send-refuses-a-closing-websocket)
   (test-ws-close)
   (test-ws-message-deadline-e2e)
+  (test-ws-upgrade-shapes-the-101)
+  (test-ws-upgrade-subprotocol-e2e)
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)

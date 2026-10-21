@@ -110,15 +110,94 @@
                                   (char= c #\+) (char= c #\/)))
                  (string= version "13")))))))
 
-(defun make-websocket-handshake-response (request)
+;;; ---------------------------------------------------------------------------
+;;; Shaping the 101: a subprotocol, and headers of the application's
+;;; ---------------------------------------------------------------------------
+
+(defstruct (ws-upgrade (:constructor %make-ws-upgrade (protocol headers)))
+  "A handler's answer to a WebSocket handshake that shapes the 101, made by
+   WS-UPGRADE and returned in place of :UPGRADE."
+  (protocol nil :type (or null string))
+  (headers  nil :type list))
+
+(defparameter *ws-handshake-owned-headers*
+  '("upgrade" "connection" "sec-websocket-accept" "sec-websocket-protocol"
+    "sec-websocket-extensions" "content-length" "transfer-encoding")
+  "Fields of the 101 the handshake writes or rules out, which WS-UPGRADE's
+   HEADERS may not carry. Sec-WebSocket-Protocol is WS-UPGRADE's PROTOCOL,
+   checked against what the client offered. Sec-WebSocket-Extensions would
+   agree to an extension, such as permessage-deflate, that the frame
+   reader does not implement. A 101 has no body to frame.")
+
+(defun ws-upgrade (&key protocol headers)
+  "An answer to a WebSocket handshake that shapes the 101, for a handler to
+   return in place of :UPGRADE.
+
+   PROTOCOL is the subprotocol chosen, sent as the 101's
+   Sec-WebSocket-Protocol. It must be one the client offered (RFC 6455
+   §4.2.2), and a client that offered any fails the connection unless the
+   101 names one of them; WS-CHOOSE-PROTOCOL picks it. HEADERS is an alist
+   of further fields for the 101, (NAME . VALUE) strings: a cookie, a
+   correlation id. Each goes out as written, so a name may repeat.
+
+   Signals for a field the handshake owns (*WS-HANDSHAKE-OWNED-HEADERS*),
+   and for a name or value that is not a string. The handshake's own
+   checks still decide the answer: a request that is not a valid upgrade
+   is answered 400, and a PROTOCOL the client did not offer is a 500 that
+   names it."
+  (unless (or (null protocol) (stringp protocol))
+    (error "ws-upgrade: :protocol is ~s; it must be a string, or NIL" protocol))
+  (unless (listp headers)
+    (error "ws-upgrade: :headers is ~s; it must be an alist of (name . value) ~
+            strings" headers))
+  (loop for entry in headers
+        do (unless (and (consp entry) (stringp (car entry)) (stringp (cdr entry)))
+             (error "ws-upgrade: header ~s is not a (name . value) pair of strings"
+                    entry))
+           (when (member (car entry) *ws-handshake-owned-headers*
+                         :test #'string-equal)
+             (error "ws-upgrade: ~a is the handshake's to write~a"
+                    (car entry)
+                    (if (string-equal (car entry) "sec-websocket-protocol")
+                        "; choose the subprotocol with :protocol"
+                        ""))))
+  (%make-ws-upgrade protocol (copy-alist headers)))
+
+(defun ws-offered-protocols (request)
+  "The subprotocols REQUEST's client offered, in the order offered: every
+   Sec-WebSocket-Protocol field, split on commas, each name trimmed."
+  (loop for value in (get-headers request "sec-websocket-protocol")
+        nconc (loop for start = 0 then (1+ comma)
+                    for comma = (position #\, value :start start)
+                    for name = (string-trim '(#\Space #\Tab)
+                                            (subseq value start comma))
+                    unless (zerop (length name)) collect name
+                    while comma)))
+
+(defun ws-choose-protocol (request supported)
+  "The subprotocol to answer REQUEST's handshake with: the first of
+   SUPPORTED, a list of names in the application's order of preference,
+   that the client offered, or NIL when it offered none of them. Names
+   are compared exactly, as browsers compare the one a 101 returns."
+  (let ((offered (ws-offered-protocols request)))
+    (find-if (lambda (name) (member name offered :test #'string=)) supported)))
+
+(defun make-websocket-handshake-response (request &optional upgrade)
   "Build the 101 Switching Protocols response for a WebSocket upgrade.
-   Returns an HTTP-RESPONSE."
+   Returns an HTTP-RESPONSE. UPGRADE, a WS-UPGRADE, adds its subprotocol
+   and its headers; it has been checked against REQUEST already."
   (let* ((key (get-header request "sec-websocket-key"))
          (accept (websocket-accept-key key))
          (response (make-http-response :status 101)))
     (set-response-header response "upgrade" "websocket")
     (set-response-header response "connection" "Upgrade")
     (set-response-header response "sec-websocket-accept" accept)
+    (when upgrade
+      (when (ws-upgrade-protocol upgrade)
+        (set-response-header response "sec-websocket-protocol"
+                             (ws-upgrade-protocol upgrade)))
+      (loop for (name . value) in (ws-upgrade-headers upgrade)
+            do (add-response-header response name value)))
     response))
 
 ;;; ---------------------------------------------------------------------------

@@ -339,7 +339,10 @@ tests/
   `web-skeleton-tls` for it
 - **JWT validation** — ES256 token verification, JWKS key set parsing,
   claim extraction, expiration checking.
-- **WebSocket handshake** — validates upgrade request, computes accept key
+- **WebSocket handshake** — validates upgrade request, computes accept key.
+  A handler that returns `ws-upgrade` instead of `:upgrade` shapes the 101:
+  a subprotocol chosen from those the client offered (`ws-choose-protocol`),
+  and headers of its own
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
   (automatic reassembly, bounded in size and in the time a message may

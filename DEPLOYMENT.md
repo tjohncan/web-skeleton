@@ -286,6 +286,41 @@ Check Origin in your handler before returning `:upgrade`:
            (make-error-response 404)))))
 ```
 
+### Subprotocols, and the rest of the 101
+
+A client that opens `new WebSocket(url, ["graphql-transport-ws"])` offers
+subprotocols in `Sec-WebSocket-Protocol`, and fails the connection unless
+the 101 names one of them (RFC 6455 §4.1). GraphQL subscriptions, STOMP and
+MQTT over WebSocket all negotiate this way. Return `ws-upgrade` in place of
+`:upgrade` to answer with one:
+
+```lisp
+((string= (http-request-path request) "/graphql")
+ (let ((protocol (ws-choose-protocol request '("graphql-transport-ws"
+                                               "graphql-ws"))))
+   (if protocol
+       (ws-upgrade :protocol protocol
+                   :headers (list (cons "set-cookie" (session-cookie request))))
+       (make-error-response 400 "no subprotocol in common"))))
+```
+
+- **`ws-choose-protocol`** answers the first of the names you list, in your
+  order of preference, that the client offered, or `nil`.
+  `ws-offered-protocols` lists what it offered, in its order. Names are
+  compared exactly, as browsers compare the one the 101 returns.
+- **`ws-upgrade :protocol`** must be one the client offered. Any other is
+  a 500 that names it, since the client would fail the connection with
+  nothing said to the server.
+- **`ws-upgrade :headers`** adds fields to the 101: a cookie, a correlation
+  id. The fields the handshake owns are refused (`Upgrade`, `Connection`,
+  `Sec-WebSocket-Accept`, `Sec-WebSocket-Protocol`, `Content-Length`,
+  `Transfer-Encoding`), and so is `Sec-WebSocket-Extensions`, which would
+  agree to an extension, such as `permessage-deflate`, that the frame reader
+  does not implement.
+- **The handshake's checks still decide.** A request that is not a valid
+  upgrade is answered 400 whatever the handler returned, and the Origin
+  check above belongs before either.
+
 ### JWT issuer and audience
 
 `jwt-verify` checks the signature, and checks `exp` / `nbf` **when those claims

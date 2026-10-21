@@ -112,6 +112,9 @@
            #:build-ws-close
            #:ws-send
            #:ws-close
+           #:ws-upgrade
+           #:ws-choose-protocol
+           #:ws-offered-protocols
            ;; Static files
            #:load-static-files
            #:serve-static

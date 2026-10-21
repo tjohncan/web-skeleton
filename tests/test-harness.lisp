@@ -5509,6 +5509,10 @@
                    ((string= path "/raise-end")
                     (recv :end (lambda (acc) (declare (ignore acc))
                                  (error "deliberate: on-end"))))
+                   ((string= path "/end-upgrade")
+                    (recv :end (lambda (acc) (declare (ignore acc)) :upgrade)))
+                   ((string= path "/end-ws-upgrade")
+                    (recv :end (lambda (acc) (declare (ignore acc)) (ws-upgrade))))
                    ((string= path "/unbounded") (recv :max-size nil))
                    ((string= path "/fetch")
                     (recv :end (lambda (acc)
@@ -5639,6 +5643,16 @@
                  t)
           (check "raised in ON-END: ON-ABORT heard :error" (aborted "/raise-end")
                  '(:error))
+          ;; A request whose body was read is no handshake, whichever way
+          ;; ON-END asks to switch protocols.
+          (check "ON-END answering :upgrade, or a WS-UPGRADE: 500 each"
+                 (loop for path in '("/end-upgrade" "/end-ws-upgrade")
+                       collect (and (search "HTTP/1.1 500"
+                                            (answer-of (head path "Content-Length: 4"
+                                                             "Connection: close")
+                                                       (%ascii "abcd")))
+                                    t))
+                 '(t t))
           (check "malformed: chunked framing that is wrong is 400"
                  (and (search "HTTP/1.1 400"
                               (answer-of (head "/recv-malformed"

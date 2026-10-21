@@ -888,14 +888,27 @@
    become the 101 or the 400 its handshake earns. Anything else signals,
    naming the shapes."
   (cond
-    ;; Handler signals WebSocket upgrade
-    ((eq response :upgrade)
+    ;; Handler signals WebSocket upgrade, as :UPGRADE or as a WS-UPGRADE
+    ;; that shapes the 101
+    ((or (eq response :upgrade) (ws-upgrade-p response))
      (if (websocket-upgrade-p request)
-         (progn
+         (let ((upgrade (and (ws-upgrade-p response) response)))
+           ;; A 101 naming a subprotocol the client did not offer fails the
+           ;; connection at the client (RFC 6455 §4.1), with nothing said
+           ;; to the server. Refused here instead, where the 500 can name
+           ;; the handler's choice.
+           (when (and upgrade
+                      (ws-upgrade-protocol upgrade)
+                      (not (member (ws-upgrade-protocol upgrade)
+                                   (ws-offered-protocols request)
+                                   :test #'string=)))
+             (error "ws-upgrade: :protocol ~s is not one the client offered ~
+                     (~{~s~^, ~}); WS-CHOOSE-PROTOCOL picks from what it offered"
+                    (ws-upgrade-protocol upgrade) (ws-offered-protocols request)))
            (log-debug "~a ~a -> 101 upgrade"
                      (http-request-method request)
                      (http-request-path request))
-           (values (make-websocket-handshake-response request) t))
+           (values (make-websocket-handshake-response request upgrade) t))
          (progn
            (log-warn "~a ~a -> 400 bad upgrade"
                      (http-request-method request)
@@ -1552,9 +1565,10 @@
                     (serious-condition (e)
                       (abort-received-body plan conn :error)
                       (error e)))))
-      (when (eq answer :upgrade)
-        (error "receive-body: :on-end returned :UPGRADE; a request whose ~
-                body was received cannot switch protocols"))
+      (when (or (eq answer :upgrade) (ws-upgrade-p answer))
+        (error "receive-body: :on-end returned ~:[:UPGRADE~;a WS-UPGRADE~]; a ~
+                request whose body was received cannot switch protocols"
+               (ws-upgrade-p answer)))
       (multiple-value-bind (response upgrade-p)
           (classify-response request answer)
         (carry-out-response conn epoll-fd request response upgrade-p)))))
