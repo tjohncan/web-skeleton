@@ -45,8 +45,9 @@
    containing two EC keys with the same kid — an accidental duplicate
    during a rotation window would make (FIND kid ...) silently pick
    whichever one sorted first, and that's rarely what the issuer
-   meant. Missing kty or crv are skipped cleanly (not type-erroring
-   on STRING= against NIL)."
+   meant. A key whose kty or crv is missing, or is not a string, is
+   skipped as one of another type is: RFC 7517 §5 has a JWK Set's
+   reader ignore the keys whose kty it does not understand."
   (let* ((jwks (json-parse json-string))
          (keys-array (json-get jwks "keys"))
          ;; "keys" must be an array. A JWKS with "keys": {} or a scalar is
@@ -61,7 +62,7 @@
           (loop for key-obj in keys-array
                 for kty = (json-get key-obj "kty")
                 for crv = (json-get key-obj "crv")
-                when (and kty crv
+                when (and (stringp kty) (stringp crv)
                           (string= kty "EC")
                           (string= crv "P-256"))
                 collect (let ((x-b64 (json-get key-obj "x"))
@@ -126,7 +127,15 @@
 
    The claims value is always non-NIL on success, including for a token
    whose payload is {}, so an empty but valid claim set cannot be taken
-   for a rejected token at the call site."
+   for a rejected token at the call site. A payload that is not a JSON
+   object (5, \"x\", [], null) is refused however it is signed: RFC 7519
+   §7.2 makes the claims set an object.
+
+   Anything that raises on the way, from a token that is not base64url
+   or JSON to a fault in the verifier itself, answers NIL, so attacker
+   input never reaches the caller as a condition. What raised is logged
+   at DEBUG, throttled, and never the token, so a fault in the verifier
+   can be told apart from a bad token."
   (handler-case
       (let ((parts (jwt-split token)))
         (unless (= (length parts) 3)
@@ -166,6 +175,11 @@
                                         (base64url-decode payload-b64)
                                         :external-format :utf-8)))
                    (now (jwt-current-time)))
+              ;; RFC 7519 §7.2 step 10. JSON-GET answers NIL on anything
+              ;; that is not an object, so without this a signed 5 would
+              ;; pass the exp and nbf checks and come back as the claims.
+              (unless (json-object-p claims)
+                (return-from jwt-verify nil))
               (let ((exp (json-get claims "exp")))
                 (when exp
                   (unless (numberp exp)
@@ -188,7 +202,10 @@
                                                 (jwt-key-x key) (jwt-key-y key)))
                   (return-from jwt-verify nil))
                 claims)))))
-    (error () nil)))
+    (error (e)
+      (log-throttled :debug :jwt-verify-raised
+                     "jwt-verify: ~a while verifying a token: ~a" (type-of e) e)
+      nil)))
 
 (defun jwt-claim (claims key)
   "Extract a claim value from the JSON-OBJECT returned by JWT-VERIFY."

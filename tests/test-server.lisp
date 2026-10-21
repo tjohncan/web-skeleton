@@ -5227,6 +5227,142 @@
 ;;; JWT tests
 ;;; ---------------------------------------------------------------------------
 
+;;; A signer, for the tests alone. The framework verifies ES256 and signs
+;;; nothing, and a refusal is only shown to be for its own reason by a
+;;; token whose one fault is that reason: a header naming another alg, a
+;;; payload changed after signing, a claims set that is not an object, each
+;;; validly signed and unexpired. Built from the framework's own P-256
+;;; arithmetic, with RFC 6979's A.2.5 key and its nonce for "sample" so the
+;;; signer is checked against published answers before anything rests on it.
+;;; A test key, never a secret.
+
+(defparameter *test-es256-d*
+  #xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+  "RFC 6979 A.2.5's P-256 private key.")
+
+(defparameter *test-es256-k*
+  #xA6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60
+  "RFC 6979 A.2.5's nonce for SHA-256 over \"sample\"; reused for every
+   test signature, which a real signer must never do.")
+
+(defun %p256-times-g (k)
+  "K times the P-256 base point, affine, as (values X Y)."
+  (let ((p web-skeleton::+p256-p+))
+    (multiple-value-bind (x y z)
+        (web-skeleton::ec-mul-add k 0 web-skeleton::+p256-gx+ web-skeleton::+p256-gy+)
+      (let* ((zi (web-skeleton::mod-inv z p))
+             (zi2 (mod (* zi zi) p)))
+        (values (mod (* x zi2) p) (mod (* y zi2 zi) p))))))
+
+(defun %octets-32 (n)
+  "N as 32 big-endian bytes."
+  (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+    (loop for i from 31 downto 0
+          do (setf (aref v i) (ldb (byte 8 0) n)
+                   n (ash n -8)))
+    v))
+
+(defun %es256-sign (message)
+  "The 64-byte ES256 signature, r then s, of MESSAGE, a string, under
+   *TEST-ES256-D* with the nonce *TEST-ES256-K*."
+  (let* ((n web-skeleton::+p256-n+)
+         (z (web-skeleton::bytes-to-integer
+             (sha256 (sb-ext:string-to-octets message :external-format :ascii))))
+         (r (mod (%p256-times-g *test-es256-k*) n))
+         (s (mod (* (web-skeleton::mod-inv *test-es256-k* n)
+                    (+ z (* r *test-es256-d*)))
+                 n)))
+    (concatenate '(simple-array (unsigned-byte 8) (*)) (%octets-32 r) (%octets-32 s))))
+
+(defun %es256-test-key ()
+  "The JWT-KEY for *TEST-ES256-D*, kid \"test\"."
+  (multiple-value-bind (x y) (%p256-times-g *test-es256-d*)
+    (make-jwt-key :kid "test" :x (%octets-32 x) :y (%octets-32 y))))
+
+(defun %es256-token (header payload &key (signed-payload payload) flip-bit)
+  "A compact JWS of the JSON strings HEADER and PAYLOAD, signed over HEADER
+   and SIGNED-PAYLOAD: the same unless a test changes the payload after
+   signing. FLIP-BIT flips the signature's lowest bit."
+  (flet ((b64 (s) (base64url-encode (sb-ext:string-to-octets s :external-format :utf-8))))
+    (let ((sig (%es256-sign (format nil "~a.~a" (b64 header) (b64 signed-payload)))))
+      (when flip-bit
+        (setf (aref sig 63) (logxor (aref sig 63) 1)))
+      (format nil "~a.~a.~a" (b64 header) (b64 payload) (base64url-encode sig)))))
+
+(defun test-jwt-refusals-for-their-own-reasons ()
+  "Each refusal JWT-VERIFY makes, shown on a token whose one fault is the
+   one refused: signed by the key it is checked against, unexpired, and
+   otherwise valid, beside a token that is all of that and verifies. A
+   check written against an expired token, or a payload that is not JSON,
+   passes whichever check is missing."
+  (format t "~%JWT: each refusal for its own reason~%")
+  ;; The signer first, against RFC 6979 A.2.5, since every check below
+  ;; trusts it.
+  (multiple-value-bind (ux uy) (%p256-times-g *test-es256-d*)
+    (check "test signer: the public key is RFC 6979's"
+           (list ux uy)
+           (list #x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6
+                 #x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299)))
+  (check "test signer: \"sample\" signs to RFC 6979's r and s"
+         (bytes-to-hex (%es256-sign "sample"))
+         (string-downcase
+          (concatenate 'string
+                       "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716"
+                       "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")))
+  (let* ((keys (list (%es256-test-key)))
+         (now (web-skeleton::jwt-current-time))
+         (header "{\"alg\":\"ES256\",\"kid\":\"test\"}")
+         (payload (format nil "{\"sub\":\"alice\",\"exp\":~d}" (+ now 3600))))
+    (check "minted: the control verifies"
+           (jwt-claim (jwt-verify (%es256-token header payload) keys) "sub")
+           "alice")
+    (check "minted: another alg, validly signed, is refused"
+           (jwt-verify (%es256-token "{\"alg\":\"ES384\",\"kid\":\"test\"}" payload) keys)
+           nil)
+    (check "minted: a payload changed after signing is refused"
+           (jwt-verify (%es256-token header
+                                     (format nil "{\"sub\":\"mallory\",\"exp\":~d}" (+ now 3600))
+                                     :signed-payload payload)
+                       keys)
+           nil)
+    (check "minted: a signature with a bit flipped is refused"
+           (jwt-verify (%es256-token header payload :flip-bit t) keys)
+           nil)
+    (check "minted: an expired token is refused"
+           (jwt-verify (%es256-token header (format nil "{\"exp\":~d}" (- now 3600))) keys)
+           nil)
+    (check "minted: a token before its nbf is refused"
+           (jwt-verify (%es256-token header (format nil "{\"nbf\":~d}" (+ now 3600))) keys)
+           nil)
+    ;; [] parses to NIL, so it would come back as NIL either way; the
+    ;; others would come back as themselves.
+    (dolist (claims '("5" "\"alice\"" "true" "null" "[]" "[{\"sub\":\"alice\"}]"))
+      (check (format nil "minted: claims of ~a, not an object, are refused" claims)
+             (jwt-verify (%es256-token header claims) keys)
+             nil))
+    ;; A raise inside verification answers NIL like any bad token, and says
+    ;; at DEBUG what raised, so a fault in the verifier can be found.
+    (let ((real (symbol-function 'ecdsa-verify-p256))
+          (out (make-string-output-stream)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ecdsa-verify-p256)
+                   (lambda (&rest args)
+                     (declare (ignore args))
+                     (error "a fault inside the verifier")))
+             (let ((*log-stream* out)
+                   (*log-level* :debug))
+               (check "minted: a raise inside verification answers NIL"
+                      (jwt-verify (%es256-token header payload) keys)
+                      nil)
+               (check "minted: and is logged at DEBUG, naming what raised"
+                      (let ((text (get-output-stream-string out)))
+                        (and (search "[DEBUG]" text)
+                             (search "a fault inside the verifier" text)
+                             t))
+                      t)))
+        (setf (symbol-function 'ecdsa-verify-p256) real)))))
+
 (defun test-jwt ()
   (format t "~%JWT~%")
 
@@ -5330,36 +5466,34 @@
              (jwt-verify (concatenate 'string token "==") keys)
              nil))
 
-    ;; jwt-verify rejects expired token
+    ;; The A.3 token, outside the widened window, is refused for its 2011
+    ;; exp. A tampered token and another alg are refused for their own
+    ;; reasons in TEST-JWT-REFUSALS-FOR-THEIR-OWN-REASONS: tried on this
+    ;; token, the exp check refuses them first, whatever else is missing.
     (check "jwt expired token"
            (jwt-verify token keys)
-           nil)
-
-    ;; jwt-verify rejects tampered token
-    (let ((bad-token (format nil "~a.~a.~a"
-                             header-b64
-                             ;; tamper: change one base64 character
-                             (concatenate 'string "X" (subseq payload-b64 1))
-                             sig-b64)))
-      (check "jwt tampered token"
-             (jwt-verify bad-token keys)
-             nil))
-
-    ;; jwt-verify rejects wrong algorithm
-    (let ((bad-alg-token (format nil "~a.~a.~a"
-                                 (base64url-encode
-                                  (sb-ext:string-to-octets
-                                   "{\"alg\":\"RS256\"}" :external-format :utf-8))
-                                 payload-b64 sig-b64)))
-      (check "jwt wrong algorithm"
-             (jwt-verify bad-alg-token keys)
-             nil)))
+           nil))
 
   ;; JWKS parsing
   (let* ((jwks-json "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"test-key\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},{\"kty\":\"RSA\",\"kid\":\"rsa-key\",\"n\":\"abc\",\"e\":\"def\"}]}")
          (keys (parse-jwks jwks-json)))
     (check "jwks parses EC keys only" (length keys) 1)
     (check "jwks kid" (jwt-key-kid (first keys)) "test-key"))
+
+  ;; A kty or crv that is not a string names no key type this reader
+  ;; understands, and RFC 7517 §5 has those keys ignored: skipped beside the
+  ;; good one, as an RSA key is, rather than a bare type error out of
+  ;; STRING= on a number or a list.
+  (let ((good "{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"))
+    (dolist (odd '("{\"kty\":5,\"crv\":\"P-256\"}"
+                   "{\"kty\":\"EC\",\"crv\":[1]}"
+                   "{\"kty\":{},\"crv\":\"P-256\"}"))
+      (check (format nil "jwks: ~a is skipped" odd)
+             (handler-case
+                 (mapcar #'jwt-key-kid
+                         (parse-jwks (format nil "{\"keys\":[~a,~a]}" odd good)))
+               (error (e) (princ-to-string e)))
+             '("k"))))
 
   ;; Two kidless keys — RFC 7517 §4.5 says kid is OPTIONAL, so a
   ;; JWKS with multiple kidless keys is spec-legal. Dedup only on
@@ -14104,6 +14238,7 @@
   (test-static-range-copies-nothing)
   (test-static-date)
   (test-jwt)
+  (test-jwt-refusals-for-their-own-reasons)
   (test-shutdown-hooks)
   (test-read-available-eof)
   (test-awaiting-sweep-504)
