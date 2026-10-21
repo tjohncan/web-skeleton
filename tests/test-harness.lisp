@@ -612,8 +612,9 @@
 
 (defun test-harness-expect-417-on-unknown-e2e ()
   "An HTTP/1.1 request carrying an Expect token other than
-   100-continue must receive a 417 Expectation Failed (RFC 7231
-   §5.1.1 MUST), with the body never reaching the handler. Sends
+   100-continue receives a 417 Expectation Failed, with the body never
+   reaching the handler. RFC 9110 §10.1.1 lets a server answer 417
+   (MAY); the framework always does, so this pins its choice. Sends
    headers only (Content-Length: 4 declared, body bytes withheld):
    body-available=0 < CL=4 keeps the request out of the already-
    have-full-body fast path, so SCAN-EXPECT-DISPOSITION actually

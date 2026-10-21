@@ -1224,10 +1224,17 @@
                      every one is 100-continue (case-insensitive). A
                      member may carry ;parameters. Near-miss values like
                      100-continued are not 100-continue.
-     :UNKNOWN      — an Expect header with any other member, or with no
-                     member at all. RFC 9110 §10.1.1 lets a server answer
-                     417 (MAY); the state machine does so unconditionally.
-     :NONE         — no Expect header present.
+     :UNKNOWN      — an Expect header with any other member. RFC 9110
+                     §10.1.1 lets a server answer 417 (MAY); the state
+                     machine does so unconditionally.
+     :INVALID      — an Expect value holding a bare CR or a bare LF,
+                     which PARSE-HEADERS-BYTES refuses at dispatch. The
+                     state machine answers it 400 at once, the parser's
+                     answer, rather than a 417, or a 100 Continue for a
+                     request about to be refused.
+     :NONE         — no Expect header, or Expect headers naming nothing:
+                     `Expect: ,` is an empty list, which RFC 9110 §5.6.1.2
+                     has a recipient ignore, so it carries no expectation.
 
    Every header and every member counts, because the policy is about which
    expectations a request carries. Reading the first token of the first
@@ -1240,7 +1247,6 @@
   (let ((name (load-time-value
                (sb-ext:string-to-octets "expect:"
                                          :external-format :ascii)))
-        (seen nil)
         (members 0))
     (loop for i from start below end
           do (when (and (>= i 2)
@@ -1253,10 +1259,16 @@
                               always (or (= b n)
                                          (and (<= 97 n 122)
                                               (= b (- n 32))))))
-               (setf seen t)
-               ;; The value runs to the line's CR; walk its members.
+               ;; The value runs to the line's CR; walk its members. A CR
+               ;; that is not the line's end, or an LF before it, would
+               ;; have this reader and PARSE-HEADERS-BYTES see different
+               ;; values: the TRANSFER-ENCODING scan's rule, and its reason.
                (let* ((line-end (or (position 13 buf :start i :end end) end))
                       (pos (+ i (length name))))
+                 (when (or (and (< line-end end)
+                                (/= (aref buf (1+ line-end)) 10))
+                           (position 10 buf :start pos :end line-end))
+                   (return-from scan-expect-disposition :invalid))
                  (loop
                    (let ((comma (or (position 44 buf :start pos :end line-end)
                                     line-end)))
@@ -1271,9 +1283,7 @@
                              (return-from scan-expect-disposition :unknown)))))
                      (when (>= comma line-end) (return))
                      (setf pos (1+ comma)))))))
-    (cond ((not seen) :none)
-          ((zerop members) :unknown)
-          (t :100-continue))))
+    (if (zerop members) :none :100-continue)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Is this request's body finished?
@@ -1976,6 +1986,10 @@
                         (expect (scan-expect-disposition
                                  buf header-end hdr-start)))
                  (cond
+                   ;; An Expect value this scan and the parser would read
+                   ;; differently: refused with the parser's 400.
+                   ((eq expect :invalid)
+                    (http-parse-error "malformed Expect value"))
                    ;; Unknown Expect → 417 regardless of body. RFC 7231
                    ;; §5.1.1 MAY; framework always 417s so a GET probe
                    ;; can't bypass the check a matching POST receives.

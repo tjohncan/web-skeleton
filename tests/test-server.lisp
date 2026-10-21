@@ -582,9 +582,15 @@
            (disp "Host: localhost" "Expect: 100-continue" "Expect: foo") :unknown)
     (check "another expectation in the first header → :unknown"
            (disp "Host: localhost" "Expect: foo" "Expect: 100-continue") :unknown)
-    (check "an Expect header naming nothing → :unknown"
-           (disp "Host: localhost" "Expect: ,") :unknown)
-    ;; :NONE — no Expect header at all.
+    ;; :NONE — no expectation: no Expect header, or Expect headers whose
+    ;; lists are empty. RFC 9110 §5.6.1.2 has a recipient ignore empty
+    ;; list elements, so `Expect: ,` carries nothing a 417 could answer.
+    (check "an Expect header naming nothing → :none"
+           (disp "Host: localhost" "Expect: ,") :none)
+    (check "an empty Expect header → :none"
+           (disp "Host: localhost" "Expect:") :none)
+    (check "an empty element before 100-continue is still 100-continue"
+           (disp "Host: localhost" "Expect: , 100-continue") :100-continue)
     (check "no Expect header"
            (disp "Host: localhost" "Content-Length: 10") :none)
     (check "suffixed header name does not match"
@@ -598,7 +604,16 @@
     (check "100-continued (trailing garbage) → :unknown"
            (disp "Host: localhost" "Expect: 100-continued") :unknown)
     (check "x-custom-expectation → :unknown"
-           (disp "Host: localhost" "Expect: x-custom-expect") :unknown))
+           (disp "Host: localhost" "Expect: x-custom-expect") :unknown)
+    ;; :INVALID — a value this scan and PARSE-HEADERS-BYTES would read
+    ;; differently. A bare CR would end this scan's value at 100-continue,
+    ;; and a 100 Continue would go out for a request the parser refuses.
+    (check "a bare CR in the value → :invalid"
+           (disp "Host: localhost" (format nil "Expect: 100-continue~cX" #\Return))
+           :invalid)
+    (check "a bare LF in the value → :invalid"
+           (disp "Host: localhost" (format nil "Expect: 100-continue~cX" #\Newline))
+           :invalid))
   ;; Constant sanity — the pre-built bytes are exactly the status line.
   (let ((bytes web-skeleton::*http-100-continue-bytes*))
     (check "100 Continue ends with CRLFCRLF"
