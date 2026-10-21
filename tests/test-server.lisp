@@ -2430,6 +2430,29 @@
                         (let ((b (req "PROPFIND / HTTP/1.1")))
                           (web-skeleton::parse-request-bytes b 0 (length b)))))
            501)
+    ;; 400 — a method that is not a token is malformed rather than
+    ;; unimplemented (RFC 9110 §9.1), whatever its bytes decode to. The
+    ;; first two differ only in being UTF-8: refused anywhere past the
+    ;; method, where the 501's message decodes it, they would part, 501
+    ;; and 400.
+    (flet ((method-then (&rest method-bytes)
+             (concatenate '(simple-array (unsigned-byte 8) (*))
+                          method-bytes (req " / HTTP/1.1"))))
+      (check "a method holding UTF-8 is 400, not 501"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 #xC3 #x89 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400)
+      (check "a method holding a byte that is not UTF-8 is 400"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 #xFF 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400)
+      (check "a method holding a delimiter is 400"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 40 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400))
     ;; 414 — the only part of a request line a client can grow at will is
     ;; the URI.
     (check "over-long request line is 414"

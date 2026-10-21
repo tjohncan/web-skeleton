@@ -818,10 +818,19 @@
         ;; error text, which log-warn then splits across two lines —
         ;; a log-injection primitive identical in shape to the
         ;; request-target vector.
+        ;;
+        ;; The rest of what a token excludes is refused here too (RFC 9110
+        ;; §9.1: method = token), as malformed rather than as a method we
+        ;; do not implement. Otherwise a byte at or above 0x80 would reach
+        ;; the 501 below, whose message decodes the method, and the status
+        ;; would turn on whether the bytes happen to be UTF-8: 501 for
+        ;; G<C3 89>T, 400 for G<FF>T.
         (loop for i from start below sp1
               for b = (aref buf i)
               when (or (< b #x20) (= b #x7F))
-              do (http-parse-error "control character in request method"))
+                do (http-parse-error "control character in request method")
+              unless (tchar-byte-p b)
+                do (http-parse-error "request method is not a token"))
         ;; Method and version are both resolved before either is judged,
         ;; because the order of the two rejections is itself a decision.
         ;; RFC 7230 §2.6: a server SHOULD answer 505 when it cannot
