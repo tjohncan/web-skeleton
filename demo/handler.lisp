@@ -462,7 +462,8 @@
 ;;; digest, and a JWT taken apart. Useful on their own, which is the point —
 ;;; a demo page gets opened a second time if one of its tabs does a job. All
 ;;; three already live in src/algorithms, so the demo reaches for the
-;;; framework rather than carrying a copy of anything.
+;;; framework rather than carrying a copy of anything. A fourth sample posts
+;;; a form, below.
 ;;;
 ;;; Every answer carries the same envelope: which worker ran it, how long the
 ;;; server spent inside it, and the request as the server parsed it.
@@ -730,6 +731,95 @@
             (error (e)
               (%lab-json request started nil
                          :error (format nil "~a" e) :status 400)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The lab's form — a body read as it arrives
+;;;
+;;; The one lab sample with a body. A form with a file input is sent as
+;;; multipart/form-data, and the demo's body handler reads it a part at a
+;;; time with RECEIVE-MULTIPART: text fields are collected, and a file is
+;;; counted as it passes and never held. Nothing is stored. The answer is
+;;; what the parser made of the body — each part's name, a file's filename
+;;; and type as the browser sent them, its size and its first bytes — in the
+;;; envelope every lab answer has.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *lab-upload-max* (* 4 1024 1024)
+  "Largest form body the lab reads, in bytes. Nothing is kept, so a larger
+   one costs bandwidth and the worker's attention and nothing else. A body
+   over it is answered 413 by the framework, before any of it is read when
+   it declares its length.")
+
+(defparameter *lab-upload-preview* 16
+  "How many of a file's first bytes the answer shows, as hex: enough to
+   tell most formats by their magic number.")
+
+(defstruct lab-file
+  "A file of the lab's form as it passes: its part, how many of its bytes
+   have arrived, and the first few of them."
+  part
+  (bytes 0)
+  (head (make-array *lab-upload-preview* :element-type '(unsigned-byte 8)
+                                         :fill-pointer 0)))
+
+(defun %lab-field-json (part)
+  "A collected text field: its name, and its value as text."
+  (let ((text (handler-case (form-part-text part)
+                (http-parse-error () nil))))
+    (make-json-object
+     (list (cons "name" (form-part-name part))
+           (cons "value" (cond ((null text) "(not UTF-8)")
+                               ((> (length text) *lab-input-max*)
+                                (format nil "~a..." (subseq text 0 *lab-input-max*)))
+                               (t text)))))))
+
+(defun %lab-file-json (file)
+  "A file of the lab's form: what the browser said about it, and what
+   arrived."
+  (let ((part (lab-file-part file)))
+    (make-json-object
+     (list (cons "name" (form-part-name part))
+           (cons "filename" (form-part-filename part))
+           (cons "content_type" (or (form-part-content-type part) :null))
+           (cons "bytes" (lab-file-bytes file))
+           (cons "first_bytes" (bytes-to-hex (subseq (lab-file-head file) 0)))))))
+
+(defun %lab-upload-plan (request)
+  "The body plan for the lab's form, posted to /lab/upload."
+  (let ((started (%now-us))
+        (files '()))
+    (receive-multipart
+     request
+     :max-size *lab-upload-max*
+     :max-parts 64
+     :max-collected-size (* 64 1024)
+     ;; A field is collected. A file is streamed: counted, its first bytes
+     ;; kept, and the rest let go as it arrives.
+     :on-part (lambda (conn part)
+                (declare (ignore conn))
+                (when (form-part-filename part)
+                  (push (make-lab-file :part part) files)
+                  :stream))
+     :on-part-data (lambda (conn part bytes)
+                     (declare (ignore conn part))
+                     (let ((file (first files)))
+                       (incf (lab-file-bytes file) (length bytes))
+                       (loop for b across bytes
+                             while (vector-push b (lab-file-head file))))
+                     nil)
+     :on-end (lambda (conn parts)
+               (declare (ignore conn))
+               (%lab-json request started
+                          (list (cons "fields" (mapcar #'%lab-field-json parts))
+                                (cons "files" (mapcar #'%lab-file-json
+                                                      (reverse files)))))))))
+
+(defun decide-body (request)
+  "The demo's body handler. The lab's form is read as it arrives, and every
+   other request's body is left to the usual buffered read."
+  (when (and (eq (http-request-method request) :POST)
+             (string= (http-request-path request) "/lab/upload"))
+    (%lab-upload-plan request)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Vitals — what the server can say about itself
@@ -1257,6 +1347,7 @@
                 :port port
                 :workers workers
                 :handler #'handle-request
+                :body-handler #'decide-body
                 :ws-handler #'handle-ws-message
                 :on-tick #'bulletin-tick))
 

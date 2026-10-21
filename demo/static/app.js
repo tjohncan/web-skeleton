@@ -289,8 +289,9 @@ tabs.addEventListener('click', function (e) {
 // ---------------------------------------------------------------------------
 // x-periments: the lab
 //
-// Three ordinary GETs, each shown whole — the request as the server parsed
-// it, the response as the browser received it, and both clocks.
+// Three ordinary GETs and a form post, each shown whole — the request as the
+// server parsed it, the response as the browser received it, and both
+// clocks.
 //
 // The request block is the server's account of what arrived, not this file's
 // account of what it sent. fetch() does not expose the bytes the browser put
@@ -365,6 +366,33 @@ const LAB_TOOLS = [
                               times: r.times,
                               signature_bytes: r.signature_bytes }, null, 2);
     }
+  },
+  {
+    id: 'upload',
+    title: 'form post',
+    // The one sample with a body. The form is posted the way a browser posts
+    // one, multipart/form-data, and the server reads it as it arrives: a file
+    // is counted as it passes and let go, so nothing is stored anywhere.
+    note: 'read as it arrives and never stored - the answer is what the parser saw, up to 4 MiB',
+    path: '/lab/upload',
+    method: 'POST',
+    fields: [
+      { name: 'title', type: 'text', wide: true, value: 'web-skeleton',
+        placeholder: 'a text field' },
+      { name: 'file', type: 'file' }
+    ],
+    answer: function (r) {
+      const lines = [];
+      r.fields.forEach(function (f) {
+        lines.push('field ' + f.name + ': ' + JSON.stringify(f.value));
+      });
+      r.files.forEach(function (f) {
+        lines.push('file  ' + f.name + ': ' + JSON.stringify(f.filename) + ', ' +
+                   (f.content_type || 'no type') + ', ' + n(f.bytes) + ' bytes' +
+                   (f.bytes ? ', first bytes ' + f.first_bytes : ''));
+      });
+      return lines.length ? lines.join('\n') : 'no parts';
+    }
   }
 ];
 
@@ -403,6 +431,10 @@ function labCard(tool) {
         opt.value = o;
         input.appendChild(opt);
       });
+    } else if (f.type === 'file') {
+      input = el('input');
+      input.type = 'file';
+      input.multiple = true;
     } else {
       input = el('input');
       input.type = 'text';
@@ -410,6 +442,8 @@ function labCard(tool) {
       if (f.value) input.value = f.value;
       if (f.wide) input.className = 'wide';
     }
+    // Named, so a form posted whole carries each field under its name.
+    input.name = f.name;
     input.setAttribute('aria-label', f.name);
     inputs[f.name] = input;
     form.appendChild(input);
@@ -466,18 +500,27 @@ function labCard(tool) {
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    const params = new URLSearchParams();
-    tool.fields.forEach(function (f) {
-      const v = inputs[f.name].value;
-      // An empty optional field is left out rather than sent empty: the
-      // request shown below should be the one that was made.
-      if (v !== '') params.set(f.name, v);
-    });
+    let url = tool.path;
+    let init;
+    if (tool.method === 'POST') {
+      // The form itself, as a browser would post it: an empty file input
+      // goes as the empty part a browser sends for one.
+      init = { method: 'POST', body: new FormData(form) };
+    } else {
+      const params = new URLSearchParams();
+      tool.fields.forEach(function (f) {
+        const v = inputs[f.name].value;
+        // An empty optional field is left out rather than sent empty: the
+        // request shown below should be the one that was made.
+        if (v !== '') params.set(f.name, v);
+      });
+      url = tool.path + '?' + params.toString();
+    }
     run.disabled = true;
     const sentAt = new Date();
     const t0 = performance.now();
     let res = null;
-    fetch(tool.path + '?' + params.toString())
+    fetch(url, init)
       .then(function (r) { res = r; return r.text(); })
       .then(function (raw) {
         // Parsed for the answer and the timings; shown as it came for the

@@ -114,6 +114,16 @@ server {
         proxy_pass http://127.0.0.1:8081;
     }
 
+    # The lab's form post is the one request here with a body of any size.
+    # nginx answers a body over a megabyte with its own 413 unless told
+    # otherwise. A little above the demo's own 4 MiB cap, a body just over
+    # that cap meets the framework's 413, which the page shows, and only a
+    # far larger one meets nginx's.
+    location = /lab/upload {
+        client_max_body_size 5m;
+        proxy_pass http://127.0.0.1:8081;
+    }
+
     # The socket cap lives on the WebSocket alone. Server-wide it would count
     # HTTP/2 streams too, and one page load opens about ten at once — so two
     # people behind one NAT would start getting 503s on stylesheets. Here it
