@@ -181,6 +181,7 @@
            #:*body-stall-timeout*
            #:*linger-timeout*
            #:*ws-idle-timeout*
+           #:*ws-message-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
            #:*write-stall-timeout*

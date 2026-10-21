@@ -421,6 +421,10 @@
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
   (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
   (ws-frag-total  0  :type fixnum)            ; running total bytes in frag-buf
+  ;; Universal time the WebSocket message still arriving began: its first
+  ;; fragment, or the first bytes of a frame not yet whole. 0 while no
+  ;; message is unfinished. *WS-MESSAGE-TIMEOUT* is measured from it.
+  (ws-message-at  0  :type integer)
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
   (dns-then    nil :type (or null function))  ; (IP FAMILY) -> kick off TCP phase

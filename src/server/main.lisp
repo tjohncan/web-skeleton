@@ -363,6 +363,21 @@
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
    Inactivity = no text or binary frames from the client (pongs don't count).")
 
+(defparameter *ws-message-timeout* 30
+  "Seconds a WebSocket message may take to arrive, from its first byte to
+   its last. A message still unfinished then — a fragmented message short of
+   its final fragment, or a frame not all here — closes the connection with
+   1008. 0 to disable.
+
+   *WS-IDLE-TIMEOUT* cannot bound this. Each message that completes resets
+   its clock, and a peer that answers pings keeps the connection alive, so
+   a message begun and never finished would hold its reassembly buffer, up
+   to *MAX-WS-MESSAGE-SIZE*, for as long as that allows: a day by default.
+   Measured from the message's start and not moved by its fragments, so a
+   peer adding a byte at a time is held to it too. The WebSocket
+   counterpart of *IDLE-TIMEOUT*, which bounds a request's arrival the
+   same way.")
+
 (defparameter *ws-ping-interval* 30
   "Seconds between server-initiated WebSocket pings.")
 
@@ -425,6 +440,7 @@
   (let ((idle nil)
         (stalled nil)
         (body-stalled nil)
+        (ws-late nil)
         (detached-expired nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
@@ -547,6 +563,16 @@
                            (> (- now (connection-write-progress-at conn))
                               *write-stall-timeout*))
                       (push conn stalled))
+                     ;; A WebSocket message begun and not finished in time.
+                     ;; Its own clock, since a message's fragments do not
+                     ;; move LAST-ACTIVE and a ping answered keeps the
+                     ;; connection alive. See *WS-MESSAGE-TIMEOUT*.
+                     ((and (eq state :websocket)
+                           (plusp *ws-message-timeout*)
+                           (plusp (connection-ws-message-at conn))
+                           (> (- now (connection-ws-message-at conn))
+                              *ws-message-timeout*))
+                      (push conn ws-late))
                      (waiting-on-fetch nil)
                      (awaiting-a-send nil)
                      ((and (> timeout 0)
@@ -586,6 +612,21 @@
                 *body-stall-timeout* (connection-fd conn)
                 (connection-read-pos conn))
       (close-connection conn epoll-fd :stalled))
+    (dolist (conn ws-late)
+      (log-info "ws message unfinished after ~ds fd ~d (~d bytes held) — closing 1008"
+                *ws-message-timeout* (connection-fd conn)
+                (+ (connection-ws-frag-total conn) (connection-read-pos conn)))
+      ;; What the message holds is let go now, not once the close frame
+      ;; has gone out. A peer slow to read that holds the frame back is
+      ;; then holding nothing more than its backlog.
+      (setf (connection-ws-frag-buf conn) nil
+            (connection-ws-frag-total conn) 0)
+      (handler-case (let ((*epoll-fd* epoll-fd))
+                      (ws-close conn 1008))
+        (error (e)
+          (log-warn "ws message timeout: could not close fd ~d with 1008: ~a"
+                    (connection-fd conn) e)
+          (close-connection conn epoll-fd :idle))))
     (dolist (conn idle)
       (log-debug "idle timeout fd ~d (~a)"
                  (connection-fd conn) (connection-state conn))

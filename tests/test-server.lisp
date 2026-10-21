@@ -6524,6 +6524,101 @@
       (check "stall: a moving non-websocket backlog is left alone" count 1))))
 
 ;;; ---------------------------------------------------------------------------
+;;; An unfinished WebSocket message's deadline
+;;;
+;;; *WS-MESSAGE-TIMEOUT* bounds how long a message may take to arrive. The
+;;; clock it reads is started by WEBSOCKET-ON-READ when a pass ends with a
+;;; message unfinished, and stopped when a data message completes; the
+;;; sweep closes a message past it with 1008.
+;;; ---------------------------------------------------------------------------
+
+(defun test-ws-message-clock ()
+  "WS-MESSAGE-AT through WEBSOCKET-ON-READ, a read at a time: a first
+   fragment starts it, a ping between fragments leaves it where it is, the
+   final fragment stops it; half a frame starts it, and the frame's other
+   half stops it; a message that completes in a read ending with half the
+   next one leaves it running for the next."
+  (format t "~%WebSocket: an unfinished message's clock~%")
+  (let ((conn (web-skeleton::make-connection :fd -1 :state :websocket :last-active 0)))
+    (setf (web-skeleton::connection-read-buf conn)
+          (make-array 4096 :element-type '(unsigned-byte 8))
+          (web-skeleton::connection-read-pos conn) 0)
+    (flet ((feed (&rest pieces)
+             ;; Each piece lands behind what the last pass left, and one
+             ;; pass runs over all of it.
+             (dolist (bytes pieces)
+               (let ((at (web-skeleton::connection-read-pos conn)))
+                 (replace (web-skeleton::connection-read-buf conn) bytes :start1 at)
+                 (setf (web-skeleton::connection-read-pos conn) (+ at (length bytes)))))
+             (web-skeleton::websocket-on-read conn nil)
+             (web-skeleton::connection-ws-message-at conn))
+           (text (s) (sb-ext:string-to-octets s :external-format :utf-8))
+           (set-clock (v) (setf (web-skeleton::connection-ws-message-at conn) v)))
+      (check "clock: a whole message leaves it stopped"
+             (feed (make-masked-frame t 1 (text "hello"))) 0)
+      (check "clock: a first fragment starts it"
+             (plusp (feed (make-masked-frame nil 1 (text "hel")))) t)
+      (set-clock 12345)
+      (check "clock: a ping between fragments leaves it where it was"
+             (feed (make-masked-frame t 9 (text "p"))) 12345)
+      (check "clock: and so does a continuation short of the last"
+             (feed (make-masked-frame nil 0 (text "l"))) 12345)
+      (check "clock: the final fragment stops it"
+             (feed (make-masked-frame t 0 (text "lo"))) 0)
+      (let ((frame (make-masked-frame t 2 (make-array 300 :element-type '(unsigned-byte 8)
+                                                          :initial-element 7))))
+        (check "clock: half a frame starts it"
+               (plusp (feed (subseq frame 0 150))) t)
+        (set-clock 12345)
+        (check "clock: and the other half stops it"
+               (feed (subseq frame 150)) 0)
+        (check "clock: a message done in a read that ends with half the next leaves it running"
+               (plusp (feed (make-masked-frame t 1 (text "a")) (subseq frame 0 40)))
+               t)))))
+
+(defun test-ws-message-timeout-sweep ()
+  "The sweep closes a WebSocket whose unfinished message is past
+   *WS-MESSAGE-TIMEOUT* with 1008, and lets go of the fragments it held at
+   once. A message within its time is left alone, and 0 turns the bound
+   off."
+  (format t "~%WebSocket: an unfinished message's deadline~%")
+  (flet ((sweep-one (&key (age 0) (timeout 30))
+           ;; A WebSocket holding an unfinished fragmented message begun AGE
+           ;; seconds ago. Answers its state, the close code queued for it
+           ;; if any, and the fragment bytes it still holds.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (now (get-universal-time)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                         (web-skeleton:*log-stream* (make-broadcast-stream))
+                         (web-skeleton:*ws-message-timeout* timeout)
+                         (conn (web-skeleton::make-connection
+                                :fd connfd :state :websocket :last-active now)))
+                    (setf (web-skeleton::connection-ws-frag-buf conn)
+                          (list (make-array 1000 :element-type '(unsigned-byte 8)))
+                          (web-skeleton::connection-ws-frag-total conn) 1000
+                          (web-skeleton::connection-ws-message-at conn) (- now age))
+                    (web-skeleton::epoll-add epfd connfd (logior web-skeleton::+epollin+
+                                                                 web-skeleton::+epollet+))
+                    (web-skeleton::register-connection conn)
+                    (let ((web-skeleton::*epoll-fd* epfd))
+                      (web-skeleton::sweep-idle-connections epfd now))
+                    (let ((frame (web-skeleton::connection-write-buf conn)))
+                      (list (web-skeleton::connection-state conn)
+                            (and frame (>= (length frame) 4) (= (aref frame 0) #x88)
+                                 (logior (ash (aref frame 2) 8) (aref frame 3)))
+                            (web-skeleton::connection-ws-frag-total conn))))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+    (check "deadline: a message past it is closed 1008, its fragments let go"
+           (sweep-one :age 31) '(:closing 1008 0))
+    (check "deadline: one within it is left alone"
+           (sweep-one :age 5) '(:websocket nil 1000))
+    (check "deadline: 0 turns it off"
+           (sweep-one :age 100000 :timeout 0) '(:websocket nil 1000))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Chunked encoder
 ;;;
 ;;; The generated property covers agreement with the three readers. These
@@ -12942,6 +13037,69 @@
              (error () :refused)))
          :refused))
 
+(defun test-ws-message-deadline-e2e ()
+  "A peer that begins a fragmented message and never finishes it is closed
+   with 1008 once *WS-MESSAGE-TIMEOUT* has passed, though the connection is
+   otherwise healthy; a peer that finishes its message in time is answered
+   and kept.
+
+   *WS-MESSAGE-TIMEOUT* is 1 for the run. SETF rather than LET: the worker
+   reads it, and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%WebSocket: an unfinished message is closed in time~%")
+  (let ((saved web-skeleton:*ws-message-timeout*)
+        (lock (sb-thread:make-mutex :name "ws-deadline"))
+        (received nil))
+    (setf web-skeleton:*ws-message-timeout* 1)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) :upgrade)
+              :ws-handler (lambda (conn frame)
+                            (declare (ignore conn))
+                            (sb-thread:with-mutex (lock)
+                              (push (sb-ext:octets-to-string (ws-frame-payload frame)
+                                                             :external-format :utf-8)
+                                    received))
+                            nil))
+           (flet ((session (frames &key (pause 0) (seconds 4))
+                    ;; Upgrade, send FRAMES with PAUSE seconds between them,
+                    ;; and read what comes back for SECONDS. Answers
+                    ;; (values BYTES REASON SECONDS-TAKEN).
+                    (let* ((sock (connect-to-test-server))
+                           (stream (sb-bsd-sockets:socket-make-stream
+                                    sock :input t :output t
+                                    :element-type '(unsigned-byte 8)))
+                           (start (get-internal-real-time)))
+                      (unwind-protect
+                           (progn
+                             (%ws-client-upgrade stream)
+                             (dolist (frame frames)
+                               (write-sequence frame stream)
+                               (force-output stream)
+                               (sleep pause))
+                             (multiple-value-bind (buf reason)
+                                 (read-until-bounded stream :seconds seconds)
+                               (values (coerce buf 'list) reason
+                                       (/ (float (- (get-internal-real-time) start))
+                                          internal-time-units-per-second))))
+                        (ignore-errors (close stream))
+                        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+             (multiple-value-bind (bytes reason secs)
+                 (session (list (%ws-client-frame 1 "hel" :fin nil)))
+               (check "unfinished: closed with 1008"
+                      (list (first bytes) (and (cdddr bytes)
+                                               (logior (ash (third bytes) 8) (fourth bytes)))
+                            reason)
+                      (list #x88 1008 :eof))
+               (check "unfinished: once its time had passed" (< 0.9 secs 3.9) t))
+             (multiple-value-bind (bytes reason)
+                 (session (list (%ws-client-frame 1 "hel" :fin nil)
+                                (%ws-client-frame 0 "lo"))
+                          :pause 0.3 :seconds 2.5)
+               (check "finished in time: answered, and kept open"
+                      (list bytes reason (sb-thread:with-mutex (lock) received))
+                      (list nil :deadline '("hello"))))))
+      (setf web-skeleton:*ws-message-timeout* saved))))
+
 (defun test-ws-handler-reply-of-the-wrong-type ()
   "A ws-handler that returns something other than a frame's bytes — a
    string, the commonest slip — has its connection closed, however many
@@ -13628,11 +13786,14 @@
   (test-ws-send-refuses-a-foreign-connection)
   (test-ws-send-refuses-a-closing-websocket)
   (test-ws-close)
+  (test-ws-message-deadline-e2e)
   (test-ws-handler-reply-of-the-wrong-type)
   (test-ws-replies-keep-the-order-they-were-made-in)
   (test-websocket-read-buffer-gives-back-what-a-frame-grew)
   (test-websocket-peer-that-leaves-mid-frame)
   (test-ws-write-stall-sweep)
+  (test-ws-message-clock)
+  (test-ws-message-timeout-sweep)
   (test-ws-handler-push-and-return)
   (test-a-stale-event-skips-the-fd-s-next-connection)
   (test-a-client-reset-is-a-disconnect)
