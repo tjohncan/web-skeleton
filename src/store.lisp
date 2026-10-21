@@ -35,7 +35,14 @@
   ;; use sub-second intervals without a real 2-second sleep.
   (reap-interval  nil :type (or null (real (0))))
   (reaper-thread  nil)
-  (stop-requested nil))
+  (stop-requested nil)
+  ;; Signalled by STOP-STORE-REAPER; the reaper sleeps on it between
+  ;; sweeps, so a stop wakes it at once.
+  (wake (sb-thread:make-semaphore :name "store-reaper"))
+  ;; The shutdown hook that stops the reaper, taken back out of
+  ;; *SHUTDOWN-HOOKS* when the reaper is stopped another way, so a store
+  ;; an application retires is not held there until the run ends.
+  (cleanup nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API
@@ -163,19 +170,15 @@
              (loop until (sb-thread:with-mutex ((store-lock store))
                            (store-stop-requested store))
                    do
-               ;; Sleep the configured interval in 100 ms slices so a
-               ;; shutdown request is noticed within one slice regardless
-               ;; of how long REAP-INTERVAL is. Polling beats
-               ;; TERMINATE-THREAD — interrupting MAPHASH mid-sweep is
-               ;; async-unsafe, and the 100 ms idle cost is nothing next
-               ;; to a reap-interval typically measured in minutes.
-               (let ((deadline (+ (get-internal-real-time)
-                                  (* interval
-                                     internal-time-units-per-second))))
-                 (loop until (or (sb-thread:with-mutex ((store-lock store))
-                                   (store-stop-requested store))
-                                 (>= (get-internal-real-time) deadline))
-                       do (sleep 0.1)))
+               ;; The interval is slept on the store's semaphore, which
+               ;; STOP-STORE-REAPER signals, so a stop ends the wait at once
+               ;; and an idle store costs no wake-up between sweeps. Waking
+               ;; the thread beats TERMINATE-THREAD, which would interrupt
+               ;; MAPHASH mid-sweep, an async-unsafe point; and it beats
+               ;; polling the flag on a short sleep, which costs every store
+               ;; a wake-up and a lock round trip several times a second for
+               ;; the life of the process.
+               (sb-thread:wait-on-semaphore (store-wake store) :timeout interval)
                (unless (sb-thread:with-mutex ((store-lock store))
                          (store-stop-requested store))
                  (handler-case
@@ -189,18 +192,27 @@
                    (serious-condition (e)
                      (log-error "store reaper error: ~a" e))))))
            :name "web-skeleton-store-reaper"))
-    (register-cleanup (lambda () (stop-store-reaper store)))))
+    (setf (store-cleanup store)
+          (register-cleanup (lambda () (stop-store-reaper store))))))
 
 (defun stop-store-reaper (store)
-  "Stop STORE's reaper thread. Safe to call on a store with no reaper,
-   and safe to call multiple times. Sets STOP-REQUESTED and waits for
-   the reaper to notice on its next slice — within ~100 ms in the
-   common case, capped at 5 s if the reaper is stuck inside a sweep
-   that the expiry predicate made slow."
-  (let ((thread (sb-thread:with-mutex ((store-lock store))
-                  (prog1 (store-reaper-thread store)
-                    (setf (store-stop-requested store) t
-                          (store-reaper-thread store)  nil)))))
+  "Stop STORE's reaper thread, so the store expires nothing more and its
+   reaper no longer holds it. A shutdown hook does this for every store
+   when START-SERVER returns; an application retiring a store before then
+   calls it itself. Safe to call on a store with no reaper, and safe to
+   call more than once. Sets STOP-REQUESTED and wakes the reaper, then
+   waits for it to end: at once between sweeps, and at most 5 s if it is
+   inside a sweep the expiry predicate made slow."
+  (multiple-value-bind (thread cleanup)
+      (sb-thread:with-mutex ((store-lock store))
+        (multiple-value-prog1 (values (store-reaper-thread store)
+                                      (store-cleanup store))
+          (setf (store-stop-requested store) t
+                (store-reaper-thread store)  nil
+                (store-cleanup store)        nil)))
+    (sb-thread:signal-semaphore (store-wake store))
+    (when cleanup
+      (unregister-cleanup cleanup))
     (when (and thread (sb-thread:thread-alive-p thread))
       (handler-case
           (sb-thread:join-thread thread :default nil :timeout 5)

@@ -5618,6 +5618,18 @@
     (check "hooks run LIFO and survive a raising hook"
            (coerce log 'list)
            '(:third :second :first))
+    ;; The run that fires the hooks consumes them. Kept, a second
+    ;; START-SERVER in the same image would run every earlier run's hooks
+    ;; again, and each store with a reaper would hold its place for good.
+    (check "the hooks are consumed by the run that fires them"
+           web-skeleton::*shutdown-hooks* nil)
+    (web-skeleton:register-cleanup (lambda () (vector-push-extend :later log)))
+    (setf (fill-pointer log) 0)
+    (let ((web-skeleton:*log-level* :error)
+          (web-skeleton:*log-stream* (make-broadcast-stream)))
+      (web-skeleton::run-shutdown-hooks))
+    (check "a later run fires only the hooks registered since"
+           (coerce log 'list) '(:later))
     ;; Registration is idempotent on the return value — it returns FN.
     (let ((fn (lambda () nil)))
       (check "register-cleanup returns the function"

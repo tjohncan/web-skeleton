@@ -401,7 +401,8 @@ tests/
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
   Optional background reaper sweeps entries on an app-supplied predicate
-  and registers its stop via the cleanup hook machinery — no app-side teardown needed
+  and registers its stop via the cleanup hook machinery — no app-side teardown needed;
+  `stop-store-reaper` retires one early
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,

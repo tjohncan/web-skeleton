@@ -1622,6 +1622,14 @@ each wrapped in `handler-case` — a raising hook cannot block the rest
 or prevent `start-server` from returning to its caller.
 SIGTERM from Docker exercises the same path as Ctrl-C at the REPL.
 
+A hook fires once. The run that fires the hooks consumes them, so a second
+`start-server` in the same image (a restart at the REPL, an app that
+restarts its server in-process) runs only the hooks registered since the
+last one ended. Something started once at load time and stopped by a hook
+is therefore stopped for good after the first run: start it again, and
+register its hook again, before the next `start-server`, as the `start`
+function above does on every call.
+
 ### Concurrent store
 
 `make-store` returns a thread-safe hash-table-backed store for app-level state
@@ -1643,6 +1651,14 @@ The reaper thread is spawned during `make-store` and its stop function
 is registered in the shutdown hook machinery — no app-side teardown.
 Supplying `:expiry-fn` without `:reap-interval` (or vice versa) signals
 an error at `make-store` time rather than silently skipping the reaper.
+
+The reaper sleeps between sweeps and costs nothing while it waits. It
+stops when the `start-server` run it was made before or during ends, since
+that run consumes the hook. A store made once at load time, as above, and
+used across several runs in one image (a server restarted at the REPL)
+reaps during the first only; make it in the function that starts the
+server when that matters. `stop-store-reaper` stops one sooner, for a
+store the application retires, and lets the store be collected.
 
 Two locking hazards to know about:
 

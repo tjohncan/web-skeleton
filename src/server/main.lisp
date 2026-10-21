@@ -873,18 +873,33 @@
    Hooks run after workers have drained, before START-SERVER returns.
    Thread-safe — callable from any thread, before or during server run.
    Each invocation is wrapped in HANDLER-CASE, so raising from a hook does
-   not abort the rest. Returns FN."
+   not abort the rest. Returns FN.
+
+   A hook runs once, at the end of the run it was registered before or
+   during: the run that fires the hooks consumes them, so a second
+   START-SERVER in the same image runs only the hooks registered since."
   (sb-thread:with-mutex (*shutdown-hooks-lock*)
     (push fn *shutdown-hooks*))
   fn)
 
+(defun unregister-cleanup (fn)
+  "Take FN, as REGISTER-CLEANUP returned it, back out of the hooks, for a
+   resource stopped before the run ends: STOP-STORE-REAPER on a store an
+   application retires. A FN no longer there (the run that fired it has
+   taken the list) is no error."
+  (sb-thread:with-mutex (*shutdown-hooks-lock*)
+    (setf *shutdown-hooks* (delete fn *shutdown-hooks* :count 1)))
+  nil)
+
 (defun run-shutdown-hooks ()
   "Invoke each registered cleanup hook in LIFO order, catching errors.
    Called from START-SERVER's unwind-protect — do not call directly.
-   Copies the hook list under the mutex before iterating so a hook that
-   registers another hook does not mutate the list we're walking."
+   Takes the list and empties it under the mutex before iterating, so the
+   hooks are this run's and no later one's, and a hook that registers
+   another leaves it for the next run rather than in the list being
+   walked."
   (let ((hooks (sb-thread:with-mutex (*shutdown-hooks-lock*)
-                 (copy-list *shutdown-hooks*))))
+                 (shiftf *shutdown-hooks* nil))))
     (dolist (fn hooks)
       (handler-case (funcall fn)
         ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.

@@ -206,4 +206,5 @@
            #:store-update-plist
            #:store-delete
            #:store-map
-           #:store-count))
+           #:store-count
+           #:stop-store-reaper))
