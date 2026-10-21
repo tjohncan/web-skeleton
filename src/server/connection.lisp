@@ -1841,7 +1841,13 @@
                     ;; so starting at byte 0 lets a \r\n injected in the
                     ;; request-target create a fake header boundary before
                     ;; parse-request-bytes validates CTL bytes.
-                    (req-line-end (scan-crlf buf 0 header-end)))
+                    ;;
+                    ;; Searched through the terminator's first CRLF: a
+                    ;; head with no header fields, `GET / HTTP/1.0` and
+                    ;; CRLFCRLF, ends its request line there. Its fields
+                    ;; then run from HEADER-END + 2 to HEADER-END, which
+                    ;; every scanner below reads as none.
+                    (req-line-end (scan-crlf buf 0 (+ header-end 2))))
                (unless req-line-end
                  (http-parse-error "no CRLF in request line"))
                ;; Verify the request line ends with HTTP/1.x before

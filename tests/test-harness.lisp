@@ -433,6 +433,32 @@
              (drain-response stream)))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
+(defun test-harness-a-head-with-no-fields-e2e ()
+  "A request line and CRLFCRLF with nothing between, on the wire: answered
+   at HTTP/1.0, which requires no field, and refused 400 at HTTP/1.1,
+   which requires Host. OPTIONS / HTTP/1.0 alone is HAProxy's default
+   health probe, so a server that refuses this shape fails its checks."
+  (format t "~%Harness: a request head with no header fields~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response 200 (format nil "~a ~a"
+                                                  (http-request-method req)
+                                                  (http-request-path req)))))
+    (flet ((exchange (line)
+             (%exchange-or-why (%ascii (format nil "~a~a~a" line *crlf* *crlf*))))
+           (status-line (text)
+             (subseq text 0 (min 12 (length text)))))
+      (let ((answer (exchange "GET /probe HTTP/1.0")))
+        (check "no fields: GET at 1.0 is answered" (status-line answer) "HTTP/1.1 200")
+        (check "no fields: GET reaches the handler"
+               (not (null (search "GET /probe" answer))) t))
+      (let ((answer (exchange "OPTIONS / HTTP/1.0")))
+        (check "no fields: OPTIONS at 1.0 is answered" (status-line answer) "HTTP/1.1 200")
+        (check "no fields: OPTIONS reaches the handler"
+               (not (null (search "OPTIONS /" answer))) t))
+      (check "no fields: at 1.1 it is refused for its missing Host"
+             (status-line (exchange "GET / HTTP/1.1")) "HTTP/1.1 400"))))
+
 (defun test-harness-http10-keepalive-no-mutation-e2e ()
   "An HTTP/1.0 + Connection: keep-alive request must not stamp
    'Connection: keep-alive' onto the handler's returned struct.
@@ -8351,6 +8377,7 @@
   (test-harness-chunked-body-cap-e2e)
   (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
+  (test-harness-a-head-with-no-fields-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
   (test-harness-expect-417-on-unknown-e2e)

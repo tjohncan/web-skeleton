@@ -10983,6 +10983,45 @@
                  (list :dispatch (length head))))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; A request head with no header fields
+;;; ---------------------------------------------------------------------------
+
+(defun test-a-head-with-no-fields ()
+  "A request line followed by CRLFCRLF is a whole request head: the line's
+   own CRLF is the first half of the terminator. CONNECTION-ON-READ finds
+   the request line's end there and dispatches; PARSE-REQUEST-BYTES then
+   accepts it at HTTP/1.0, which requires no field, and refuses it at 1.1
+   for its missing Host. OPTIONS / HTTP/1.0 alone is HAProxy's default
+   health probe.
+
+   Searching for the request line's end short of the terminator misses
+   that CRLF, and the head is refused 400 as having no request line."
+  (format t "~%A request head with no header fields~%")
+  (flet ((on-read (line)
+           (let ((b (sb-ext:string-to-octets
+                     (format nil "~a~a~a" line *crlf* *crlf*)
+                     :external-format :ascii))
+                 (conn (web-skeleton::make-connection
+                        :fd -1
+                        :read-fn (lambda (buffer start max-bytes)
+                                   (declare (ignore buffer start max-bytes))
+                                   :again))))
+             (setf (web-skeleton::connection-read-buf conn) b
+                   (web-skeleton::connection-read-pos conn) (length b))
+             (handler-case
+                 (list (web-skeleton::connection-on-read conn)
+                       (web-skeleton::connection-request-end conn))
+               (web-skeleton:http-parse-error (e)
+                 (list (web-skeleton::http-parse-error-status e)))
+               (error (e) (list :raised (princ-to-string e)))))))
+    (check "no fields: GET / HTTP/1.0 dispatches, ending at its terminator"
+           (on-read "GET / HTTP/1.0") (list :dispatch 18))
+    (check "no fields: OPTIONS / HTTP/1.0 dispatches"
+           (on-read "OPTIONS / HTTP/1.0") (list :dispatch 22))
+    (check "no fields: HTTP/1.1 dispatches too, for the parser to judge"
+           (on-read "GET / HTTP/1.1") (list :dispatch 18))))
+
+;;; ---------------------------------------------------------------------------
 ;;; A buffer that fills on a read is answered on that read
 ;;; ---------------------------------------------------------------------------
 
@@ -13950,6 +13989,7 @@
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)
   (test-head-search-resumes)
+  (test-a-head-with-no-fields)
   (test-full-buffer-is-answered-when-it-fills)
   (test-expect-100-continue)
   (test-http-date)
