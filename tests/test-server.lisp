@@ -6537,7 +6537,10 @@
    fragment starts it, a ping between fragments leaves it where it is, the
    final fragment stops it; half a frame starts it, and the frame's other
    half stops it; a message that completes in a read ending with half the
-   next one leaves it running for the next."
+   next one leaves it running for the next. A ping in two halves on a
+   socket with nothing else unfinished starts it and stops it, though no
+   data message completes: left running, the sweep would close a quiet
+   socket that only answers pings."
   (format t "~%WebSocket: an unfinished message's clock~%")
   (let ((conn (web-skeleton::make-connection :fd -1 :state :websocket :last-active 0)))
     (setf (web-skeleton::connection-read-buf conn)
@@ -6556,6 +6559,11 @@
            (set-clock (v) (setf (web-skeleton::connection-ws-message-at conn) v)))
       (check "clock: a whole message leaves it stopped"
              (feed (make-masked-frame t 1 (text "hello"))) 0)
+      (let ((ping (make-masked-frame t 9 (text "p"))))
+        (check "clock: half a ping starts it"
+               (plusp (feed (subseq ping 0 3))) t)
+        (check "clock: and the ping's other half stops it, nothing being unfinished"
+               (feed (subseq ping 3)) 0))
       (check "clock: a first fragment starts it"
              (plusp (feed (make-masked-frame nil 1 (text "hel")))) t)
       (set-clock 12345)

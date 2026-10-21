@@ -719,14 +719,18 @@
           ;; left fits the default: a WebSocket lives for hours, and
           ;; nothing else shrinks it. See CONNECTION-SHRINK-READ-BUF.
           (connection-shrink-read-buf conn)
-          ;; A message left unfinished starts its clock here unless it has
-          ;; one: a fragmented message short of its last fragment, or a
-          ;; frame not all here. A message that completes stops it.
-          ;; *WS-MESSAGE-TIMEOUT* is measured from it.
-          (when (and (zerop (connection-ws-message-at conn))
-                     (or (connection-ws-frag-buf conn)
-                         (plusp (connection-read-pos conn))))
-            (setf (connection-ws-message-at conn) (get-universal-time)))
+          ;; The clock runs while something is unfinished — a fragmented
+          ;; message short of its last fragment, or a frame not all here —
+          ;; and *WS-MESSAGE-TIMEOUT* is measured from when it started.
+          ;; Started here unless it is already running, and stopped here
+          ;; once nothing is left. A completed data message also stops it
+          ;; below; a control frame split across two reads starts it and
+          ;; completes as no data message, so this is what stops it then.
+          (if (or (connection-ws-frag-buf conn)
+                  (plusp (connection-read-pos conn)))
+              (when (zerop (connection-ws-message-at conn))
+                (setf (connection-ws-message-at conn) (get-universal-time)))
+              (setf (connection-ws-message-at conn) 0))
           (return))
         ;; Advance past this frame
         (incf pos consumed)
