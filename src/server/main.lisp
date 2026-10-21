@@ -2093,11 +2093,12 @@
                     ;; Back to the default 4 KiB when a prior large body
                     ;; grew the buffer and the shifted pipelined bytes fit
                     ;; in the default; see CONNECTION-SHRINK-READ-BUF.
+                    ;; READ-POS first: the shrink reads it to know what to
+                    ;; carry into the fresh buffer.
                     (setf (connection-read-pos conn) (max extra 0))
                     (connection-shrink-read-buf conn)
                     (connection-reset-write conn)
-                    (setf (connection-read-pos conn) (max extra 0)
-                          (connection-request conn) nil
+                    (setf (connection-request conn) nil
                           (connection-body-expected conn) 0
                           (connection-body-decoded conn) 0
                           ;; The pipelined bytes have moved to offset 0
@@ -2111,6 +2112,10 @@
                           (connection-body-limit conn) nil
                           (connection-body-progress-at conn) 0
                           (connection-close-after-p conn) nil
+                          ;; Set only beside CLOSE-AFTER-P, so never set on a
+                          ;; connection kept alive, and cleared with it so
+                          ;; that holds whoever sets it next.
+                          (connection-linger conn) nil
                           (connection-state conn) :read-http
                           (connection-last-active conn) (get-universal-time))
                     (epoll-modify epoll-fd (connection-fd conn)
