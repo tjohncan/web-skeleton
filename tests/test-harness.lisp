@@ -459,6 +459,67 @@
       (check "no fields: at 1.1 it is refused for its missing Host"
              (status-line (exchange "GET / HTTP/1.1")) "HTTP/1.1 400"))))
 
+(defun test-harness-content-length-spellings-e2e ()
+  "Every spelling of a Content-Length field is read alike by both of its
+   readers, or refused with the connection closed.
+
+   SCAN-CONTENT-LENGTH takes the body's length from the raw head when its
+   CRLFCRLF arrives, and PARSE-HEADERS-BYTES reads the same field again at
+   dispatch. A spelling one of them reads and the other does not is what
+   request smuggling is made of, so each case carries five body bytes with
+   GET /second behind them in the same write.
+   - Read alike: the body is the five bytes, and /second is answered.
+   - Refused: one 400, and /second never answered.
+   - A name that is not Content-Length frames no body, so its five bytes
+     begin the next request, refused 501 and closed."
+  (format t "~%Harness: Content-Length spellings, read alike or refused~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response 200 (format nil "~a ~d"
+                                                  (http-request-path req)
+                                                  (length (or (http-request-body req) ""))))))
+    (flet ((shown (field)
+             ;; FIELD for a check's name, its CR, LF and TAB written out.
+             (with-output-to-string (s)
+               (loop for c across field
+                     do (case c
+                          (#\Return (write-string "<CR>" s))
+                          (#\Newline (write-string "<LF>" s))
+                          (#\Tab (write-string "<TAB>" s))
+                          (t (write-char c s))))))
+           (outcome (field)
+             ;; (statuses first-body-length second-answered-p)
+             (let* ((resp (%exchange-or-why
+                           (%ascii (format nil "POST /first HTTP/1.1~aHost: x~a~a~a~a~
+                                                helloGET /second HTTP/1.1~aHost: x~a~a"
+                                           *crlf* *crlf* field *crlf* *crlf*
+                                           *crlf* *crlf* *crlf*))))
+                    (statuses (loop for at = (search "HTTP/1.1 " resp)
+                                      then (search "HTTP/1.1 " resp :start2 (1+ at))
+                                    while at
+                                    collect (subseq resp (+ at 9) (min (length resp) (+ at 12))))))
+               (list statuses
+                     (cond ((search "/first 5" resp) 5)
+                           ((search "/first 0" resp) 0))
+                     (not (null (search "/second 0" resp)))))))
+      (dolist (field (list "Content-Length: 5" "Content-Length:5" "content-length: 5"
+                           "CONTENT-LENGTH: 5" "Content-Length: 05" "Content-Length: 5 "
+                           (format nil "Content-Length:~c5" #\Tab)
+                           (format nil "Content-Length: 5~c" #\Tab)
+                           (format nil "Content-Length: 5~aContent-Length: 5" *crlf*)))
+        (check (format nil "CL read alike: ~a" (shown field))
+               (outcome field) '(("200" "200") 5 t)))
+      (dolist (field (list "Content-Length : 5" (format nil "Content-Length~c: 5" #\Tab)
+                           "Content-Length: +5" "Content-Length: -5" "Content-Length: 0x5"
+                           "Content-Length: 5x" "Content-Length: 5,5" "Content-Length: 5, 5"
+                           "Content-Length: 5, 6" "Content-Length: 5 5" "Content-Length: "
+                           (format nil "X-Pad: y~a Content-Length: 5" *crlf*)))
+        (check (format nil "CL refused, nothing behind it read: ~a" (shown field))
+               (outcome field) '(("400") nil nil)))
+      (dolist (field '("X-Content-Length: 5" "Content-Lengthx: 5"))
+        (check (format nil "not a CL, no body: ~a" (shown field))
+               (outcome field) '(("200" "501") 0 nil))))))
+
 (defun test-harness-http10-keepalive-no-mutation-e2e ()
   "An HTTP/1.0 + Connection: keep-alive request must not stamp
    'Connection: keep-alive' onto the handler's returned struct.
@@ -8378,6 +8439,7 @@
   (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-a-head-with-no-fields-e2e)
+  (test-harness-content-length-spellings-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
   (test-harness-expect-417-on-unknown-e2e)

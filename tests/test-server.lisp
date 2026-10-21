@@ -8903,6 +8903,9 @@
              ;; value may contain, and one this scan has to notice before
              ;; PARSE-HEADERS-BYTES gets to at dispatch.
              (concatenate 'string before (string #\Return) after))
+           (lf (before after)
+             ;; The same, joined by a bare LF.
+             (concatenate 'string before (string #\Newline) after))
            (coding-of (headers &optional (version "1.1"))
              ;; Called the way CONNECTION-ON-READ calls it: bounded by the
              ;; CRLFCRLF and started past the request line.
@@ -9004,6 +9007,14 @@
     (check "TE: bare CR at the end of the value is invalid"
            (coding-of (list "Host: x" (te (cr "gzip" "")))) :invalid)
 
+    ;; A bare LF is the same disagreement from the other side: this scan
+    ;; would take `chunked<LF>X` for one value and answer it 501, a coding
+    ;; it does not implement, where PARSE-HEADERS-BYTES refuses the LF 400.
+    (check "TE: bare LF inside the value is invalid"
+           (coding-of (list "Host: x" (te (lf "chunked" "X")))) :invalid)
+    (check "TE: bare LF at the end of the value is invalid"
+           (coding-of (list "Host: x" (te (lf "gzip" "")))) :invalid)
+
     ;; PARSE-HEADERS-BYTES rejects obsolete line folding too, but at
     ;; dispatch — after this scan has already decided how the body is
     ;; framed. Broken state: the fold is not noticed here, this reader
@@ -9086,6 +9097,9 @@
 
     (check "TE bare CR is 400"
            (on-read (list "Host: x" (te (cr "chunked" ",gzip")))) 400)
+
+    (check "TE bare LF is 400"
+           (on-read (list "Host: x" (te (lf "chunked" "X")))) 400)
 
     (check "TE obs-folded is 400"
            (on-read (list "Host: x" "Transfer-Encoding: chunked"

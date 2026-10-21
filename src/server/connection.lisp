@@ -1182,6 +1182,11 @@
            ((and (< line-end end)
                  (/= (aref buf (1+ line-end)) 10))
             :invalid)
+           ;; A bare LF is the same fault the other way round: this scan
+           ;; would read `chunked<LF>X` as one value and classify it, where
+           ;; PARSE-HEADERS-BYTES refuses the LF at dispatch.
+           ((position 10 buf :start value-start :end line-end)
+            :invalid)
            ;; The value continues on a folded line this scan would not see.
            ((and (< (+ line-end 2) end)
                  (let ((b (aref buf (+ line-end 2))))
@@ -1818,6 +1823,13 @@
           ;; The buffer is at CONNECTION-READ-CAP with no complete
           ;; request in it. Whatever the client is sending, there is
           ;; more of it than we will hold — 413, not 400.
+          ;;
+          ;; Reached in :READ-BODY, by a body short of its end at the cap:
+          ;; a chunked body whose framing outgrows it. Not in :READ-HTTP
+          ;; while the cap is REQUEST-HEAD-BUDGET plus the body's share,
+          ;; because a head still unended at its budget is refused on the
+          ;; read that crosses it, before the buffer can fill. The arm
+          ;; covers both, so the bound holds if that arithmetic changes.
           (http-reject 413 "request too large (buffer full)"))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
