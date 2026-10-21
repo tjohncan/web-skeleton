@@ -32,6 +32,7 @@
         (test-https-on-body-relays-past-the-cap)
         (test-https-close-without-close-notify-ends-the-body)
         (test-https-a-dirty-error-queue-does-not-fail-a-read)
+        (test-https-streamed-request-body)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -1401,7 +1402,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
    stdin open. FN gets the port, or NIL if the peer never listened, and the
    process. The response goes to (PROCESS-INPUT PROCESS) when FN chooses,
    and what the client sent comes back on (PROCESS-OUTPUT PROCESS), where
-   s_server copies it.
+   s_server copies it. Both streams are Latin-1, a character a byte, so a
+   body of any bytes crosses them as it is.
 
    Held open because a relay whose input runs out ends with close_notify.
    With the input still open, s_server sends what it has been given and
@@ -1416,6 +1418,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                       "-key"  (format nil "~a/~a.key" dir leaf)
                       "-quiet" "-naccept" "1")
                 :wait nil :input :stream :output :stream :error nil
+                :external-format :latin-1
                 :directory dir :search t)))
     (unwind-protect
          (funcall fn (and (%wait-for-listener port) port) proc)
@@ -1587,6 +1590,184 @@ printf 'TAIL-MARKER\\n' >> body.txt
                    final 200)
             (check "https error queue: with both halves of the body"
                    (reverse chunks) '("FIRST-HALF" "SECOND-HALF")))))))))
+
+(defun %read-relayed-request (peer &key head-only)
+  "Read the request a held TLS peer copies to its output: the head, then
+   the body as the head frames it, by Content-Length or chunked to its
+   terminator. Returns (values HEAD BODY), the head a string and the body
+   bytes; BODY is NIL when HEAD-ONLY, or when the output ended first.
+
+   Chunked is read as this framework writes it, a size line and its data
+   for each chunk, then a zero chunk with no trailer."
+  (let* ((out (sb-ext:process-output peer))
+         (lines (loop for line = (read-line out nil nil)
+                      do (unless line
+                           (return-from %read-relayed-request (values nil nil)))
+                      until (string= line (string #\Return))
+                      collect (string-right-trim '(#\Return) line)))
+         (head (format nil "~{~a~%~}" lines)))
+    (flet ((header (name)
+             (loop for line in lines
+                   for colon = (position #\: line)
+                   when (and colon (string-equal name line :end2 colon))
+                     return (string-trim " " (subseq line (1+ colon)))))
+           (read-bytes (n)
+             ;; N characters, each one byte, or NIL if the output ends.
+             (let ((s (make-string n)))
+               (when (= (read-sequence s out) n)
+                 (map '(simple-array (unsigned-byte 8) (*)) #'char-code s)))))
+      (values
+       head
+       (unless head-only
+         (let ((declared (header "content-length")))
+           (if declared
+               (read-bytes (parse-integer declared))
+               (let ((runs '()))
+                 (loop
+                   (let* ((size-line (read-line out nil nil))
+                          (size (and size-line
+                                     (parse-integer size-line :radix 16 :junk-allowed t))))
+                     (cond
+                       ((null size) (return nil))
+                       ((zerop size)
+                        (read-line out nil nil)
+                        (return (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                                       (nreverse runs))))
+                       (t
+                        (let ((run (read-bytes size)))
+                          (unless run (return nil))
+                          (push run runs)
+                          (read-line out nil nil))))))))))))))
+
+(defun test-https-streamed-request-body ()
+  "A request body forwarded upstream over TLS as it arrives, end to end:
+   FORWARD-BODY into an https:// fetch. A body declared by Content-Length
+   reaches the peer with that length, and one sent chunked reaches it
+   chunked, each whole and in order, and the client hears the peer's
+   answer. A peer that answers before the body has all gone answers the
+   client, and the rest of the body is refused.
+
+   :OUT-SEND reads while it writes, and under TLS either one can be waiting
+   on the other direction, a write on readability or a read on
+   writability, which a plain socket never asks for. The peer is s_server
+   in relay mode, held open: what the fetch sends comes out on its output,
+   which the test reads to the end of the body before giving the answer to
+   its input. The early peer answers at the head and then reads slowly, so
+   the body is still arriving when its answer does."
+  (format t "~%HTTPS: a request body forwarded upstream as it arrives~%")
+  (%call-with-https-fixture
+   "https upload"
+   (lambda (dir)
+     (let* ((body (%pseudo-random-bytes (* 1024 1024) 81))
+            (expected (format nil "got:~d:~a" (length body) (%sha256-hex body)))
+            (lock (sb-thread:make-mutex :name "https-upload"))
+            (aborts nil)
+            (port-box (list nil)))
+       (labels ((answer (peer status text)
+                  (let ((input (sb-ext:process-input peer)))
+                    (format input "HTTP/1.1 ~d X~c~cContent-Length: ~d~c~c~
+                                   Connection: close~c~c~c~c~a"
+                            status #\Return #\Linefeed (length text) #\Return #\Linefeed
+                            #\Return #\Linefeed #\Return #\Linefeed text)
+                    (finish-output input)))
+                (aborts-for (path)
+                  (sb-thread:with-mutex (lock)
+                    (loop for (p . r) in aborts when (string= p path) collect r)))
+                (exchange (path peer reader-fn &key chunk-size (bytes body))
+                  ;; (values REPLY SEEN): the client's answer for BYTES sent
+                  ;; to PATH, and what READER-FN made of the relayed request.
+                  (let* ((reader (sb-thread:make-thread (lambda () (funcall reader-fn peer))
+                                                        :name "relayed request reader"))
+                         (reply (%exchange-or-why (%form-post-bytes path bytes
+                                                                 :chunk-size chunk-size
+                                                                 :headers '("Connection: close"))
+                                               :seconds 30)))
+                    (values reply
+                            (handler-case (sb-thread:join-thread reader :timeout 20)
+                              (error () nil))))))
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (let ((path (http-request-path req)))
+                  (forward-body
+                   (http-fetch :put (format nil "https://right.test:~d/up" (first port-box))
+                               :body :stream
+                               :content-length (and (string= path "/length")
+                                                    (parse-integer
+                                                     (get-header req "content-length")))
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers))
+                                       (if (eql status 200)
+                                           (make-text-response
+                                            200 (sb-ext:octets-to-string
+                                                 b :external-format :latin-1))
+                                           (make-error-response (or status 502)))))
+                   :max-size nil
+                   :on-abort (lambda (conn reason)
+                               (declare (ignore conn))
+                               (sb-thread:with-mutex (lock)
+                                 (push (cons path reason) aborts)))))))
+           ;; ---- forwarded whole, framed as it arrived ----
+           (loop for (path chunk-size framing)
+                   in '(("/length" nil "content-length: 1048576")
+                        ("/chunked" 65521 "transfer-encoding: chunked"))
+                 do (%call-with-held-tls-peer
+                     dir "right"
+                     (lambda (port peer)
+                       (check (format nil "https upload ~a: the peer is listening" path)
+                              (not (null port)) t)
+                       (when port
+                         (setf (first port-box) port)
+                         (multiple-value-bind (reply seen)
+                             (exchange path peer
+                                       (lambda (peer)
+                                         (multiple-value-bind (head got)
+                                             (%read-relayed-request peer)
+                                           (when got
+                                             (answer peer 200 (format nil "got:~d:~a" (length got)
+                                                                      (%sha256-hex got))))
+                                           (list head got)))
+                                       :chunk-size chunk-size)
+                           (check (format nil "https upload ~a: framed as it arrived" path)
+                                  (and seen (search framing (first seen) :test #'char-equal) t)
+                                  t)
+                           (check (format nil "https upload ~a: the peer got it whole" path)
+                                  (and seen (equalp (second seen) body)) t)
+                           (check (format nil "https upload ~a: the client heard the peer" path)
+                                  (and (search "HTTP/1.1 200" reply) (search expected reply) t)
+                                  t))))))
+           ;; ---- a peer that answers first ----
+           ;; A body larger than the socket buffers on the way can take in
+           ;; while the answer is on its way back, so it is still arriving
+           ;; when the answer does.
+           (%call-with-held-tls-peer
+            dir "right"
+            (lambda (port peer)
+              (check "https upload early: the peer is listening" (not (null port)) t)
+              (when port
+                (setf (first port-box) port)
+                (let ((reply (exchange "/early" peer
+                                       (lambda (peer)
+                                         (%read-relayed-request peer :head-only t)
+                                         (answer peer 413 "refused")
+                                         ;; Read on slowly to the end, so
+                                         ;; the peer is never held writing
+                                         ;; its output.
+                                         (let ((buf (make-string 16384))
+                                               (out (sb-ext:process-output peer)))
+                                           (loop while (= (read-sequence buf out) (length buf))
+                                                 do (sleep 0.005))))
+                                       :bytes (%pseudo-random-bytes (* 16 1024 1024) 82))))
+                  (check "https upload early: the peer's answer reached the client"
+                         (and (search "HTTP/1.1 413" reply) t) t)
+                  (check "https upload early: and the rest of the body was refused"
+                         (loop repeat 100 until (aborts-for "/early") do (sleep 0.05)
+                               finally (return (aborts-for "/early")))
+                         '(:refused))))))
+           (check "https upload: nothing aborted the bodies forwarded whole"
+                  (list (aborts-for "/length") (aborts-for "/chunked"))
+                  '(nil nil))))))))
 
 (defun test-ssl-read-classification ()
   "Every branch of the SSL_read classifier, and the blocking wrapper's one

@@ -212,7 +212,7 @@ specific status, not a blanket 400:
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
 | `501 Not Implemented` | A method not in the accepted set, or a transfer coding that is legal and unimplemented — `gzip`, or `gzip, chunked` (RFC 7230 §3.3.1). A bare final `chunked` is accepted |
 | `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
-| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |
+| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed. For a request answered with a streamed fetch, the wait starts once its body has gone; see "Sending a request body as it is produced" |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
 
@@ -524,8 +524,9 @@ rather than going on the wire. Both are ways for a request's declared
 framing to disagree with the bytes that follow (RFC 7230 §3.3.3), and
 either one aimed at an upstream is a request-smuggling primitive:
 
-- `Transfer-Encoding` — the framework never chunk-encodes, so the claim
-  is false whatever the body is, and it does not suppress the computed
+- `Transfer-Encoding` — the framework chunk-encodes only a streamed body
+  with no declared length, and writes that header itself, so a caller's
+  claim is false for any other body. It does not suppress the computed
   `Content-Length`, so the request would have carried both framing
   headers at once.
 - `Content-Length` — a caller-supplied one *does* suppress the computed
@@ -535,7 +536,10 @@ either one aimed at an upstream is a request-smuggling primitive:
   rest of a header alist.
 
 For a deliberate `Content-Length: 0` on a bodiless POST, pass `:body ""`
-— an empty body is still a body, and the header is computed from it.
+— an empty body is still a body, and the header is computed from it. A
+streamed body's length is declared with `:content-length` instead, and the
+bytes are held to it: `fetch-send` signals past it, and `fetch-finish`
+short of it.
 
 ### Fetch callback contract
 
@@ -2023,7 +2027,8 @@ held.
   can answer with the fetch that completes the upload. A `:then` that finds
   another full piece already collected can send it at once with another
   `fetch-into` before it resumes. The fetch's own marker is released before
-  `:then` runs.
+  `:then` runs. A file can also go upstream as one request, its runs sent as
+  they arrive: see "Sending a request body as it is produced".
 
 **What is accepted, and what is refused.** One parser serves both
 functions. Where the format leaves room for two readings, it refuses the
@@ -2061,6 +2066,116 @@ the client's. Name the stored file yourself. Where the client's path
 matters, check every segment of it before any of it names something on
 disk: no empty segment, no `.` or `..`, no backslash, no NUL, nothing that
 reads as a drive.
+
+### Sending a request body as it is produced
+
+A fetch's body is given whole by default: a string or bytes, measured and
+framed with `Content-Length`. `:body :stream` makes it the application's to
+send as it has it, so an upload can go on to an upstream as it arrives and
+never be held whole:
+
+```lisp
+(defun decide-body (request)
+  (when (string= (http-request-path request) "/upload")
+    (forward-body
+     (http-fetch :put (object-url request)
+                 :body :stream
+                 :content-length (let ((n (get-header request "content-length")))
+                                   (and n (parse-integer n)))
+                 :then (lambda (status headers body)
+                         (declare (ignore headers body))
+                         (if (and status (<= 200 status 299))
+                             (make-text-response 201 "stored")
+                             (make-error-response 502))))
+     :max-size (* 5 1024 1024 1024))))             ; 5 GiB
+```
+
+- **`forward-body`** is a body plan, for a body handler to return. The
+  request's body goes upstream as the fetch's body, a run at a time as it
+  arrives, and the client is answered with what `:then` returns. The fetch
+  starts with the body's first bytes, and a body with none starts it at
+  its end, with an empty body. `:max-size` and `:on-abort` are
+  `receive-body`'s.
+- **The client is held to the upstream's pace.** When the upstream falls
+  behind, the body pauses, and it resumes once the upload has drained. What
+  is held between the two is one read of the body at most, plus what the
+  sockets hold, whatever the upload's size.
+- **An upstream that answers first has answered the client.** One that
+  refuses an upload at its head, a 413 or a 401, answers before the body
+  has all gone, and so does one that fails partway. `:then` hears that
+  answer, and the rest of the body is refused with what `:then` returned
+  if that is an `http-response`, or 502 if not. A connection that fails
+  reaches `:then` as the abort sentinel, and the client is answered 502.
+- **The answer is read as the body goes out.** `:on-body` gets an early
+  answer's chunks as they arrive, as it gets any fetch's. A `:pause` from
+  it holds the answer and not the request: the body goes on going out, and
+  the answer is read again from `fetch-resume`.
+- **Framing.** A fetch that declares `:content-length` sends exactly that
+  many bytes, framed by `Content-Length`; without it the body is sent
+  chunked. Some upstreams take only the first. S3's PutObject is one, and so
+  is a presigned URL to it, so forward the length the client declared, as
+  above. A client that sent its body chunked declared no length, and for
+  an upstream that needs one the route is the one in "Forms and file
+  uploads": a piece at a time, each piece its own request.
+
+**By hand.** `forward-body` is `receive-body` and the three calls a streamed
+fetch has:
+
+```lisp
+(let ((put (http-fetch :put (object-url) :body :stream :then #'stored-or-502)))
+  (receive-body
+   :on-data (lambda (conn bytes)
+              (unless (fetch-started-p put)
+                (fetch-into conn put :failure-disposition :keep))
+              (let ((sent (fetch-send put bytes)))
+                (cond ((eq sent t) nil)                ; with the kernel: go on
+                      ((null sent) :pause)             ; resumed when it drains
+                      (t (make-error-response 502))))) ; the fetch is over
+   :on-end (lambda (conn)
+             (declare (ignore conn))
+             put)))                                    ; answered by the upstream
+```
+
+- **`(fetch-send fetch bytes)`** sends the next piece of the body, a chunk
+  of its own unless a length was declared. It answers `t` when everything
+  sent so far is with the kernel and `nil` when some of it is waiting. `nil`
+  is backpressure, as `stream-send`'s is. A body being received pauses on
+  it and is resumed when the upload drains, with nothing more asked of the
+  application. Any other producer, an `:on-tick` for one, stops and asks
+  again later with an empty send, which sends nothing and answers `t` once
+  the upstream has caught up; sending on regardless signals at
+  `*max-write-backlog*`. `:ended` means the fetch is over, answered or
+  failed or stopped, and the bytes went nowhere. The bytes are copied, so
+  the vector may be reused at once.
+- **`(fetch-finish fetch)`** ends the body: the chunked terminator, or a
+  check that the declared length has all been sent, which signals if not.
+- **Answering with the fetch.** An `:on-end`, or a fetch's `:then`, that
+  answers with a streamed fetch already started for its request answers
+  the request with what that fetch's `:then` returns: once the upstream has
+  answered, or at once if it already has. A fetch whose body is not
+  finished is finished then.
+- **Started once.** `fetch-into` starts a streamed fetch, or it starts as an
+  answer, like any fetch. What is sent before it starts is held for it,
+  under the same backlog bound. Starting it a second time signals, since
+  the fetch is the application's handle on that one exchange, and
+  `fetch-started-p` says whether it has started.
+- **On the worker.** `fetch-send` and `fetch-finish` are called on the
+  worker that carries the fetch, from a body's callbacks, a fetch's `:then`
+  or an `:on-tick`, and signal anywhere else. An `:on-tick` runs on every
+  worker, so one that feeds a fetch keeps the `*worker-id*` the fetch was
+  started on and feeds it there alone.
+- **Timing.** While the body is going out, `*fetch-timeout*` bounds it
+  standing still, not the upload. Each piece sent, and each piece the
+  upstream takes, moves the deadline out, so an upload takes as long as it
+  keeps moving. If the upstream stops reading, the fetch ends once that
+  long has passed and the client is answered 502. If the client stops
+  sending, the fetch ends the same way; the client is answered 502 if it
+  sends again, and is ended as a stall under `*body-stall-timeout*` if it
+  does not. Once the body has all been written to the socket, the answer is
+  waited for under `*fetch-timeout*` as any fetch's is, and a request
+  answered with the fetch is answered 504 if it does not come. That wait
+  includes the time the upstream takes to read what the kernel was still
+  holding for it, which over a slow link can be seconds.
 
 ### Form body decoding
 

@@ -64,6 +64,10 @@
                ;; meant to be paired with. Both fetch and dns call it, so
                ;; the dependency is declared rather than left to rely on
                ;; the order of this list.
+               ;; src/server/streaming for the chunk encoder a streamed
+               ;; request body is framed with, and src/server/body for the
+               ;; resume that lets a received body go once the upload it
+               ;; feeds has drained.
                (:file "src/server/fetch" :depends-on ("src/package"
                                                         "src/log"
                                                         "src/epoll"
@@ -71,7 +75,9 @@
                                                         "src/server/http"
                                                         "src/server/chunked"
                                                         "src/server/connection"
-                                                        "src/server/websocket"))
+                                                        "src/server/websocket"
+                                                        "src/server/streaming"
+                                                        "src/server/body"))
                (:file "src/server/dns" :depends-on ("src/package"
                                                       "src/log"
                                                       "src/epoll"

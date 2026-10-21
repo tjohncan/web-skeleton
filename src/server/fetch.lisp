@@ -46,7 +46,38 @@
   ;; path resumes several frames later holding this struct and nothing
   ;; else, and re-deriving it there would be a second chance to disagree
   ;; with the first answer.
-  (sink     :inbound :type keyword))
+  (sink     :inbound :type keyword)
+  ;; The rest is a fetch's life once started, which the application holds
+  ;; this struct to ask about — FETCH-SEND and FETCH-FINISH take it.
+  ;;
+  ;; T when :BODY was :STREAM: the request body is the application's to
+  ;; send, a piece at a time, and CONTENT-LENGTH is its declared length,
+  ;; or NIL for a body sent chunked.
+  (stream-body nil :type boolean)
+  (content-length nil :type (or null (integer 0)))
+  ;; The connection carrying the fetch: its :OUT-DNS connection while the
+  ;; name resolves, then its outbound. NIL before it starts and once it has
+  ;; ended.
+  (carrier nil)
+  ;; The connection it was started for, the one a detached fetch fetches
+  ;; into or an inbound one is parked on; -1 before it starts.
+  (target-fd -1 :type fixnum)
+  ;; A streamed body's pieces sent before the outbound exists, framed and
+  ;; oldest first, which become its write queue after the request head.
+  (pending nil :type list)
+  (pending-bytes 0 :type fixnum)
+  ;; Body bytes the application has sent, unframed — the count a declared
+  ;; Content-Length is held to.
+  (sent 0 :type unsigned-byte)
+  ;; FETCH-FINISH has been called: the body is complete.
+  (finished nil :type boolean)
+  ;; T once the fetch is over, however it ended. A streamed fetch's
+  ;; FETCH-SEND answers :ENDED from then on.
+  (ended nil :type boolean)
+  ;; What :THEN returned, when it ran for a detached fetch, kept for a
+  ;; request that is answered with the fetch afterwards (see ADOPT-FETCH).
+  (answered nil :type boolean)
+  (answer nil))
 
 (defparameter *fetch-timeout* 30
   "Seconds. A total on the HTTP-FETCH path, both schemes: the inbound
@@ -57,6 +88,13 @@
    blocking setup paths only. There it bounds DNS, connect, and each
    individual socket read separately, so a trickling upstream never trips
    it. README Limitations has what that costs.
+
+   A request body sent as it is produced (:BODY :STREAM) is bounded by its
+   progress instead while it goes out: each piece the application sends,
+   and each piece the upstream takes, moves the deadline out again
+   (NOTE-REQUEST-PROGRESS), so an upload takes as long as it keeps moving.
+   The wait for its answer is bounded by this from when the body has gone
+   (BEGIN-RESPONSE-READ), as any fetch's is.
 
    The trigger for revisiting this docstring is not 'find the sentence
    about timeouts' but any change to which paths reach the event loop.
@@ -169,7 +207,7 @@
    operate on one line at a time and never buffer the whole
    response.")
 
-(defun http-fetch (method url &key headers body then on-body)
+(defun http-fetch (method url &key headers body then on-body content-length)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
    THEN is called with (status headers body) when the response arrives,
@@ -237,12 +275,40 @@
    connection worth keeping. On the handler-returned path a client is
    parked with no answer owed by anything else, so a stop there is
    delivered as the same 502 that path gives every other response which
-   never arrived."
+   never arrived.
+
+   BODY is a string, a byte vector, or :STREAM. :STREAM makes the request
+   body the application's to send as it has it, with FETCH-SEND, and to
+   end with FETCH-FINISH — an upload forwarded upstream as it arrives,
+   never held whole. CONTENT-LENGTH declares its length, and the body must
+   then be exactly that many bytes; without it the body is sent chunked,
+   which an upstream that needs a length up front (S3's PutObject among
+   them) refuses. See FETCH-SEND for the rest of the contract."
   (unless then
     (error "http-fetch requires :then callback"))
-  (make-http-fetch-continuation :method method :url url
-                                :headers headers :body body
-                                :callback then :on-body on-body))
+  (when content-length
+    (unless (eq body :stream)
+      (error "http-fetch: :content-length declares a streamed body's length; ~
+              a body given whole is measured, so pass :body :stream with it."))
+    (unless (and (integerp content-length) (<= 0 content-length))
+      (error "http-fetch: :content-length is ~s; it must be a non-negative ~
+              integer of bytes."
+             content-length)))
+  (let ((streamed (eq body :stream)))
+    (make-http-fetch-continuation :method method :url url
+                                  :headers headers
+                                  :body (if streamed nil body)
+                                  :stream-body streamed
+                                  :content-length content-length
+                                  :callback then :on-body on-body)))
+
+(defun fetch-started-p (fetch)
+  "True once FETCH, a streamed fetch, has been started — by FETCH-INTO, or
+   as a handler's answer. A fetch whose body was given whole is a
+   description that may be started any number of times, and never counts
+   as started."
+  (and (http-fetch-continuation-stream-body fetch)
+       (>= (http-fetch-continuation-target-fd fetch) 0)))
 
 (defun defer-to-fetch (method url &key headers body then)
   "Readability alias for HTTP-FETCH at the handler call site. Returns an
@@ -509,8 +575,14 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun build-outbound-request (method host path &key (scheme :http) (port 80)
-                                                      headers body)
+                                                      headers body
+                                                      streamed declared-length)
   "Build an HTTP/1.1 request as a byte vector ready to write.
+
+   STREAMED builds the head of a request whose body follows it as the
+   application sends it: framed by Content-Length when DECLARED-LENGTH is
+   given, and chunked otherwise. BODY is ignored then; the head is all
+   this builds.
 
    IPv6 literal hosts are re-bracketed for the wire Host: value.
    parse-authority strips the brackets from the internal HOST
@@ -543,10 +615,12 @@
     ;; two ways for a request's declared framing to disagree with the
     ;; bytes that follow, and :headers can reach both.
     ;;
-    ;; Transfer-Encoding: this function never chunk-encodes, so the claim
-    ;; is false whatever the body is. The merge below adds Content-Length
-    ;; only when the caller did not supply one — and Transfer-Encoding is
-    ;; not Content-Length, so it does not suppress it. A caller passing
+    ;; Transfer-Encoding: the framework writes this one itself, for a
+    ;; streamed body with no declared length, which FETCH-SEND frames to
+    ;; match; for any other body a caller's claim is false. The merge below
+    ;; adds Content-Length only when the caller did not supply one — and
+    ;; Transfer-Encoding is not Content-Length, so it does not suppress
+    ;; it. A caller passing
     ;; ("transfer-encoding" . "chunked") with a body therefore emits both
     ;; framing headers at once, which is the canonical smuggling shape,
     ;; pointed at the upstream.
@@ -568,12 +642,14 @@
     ;; already accepts — attacker-influenced data reaching :headers is
     ;; likelier than attacker-influenced data reaching :method.
     (when (assoc "transfer-encoding" headers :test #'string-equal)
-      (error "build-outbound-request: Transfer-Encoding is not supported on ~
-              outbound requests — the framework frames bodies with ~
-              Content-Length"))
+      (error "build-outbound-request: Transfer-Encoding is the framework's to ~
+              write — a body given whole is framed with Content-Length, and a ~
+              streamed one (:body :stream) is chunked unless it declares a ~
+              :content-length"))
     (when (assoc "content-length" headers :test #'string-equal)
-      (error "build-outbound-request: Content-Length is computed from :body. ~
-              A caller-supplied one that disagrees with the body is a framing ~
+      (error "build-outbound-request: Content-Length is computed from :body, or ~
+              declared with :content-length for a streamed body. A ~
+              caller-supplied one that disagrees with the body is a framing ~
               lie aimed at the upstream. Pass :body \"\" for a deliberate ~
               Content-Length: 0."))
   (let* ((default-port-p (or (and (eq scheme :http) (= port 80))
@@ -588,11 +664,13 @@
          (host-value (if default-port-p
                          wire-host
                          (format nil "~a:~d" wire-host port)))
-         (body-bytes (etypecase body
-                       (null nil)
-                       (string (sb-ext:string-to-octets body
-                                                         :external-format :utf-8))
-                       ((simple-array (unsigned-byte 8) (*)) body)))
+         (body-bytes (if streamed
+                         nil
+                         (etypecase body
+                           (null nil)
+                           (string (sb-ext:string-to-octets body
+                                                             :external-format :utf-8))
+                           ((simple-array (unsigned-byte 8) (*)) body))))
          (all-headers (flet ((has-header-p (name)
                               (assoc name headers :test #'string-equal)))
                        (append
@@ -615,10 +693,16 @@
                         ;; wrong rule.
                         ;; HOST / CONNECTION / USER-AGENT above stay
                         ;; conditional: those are real caller overrides.
-                        (when body-bytes
-                          (list (cons "content-length"
-                                      (write-to-string
-                                       (length body-bytes)))))))))
+                        (cond
+                          ((and streamed declared-length)
+                           (list (cons "content-length"
+                                       (write-to-string declared-length))))
+                          (streamed
+                           (list (cons "transfer-encoding" "chunked")))
+                          (body-bytes
+                           (list (cons "content-length"
+                                       (write-to-string
+                                        (length body-bytes))))))))))
     (serialize-http-message
      (format nil "~a ~a HTTP/1.1" method-str path)
      all-headers body-bytes))))
@@ -1713,7 +1797,7 @@
    abort sentinel, and :ON-BODY receives (outbound-connection chunk) and
    may return :PAUSE or :STOP. A :THEN moves from a handler-returned fetch
    to this one unchanged. :THEN's return value is discarded here — there is
-   no parked request for it to answer.
+   no parked request for it to answer — except a streamed fetch's, below.
 
    :STOP is the verdict this path exists for. It closes the outbound,
    leaves CONNECTION alone, and fires :THEN with the abort sentinel, so an
@@ -1739,6 +1823,15 @@
    :THEN alone, the connection being the one whose life bounds it — a
    client that leaves takes the fetch down with it.
 
+   A streamed fetch (:BODY :STREAM) is the other shape for that case: one
+   request, its body sent with FETCH-SEND as ON-DATA is handed it. A NIL
+   from FETCH-SEND pauses the body, and the request draining resumes it,
+   with no :THEN involved. Its :THEN's value is kept on the fetch rather
+   than discarded, because the request being received may be answered with
+   the fetch once its body has ended (ADOPT-FETCH), and an upstream that
+   answered before then has answered that request too. FORWARD-BODY is the
+   whole shape in one call.
+
    The asymmetry is not an oversight. On :STREAMING the disposition is a
    protocol obligation — the framework owns the terminator and writing one
    claims the body is complete — so :KEEP there is refused rather than
@@ -1752,7 +1845,7 @@
    why :CLOSE stays the default: it is the safe answer for the app that has
    not thought about it.
 
-   Signals, rather than returning NIL, in seven cases:
+   Signals, rather than returning NIL, in eight cases:
 
      the connection is not :STREAMING or :WEBSOCKET, nor receiving a body
        — nothing else owns its own write path or what it reads, so
@@ -1772,7 +1865,10 @@
        by looking its fd up in *CONNECTIONS*, which is per-worker while fds
        are unique across the process — so a cross-worker fetch runs, and
        then finds nothing to deliver into, leaving the marker set for the
-       life of the connection and the disposition unapplied.
+       life of the connection and the disposition unapplied;
+     CONTINUATION is a streamed fetch already started. It is the
+       application's handle on one exchange, and FETCH-SEND writes through
+       it, so a second start would be two exchanges under one name.
 
    Signalling rather than returning NIL because a call from the wrong
    state is a programming error whose silent failure mode is a connection
@@ -1830,8 +1926,8 @@
   ;; "wrong worker" off a worker entirely, a caller would go looking for
   ;; the right one.
   ;;
-  ;; This is the only one of the seven that cannot be answered from the
-  ;; connection alone. A cross-worker call satisfies every other check —
+  ;; This is the only one of the eight that needs the worker's table to
+  ;; answer. A cross-worker call satisfies every other check —
   ;; the state is right, *EPOLL-FD* is bound, nothing is outstanding — so
   ;; the outbound is created and registered here and runs correctly.
   ;; Delivery is what fails: DELIVER-DETACHED and STOP-FETCH both reach
@@ -1862,7 +1958,8 @@
   ;; restoring the connection rather than overwriting a choice — and the
   ;; slot is unread anyway while no fetch is outstanding.
   (setf (connection-fetch-outstanding connection) t
-        (connection-fetch-failure-disposition connection) failure-disposition)
+        (connection-fetch-failure-disposition connection) failure-disposition
+        (connection-send-waiting connection) nil)
   (handler-case (initiate-fetch connection *epoll-fd* continuation)
     (error (e)
       (setf (connection-fetch-outstanding connection) nil
@@ -1878,7 +1975,17 @@
    Both schemes take the same non-blocking epoll path, and neither holds
    the worker for the exchange. What differs is a transport installed on
    the outbound connection — a handshake step, a byte source, a byte sink
-   and a release — and nothing about the state machine that drives them."
+   and a release — and nothing about the state machine that drives them.
+
+   A streamed fetch starts once. Its struct is the application's handle on
+   it from then on — FETCH-SEND writes through it — so a second start
+   would be two exchanges answering to one name; an answer that names one
+   already started goes to ADOPT-FETCH instead. Any other fetch is a
+   description, and may be started as often as it is returned."
+  (when (fetch-started-p fetch-req)
+    (error "fetch to ~a has already been started; a fetch starts once"
+           (http-fetch-continuation-url fetch-req)))
+  (setf (http-fetch-continuation-target-fd fetch-req) (connection-fd conn))
   (handler-case
       (multiple-value-bind (scheme host port path)
           (parse-url (http-fetch-continuation-url fetch-req))
@@ -1894,7 +2001,11 @@
       ;; once` to apply within, and delivering here would also mean :THEN
       ;; could run before FETCH-INTO returned.
       (when (eq (http-fetch-continuation-sink fetch-req) :detached)
+        ;; Refused at the door, so not started: FETCH-INTO's caller may
+        ;; start it again once it has dealt with the cause.
+        (setf (http-fetch-continuation-target-fd fetch-req) -1)
         (error e))
+      (setf (http-fetch-continuation-ended fetch-req) t)
       (log-error "fetch setup failed: ~a" e)
       ;; Fire the cleanup sentinel so the app's :then closure runs
       ;; exactly once even on pre-connection errors (malformed URL,
@@ -1968,13 +2079,17 @@
                        (error "connect: ~a" (errno-string errno))))))
                (let* ((out-fd (socket-fd socket))
                       (scheme (http-fetch-continuation-scheme fetch-req))
+                      (streamed (http-fetch-continuation-stream-body fetch-req))
                       (request-bytes (build-outbound-request
                                       (http-fetch-continuation-method fetch-req)
                                       host path
                                       :scheme scheme
                                       :port port
                                       :headers (http-fetch-continuation-headers fetch-req)
-                                      :body (http-fetch-continuation-body fetch-req))))
+                                      :body (http-fetch-continuation-body fetch-req)
+                                      :streamed streamed
+                                      :declared-length
+                                      (http-fetch-continuation-content-length fetch-req))))
                  (setf out-conn (make-connection
                                  :fd out-fd
                                  :socket socket
@@ -1988,6 +2103,7 @@
                                  :fetch-started-at (get-universal-time)
                                  :fetch-deadline (+ (get-universal-time)
                                                     *fetch-timeout*)
+                                 :fetch-continuation fetch-req
                                  :last-active (get-universal-time)))
                  ;; Before the request is queued and before epoll is armed:
                  ;; HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN, so no path
@@ -1995,6 +2111,15 @@
                  (when (eq scheme :https)
                    (funcall *tls-outbound-setup-fn* out-conn host))
                  (connection-queue-write out-conn request-bytes)
+                 ;; A streamed body's pieces sent before there was a socket to
+                 ;; queue them on follow the head, in the order sent. They were
+                 ;; held to the backlog bound as they came, so they join the
+                 ;; queue without a second check.
+                 (when streamed
+                   (dolist (piece (http-fetch-continuation-pending fetch-req))
+                     (%queue-tail out-conn piece))
+                   (setf (http-fetch-continuation-pending fetch-req) nil
+                         (http-fetch-continuation-pending-bytes fetch-req) 0))
                  (register-connection out-conn)
                  (setf registered t)
                  (epoll-add epoll-fd out-fd (logior +epollout+ +epollet+))
@@ -2011,7 +2136,8 @@
                    (:detached nil))
                  (log-debug "fetch: fd ~d -> ~a :~d~a (outbound fd ~d, ~a)"
                             (connection-fd conn) host port path out-fd family)
-                 (setf done t)))
+                 (setf (http-fetch-continuation-carrier fetch-req) out-conn
+                       done t)))
           ;; Error path: if the error landed after REGISTER-CONNECTION but
           ;; before we finished wiring, tear down partial state. Symmetric
           ;; with ACCEPT-CONNECTION's flagged-unwind shape — an error
@@ -2106,7 +2232,13 @@
         ;; chunks the pause is holding back and hand them over while the
         ;; consumer is still behind. FETCH-RESUME's re-arm brings any such
         ;; condition back as an event, and it is handled then.
-        ((connection-fetch-paused conn) nil)
+        ;;
+        ;; Except a request still going out, which the pause does not hold:
+        ;; a wake-up armed for its writes drives them, and reads nothing.
+        ((connection-fetch-paused conn)
+         (when (and (eq (connection-state conn) :out-send)
+                    (logtest flags (logior +epollin+ +epollout+)))
+           (handle-outbound-send conn epoll-fd)))
         (t
          ;; 1. Drain readable bytes first so a batched IN+HUP sees
          ;;    the bytes before the HUP is treated as fatal.
@@ -2122,6 +2254,8 @@
              ;; protocol error that surfaces looking like a broken peer.
              (:out-write (when (connection-interest-inverted conn)
                            (handle-outbound-write conn epoll-fd)))
+             ;; Both directions, whichever woke it; once per event.
+             (:out-send (handle-outbound-send conn epoll-fd))
              ;; Stale EPOLLIN in another state — ignore silently.
              (otherwise nil)))
          ;; 2. Handle writable. Gated on (lookup-connection ...) so
@@ -2136,6 +2270,9 @@
              ;; The mirror of the EPOLLIN arm above.
              (:out-read       (when (connection-interest-inverted conn)
                                 (handle-outbound-read conn epoll-fd)))
+             ;; Already driven by the EPOLLIN arm when both came together.
+             (:out-send       (unless (logtest flags +epollin+)
+                                (handle-outbound-send conn epoll-fd)))
              (otherwise nil)))
          ;; 3. HUP/ERR after draining. If we still have a live
          ;;    :out-read connection, give it one more shot at
@@ -2152,6 +2289,13 @@
               (when (lookup-connection (connection-fd conn))
                 (deliver-fetch-error conn epoll-fd
                                      "connection error after partial read")))
+             ;; An upstream that answered and then hung up, or reset, before
+             ;; the request was all sent: what it answered is read first.
+             ((eq (connection-state conn) :out-send)
+              (read-while-sending conn epoll-fd)
+              (when (lookup-connection (connection-fd conn))
+                (deliver-fetch-error conn epoll-fd
+                                     "connection error while sending the request")))
              (t
               (deliver-fetch-error conn epoll-fd "connection error"))))))
     ;; SERIOUS-CONDITION, not ERROR, because :ON-BODY runs inside this: see
@@ -2233,14 +2377,37 @@
       ((connection-handshake-fn conn)
        (setf (connection-state conn) :out-handshake)
        (handle-outbound-handshake conn epoll-fd))
-      (t
-       ;; Connect succeeded — start writing request (already queued)
-       (setf (connection-state conn) :out-write)
-       (handle-outbound-write conn epoll-fd)))))
+      ;; Connect succeeded — start writing the request, already queued.
+      (t (begin-request conn epoll-fd)))))
+
+(defun begin-request (conn epoll-fd)
+  "CONN's transport is usable: send the request queued on it.
+
+   A request whose body is given whole goes out in :OUT-WRITE and is read
+   for its answer once it has all gone. One whose body the application
+   streams goes out in :OUT-SEND, which reads as it writes: the body may be
+   long in coming, and an upstream may answer before it has all arrived —
+   a 413 at the head, a 401, a failure partway — which a client that only
+   listened afterwards would hear only once it had sent everything, or
+   never. The response is read from the start, so its cursors are set
+   here rather than at the change to :OUT-READ."
+  (let ((fetch (connection-fetch-continuation conn)))
+    (if (and fetch (http-fetch-continuation-stream-body fetch))
+        (progn
+          (setf (connection-state conn) :out-send
+                (connection-read-pos conn) 0
+                (connection-header-scan-pos conn) 0
+                (connection-out-head-start conn) 0
+                (connection-out-interims conn) 0
+                (connection-interest-inverted conn) nil)
+          (handle-outbound-send conn epoll-fd))
+        (progn
+          (setf (connection-state conn) :out-write)
+          (handle-outbound-write conn epoll-fd)))))
 
 (defun handle-outbound-handshake (conn epoll-fd)
   "Run one step of the transport handshake and arm whichever direction it
-   asks for, or advance to :OUT-WRITE when it finishes.
+   asks for, or begin the request when it finishes (BEGIN-REQUEST).
 
    This is the one state in the outbound machine where readable does not
    mean read and writable does not mean write. A TLS handshake exchanges
@@ -2259,9 +2426,7 @@
    handshake message, and tracking the current mask to avoid it would add
    state whose only purpose is to be wrong once."
   (ecase (funcall (connection-handshake-fn conn))
-    (:done
-     (setf (connection-state conn) :out-write)
-     (handle-outbound-write conn epoll-fd))
+    (:done (begin-request conn epoll-fd))
     (:want-read
      (epoll-modify epoll-fd (connection-fd conn)
                    (logior +epollin+ +epollet+)))
@@ -2289,6 +2454,432 @@
       (:want-read (invert-interest conn epoll-fd))
       ;; :continue — more bytes to write
       (t (restore-interest conn epoll-fd)))))
+
+;;; ---------------------------------------------------------------------------
+;;; A request body the application streams
+;;; ---------------------------------------------------------------------------
+
+(defun handle-outbound-send (conn epoll-fd)
+  "Drive CONN in :OUT-SEND: write what is queued of the request, read what
+   the upstream has answered so far, and arm what each direction waits on.
+
+   Both directions are tried on every wake-up, whichever one woke it. With
+   both in flight the state cannot say which operation a wake-up is for,
+   which is what INVERT-INTEREST relies on in the other states: under
+   TLS a write can be waiting on readability while a read waits on
+   writability. Retrying both is right for either, costs one read that
+   finds nothing on a wake-up meant for the write, and leaves no edge
+   unwatched — readability is armed throughout, writability whenever a
+   write or a read is waiting on it.
+
+   The queue draining with the body unfinished lets go of a body the
+   application paused on this fetch (RELEASE-SEND-WAITER). The queue
+   draining with the body finished is the end of the request, and the
+   fetch goes on in :OUT-READ.
+
+   A pause :ON-BODY takes holds the reading alone. The request goes on
+   going out, and readability is armed again by FETCH-RESUME, unless a
+   write is waiting on it."
+  (let ((fetch (connection-fetch-continuation conn))
+        (want-write nil)
+        (write-wants-read nil)
+        (drained nil))
+    (when (plusp (connection-write-pending conn))
+      (let ((before (connection-write-pending conn)))
+        (ecase (connection-on-write conn)
+          (:continue (setf want-write t))
+          ;; The wake-up for readability, armed below, re-issues it.
+          (:want-read (setf write-wants-read t))
+          (:done (setf drained t)))
+        (when (< (connection-write-pending conn) before)
+          (note-request-progress conn))))
+    ;; The answer, unless :ON-BODY has paused it. A pause holds the
+    ;; reading and not the request, which goes on going out.
+    (unless (connection-fetch-paused conn)
+      (case (read-while-sending conn epoll-fd)
+        ;; Answered or failed: the fetch is over and closed.
+        (:ended (return-from handle-outbound-send))
+        (:want-write (setf want-write t))))
+    (cond
+      ((and (http-fetch-continuation-finished fetch)
+            (zerop (connection-write-pending conn)))
+       (begin-response-read conn epoll-fd))
+      (t
+       (when drained
+         (release-send-waiter conn epoll-fd))
+       (epoll-modify epoll-fd (connection-fd conn)
+                     (logior +epollet+
+                             (if (or (not (connection-fetch-paused conn))
+                                     write-wants-read)
+                                 +epollin+
+                                 0)
+                             (if want-write +epollout+ 0)))))))
+
+(defun read-while-sending (conn epoll-fd)
+  "Read what CONN's upstream has sent while its request is still going
+   out, and walk it. Answers :ENDED when that ended the fetch — an answer
+   complete before the request was, or a failure — :PAUSED when :ON-BODY
+   paused it, :WANT-WRITE when the transport has to write before it can
+   read again, or NIL to wait for more.
+
+   The walk is :OUT-READ's, without its arming: HANDLE-OUTBOUND-SEND arms
+   both directions at once. A read cut short by the buffer's cap is read
+   again here, in this wake-up. :OUT-READ is woken for that by
+   writability, which a socket with a request still filling it does not
+   have at once."
+  (when (connection-fetch-rewalk conn)
+    (setf (connection-fetch-rewalk conn) nil)
+    (let ((verdict (walk-outbound-response conn epoll-fd :buffered :arm nil)))
+      (unless (eq verdict :reading)
+        (return-from read-while-sending verdict))))
+  ;; Sixteen reads at most, as a received body is read in at most sixteen
+  ;; windows a wake-up: enough for a relay that frees what it hands on, and
+  ;; a bound for one that does not.
+  (loop repeat 16
+        do (let ((result (connection-read-available conn)))
+             (case result
+               ;; End of stream: an answer framed by the close, or an
+               ;; upstream that hung up on the request. COMPLETE-FETCH tells
+               ;; the two apart.
+               (:eof (complete-fetch conn epoll-fd) (return :ended))
+               (:full
+                (deliver-fetch-error
+                 conn epoll-fd (format nil "response exceeds ~d bytes (cap)"
+                                       *max-outbound-response-size*))
+                (return :ended))
+               (:again (return nil))
+               (:want-write (return :want-write))
+               ((:ok :ok-eof :ok-want-write)
+                (multiple-value-bind (verdict wants)
+                    (walk-outbound-response conn epoll-fd result :arm nil)
+                  (cond
+                    ((not (eq verdict :reading)) (return verdict))
+                    ((eq wants :write) (return :want-write))
+                    ;; Cut at the cap: read again.
+                    ((eq wants :cut) nil)
+                    (t (return nil)))))))
+        ;; Still cut after every round: writability, when it comes, wakes
+        ;; the read again.
+        finally (return :want-write)))
+
+(defun begin-response-read (conn epoll-fd)
+  "CONN's streamed request has all gone out: read the rest of its answer
+   in :OUT-READ.
+
+   What arrived of the answer while the request was going out stays where
+   it is, walked as far as it goes. The fetch's own deadline starts here,
+   since what it bounds is the upstream answering, and a request answered
+   with this fetch starts its wait for the answer here too. Before this
+   point both were waiting on the body, which progress bounded."
+  (setf (connection-state conn) :out-read
+        (connection-interest-inverted conn) nil
+        (connection-fetch-deadline conn) (+ (get-universal-time) *fetch-timeout*))
+  (let ((in (awaiting-inbound-for (connection-inbound-fd conn) (connection-fd conn))))
+    (when in
+      (setf (connection-last-active in) (get-universal-time))))
+  ;; A fetch :ON-BODY has paused reads nothing until FETCH-RESUME, which
+  ;; wakes it from :OUT-READ as from any pause there.
+  (epoll-modify epoll-fd (connection-fd conn)
+                (if (connection-fetch-paused conn)
+                    +epollet+
+                    (logior +epollin+ +epollet+))))
+
+(defun note-request-progress (out)
+  "Some of OUT's streamed request moved — the application sent more, or
+   the upstream took more — so its deadline moves out again. While a
+   request body is going out the deadline is a bound on silence, not on
+   the whole: an upload takes as long as it keeps moving."
+  (setf (connection-fetch-deadline out) (+ (get-universal-time) *fetch-timeout*)))
+
+(defun release-send-waiter (out epoll-fd)
+  "OUT's streamed request body has drained. If its application was told
+   to wait for that — FETCH-SEND answered NIL — the wait is over, and a
+   body the application paused on it, still being received, is resumed.
+
+   Only a body FETCH-SEND told to wait: a pause the application took for
+   reasons of its own is the application's to end."
+  (%release-target-waiter (connection-inbound-fd out) epoll-fd))
+
+(defun %flush-request-body (out)
+  "Write what OUT's queue holds, from FETCH-SEND or FETCH-FINISH.
+   Returns T when the queue emptied.
+
+   A remainder is left to OUT's own event handler, with writability and
+   readability armed for it. So is a write that fails: the handler meets
+   the same failure and ends the fetch as every upstream failure is ended,
+   where raising here would raise into the callback that sent the bytes —
+   an inbound body's ON-DATA — and blame that connection for its
+   upstream's."
+  (let ((drained (handler-case (eq (connection-on-write out) :done)
+                   (error () nil))))
+    (unless drained
+      (ignore-errors
+       (epoll-modify *epoll-fd* (connection-fd out)
+                     (logior +epollin+ +epollout+ +epollet+))))
+    drained))
+
+(defun %check-fetch-owner (fetch who)
+  "Signal unless FETCH may be written to from here: off a worker, or on a
+   fetch another worker carries. As WS-SEND and BODY-RESUME refuse, and for
+   the same reason — the queue and the epoll interest are the carrying
+   worker's alone."
+  (let ((carrier (http-fetch-continuation-carrier fetch)))
+    (when carrier
+      (unless *epoll-fd*
+        (error "~a: no event loop on this thread. A streamed fetch is sent to ~
+                from the worker that carries it — a body's callbacks, a ~
+                fetch's :THEN, an :ON-TICK."
+               who))
+      (unless (eq (lookup-connection (connection-fd carrier)) carrier)
+        (error "~a: the fetch to ~a is carried by another worker. Only that ~
+                worker may send its body."
+               who (http-fetch-continuation-url fetch))))))
+
+(defun %mark-send-waiting (fetch)
+  "Record, on the connection FETCH was started for, that its application
+   has been told to wait for FETCH's body to drain."
+  (let ((target (and (>= (http-fetch-continuation-target-fd fetch) 0)
+                     (lookup-connection (http-fetch-continuation-target-fd fetch)))))
+    (when target
+      (setf (connection-send-waiting target) t))))
+
+(defun %queue-request-piece (fetch piece &key (bounded t))
+  "Put PIECE, framed, behind what FETCH's request has queued: on its
+   outbound's write queue once there is one, held on FETCH until then.
+   Returns the outbound, or NIL while there is none. Signals at
+   *MAX-WRITE-BACKLOG* when BOUNDED."
+  (let ((carrier (http-fetch-continuation-carrier fetch)))
+    (if (and carrier (not (eq (connection-state carrier) :out-dns)))
+        (progn
+          (if bounded
+              (unless (connection-append-write carrier piece)
+                (error "fetch-send: the fetch to ~a is at *max-write-backlog* ~
+                        (~d bytes pending, this piece is ~d); the upstream is ~
+                        not keeping up, and FETCH-SEND answering NIL was the ~
+                        signal to pause."
+                       (http-fetch-continuation-url fetch)
+                       (connection-write-pending carrier) (length piece)))
+              (if (zerop (connection-write-pending carrier))
+                  (connection-append-write carrier piece)
+                  (%queue-tail carrier piece)))
+          (note-request-progress carrier)
+          carrier)
+        (progn
+          (when (and bounded
+                     (> (+ (http-fetch-continuation-pending-bytes fetch) (length piece))
+                        *max-write-backlog*))
+            (error "fetch-send: the fetch to ~a has ~d bytes waiting for its ~
+                    upstream to connect, and this piece of ~d would pass ~
+                    *max-write-backlog*; FETCH-SEND answering NIL was the ~
+                    signal to pause."
+                   (http-fetch-continuation-url fetch)
+                   (http-fetch-continuation-pending-bytes fetch) (length piece)))
+          (setf (http-fetch-continuation-pending fetch)
+                (append (http-fetch-continuation-pending fetch) (list piece)))
+          (incf (http-fetch-continuation-pending-bytes fetch) (length piece))
+          nil))))
+
+(defun fetch-send (fetch bytes)
+  "Send BYTES as the next piece of FETCH's request body, a fetch made with
+   :BODY :STREAM. Returns T when everything sent so far has reached the
+   kernel, NIL when some of it is waiting, or :ENDED when the fetch is
+   over and nothing was sent.
+
+   NIL is backpressure, the same answer STREAM-SEND and WS-SEND give and
+   for the same reason: the upstream is not keeping up, and the producer
+   should stop until it has. A producer that is a body being received —
+   RECEIVE-BODY's ON-DATA, RECEIVE-MULTIPART's ON-PART-DATA — returns
+   :PAUSE, and the body is resumed when FETCH's request drains, without
+   anything more from the application. A send made before the upstream has
+   connected answers NIL too: its bytes wait for the connection, and the
+   resume comes once they have gone. Any other producer, an :ON-TICK for
+   one, asks again with an empty BYTES, which sends nothing and answers as a
+   send would: T once the upstream has caught up.
+
+   :ENDED means the fetch ended while the body was being sent: the upstream
+   answered early (a 413, a 401), failed, or :ON-BODY stopped it. Its :THEN
+   has heard how. The bytes are dropped, so a producer may keep calling
+   until it learns, and stop then.
+
+   The bytes are copied, so BYTES may be reused at once. Chunked unless
+   the fetch declared :CONTENT-LENGTH, each call one chunk.
+
+   Signals:
+     - FETCH's body was given whole, or has been finished (FETCH-FINISH);
+     - BYTES would take the body past its declared :CONTENT-LENGTH;
+     - the bytes waiting would pass *MAX-WRITE-BACKLOG*, which is what
+       sending on through NIL answers comes to;
+     - off a worker, or on a fetch another worker carries.
+   A send before the fetch has started is held for it, on any thread."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (unless (http-fetch-continuation-stream-body fetch)
+    (error "fetch-send: the fetch to ~a was given its body whole; one made ~
+            with :body :stream has its body sent with FETCH-SEND"
+           (http-fetch-continuation-url fetch)))
+  (cond
+    ((http-fetch-continuation-ended fetch) :ended)
+    ((http-fetch-continuation-finished fetch)
+     (error "fetch-send: the body of the fetch to ~a is finished; ~
+             FETCH-FINISH has been called"
+            (http-fetch-continuation-url fetch)))
+    (t
+     (let ((declared (http-fetch-continuation-content-length fetch))
+           (sent (http-fetch-continuation-sent fetch)))
+       (when (and declared (> (+ sent (length bytes)) declared))
+         (error "fetch-send: ~d more bytes would take the body of the fetch ~
+                 to ~a past the ~d it declared (~d sent)"
+                (length bytes) (http-fetch-continuation-url fetch) declared sent))
+       (%check-fetch-owner fetch "fetch-send")
+       (let ((out (if (zerop (length bytes))
+                      ;; Nothing to queue: the call is the question alone.
+                      (let ((c (http-fetch-continuation-carrier fetch)))
+                        (and c (not (eq (connection-state c) :out-dns)) c))
+                      (%queue-request-piece
+                       fetch (if declared (copy-seq bytes) (encode-chunk bytes))))))
+         (incf (http-fetch-continuation-sent fetch) (length bytes))
+         (if (and out
+                  (eq (connection-state out) :out-send)
+                  (%flush-request-body out))
+             t
+             (progn (%mark-send-waiting fetch) nil)))))))
+
+(defun fetch-finish (fetch)
+  "End FETCH's streamed request body. Returns T, or :ENDED when the fetch
+   is already over.
+
+   A chunked body gets its terminator; a body with a declared
+   :CONTENT-LENGTH must have been sent in full, and signals otherwise —
+   the upstream would wait for the rest, or read the next request out of
+   it. Once the body has gone out the fetch reads the upstream's answer,
+   under its *FETCH-TIMEOUT* from there.
+
+   Calling it twice is calling it once. A body handler's ON-END that
+   answers with FETCH finishes it if it has not been (see ADOPT-FETCH).
+   Signals off a worker or on a fetch another worker carries, as
+   FETCH-SEND does."
+  (unless (http-fetch-continuation-stream-body fetch)
+    (error "fetch-finish: the fetch to ~a was given its body whole"
+           (http-fetch-continuation-url fetch)))
+  (cond
+    ((http-fetch-continuation-ended fetch) :ended)
+    ((http-fetch-continuation-finished fetch) t)
+    (t
+     (let ((declared (http-fetch-continuation-content-length fetch))
+           (sent (http-fetch-continuation-sent fetch)))
+       (when (and declared (/= sent declared))
+         (error "fetch-finish: the body of the fetch to ~a is ~d bytes of the ~
+                 ~d it declared"
+                (http-fetch-continuation-url fetch) sent declared))
+       (%check-fetch-owner fetch "fetch-finish")
+       (setf (http-fetch-continuation-finished fetch) t)
+       (let ((out (if declared
+                      (let ((c (http-fetch-continuation-carrier fetch)))
+                        (and c (not (eq (connection-state c) :out-dns)) c))
+                      ;; Five bytes, after everything else the body queued:
+                      ;; held to no bound, as a terminator is never refused.
+                      (%queue-request-piece fetch (chunked-terminator)
+                                            :bounded nil))))
+         (when (and out
+                    (eq (connection-state out) :out-send)
+                    (%flush-request-body out))
+           (begin-response-read out *epoll-fd*)))
+       t))))
+
+(defun adopt-fetch (conn fetch)
+  "Answer CONN's request with FETCH, a streamed fetch already started for
+   it: what FETCH's :THEN returns becomes the request's response, as it
+   does for a fetch a handler returns. The shape of an upload forwarded
+   upstream as it arrives — the body's ON-END answers with the fetch the
+   body went into, and the client hears what the upstream said.
+
+   Returns :PARKED when the answer is still to come: CONN waits in
+   :AWAITING on FETCH's carrier, as a handler's fetch parks it, and the
+   fetch delivers to it from then on. Returns :ANSWER and the answer when
+   FETCH has already ended — an upstream that answered before the body
+   was all sent, or failed — since its :THEN ran then and its value was
+   kept; a fetch that ended with no value kept answers 502.
+
+   FETCH's body is finished first if it has not been: an answer is the
+   statement that the body is done. Signals for a fetch started for
+   another connection."
+  (unless (= (http-fetch-continuation-target-fd fetch) (connection-fd conn))
+    (error "a fetch started for fd ~d cannot answer the request on fd ~d"
+           (http-fetch-continuation-target-fd fetch) (connection-fd conn)))
+  (fetch-finish fetch)
+  (setf (connection-fetch-outstanding conn) nil
+        (connection-send-waiting conn) nil)
+  (if (http-fetch-continuation-ended fetch)
+      (values :answer (if (http-fetch-continuation-answered fetch)
+                          (http-fetch-continuation-answer fetch)
+                          (make-error-response 502)))
+      (let ((carrier (http-fetch-continuation-carrier fetch)))
+        ;; From here the fetch is a parked one: its result answers CONN, a
+        ;; failure answers CONN 502, and the :AWAITING sweep bounds the wait
+        ;; once the request has all gone out (see BEGIN-RESPONSE-READ).
+        (setf (http-fetch-continuation-sink fetch) :inbound
+              (connection-fetch-sink carrier) :inbound
+              (connection-state conn) :awaiting
+              (connection-awaiting-fd conn) (connection-fd carrier)
+              (connection-last-active conn) (get-universal-time))
+        :parked)))
+
+(defun forward-body (fetch &key (max-size *max-body-size*) on-abort)
+  "A body plan, for a body handler to return: send the request's body
+   upstream as FETCH's streamed body, as it arrives, and answer the
+   request with what FETCH's :THEN returns. An upload proxy in one form:
+
+     (forward-body (http-fetch :put (object-url request)
+                               :body :stream
+                               :content-length (declared-length request)
+                               :then (lambda (status headers body)
+                                       (declare (ignore headers body))
+                                       (if (eql status 200)
+                                           (make-text-response 201 \"stored\")
+                                           (make-error-response 502)))))
+
+   The body is never held. FETCH starts with the body's first bytes, each
+   run is sent as it arrives, and the body pauses whenever the upstream
+   falls behind and resumes when it catches up, so the client is held to
+   the upstream's pace. FETCH's body is finished when the request's is.
+
+   An upstream that answers before the body is all sent — a 413, a 401 —
+   has answered the client: the rest of the body is refused with what
+   :THEN returned, if that is an HTTP-RESPONSE, or 502. A failure answers
+   502 the same way, since :THEN hears it as the abort sentinel and its
+   answer is the client's. ON-ABORT is RECEIVE-BODY's, and MAX-SIZE caps
+   the body as RECEIVE-BODY's does.
+
+   FETCH must be streamed (:BODY :STREAM) and not yet started."
+  (unless (http-fetch-continuation-stream-body fetch)
+    (error "forward-body: the fetch to ~a was given its body whole; it needs ~
+            :body :stream"
+           (http-fetch-continuation-url fetch)))
+  (when (fetch-started-p fetch)
+    (error "forward-body: the fetch to ~a has already been started"
+           (http-fetch-continuation-url fetch)))
+  (flet ((early-answer ()
+           (let ((answer (http-fetch-continuation-answer fetch)))
+             (if (typep answer 'http-response)
+                 answer
+                 (make-error-response 502)))))
+    (receive-body
+     :max-size max-size
+     :on-data (lambda (conn bytes)
+                (unless (fetch-started-p fetch)
+                  ;; :KEEP, so a failure reaches the client as :THEN's
+                  ;; answer rather than as a closed connection.
+                  (fetch-into conn fetch :failure-disposition :keep))
+                (let ((sent (fetch-send fetch bytes)))
+                  (cond ((eq sent t) nil)
+                        ((null sent) :pause)
+                        (t (early-answer)))))
+     :on-end (lambda (conn)
+               (declare (ignore conn))
+               ;; A body that had no bytes never started FETCH; finished,
+               ;; it starts here as an ordinary answer, its body empty.
+               (fetch-finish fetch)
+               fetch)
+     :on-abort on-abort)))
 
 (defun fetch-resume (conn)
   "Resume an outbound response that ON-BODY paused.
@@ -2329,7 +2920,13 @@
                        (connection-fd conn)))
         (setf (connection-paused-outbound-fd in) -1)))
     (when *epoll-fd*
-      (invert-interest conn *epoll-fd*)))
+      (if (eq (connection-state conn) :out-send)
+          ;; Both directions, as :OUT-SEND always arms them. Writability
+          ;; wakes it at once, and the wake-up walks what the pause held
+          ;; before it reads on.
+          (epoll-modify *epoll-fd* (connection-fd conn)
+                        (logior +epollin+ +epollout+ +epollet+))
+          (invert-interest conn *epoll-fd*))))
   (values))
 
 (defun resume-paused-outbound (conn epoll-fd)
@@ -2447,12 +3044,17 @@
       ((:ok :ok-eof :ok-want-write)
        (walk-outbound-response conn epoll-fd result)))))
 
-(defun walk-outbound-response (conn epoll-fd result)
+(defun walk-outbound-response (conn epoll-fd result &key (arm t))
   "Walk the response in CONN's read buffer, hand :ON-BODY its chunks, and
    act on what the walk and the verdicts decided. RESULT is what
    CONNECTION-READ-AVAILABLE answered for the read that brought the bytes,
    or :BUFFERED for chunks a pause left behind, walked with no read since.
    Answers :READING when the fetch reads on, :PAUSED, or :ENDED.
+
+   ARM NIL leaves the epoll interest of a fetch that reads on to the
+   caller, and says what it wanted as a second value: :WRITE for a
+   transport that must write before reading again, :CUT for a read the
+   buffer's cap cut short, or NIL. :OUT-SEND arms both directions itself.
 
    Is the response framed-complete yet? OUTBOUND-RESPONSE-COMPLETE-P is
    the one definition of \"done\", shared with the TLS path. CHUNK-SCAN-POS
@@ -2523,7 +3125,10 @@
         ((eq result :ok-eof) (complete-fetch conn epoll-fd) :ended)
         ;; Bytes arrived, then the transport asked to send. The response is
         ;; incomplete, so this same read is re-issued.
-        ((eq result :ok-want-write) (invert-interest conn epoll-fd) :reading)
+        ((eq result :ok-want-write)
+         (if arm
+             (progn (invert-interest conn epoll-fd) :reading)
+             (values :reading :write)))
         ;; Buffered chunks walked with nothing halting them: the caller
         ;; reads next, in the same wake-up.
         ((eq result :buffered) :reading)
@@ -2536,8 +3141,10 @@
         ;; what it handed on, so the read finds room. A buffered fetch
         ;; finds none and answers :FULL, a prompt 502 rather than a wait
         ;; for bytes that may never come.
-        (cut (invert-interest conn epoll-fd) :reading)
-        (t (restore-interest conn epoll-fd) :reading)))))
+        (cut (if arm
+                 (progn (invert-interest conn epoll-fd) :reading)
+                 (values :reading :cut)))
+        (t (when arm (restore-interest conn epoll-fd)) :reading)))))
 
 (defun pause-outbound (conn epoll-fd)
   "Stop CONN reading: the backpressure ON-BODY asked for.
@@ -2548,7 +3155,11 @@
    HANDLE-OUTBOUND-EVENT ignores the error and hang-up reports epoll sends
    regardless, so nothing is handed over until FETCH-RESUME. FETCH-REWALK
    is set because the walk halted at a chunk and what followed it in the
-   read is still in the buffer."
+   read is still in the buffer.
+
+   In :OUT-SEND the request may still be going out, and the pause is not
+   on it: HANDLE-OUTBOUND-SEND, whose read this pause came from, arms its
+   writes again before it returns."
   (setf (connection-fetch-paused conn) t
         (connection-fetch-paused-at conn) (get-universal-time)
         (connection-fetch-rewalk conn) t
@@ -2745,8 +3356,19 @@
                 nil))
             (invoke))))))
 
+(defun %release-target-waiter (target-fd epoll-fd)
+  "End the wait FETCH-SEND set on the connection at TARGET-FD, resuming a
+   body it is receiving that paused on it. See RELEASE-SEND-WAITER."
+  (let ((target (lookup-connection target-fd)))
+    (when (and target (connection-send-waiting target))
+      (setf (connection-send-waiting target) nil)
+      (when (and (receiving-body-p target)
+                 (connection-body-paused target))
+        (let ((*epoll-fd* epoll-fd))
+          (body-resume target))))))
+
 (defun deliver-detached (target-fd epoll-fd callback outcome
-                         &key status headers body)
+                         &key status headers body fetch)
   "Hand a detached fetch's result to CALLBACK, then decide what becomes of
    the connection it was fetching into.
 
@@ -2803,13 +3425,23 @@
    A raising callback is caught here rather than propagating as
    FINISH-FETCH's :DELIVERED contract otherwise allows, because that
    contract's reason — the caller has an inbound request and a 500 to
-   answer it with — does not hold on this path. There is nothing to answer."
+   answer it with — does not hold on this path. There is nothing to answer.
+
+   Nothing yet. What the callback returns is kept on FETCH, a streamed
+   fetch, because the request its body was being received for may be
+   answered with it afterwards (ADOPT-FETCH): an upstream that answered
+   before the body was all sent has answered for that request too. And a
+   body that was waiting on FETCH's request to drain is let go once the
+   disposition has been applied — a fetch that has ended will not drain."
   (let ((target (lookup-connection target-fd)))
     (when target
       (setf (connection-fetch-outstanding target) nil))
     (handler-case
-        (finish-fetch callback outcome
-                      :status status :headers headers :body body)
+        (let ((answer (finish-fetch callback outcome
+                                    :status status :headers headers :body body)))
+          (when fetch
+            (setf (http-fetch-continuation-answer fetch) answer
+                  (http-fetch-continuation-answered fetch) t)))
       ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
       (serious-condition (e)
         (log-warn "detached fetch callback raised for fd ~d: ~a" target-fd e))))
@@ -2886,7 +3518,8 @@
                     (eq (connection-fetch-failure-disposition target) :close))
            (log-warn "detached fetch failed for fd ~d — ending the body it ~
                       was received for" target-fd)
-           (close-connection target epoll-fd :upstream-failed)))))))
+           (close-connection target epoll-fd :upstream-failed))))))
+  (%release-target-waiter target-fd epoll-fd))
 
 (defun complete-fetch (out-conn epoll-fd &key framing-complete)
   "Parse the outbound response and deliver it to the parked inbound connection.
@@ -3030,12 +3663,14 @@
            ;; parked on this outbound rather than a reuse of its number.
            ;; Captured before teardown for the same reason as OUT-FD.
            (sink (connection-fetch-sink out-conn))
-           (out-fd (connection-fd out-conn)))
+           (out-fd (connection-fd out-conn))
+           (fetch (connection-fetch-continuation out-conn)))
       (close-outbound out-conn epoll-fd)
       (when (eq sink :detached)
         (deliver-detached inbound-fd epoll-fd callback :delivered
                           :status status :headers (or headers nil)
-                          :body (or body nil))
+                          :body (or body nil)
+                          :fetch fetch)
         (return-from complete-fetch))
       ;; Find and resume inbound connection. If the inbound vanished
       ;; between :awaiting parking and now (drain race, idle reap,
@@ -3050,8 +3685,18 @@
                                               :status status
                                               :headers (or headers nil)
                                               :body (or body nil))))
-                  ;; Sync close-after-p from the callback's response BEFORE
-                  ;; computing the connection-hint — a handler-set
+                  ;; A streamed fetch already started for this request
+                  ;; answers it as a handler's fetch would: parked on until
+                  ;; it has, or answered with what it answered already.
+                  (loop while (and (typep response 'http-fetch-continuation)
+                                   (fetch-started-p response))
+                        do (multiple-value-bind (verdict answer)
+                               (adopt-fetch inbound response)
+                             (if (eq verdict :parked)
+                                 (return-from complete-fetch)
+                                 (setf response answer))))
+                  ;; Sync close-after-p from the response that answers,
+                  ;; BEFORE computing the connection-hint — a handler-set
                   ;; Connection: close flips close-after-p to T so the
                   ;; hint resolves to :CLOSE and the server stamps the
                   ;; header on the wire instead of leaving the framing
@@ -3116,9 +3761,10 @@
     ;; framing confusion this codebase refuses on principle. It gets the
     ;; abort outcome and DELIVER-DETACHED's disposition instead.
     (when (eq sink :detached)
-      (let ((callback (claim-fetch-callback out-conn)))
+      (let ((callback (claim-fetch-callback out-conn))
+            (fetch (connection-fetch-continuation out-conn)))
         (close-outbound out-conn epoll-fd)
-        (deliver-detached inbound-fd epoll-fd callback :aborted))
+        (deliver-detached inbound-fd epoll-fd callback :aborted :fetch fetch))
       (return-from deliver-fetch-error))
     (close-outbound out-conn epoll-fd)
     (let ((inbound (awaiting-inbound-for inbound-fd out-fd)))
@@ -3154,6 +3800,13 @@
       ;; no-op its contract promises rather than an epoll_ctl on a dead fd.
       (setf (connection-fetch-paused conn) nil
             (connection-fetch-rewalk conn) nil)
+      ;; The fetch is over if this was what carried it. A resolved name's
+      ;; pipe is closed after the outbound it led to has taken the fetch
+      ;; on, and that close ends nothing.
+      (let ((fetch (connection-fetch-continuation conn)))
+        (when (and fetch (eq (http-fetch-continuation-carrier fetch) conn))
+          (setf (http-fetch-continuation-carrier fetch) nil
+                (http-fetch-continuation-ended fetch) t)))
       (finish-fetch (claim-fetch-callback conn) :aborted)
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
@@ -3199,11 +3852,14 @@
    response on that path already produces. The application still gets the
    abort sentinel, from CLOSE-OUTBOUND, on the way through."
   (if (eq (connection-fetch-sink out-conn) :detached)
-      (progn
-        (let ((target (lookup-connection (connection-inbound-fd out-conn))))
+      (let ((target-fd (connection-inbound-fd out-conn)))
+        (let ((target (lookup-connection target-fd)))
           (when target
             (setf (connection-fetch-outstanding target) nil)))
         (log-debug "fetch: stopped by :on-body, fd ~d" (connection-fd out-conn))
-        (close-outbound out-conn epoll-fd))
+        (close-outbound out-conn epoll-fd)
+        ;; A stopped fetch will not drain, so a body FETCH-SEND told to wait
+        ;; on it is not kept waiting.
+        (%release-target-waiter target-fd epoll-fd))
       (deliver-fetch-error out-conn epoll-fd
                            ":on-body returned :stop on a parked fetch")))

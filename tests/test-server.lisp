@@ -10264,6 +10264,185 @@
           (check "paused: no callback ran while a pause held" while-paused 0)
           (check "paused: and nothing was aborted" aborted nil))))))
 
+(defun test-streamed-fetch-contract ()
+  "A fetch whose body the application streams: what HTTP-FETCH accepts,
+   the head BUILD-OUTBOUND-REQUEST writes for one, and what FETCH-SEND and
+   FETCH-FINISH answer and refuse before any connection is involved."
+  (format t "~%Streamed request bodies: the contract~%")
+  (flet ((streamed (&rest args)
+           (apply #'http-fetch :put "http://127.0.0.1:9/u" :body :stream
+                  :then (lambda (s h b) (declare (ignore s h b)) nil)
+                  args))
+         (bytes (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 97))
+         (head (&rest args)
+           (sb-ext:octets-to-string
+            (apply #'web-skeleton::build-outbound-request :put "h" "/u" args)
+            :external-format :latin-1)))
+    ;; ---- making one ----
+    (check "make: :content-length without :body :stream is refused"
+           (and (stringp (attempt (http-fetch :put "http://h/" :body "x" :content-length 1
+                                              :then #'identity)))
+                t)
+           t)
+    (check "make: a negative :content-length is refused"
+           (and (stringp (attempt (streamed :content-length -1))) t) t)
+    (check "make: a streamed fetch has no whole body, and is not started"
+           (let ((f (streamed)))
+             (list (web-skeleton::http-fetch-continuation-body f) (fetch-started-p f)))
+           '(nil nil))
+    ;; ---- its head ----
+    (check "head: a declared length is the Content-Length"
+           (let ((h (head :streamed t :declared-length 5)))
+             (list (and (search "content-length: 5" h) t)
+                   (and (search "transfer-encoding" h) t)
+                   (subseq h (- (length h) 4))))
+           (list t nil (format nil "~a~a" *crlf* *crlf*)))
+    (check "head: no declared length is chunked"
+           (let ((h (head :streamed t)))
+             (list (and (search "transfer-encoding: chunked" h) t)
+                   (and (search "content-length" h) t)))
+           '(t nil))
+    (check "head: a caller's Transfer-Encoding is still refused"
+           (and (stringp (attempt (head :streamed t
+                                        :headers '(("transfer-encoding" . "chunked")))))
+                t)
+           t)
+    (check "head: and a caller's Content-Length"
+           (and (stringp (attempt (head :streamed t :declared-length 3
+                                        :headers '(("content-length" . "3")))))
+                t)
+           t)
+    ;; ---- sending before it has started: held for it ----
+    (let ((f (streamed :content-length 6)))
+      (check "send: before the start, the bytes are held and it answers NIL"
+             (list (fetch-send f (bytes 4))
+                   (web-skeleton::http-fetch-continuation-pending-bytes f)
+                   (web-skeleton::http-fetch-continuation-sent f))
+             '(nil 4 4))
+      (check "send: an empty piece sends nothing, and answers as a send would"
+             (list (fetch-send f (bytes 0))
+                   (web-skeleton::http-fetch-continuation-pending-bytes f)
+                   (web-skeleton::http-fetch-continuation-sent f))
+             '(nil 4 4))
+      (check "send: past the declared length is refused, and nothing is held"
+             (list (and (stringp (attempt (fetch-send f (bytes 3)))) t)
+                   (web-skeleton::http-fetch-continuation-sent f))
+             '(t 4))
+      (check "finish: short of the declared length is refused"
+             (and (stringp (attempt (fetch-finish f))) t) t)
+      (fetch-send f (bytes 2))
+      (check "finish: at the declared length, T"
+             (fetch-finish f) t)
+      (check "finish: twice is once" (fetch-finish f) t)
+      (check "send: after the finish is refused"
+             (and (stringp (attempt (fetch-send f (bytes 1)))) t) t))
+    (let ((f (streamed))
+          (web-skeleton:*max-write-backlog* 16))
+      (fetch-send f (bytes 6))
+      (check "send: sending on through NIL is refused at *max-write-backlog*"
+             (list (and (stringp (attempt (fetch-send f (bytes 20)))) t)
+                   (web-skeleton::http-fetch-continuation-sent f))
+             '(t 6)))
+    (let ((f (streamed)))
+      (fetch-send f (bytes 3))
+      (fetch-finish f)
+      (check "chunked: each send a chunk, and the finish its terminator"
+             (sb-ext:octets-to-string
+              (apply #'concatenate '(vector (unsigned-byte 8))
+                     (web-skeleton::http-fetch-continuation-pending f))
+              :external-format :latin-1)
+             (format nil "3~aaaa~a0~a~a" *crlf* *crlf* *crlf* *crlf*)))
+    ;; ---- an ended fetch ----
+    (let ((f (streamed)))
+      (setf (web-skeleton::http-fetch-continuation-ended f) t)
+      (check "ended: a send is dropped and answers :ENDED" (fetch-send f (bytes 3)) :ended)
+      (check "ended: and a finish" (fetch-finish f) :ended))
+    ;; ---- a fetch given its body whole ----
+    (let ((f (http-fetch :put "http://h/" :body "whole" :then #'identity)))
+      (check "whole: FETCH-SEND refuses it"
+             (and (stringp (attempt (fetch-send f (bytes 1)))) t) t)
+      (check "whole: FETCH-FINISH refuses it"
+             (and (stringp (attempt (fetch-finish f))) t) t)
+      (setf (web-skeleton::http-fetch-continuation-target-fd f) 5)
+      (check "whole: never counts as started, however often it is returned"
+             (fetch-started-p f) nil)
+      (check "forward-body: refuses a fetch given its body whole"
+             (and (stringp (attempt (forward-body f))) t) t))
+    ;; ---- carried by a worker: refused from anywhere else ----
+    (let ((f (streamed))
+          (carrier (web-skeleton::make-connection :fd 7 :state :out-send :outbound-p t)))
+      (setf (web-skeleton::http-fetch-continuation-carrier f) carrier
+            (web-skeleton::http-fetch-continuation-target-fd f) 6)
+      (check "started: counts as started" (fetch-started-p f) t)
+      (check "forward-body: refuses a fetch already started"
+             (and (stringp (attempt (forward-body f))) t) t)
+      (let ((web-skeleton::*epoll-fd* nil))
+        (check "worker: a send off a worker is refused"
+               (and (stringp (attempt (fetch-send f (bytes 1)))) t) t))
+      (let ((web-skeleton::*epoll-fd* 999)
+            (web-skeleton::*connections* (make-hash-table :test #'eql)))
+        (check "worker: a send on a fetch another worker carries is refused"
+               (and (stringp (attempt (fetch-send f (bytes 1)))) t) t)
+        (check "worker: and nothing was counted as sent"
+               (web-skeleton::http-fetch-continuation-sent f) 0)))))
+
+(defun test-streamed-fetch-sweep ()
+  "The sweep's rules for a fetch still sending a streamed request body.
+
+   A request answered with such a fetch is parked on its outbound, and is
+   not answered 504 by the :AWAITING clock while its request is still going
+   out: its wait for the answer starts when the request has gone
+   (BEGIN-RESPONSE-READ). The outbound is bound meanwhile by a deadline of
+   its own, which the body's progress moves and which ends the fetch once
+   it passes, the parked request answered 502 as for any failed fetch.
+
+   Control: the same parked request on an outbound reading its answer is
+   answered 504, so the first is spared for what its outbound is doing."
+  (format t "~%Streamed request bodies: the sweep~%")
+  (flet ((sweep (&key (out-state :out-send) (deadline-in 10))
+           ;; A request parked longer than *FETCH-TIMEOUT* on an outbound in
+           ;; OUT-STATE whose deadline is DEADLINE-IN seconds away. Answers
+           ;; the request's state, the status line it was answered with if
+           ;; any, and whether the outbound is still registered.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (in-fd (web-skeleton::epoll-create))
+                 (out-fd (web-skeleton::epoll-create))
+                 (now (get-universal-time)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                         (web-skeleton:*log-stream* (make-broadcast-stream))
+                         (in (web-skeleton::make-connection
+                              :fd in-fd :state :awaiting
+                              :last-active (- now web-skeleton:*fetch-timeout* 5)))
+                         (out (web-skeleton::make-connection
+                               :fd out-fd :state out-state :outbound-p t
+                               :inbound-fd in-fd :fetch-sink :inbound
+                               :fetch-deadline (+ now deadline-in)
+                               :last-active now)))
+                    (setf (web-skeleton::connection-awaiting-fd in) out-fd)
+                    (dolist (fd (list in-fd out-fd))
+                      (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                               web-skeleton::+epollet+)))
+                    (web-skeleton::register-connection in)
+                    (web-skeleton::register-connection out)
+                    (web-skeleton::sweep-idle-connections epfd now)
+                    (let ((buf (web-skeleton::connection-write-buf in)))
+                      (list (web-skeleton::connection-state in)
+                            (and buf
+                                 (let ((text (sb-ext:octets-to-string
+                                              buf :external-format :latin-1)))
+                                   (subseq text 0 (search *crlf* text))))
+                            (and (web-skeleton::lookup-connection out-fd) t))))
+               (ignore-errors (web-skeleton::%close in-fd))
+               (ignore-errors (web-skeleton::%close out-fd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+    (check "sweep: a request parked on a request still going out is left waiting"
+           (sweep) '(:awaiting nil t))
+    (check "control: parked on an outbound reading its answer, it is answered 504"
+           (sweep :out-state :out-read) '(:write-response "HTTP/1.1 504 Gateway Timeout" nil))
+    (check "sweep: a request body standing still past its deadline ends the fetch, and 502"
+           (sweep :deadline-in -5) '(:write-response "HTTP/1.1 502 Bad Gateway" nil))))
+
 (defun test-body-handler-validated-at-boot ()
   "START-SERVER refuses a :BODY-HANDLER it could not call, and a
    *BODY-STALL-TIMEOUT* that would leave an accepted body with no time
@@ -13377,6 +13556,8 @@
   (test-multipart-parse)
   (test-receive-multipart-contract)
   (test-receive-multipart-pauses-where-it-falls)
+  (test-streamed-fetch-contract)
+  (test-streamed-fetch-sweep)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)

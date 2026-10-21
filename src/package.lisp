@@ -119,6 +119,10 @@
            #:http-fetch
            #:defer-to-fetch
            #:fetch-into
+           #:fetch-send
+           #:fetch-finish
+           #:fetch-started-p
+           #:forward-body
            #:http-fetch-stream
            #:parse-url
            #:parse-ipv4-literal

@@ -129,6 +129,9 @@
   ;;                            the one state where readable does not mean
   ;;                            read and writable does not mean write
   ;;   :out-write             — outbound: sending HTTP request
+  ;;   :out-send              — outbound: sending a request body the
+  ;;                            application streams, and reading whatever
+  ;;                            the upstream answers meanwhile
   ;;   :out-read              — outbound: reading HTTP response
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes, grows as needed
@@ -360,6 +363,16 @@
   ;; whole seam exists to remove.
   (fetch-started-at 0 :type integer)
   (fetch-deadline   0 :type integer)
+  ;; On an outbound or :OUT-DNS connection: the HTTP-FETCH-CONTINUATION it
+  ;; carries, so that the fetch's life — a streamed body's state, whether it
+  ;; has ended — is answered from the struct the application holds.
+  (fetch-continuation nil)
+  ;; T on a *target* connection while its application has been told to wait
+  ;; for a streamed fetch's request body to drain: FETCH-SEND answered NIL.
+  ;; The drain resumes the body it is receiving if that body is paused, so
+  ;; an upload forwarded upstream is held back by the upstream's pace and
+  ;; let go by it, as a relay's pause is let go by its client's.
+  (send-waiting nil :type boolean)
   ;; T on a *target* connection while a detached fetch it started is still
   ;; outstanding. Read by FETCH-INTO to refuse a second, and by the
   ;; delivery step to tell "this callback chained another fetch" from "this

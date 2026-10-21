@@ -350,6 +350,7 @@
                     ;; here is that it is bounded.
                     :fetch-started-at (get-universal-time)
                     :fetch-deadline (+ (get-universal-time) *fetch-timeout*)
+                    :fetch-continuation fetch-req
                     ;; Carried so HANDLE-DNS-READY can name the host when
                     ;; it runs the getent output past the address filter.
                     :dns-host host
@@ -385,7 +386,8 @@
                (:detached nil))
              (log-debug "dns: fd ~d -> getent ahosts ~a (pipe fd ~d)"
                         (connection-fd conn) host out-fd)
-             (setf success t))
+             (setf (http-fetch-continuation-carrier fetch-req) dns-conn
+                   success t))
         ;; Error path: partial setup. Unregister the dns-conn if we
         ;; created it, release the getent child, let the outer error
         ;; handler in initiate-fetch deliver the 502.

@@ -148,7 +148,7 @@ src/
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
-    fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch)
+    fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch, streamed request bodies)
     dns.lisp           Async DNS via getent ahosts subprocess
     streaming.lisp     Streamed responses, chunked or close-delimited, produced over time
     main.lisp          epoll event loop, handler dispatch, server entry point
@@ -287,6 +287,19 @@ tests/
   delimiter or a 400, never content; CRLF only; one `Content-Disposition`
   per part with one name; no `filename*`; no `Content-Transfer-Encoding`
   that changes the bytes. Names and filenames are returned as sent
+- **Request bodies sent as they are produced** — `(http-fetch … :body
+  :stream)` makes a fetch's body the application's to send a piece at a
+  time with `fetch-send` and end with `fetch-finish`: chunked, or framed by
+  a `:content-length` declared up front for an upstream that needs one.
+  `fetch-send` answers `nil` when the upstream falls behind, and a received
+  body that pauses on that answer is resumed when the upload drains, so a
+  client is held to its upstream's pace and nothing is held whole.
+  `forward-body` is the upload proxy in one form: a body plan that sends
+  the request's body upstream as it arrives and answers the client with
+  what `:then` makes of the upstream's answer. One that answers before the
+  body has all gone, a 413 or a 401, has answered the client, and the rest
+  of the body is refused. A multipart file goes the same way from
+  `:on-part-data`. Both schemes
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -615,6 +628,13 @@ read about here.
   ending that produces no response there already gives. "Stop the upstream
   and let me answer the client myself" is not expressible; let the fetch
   finish and answer from `:then` instead.
+- **A streamed request body is chunked unless its length is declared.**
+  `:body :stream` without `:content-length` sends `Transfer-Encoding:
+  chunked`, which an upstream that needs a length up front refuses, S3's
+  PutObject among them. A client that sent its own body chunked declared no
+  length to forward, so its upload reaches such an upstream a piece at a
+  time, each piece a request of its own (DEPLOYMENT.md, "Forms and file
+  uploads").
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
@@ -702,7 +722,7 @@ All configurable via `setf` before calling `start-server`.
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
 | `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
-| `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations |
+| `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. A **streamed** request body (`:body :stream`) is bounded by its progress while it goes out, every piece sent or taken moving the deadline, and its answer by this value from when the body has gone. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
 | `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
@@ -781,6 +801,12 @@ The callback can itself return another continuation for chained fetches —
 the framework detects the nested continuation and runs the chain.
 A regular `http-response` object terminates the chain.
 See `demo/handler.lisp`'s `/demo-fetch` endpoint for a runnable example.
+
+A fetch's body can also be sent as it is produced: `:body :stream` makes it
+the application's to send with `fetch-send` and end with `fetch-finish`,
+and `forward-body` is a body plan built from the two that sends a
+request's body upstream as it arrives. DEPLOYMENT.md's "Sending a request
+body as it is produced" has the contract.
 
 `http-fetch-stream` is a separate, **blocking** variant that
 reads the response body line by line via a per-line callback.

@@ -437,8 +437,13 @@
                ;; the app's callback never fires. A pause whose target is
                ;; still draining is the target's stall timeout's to bound,
                ;; not this one's — see PAUSED-BEHIND-A-BACKLOG-P.
+               ;; An outbound still sending a streamed request body is bound
+               ;; the same way whoever it answers to: its deadline moves out
+               ;; whenever the body does (NOTE-REQUEST-PROGRESS), so what it
+               ;; bounds is the body standing still.
                (when (and (connection-outbound-p conn)
-                          (eq (connection-fetch-sink conn) :detached)
+                          (or (eq (connection-fetch-sink conn) :detached)
+                              (eq (connection-state conn) :out-send))
                           (plusp (connection-fetch-deadline conn))
                           (> now (connection-fetch-deadline conn))
                           (not (paused-behind-a-backlog-p conn)))
@@ -462,6 +467,15 @@
                           (and body-clock
                                (connection-body-paused conn)
                                (connection-fetch-outstanding conn)))
+                        ;; Parked on a fetch whose streamed request is still
+                        ;; going out: the outbound's own bound is on that,
+                        ;; and this one's wait for the answer starts when the
+                        ;; request has gone (BEGIN-RESPONSE-READ).
+                        (awaiting-a-send
+                          (and (eq state :awaiting)
+                               (let ((out (lookup-connection
+                                           (connection-awaiting-fd conn))))
+                                 (and out (eq (connection-state out) :out-send)))))
                         (timeout (cond
                                    (body-clock *body-stall-timeout*)
                                    ((eq state :websocket) *ws-idle-timeout*)
@@ -534,6 +548,7 @@
                               *write-stall-timeout*))
                       (push conn stalled))
                      (waiting-on-fetch nil)
+                     (awaiting-a-send nil)
                      ((and (> timeout 0)
                            (> (- now since) timeout))
                       (if body-clock
@@ -541,14 +556,21 @@
                           (push conn idle)))))))
              *connections*)
     (dolist (conn detached-expired)
-      (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
-                *fetch-timeout* (connection-fd conn))
+      (if (eq (connection-state conn) :out-send)
+          (log-warn "fetch request body made no progress for ~ds on outbound ~
+                     fd ~d — aborting"
+                    *fetch-timeout* (connection-fd conn))
+          (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
+                    *fetch-timeout* (connection-fd conn)))
       ;; Through DELIVER-FETCH-ERROR so the app's callback fires its abort
       ;; exactly once and the target gets DELIVER-DETACHED's disposition,
       ;; rather than a bare close that leaves the stream open and the
       ;; callback never run.
       (handler-case
-          (deliver-fetch-error conn epoll-fd "detached fetch timed out")
+          (deliver-fetch-error conn epoll-fd
+                               (if (eq (connection-state conn) :out-send)
+                                   "request body stalled"
+                                   "detached fetch timed out"))
         (error (e)
           (log-warn "detached fetch timeout: could not abort fd ~d: ~a"
                     (connection-fd conn) e)
@@ -1447,6 +1469,15 @@
             (stream-response-response response)
             response))
   (cond
+    ;; A streamed fetch already started for this request — a received
+    ;; body's ON-END answering with the fetch the body went into — answers
+    ;; it once the upstream has, or with what it answered already.
+    ((and (typep response 'http-fetch-continuation)
+          (fetch-started-p response))
+     (multiple-value-bind (verdict answer) (adopt-fetch conn response)
+       (when (eq verdict :answer)
+         (multiple-value-bind (response upgrade-p) (classify-response request answer)
+           (carry-out-response conn epoll-fd request response upgrade-p)))))
     ;; Outbound fetch — park and initiate
     ((typep response 'http-fetch-continuation)
      (initiate-fetch conn epoll-fd response))
@@ -1909,16 +1940,23 @@
    a response that takes longer than *IDLE-TIMEOUT* to flush."
   (setf (connection-last-active conn) (get-universal-time))
   (handler-case
-      (let ((result (connection-on-write conn)))
+      (let* ((backlog (plusp (connection-write-pending conn)))
+             (result (connection-on-write conn)))
         (case result
           (:done
-           ;; The backlog is empty, which is the event a relay's paused
+           ;; A backlog that has emptied is the event a relay's paused
            ;; upstream is waiting for. Here rather than in the :streaming
            ;; arm below because every state that can be relayed into
            ;; reaches this point, and a resume that only worked for one of
            ;; them would be the kind of gap nobody finds until a different
            ;; response shape turns up.
-           (resume-paused-outbound conn epoll-fd)
+           ;;
+           ;; Only one that was there to empty. A wake-up that found nothing
+           ;; queued drained nothing: BODY-RESUME wakes a received body
+           ;; through writability, and a fetch :ON-BODY paused on that
+           ;; connection is not waiting for that.
+           (when backlog
+             (resume-paused-outbound conn epoll-fd))
            ;; All bytes sent — next action depends on state
            (case (connection-state conn)
              (:write-response
