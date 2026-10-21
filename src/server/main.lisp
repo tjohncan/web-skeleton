@@ -2886,6 +2886,11 @@
             accepted — such a body is timed on its progress, not by ~
             *idle-timeout*."
            *body-stall-timeout*))
+  ;; Eighth. A level LOG-LEVEL-VALUE does not know reads as the lowest, so
+  ;; a typo such as :WARNING would turn on every DEBUG line, unannounced.
+  (unless (member *log-level* *log-levels*)
+    (error "start-server: *log-level* is ~s; it must be one of ~{~s~^, ~}."
+           *log-level* *log-levels*))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.

@@ -12217,6 +12217,34 @@
              (and (stringp msg) (search "*fetch-timeout*" msg) t))
            t)))
 
+(defun test-log-level-validated-at-boot ()
+  "START-SERVER refuses a *LOG-LEVEL* that is not one of *LOG-LEVELS*, and
+   a line logged at such a level is shown rather than dropped.
+
+   Counted as the lowest severity, an unknown level would have
+   (setf *log-level* :warning) turn on every DEBUG line with nothing said,
+   and drop a line logged at :warning unless DEBUG were on.
+   The invalid :HOST is TEST-FETCH-TIMEOUT-VALIDATED-AT-BOOT's device: with
+   the check reverted, MAKE-TCP-LISTENER refuses it by another name, and
+   no server starts."
+  (format t "~%start-server: *log-level* is a known level~%")
+  (let ((*log-level* :warning))
+    (check "boot: an unknown *log-level* is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*log-level*" msg) t))
+           t))
+  (let ((out (make-string-output-stream)))
+    (let ((*log-stream* out)
+          (*log-level* :info))
+      (log-msg :warning "a line at a misspelt level")
+      (log-msg :debug "a line at debug"))
+    (let ((text (get-output-stream-string out)))
+      (check "log: a line at an unknown level is shown"
+             (not (null (search "a line at a misspelt level" text))) t)
+      (check "log: while DEBUG stays below INFO"
+             (search "a line at debug" text) nil))))
+
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
    and connection table bound.
@@ -14317,6 +14345,7 @@
   (test-ws-oversized-frame-close-code)
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
+  (test-log-level-validated-at-boot)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)

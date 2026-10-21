@@ -46,8 +46,13 @@
   "Stream to write log output to. NIL uses *standard-output*.")
 
 (defun log-level-value (level)
-  "Return the numeric severity of LEVEL."
-  (or (position level *log-levels*) 0))
+  "Return the numeric severity of LEVEL.
+
+   A level not in *LOG-LEVELS* counts as the most severe, so a line logged
+   at a misspelt level, :WARNING say, is shown rather than dropped.
+   START-SERVER refuses a *LOG-LEVEL* not in the list, where the same rule
+   would quiet everything but errors."
+  (or (position level *log-levels*) (1- (length *log-levels*))))
 
 (defun timestamp ()
   "Return current UTC time as YYYY-MM-DD hh:mm:ss.mmm.
