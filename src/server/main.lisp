@@ -12,11 +12,23 @@
 ;;; TCP listener
 ;;; ---------------------------------------------------------------------------
 
+(defparameter *listen-backlog* 128
+  "Each worker's accept queue: the connections the kernel holds, completed
+   and not yet accepted, before it starts dropping SYNs. Per worker, since
+   each binds its own SO_REUSEPORT listener, so the server's is this times
+   the worker count. Linux clamps it to net.core.somaxconn, so raising it
+   past that needs the sysctl raised too.")
+
 (defun make-tcp-listener (host port)
-  "Create a TCP socket, bind to HOST:PORT, listen with a backlog of 128.
-   HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector; the family
-   is dispatched accordingly. Sets SO_REUSEADDR, SO_REUSEPORT, and
-   non-blocking. Returns the socket."
+  "Create a TCP socket, bind to HOST:PORT, listen with a backlog of
+   *LISTEN-BACKLOG*. HOST is a 4-byte IPv4 vector or a 16-byte IPv6
+   vector; the family is dispatched accordingly. Sets SO_REUSEADDR,
+   SO_REUSEPORT, and non-blocking. Returns the socket.
+
+   IPV6_V6ONLY is left as the host sets it. With Linux's default,
+   net.ipv6.bindv6only = 0, a listener on :: takes IPv4 peers too, as
+   v4-mapped addresses (::ffff:a.b.c.d), so one listener serves both
+   families; a host with bindv6only = 1 serves only IPv6 on ::."
   (let* ((family (case (length host)
                    (4  :inet)
                    (16 :inet6)
@@ -31,7 +43,7 @@
     (set-socket-option-int (socket-fd socket)
                            +sol-socket+ +so-reuseport+ 1)
     (sb-bsd-sockets:socket-bind socket host port)
-    (sb-bsd-sockets:socket-listen socket 128)
+    (sb-bsd-sockets:socket-listen socket *listen-backlog*)
     (set-nonblocking (socket-fd socket))
     socket))
 
@@ -2906,6 +2918,12 @@
   (unless (member *log-level* *log-levels*)
     (error "start-server: *log-level* is ~s; it must be one of ~{~s~^, ~}."
            *log-level* *log-levels*))
+  ;; Ninth. Read by each worker as it binds, so a bad value would fail
+  ;; every worker's listener rather than the start.
+  (unless (and (integerp *listen-backlog*) (plusp *listen-backlog*))
+    (error "start-server: *listen-backlog* is ~s; it must be a positive ~
+            integer (the kernel clamps it to net.core.somaxconn)."
+           *listen-backlog*))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.

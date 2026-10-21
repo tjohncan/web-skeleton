@@ -2361,12 +2361,21 @@
          (web-skeleton::format-peer-addr
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
          "[2001:db8:0:0:0:0:0:1]:80")
+  ;; An IPv4 peer on an IPv6 wildcard listener arrives v4-mapped, and is
+  ;; logged with its IPv4 address readable: RFC 4291's x:x:x:x:x:x:d.d.d.d.
+  (check "v6: a v4-mapped peer keeps its dotted quad"
+         (web-skeleton::format-peer-addr
+          #(0 0 0 0 0 0 0 0 0 0 #xff #xff 127 0 0 1) 8080)
+         "[0:0:0:0:0:ffff:127.0.0.1]:8080")
+  (check "v6: an address merely ending in ffff and four bytes is not mapped"
+         (web-skeleton::format-ip #(0 0 0 0 0 0 0 0 0 1 #xff #xff 127 0 0 1))
+         "0:0:0:0:1:ffff:7f00:1")
   ;; Neither length — the fallback both functions share.
   (check "unknown length"
          (web-skeleton::format-peer-addr #(1 2 3) 80)
          "<addr>:80")
-  ;; FORMAT-PEER-ADDR is now FORMAT-IP plus brackets and a port, rather
-  ;; than a second implementation of the same sixteen-byte walk. Asserted
+  ;; FORMAT-PEER-ADDR is FORMAT-IP plus brackets and a port, rather than
+  ;; a second implementation of the same sixteen-byte walk. Asserted
   ;; as a relationship so the two cannot drift back apart: a log line
   ;; disagreeing with an address-filter decision about what an address
   ;; even looks like is a miserable thing to debug.
@@ -12257,6 +12266,44 @@
       (check "log: while DEBUG stays below INFO"
              (search "a line at debug" text) nil))))
 
+(defun test-listen-backlog-reaches-the-listener ()
+  "MAKE-TCP-LISTENER listens with *LISTEN-BACKLOG*, and START-SERVER
+   refuses one that is not a positive integer.
+
+   Nothing accepts on these listeners, so the accept queue is all there
+   is. At a backlog of 1 Linux holds two completed connections, and a
+   third connect waits, its SYN dropped; at 8 the third completes at
+   once. A listener that ignored the setting would answer both the same."
+  (format t "~%start-server: *listen-backlog* reaches listen(2)~%")
+  (flet ((third-connect-completes-p (backlog)
+           (let* ((web-skeleton:*listen-backlog* backlog)
+                  (listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+                  (clients (loop repeat 3
+                                 collect (make-instance 'sb-bsd-sockets:inet-socket
+                                                        :type :stream :protocol :tcp))))
+             (unwind-protect
+                  (progn
+                    (sb-bsd-sockets:socket-connect (first clients) #(127 0 0 1) port)
+                    (sb-bsd-sockets:socket-connect (second clients) #(127 0 0 1) port)
+                    (handler-case
+                        (progn (web-skeleton::blocking-connect
+                                (third clients) #(127 0 0 1) port 0.5)
+                               t)
+                      (error () nil)))
+               (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
+               (ignore-errors (sb-bsd-sockets:socket-close listener))))))
+    (check "backlog: at 1, a third connect waits"
+           (third-connect-completes-p 1) nil)
+    (check "backlog: at 8, it completes"
+           (third-connect-completes-p 8) t))
+  (let ((web-skeleton:*listen-backlog* 0))
+    (check "boot: a zero *listen-backlog* is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*listen-backlog*" msg) t))
+           t)))
+
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
    and connection table bound.
@@ -14358,6 +14405,7 @@
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
   (test-log-level-validated-at-boot)
+  (test-listen-backlog-reaches-the-listener)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)

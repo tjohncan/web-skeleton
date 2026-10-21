@@ -149,6 +149,7 @@
            #:*max-ws-payload-size*
            #:*max-ws-message-size*
            #:*max-connections*
+           #:*listen-backlog*
            #:*max-write-backlog*
            ;; Request bodies, decided at the head
            #:buffer-body

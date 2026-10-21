@@ -44,15 +44,22 @@
 (defun format-ip (bytes)
   "Format an address byte vector for logs. 4 bytes → dotted quad,
    16 bytes → colon-separated lowercase hex groups (no :: compression —
-   a log line wants unambiguous identity, not canonical form). Anything
-   else → \"<addr>\". Bracketless: a caller needing the RFC 3986
-   authority form adds its own brackets."
+   a log line wants unambiguous identity, not canonical form). A
+   v4-mapped address, ::ffff:0:0/96, keeps its IPv4 half as a dotted quad
+   in RFC 4291's x:x:x:x:x:x:d.d.d.d form, 0:0:0:0:0:ffff:192.0.2.1, since
+   it is an IPv4 peer an IPv6 wildcard listener accepted, and the log
+   should read as the address that peer has. Anything else → \"<addr>\".
+   Bracketless: a caller needing the RFC 3986 authority form adds its own
+   brackets."
   (case (length bytes)
     (4  (format nil "~{~d~^.~}" (coerce bytes 'list)))
-    (16 (format nil "~(~{~x~^:~}~)"
-                (loop for i from 0 below 16 by 2
-                      collect (logior (ash (aref bytes i) 8)
-                                      (aref bytes (1+ i))))))
+    (16 (if (and (every #'zerop (subseq bytes 0 10))
+                 (= (aref bytes 10) #xff) (= (aref bytes 11) #xff))
+            (format nil "0:0:0:0:0:ffff:~{~d~^.~}" (coerce (subseq bytes 12) 'list))
+            (format nil "~(~{~x~^:~}~)"
+                    (loop for i from 0 below 16 by 2
+                          collect (logior (ash (aref bytes i) 8)
+                                          (aref bytes (1+ i)))))))
     (t  "<addr>")))
 
 (defun ipv4-public-p (bytes)

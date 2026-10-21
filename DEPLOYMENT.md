@@ -197,6 +197,14 @@ an accepted body is timed by `*body-stall-timeout*` on its progress,
 so an upload that keeps arriving is not cut off for its size,
 and one that stops is still closed.
 
+A proxy that opens connections in bursts meets the accept queue.
+Each worker listens with `*listen-backlog*` (128) completed connections
+held for it, so the server holds that times its worker count,
+and a burst past that is dropped at the SYN, which the client retries
+after a second or more and nothing on this side logs.
+Linux clamps the backlog to `net.core.somaxconn`;
+raising `*listen-backlog*` past it needs that sysctl raised as well.
+
 ### Status codes the framework itself sends
 
 A request the framework rejects before your handler sees it gets a
