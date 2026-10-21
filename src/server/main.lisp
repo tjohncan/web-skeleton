@@ -1500,9 +1500,13 @@
             ((string= (http-request-version request) "1.0") t)
             (t nil)))))
 
-(defun carry-out-response (conn epoll-fd request response upgrade-p)
+(defun carry-out-response (conn epoll-fd request response upgrade-p &key inline)
   "Set out RESPONSE, CLASSIFY-RESPONSE's answer to CONN's REQUEST: a fetch
-   to park on, a stream to start, or a response to queue."
+   to park on, a stream to start, or a response to queue.
+
+   INLINE, from the read that produced the request, lets a response be
+   written here rather than on a writability wake-up: see
+   WRITE-RESPONSE-INLINE-P."
   ;; Sync close-after-p from a handler-set Connection: close
   ;; header. Without this step an HTTP/1.1 handler that
   ;; explicitly asks to close the socket would advertise
@@ -1543,8 +1547,38 @@
      (queue-final-response conn response)
      (setf (connection-state conn)
            (if upgrade-p :ws-upgrade :write-response))
-     (epoll-modify epoll-fd (connection-fd conn)
-                   (logior +epollout+ +epollet+)))))
+     (if (and inline (write-response-inline-p conn))
+         (write-response-inline conn epoll-fd)
+         (epoll-modify epoll-fd (connection-fd conn)
+                       (logior +epollout+ +epollet+))))))
+
+(defun write-response-inline-p (conn)
+  "T when CONN's queued response may be written at once, from the read
+   that produced its request: an ordinary response on a connection kept
+   alive, with nothing buffered after the request.
+
+   Written then, a response the socket takes whole costs no change of
+   epoll interest to writability and no wake-up to write it, where arming
+   writability and coming back costs two of the first and one of the
+   second. The other cases keep that path, for what each finishes with:
+   - an upgrade, whose 101 leaves frames behind it to read;
+   - a close, which ends in a lingering drain or a teardown;
+   - pipelined bytes, which the keep-alive reset leaves for a read the
+     wake-up's return value asks for (DISPATCH-CONNECTION-EVENT)."
+  (and (eq (connection-state conn) :write-response)
+       (not (connection-close-after-p conn))
+       (<= (connection-read-pos conn) (connection-request-end conn))))
+
+(defun write-response-inline (conn epoll-fd)
+  "Write CONN's response now, through HANDLE-CLIENT-WRITE, which resets a
+   connection whose response has all gone for its next request, as it does
+   on a writability wake-up. A remainder the socket did not take is left
+   to that wake-up, armed here because it is needed."
+  (handle-client-write conn epoll-fd)
+  (when (and (eq (lookup-connection (connection-fd conn)) conn)
+             (eq (connection-state conn) :write-response))
+    (epoll-modify epoll-fd (connection-fd conn)
+                  (logior +epollout+ +epollet+))))
 
 (defun answer-request (conn epoll-fd handler)
   "CONN's request is complete: parse it, hand it to HANDLER, and set out
@@ -1560,7 +1594,7 @@
     (decide-keep-alive conn request)
     (multiple-value-bind (response upgrade-p)
         (dispatch-request request handler)
-      (carry-out-response conn epoll-fd request response upgrade-p))))
+      (carry-out-response conn epoll-fd request response upgrade-p :inline t))))
 
 (defun answer-received-body (conn epoll-fd)
   "CONN's received body is complete: claim its plan, let ON-END answer the

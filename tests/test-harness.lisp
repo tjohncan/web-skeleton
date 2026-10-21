@@ -7341,6 +7341,66 @@
       (setf web-skeleton::*dns-lookup-fn* saved-lookup
             web-skeleton::*dns-resolve-blocking-fn* saved-blocking))))
 
+(defun test-harness-a-response-is-written-from-its-read-e2e ()
+  "An ordinary keep-alive response is written from the read that produced
+   its request: one change of epoll interest per request, the keep-alive
+   reset's re-arming of readability, where arming writability and coming
+   back to write costs two. Pipelined requests keep the writability path,
+   and each is answered, in order.
+
+   Counted at EPOLL-MODIFY, wrapped for the run and restored after."
+  (format t "~%Harness: a response is written from its read~%")
+  (let ((real (symbol-function 'web-skeleton::epoll-modify))
+        (mods 0)
+        (lock (sb-thread:make-mutex :name "inline-count")))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'web-skeleton::epoll-modify)
+                 (lambda (&rest args)
+                   (sb-thread:with-mutex (lock) (incf mods))
+                   (apply real args)))
+           (with-test-server
+               (:handler (lambda (req)
+                           (make-text-response 200 (http-request-path req))))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (flet ((ask (&rest paths)
+                             ;; All of PATHS in one write; their answers,
+                             ;; bodies only, in order.
+                             (write-sequence
+                              (%ascii (format nil "~{GET ~a HTTP/1.1~aHost: x~a~a~}"
+                                              (loop for p in paths
+                                                    append (list p *crlf* *crlf* *crlf*))))
+                              stream)
+                             (force-output stream)
+                             (loop for p in paths
+                                   collect (let ((tail 0))
+                                             (loop until (= tail 4)
+                                                   do (let ((b (read-byte stream)))
+                                                        (setf tail
+                                                              (cond ((and (member tail '(0 2)) (= b 13)) (1+ tail))
+                                                                    ((and (member tail '(1 3)) (= b 10)) (1+ tail))
+                                                                    ((= b 13) 1)
+                                                                    (t 0)))))
+                                             (let ((body (make-array (length p)
+                                                                     :element-type '(unsigned-byte 8))))
+                                               (read-sequence body stream)
+                                               (sb-ext:octets-to-string body :external-format :ascii))))))
+                      (dotimes (i 20) (ask "/warm"))
+                      (sb-thread:with-mutex (lock) (setf mods 0))
+                      (dotimes (i 200) (ask "/one"))
+                      (check "inline: one change of interest per keep-alive request"
+                             (sb-thread:with-mutex (lock) (/ mods 200)) 1)
+                      ;; Caught, so a stall that ends in a close reports
+                      ;; here rather than ending the run.
+                      (check "pipelined: three in one write, answered in order"
+                             (handler-case (ask "/a" "/bb" "/ccc")
+                               (error (e) (princ-to-string e)))
+                             '("/a" "/bb" "/ccc")))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf (symbol-function 'web-skeleton::epoll-modify) real))))
+
 (defun %exchange-or-why (bytes &rest args)
   "%RAW-EXCHANGE, except that a connection reset or closed while the request
    was still being written answers as the text of that error, so a check
@@ -8364,6 +8424,7 @@
   (test-harness-streamed-request-body-from-a-tick-e2e)
   (test-harness-answer-paused-while-the-request-goes-out-e2e)
   (test-harness-fetch-falls-back-to-the-next-address-e2e)
+  (test-harness-a-response-is-written-from-its-read-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)
