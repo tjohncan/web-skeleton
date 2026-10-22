@@ -118,6 +118,7 @@
            ;; Static files
            #:load-static-files
            #:serve-static
+           #:*extra-mime-types*
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
            #:defer-to-fetch

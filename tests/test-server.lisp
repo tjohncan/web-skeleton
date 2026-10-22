@@ -5319,8 +5319,29 @@
          "text/html; charset=utf-8")
   (check "mime css"   (web-skeleton::mime-type-for-path "/style.css")
          "text/css; charset=utf-8")
+  ;; RFC 9239's type, for a classic script and an ES module alike: a
+  ;; browser refuses a module script served as anything but JavaScript.
   (check "mime js"    (web-skeleton::mime-type-for-path "/app.js")
-         "application/javascript; charset=utf-8")
+         "text/javascript; charset=utf-8")
+  (check "mime mjs"   (web-skeleton::mime-type-for-path "/app.mjs")
+         "text/javascript; charset=utf-8")
+  (check "mime mjs, in any case" (web-skeleton::mime-type-for-path "/APP.MJS")
+         "text/javascript; charset=utf-8")
+  ;; Captions, which a <track> ignores served as anything else.
+  (check "mime vtt"   (web-skeleton::mime-type-for-path "/captions.vtt")
+         "text/vtt; charset=utf-8")
+  (check "mime mp3"   (web-skeleton::mime-type-for-path "/song.mp3")
+         "audio/mpeg")
+  (check "mime ogg"   (web-skeleton::mime-type-for-path "/song.ogg")
+         "audio/ogg")
+  (check "mime ogv"   (web-skeleton::mime-type-for-path "/clip.ogv")
+         "video/ogg")
+  (check "mime csv"   (web-skeleton::mime-type-for-path "/data.csv")
+         "text/csv; charset=utf-8")
+  (check "mime zip"   (web-skeleton::mime-type-for-path "/bundle.zip")
+         "application/zip")
+  (check "mime eot"   (web-skeleton::mime-type-for-path "/font.eot")
+         "application/vnd.ms-fontobject")
   (check "mime png"   (web-skeleton::mime-type-for-path "/image.png")
          "image/png")
   (check "mime json"  (web-skeleton::mime-type-for-path "/data.json")
@@ -5345,6 +5366,68 @@
          "application/octet-stream")
   (check "mime no ext" (web-skeleton::mime-type-for-path "/LICENSE")
          "application/octet-stream")
+
+  ;; *EXTRA-MIME-TYPES* is consulted first: a type the table lacks, and an
+  ;; answer the table gives differently, in any case of extension.
+  (let ((web-skeleton:*extra-mime-types* '(("glb" . "model/gltf-binary")
+                                           ("JS" . "application/x-custom"))))
+    (check "extra mime: a type the table does not know"
+           (web-skeleton::mime-type-for-path "/scene.glb") "model/gltf-binary")
+    (check "extra mime: consulted before the table, in any case"
+           (web-skeleton::mime-type-for-path "/app.js") "application/x-custom")
+    (check "extra mime: and the table still answers the rest"
+           (web-skeleton::mime-type-for-path "/app.mjs")
+           "text/javascript; charset=utf-8"))
+  (flet ((refused-p (table)
+           (let ((web-skeleton:*extra-mime-types* table))
+             (handler-case (progn (web-skeleton::validate-extra-mime-types) nil)
+               (error (e) (and (search "*extra-mime-types*" (princ-to-string e)) t))))))
+    (check "extra mime: no table, and a table of strings, are accepted"
+           (list (refused-p nil) (refused-p '(("glb" . "model/gltf-binary"))))
+           '(nil nil))
+    ;; A dotted extension could never match: a path's extension is what
+    ;; follows its last dot.
+    (check "extra mime: an extension with a dot is refused"
+           (refused-p '(("tar.gz" . "application/gzip"))) t)
+    (check "extra mime: an empty extension is refused"
+           (refused-p '(("" . "text/plain"))) t)
+    (check "extra mime: a type that is not a string is refused"
+           (refused-p '(("glb" . :model))) t)
+    (check "extra mime: an entry that is not a pair is refused"
+           (refused-p '("glb")) t)
+    (check "extra mime: a table that is not a list is refused"
+           (refused-p "glb") t)
+    (check "extra mime: an improper list is refused"
+           (refused-p '(("glb" . "model/gltf-binary") . "x")) t))
+  ;; Through a load: the type reaches the file's response, and a malformed
+  ;; table is refused at the load rather than at the first request.
+  (let ((dir (format nil "/tmp/ws-static-mime-~36r/" (random (expt 36 10))))
+        (saved-cache web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (with-open-file (s (concatenate 'string dir "scene.glb")
+                              :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+             (write-sequence (sb-ext:string-to-octets "glTF" :external-format :ascii) s))
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (let ((web-skeleton:*extra-mime-types* '(("glb" . "model/gltf-binary"))))
+             (web-skeleton::load-static-files dir))
+           (check "extra mime: a loaded file goes out with its type"
+                  (let ((entry (gethash "/scene.glb" web-skeleton::*static-cache*)))
+                    (and entry
+                         (cdr (assoc "content-type"
+                                     (web-skeleton::static-entry-headers entry)
+                                     :test #'string-equal))))
+                  "model/gltf-binary")
+           (check "extra mime: a malformed table is refused at the load"
+                  (let ((web-skeleton:*extra-mime-types* '(("tar.gz" . "application/gzip"))))
+                    (handler-case (progn (web-skeleton::load-static-files dir) :loaded)
+                      (error (e) (and (search "*extra-mime-types*" (princ-to-string e))
+                                      :refused))))
+                  :refused))
+      (setf web-skeleton::*static-cache* saved-cache)
+      (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil)))
 
   (check "ext html" (web-skeleton::file-extension "/index.html") "html")
   (check "ext none" (web-skeleton::file-extension "/LICENSE") nil)

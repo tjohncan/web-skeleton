@@ -24,46 +24,114 @@
     (when (and dot (or (null slash) (> dot (1+ slash))))
       (subseq path (1+ dot)))))
 
+(defparameter *mime-types*
+  '(;; Text. JavaScript is text/javascript (RFC 9239), for a classic script
+    ;; and an ES module alike: a browser refuses a module script, and an
+    ;; import(), served with a type that is not JavaScript's.
+    ("html" . "text/html; charset=utf-8")
+    ("htm"  . "text/html; charset=utf-8")
+    ("xhtml" . "application/xhtml+xml; charset=utf-8")
+    ("css"  . "text/css; charset=utf-8")
+    ("js"   . "text/javascript; charset=utf-8")
+    ("mjs"  . "text/javascript; charset=utf-8")
+    ("json" . "application/json; charset=utf-8")
+    ("map"  . "application/json; charset=utf-8") ; source maps
+    ("webmanifest" . "application/manifest+json; charset=utf-8")
+    ("txt"  . "text/plain; charset=utf-8")
+    ("md"   . "text/markdown; charset=utf-8")
+    ("csv"  . "text/csv; charset=utf-8")
+    ("xml"  . "application/xml; charset=utf-8")
+    ("rss"  . "application/rss+xml; charset=utf-8")
+    ("atom" . "application/atom+xml; charset=utf-8")
+    ("ics"  . "text/calendar; charset=utf-8")
+    ;; A <track> whose captions arrive as anything else is ignored.
+    ("vtt"  . "text/vtt; charset=utf-8")
+    ("m3u8" . "application/vnd.apple.mpegurl")
+    ;; Images
+    ("png"  . "image/png")
+    ("apng" . "image/apng")
+    ("jpg"  . "image/jpeg")
+    ("jpeg" . "image/jpeg")
+    ("gif"  . "image/gif")
+    ("svg"  . "image/svg+xml")
+    ("ico"  . "image/x-icon")
+    ("webp" . "image/webp")
+    ("avif" . "image/avif")
+    ("bmp"  . "image/bmp")
+    ("tif"  . "image/tiff")
+    ("tiff" . "image/tiff")
+    ;; Fonts
+    ("woff"  . "font/woff")
+    ("woff2" . "font/woff2")
+    ("ttf"   . "font/ttf")
+    ("otf"   . "font/otf")
+    ("eot"   . "application/vnd.ms-fontobject")
+    ;; Audio and video
+    ("mp3"  . "audio/mpeg")
+    ("ogg"  . "audio/ogg")
+    ("oga"  . "audio/ogg")
+    ("opus" . "audio/ogg")
+    ("wav"  . "audio/wav")
+    ("flac" . "audio/flac")
+    ("m4a"  . "audio/mp4")
+    ("aac"  . "audio/aac")
+    ("mp4"  . "video/mp4")
+    ("m4v"  . "video/mp4")
+    ("webm" . "video/webm")
+    ("ogv"  . "video/ogg")
+    ("mov"  . "video/quicktime")
+    ;; Documents and archives
+    ("pdf"  . "application/pdf")
+    ("zip"  . "application/zip")
+    ("gz"   . "application/gzip")
+    ;; WebAssembly: exactly application/wasm, since browsers refuse
+    ;; WebAssembly.instantiateStreaming() and compileStreaming() on any
+    ;; other Content-Type.
+    ("wasm" . "application/wasm"))
+  "The Content-Type MIME-TYPE-FOR-PATH answers for each extension it knows,
+   after *EXTRA-MIME-TYPES*.")
+
+(defparameter *extra-mime-types* nil
+  "Extension and Content-Type pairs MIME-TYPE-FOR-PATH consults before the
+   framework's table, for a type the table does not know or one it should
+   answer differently: '((\"glb\" . \"model/gltf-binary\")). An extension
+   is written without its dot and matched in any case. Read as each file
+   is loaded, so set it before LOAD-STATIC-FILES, which refuses an entry
+   that is not two strings.")
+
 (defun mime-type-for-path (path)
-  "Return the MIME type for a file path based on its extension."
+  "The Content-Type for a file path, by its extension, matched in any
+   case: *EXTRA-MIME-TYPES* first, then *MIME-TYPES*, and
+   application/octet-stream for an extension neither knows or a path with
+   none."
   (let ((ext (file-extension path)))
-    (if (null ext)
-        "application/octet-stream"
-        (let ((e (string-downcase ext)))
-          (cond
-            ;; Text
-            ((or (string= e "html") (string= e "htm"))
-             "text/html; charset=utf-8")
-            ((string= e "css")  "text/css; charset=utf-8")
-            ((string= e "js")   "application/javascript; charset=utf-8")
-            ((string= e "json") "application/json; charset=utf-8")
-            ((string= e "txt")  "text/plain; charset=utf-8")
-            ((string= e "xml")  "application/xml; charset=utf-8")
-            ((string= e "webmanifest") "application/manifest+json; charset=utf-8")
-            ((string= e "map")  "application/json; charset=utf-8") ; source maps
-            ;; Images
-            ((string= e "png")  "image/png")
-            ((or (string= e "jpg") (string= e "jpeg")) "image/jpeg")
-            ((string= e "gif")  "image/gif")
-            ((string= e "svg")  "image/svg+xml")
-            ((string= e "ico")  "image/x-icon")
-            ((string= e "webp") "image/webp")
-            ((string= e "avif") "image/avif")
-            ;; Fonts
-            ((string= e "woff")  "font/woff")
-            ((string= e "woff2") "font/woff2")
-            ((string= e "ttf")   "font/ttf")
-            ((string= e "otf")   "font/otf")
-            ;; Media / documents
-            ((string= e "mp4")  "video/mp4")
-            ((string= e "webm") "video/webm")
-            ((string= e "pdf")  "application/pdf")
-            ;; WebAssembly — must be exactly application/wasm: browsers
-            ;; refuse WebAssembly.instantiateStreaming() /
-            ;; compileStreaming() on any other Content-Type.
-            ((string= e "wasm") "application/wasm")
-            ;; Default
-            (t "application/octet-stream"))))))
+    (or (and ext
+             (or (cdr (assoc ext *extra-mime-types* :test #'string-equal))
+                 (cdr (assoc ext *mime-types* :test #'string-equal))))
+        "application/octet-stream")))
+
+(defun validate-extra-mime-types ()
+  "Refuse an *EXTRA-MIME-TYPES* that is not a list of (EXTENSION . TYPE)
+   strings, an extension without its dot. Each type goes on to the header
+   checks every static head gets when it is built.
+
+   An extension with a dot in it is refused rather than kept: the
+   extension a path is matched on is what follows its last dot, so \"tar.gz\"
+   would never match anything, and the file it was meant for would go out
+   as whatever \"gz\" is."
+  (unless (and (listp *extra-mime-types*)
+               (null (cdr (last *extra-mime-types*)))
+               (every (lambda (entry)
+                        (and (consp entry)
+                             (stringp (car entry))
+                             (plusp (length (car entry)))
+                             (not (find #\. (car entry)))
+                             (stringp (cdr entry))))
+                      *extra-mime-types*))
+    (error "load-static-files: *extra-mime-types* is ~s. It must be a list of ~
+            (extension . content-type) strings, each extension without its ~
+            dot, as in ((\"glb\" . \"model/gltf-binary\"))."
+           *extra-mime-types*)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file cache
@@ -365,6 +433,7 @@
    A key that matches no loaded file signals ERROR — typos fail at
    deploy time rather than serving unsubstituted bytes. Escaping for
    the target format (HTML, JS, CSS) is the caller's responsibility."
+  (validate-extra-mime-types)
   (let ((dir-path (probe-file (pathname directory)))
         (subs-table (when substitutions
                       (validate-and-normalize-substitutions substitutions))))

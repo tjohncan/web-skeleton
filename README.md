@@ -381,7 +381,9 @@ tests/
   at no other, so a route in front of it sees what it serves
   (DEPLOYMENT.md, "Routes in front of static files").
   MIME detection (including `application/wasm`, without which browsers refuse
-  `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
+  `WebAssembly.instantiateStreaming`, and `text/javascript` for `.mjs`, without
+  which they refuse a module script), with `*extra-mime-types*` for a type the
+  table does not know, extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),
   directory traversal protection, ETag-based revalidation
   (`If-None-Match` → `304 Not Modified` using a SHA-256 strong entity tag
@@ -741,6 +743,7 @@ All configurable via `setf` before calling `start-server`.
 | `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
 | `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
 | `*match-path-literals*`        | `:exact`  | How `match-path` compares a pattern's literal segments. `:exact` matches the path as it arrived, the spelling `http-request-path` shows, read through `canonical-path`: `/%61dmin` does not match `/admin`, and `/a%5B1%5D` does match `/a[1]`. `:decoded` percent-decodes the segment first (RFC 3986 §6.2.2.2), and then access decisions belong on the matched route, never on the raw path. Captures are decoded either way. Validated when the server starts |
+| `*extra-mime-types*`           | `nil`     | Extension and Content-Type pairs `load-static-files` consults before its own table, for a type the table does not know or one it should answer differently: `'(("glb" . "model/gltf-binary"))`. Extensions without the dot, matched in any case. Read as each file is loaded, so set it before `load-static-files`, which refuses an entry that is not two strings |
 | `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes |
 
