@@ -1570,7 +1570,10 @@
            (check "ok-eof: every chunk reached :on-body, in order"
                   (reverse chunks) *chunked-corpus*)
            (check "ok-eof: the fetch ended exactly once" fires 1))
-      (ignore-errors (web-skeleton::%close epfd)))))
+      (ignore-errors (web-skeleton::%close epfd))
+      ;; The fetch's teardown closes the socket; this is for a run that
+      ;; never reached it. A closed socket takes a second close as a no-op.
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-harness-fetch-on-body-truncated-chunked-e2e ()
   "A chunked upstream that delivers chunks and then closes without the
@@ -3091,43 +3094,45 @@
                       ;; deadline is the mechanism. Four seconds at a
                       ;; one-second interval collects the event plus
                       ;; several keepalives.
-                      (let ((buf (read-until-bounded stream :seconds 4)))
-                        (let* ((raw (subseq buf 0 (fill-pointer buf)))
-                               (hend (or (web-skeleton::scan-crlf-crlf
-                                          raw 0 (length raw))
-                                         (error "no header boundary in ~d bytes"
-                                                (length raw))))
-                               (body (subseq raw (+ hend 4)))
-                               ;; The stream is still open, so it has no
-                               ;; terminator. Append one and the decoder
-                               ;; can pass judgement on everything sent
-                               ;; so far.
-                               (terminated
-                                 (concatenate '(vector (unsigned-byte 8))
-                                              body
-                                              (web-skeleton::chunked-terminator))))
-                          (check "sse keepalive: the stream so far is valid chunked"
-                                 (handler-case
-                                     (progn (web-skeleton::decode-chunked-body
-                                             terminated 0 (length terminated))
-                                            :decoded)
-                                   (error (e) (princ-to-string e)))
-                                 :decoded)
-                          (check "sse keepalive: and a comment line reached the client"
-                                 (let ((decoded
-                                         (handler-case
-                                             (sb-ext:octets-to-string
-                                              (web-skeleton::decode-chunked-body
+                      (let* ((buf (read-until-bounded stream :seconds 4))
+                             (raw (subseq buf 0 (fill-pointer buf)))
+                             (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+                        ;; A check rather than a raise, so a head that never
+                        ;; came fails here and the run goes on.
+                        (check "sse keepalive: the head arrived"
+                               (not (null hend)) t)
+                        (when hend
+                          (let* ((body (subseq raw (+ hend 4)))
+                                 ;; The stream is still open, so it has no
+                                 ;; terminator. Append one and the decoder
+                                 ;; can pass judgement on everything sent
+                                 ;; so far.
+                                 (terminated
+                                   (concatenate '(vector (unsigned-byte 8))
+                                                body
+                                                (web-skeleton::chunked-terminator))))
+                            (check "sse keepalive: the stream so far is valid chunked"
+                                   (handler-case
+                                       (progn (web-skeleton::decode-chunked-body
                                                terminated 0 (length terminated))
-                                              :external-format :utf-8)
-                                           (error () ""))))
-                                   (and (search "data: start" decoded)
-                                        (search ":" decoded :start2
-                                                (+ 11 (or (search "data: start"
-                                                                  decoded)
-                                                          0)))
-                                        t))
-                                 t))))
+                                              :decoded)
+                                     (error (e) (princ-to-string e)))
+                                   :decoded)
+                            (check "sse keepalive: and a comment line reached the client"
+                                   (let ((decoded
+                                           (handler-case
+                                               (sb-ext:octets-to-string
+                                                (web-skeleton::decode-chunked-body
+                                                 terminated 0 (length terminated))
+                                                :external-format :utf-8)
+                                             (error () ""))))
+                                     (and (search "data: start" decoded)
+                                          (search ":" decoded :start2
+                                                  (+ 11 (or (search "data: start"
+                                                                    decoded)
+                                                            0)))
+                                          t))
+                                   t)))))
                  (ignore-errors (close stream))
                  (ignore-errors (sb-bsd-sockets:socket-close socket))))))
       (setf *stream-keepalive-interval* saved))))
@@ -3284,15 +3289,20 @@
                  (declare (ignore got))
                  (check "stream/worker: the stream delivered its first chunk"
                         reason :satisfied))
-               (check "stream/worker: the stream is still open"
-                      (null live-conn) nil)
                ;; The worker must still be able to serve someone else.
                (multiple-value-bind (status headers body)
                    (test-http-request :get "/fast")
                  (declare (ignore headers))
                  (check "stream/worker: a concurrent request is answered"
                         status 200)
-                 (check "stream/worker: and answered correctly" body "fast")))
+                 (check "stream/worker: and answered correctly" body "fast"))
+               ;; Asked after a request the one worker served, so a stream it
+               ;; closed after the first chunk would be closed by now: ON-CLOSE
+               ;; has not fired, and the connection is still streaming.
+               (check "stream/worker: the stream is still open"
+                      (list closed-reason
+                            (and live-conn (web-skeleton::connection-state live-conn)))
+                      '(:never :streaming)))
           (ignore-errors (close stream))
           (ignore-errors (sb-bsd-sockets:socket-close socket))))
       ;; The streaming client is gone now. The server should notice and
@@ -3482,7 +3492,11 @@
               do (sleep 0.05))))
     (let ((pairs (sb-thread:with-mutex (lock) (copy-list seen))))
       (check "three workers, three different ids"
-             (sort (mapcar #'cdr pairs) #'<) '(0 1 2))
+             (let ((ids (mapcar #'cdr pairs)))
+               ;; Sorted only when every id is a number, so a worker whose
+               ;; id is NIL fails this check rather than raising out of SORT.
+               (if (every #'realp ids) (sort ids #'<) ids))
+             '(0 1 2))
       (check "the id :ON-TICK is handed is the one bound on its thread"
              (and pairs (every (lambda (p) (eql (car p) (cdr p))) pairs))
              t))))
@@ -5763,7 +5777,8 @@
                                          (%ascii (make-string 1001 :initial-element #\c))))
                       t)
                  t)
-          (check "cap: ON-ABORT heard :too-large, once" (aborted "/cap") '(:too-large))
+          (check "cap: the declared length's ON-ABORT heard :too-large, once"
+                 (aborted "/cap") '(:too-large))
           (sb-thread:with-mutex (lock) (setf aborts nil))
           (check "cap: a chunked body passing it is 413"
                  (and (search "HTTP/1.1 413"
@@ -5777,7 +5792,8 @@
                  t)
           (check "cap: and nothing past the cap was handed over"
                  (<= (gethash "/cap" handed 0) 1000) t)
-          (check "cap: ON-ABORT heard :too-large, once" (aborted "/cap") '(:too-large))
+          (check "cap: the chunked body's ON-ABORT heard :too-large, once"
+                 (aborted "/cap") '(:too-large))
           (check "refused: ON-DATA's answer is the client's"
                  (and (search "HTTP/1.1 415"
                               (answer-of (head "/refuse" "Content-Length: 4")
@@ -7607,12 +7623,18 @@
    *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
    a budget for the whole request.
 
-   *IDLE-TIMEOUT* is 1 and *BODY-STALL-TIMEOUT* 2 for the run. A body
-   arriving four bytes every 0.7 s takes about 3.5 s, well past the idle
-   budget and never 2 s without a byte: accepted, it is served; not
-   accepted, it is cut off. A body that stops arriving is closed by the
-   stall clock, and not before the idle budget would have — the test
-   that the clock really is a different one.
+   *IDLE-TIMEOUT* is 1 and *BODY-STALL-TIMEOUT* 2 for the bodies that keep
+   arriving. A body arriving four bytes every 0.7 s takes about 3.5 s,
+   well past the idle budget and never 2 s without a byte: accepted, it is
+   served; not accepted, it is cut off.
+
+   A body that stops arriving is closed by the stall clock, and not before
+   the idle budget would have: the test that the clock really is a
+   different one. The sweep runs once a second on whole-second clocks, so
+   a close comes between T and T + 2 seconds after the last byte, and with
+   the stall budget at 2 the two windows overlap. The bodies that stop
+   arriving have it at 4: an idle close lands before 3 s, a stall close
+   after 4 s.
 
    SETF for both timeouts, for the reason TEST-HARNESS-BODY-HANDLER-E2E
    gives."
@@ -7716,6 +7738,9 @@
                  (ignore-errors (sb-bsd-sockets:socket-close socket)))))
            ;; Four bytes, then nothing. Closed by the stall clock: after
            ;; *BODY-STALL-TIMEOUT* of quiet and not at the idle budget.
+           ;; The budget at 4 from here on, so the windows are apart: see
+           ;; the docstring.
+           (setf web-skeleton:*body-stall-timeout* 4)
            (multiple-value-bind (socket stream) (%raw-connect)
              (unwind-protect
                   (let ((start (get-internal-real-time)))
@@ -7726,7 +7751,7 @@
                      stream)
                     (force-output stream)
                     (multiple-value-bind (buf reason)
-                        (read-until-bounded stream :seconds 8)
+                        (read-until-bounded stream :seconds 10)
                       (let ((elapsed (/ (- (get-internal-real-time) start)
                                         internal-time-units-per-second)))
                         (check "stalled: the connection is closed, with nothing sent"
@@ -7734,7 +7759,7 @@
                                      (fill-pointer buf))
                                '(t 0))
                         (check "stalled: not at the idle budget, but after the stall"
-                               (and (>= elapsed 1.9) (< elapsed 6) t)
+                               (and (>= elapsed 3.5) (< elapsed 9) t)
                                t))))
                (ignore-errors (close stream))
                (ignore-errors (sb-bsd-sockets:socket-close socket))))
@@ -7749,7 +7774,7 @@
                                      *crlf* *crlf* *crlf* *crlf*))
                      stream)
                     (force-output stream)
-                    (read-until-bounded stream :seconds 8)
+                    (read-until-bounded stream :seconds 10)
                     (check "stalled: a received body's ON-ABORT hears :stalled"
                            received-abort :stalled))
                (ignore-errors (close stream))
@@ -7934,7 +7959,10 @@
            (values final (reverse chunks) fires
                    (hash-table-count web-skeleton::*connections*)
                    target))
-      (ignore-errors (web-skeleton::%close epfd)))))
+      (ignore-errors (web-skeleton::%close epfd))
+      ;; The stop's teardown closes the socket; this is for a pass that
+      ;; never reached it. A closed socket takes a second close as a no-op.
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-fetch-stop-ends-the-pass-at-its-chunk ()
   "A :STOP on the first chunk of a pass ends the fetch there: no later
