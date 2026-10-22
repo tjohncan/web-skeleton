@@ -447,12 +447,37 @@
 
 (defun handle-dns-ready (dns-conn epoll-fd)
   "Called from HANDLE-OUTBOUND-EVENT when epoll reports readability
-   (EPOLLIN or EPOLLHUP) on a :out-dns pipe fd. Drain what is
-   available, try to parse an address, fire DNS-THEN on success,
-   deliver a 502 on EOF-without-answer."
+   (EPOLLIN or EPOLLHUP) on a :out-dns pipe fd. Drain what is available,
+   and once getent's output has ended, parse it: fire DNS-THEN on an
+   address, or deliver a 502 without one.
+
+   Parsed at the end and not before, so *FETCH-ADDRESS-FILTER* is asked
+   about each address once a lookup. The output usually arrives in one
+   read and getent's exit in another, and a parse at each would ask
+   twice, with nothing to gain: an address is dialed only once all of
+   them are known."
   (let ((result (connection-read-available dns-conn)))
     (case result
-      ((:ok :ok-eof :eof)
+      ;; The output still to end: the next epoll wake brings the rest, or
+      ;; the exit that ends it.
+      ((:ok :again) nil)
+      ;; :OK-EOF ends the output as surely as :EOF, and leaving it out
+      ;; would be a race rather than a certainty — a branch that mostly
+      ;; works, with a bug that is hard to see.
+      ;;
+      ;; getent writes its output in one go and the EOF appears when it
+      ;; exits. Usually it has not exited by the time we drain, so the
+      ;; bytes come back :OK, the exit arrives as a later event, and this
+      ;; arm runs on a clean :EOF — the common ordering, under which an
+      ;; arm taking :EOF alone is right. When getent has already exited,
+      ;; both land in one read; reported as :OK, they would wait for a
+      ;; wake-up the closed pipe will never deliver, and the parked inbound
+      ;; would sit until the sweeper took it.
+      ;;
+      ;; So neither is dead. :EOF is the common path and :OK-EOF is the
+      ;; coalesced one, and the arm has to take both because which one
+      ;; arrives is not ours to decide.
+      ((:ok-eof :eof)
        (multiple-value-bind (parsed refused all)
            (parse-getent-output
             (connection-read-buf dns-conn)
@@ -463,7 +488,7 @@
            ;; on are all there. getent writes its answer at once and ends
            ;; it by exiting, so waiting for the end costs the exit and no
            ;; more.
-           ((and parsed (member result '(:eof :ok-eof)))
+           (parsed
             (let ((dns-then (connection-dns-then dns-conn))
                   (chained nil))
               ;; CHAINED is what separates "the lookup failed" from "the
@@ -505,29 +530,10 @@
                     (log-warn "dns: closing the resolved pipe on fd ~d ~
                                failed: ~a"
                               (connection-fd dns-conn) e))))))
-           ((member result '(:eof :ok-eof))
+           (t
             ;; No parseable STREAM row, or every address the name
             ;; resolved to was refused by *FETCH-ADDRESS-FILTER*. Both
             ;; are "no address we are willing to dial" — same 502.
-            ;;
-            ;; :OK-EOF belongs here as much as :EOF, and leaving it out
-            ;; would be a race rather than a certainty — a branch that
-            ;; mostly works, with a bug that is hard to see.
-            ;;
-            ;; getent writes its output in one go and the EOF appears
-            ;; when it exits. Usually it has not exited by the time we
-            ;; drain, so the bytes come back :OK, the exit arrives as a
-            ;; later event, and this branch fires on a clean :EOF — the
-            ;; common ordering, under which a branch taking :EOF alone
-            ;; is right. When getent has already exited, both land in
-            ;; one read; reported as :OK, that would fall straight past
-            ;; here to wait for a wake-up the closed pipe will never
-            ;; deliver, and the parked inbound would sit until the
-            ;; sweeper took it.
-            ;;
-            ;; So neither arm is dead. :EOF is the common path and
-            ;; :OK-EOF is the coalesced one, and the branch has to accept
-            ;; both because which one arrives is not ours to decide.
             (if (plusp refused)
                 ;; The resolver worked. Policy is what said no, and an
                 ;; operator told "DNS lookup failed" here goes and debugs
@@ -541,11 +547,7 @@
             (deliver-dns-error dns-conn epoll-fd
                                (if (plusp refused)
                                    "address refused by policy"
-                                   "DNS lookup failed")))
-           ;; :OK, its end still to come — the next epoll wake brings the
-           ;; rest, or the exit that ends it.
-           )))
-      (:again nil)
+                                   "DNS lookup failed"))))))
       (:full
        (log-warn "dns: getent output exceeded read buffer")
        (deliver-dns-error dns-conn epoll-fd)))))

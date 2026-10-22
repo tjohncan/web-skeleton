@@ -143,18 +143,14 @@
    cleanup sentinel exactly once. The filter runs on the worker thread
    inside the resolve path, so keep it cheap and non-blocking.
 
-   It may be called more than once for the same address, and the count is
-   not fixed. HANDLE-DNS-READY parses whatever getent has written on every
-   epoll readiness event, re-scanning from the start of the buffer, and the
-   filter runs during that scan. An address the filter accepts ends the scan,
-   so the repeat happens only on the refusal path — but how many times
-   depends on how the subprocess's bytes happened to arrive.
-
-   That is fine for a predicate and wrong for a side effect. A filter that
-   only answers yes or no can be called any number of times; one that writes
-   an audit line or decrements a rate budget will over-count, and it is this
-   sentence rather than the code that has to say so, because the scan has no
-   cheap way to remember what it already asked.")
+   It is asked about each address once a lookup, accepted or refused: for
+   a name, once for each address getent prints, when getent's output has
+   ended; for an IP literal, once. A resolution remembered under
+   *DNS-CACHE-TTL* is asked about again, every address, on each fetch it
+   serves, which is how a cached address never outlives a change of
+   policy. A filter that writes an audit line or spends a rate budget is
+   charged that often: once an address a lookup, and once an address a
+   cache hit.")
 
 (defun fetch-address-allowed-p (ip family host)
   "Gate IP (byte vector) / FAMILY (:INET or :INET6) / HOST (the name or

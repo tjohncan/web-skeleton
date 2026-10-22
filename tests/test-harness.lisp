@@ -1864,6 +1864,67 @@
                   sentinel-fires 1))
       (setf web-skeleton:*fetch-address-filter* saved))))
 
+(defun test-harness-address-filter-asked-once-e2e ()
+  "*FETCH-ADDRESS-FILTER* is asked about each address of a name once a
+   lookup, and once again on each fetch a cached resolution serves: the
+   count its docstring gives a filter with a side effect, an audit line or
+   a rate budget, to be charged.
+
+   getent's output usually arrives in one read and its exit in another,
+   and a lookup that parsed the output at each would ask twice. The fetch
+   is to localhost, so the name's addresses are whatever this host's
+   getent prints for it, one or two; the check is that none is asked about
+   twice in one fetch, the cache off and on.
+
+   The filter and *DNS-CACHE-TTL* are set globally, not bound: the worker
+   reads them on a thread START-SERVER spawned."
+  (format t "~%Harness: the address filter is asked once an address~%")
+  (let ((saved-filter web-skeleton:*fetch-address-filter*)
+        (saved-ttl web-skeleton:*dns-cache-ttl*)
+        (lock (sb-thread:make-mutex :name "filter-calls"))
+        (calls nil))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore family host))
+            (sb-thread:with-mutex (lock)
+              (push (web-skeleton::format-ip ip) calls))
+            t))
+    (unwind-protect
+         (dolist (ttl '(0 60))
+           (setf web-skeleton:*dns-cache-ttl* ttl)
+           (let ((port nil))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (if (string= (http-request-path req) "/up")
+                        (make-text-response 200 "up")
+                        (defer-to-fetch :get (format nil "http://localhost:~d/up" port)
+                          :then (lambda (status headers body)
+                                  (declare (ignore headers body))
+                                  (make-text-response (or status 502) "fetched"))))))
+               (setf port *test-port*)
+               (let ((fetches
+                       (loop repeat 3
+                             collect (progn
+                                       (sb-thread:with-mutex (lock) (setf calls nil))
+                                       (let ((status (test-http-request :get "/go")))
+                                         (list status
+                                               (sb-thread:with-mutex (lock)
+                                                 (reverse calls))))))))
+                 (check (format nil "filter, cache ~:[off~;on~]: three fetches answered"
+                                (plusp ttl))
+                        (mapcar #'first fetches) '(200 200 200))
+                 (check (format nil "filter, cache ~:[off~;on~]: each address asked once a fetch"
+                                (plusp ttl))
+                        (loop for (nil asked) in fetches
+                              always (and asked
+                                          (= (length asked)
+                                             (length (remove-duplicates
+                                                      asked :test #'string=)))))
+                        t)))))
+      (setf web-skeleton:*fetch-address-filter* saved-filter
+            web-skeleton:*dns-cache-ttl* saved-ttl))))
+
 (defun %proc-pids ()
   "Every pid with a directory under /proc.
 
@@ -8793,6 +8854,7 @@
   (test-harness-client-errors-log-once-a-minute-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
+  (test-harness-address-filter-asked-once-e2e)
   (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
