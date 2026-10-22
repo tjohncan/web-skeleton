@@ -10936,6 +10936,133 @@
           (check (format nil "~a: never called while a pause held" name)
                  while-paused 0))))))
 
+(defun %one-byte-chunks (bytes)
+  "BYTES framed as chunks of one byte each, with no terminator."
+  (let ((out (%kernel)))
+    (loop for b across bytes
+          do (%supply out (format nil "1~a" *crlf*))
+             (vector-push-extend b out)
+             (%supply out *crlf*))
+    out))
+
+(defun test-received-chunked-body-one-run-per-read ()
+  "A received chunked body reaches its plan one run a read, however small
+   its chunks: RECEIVE-BODY's ON-DATA, and a streamed part's ON-PART-DATA
+   under RECEIVE-MULTIPART, are called once for a read that brought a
+   thousand one-byte chunks. Handed over a chunk at a time, a client
+   choosing one-byte chunks would cost a call into the application, and
+   through FORWARD-BODY a write upstream, for every byte."
+  (format t "~%Received body: one run a read, however small the chunks~%")
+  ;; ---- RECEIVE-BODY ----
+  (let ((body (let ((v (make-array 2000 :element-type '(unsigned-byte 8))))
+                (dotimes (i 2000 v) (setf (aref v i) (mod (* i 7) 251)))))
+        (pieces '())
+        (ended nil)
+        (kernel (%kernel)))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (declare (ignore req))
+                (receive-body :on-data (lambda (c bytes)
+                                         (declare (ignore c))
+                                         (push bytes pieces)
+                                         nil)
+                              :on-end (lambda (c)
+                                        (declare (ignore c))
+                                        (setf ended t)
+                                        (make-text-response 200 "ok"))))))
+        (%supply kernel (format nil "POST /u HTTP/1.1~aHost: x~a~
+                                     Transfer-Encoding: chunked~a~a"
+                                *crlf* *crlf* *crlf* *crlf*))
+        (%supply kernel (%one-byte-chunks (subseq body 0 1000)))
+        (web-skeleton::handle-client-read conn 999 nil nil)
+        (check "receive-body: a read of a thousand one-byte chunks is one call"
+               (mapcar #'length pieces) '(1000))
+        (%supply kernel (%one-byte-chunks (subseq body 1000)))
+        (%supply kernel (format nil "0~a~a" *crlf* *crlf*))
+        (web-skeleton::handle-client-read conn 999 nil nil)
+        (check "receive-body: and the next read, the rest and the end, one more"
+               (list (mapcar #'length pieces) ended) '((1000 1000) t))
+        (check "receive-body: the body, whole and in order"
+               (equalp (apply #'concatenate '(vector (unsigned-byte 8)) (reverse pieces))
+                       body)
+               t))))
+  ;; ---- RECEIVE-MULTIPART, a streamed part ----
+  (let* ((file (make-array 1000 :element-type '(unsigned-byte 8) :initial-element 65))
+         (form (concatenate '(vector (unsigned-byte 8))
+                            (sb-ext:string-to-octets
+                             (%form "--B0und"
+                                    "Content-Disposition: form-data; name=\"up\"; filename=\"x.bin\""
+                                    "" "")
+                             :external-format :latin-1)
+                            file
+                            (sb-ext:string-to-octets (%form "" "--B0und--" "")
+                                                     :external-format :latin-1)))
+         (runs '())
+         (answered nil)
+         (kernel (%kernel)))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (receive-multipart
+                 req
+                 :on-part (lambda (c part) (declare (ignore c part)) :stream)
+                 :on-part-data (lambda (c part bytes)
+                                 (declare (ignore c part))
+                                 (push bytes runs)
+                                 nil)
+                 :on-end (lambda (c parts)
+                           (declare (ignore c parts))
+                           (setf answered t)
+                           (make-text-response 200 "stored"))))))
+        (%supply kernel (format nil "POST /f HTTP/1.1~aHost: x~a~
+                                     Content-Type: multipart/form-data; boundary=B0und~a~
+                                     Transfer-Encoding: chunked~a~a"
+                                *crlf* *crlf* *crlf* *crlf* *crlf*))
+        (%supply kernel (%one-byte-chunks form))
+        (%supply kernel (format nil "0~a~a" *crlf* *crlf*))
+        (web-skeleton::handle-client-read conn 999 nil nil)
+        (check "receive-multipart: a part in one-byte chunks, read at once, is one run"
+               (list (length runs) answered) '(1 t))
+        (check "receive-multipart: the part, whole"
+               (equalp (apply #'concatenate '(vector (unsigned-byte 8)) (reverse runs))
+                       file)
+               t))))
+  ;; ---- the cap, across the read's chunks ----
+  ;; Twelve chunks of ten against a cap of 100, and framing no reader
+  ;; accepts after them, all in one read. The eleventh chunk is the one
+  ;; that passes the cap, and the refusal is its 413, before the walk
+  ;; reaches the bad framing: the run gathered so far counts, not only the
+  ;; chunk in hand.
+  (let ((handed 0)
+        (aborted nil)
+        (kernel (%kernel)))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (declare (ignore req))
+                (receive-body :max-size 100
+                              :on-data (lambda (c bytes)
+                                         (declare (ignore c))
+                                         (incf handed (length bytes))
+                                         nil)
+                              :on-end (lambda (c)
+                                        (declare (ignore c))
+                                        (make-text-response 200 "ok"))
+                              :on-abort (lambda (c reason)
+                                          (declare (ignore c))
+                                          (push reason aborted)))))
+            (web-skeleton:*log-level* :error))
+        (%supply kernel (format nil "POST /u HTTP/1.1~aHost: x~a~
+                                     Transfer-Encoding: chunked~a~a"
+                                *crlf* *crlf* *crlf* *crlf*))
+        (dotimes (i 12)
+          (%supply kernel (format nil "a~a0123456789~a" *crlf* *crlf*)))
+        (%supply kernel (format nil "zz~a" *crlf*))
+        (web-skeleton::handle-client-read conn 999 nil nil)
+        (check "cap: chunks that pass it together in one read are refused at the one that does"
+               (list aborted handed) '((:too-large) 0))))))
+
 (defun test-receive-multipart-pauses-where-it-falls ()
   "A received form's pause holds the body at the event that asked for it,
    inside a read as well as at its end: nothing more of the body is parsed
@@ -14677,6 +14804,7 @@
   (test-received-body-window-and-yield)
   (test-body-resume-and-refuse-contract)
   (test-received-body-pause-within-a-run)
+  (test-received-chunked-body-one-run-per-read)
   (test-multipart-content-type)
   (test-multipart-parse)
   (test-receive-multipart-contract)

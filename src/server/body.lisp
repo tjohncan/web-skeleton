@@ -197,6 +197,7 @@
     (setf (connection-body-receiver conn) plan
           (connection-body-received conn) 0
           (connection-body-owed conn) 0
+          (connection-body-held conn) 0
           (connection-body-paused conn) nil)))
 
 (defun body-resume (conn)

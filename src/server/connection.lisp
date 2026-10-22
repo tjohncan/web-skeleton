@@ -34,7 +34,8 @@
      MAX-SIZE  the cap on the body's decoded bytes
      FEED      a :RECEIVE plan's reader, called (CONN BUF FROM TO) with the
                next run of the body where it lies, BUF[FROM, TO) of the read
-               buffer, and returning (values VERDICT UPTO). VERDICT is NIL,
+               buffer: one run a read, decoded, whatever the framing. It
+               returns (values VERDICT UPTO). VERDICT is NIL,
                :PAUSE or an HTTP-RESPONSE, as RECEIVE-BODY's ON-DATA answers.
                With :PAUSE, UPTO is how far into the run the reader got: the
                bytes from there stay buffered and begin its next run, after
@@ -266,16 +267,21 @@
   ;; on: a body that ended left nothing to clear.
   (body-receiver nil :type (or null body-plan))
   ;; Bytes of a received body its plan's FEED has taken so far, decoded.
-  ;; The total the cap is held to, and on a Content-Length body what tells
-  ;; the read path how much of it is still to come.
+  ;; With BODY-HELD, the total the cap is held to, and on a Content-Length
+  ;; body what tells the read path how much of it is still to come.
   ;;
-  ;; This and BODY-OWED are zeroed by APPLY-BODY-PLAN when a :RECEIVE plan
-  ;; is installed and read only while one is, so no reset clears them: a
-  ;; value left from an earlier body is never looked at.
+  ;; This, BODY-OWED and BODY-HELD are zeroed by APPLY-BODY-PLAN when a
+  ;; :RECEIVE plan is installed and read only while one is, so no reset
+  ;; clears them: a value left from an earlier body is never looked at.
   (body-received 0 :type unsigned-byte)
   ;; CHUNKED-BODY-FEED's OWED between reads: the bytes of the current chunk
   ;; still to come, its data and its CRLF, or 0 at a chunk boundary.
   (body-owed 0 :type unsigned-byte)
+  ;; Bytes of a chunked body that a pause left untaken. Decoded already,
+  ;; they sit at the start of the body's place in the read buffer, where
+  ;; the run they belonged to was gathered, and begin the next run handed
+  ;; over; the walk over the framing resumes after them.
+  (body-held 0 :type unsigned-byte)
   ;; T while a received body's FEED has asked for a pause: nothing is
   ;; handed over, the connection is subscribed to no events, and the
   ;; client's bytes wait in the kernel until BODY-RESUME. Cleared there,
@@ -1510,10 +1516,18 @@
    with that reason through NOTIFY-BODY-ABORTED. The reason is known here
    and nowhere else: the catch that answers the raise sees only a status.
 
-   A chunked body is held to its cap before its bytes are handed over: a
-   run is handed to the feed only if the chunk it belongs to, as declared,
-   keeps the total within the cap, and a size line declaring more is
-   refused on arrival with none of its chunk delivered."
+   The feed is handed one run a read, whatever the framing. A chunked
+   body's data is gathered first: the walk moves each chunk's bytes down
+   over the framing before them, which it has passed, so the read's data
+   lies contiguous from the body's start, as a Content-Length body's does.
+   Handed over a chunk at a time instead, a client choosing one-byte
+   chunks would cost a call into the application, and through
+   FORWARD-BODY a write upstream, for every byte.
+
+   The run is held to the cap before any of it is handed over: every
+   chunk in it, as declared, must keep the total within the cap, and a
+   size line declaring more is refused on arrival with none of that read's
+   run delivered."
   (let* ((plan (connection-body-receiver conn))
          (buf (connection-read-buf conn))
          (body-start (+ (connection-header-end conn) 4))
@@ -1567,64 +1581,85 @@
               :received)
              (t nil))))
         (:chunked
-         (multiple-value-bind (complete next owed data-bytes pending
-                               after-size-line)
-             (handler-case
-                 (chunked-body-feed
-                  buf body-start end (connection-body-owed conn)
-                  (lambda (b from to rest)
-                    (declare (ignore b))
-                    ;; This run and the rest of its chunk, as declared,
-                    ;; against the cap — before the feed sees any of it.
-                    (let ((projected (+ (connection-body-received conn)
-                                        (- to from) rest)))
-                      (if (> projected limit)
-                          (progn (setf over projected) :halt)
-                          (hand-over from to)))))
-               (chunked-framing-error (e)
-                 (refuse :malformed 400 "malformed chunked framing: ~a" e)))
-           (declare (ignore data-bytes))
-           (when ended
-             (return-from connection-deliver-body :ended))
-           (when over
-             (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
-                     over limit))
-           (let ((projected (+ (connection-body-received conn) pending)))
-             (when (> projected limit)
+         ;; RUN-END is where the run being gathered ends. It starts past
+         ;; what a pause left untaken, which is gathered already, and the
+         ;; walk over the framing resumes there.
+         (let ((run-end (+ body-start (connection-body-held conn))))
+           (multiple-value-bind (complete next owed data-bytes pending
+                                 after-size-line)
+               (handler-case
+                   (chunked-body-feed
+                    buf run-end end (connection-body-owed conn)
+                    (lambda (b from to rest)
+                      (declare (ignore b))
+                      ;; The run so far, this chunk's bytes and the rest of
+                      ;; the chunk, as declared, against the cap — before
+                      ;; the feed sees any of them.
+                      (let ((projected (+ (connection-body-received conn)
+                                          (- run-end body-start)
+                                          (- to from) rest)))
+                        (if (> projected limit)
+                            (progn (setf over projected) :halt)
+                            ;; Down over the framing the walk has passed.
+                            ;; RUN-END never passes FROM, so nothing the walk
+                            ;; has still to read is written over.
+                            (progn
+                              (replace buf buf :start1 run-end :start2 from :end2 to)
+                              (incf run-end (- to from))
+                              nil)))))
+                 (chunked-framing-error (e)
+                   (refuse :malformed 400 "malformed chunked framing: ~a" e)))
+             (declare (ignore data-bytes))
+             (when over
                (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
-                       projected limit)))
-           (setf (connection-body-owed conn) owed)
-           (cond
-             (answer
-              (connection-drop-read-bytes conn body-start next)
-              (values :refused answer))
-             ;; A halt, so not COMPLETE: what the pause left of its run and
-             ;; the chunks after it stay in the buffer, and BODY-RESUME's
-             ;; read walks them first.
-             ((connection-body-paused conn)
-              (connection-drop-read-bytes conn body-start next)
-              :paused)
-             (complete
-              (multiple-value-bind (status offset)
-                  (chunked-trailer-status buf after-size-line end)
-                (ecase status
-                  ;; The empty trailer's CRLF has not arrived: keep the
-                  ;; zero-size line, which the next call reads again.
-                  (:incomplete
-                   (connection-drop-read-bytes conn body-start next)
-                   nil)
-                  (:present
-                   (refuse :malformed 400 "trailer section not accepted"))
-                  (:malformed
-                   (refuse :malformed 400
-                           "malformed chunked framing after terminator"))
-                  (:empty
-                   (connection-drop-read-bytes conn body-start offset)
-                   (setf (connection-request-end conn) body-start)
-                   :received))))
-             (t
-              (connection-drop-read-bytes conn body-start next)
-              nil))))))))
+                       over limit))
+             (let ((projected (+ (connection-body-received conn)
+                                 (- run-end body-start) pending)))
+               (when (> projected limit)
+                 (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
+                         projected limit)))
+             (setf (connection-body-owed conn) owed)
+             (let ((upto (if (> run-end body-start)
+                             (nth-value 1 (hand-over body-start run-end))
+                             run-end)))
+               (when ended
+                 (return-from connection-deliver-body :ended))
+               ;; Short of RUN-END only after a pause.
+               (setf (connection-body-held conn) (- run-end upto))
+               (cond
+                 (answer
+                  (connection-drop-read-bytes conn body-start next)
+                  (values :refused answer))
+                 ;; A pause: keep the run's untaken bytes where they are and
+                 ;; what the walk has not reached, and drop between them the
+                 ;; framing the walk passed after the run; then drop the part
+                 ;; of the run the feed took. BODY-RESUME's read hands the
+                 ;; untaken bytes over first, and walks on from NEXT.
+                 ((connection-body-paused conn)
+                  (connection-drop-read-bytes conn run-end next)
+                  (connection-drop-read-bytes conn body-start upto)
+                  :paused)
+                 (complete
+                  (multiple-value-bind (status offset)
+                      (chunked-trailer-status buf after-size-line end)
+                    (ecase status
+                      ;; The empty trailer's CRLF has not arrived: keep the
+                      ;; zero-size line, which the next call reads again.
+                      (:incomplete
+                       (connection-drop-read-bytes conn body-start next)
+                       nil)
+                      (:present
+                       (refuse :malformed 400 "trailer section not accepted"))
+                      (:malformed
+                       (refuse :malformed 400
+                               "malformed chunked framing after terminator"))
+                      (:empty
+                       (connection-drop-read-bytes conn body-start offset)
+                       (setf (connection-request-end conn) body-start)
+                       :received))))
+                 (t
+                  (connection-drop-read-bytes conn body-start next)
+                  nil))))))))))
 
 (defun connection-receive (conn peer-finished)
   "Hand CONN's received body over as it arrives, reading again for as long

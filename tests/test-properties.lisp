@@ -696,70 +696,137 @@
                           cuts verdict2 got2 verdict got))))))))
     bad))
 
-(defun chunk-feed-in-partial-halts (framed cuts)
-  "FEED-IN-PIECES, but with a consumer that takes each run only partway
-   and halts there, as a received body's feed does when a pause falls
-   inside a run: half of every run of two bytes or more, and the next
-   call is handed the rest first. Returns (values VERDICT BYTES)."
-  (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
-                           :adjustable t :fill-pointer 0))
-        (got (make-array 0 :element-type '(unsigned-byte 8)
-                           :adjustable t :fill-pointer 0))
-        (owed 0)
-        (at 0))
-    (dolist (cut (append cuts (list (length framed))))
-      (loop for i from at below cut do (vector-push-extend (aref framed i) buf))
-      (setf at cut)
-      ;; Called until a call makes no progress, since every call halts.
-      (loop
-        (let ((progress nil))
-          (handler-case
-              (multiple-value-bind (complete next new-owed)
-                  (web-skeleton::chunked-body-feed
-                   buf 0 (fill-pointer buf) owed
-                   (lambda (b from to rest)
-                     (declare (ignore rest))
-                     (let ((upto (if (>= (- to from) 2) (+ from (floor (- to from) 2)) to)))
-                       (loop for i from from below upto
-                             do (vector-push-extend (aref b i) got))
-                       (setf progress t)
-                       (values :halt upto))))
-                (when complete
-                  (return-from chunk-feed-in-partial-halts (values :complete got)))
-                (when (plusp next) (setf progress t))
-                (replace buf buf :start2 next)
-                (setf (fill-pointer buf) (- (fill-pointer buf) next)
-                      owed new-owed))
-            (web-skeleton::chunked-framing-error ()
-              (return-from chunk-feed-in-partial-halts (values :refused got))))
-          (unless progress (return)))))
-    (values :incomplete got)))
+(defun received-chunked-body (framed cuts halve)
+  "FRAMED received as a request's chunked body through the read path:
+   HANDLE-CLIENT-READ over a read-fn, the head first and then the body in
+   the pieces CUTS marks, by a plan whose feed takes every run whole or,
+   when HALVE, half of each run of two bytes or more, pausing there and
+   resumed until it stops. Returns (values VERDICT BYTES MOST): :COMPLETE
+   once ON-END has run, :REFUSED once ON-ABORT has heard :MALFORMED, any
+   other reason it heard, or :INCOMPLETE; the bytes the feed took, in
+   order; and the most feed calls one read or one resume made."
+  (let ((kernel (%kernel))
+        (taken (make-array 0 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer 0))
+        (calls 0)
+        (most 0)
+        (paused nil)
+        (ended nil)
+        (aborted nil)
+        (at 0)
+        ;; A mutated case, one in four, is mostly refused, and each refusal
+        ;; logs its 400 at WARN, saying nothing the verdict does not.
+        (web-skeleton:*log-level* :error))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (declare (ignore req))
+                (web-skeleton::%make-body-plan
+                 :kind :receive :max-size most-positive-fixnum
+                 :feed (lambda (c buf from to)
+                         (declare (ignore c))
+                         (incf calls)
+                         (let ((upto (if (and halve (>= (- to from) 2))
+                                         (+ from (floor (- to from) 2))
+                                         to)))
+                           (loop for i from from below upto
+                                 do (vector-push-extend (aref buf i) taken))
+                           (if (< upto to)
+                               (progn (setf paused t) (values :pause upto))
+                               (values nil to))))
+                 :on-end (lambda (c)
+                           (declare (ignore c))
+                           (setf ended t)
+                           (make-text-response 200 "ok"))
+                 :on-abort (lambda (c reason)
+                             (declare (ignore c))
+                             (setf aborted reason))))))
+        (flet ((counted (thunk)
+                 (setf calls 0)
+                 (funcall thunk)
+                 (setf most (max most calls))))
+          (%supply kernel (format nil "POST /u HTTP/1.1~aHost: x~a~
+                                       Transfer-Encoding: chunked~a~a"
+                                  *crlf* *crlf* *crlf* *crlf*))
+          (dolist (cut (append cuts (list (length framed))))
+            (%supply kernel (subseq framed at cut))
+            (setf at cut)
+            (counted (lambda () (web-skeleton::handle-client-read conn 999 nil nil)))
+            (loop repeat 100
+                  while (and paused (not ended) (not aborted))
+                  do (setf paused nil)
+                     (counted (lambda ()
+                                (body-resume conn)
+                                (%resume-and-read conn))))
+            (when (or ended aborted)
+              (return))))))
+    (values (cond (ended :complete)
+                  ((eq aborted :malformed) :refused)
+                  (aborted aborted)
+                  (t :incomplete))
+            (coerce taken '(simple-array (unsigned-byte 8) (*)))
+            most)))
 
-(defun prop-chunk-feed-halts-short-of-a-run (seed)
-  "A consumer of CHUNKED-BODY-FEED that halts partway into a run, with the
-   UPTO it took the run to, is handed the rest of that run first by the
-   next call, and nothing twice: the bytes it takes, in any pieces, are
-   the decoded body, and its verdict is the one-pass feed's.
+(defun prop-received-chunked-body-one-run-per-read (seed)
+  "A chunked request body received through the read path reaches its
+   plan's feed as one run a read, whatever its chunking, and a pause
+   anywhere in a run loses and repeats nothing.
 
-   That is what a received body's pause inside a run rests on, a
-   multipart body paused at a part's end in the middle of a read."
+   Each case is received whole, in one piece, and then cut into random
+   pieces twice: by a feed that takes every run, and by one that takes
+   half of every run and pauses there, so that the next resume begins
+   with the run's untaken rest, its framing already gone. No read or
+   resume may call the feed twice. The cut receptions must end as the
+   whole one does and take what it takes; for a refused body, a prefix of
+   what the walk proves before the fault, since the read that shows a
+   fault hands nothing over and an earlier read may already have. The
+   whole one is held to the decoder: a body it completes is the body the
+   decoder reads. The corpus is PROP-CHUNK-FEED-MATCHES-DECODER's, cut one
+   byte at a time on some cases, so a read holds many chunks or splits a
+   size line or a CRLF anywhere."
   (let ((bad nil))
     (dotimes (i *fuzz-iterations*)
       (declare (ignorable i))
       (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
              (framed (if (zerop (random 4)) (mutate-framing valid) valid))
              (n (length framed))
-             (cuts (sort (remove-duplicates
-                          (loop repeat (random 6) collect (random (max 1 n))))
-                         #'<)))
-        (multiple-value-bind (verdict got) (feed-in-pieces framed nil)
-          (multiple-value-bind (verdict2 got2) (chunk-feed-in-partial-halts framed cuts)
-            (unless (and (eq verdict verdict2) (equalp got got2))
-              (unless bad
-                (setf bad :partial)
-                (fuzz-report nil seed framed)
-                (format t "    cut at ~s, halting halfway: ~s ~s; whole runs ~s ~s~%"
-                        cuts verdict2 got2 verdict got)))))))
+             (cuts (if (zerop (random 4))
+                       (loop for k from 1 below n collect k)
+                       (sort (remove-duplicates
+                              (loop repeat (random 6) collect (random (max 1 n))))
+                             #'<)))
+             (decoded (handler-case (web-skeleton::decode-chunked-body framed 0 n)
+                        (web-skeleton::chunked-framing-error () :refused)))
+             (walked (nth-value 1 (feed-in-pieces framed nil))))
+        (flet ((report (kind fmt &rest args)
+                 (unless bad
+                   (setf bad kind)
+                   (fuzz-report nil seed framed)
+                   (apply #'format t fmt args)))
+               (prefix-p (short long)
+                 (and (<= (length short) (length long))
+                      (equalp short (subseq long 0 (length short))))))
+          (multiple-value-bind (verdict got most) (received-chunked-body framed nil nil)
+            (when (and (eq framed valid) (not (eq verdict :complete)))
+              (report :valid "    a valid body was ~s~%" verdict))
+            (when (and (eq verdict :complete) (not (equalp got decoded)))
+              (report :whole "    received ~s; decoder ~s~%" got decoded))
+            (when (> most 1)
+              (report :runs "    in one piece: ~d feed calls in one read~%" most))
+            (dolist (halve '(nil t))
+              (multiple-value-bind (verdict2 got2 most2)
+                  (received-chunked-body framed cuts halve)
+                (unless (and (eq verdict2 verdict)
+                             (if (eq verdict :refused)
+                                 (prefix-p got2 walked)
+                                 (equalp got2 got)))
+                  (report :pieces "    cut at ~s~:[~;, halving~]: ~s ~s; ~
+                                   in one piece ~s ~s~%"
+                          cuts halve verdict2 got2 verdict got))
+                (when (> most2 1)
+                  (report :runs "    cut at ~s~:[~;, halving~]: ~d feed calls ~
+                                 in one read~%"
+                          cuts halve most2))))))))
     bad))
 
 ;;; ---------------------------------------------------------------------------
@@ -1452,8 +1519,8 @@
                             #'prop-chunk-walk-matches-decoder)
                       (cons "chunk feed, in any pieces, matches the decoder"
                             #'prop-chunk-feed-matches-decoder)
-                      (cons "chunk feed halted inside a run hands the rest over next"
-                            #'prop-chunk-feed-halts-short-of-a-run)
+                      (cons "a received chunked body: one run a read, paused anywhere"
+                            #'prop-received-chunked-body-one-run-per-read)
                       (cons "multipart reads alike in any pieces"
                             #'prop-multipart-reads-alike-in-any-pieces)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
