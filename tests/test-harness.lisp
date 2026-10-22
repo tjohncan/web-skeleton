@@ -534,14 +534,38 @@
         (:handler (lambda (req)
                     (declare (ignore req))
                     cached))
-      ;; Raw HTTP/1.0 + Connection: keep-alive.
-      (%raw-http-request
-       (sb-ext:string-to-octets
-        (concatenate 'string
-                     "GET / HTTP/1.0" *crlf*
-                     "Host: localhost" *crlf*
-                     "Connection: keep-alive" *crlf* *crlf*)
-        :external-format :ascii))
+      ;; One connection, kept alive, and no half-close: a FIN beside the
+      ;; request would have the server answer it Connection: close.
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (flet ((ask (request)
+                      ;; REQUEST sent; its answer, head and four-byte body, as
+                      ;; text, read no further than that.
+                      (write-sequence (%ascii request) stream)
+                      (force-output stream)
+                      (let ((buf (read-until-bounded
+                                  stream :seconds 5
+                                  :until (lambda (b fill)
+                                           (let ((hend (web-skeleton::scan-crlf-crlf b 0 fill)))
+                                             (and hend (>= fill (+ hend 4 4))))))))
+                        (string-downcase
+                         (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                  :external-format :latin-1)))))
+               (let ((first (ask (concatenate 'string
+                                              "GET / HTTP/1.0" *crlf*
+                                              "Host: localhost" *crlf*
+                                              "Connection: keep-alive" *crlf* *crlf*))))
+                 (check "http/1.0 keep-alive: the hint is on the wire"
+                        (not (null (search "connection: keep-alive" first))) t))
+               (let ((second (ask (concatenate 'string
+                                               "GET / HTTP/1.1" *crlf*
+                                               "Host: localhost" *crlf* *crlf*))))
+                 (check "http/1.0 keep-alive: the connection serves the next request"
+                        (not (null (search "http/1.1 200" second))) t)
+                 (check "http/1.0 keep-alive: which carries no stale hint"
+                        (search "connection: keep-alive" second) nil)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
       (check "http/1.0 keep-alive: struct body still set"
              (http-response-body cached) "body")
       (check "http/1.0 keep-alive: no connection header on struct"
@@ -1965,27 +1989,43 @@
   "A client that sends split Connection: keep-alive / Connection:
    close pair (semantically equivalent to 'keep-alive, close' per
    RFC 7230 §6.1) must be read as 'close' — GET-HEADERS walks every
-   instance, not just the first one."
+   instance, not just the first one.
+
+   Sent with no half-close: a FIN beside the request would have the
+   server answer it Connection: close whatever its headers said."
   (format t "~%Harness: split Connection header close wins~%")
   (with-test-server
       (:handler (lambda (req)
                   (declare (ignore req))
                   (make-text-response 200 "body")))
-    (let* ((req (concatenate 'string
-                             "GET / HTTP/1.1" *crlf*
-                             "Host: localhost" *crlf*
-                             "Connection: keep-alive" *crlf*
-                             "Connection: close" *crlf* *crlf*))
-           (raw (%raw-http-request
-                 (sb-ext:string-to-octets req :external-format :ascii))))
-      (check "split Connection: response present"
-             (not (null (search "HTTP/1.1 200" raw))) t)
-      ;; If the server honored 'close', the socket was closed after
-      ;; this response — which is already the shape of this test
-      ;; (raw reads until EOF). The presence of a complete response
-      ;; confirms framing was correct.
-      (check "split Connection: body byte received"
-             (not (null (search "body" raw))) t))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (write-sequence (%ascii (concatenate 'string
+                                                  "GET / HTTP/1.1" *crlf*
+                                                  "Host: localhost" *crlf*
+                                                  "Connection: keep-alive" *crlf*
+                                                  "Connection: close" *crlf* *crlf*))
+                             stream)
+             (force-output stream)
+             ;; To the end of the stream, which only the server's close
+             ;; brings: a connection kept open ends the read at its
+             ;; deadline instead.
+             (multiple-value-bind (buf reason) (read-until-bounded stream :seconds 5)
+               (let ((raw (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                   :external-format :latin-1)))
+                 (check "split Connection: response present"
+                        (not (null (search "HTTP/1.1 200" raw))) t)
+                 (check "split Connection: body byte received"
+                        (not (null (search "body" raw))) t)
+                 ;; The property, in both places it shows: what the server
+                 ;; says, and what it does.
+                 (check "split Connection: close answered on the wire"
+                        (not (null (search "connection: close" raw))) t)
+                 (check "split Connection: and the connection closed"
+                        reason :eof))))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-workers-zero-rejected ()
   "start-server with :workers 0 must raise rather than silently
@@ -2003,7 +2043,9 @@
                         (lambda ()
                           (handler-case
                               (progn
+                                ;; Port 0: see the backlog probe below.
                                 (start-server
+                                 :port 0
                                  :workers n
                                  :handler (lambda (r) (declare (ignore r))))
                                 nil)
@@ -2051,7 +2093,12 @@
                                (lambda ()
                                  (handler-case
                                      (progn
+                                       ;; Port 0, so a start that got past
+                                       ;; the check never binds the default
+                                       ;; port, which SO_REUSEPORT would
+                                       ;; share with whatever serves there.
                                        (start-server
+                                        :port 0
                                         :workers 1
                                         :handler (lambda (r) (declare (ignore r))))
                                        nil)
@@ -2106,7 +2153,12 @@
                                (lambda ()
                                  (handler-case
                                      (progn
+                                       ;; Port 0, so a start that got past
+                                       ;; the check never binds the default
+                                       ;; port, which SO_REUSEPORT would
+                                       ;; share with whatever serves there.
                                        (start-server
+                                        :port 0
                                         :workers 1
                                         :handler (lambda (r) (declare (ignore r))))
                                        nil)
@@ -2130,13 +2182,12 @@
                     (and m (not (null (search "*max-write-backlog*" m))) t))
                   t)
            ;; And exactly at the bound must start. Asserted by the absence
-           ;; of a message, since this probe's server is torn down by the
-           ;; thread timeout rather than returning.
+           ;; of any message, since this probe's server is torn down by the
+           ;; thread timeout rather than returning: a start that failed for
+           ;; another reason is no start either.
            (check "start-server: exactly ten bytes of headroom is accepted"
-                  (let ((m (try-backlog (+ *max-ws-message-size* 10))))
-                    (or (null m)
-                        (null (search "*max-write-backlog*" m))))
-                  t))
+                  (try-backlog (+ *max-ws-message-size* 10))
+                  nil))
       (setf *max-write-backlog* saved))))
 
 (defun %split-ws (line)
@@ -2750,9 +2801,13 @@
                             (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
                                    "Connection: close" "")
                             "{\"a\":1}")
+                      ;; A length shorter than the body, so a reader that
+                      ;; honoured it instead of reading to the close would
+                      ;; answer "hel" and fail here, where an equal length
+                      ;; could not tell the two apart.
                       (list "identity beside a Content-Length"
                             (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: identity"
-                                   "Content-Length: 5" "Connection: close" "")
+                                   "Content-Length: 3" "Connection: close" "")
                             "hello")))
     (destructuring-bind (name head body) case
       (%call-with-scripted-upstream
@@ -4410,6 +4465,7 @@
              (web-skeleton::decode-chunked-body raw (+ hend 4) (length raw))
              :external-format :ascii)
           (error (e) (princ-to-string e))))))
+
 (defun test-harness-fetch-into-relay-e2e ()
   "The relay DEPLOYMENT.md describes, end to end — and through the real
    resolver.
@@ -4876,13 +4932,18 @@
                :signalled))
       ;; Already outstanding. Two would race to apply the disposition and
       ;; whichever finished first would close the target under the other.
+      ;; On this worker's table, or the table guard ahead of this one
+      ;; refuses it first; and asserted on the text, so that guard cannot
+      ;; pass for this one.
       (let ((conn (web-skeleton::make-connection
                    :fd 1 :state :streaming :fetch-outstanding t))
-            (web-skeleton::*epoll-fd* 99))
+            (web-skeleton::*epoll-fd* 99)
+            (web-skeleton::*connections* (make-hash-table :test #'eql)))
+        (web-skeleton::register-connection conn)
         (check "refusal: a second outstanding fetch signals"
                (handler-case (progn (fetch-into conn (cont)) :no-signal)
-                 (error () :signalled))
-               :signalled))
+                 (error (e) (and (search "already has" (princ-to-string e)) :outstanding)))
+               :outstanding))
       ;; The three disposition refusals assert on the error's *text* where
       ;; the four above assert only that something signalled. Not a style
       ;; difference: these three fail into each other. With no event loop
@@ -4936,16 +4997,27 @@
       ;; the marker is set and then cleared, which is the setup-failure
       ;; path below.
       ;;
-      ;; What is worth asserting here is the property these four share
-      ;; that the marker cannot show: refusing did not consume the
-      ;; continuation, so the same one still reaches the next refusal
-      ;; rather than having been spent on the last.
-      (let ((conn (web-skeleton::make-connection
-                   :fd 1 :state :streaming :fetch-outstanding t)))
+      ;; What is worth asserting here is the property these share that the
+      ;; marker cannot show: refusing did not consume the continuation. One
+      ;; continuation, held, goes through two refusals in turn and comes
+      ;; out of both as it went in, its sink untouched, so the second
+      ;; refusal is the guard's own and not one for a fetch already spent.
+      (let* ((same (cont))
+             (sink-before (web-skeleton::http-fetch-continuation-sink same))
+             (wrong-state (web-skeleton::make-connection :fd 1 :state :read-http))
+             (outstanding (web-skeleton::make-connection
+                           :fd 1 :state :streaming :fetch-outstanding t))
+             (web-skeleton::*epoll-fd* 99)
+             (web-skeleton::*connections* (make-hash-table :test #'eql)))
+        (web-skeleton::register-connection outstanding)
         (check "refusal: refusing does not consume the continuation"
-               (handler-case (progn (fetch-into conn (cont)) :no-signal)
-                 (error () :signalled))
-               :signalled)
+               (list (handler-case (progn (fetch-into wrong-state same) :no-signal)
+                       (error (e) (and (search "state" (princ-to-string e)) :wrong-state)))
+                     (handler-case (progn (fetch-into outstanding same) :no-signal)
+                       (error (e) (and (search "already has" (princ-to-string e))
+                                       :outstanding)))
+                     (eq (web-skeleton::http-fetch-continuation-sink same) sink-before))
+               '(:wrong-state :outstanding t))
         (check "refusal: and still fired no callback" fires 0)))))
 
 (defun test-harness-detached-deadline-sweep ()
@@ -5242,17 +5314,16 @@
                            (raw (subseq buf 0 (fill-pointer buf)))
                            (decoded (%decode-streamed-body raw)))
                       (check "upstream stall: the bytes already relayed arrived"
-                             (search "partial"
-                                     (sb-ext:octets-to-string
-                                      raw :external-format :latin-1))
-                             (search "partial"
-                                     (sb-ext:octets-to-string
-                                      raw :external-format :latin-1)))
+                             (not (null (search "partial"
+                                                (sb-ext:octets-to-string
+                                                 raw :external-format :latin-1))))
+                             t)
                       ;; The property. A terminator here would claim the
-                      ;; body was whole.
+                      ;; body was whole, and the decode would succeed;
+                      ;; failing, it answers its error's text.
                       (check "upstream stall: the client's decode fails"
-                             (search "chunked" decoded)
-                             (search "chunked" decoded))
+                             (not (null (search "chunked" decoded)))
+                             t)
                       (check "upstream stall: decode did not succeed short"
                              (string= decoded "partial") nil)))
                (ignore-errors (close stream))
@@ -7452,38 +7523,51 @@
                            (make-text-response 200 (http-request-path req))))
              (multiple-value-bind (socket stream) (%raw-connect)
                (unwind-protect
-                    (flet ((ask (&rest paths)
-                             ;; All of PATHS in one write; their answers,
-                             ;; bodies only, in order.
-                             (write-sequence
-                              (%ascii (format nil "~{GET ~a HTTP/1.1~aHost: x~a~a~}"
-                                              (loop for p in paths
-                                                    append (list p *crlf* *crlf* *crlf*))))
-                              stream)
-                             (force-output stream)
-                             (loop for p in paths
-                                   collect (let ((tail 0))
-                                             (loop until (= tail 4)
-                                                   do (let ((b (read-byte stream)))
-                                                        (setf tail
-                                                              (cond ((and (member tail '(0 2)) (= b 13)) (1+ tail))
-                                                                    ((and (member tail '(1 3)) (= b 10)) (1+ tail))
-                                                                    ((= b 13) 1)
-                                                                    (t 0)))))
-                                             (let ((body (make-array (length p)
-                                                                     :element-type '(unsigned-byte 8))))
-                                               (read-sequence body stream)
-                                               (sb-ext:octets-to-string body :external-format :ascii))))))
-                      (dotimes (i 20) (ask "/warm"))
+                    (labels ((ask (&rest paths)
+                               ;; All of PATHS in one write; their answers,
+                               ;; bodies only, in order.
+                               (write-sequence
+                                (%ascii (format nil "~{GET ~a HTTP/1.1~aHost: x~a~a~}"
+                                                (loop for p in paths
+                                                      append (list p *crlf* *crlf* *crlf*))))
+                                stream)
+                               (force-output stream)
+                               (loop for p in paths
+                                     collect (let ((tail 0))
+                                               (loop until (= tail 4)
+                                                     do (let ((b (read-byte stream)))
+                                                          (setf tail
+                                                                (cond ((and (member tail '(0 2)) (= b 13)) (1+ tail))
+                                                                      ((and (member tail '(1 3)) (= b 10)) (1+ tail))
+                                                                      ((= b 13) 1)
+                                                                      (t 0)))))
+                                               (let ((body (make-array (length p)
+                                                                       :element-type '(unsigned-byte 8))))
+                                                 (read-sequence body stream)
+                                                 (sb-ext:octets-to-string body :external-format :ascii)))))
+                             (bounded (thunk)
+                               ;; THUNK's reads under a deadline, as every read
+                               ;; in this file is, and a close or a reset
+                               ;; answered as its text: a dropped response
+                               ;; fails a check rather than hanging the suite,
+                               ;; and a close fails one rather than ending it.
+                               (multiple-value-bind (result completed)
+                                   (web-skeleton-test-harness::call-with-read-deadline
+                                    20 (lambda ()
+                                         (handler-case (funcall thunk)
+                                           (error (e) (princ-to-string e)))))
+                                 (if completed result "no answer before the deadline"))))
+                      (check "inline: the warm-up is answered"
+                             (bounded (lambda () (dotimes (i 20) (ask "/warm")) :ok))
+                             :ok)
                       (sb-thread:with-mutex (lock) (setf mods 0))
-                      (dotimes (i 200) (ask "/one"))
+                      (check "inline: two hundred requests are answered"
+                             (bounded (lambda () (dotimes (i 200) (ask "/one")) :ok))
+                             :ok)
                       (check "inline: one change of interest per keep-alive request"
                              (sb-thread:with-mutex (lock) (/ mods 200)) 1)
-                      ;; Caught, so a stall that ends in a close reports
-                      ;; here rather than ending the run.
                       (check "pipelined: three in one write, answered in order"
-                             (handler-case (ask "/a" "/bb" "/ccc")
-                               (error (e) (princ-to-string e)))
+                             (bounded (lambda () (ask "/a" "/bb" "/ccc")))
                              '("/a" "/bb" "/ccc")))
                  (ignore-errors (close stream))
                  (ignore-errors (sb-bsd-sockets:socket-close socket))))))
