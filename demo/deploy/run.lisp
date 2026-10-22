@@ -78,9 +78,10 @@
 ;; would override the default with nothing and every process would be "????".
 ;; Set it to whatever the deployment already calls this box, and the handles
 ;; the bulletin shows will agree with the logs somebody reads next to them.
-;; WS_ prefixed like the rest of this file's variables, and the same idea as
-;; the BACKLINK_URL an operator may already be setting elsewhere. Absent means
-;; absent: no link is rendered, rather than a link to nowhere.
+;; WS_BACKLINK_URL is WS_ prefixed like the rest of this file's variables,
+;; though it is the same idea as a BACKLINK_URL an operator may already set
+;; elsewhere. Absent means absent: no link is rendered, rather than a link to
+;; nowhere.
 (defun env-string (name)
   (let ((v (sb-ext:posix-getenv name)))
     (and v (plusp (length v)) v)))

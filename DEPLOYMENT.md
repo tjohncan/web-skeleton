@@ -298,6 +298,12 @@ Check Origin in your handler before returning `:upgrade`:
            (make-error-response 404)))))
 ```
 
+Comparing the whole Origin is right for a site that knows its public
+origin. One that does not, served under whatever name its proxy is given,
+can compare the Origin's host and port with the `Host` the request arrived
+with instead: `%ws-origin-allowed-p` in `demo/handler.lisp` does, and says
+why it leaves the scheme out and what the proxy has to pass through.
+
 ### Subprotocols, and the rest of the 101
 
 A client that opens `new WebSocket(url, ["graphql-transport-ws"])` offers
@@ -859,9 +865,12 @@ every connection on the box being simultaneously backed up to reach it.
 Lower it for many connections and a generous `ulimit`; raise it for few
 connections and bursty output.
 
-`ws-send` is the first surface to use it. The HTTP response path still
-sends one vector and waits for it, so a plain request/response connection
-never builds a queue.
+The bound holds what a producer sends, the case it exists for: `ws-send`,
+`stream-send` (a streaming response or SSE, and a relay into either), and
+`fetch-send` on a streamed request body. A complete response, a handler's
+or a static file's, is queued as one act outside it: held to the bound, a
+finished file larger than the bound would have its body refused after its
+head had gone out promising one.
 
 ### Reading a response incrementally
 
@@ -1247,10 +1256,15 @@ next response's status line landing where a downstream reader expects a
 chunk-size is a request-smuggling primitive, and it would be one we built
 ourselves.
 
-`:on-close` fires exactly once however the stream ends, with a reason —
-`:done`, `:disconnected`, `:idle`, `:stalled`, `:shutdown`, or `:closed`.
-Register teardown there rather than after `stream-close`, because most of
-those reasons never reach the app's own code path.
+`:on-close` fires exactly once however the stream ends, with a reason:
+`:done` when the app closed it, `:disconnected` when the peer went away,
+`:idle` or `:stalled` when a deadline took it, `:upstream-failed` when a
+`fetch-into` relaying into it failed or its close could not be written,
+`:error` when `:on-open` raised after the head went out or the worker
+carrying the stream crashed, `:shutdown` on server drain, and `:closed`
+for a close that names no reason of its own. Register teardown there
+rather than after `stream-close`, because most of those reasons never
+reach the app's own code path.
 
 Three deadlines apply, and they answer different questions:
 

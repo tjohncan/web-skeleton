@@ -18,9 +18,12 @@ It is the network and protocol layer; applications must bring their own flesh.
 - SBCL (Steel Bank Common Lisp), 2.2.9 or later — the oldest the suite is
   run on
 - Linux
-- `getent` on PATH — ships with glibc and musl, present on every
-  mainstream distro (used via `sb-ext:run-program`
-  for non-blocking hostname resolution).
+- `getent` on PATH, glibc's, which every glibc distro ships (used via
+  `sb-ext:run-program` for non-blocking hostname resolution). Its
+  `ahosts` output is what the parser reads, and the name is passed after
+  `--`, which glibc's getent honours. Other getents are untested,
+  Alpine's among them (musl itself ships none; Alpine's comes from its
+  musl-utils package), which is why the demo's image is Debian.
 
 SBCL built-ins used:
  `sb-bsd-sockets` (TCP),
@@ -299,7 +302,8 @@ tests/
   what `:then` makes of the upstream's answer. One that answers before the
   body has all gone, a 413 or a 401, has answered the client, and the rest
   of the body is refused. A multipart file goes the same way from
-  `:on-part-data`. Both schemes
+  `:on-part-data`, and all of it works the same over `http://` and
+  `https://`
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
