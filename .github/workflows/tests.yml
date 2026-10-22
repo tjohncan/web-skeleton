@@ -107,11 +107,11 @@ jobs:
       # before a deployment does.
       #
       # Loading the system is most of the check: a demo that does not compile
-      # has no behaviour to test. The one behaviour checked here is the Origin
-      # check on /ws, the page's only security control and the part of it most
-      # likely to be copied into something else. demo/test-origin.lisp runs
-      # between the load and the sentinel, so a wrong answer leaves no
-      # sentinel either.
+      # has no behaviour to test. demo/test-demo.lisp checks the Origin check
+      # on /ws, the page's only security control and the part of it most
+      # likely to be copied into something else, and a few of the demo's own
+      # small functions. It runs between the load and the sentinel, so a
+      # wrong answer leaves no sentinel either.
       #
       # Success is a file, not a word in the log, and that is not fussiness.
       # A step that printed DEMO COMPILED and grepped for it would pass on a
@@ -123,7 +123,7 @@ jobs:
       # The suite's own totals-line check above is safe from this because
       # run-tests.lisp arrives through --load, so the string it prints is
       # nowhere on the command line.
-      - name: Compile the demo system, and check its Origin table
+      - name: Compile the demo system, and run its checks
         run: |
           set -o pipefail
           rm -f /tmp/demo.ok
@@ -131,11 +131,11 @@ jobs:
                --eval '(require :asdf)' \
                --eval '(push *default-pathname-defaults* asdf:*central-registry*)' \
                --eval '(asdf:load-system "web-skeleton-demo")' \
-               --load demo/test-origin.lisp \
+               --load demo/test-demo.lisp \
                --eval '(with-open-file (f "/tmp/demo.ok" :direction :output) (write-line "ok" f))' \
                2>&1 | tee /tmp/demo.log
           if [ ! -f /tmp/demo.ok ]; then
-            echo "::error::the demo system did not load, or its Origin table failed"
+            echo "::error::the demo system did not load, or one of its checks failed"
             tail -40 /tmp/demo.log
             exit 1
           fi
@@ -183,7 +183,7 @@ jobs:
             exit 1
           fi
 
-      - name: Compile the demo system, and check its Origin table
+      - name: Compile the demo system, and run its checks
         run: |
           set -o pipefail
           rm -f /tmp/demo.ok
@@ -191,11 +191,11 @@ jobs:
                --eval '(require :asdf)' \
                --eval '(push *default-pathname-defaults* asdf:*central-registry*)' \
                --eval '(asdf:load-system "web-skeleton-demo")' \
-               --load demo/test-origin.lisp \
+               --load demo/test-demo.lisp \
                --eval '(with-open-file (f "/tmp/demo.ok" :direction :output) (write-line "ok" f))' \
                2>&1 | tee /tmp/demo.log
           if [ ! -f /tmp/demo.ok ]; then
-            echo "::error::the demo system did not load, or its Origin table failed"
+            echo "::error::the demo system did not load, or one of its checks failed"
             tail -40 /tmp/demo.log
             exit 1
           fi

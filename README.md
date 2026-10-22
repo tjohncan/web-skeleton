@@ -158,7 +158,7 @@ src/
 demo/
   package.lisp     Demo package declaration
   handler.lisp     Bulletin fan-out, census endpoint, request lab, refusal bench
-  test-origin.lisp The /ws Origin check's cases, as a table CI runs
+  test-demo.lisp   The demo's checks CI runs: the /ws Origin table and a few helpers
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
   deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/

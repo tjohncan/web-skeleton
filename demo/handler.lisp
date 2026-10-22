@@ -49,11 +49,29 @@
 ;;; ---------------------------------------------------------------------------
 
 (defvar *demo-host* "127.0.0.1"
-  "Host the /demo-fetch endpoint uses to self-fetch over HTTP.")
+  "Host the /demo-fetch endpoint dials to reach this server, as it goes in a
+   URL. START-DEMO sets it from the address it binds; see %SELF-FETCH-HOST.")
 
 (defvar *demo-port* 8081
   "Port the demo server is listening on. START-DEMO sets this so the
    /demo-fetch endpoint can build a self-referential URL.")
+
+(defun %self-fetch-host (host)
+  "The host part of a URL that reaches a server bound to HOST, an IPv4 or
+   IPv6 address vector: loopback of the same family for a wildcard, and the
+   bound address itself otherwise, bracketed when it is IPv6.
+
+   A server bound to one address answers on that address alone, so a fixed
+   127.0.0.1 reaches it only when that is the address: bound to ::1, to ::
+   or to one interface's address, the self-fetch would find nothing
+   listening and answer 502."
+  (let ((v6 (= (length host) 16)))
+    (cond ((and v6 (every #'zerop host)) "[::1]")
+          (v6 (format nil "[~{~(~x~)~^:~}]"
+                      (loop for i from 0 below 16 by 2
+                            collect (+ (ash (aref host i) 8) (aref host (1+ i))))))
+          ((every #'zerop host) "127.0.0.1")
+          (t (format nil "~{~d~^.~}" (coerce host 'list))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Origin check for the /ws upgrade
@@ -97,7 +115,7 @@
    proxy_set_header Host $host — the sample's comment on that line says what
    happens without it.
 
-   demo/test-origin.lisp holds the cases, as a table of what the route owes
+   demo/test-demo.lisp holds the cases, as a table of what the route owes
    each pair of headers."
   (let ((origin (get-header request "origin")))
     (or (null origin)
@@ -204,7 +222,13 @@
    Probed at HOST because that is the address a second server has to share
    for the kernel to pool the two, and a server bound to one address does not
    answer on loopback. A wildcard is probed on loopback, which every wildcard
-   listener answers on."
+   listener answers on.
+
+   The connect is bounded, at two seconds. Loopback answers at once, but an
+   interface whose firewall drops SYNs would hold a blocking connect for the
+   kernel's own timeout, minutes, before START-DEMO bound anything. A connect
+   still going at the bound is taken for nothing there: a listener on this
+   host answers well inside it."
   (let* ((v6 (= (length host) 16))
          (target (cond ((notevery #'zerop host) host)
                        (v6 #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))
@@ -215,8 +239,18 @@
                                         'sb-bsd-sockets:inet-socket)
                                     :type :stream :protocol :tcp)))
           (unwind-protect
-               (progn (sb-bsd-sockets:socket-connect probe target port)
-                      t)
+               (progn
+                 (setf (sb-bsd-sockets:non-blocking-mode probe) t)
+                 ;; In progress is the usual answer off loopback, and the
+                 ;; connect goes on while the wait below watches it.
+                 (handler-case (sb-bsd-sockets:socket-connect probe target port)
+                   (sb-bsd-sockets:operation-in-progress () nil))
+                 ;; Writable is a connect that has finished, made or refused;
+                 ;; only a made one has a peer to name.
+                 (and (sb-sys:wait-until-fd-usable
+                       (sb-bsd-sockets:socket-file-descriptor probe) :output 2)
+                      (handler-case (progn (sb-bsd-sockets:socket-peername probe) t)
+                        (error () nil))))
             (ignore-errors (sb-bsd-sockets:socket-close probe))))
       (error () nil))))
 
@@ -880,19 +914,24 @@
    wedged worker would fail about one probe in four, and a check that wants
    three failures in a row would almost never see it. Here any live worker
    answers for all of them, because the ticks it reads are every worker's
-   own, so one stuck loop fails every probe, whichever worker takes it."
+   own, so one stuck loop fails every probe, whichever worker takes it.
+
+   Before START-DEMO there are no workers to read, and the answer is 503,
+   not started."
   (declare (ignore request))
-  (let* ((now (get-universal-time))
-         (stale (loop for at across *last-tick*
-                      for i from 0
-                      when (> (- now at) *healthz-stale-after*)
-                        collect i)))
-    (if stale
-        (make-text-response
-         503 (format nil "wedged worker~p: ~{~d~^, ~}~%" (length stale) stale))
-        (make-text-response
-         200 (format nil "ok: ~d workers passing their loops~%"
-                     (length *last-tick*))))))
+  (if (null *last-tick*)
+      (make-text-response 503 (format nil "not started~%"))
+      (let* ((now (get-universal-time))
+             (stale (loop for at across *last-tick*
+                          for i from 0
+                          when (> (- now at) *healthz-stale-after*)
+                            collect i)))
+        (if stale
+            (make-text-response
+             503 (format nil "wedged worker~p: ~{~d~^, ~}~%" (length stale) stale))
+            (make-text-response
+             200 (format nil "ok: ~d workers passing their loops~%"
+                         (length *last-tick*)))))))
 
 (defun handle-census (request)
   "Server-derived vitals as JSON, for the sternum and limbs panels."
@@ -1088,8 +1127,10 @@
       ;; only once the ring holding it exists, STORE-GET waits on the update
       ;; that built it, and a trim never takes the line just added: a worker
       ;; slow enough to lose lines to the trim loses older ones, and still
-      ;; finds this. So there is no branch for an empty NEW. Were one ever
-      ;; reached, the REDUCE below would signal rather than skip a line.
+      ;; finds this. Should a change ever break that, an empty NEW leaves
+      ;; *FANNED* where it is, the :INITIAL-VALUE below, for the next pass to
+      ;; look again, where a REDUCE with nothing to reduce would raise on
+      ;; every pass and stop this worker's fan-out for good.
       (let* ((new (bulletin-since (aref *fanned* worker-id)))
              (payloads (mapcar #'%bulletin-payload new)))
         (map-worker-websockets
@@ -1106,7 +1147,8 @@
              (error ()
                (ignore-errors (ws-close conn 1013))))))
         (setf (aref *fanned* worker-id)
-              (reduce #'max new :key #'first))))))
+              (reduce #'max new :key #'first
+                                :initial-value (aref *fanned* worker-id)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler
@@ -1267,10 +1309,19 @@
 
    A post is one row. The log renders with white-space: pre-wrap, so a newline
    in the text would draw a second row that its sender could dress up as
-   somebody else's line.
+   somebody else's line. A newline is not the only character that breaks a
+   line: NEL (U+0085), the LINE and PARAGRAPH SEPARATORs (U+2028, U+2029)
+   are mandatory breaks in Unicode's line breaking (UAX #14), so they go
+   with the controls, C0, DEL and C1, that NEL is one of.
 
    Space is 32, so the test below never catches it and needs no exception."
-  (let ((clean (remove-if (lambda (c) (< (char-code c) 32)) text)))
+  (let ((clean (remove-if (lambda (c)
+                            (let ((code (char-code c)))
+                              (or (< code 32)
+                                  (<= #x7F code #x9F)
+                                  (= code #x2028)
+                                  (= code #x2029))))
+                          text)))
     (if (> (length clean) *bulletin-line-max*)
         (subseq clean 0 *bulletin-line-max*)
         clean)))
@@ -1300,24 +1351,24 @@
    BACKLINK is an absolute URL to whatever this demo hangs off, or NIL. A
    page served from somebody's collection of things should offer a way back
    to the collection; a page served from nowhere in particular should not
-   invent one."
+   invent one.
+
+   The pages are read from demo/static/ beside the demo's system definition,
+   wherever the process was started, and a directory with no index.html is
+   refused rather than served as an empty site.
+
+   *WORKER-WAKE-INTERVAL* is the image's, and this sets it to 0.05 for as
+   long as the demo serves, putting it back when START-SERVER returns. A
+   server started beside the demo in one image runs at that cadence too
+   while the demo does."
   (when (%port-already-served-p host port)
     (error "start-demo: something is already answering on port ~d.~%~
             SO_REUSEPORT means a second server binds it rather than failing, ~
             and both would serve — the kernel splitting connections between ~
             them, each with its own bulletin, so the room divides in two with ~
             no error anywhere. Stop the other one first." port))
-  (setf *demo-port* port)
-  ;; The fan-out can only be as prompt as the workers wake: a worker with no
-  ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
-  ;; returns. The default second is fine for a server and far too slow for a
-  ;; bulletin — at 0.05 a posted line lands in about 50ms, and the cost is
-  ;; twenty syscall returns per worker per second doing a sequence compare.
-  ;;
-  ;; Set here rather than left alone because the page displays it: the cadence
-  ;; is what sharing nothing costs, and the number belongs on screen rather
-  ;; than in an apology.
-  (setf *worker-wake-interval* 0.05)
+  (setf *demo-host* (%self-fetch-host host)
+        *demo-port* port)
   (setf *instance* instance
         *backlink-url* backlink)
   (setf *started-at* (get-universal-time)
@@ -1337,19 +1388,42 @@
   ;; and still off any worker so they stay out of the census. See
   ;; %BENCH-RESPONSE.
   (setf *bench-responses* (%build-bench-responses))
-  ;; Backquoted rather than quoted: the backlink is not known until
-  ;; this call, and the cache is built once from what it says here.
-  (load-static-files "demo/static/"
-                     :substitutions
-                     `(("robots.txt" ("are smart" . "robots are cool and smart"))
-                       ("index.html" ("__BACKLINK__" . ,(%backlink-html)))))
-  (start-server :host host
-                :port port
-                :workers workers
-                :handler #'handle-request
-                :body-handler #'decide-body
-                :ws-handler #'handle-ws-message
-                :on-tick #'bulletin-tick))
+  ;; Beside the system definition, not relative to wherever the process
+  ;; started: started elsewhere, a relative path finds no directory, and
+  ;; LOAD-STATIC-FILES warns and goes on with an empty cache, so every page
+  ;; is a 404.
+  (let ((static (asdf:system-relative-pathname "web-skeleton-demo" "demo/static/")))
+    (unless (probe-file (merge-pathnames "index.html" static))
+      (error "start-demo: ~a holds no index.html, so the demo has no page to ~
+              serve." static))
+    ;; Backquoted rather than quoted: the backlink is not known until
+    ;; this call, and the cache is built once from what it says here.
+    (load-static-files static
+                       :substitutions
+                       `(("robots.txt" ("are smart" . "robots are cool and smart"))
+                         ("index.html" ("__BACKLINK__" . ,(%backlink-html))))))
+  ;; The fan-out can only be as prompt as the workers wake: a worker with no
+  ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
+  ;; returns. The default second is fine for a server and far too slow for a
+  ;; bulletin — at 0.05 a posted line lands in about 50ms, and the cost is
+  ;; twenty syscall returns per worker per second doing a sequence compare.
+  ;;
+  ;; Set here rather than left alone because the page displays it: the cadence
+  ;; is what sharing nothing costs, and the number belongs on screen rather
+  ;; than in an apology. Put back when the server returns, since the setting
+  ;; is the whole image's.
+  (let ((wake *worker-wake-interval*))
+    (unwind-protect
+         (progn
+           (setf *worker-wake-interval* 0.05)
+           (start-server :host host
+                         :port port
+                         :workers workers
+                         :handler #'handle-request
+                         :body-handler #'decide-body
+                         :ws-handler #'handle-ws-message
+                         :on-tick #'bulletin-tick))
+      (setf *worker-wake-interval* wake))))
 
 (defun main ()
   (start-demo))
