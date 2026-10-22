@@ -114,20 +114,31 @@
   (format t "~%HTTP Date cache~%")
   ;; No cache bound is the state every existing test and every REPL call
   ;; runs in, and it must keep formatting.
-  (let ((web-skeleton::*http-date-cache* nil))
-    (check "date: no cache bound still formats correctly"
-           (string= (web-skeleton::http-date)
-                    (web-skeleton::%format-http-date (get-universal-time)))
-           t))
+  ;; Each of these reads the clock on both sides of the call, and takes
+  ;; either second: a second can turn between the call and a later read.
+  (flet ((formatted-within (thunk)
+           (let* ((before (get-universal-time))
+                  (got (funcall thunk))
+                  (after (get-universal-time)))
+             (or (string= got (web-skeleton::%format-http-date before))
+                 (string= got (web-skeleton::%format-http-date after))))))
+    (let ((web-skeleton::*http-date-cache* nil))
+      (check "date: no cache bound still formats correctly"
+             (formatted-within #'web-skeleton::http-date)
+             t))
+    (let ((web-skeleton::*http-date-cache* (cons 0 "")))
+      ;; A cold cache formats and fills.
+      (check "date: cold cache produces the right string"
+             (formatted-within #'web-skeleton::http-date)
+             t)))
   (let ((web-skeleton::*http-date-cache* (cons 0 "")))
-    ;; A cold cache formats and fills.
-    (check "date: cold cache produces the right string"
-           (string= (web-skeleton::http-date)
-                    (web-skeleton::%format-http-date (get-universal-time)))
-           t)
-    (check "date: cold cache records the second it built for"
-           (eql (car web-skeleton::*http-date-cache*) (get-universal-time))
-           t)
+    (let* ((before (get-universal-time))
+           (got (progn (web-skeleton::http-date)
+                       (car web-skeleton::*http-date-cache*)))
+           (after (get-universal-time)))
+      (check "date: cold cache records the second it built for"
+             (<= before got after)
+             t))
     ;; A hit is served without reformatting. Asserted through a sentinel
     ;; that formatting could never produce, and tolerant of the second
     ;; ticking between setup and call — rare, and a fresh format is the
@@ -1293,8 +1304,8 @@
     (let ((r (make-text-response 200 "x")))
       (set-response-header r "connection" "close")
       (check "sync-close: nil inbound is safe"
-             (progn (web-skeleton::sync-close-after-p-from-response nil r)
-                    :ok)
+             (attempt (progn (web-skeleton::sync-close-after-p-from-response nil r)
+                             :ok))
              :ok))))
 
 ;;; ---------------------------------------------------------------------------
@@ -2310,7 +2321,7 @@
            (public-via-literal-p "fe80::1") nil)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Peer address formatter — both families
+;;; The configuration table, and errno names
 ;;; ---------------------------------------------------------------------------
 
 (defun test-documented-settings-are-exported ()
@@ -2377,6 +2388,10 @@
              (list name text))))
   (check "errno: an unnamed one reads as its number"
          (web-skeleton::errno-string 200) "errno 200"))
+
+;;; ---------------------------------------------------------------------------
+;;; Peer address formatter — both families
+;;; ---------------------------------------------------------------------------
 
 (defun test-format-peer-addr ()
   (format t "~%format-peer-addr~%")
@@ -6219,10 +6234,15 @@
                                           (declare (ignore s h b)) nil))))
              ;; -1 is not an epoll fd, so EPOLL-ADD raises after the
              ;; transport is in place. ATTEMPT because the raise is the
-             ;; point and must not end the run.
-             (attempt
-              (web-skeleton::initiate-http-fetch-to-address
-               inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet))
+             ;; point and must not end the run, and the raise is asserted,
+             ;; so the release below is shown to follow the failure this
+             ;; arranges rather than some other way through the setup.
+             (check "fetch setup: the wiring failed, as arranged"
+                    (stringp
+                     (attempt
+                      (web-skeleton::initiate-http-fetch-to-address
+                       inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet)))
+                    t)
              (check "fetch setup: the transport was installed" installed 1)
              (check "fetch setup: and released when the wiring failed"
                     released 1)))
@@ -6274,9 +6294,22 @@
                ;; event the edge hangs on.
                (web-skeleton::connection-queue-write
                 inbound (sb-ext:string-to-octets "xyz" :external-format :ascii))
-               (check "resume edge: the inbound drained"
+               (check "resume edge: the write returns without raising"
                       (attempt (web-skeleton::handle-client-write inbound epfd))
                       nil)
+               ;; What the name says, asserted: a write that did nothing
+               ;; also returns NIL.
+               (check "resume edge: the inbound drained"
+                      (web-skeleton::connection-write-pending inbound) 0)
+               (check "resume edge: and the bytes reached its peer"
+                      (let ((got (read-until-bounded
+                                  (sb-bsd-sockets:socket-make-stream
+                                   in-client :input t :element-type '(unsigned-byte 8))
+                                  :seconds 2
+                                  :until (lambda (buf fill) (declare (ignore buf)) (>= fill 3)))))
+                        (sb-ext:octets-to-string (subseq got 0 (fill-pointer got))
+                                                 :external-format :ascii))
+                      "xyz")
                (check "resume edge: the outbound is no longer paused"
                       (web-skeleton::connection-fetch-paused outbound) nil)
                (check "resume edge: the back-link is cleared with it"
@@ -9237,7 +9270,8 @@
                       (web-skeleton::handle-dns-ready dns-conn epfd)
                       (list chained
                             (web-skeleton::connection-state target)
-                            (web-skeleton::connection-fetch-outstanding target)))
+                            (web-skeleton::connection-fetch-outstanding target)
+                            calls))
                  (setf (symbol-function 'web-skeleton::close-outbound) real)
                  (ignore-errors (sb-ext:process-close proc))
                  (ignore-errors (web-skeleton::%close targetfd))
@@ -9247,14 +9281,22 @@
       (let ((clean (run nil)))
         (check "dns teardown control: the chain ran" (first clean) t)
         (check "dns teardown control: the target is untouched"
-               (rest clean) '(:websocket t)))
+               (subseq clean 1 3) '(:websocket t))
+        ;; Counted, or a HANDLE-DNS-READY that never called CLOSE-OUTBOUND
+        ;; would raise nothing and pass every check here.
+        (check "dns teardown control: the pipe is closed, once"
+               (fourth clean) 1))
       ;; The claim.
       (let ((failed (run t)))
         (check "dns teardown: the chain still ran" (first failed) t)
         (check "dns teardown: a failed close does not close the target"
                (second failed) :websocket)
         (check "dns teardown: nor clear the marker on a live fetch"
-               (third failed) t)))))
+               (third failed) t)
+        ;; Once: the raise is logged, not taken for a failed lookup, whose
+        ;; delivery would close the pipe a second time.
+        (check "dns teardown: the failed close is not taken for a failed lookup"
+               (fourth failed) 1)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
@@ -9306,7 +9348,10 @@
                      (web-skeleton::connection-read-pos conn) (length b))
                (handler-case (web-skeleton::connection-on-read conn)
                  (web-skeleton:http-parse-error (e)
-                   (web-skeleton::http-parse-error-status e))))))
+                   (web-skeleton::http-parse-error-status e))
+                 ;; Any other raise as its text, so it fails a check rather
+                 ;; than ending the run: DRIVE's reason, below.
+                 (error (e) (princ-to-string e))))))
 
     ;; ---- classification ----
 
@@ -9820,11 +9865,6 @@
            (verdict "" :headers '("Host: x" "Transfer-Encoding: chunked"
                                   "Expect: x-foo"))
            :flush-queued)))
-
-
-;;; ---------------------------------------------------------------------------
-;;; A request that can never be finished does not keep its slot
-;;; ---------------------------------------------------------------------------
 
 ;;; ---------------------------------------------------------------------------
 ;;; A body handler is asked at the head
@@ -11055,6 +11095,10 @@
              (and (stringp msg) (not (search "*body-stall-timeout*" msg)) t))
            t)))
 
+;;; ---------------------------------------------------------------------------
+;;; A request that can never be finished does not keep its slot
+;;; ---------------------------------------------------------------------------
+
 (defun test-unfinishable-request-closes ()
   (format t "~%Unfinishable request + peer FIN~%")
   (labels ((drive (raw eof-verdict)
@@ -11121,7 +11165,7 @@
            :dispatch)))
 
 ;;; ---------------------------------------------------------------------------
-;;; A declared body costs what arrives, not what was declared
+;;; An unterminated head is refused at its budget
 ;;; ---------------------------------------------------------------------------
 
 (defun test-unterminated-head-refused-at-its-budget ()
@@ -11185,6 +11229,10 @@
       (check "control: a head that ends is left to dispatch, as before"
              (drive (format nil "GET / HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
              :dispatch))))
+
+;;; ---------------------------------------------------------------------------
+;;; A declared body costs what arrives, not what was declared
+;;; ---------------------------------------------------------------------------
 
 (defun test-declared-body-is-not-preallocated ()
   (format t "~%Content-Length: the read buffer follows the bytes~%")
@@ -11367,6 +11415,12 @@
                       (web-skeleton::connection-request-end conn) (length head))
                (check "head search: the work is linear in the head, not quadratic"
                       (< searched (* 4 (length head)))
+                      t)
+               ;; The control: every byte was searched at least once. Were
+               ;; SCAN-CRLF-CRLF ever inlined, the wrapper above would count
+               ;; nothing and the bound would hold for nothing.
+               (check "head search: and every byte of it was searched"
+                      (>= searched (length head))
                       t)))
         (sb-int:unencapsulate 'web-skeleton::scan-crlf-crlf 'counted))
       ;; Each place the terminator can be cut: CR | LF CR LF, CR LF | CR LF,
@@ -11516,17 +11570,7 @@
                  t))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Runner
-;;; ---------------------------------------------------------------------------
-
-;;; ---------------------------------------------------------------------------
-;;; cpu-count
-;;;
-;;; Driven with synthetic file contents rather than the live filesystem,
-;;; because a host that exposes cgroup CPU files cannot be relied on. CI does
-;;; not, so without this every branch except the final fall-through would go
-;;; unexercised — and the fall-through is the one path that was already
-;;; working.
+;;; A paused detached fetch resumes when its target drains
 ;;; ---------------------------------------------------------------------------
 
 (defun %detached-pause-pass (label target-state)
@@ -12727,13 +12771,20 @@
    server never answers again."
   (format t "~%serious conditions: a stray timeout at RUN-WORKER's backstop~%")
   (let ((log (make-string-output-stream))
-        (saved-stream web-skeleton::*log-stream*))
+        (saved-stream web-skeleton::*log-stream*)
+        ;; The worker that answers, recorded by the handler on its own
+        ;; thread. A lookup by thread name could find a worker an earlier
+        ;; server left behind, and interrupt that one instead.
+        (answered-on nil)
+        (lock (sb-thread:make-mutex :name "backstop-worker")))
     (setf web-skeleton::*log-stream* log)
     (unwind-protect
          (call-with-escapes-ending-the-thread
           (lambda ()
             (with-test-server (:handler (lambda (req)
                                           (declare (ignore req))
+                                          (sb-thread:with-mutex (lock)
+                                            (setf answered-on sb-thread:*current-thread*))
                                           (make-text-response 200 "ok")))
               (flet ((answers-p (seconds)
                        ;; Retried: across a restart there is a second with
@@ -12751,9 +12802,7 @@
                            (sleep 0.1)))))
                 (check "control: the server answers before the timeout"
                        (answers-p 2) t)
-                (let ((worker (find "web-skeleton-0" (sb-thread:list-all-threads)
-                                    :key #'sb-thread:thread-name
-                                    :test #'equal)))
+                (let ((worker (sb-thread:with-mutex (lock) answered-on)))
                   (check "control: the worker thread was found" (not (null worker)) t)
                   (when worker
                     (sb-thread:interrupt-thread
@@ -12981,14 +13030,17 @@
 
    ON-CLOSE fires exactly once however the stream ends, and applications
    release whatever they registered for a stream there — a subscriber set,
-   a fan-out list. RUN-WORKER's crash cleanup closed every client
-   connection with the bare CONNECTION-CLOSE, which does not notify, so a
-   crash left every stream on that worker registered for good.
+   a fan-out list. A crash cleanup that closed every client connection
+   with the bare CONNECTION-CLOSE, which does not notify, would leave every
+   stream on that worker registered for good.
 
    The crash is real: the worker is interrupted with an error while idle,
-   which reaches RUN-WORKER's backstop the way any escaping raise does."
+   which reaches RUN-WORKER's backstop the way any escaping raise does.
+   The worker is the one the handler ran on, recorded there: a lookup by
+   thread name could find a worker an earlier server left behind."
   (format t "~%a worker crash tells its streams, through ON-CLOSE~%")
   (let ((reasons nil)
+        (answered-on nil)
         (lock (sb-thread:make-mutex :name "crash-on-close"))
         (log (make-string-output-stream))
         (saved-stream web-skeleton::*log-stream*))
@@ -12998,6 +13050,8 @@
              (:handler
               (lambda (req)
                 (declare (ignore req))
+                (sb-thread:with-mutex (lock)
+                  (setf answered-on sb-thread:*current-thread*))
                 (make-stream-response
                  :on-open (lambda (c)
                             (stream-send c (sb-ext:string-to-octets
@@ -13025,9 +13079,9 @@
                                                            "open" :external-format :ascii)
                                                           buf :end2 fill))))
                            :satisfied)
-                    (let ((worker (find "web-skeleton-0" (sb-thread:list-all-threads)
-                                        :key #'sb-thread:thread-name
-                                        :test #'equal)))
+                    (let ((worker (sb-thread:with-mutex (lock) answered-on)))
+                      (check "control: the worker the stream is on was found"
+                             (not (null worker)) t)
                       (when worker
                         (sb-thread:interrupt-thread
                          worker (lambda () (error "deliberate: the worker crashed")))))
@@ -13346,14 +13400,17 @@
    Polled rather than slept: the census publishes on the maintenance gate at
    1 Hz, which is slower than this test would care to guess at."
   (format t "~%counters: the refusals an application cannot see~%")
-  (let ((calls 0))
+  ;; Counted on the worker and read here, so under a lock, as every other
+  ;; cross-thread count in this file is.
+  (let ((calls 0)
+        (lock (sb-thread:make-mutex :name "counters-calls")))
     (with-test-server (:workers 1
                        :handler (lambda (req)
                                   (declare (ignore req))
-                                  (incf calls)
+                                  (sb-thread:with-mutex (lock) (incf calls))
                                   (web-skeleton:make-text-response 200 "ok")))
       (test-http-request :get "/")
-      (let ((calls-before calls))
+      (let ((calls-before (sb-thread:with-mutex (lock) calls)))
         (let* ((sock (connect-to-test-server))
                (stream (sb-bsd-sockets:socket-make-stream
                         sock :input t :output t
@@ -13371,7 +13428,7 @@
             (ignore-errors (close stream))
             (ignore-errors (sb-bsd-sockets:socket-close sock))))
         (check "the handler never ran for the refused request"
-               calls calls-before))
+               (sb-thread:with-mutex (lock) calls) calls-before))
       ;; Waits for both responses rather than the first. A census published
       ;; between the two requests would otherwise end the poll on a count of
       ;; one and fail the total for a reason that has nothing to do with it.
@@ -14334,6 +14391,15 @@
              (web-skeleton:http-parse-error () :refused))
            :parsed)))
 
+;;; ---------------------------------------------------------------------------
+;;; cpu-count
+;;;
+;;; Driven with synthetic file contents rather than the live filesystem,
+;;; because a host that exposes cgroup CPU files cannot be relied on. CI does
+;;; not, so without this every branch except the final fall-through, the one
+;;; an ordinary host takes, would go unexercised.
+;;; ---------------------------------------------------------------------------
+
 (defun test-cpu-count-parsers ()
   (format t "~%cpu-count: quota and topology parsing~%")
 
@@ -14421,12 +14487,16 @@
   (check "min: a non-positive source is ignored rather than winning"
          (web-skeleton::fewest-cpus 0 -3 4) 4)
 
-  ;; The whole thing, on whatever this host is. Cannot assert a number —
-  ;; that is the point of the change — but it must always be usable, since
-  ;; START-SERVER refuses anything else.
+  ;; The whole thing, on whatever this host is. Cannot assert a number,
+  ;; which is the host's, but it must always be usable, since START-SERVER
+  ;; refuses anything else.
   (let ((n (web-skeleton::cpu-count)))
     (check "cpu-count: answers a positive integer"
            (and (integerp n) (plusp n)) t)))
+
+;;; ---------------------------------------------------------------------------
+;;; Runner
+;;; ---------------------------------------------------------------------------
 
 (defun test-server ()
   (setf *tests-passed* 0
