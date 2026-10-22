@@ -302,32 +302,46 @@
       (setf (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*) saved))))
 
 (defmacro check (name expr expected)
-  "Assert that EXPR produces EXPECTED. Logs pass/fail."
-  `(let ((result ,expr))
-     (if (equal result ,expected)
-         (progn
-           (format t "  PASS  ~a~%" ,name)
-           (incf *tests-passed*))
-         (progn
-           (format t "  FAIL  ~a~%    expected: ~s~%         got: ~s~%"
-                   ,name ,expected result)
-           (incf *tests-failed*)
-           (push ,name *failed-names*)))))
+  "Assert that EXPR produces EXPECTED. Logs pass/fail.
+
+   EXPR, EXPECTED and NAME are each evaluated once, in that order, into
+   variables of the macro's own, so a form that names a variable of the
+   test's, a RESULT say, reads the test's."
+  (let ((result (gensym "RESULT"))
+        (want (gensym "EXPECTED"))
+        (label (gensym "NAME")))
+    `(let* ((,result ,expr)
+            (,want ,expected)
+            (,label ,name))
+       (if (equal ,result ,want)
+           (progn
+             (format t "  PASS  ~a~%" ,label)
+             (incf *tests-passed*))
+           (progn
+             (format t "  FAIL  ~a~%    expected: ~s~%         got: ~s~%"
+                     ,label ,want ,result)
+             (incf *tests-failed*)
+             (push ,label *failed-names*))))))
 
 (defmacro check-error (name expr)
-  "Assert that EXPR signals an HTTP-PARSE-ERROR (or any error as fallback)."
-  `(if (handler-case (progn ,expr nil)
-         (http-parse-error () t)
-         (error (e)
-           (format t "  NOTE  ~a caught ~a (not http-parse-error)~%" ,name (type-of e))
-           t))
-       (progn
-         (format t "  PASS  ~a~%" ,name)
-         (incf *tests-passed*))
-       (progn
-         (format t "  FAIL  ~a (expected error, got none)~%" ,name)
-         (incf *tests-failed*)
-         (push ,name *failed-names*))))
+  "Assert that EXPR signals an HTTP-PARSE-ERROR (or any error as fallback).
+   NAME is evaluated once, after EXPR."
+  (let ((signalled (gensym "SIGNALLED"))
+        (label (gensym "NAME")))
+    `(let* ((,signalled (handler-case (progn ,expr nil)
+                          (http-parse-error () :parse-error)
+                          (error (e) (type-of e))))
+            (,label ,name))
+       (when (and ,signalled (not (eq ,signalled :parse-error)))
+         (format t "  NOTE  ~a caught ~a (not http-parse-error)~%" ,label ,signalled))
+       (if ,signalled
+           (progn
+             (format t "  PASS  ~a~%" ,label)
+             (incf *tests-passed*))
+           (progn
+             (format t "  FAIL  ~a (expected error, got none)~%" ,label)
+             (incf *tests-failed*)
+             (push ,label *failed-names*))))))
 
 (defun report-suite (suite-name &optional suffix)
   "Emit the per-suite summary line, preceded by the list of failing
