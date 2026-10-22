@@ -2977,6 +2977,106 @@
                       t)))
              t))))
 
+(defun test-harness-serves-without-tls-e2e ()
+  "The framework starts and serves with web-skeleton-tls absent, the build
+   the demo's image and demo/deploy/run.lisp support.
+
+   The suite runs with TLS loaded, so its absence is made here: the two
+   hooks it registers unset, and SHA1, SHA256 and ECDSA-VERIFY-P256 back on
+   the pure-Lisp versions it swaps out. A live server then answers a plain
+   request; a WebSocket upgrade, whose accept key is SHA-1's; an ES256
+   token, whose hash and signature check are SHA-256's and the pure-Lisp
+   verifier's; and a static file, whose ETag is the SHA-256 of its bytes.
+   An https:// fetch is refused for want of TLS, with a 502, and :THEN
+   hears the cleanup sentinel.
+
+   SETF, not LET: the workers read the hooks, and a function cell is
+   global already."
+  (format t "~%Harness: the framework serves with web-skeleton-tls absent~%")
+  (let ((saved-setup web-skeleton::*tls-outbound-setup-fn*)
+        (saved-stream web-skeleton:*https-stream-fn*)
+        (saved-sha1 (symbol-function 'sha1))
+        (saved-sha256 (symbol-function 'sha256))
+        (saved-ecdsa (symbol-function 'web-skeleton::ecdsa-verify-p256))
+        (saved-cache web-skeleton::*static-cache*)
+        (then-status :never))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*tls-outbound-setup-fn* nil
+                 web-skeleton:*https-stream-fn* nil
+                 (symbol-function 'sha1) #'web-skeleton::sha1-lisp
+                 (symbol-function 'sha256) #'web-skeleton::sha256-lisp
+                 (symbol-function 'web-skeleton::ecdsa-verify-p256)
+                 #'web-skeleton::ecdsa-verify-p256-lisp)
+           (check "without TLS: the suite's own test reads it as absent"
+                  (tls-loaded-p) nil)
+           ;; Built with the pure-Lisp SHA-256 in the cell, as a load
+           ;; without TLS builds it.
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal)
+                 (gethash "/hello.txt" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response
+                  "text/plain; charset=utf-8"
+                  (sb-ext:string-to-octets "hello" :external-format :ascii) 0))
+           (let ((key (%es256-test-key))
+                 (token (%es256-token "{\"alg\":\"ES256\",\"kid\":\"test\"}"
+                                      "{\"sub\":\"no-tls\"}")))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (let ((path (http-request-path req)))
+                      (cond
+                        ((string= path "/ws") :upgrade)
+                        ((string= path "/jwt")
+                         (let ((claims (jwt-verify (get-header req "x-token")
+                                                   (list key))))
+                           (make-text-response
+                            200 (if claims (jwt-claim claims "sub") "refused"))))
+                        ((string= path "/out")
+                         (defer-to-fetch :GET "https://example.test/"
+                           :then (lambda (s h b)
+                                   (declare (ignore h b))
+                                   (setf then-status s)
+                                   (make-text-response 200 "fetched"))))
+                        ((serve-static req))
+                        (t (make-text-response 200 "plain")))))
+                  :ws-handler (lambda (conn frame)
+                                (declare (ignore conn frame))
+                                nil))
+               (multiple-value-bind (status headers body) (test-http-request :get "/")
+                 (declare (ignore headers))
+                 (check "without TLS: a plain request is answered"
+                        (list status body) '(200 "plain")))
+               (multiple-value-bind (socket stream) (%raw-connect)
+                 (unwind-protect
+                      (let ((head (string-downcase (%ws-client-upgrade stream))))
+                        ;; RFC 6455 §1.3's sample key and its accept value.
+                        (check "without TLS: the upgrade's accept key is SHA-1's"
+                               (list (not (null (search "http/1.1 101" head)))
+                                     (not (null (search "s3pplmbitxaq9kygzzhzrbk+xoo=" head))))
+                               '(t t)))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))
+               (multiple-value-bind (status headers body)
+                   (test-http-request :get "/jwt" :headers (list (cons "x-token" token)))
+                 (declare (ignore headers))
+                 (check "without TLS: an ES256 token verifies"
+                        (list status body) '(200 "no-tls")))
+               (multiple-value-bind (status headers body) (test-http-request :get "/hello.txt")
+                 (check "without TLS: a static file is served with its SHA-256 ETag"
+                        (list status body (cdr (assoc "etag" headers :test #'string-equal)))
+                        '(200 "hello"
+                          "\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"")))
+               (multiple-value-bind (status headers body) (test-http-request :get "/out")
+                 (declare (ignore headers body))
+                 (check "without TLS: an https:// fetch is refused 502"
+                        (list status then-status) '(502 nil))))))
+      (setf web-skeleton::*tls-outbound-setup-fn* saved-setup
+            web-skeleton:*https-stream-fn* saved-stream
+            (symbol-function 'sha1) saved-sha1
+            (symbol-function 'sha256) saved-sha256
+            (symbol-function 'web-skeleton::ecdsa-verify-p256) saved-ecdsa
+            web-skeleton::*static-cache* saved-cache))))
+
 (defun test-harness-fetch-stream-plain-write-timeout-e2e ()
   "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
    the request, after *FETCH-TIMEOUT*.
@@ -8711,6 +8811,7 @@
   (test-harness-fetch-bodiless-status-kept-alive-e2e)
   (test-harness-fetch-non-chunked-coding-e2e)
   (test-harness-upstream-header-limits-e2e)
+  (test-harness-serves-without-tls-e2e)
   (test-harness-a-worker-left-behind-stays-with-its-run)
   (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
