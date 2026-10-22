@@ -25,6 +25,14 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Nothing in the container needs a capability: the server binds 8081,
+    # above the privileged ports, as a user that is not root. So none are
+    # kept, and no-new-privileges stops anything it runs from gaining one
+    # through a setuid binary, of which the base image has several.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:8081:8081"
     environment:
