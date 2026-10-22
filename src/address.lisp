@@ -256,9 +256,14 @@
    coverage can be read off rather than inferred, so a prefix added to the
    code and not to this list costs more than one left out of both.
 
-   This helper answers \"is this concrete address safe to dial?\"
-   It does not resolve hostnames. Apps that accept hostnames must
-   resolve first and call this on each resolved address."
+   This helper answers \"is this concrete address safe to dial?\" and
+   resolves nothing. For the addresses a fetch is about to dial, install it
+   through *FETCH-ADDRESS-FILTER*, which runs on the resolution the fetch
+   actually uses. Called directly, it is for an address the app already
+   holds: an allowlist entry, a literal it parsed. Checking what a name
+   resolves to here and then handing the fetch the name checks one
+   resolution and dials another, which an attacker's nameserver can answer
+   differently."
   (case family
     (:inet  (and (= (length bytes) 4)  (ipv4-public-p bytes)))
     (:inet6 (and (= (length bytes) 16) (ipv6-public-p bytes)))

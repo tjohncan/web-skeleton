@@ -352,10 +352,13 @@
    dripping. The same rule cuts off an honest upload that is merely
    slow — at 20 KiB/s, ten seconds is about 200 KiB — with a close and no
    response. Behind a proxy that buffers request bodies the body arrives
-   at once and this never matters; behind one that streams them, raise
-   this to cover the slowest upload you accept, as DEPLOYMENT.md's
-   reverse-proxy section says. A slow download is not cut off: the write
-   path counts a writable socket as activity.")
+   at once and this never matters. Behind one that streams them, accept
+   the bodies you expect from a body handler (BUFFER-BODY, RECEIVE-BODY):
+   an accepted body is timed on its progress, by *BODY-STALL-TIMEOUT*, as
+   DEPLOYMENT.md's reverse-proxy section says. Raising this instead would
+   lengthen every request's budget, a client dripping one included. A
+   slow download is not cut off: the write path counts a writable socket
+   as activity.")
 
 (defparameter *linger-timeout* 2
   "Seconds a connection closed after an early error response may go on
