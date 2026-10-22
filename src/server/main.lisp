@@ -2944,6 +2944,37 @@
         (error "start-server: ~(~a~) is ~s; it must be a positive integer, ~
                 or NIL for the inbound limit's value."
                name value))))
+  ;; Eleventh. The timeouts and intervals the idle sweep, the ping pass,
+  ;; the keepalive tick, the fetch path and the drain read, and the count
+  ;; of missed pongs. Each is read on a worker. A value that is not a
+  ;; number raises there: in the sweep or a tick it reaches RUN-WORKER's
+  ;; backstop, so the worker restarts, dropping every connection it held,
+  ;; and does it again on the next pass; in a fetch it is a 502 that says
+  ;; nothing about the setting. Where a setting's docstring names an off,
+  ;; 0 is it.
+  (loop for (name kind) in '((*idle-timeout* :seconds)
+                             (*ws-idle-timeout* :seconds)
+                             (*ws-message-timeout* :seconds)
+                             (*stream-idle-timeout* :seconds)
+                             (*linger-timeout* :seconds)
+                             (*stream-keepalive-interval* :seconds)
+                             (*dns-cache-ttl* :seconds)
+                             (*drain-timeout* :seconds)
+                             (*ws-ping-interval* :positive-seconds)
+                             (*connect-fallback-delay* :positive-seconds)
+                             (*worker-wake-interval* :positive-seconds)
+                             (*ws-max-missed-pongs* :count))
+        for value = (symbol-value name)
+        unless (ecase kind
+                 (:seconds (and (realp value) (>= value 0)))
+                 (:positive-seconds (and (realp value) (plusp value)))
+                 (:count (and (integerp value) (plusp value))))
+          do (error "start-server: ~(~a~) is ~s; it must be ~a."
+                    name value
+                    (ecase kind
+                      (:seconds "a number of seconds, 0 or more")
+                      (:positive-seconds "a positive number of seconds")
+                      (:count "a positive integer"))))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.

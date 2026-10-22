@@ -12738,6 +12738,47 @@
       (check "log: while DEBUG stays below INFO"
              (search "a line at debug" text) nil))))
 
+(defun test-timing-settings-validated-at-boot ()
+  "START-SERVER refuses a timing setting outside its range, by name: each
+   timeout and interval the idle sweep, the ping pass, the keepalive tick,
+   the fetch path and the drain read, and the count of missed pongs. Read
+   on a worker, a value that is not a number raises there; in the sweep it
+   crashes the worker, dropping every connection it held, a second after
+   the first WebSocket opens.
+
+   Each setting is tried with NIL and with the nearest values outside its
+   range, which are refused, and then with the edge of its range, which
+   passes its check: the refusal that comes then is the invalid :HOST's,
+   TEST-FETCH-TIMEOUT-VALIDATED-AT-BOOT's device, so no server starts
+   either way."
+  (format t "~%start-server: the timing settings are numbers in range~%")
+  (flet ((refusal (name value)
+           (progv (list name) (list value)
+             (attempt (web-skeleton:start-server :host #(1 2 3) :port 0 :workers 1)))))
+    (loop for (name bad edge)
+            in '((web-skeleton:*idle-timeout* (nil -1) 0)
+                 (web-skeleton:*ws-idle-timeout* (nil -1) 0)
+                 (web-skeleton:*ws-message-timeout* (nil -1) 0)
+                 (web-skeleton:*stream-idle-timeout* (nil -1) 0)
+                 (web-skeleton:*linger-timeout* (nil -1) 0)
+                 (web-skeleton:*stream-keepalive-interval* (nil -1) 0)
+                 (web-skeleton:*dns-cache-ttl* (nil -1) 0)
+                 (web-skeleton:*drain-timeout* (nil -1) 0)
+                 (web-skeleton:*ws-ping-interval* (nil 0) 1/2)
+                 (web-skeleton:*connect-fallback-delay* (nil 0) 1/2)
+                 (web-skeleton:*worker-wake-interval* (nil 0) 0.05)
+                 (web-skeleton:*ws-max-missed-pongs* (nil 0 1.5) 1))
+          do (let ((label (string-downcase (symbol-name name))))
+               (dolist (value bad)
+                 (check (format nil "boot: ~a ~s is refused by name" label value)
+                        (let ((msg (refusal name value)))
+                          (and (stringp msg) (search label msg) t))
+                        t))
+               (check (format nil "boot: ~a ~s passes its check" label edge)
+                      (let ((msg (refusal name edge)))
+                        (and (stringp msg) (not (search label msg)) t))
+                      t)))))
+
 (defun test-listen-backlog-reaches-the-listener ()
   "MAKE-TCP-LISTENER listens with *LISTEN-BACKLOG*, and START-SERVER
    refuses one that is not a positive integer.
@@ -15045,6 +15086,7 @@
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
   (test-log-level-validated-at-boot)
+  (test-timing-settings-validated-at-boot)
   (test-listen-backlog-reaches-the-listener)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
