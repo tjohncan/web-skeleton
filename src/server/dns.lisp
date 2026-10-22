@@ -88,9 +88,9 @@
    moves on to the next of them (FALL-BACK-TO-NEXT-ADDRESS), so a caller
    that wants them all waits for getent's output to end.
 
-   Second value: how many parseable addresses policy refused. NIL with a
-   positive count is a policy decision; NIL with zero is a name that did not
-   resolve. Callers must keep giving both the same answer to the client —
+   Second value: how many parseable addresses policy refused, each counted
+   once. NIL with a positive count is a policy decision; NIL with zero is a
+   name that did not resolve. Callers must keep giving both the same answer to the client —
    see below — but they should not give an operator the same answer, and
    without the count they could not tell the two apart.
 
@@ -105,7 +105,9 @@
 
    HOST is the name being resolved; it is used only by the address
    filter and its log line. Every candidate address is gated on
-   *FETCH-ADDRESS-FILTER* before selection. This is the point at which
+   *FETCH-ADDRESS-FILTER* before selection, once: getent can print an
+   address on more than one STREAM line, and the filter is asked about it
+   the first time. This is the point at which
    an address gets *chosen*, so a refusal here means a multi-homed name
    whose first address is refused simply falls through to the next one,
    and a name with no acceptable address returns NIL — indistinguishable
@@ -113,16 +115,20 @@
    than at the connect syscall introduces no new failure mode and keeps
    the fallback behavior for free."
   (let ((line-start 0)
-        ;; Counted so a caller can tell "nothing resolved" from "everything
+        ;; Kept so a caller can tell "nothing resolved" from "everything
         ;; that resolved was refused". Both return NIL, deliberately — the
         ;; client must not learn which — but an operator reading a log is a
         ;; different audience, and sending them to debug a resolver when
         ;; their own filter said no costs an afternoon.
-        (refused 0)
+        (refused '())
         (accepted '()))
-    (flet ((accept (address)
-             (unless (member address accepted :test #'equalp)
-               (push address accepted))))
+    (flet ((consider (address host)
+             ;; ADDRESS to the filter, unless an earlier line printed it.
+             (unless (or (member address accepted :test #'equalp)
+                         (member address refused :test #'equalp))
+               (if (fetch-address-allowed-p (car address) (cdr address) host)
+                   (push address accepted)
+                   (push address refused)))))
       (loop while (< line-start end) do
         (let ((lf (position 10 buf :start line-start :end end)))
           (unless lf (loop-finish))
@@ -153,17 +159,13 @@
                 (when (and stream-token-p addr-str)
                   (let ((v4 (parse-ipv4-literal addr-str)))
                     (when (and v4 (not (%unspecified-address-p v4)))
-                      (if (fetch-address-allowed-p v4 :inet (or host addr-str))
-                          (accept (cons v4 :inet))
-                          (incf refused))))
+                      (consider (cons v4 :inet) (or host addr-str))))
                   (let ((v6 (parse-ipv6-literal addr-str)))
                     (when (and v6 (not (%unspecified-address-p v6)))
-                      (if (fetch-address-allowed-p v6 :inet6 (or host addr-str))
-                          (accept (cons v6 :inet6))
-                          (incf refused))))))))
+                      (consider (cons v6 :inet6) (or host addr-str))))))))
           (setf line-start (1+ lf)))
             finally (let ((all (reverse accepted)))
-                      (return (values (first all) refused all)))))))
+                      (return (values (first all) (length refused) all)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Optional per-worker resolution cache

@@ -1871,10 +1871,11 @@
    a rate budget, to be charged.
 
    getent's output usually arrives in one read and its exit in another,
-   and a lookup that parsed the output at each would ask twice. The fetch
-   is to localhost, so the name's addresses are whatever this host's
-   getent prints for it, one or two; the check is that none is asked about
-   twice in one fetch, the cache off and on.
+   and a lookup that parsed the output at each would ask twice; getent can
+   also print an address on two lines. The fetch is to localhost, so the
+   name's addresses are whatever this host's getent prints for it, one or
+   two, and the check is that none is asked about twice in one fetch, the
+   cache off and on.
 
    The filter and *DNS-CACHE-TTL* are set globally, not bound: the worker
    reads them on a thread START-SERVER spawned."
@@ -1914,14 +1915,16 @@
                  (check (format nil "filter, cache ~:[off~;on~]: three fetches answered"
                                 (plusp ttl))
                         (mapcar #'first fetches) '(200 200 200))
-                 (check (format nil "filter, cache ~:[off~;on~]: each address asked once a fetch"
-                                (plusp ttl))
-                        (loop for (nil asked) in fetches
-                              always (and asked
-                                          (= (length asked)
-                                             (length (remove-duplicates
-                                                      asked :test #'string=)))))
-                        t)))))
+                 ;; Against the same lists with any repeat taken out, so a
+                 ;; failure prints what was asked.
+                 (let ((asked (mapcar #'second fetches)))
+                   (check (format nil "filter, cache ~:[off~;on~]: each address asked once a fetch"
+                                  (plusp ttl))
+                          (list (notany #'null asked) asked)
+                          (list t (mapcar (lambda (a)
+                                            (remove-duplicates a :test #'string=
+                                                                 :from-end t))
+                                          asked))))))))
       (setf web-skeleton:*fetch-address-filter* saved-filter
             web-skeleton:*dns-cache-ttl* saved-ttl))))
 

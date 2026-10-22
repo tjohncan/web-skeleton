@@ -8943,7 +8943,9 @@
   "A name's addresses after the first are kept, to fall back on: by
    PARSE-GETENT-OUTPUT as its third value, every accepted STREAM address
    in the order getent printed it, each once; and by the DNS cache, which
-   hands them back still filtered."
+   hands them back still filtered. getent can print an address on more
+   than one line, and the filter is asked about it once, the refused one
+   as well as the accepted."
   (format t "~%DNS: every address a name resolves to is kept~%")
   (let* ((out (format nil "::1             STREAM localhost~%~
                            ::1             DGRAM~%~
@@ -8951,11 +8953,14 @@
                            127.0.0.1       STREAM~%~
                            127.0.0.1       DGRAM~%~
                            127.0.0.1       STREAM~%~
+                           10.0.0.9        STREAM~%~
                            127.0.0.2       STREA"))
          (buf (sb-ext:string-to-octets out :external-format :ascii))
+         (asked '())
          (web-skeleton:*fetch-address-filter*
            (lambda (ip family host)
              (declare (ignore family host))
+             (push (coerce ip 'list) asked)
              ;; 10.0.0.9 is refused, as a policy might.
              (not (equalp ip #(10 0 0 9))))))
     (multiple-value-bind (first refused all)
@@ -8966,8 +8971,11 @@
       (check "getent: every accepted STREAM address, in order, each once"
              (mapcar (lambda (a) (list (coerce (car a) 'list) (cdr a))) all)
              '(((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) ((127 0 0 1) :inet)))
-      (check "getent: the refused one counted, and a line not yet ended not read"
-             refused 1)))
+      (check "getent: the refused one counted once, though printed twice, and a line not yet ended not read"
+             refused 1)
+      (check "getent: the filter asked about each address once, however often printed"
+             (reverse asked)
+             '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) (10 0 0 9) (127 0 0 1)))))
   (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
         (web-skeleton::*dns-cache-ttl* 60)
         (fallbacks (list (cons (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (*)))
