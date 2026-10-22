@@ -432,8 +432,8 @@
             (return (nreverse segments)))))))
 
 (defun path-either-spelling-byte-p (byte)
-  "T for a byte a path may carry either as itself or as an uppercase %XX
-   escape, naming the same path both ways.
+  "T for a byte a path may carry either as itself or as a %XX escape,
+   naming the same path both ways.
 
    These are [ ] : @ and the RFC 3986 sub-delims ! $ & ' ( ) * + , ; =. A
    browser writes them as themselves in a path it builds, but a page that
@@ -446,36 +446,48 @@
        t))
 
 (defun canonical-path (path)
-  "PATH with each uppercase %XX escape of a byte PATH-EITHER-SPELLING-BYTE-P
-   accepts replaced by the byte itself, and nothing else changed. This is
-   the form in which MATCH-PATH, under :EXACT, and SERVE-STATIC compare a
-   path, so the two read every request the same way.
+  "PATH with each %XX escape's hex digits in uppercase, each escape of a
+   byte PATH-EITHER-SPELLING-BYTE-P accepts replaced by the byte itself,
+   and nothing else changed. This is the form in which MATCH-PATH, under
+   :EXACT, and SERVE-STATIC compare a path, so the two read every request
+   the same way.
 
-   Every other escape, and every byte written as itself, is left as it
-   arrived. So /a%5B1%5D and /a[1] are one path, while /%61dmin stays
-   apart from /admin, %2F stays inside its segment, and lowercase hex is
-   not a second spelling of an escape. An application checking the raw
-   path against a literal compares CANONICAL-PATH of it, which is the
-   router's reading."
+   Uppercase because RFC 3986 §2.1 makes the case of an escape's hex
+   digits no part of the URI, and §6.2.2.1 normalizes it to uppercase: a
+   proxy that writes %c3%a9, as Apache httpd's re-encoding does, names the
+   path a browser writes as %C3%A9. Every other escape, and every byte
+   written as itself, is left as it arrived. So /a%5B1%5D, /a%5b1%5d and
+   /a[1] are one path, while /%61dmin stays apart from /admin and %2F
+   stays inside its segment. An application checking the raw path against
+   a literal compares CANONICAL-PATH of it, which is the router's
+   reading."
   (if (not (find #\% path))
       path
-      (flet ((upper-hex (c)
+      ;; ASCII hex only: DIGIT-CHAR-P would take other scripts' digits.
+      (flet ((hex (c)
                (cond ((char<= #\0 c #\9) (- (char-code c) 48))
-                     ((char<= #\A c #\F) (- (char-code c) 55)))))
+                     ((char<= #\A c #\F) (- (char-code c) 55))
+                     ((char<= #\a c #\f) (- (char-code c) 87)))))
         (with-output-to-string (out)
           (let ((len (length path))
                 (i 0))
             (loop while (< i len)
                   do (let* ((c (char path i))
                             (hi (and (char= c #\%) (< (+ i 2) len)
-                                     (upper-hex (char path (1+ i)))))
-                            (lo (and hi (upper-hex (char path (+ i 2)))))
+                                     (hex (char path (1+ i)))))
+                            (lo (and hi (hex (char path (+ i 2)))))
                             (byte (and lo (logior (ash hi 4) lo))))
-                       (if (and byte (path-either-spelling-byte-p byte))
-                           (progn (write-char (code-char byte) out)
-                                  (incf i 3))
-                           (progn (write-char c out)
-                                  (incf i))))))))))
+                       (cond ((null byte)
+                              (write-char c out)
+                              (incf i))
+                             ((path-either-spelling-byte-p byte)
+                              (write-char (code-char byte) out)
+                              (incf i 3))
+                             (t
+                              (write-char #\% out)
+                              (write-char (char-upcase (char path (1+ i))) out)
+                              (write-char (char-upcase (char path (+ i 2))) out)
+                              (incf i 3))))))))))
 
 (defparameter *match-path-literals* :exact
   "How MATCH-PATH compares a pattern's literal segments with a path's.

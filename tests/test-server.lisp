@@ -2739,21 +2739,37 @@
   (check "literals :exact: and its decoded spelling does not match"
          (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") nil)
   ;; The punctuation a page's encodeURIComponent escapes reads either way,
-  ;; on both sides, as CANONICAL-PATH says — and only that punctuation, in
-  ;; uppercase hex.
+  ;; on both sides, as CANONICAL-PATH says, and only that punctuation; an
+  ;; escape's hex digits read in either case.
   (check "literals :exact: an escaped bracket matches the literal one"
          (match-path "/chunks/[id].js" "/chunks/%5Bid%5D.js") t)
   (check "literals :exact: and a pattern may be written escaped"
          (match-path "/chunks/%5Bid%5D.js" "/chunks/[id].js") t)
   (check "literals :exact: every sub-delim and : @ read either way"
          (match-path "/a!$&'()*+,;=:@b" "/a%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40b") t)
-  (check "literals :exact: lowercase hex is not a second spelling"
-         (match-path "/chunks/[id].js" "/chunks/%5bid%5d.js") nil)
+  ;; RFC 3986 §2.1: the case of an escape's hex digits is no part of the
+  ;; URI. A proxy re-encoding in lowercase names the same path.
+  (check "literals :exact: lowercase hex is the same spelling"
+         (match-path "/chunks/[id].js" "/chunks/%5bid%5d.js") t)
+  (check "literals :exact: and so is a lowercase non-ASCII escape"
+         (match-path "/caf%C3%A9" "/caf%c3%a9") t)
+  (check "literals :exact: in a pattern too"
+         (match-path "/caf%c3%A9" "/caf%C3%a9") t)
+  (check "literals :exact: but an escaped letter in lowercase hex still does not match"
+         (match-path "/jobs" "/%6aobs") nil)
   (check "literals :exact: an escaped slash stays inside its segment"
          (match-path "/a/b" "/a%2Fb") nil)
-  (check "canonical-path: decodes only that punctuation"
+  (check "literals :exact: in lowercase hex too"
+         (match-path "/a/b" "/a%2fb") nil)
+  (check "canonical-path: decodes only that punctuation, in either case"
          (web-skeleton:canonical-path "/%5Bx%5D/%61%2F%25%20%3a")
-         "/[x]/%61%2F%25%20%3a")
+         "/[x]/%61%2F%25%20:")
+  (check "canonical-path: every other escape has its hex in uppercase"
+         (web-skeleton:canonical-path "/caf%c3%a9/%2e%2f%6a%Ab")
+         "/caf%C3%A9/%2E%2F%6A%AB")
+  (check "canonical-path: a % that starts no escape is left as it is"
+         (web-skeleton:canonical-path "/100%/%g1/%a")
+         "/100%/%g1/%a")
   (check "canonical-path: a path with no escape is returned as is"
          (let ((p "/plain/path")) (eq (web-skeleton:canonical-path p) p))
          t)
@@ -5087,9 +5103,15 @@
                              ("/100%25.txt" :served)
                              ("/icon@2x.txt" :served)
                              ("/icon%402x.txt" :served)
-                             ;; And spellings no browser sends.
-                             ("/caf%c3%a9.txt" 404)
-                             ("/vault%5b1%5d.txt" 404)
+                             ;; Lowercase hex, as a proxy may re-encode a
+                             ;; path: the same spellings, and the guard
+                             ;; covers the bracketed one there too.
+                             ("/caf%c3%a9.txt" :served)
+                             ("/vault%5b1%5d.txt" 403)
+                             ("/admin%2ehtml" 404)
+                             ("/admin%2freport.txt" 404)
+                             ("/ad%6din.html" 404)
+                             ;; And a spelling no browser sends.
                              ("/100%.txt" 404)))
                (destructuring-bind (target expected) spec
                  (check (format nil "static spelling: ~a" target)
@@ -5107,10 +5129,13 @@
                   ("/a+b,c;d=e:f@g!h" "/a+b,c;d=e:f@g!h")
                   ("/a%2Bb%2Cc%3Bd%3De%3Af%40g%21h" "/a+b,c;d=e:f@g!h")
                   ("/%5Bid%5D-abc.js" "/[id]-abc.js")
-                  ("/%5bid%5d-abc.js" nil)
+                  ("/%5bid%5d-abc.js" "/[id]-abc.js")
                   ("/%61dmin.html" nil)
+                  ("/ad%6din.html" nil)
                   ("/%2E%2E/x" nil)
-                  ("/caf%c3%a9" nil)
+                  ("/%2e%2e/x" nil)
+                  ("/caf%c3%a9" ,(format nil "/caf~c" (code-char #xE9)))
+                  ("/caf%C3%a9" ,(format nil "/caf~c" (code-char #xE9)))
                   ("/100%" nil)
                   ("/100%2" nil)
                   ("/a\"b" nil)

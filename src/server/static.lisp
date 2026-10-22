@@ -773,15 +773,17 @@
 
 (defun static-path-spelling (raw)
   "The file path RAW names, decoded, or NIL when RAW is not a spelling of
-   it that a browser sends.
+   it that a browser sends, up to the case of an escape's hex digits.
 
    Each byte is escaped or written as itself, as STATIC-ESCAPE-REQUIRED-P
-   says, and an escape uses uppercase hex digits. The one exception is the
+   says. An escape's hex digits may be in either case: RFC 3986 §2.1
+   counts the two as one URI, CANONICAL-PATH reads them as one path, and a
+   proxy may re-encode a path in lowercase. The one exception is the
    punctuation PATH-EITHER-SPELLING-BYTE-P names, which a page's own
    script may escape and a browser then sends as written, so either
    spelling is accepted. Any other spelling — an escaped letter, digit,
-   '.' or '/' (%61, %2E, %2F), lowercase hex, a % that starts no escape,
-   or a byte written as itself that has to be escaped — names no file.
+   '.' or '/' (%61, %2E, %2F), a % that starts no escape, or a byte
+   written as itself that has to be escaped — names no file.
 
    That is what lets SERVE-STATIC sit behind a router. URL-DECODE maps
    /admin.html, /%61dmin.html and /admin%2Ehtml to one file, and a
@@ -793,16 +795,18 @@
   (let ((out (make-array (length raw) :element-type '(unsigned-byte 8)
                                       :fill-pointer 0))
         (len (length raw)))
-    (flet ((upper-hex (c)
+    ;; ASCII hex only, as in CANONICAL-PATH.
+    (flet ((hex (c)
              (cond ((char<= #\0 c #\9) (- (char-code c) 48))
-                   ((char<= #\A c #\F) (- (char-code c) 55)))))
+                   ((char<= #\A c #\F) (- (char-code c) 55))
+                   ((char<= #\a c #\f) (- (char-code c) 87)))))
       (loop with i = 0
             while (< i len)
             do (let ((c (char-code (char raw i))))
                  (cond
                    ((= c #x25)
-                    (let ((hi (and (< (+ i 2) len) (upper-hex (char raw (1+ i)))))
-                          (lo (and (< (+ i 2) len) (upper-hex (char raw (+ i 2))))))
+                    (let ((hi (and (< (+ i 2) len) (hex (char raw (1+ i)))))
+                          (lo (and (< (+ i 2) len) (hex (char raw (+ i 2))))))
                       (unless (and hi lo)
                         (return-from static-path-spelling nil))
                       (let ((b (logior (ash hi 4) lo)))

@@ -376,9 +376,10 @@ tests/
   the server's side, with a close frame when the peer has room for one
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
-  A file is served at the spellings of its path a browser sends, which the
-  router reads as one, and at no other, so a route in front of it sees what
-  it serves (DEPLOYMENT.md, "Routes in front of static files").
+  A file is served at the spellings of its path a browser sends, with an
+  escape's hex digits in either case, which the router reads as one, and
+  at no other, so a route in front of it sees what it serves
+  (DEPLOYMENT.md, "Routes in front of static files").
   MIME detection (including `application/wasm`, without which browsers refuse
   `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),

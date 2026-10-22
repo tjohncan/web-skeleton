@@ -97,16 +97,20 @@ request's path the same way. They do:
 - `match-path` compares a pattern's literal segments with that spelling
   under the default `*match-path-literals*` of `:exact` (with its decoding
   under `:decoded`), and decodes captures. Under `:exact` both sides are
-  read through `canonical-path`, which decodes one thing: an uppercase
-  escape of `[ ] : @ ! $ & ' ( ) * + , ; =`. Those may be written either
-  way, because a page that builds its URLs with `encodeURIComponent`
-  escapes them, as Next.js does for its asset paths.
+  read through `canonical-path`, which puts each escape's hex digits in
+  uppercase and decodes one thing: an escape of
+  `[ ] : @ ! $ & ' ( ) * + , ; =`. Those may be written either way,
+  because a page that builds its URLs with `encodeURIComponent` escapes
+  them, as Next.js does for its asset paths. The case of the hex is no
+  part of the URI (RFC 3986 §2.1), and a proxy may re-encode a path in
+  lowercase, as Apache httpd does, so `/caf%c3%a9` and `/caf%C3%A9` are
+  one path.
 - `serve-static` serves a file at the spellings of its path a browser
   sends. A byte is escaped where a browser escapes it (space, `"`, `#`,
   `%`, `<`, `>`, `?`, `` ` ``, `{`, `}`, controls and non-ASCII), with
-  uppercase hex, the punctuation above is either escaped or not, and every
-  other byte is written as itself. `/%61dmin.html`, `/admin%2Ehtml`,
-  `/admin%2Freport.txt` and `/caf%c3%a9.html` name no file.
+  hex in either case, the punctuation above is either escaped or not, and
+  every other byte is written as itself. `/%61dmin.html`, `/admin%2Ehtml`
+  and `/admin%2Freport.txt` name no file, in either case of hex.
 
 So every spelling that reaches a file is one the router reads the same way,
 and a guard's literal covers all of them. An application that checks the
