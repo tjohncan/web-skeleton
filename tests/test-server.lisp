@@ -13965,6 +13965,55 @@
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client)))))
+  ;; The same from a ws-handler, with a frame behind the one it closes on:
+  ;; the read ends at the close, and nothing is armed on a descriptor that
+  ;; is gone, which would fail and be logged as the server's own error.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (calls 0)
+          (log (make-string-output-stream)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*max-write-backlog* 64)
+                  (web-skeleton:*log-stream* log)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (get-universal-time)))
+                  (frames (concatenate '(vector (unsigned-byte 8))
+                                       (%ws-client-frame 1 "bye")
+                                       (%ws-client-frame 1 "after"))))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (web-skeleton::connection-append-write
+              conn (make-array 64 :element-type '(unsigned-byte 8)
+                                  :initial-element 65))
+             (let ((out (sb-bsd-sockets:socket-make-stream
+                         client :output t :element-type '(unsigned-byte 8))))
+               (write-sequence frames out)
+               (finish-output out))
+             (%await-arrival fd :bytes (length frames))
+             (web-skeleton::handle-client-read
+              conn epfd nil
+              (lambda (c frame)
+                (declare (ignore frame))
+                (incf calls)
+                (web-skeleton:ws-close c)
+                nil))
+             (check "ws-close from a handler at the bound: closed, the handler called once"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd conn)
+                          calls)
+                    (list nil -1 1))
+             (check "ws-close from a handler at the bound: and nothing logged as an error"
+                    (search "error fd" (get-output-stream-string log))
+                    nil))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
   ;; Off a worker there is no loop to carry the close out.
   (check "ws-close: refused off a worker"
          (let ((web-skeleton::*epoll-fd* nil))
@@ -13974,6 +14023,90 @@
                       :closed)
              (error () :refused)))
          :refused))
+
+(defun test-ws-close-from-a-handler-e2e ()
+  "A ws-handler that closes its own connection with WS-CLOSE ends the read
+   it was called in. The client gets the close frame with the code asked
+   for and then the end of the connection, and nothing else: not a reply
+   to a frame that followed in the same read, not the pong to a ping
+   there, not the reply the closing handler returned.
+
+   Three connections, each sending its frames in one write. On the first,
+   a later frame's handler would return its echo. On the second it would
+   send the echo with WS-SEND, which refuses a closing connection, so the
+   handler would raise, and the raise would close the connection without
+   the close frame. On the third, the closing handler returns a reply of
+   its own."
+  (format t "~%ws-close from a ws-handler: nothing follows its close frame~%")
+  (let ((lock (sb-thread:make-mutex :name "ws-close-handled"))
+        (handled nil))
+    (with-test-server
+        (:workers 1
+         :handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (conn frame)
+                       (let ((text (sb-ext:octets-to-string
+                                    (web-skeleton::ws-frame-payload frame)
+                                    :external-format :utf-8)))
+                         (sb-thread:with-mutex (lock) (push text handled))
+                         (cond
+                           ((string= text "bye") (ws-close conn 1000) nil)
+                           ((string= text "bye, with a reply")
+                            (ws-close conn 1000)
+                            (build-ws-text "late"))
+                           ((string= text "send")
+                            (ws-send conn (build-ws-text "echo"))
+                            nil)
+                           (t (build-ws-text "echo"))))))
+      (flet ((exchange (&rest frames)
+               ;; FRAMES in one write on a fresh WebSocket. Returns (values
+               ;; OPCODES CODE LEFTOVER REASON HANDLED): the opcodes of the
+               ;; frames read to the end of the connection, the close
+               ;; frame's code, the bytes after the last whole frame, why the
+               ;; read ended, and the messages the handler was called for.
+               (sb-thread:with-mutex (lock) (setf handled nil))
+               (let* ((sock (connect-to-test-server))
+                      (stream (sb-bsd-sockets:socket-make-stream
+                               sock :input t :output t
+                                    :element-type '(unsigned-byte 8))))
+                 (unwind-protect
+                      (progn
+                        (%ws-client-upgrade stream)
+                        (write-sequence (apply #'concatenate
+                                               '(vector (unsigned-byte 8)) frames)
+                                        stream)
+                        (force-output stream)
+                        (multiple-value-bind (all reason)
+                            (read-until-bounded stream :seconds 3)
+                          (let ((pos 0) (fill (fill-pointer all))
+                                (opcodes nil) (code nil))
+                            ;; Server frames are unmasked, and these are short.
+                            (loop while (< (1+ pos) fill)
+                                  do (let ((op (logand (aref all pos) #x0F))
+                                           (len (logand (aref all (1+ pos)) #x7F)))
+                                       (when (> (+ pos 2 len) fill) (return))
+                                       (push op opcodes)
+                                       (when (and (= op 8) (>= len 2))
+                                         (setf code (logior (ash (aref all (+ pos 2)) 8)
+                                                            (aref all (+ pos 3)))))
+                                       (incf pos (+ 2 len))))
+                            (values (nreverse opcodes) code (- fill pos) reason
+                                    (sb-thread:with-mutex (lock) (reverse handled))))))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+        (check "a later frame's returned echo: the close frame, then the end, and nothing else"
+               (multiple-value-list
+                (exchange (%ws-client-frame 1 "bye") (%ws-client-frame 1 "after")
+                          (%ws-client-frame 9 "p")))
+               '((8) 1000 0 :eof ("bye")))
+        (check "a later frame's echo by ws-send: the same, the close frame not lost"
+               (multiple-value-list
+                (exchange (%ws-client-frame 1 "bye") (%ws-client-frame 1 "send")
+                          (%ws-client-frame 9 "p")))
+               '((8) 1000 0 :eof ("bye")))
+        (check "the closing handler's own reply is not sent either"
+               (multiple-value-list
+                (exchange (%ws-client-frame 1 "bye, with a reply")))
+               '((8) 1000 0 :eof ("bye, with a reply")))))))
 
 (defun test-ws-message-deadline-e2e ()
   "A peer that begins a fragmented message and never finishes it is closed
@@ -14886,6 +15019,7 @@
   (test-ws-send-refuses-a-foreign-connection)
   (test-ws-send-refuses-a-closing-websocket)
   (test-ws-close)
+  (test-ws-close-from-a-handler-e2e)
   (test-ws-message-deadline-e2e)
   (test-ws-upgrade-shapes-the-101)
   (test-ws-upgrade-subprotocol-e2e)

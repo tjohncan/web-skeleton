@@ -661,6 +661,11 @@
    peer at *MAX-WRITE-BACKLOG* has no room for the close frame either, and
    is not reading, so it is closed at once rather than waited on.
 
+   Called from a ws-handler, it ends the handling of that read: the reply
+   the handler returns is not sent, and no frame after the one it was
+   called for is handled, since nothing may follow the close frame (RFC
+   6455 §5.5.1).
+
    Refused, as WS-SEND refuses, for a connection this worker does not own
    and for one that is not an open WebSocket, :CLOSING included: a close
    frame is already on its way there. Refused too off a worker, since the
@@ -730,10 +735,17 @@
    while a later message in the same read was handled, and the order a
    peer saw would turn on how TCP had segmented its writes.
 
+   A ws-handler that closes its own connection, with WS-CLOSE, ends the
+   read there. Nothing may follow a close frame (RFC 6455 §5.5.1), so the
+   reply that handler returned is not sent, and no later frame in the
+   same read is handled, a ping's pong included.
+
    Returns (VALUES :CLOSE CLOSE-FRAME) when the connection should close —
    the caller queues the frame behind the replies already there —
-   :BACKLOG-FULL when a reply was refused at *MAX-WRITE-BACKLOG*, and NIL
-   otherwise."
+   :BACKLOG-FULL when a reply was refused at *MAX-WRITE-BACKLOG*, :CLOSED
+   when a ws-handler closed the connection outright, as WS-CLOSE does a
+   peer with no room for its frame, and NIL otherwise, a close a
+   ws-handler began included: its frame is queued and armed."
   (let ((buf (connection-read-buf conn))
         (pos 0)
         (end (connection-read-pos conn)))
@@ -744,6 +756,22 @@
                ;; lands behind them.
                (ws-shift-buffer conn buf pos end)
                (values :close (build-ws-close code)))
+             (handled (frame)
+               ;; FRAME to the ws-handler, and its reply onto the queue —
+               ;; unless the handler closed the connection, which ends the
+               ;; read: what is left in the buffer is moot.
+               (let ((reply (funcall ws-handler conn frame)))
+                 (unless (eq (connection-state conn) :websocket)
+                   (ws-shift-buffer conn buf pos end)
+                   (return-from websocket-on-read
+                     (if (minusp (connection-fd conn)) :closed nil)))
+                 (let ((response (check-ws-reply reply)))
+                   ;; A reply is a frame handed to this connection as
+                   ;; surely as one from WS-SEND, and it does not pass
+                   ;; through WS-SEND, so it is counted here.
+                   (when response
+                     (note-ws-frame)
+                     (queue-reply response)))))
              (queue-reply (bytes)
                ;; A peer already at *MAX-WRITE-BACKLOG* is not draining.
                ;; Dropping the reply would leave the application's view of
@@ -819,14 +847,7 @@
                    (setf (connection-last-active conn) (get-universal-time)
                          (connection-ws-message-at conn) 0)
                    (when ws-handler
-                     (let ((response (check-ws-reply
-                                      (funcall ws-handler conn frame))))
-                       ;; A reply is a frame handed to this connection as
-                       ;; surely as one from WS-SEND, and it does not pass
-                       ;; through WS-SEND, so it is counted here.
-                       (when response
-                         (note-ws-frame)
-                         (queue-reply response)))))
+                     (handled frame)))
                  ;; First fragment — start accumulating. Enforce the
                  ;; message-size cap on the starting size too, not
                  ;; only on continuation accumulation, so apps that
@@ -884,16 +905,11 @@
                    (return-from websocket-on-read (close-with 1007)))
                  (setf (connection-last-active conn) (get-universal-time)
                        (connection-ws-message-at conn) 0)
-                 (let ((complete (make-ws-frame
-                                  :fin t
-                                  :opcode (connection-ws-frag-opcode conn)
-                                  :payload payload)))
-                   (when ws-handler
-                     (let ((response (check-ws-reply
-                                      (funcall ws-handler conn complete))))
-                       (when response
-                         (note-ws-frame)
-                         (queue-reply response))))))))
+                 (when ws-handler
+                   (handled (make-ws-frame
+                             :fin t
+                             :opcode (connection-ws-frag-opcode conn)
+                             :payload payload))))))
             ;; Control frames (can arrive between fragments per RFC 6455 §5.4)
             ((= opcode +ws-op-ping+)
              (log-debug "ws ping from client fd ~d" (connection-fd conn))

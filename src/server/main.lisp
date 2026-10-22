@@ -1870,6 +1870,11 @@
                              (connection-write-pending conn))
                    (close-connection conn epoll-fd)
                    (return-from handle-client-read))
+                  ;; The ws-handler closed the connection outright, as
+                  ;; WS-CLOSE does a peer with no room for its close frame:
+                  ;; there is nothing left to arm.
+                  ((eq response :closed)
+                   (return-from handle-client-read))
                   ;; If the buffer is at capacity, no frame was consumed —
                   ;; consuming one shifts the rest down — so a partial
                   ;; frame exceeds our limit: close with 1009 to prevent a
