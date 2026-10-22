@@ -10,27 +10,30 @@
 
 (defun test-sha1 ()
   (format t "~%SHA-1~%")
+  ;; Through ATTEMPT, so a digest that raises fails its check rather than
+  ;; ending the run. With every word in the rounds typed, a fault there is
+  ;; likelier to raise a type error than to return a wrong digest.
+  (flet ((digest (text)
+           (attempt (sha1-hex (sb-ext:string-to-octets text)))))
+    ;; FIPS 180-4 one-block message
+    (check "abc"
+           (digest "abc")
+           "a9993e364706816aba3e25717850c26c9cd0d89d")
 
-  ;; FIPS 180-4 one-block message
-  (check "abc"
-         (sha1-hex (sb-ext:string-to-octets "abc"))
-         "a9993e364706816aba3e25717850c26c9cd0d89d")
+    ;; FIPS 180-4 two-block message
+    (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+           (digest "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+           "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
 
-  ;; FIPS 180-4 two-block message
-  (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-         (sha1-hex (sb-ext:string-to-octets
-                    "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
-         "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    ;; Empty string
+    (check "empty string"
+           (digest "")
+           "da39a3ee5e6b4b0d3255bfef95601890afd80709")
 
-  ;; Empty string
-  (check "empty string"
-         (sha1-hex (sb-ext:string-to-octets ""))
-         "da39a3ee5e6b4b0d3255bfef95601890afd80709")
-
-  ;; Single character
-  (check "single char 'a'"
-         (sha1-hex (sb-ext:string-to-octets "a"))
-         "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8"))
+    ;; Single character
+    (check "single char 'a'"
+           (digest "a")
+           "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Base64 test vectors (RFC 4648 §10)
@@ -75,34 +78,36 @@
 
 (defun test-base64-decode ()
   (format t "~%Base64 Decode~%")
+  ;; A decode that should succeed goes through ATTEMPT, so one that raises
+  ;; fails its check rather than ending the run.
 
   ;; RFC 4648 §10 round-trips
   (check "empty"
-         (sb-ext:octets-to-string (base64-decode "") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "") :external-format :utf-8))
          "")
 
   (check "f"
-         (sb-ext:octets-to-string (base64-decode "Zg==") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zg==") :external-format :utf-8))
          "f")
 
   (check "fo"
-         (sb-ext:octets-to-string (base64-decode "Zm8=") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm8=") :external-format :utf-8))
          "fo")
 
   (check "foo"
-         (sb-ext:octets-to-string (base64-decode "Zm9v") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9v") :external-format :utf-8))
          "foo")
 
   (check "foob"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYg==") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYg==") :external-format :utf-8))
          "foob")
 
   (check "fooba"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYmE=") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYmE=") :external-format :utf-8))
          "fooba")
 
   (check "foobar"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8))
          "foobar")
 
   ;; Invalid: single character (6 bits, can't form a byte)
@@ -116,17 +121,17 @@
     ;; must be zero or one byte string has sixteen spellings: "QQ" and
     ;; "QR" differ only in bits the decoder never emits.
     (check "2-char group: canonical trailing bits accepted"
-           (bytes-to-hex (base64-decode "QQ")) "41")
+           (attempt (bytes-to-hex (base64-decode "QQ"))) "41")
     (check "2-char group: non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64-decode "QR"))) t)
     (check "3-char group: canonical trailing bits accepted"
-           (bytes-to-hex (base64-decode "QUE")) "4141")
+           (attempt (bytes-to-hex (base64-decode "QUE"))) "4141")
     (check "3-char group: non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64-decode "QUF"))) t)
     ;; Padded spellings of those same two groups. Padding and the bit
     ;; check are separate guards, so each verdict has to survive both.
     (check "padded 2-char group accepted"
-           (bytes-to-hex (base64-decode "QQ==")) "41")
+           (attempt (bytes-to-hex (base64-decode "QQ=="))) "41")
     (check "padded non-canonical 2-char group rejected"
            (signals-error-p (lambda () (base64-decode "QR=="))) t)
 
@@ -151,6 +156,8 @@
 
 (defun test-base64url ()
   (format t "~%Base64url~%")
+  ;; A decode that should succeed goes through ATTEMPT, as in
+  ;; TEST-BASE64-DECODE.
 
   ;; URL-safe encode: no padding, - instead of +, _ instead of /
   (check "url encode no padding"
@@ -164,18 +171,18 @@
 
   ;; URL-safe decode: handles missing padding
   (check "url decode no padding"
-         (sb-ext:octets-to-string (base64url-decode "Zg") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64url-decode "Zg") :external-format :utf-8))
          "f")
 
   (check "url decode with - and _"
-         (bytes-to-hex (base64url-decode "s3pPLMBiTxaQ9kYGzzhZRbK-xOo"))
+         (attempt (bytes-to-hex (base64url-decode "s3pPLMBiTxaQ9kYGzzhZRbK-xOo")))
          (sha1-hex (sb-ext:string-to-octets
                     "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
 
   ;; Round-trip: encode then decode
   (let ((data (sb-ext:string-to-octets "the quick brown ankle leaps over the lazy heel")))
     (check "url round-trip"
-           (bytes-to-hex (base64url-decode (base64url-encode data)))
+           (attempt (bytes-to-hex (base64url-decode (base64url-encode data))))
            (bytes-to-hex data)))
 
   ;; Invalid: single character rejected
@@ -197,18 +204,18 @@
       (check "signature segment is 86 chars (2-char final group)"
              (mod (length sig) 4) 2)
       (check "signature segment decodes to 64 bytes"
-             (length (base64url-decode sig)) 64)
+             (attempt (length (base64url-decode sig))) 64)
       ;; Canonical input has exactly one spelling, and it is the one the
       ;; encoder produces — so decode is injective over what it accepts.
       (check "signature segment round-trips to its own spelling"
-             (base64url-encode (base64url-decode sig)) sig)
+             (attempt (base64url-encode (base64url-decode sig))) sig)
       (check "non-canonical twin of a signature segment rejected"
              (signals-error-p (lambda () (base64url-decode twin))) t))
 
     ;; base64url omits padding, so unpadded input stays legal — the new
     ;; padding guard must not have quietly made it mandatory.
     (check "url unpadded 2-char group still accepted"
-           (bytes-to-hex (base64url-decode "QQ")) "41")
+           (attempt (bytes-to-hex (base64url-decode "QQ"))) "41")
     (check "url non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64url-decode "QR"))) t)))
 
@@ -218,27 +225,28 @@
 
 (defun test-sha256 ()
   (format t "~%SHA-256~%")
+  ;; Through ATTEMPT, for the reason TEST-SHA1 gives.
+  (flet ((digest (text)
+           (attempt (sha256-hex (sb-ext:string-to-octets text)))))
+    ;; FIPS 180-4 one-block message
+    (check "abc"
+           (digest "abc")
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
 
-  ;; FIPS 180-4 one-block message
-  (check "abc"
-         (sha256-hex (sb-ext:string-to-octets "abc"))
-         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    ;; FIPS 180-4 two-block message
+    (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+           (digest "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
 
-  ;; FIPS 180-4 two-block message
-  (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-         (sha256-hex (sb-ext:string-to-octets
-                      "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
-         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    ;; Empty string
+    (check "empty string"
+           (digest "")
+           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 
-  ;; Empty string
-  (check "empty string"
-         (sha256-hex (sb-ext:string-to-octets ""))
-         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-
-  ;; Single character
-  (check "single char 'a'"
-         (sha256-hex (sb-ext:string-to-octets "a"))
-         "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"))
+    ;; Single character
+    (check "single char 'a'"
+           (digest "a")
+           "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; ECDSA P-256 verification tests

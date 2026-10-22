@@ -102,24 +102,28 @@
       (error "base64: invalid padding (~d '=' in ~d characters)" pad-len len))
     (when (= (mod data-len 4) 1)
       (error "base64: invalid input length ~d" len))
-    (let ((out (make-array (* 3 (ceiling data-len 4))
-                            :element-type '(unsigned-byte 8)
-                            :fill-pointer 0)))
-      (loop with i = 0
-            while (< i data-len)
-            do (let ((vals (loop for j from 0 below 4
-                                 collect (if (< (+ i j) data-len)
-                                             (let ((code (char-code (char string (+ i j)))))
-                                               (or (and (< code 128)
-                                                        (aref decode-table code))
-                                                   (error "base64: invalid character ~a at ~d"
-                                                          (char string (+ i j)) (+ i j))))
-                                             0))))
-                 (let ((triplet (logior (ash (first vals) 18)
-                                        (ash (second vals) 12)
-                                        (ash (third vals) 6)
-                                        (fourth vals)))
-                       (chars-present (min (- data-len i) 4)))
+    ;; Six bits a character, so the output's length is known before any of
+    ;; it is decoded, and the result is allocated at that length once.
+    (let ((out (make-array (floor (* 3 data-len) 4)
+                           :element-type '(unsigned-byte 8)))
+          (o 0))
+      (flet ((value-at (at)
+               ;; The value of the character at AT, or 0 past the data,
+               ;; which is how a short final group is read.
+               (if (< at data-len)
+                   (let ((code (char-code (char string at))))
+                     (or (and (< code 128) (aref decode-table code))
+                         (error "base64: invalid character ~a at ~d"
+                                (char string at) at)))
+                   0)))
+        (loop with i = 0
+              while (< i data-len)
+              do (let* ((v0 (value-at i))
+                        (v1 (value-at (+ i 1)))
+                        (v2 (value-at (+ i 2)))
+                        (v3 (value-at (+ i 3)))
+                        (triplet (logior (ash v0 18) (ash v1 12) (ash v2 6) v3))
+                        (chars-present (min (- data-len i) 4)))
                    ;; RFC 4648 §3.5: the bits of the final group that fall
                    ;; past the last whole octet carry nothing and MUST be
                    ;; zero. Only the final group can be short, so only it
@@ -131,17 +135,20 @@
                    ;; replay cache, rate-limit bucket, audit line) sees two
                    ;; different tokens where the crypto sees one.
                    (case chars-present
-                     (2 (unless (zerop (logand (second vals) #x0F))
+                     (2 (unless (zerop (logand v1 #x0F))
                           (error "base64: non-canonical trailing bits")))
-                     (3 (unless (zerop (logand (third vals) #x03))
+                     (3 (unless (zerop (logand v2 #x03))
                           (error "base64: non-canonical trailing bits"))))
-                   (vector-push (logand #xFF (ash triplet -16)) out)
+                   (setf (aref out o) (logand #xFF (ash triplet -16)))
+                   (incf o)
                    (when (> chars-present 2)
-                     (vector-push (logand #xFF (ash triplet -8)) out))
+                     (setf (aref out o) (logand #xFF (ash triplet -8)))
+                     (incf o))
                    (when (> chars-present 3)
-                     (vector-push (logand #xFF triplet) out)))
-                 (incf i 4)))
-      (subseq out 0 (fill-pointer out)))))
+                     (setf (aref out o) (logand #xFF triplet))
+                     (incf o))
+                   (incf i 4))))
+      out)))
 
 (defun base64-decode (string)
   "Decode a base64 string (standard alphabet) into a byte vector."

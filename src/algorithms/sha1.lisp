@@ -18,8 +18,12 @@
 ;;;   Rounds 60-79: Parity(b,c,d) = b XOR c XOR d                  K = CA62C1D6
 ;;; ---------------------------------------------------------------------------
 
+(declaim (inline sha1-f sha1-k))
+
 (defun sha1-f (round b c d)
   "SHA-1 logical function for the given ROUND index."
+  (declare (type (integer 0 79) round)
+           (type (unsigned-byte 32) b c d))
   (cond
     ((< round 20) (logior (logand b c)
                           (logand (logxor b #xFFFFFFFF) d)))
@@ -29,6 +33,7 @@
 
 (defun sha1-k (round)
   "SHA-1 constant for the given ROUND index."
+  (declare (type (integer 0 79) round))
   (cond
     ((< round 20) #x5A827999)
     ((< round 40) #x6ED9EBA1)
@@ -83,10 +88,18 @@
    the reuse saves is GC pressure on a busy server more than time. Every
    W slot is written before it is read (0-15 from the block, 16-79
    derived from those), so reuse needs no clearing. SHA1-LISP allocates W
-   per call, so concurrent digests never share one."
+   per call, so concurrent digests never share one.
+
+   Every word is declared (UNSIGNED-BYTE 32), so the masked sums and
+   rotations are machine arithmetic. Optimized for speed at the default
+   safety, so the declarations are checked where values enter and an
+   index is still bounds-checked: the FIPS and RFC vectors, and the corpus
+   checked against OpenSSL, are what hold the arithmetic to the standard."
   (declare (type (simple-array (unsigned-byte 8) (*)) data)
            (type (simple-array (unsigned-byte 32) (*)) w)
-           (type fixnum start))
+           (type fixnum start)
+           (type (unsigned-byte 32) h0 h1 h2 h3 h4)
+           (optimize speed))
   ;; First 16 words: read from the block as big-endian 32-bit integers
   (loop for i of-type fixnum from 0 below 16
         for offset of-type fixnum = (+ start (* i 4))
@@ -106,6 +119,7 @@
                   1)))
   ;; Initialize working variables
   (let ((a h0) (b h1) (c h2) (d h3) (e h4))
+    (declare (type (unsigned-byte 32) a b c d e))
     ;; 80 rounds
     (loop for i of-type fixnum from 0 below 80
           do (let ((temp (u32+ (u32-rotate-left a 5)
