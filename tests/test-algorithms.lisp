@@ -718,7 +718,7 @@
   ;; it must return those bytes — a RANDOM-BYTES that ignored the
   ;; binding would return four bytes from /dev/urandom instead, and
   ;; every check above would still pass.
-  (let ((path (merge-pathnames "tests/tmp-urandom.bin" (truename "."))))
+  (let ((path (scratch-path "ws-urandom" ".bin")))
     (unwind-protect
          (progn
            (with-open-file (s path :direction :output

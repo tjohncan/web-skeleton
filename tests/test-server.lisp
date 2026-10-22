@@ -4671,8 +4671,8 @@
   ;;                     resolve to empty string — skipped by design)
   ;; Also verifies :CACHE-CONTROL function form receives the URL
   ;; path for per-file tailoring.
-  (let* ((scratch (merge-pathnames "tests/tmp-static/"
-                                    (truename ".")))
+  (let* ((scratch (sb-ext:parse-native-namestring
+                   (scratch-path "ws-static-aliases" "/")))
          (cc-seen nil))
     (ensure-directories-exist (merge-pathnames "sub/" scratch))
     (ensure-directories-exist (merge-pathnames ".well-known/" scratch))
@@ -5045,7 +5045,7 @@
 
    Requests go through PARSE-REQUEST, so the path is the parser's."
   (format t "~%Static: a guard covers every spelling that reaches the file~%")
-  (let* ((dir (format nil "/tmp/ws-static-spelling-~36r/" (random (expt 36 10))))
+  (let* ((dir (scratch-path "ws-static-spelling" "/"))
          (saved-cache web-skeleton::*static-cache*)
          (crlf (format nil "~c~c" #\Return #\Newline))
          (e-acute (string (code-char #xE9))))
@@ -5158,7 +5158,7 @@
    The key set is compared whole, so an escaped key fails the check
    rather than sitting beside the right one unnoticed."
   (format t "~%Static: names that are pathname syntax~%")
-  (let* ((dir (format nil "/tmp/ws-static-syntax-~36r/" (random (expt 36 10))))
+  (let* ((dir (scratch-path "ws-static-syntax" "/"))
          (saved-cache web-skeleton::*static-cache*)
          (crlf (format nil "~c~c" #\Return #\Newline)))
     (flet ((write-file (name text)
@@ -5401,7 +5401,7 @@
            (refused-p '(("glb" . "model/gltf-binary") . "x")) t))
   ;; Through a load: the type reaches the file's response, and a malformed
   ;; table is refused at the load rather than at the first request.
-  (let ((dir (format nil "/tmp/ws-static-mime-~36r/" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-static-mime" "/"))
         (saved-cache web-skeleton::*static-cache*))
     (unwind-protect
          (progn
@@ -6645,7 +6645,7 @@
 
 (defun test-write-queue-drain ()
   (format t "~%Write queue drain~%")
-  (let ((path "/tmp/web-skeleton-write-queue.bin"))
+  (let ((path (scratch-path "ws-write-queue" ".bin")))
     (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
            (str (v) (sb-ext:octets-to-string v :external-format :ascii))
            (slurp ()

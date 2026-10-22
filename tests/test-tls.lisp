@@ -248,7 +248,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    a name, so the test needs one. A LET suffices: TLS-CONNECT is blocking
    and reads this special on this thread."
   (format t "~%TLS end to end~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -356,7 +356,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    The peer is s_server in relay mode with a stdin that never speaks: it
    completes the handshake, reads the request, and has nothing to relay."
   (format t "~%TLS: a blocking read that times out says so~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -429,7 +429,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    framed by the close, then the lines, then the end of its input, which
    it answers with close_notify."
   (format t "~%TLS: a blocking stream outlasts collections on another thread~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (expected (loop for i below 6 collect (format nil "line ~d" i))))
     (unwind-protect
          (progn
@@ -540,7 +540,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    record and leave the rest pending. One record larger than one buffer is
    the condition; this arranges several."
   (format t "~%TLS SSL_pending discipline~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -698,7 +698,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    SSL_ERROR_SSL, OpenSSL's bad-write-retry. That is this ruling
    demonstrated rather than argued."
   (format t "~%TLS write retry across a GC~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -775,7 +775,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    while its socket buffer fills, and a retry that never happens cannot
    demonstrate that the address held still across it. Review-verified."
   (format t "~%TLS connection write path~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -893,7 +893,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    other thread to rescue it: whether the fast
    request is served at all is the entire question."
   (format t "~%HTTPS relay does not hold the worker~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -1141,7 +1141,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    address is not it. That refusal is the reason this test needs a
    resolver at all."
   (format t "~%HTTPS fetch through the event loop~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -1215,7 +1215,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is where that branch is
    pinned. This one covers the boundaries."
   (format t "~%HTTPS fetch :on-body chunk boundaries~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -1298,7 +1298,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    drain stopped by a full buffer can leave bytes there with nothing on
    the socket to wake the connection again."
   (format t "~%HTTPS: an :on-body relay carries more than the cap~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*)
         (saved-cap web-skeleton:*max-outbound-response-size*)
         (corpus (%relay-corpus 40 8192)))
@@ -1383,7 +1383,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    The DNS hook is set globally rather than bound: the worker that reads it
    is a thread WITH-TEST-SERVER spawned, and a binding would not reach it."
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn

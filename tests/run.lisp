@@ -130,6 +130,24 @@
   "CRLF string for constructing test request data.")
 
 ;;; ---------------------------------------------------------------------------
+;;; Scratch paths
+;;; ---------------------------------------------------------------------------
+
+(defvar *scratch-random* (make-random-state t)
+  "The random state scratch names are drawn from, seeded from the system
+   when the suite loads. The default *RANDOM-STATE* starts out the same in
+   every fresh image, so names drawn from it repeat from one run to the
+   next, and two runs on one host would pick the same ones.")
+
+(defun scratch-path (prefix &optional (suffix ""))
+  "A path under /tmp that no other run picks: PREFIX, this process's id and
+   a random number, then SUFFIX, \"/\" for a directory or a type such as
+   \".bin\" for a file. Under /tmp rather than beside the code, so a run
+   cut short leaves nothing in the source tree."
+  (format nil "/tmp/~a-~d-~36r~a" prefix (sb-unix:unix-getpid)
+          (random (expt 36 10) *scratch-random*) suffix))
+
+;;; ---------------------------------------------------------------------------
 ;;; Reaching into the optional TLS system
 ;;;
 ;;; Two helpers rather than one, and using both together is the point.
