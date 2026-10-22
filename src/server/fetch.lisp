@@ -207,6 +207,34 @@
    operate on one line at a time and never buffer the whole
    response.")
 
+;;; An upstream's response head is held to these, a client's request head
+;;; to the inbound knobs they default to. Apart, so an upstream that sends
+;;; more than a client may, a CDN's long Set-Cookie or Link line or its
+;;; hundred and first field, can be let through without widening what
+;;; every client may send. NIL takes the inbound knob's value, so raising
+;;; that one still raises both. Both upstream readers, buffered and
+;;; streaming, take them from UPSTREAM-HEADER-LIMITS, so the two agree.
+
+(defparameter *max-upstream-header-count* nil
+  "Max header fields in an upstream's response head, or NIL, the default,
+   for *MAX-HEADER-COUNT*'s value.")
+
+(defparameter *max-upstream-header-line-length* nil
+  "Max length of one field line in an upstream's response head, or NIL,
+   the default, for *MAX-HEADER-LINE-LENGTH*'s value. The status line is
+   allowed as much in RESPONSE-HEAD-BUDGET.")
+
+(defparameter *max-upstream-total-header-bytes* nil
+  "Max field-line bytes in an upstream's response head, or NIL, the
+   default, for *MAX-TOTAL-HEADER-BYTES*'s value.")
+
+(defun upstream-header-limits ()
+  "(values COUNT LINE-LENGTH TOTAL-BYTES) an upstream's response head is
+   held to: each *MAX-UPSTREAM-* knob, or the inbound knob it defaults to."
+  (values (or *max-upstream-header-count* *max-header-count*)
+          (or *max-upstream-header-line-length* *max-header-line-length*)
+          (or *max-upstream-total-header-bytes* *max-total-header-bytes*)))
+
 (defun http-fetch (method url &key headers body then on-body content-length)
   "Create an outbound HTTP request descriptor.
    Return this from a handler to initiate a non-blocking outbound call.
@@ -777,22 +805,30 @@
    An upstream's field value that is not valid UTF-8 is read as Latin-1
    rather than refused; BYTES-TO-STRING-OR-LATIN-1 says why the response
    side differs from the request side. Every other check is
-   PARSE-HEADERS-BYTES' own, the same as a request head gets."
+   PARSE-HEADERS-BYTES' own, the same as a request head gets, against
+   UPSTREAM-HEADER-LIMITS rather than the inbound knobs."
   (let ((first-crlf (scan-crlf buf start header-end)))
     (when first-crlf
-      (parse-headers-bytes buf (+ first-crlf 2) (+ header-end 4)
-                           :invalid-utf-8 :latin-1))))
+      (multiple-value-bind (count line-length total-bytes) (upstream-header-limits)
+        ;; Bound, the way RECEIVE-MULTIPART holds a part's head to its own
+        ;; limits, for this parse only.
+        (let ((*max-header-count* count)
+              (*max-header-line-length* line-length)
+              (*max-total-header-bytes* total-bytes))
+          (parse-headers-bytes buf (+ first-crlf 2) (+ header-end 4)
+                               :invalid-utf-8 :latin-1))))))
 
 (defun response-head-budget ()
-  "How long one response head may grow before it ends: a status line of
-   *MAX-HEADER-LINE-LENGTH*, *MAX-TOTAL-HEADER-BYTES* of field lines and
-   the CRLFs around them. No head PARSE-HEADERS-BYTES would accept is
-   longer, so a head still unended past this never will be accepted. The
-   streaming reader (READER-READ-HEAD) and the buffered one
-   (OUTBOUND-RESPONSE-HEAD) both refuse at this length, so the two cannot
-   disagree about how long a head may be."
-  (+ *max-header-line-length* *max-total-header-bytes*
-     (* 2 (+ *max-header-count* 2))))
+  "How long one response head may grow before it ends: a status line as
+   long as a field line may be, the field lines' total and the CRLFs
+   around them, all as UPSTREAM-HEADER-LIMITS has them. No head
+   PARSE-RESPONSE-HEADERS would accept is longer, so a head still unended
+   past this never will be accepted. The streaming reader
+   (READER-READ-HEAD) and the buffered one (OUTBOUND-RESPONSE-HEAD) both
+   refuse at this length, so the two cannot disagree about how long a
+   head may be."
+  (multiple-value-bind (count line-length total-bytes) (upstream-header-limits)
+    (+ line-length total-bytes (* 2 (+ count 2)))))
 
 (defun parse-response-head (buf start header-end)
   "Read the final response head in BUF that begins at START and whose

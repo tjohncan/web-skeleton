@@ -2849,6 +2849,134 @@
                   (list status (reverse lines))
                   (list 200 (list body)))))))))
 
+(defun test-harness-upstream-header-limits-e2e ()
+  "An upstream's response head is held to the *MAX-UPSTREAM-* knobs, a
+   client's request head to the inbound ones, and both upstream readers
+   agree.
+
+   Each head is past an inbound default: a field line over 8 KiB, a
+   hundred and one fields, field lines over 64 KiB in all. At the
+   defaults HTTP-FETCH answers 502 and HTTP-FETCH-STREAM raises; with the
+   upstream knob raised, both read the response. Raised, it does not widen
+   what a client may send, and left NIL it follows the inbound knob, so a
+   deployment that raised that one for its upstreams keeps them.
+
+   SETF, not LET: the buffered fetch is read on the worker and the
+   streaming one on %TIMED's thread, and a binding crosses neither."
+  (format t "~%Harness: an upstream's head is held to its own limits~%")
+  (let* ((long-line (concatenate 'string "X-Long: " (make-string 9000 :initial-element #\a)))
+         (many-fields (loop for i from 1 to 101 collect (format nil "X-F~d: v" i)))
+         (big-lines (loop for i from 1 to 10
+                          collect (format nil "X-B~d: ~a" i
+                                          (make-string 7500 :initial-element #\b))))
+         (saved (list web-skeleton:*max-upstream-header-count*
+                      web-skeleton:*max-upstream-header-line-length*
+                      web-skeleton:*max-upstream-total-header-bytes*
+                      web-skeleton:*max-header-line-length*)))
+    (labels ((head (lines)
+               (apply #'%crlf "HTTP/1.1 200 OK"
+                      (append lines (list "Connection: close" ""))))
+             (buffered (head)
+               ;; HTTP-FETCH's answer to the client: (code body).
+               (let ((result nil))
+                 (%call-with-scripted-upstream
+                  (list head "ok")
+                  (lambda (port)
+                    (with-test-server
+                        (:handler
+                         (lambda (req)
+                           (declare (ignore req))
+                           (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                             :then (lambda (s h b)
+                                     (declare (ignore s h))
+                                     (make-text-response
+                                      200 (if b
+                                              (sb-ext:octets-to-string
+                                               b :external-format :latin-1)
+                                              ""))))))
+                      (multiple-value-bind (code headers reply)
+                          (handler-case (test-http-request :get "/relay")
+                            (error (e) (values nil nil (princ-to-string e))))
+                        (declare (ignore headers))
+                        (setf result (list code (if (eql code 200) reply :refused)))))))
+                 result))
+             (streamed (head)
+               ;; HTTP-FETCH-STREAM's answer: (status lines), or :REFUSED
+               ;; when it raised.
+               (let ((result nil))
+                 (%call-with-scripted-upstream
+                  (list head "ok")
+                  (lambda (port)
+                    (let* ((lines nil)
+                           (status (%timed 10 (lambda ()
+                                                (http-fetch-stream
+                                                 :get (format nil "http://127.0.0.1:~d/x" port)
+                                                 :on-line (lambda (line) (push line lines)))))))
+                      (setf result (if (integerp status)
+                                       (list status (reverse lines))
+                                       :refused)))))
+                 result))
+             (reset ()
+               (setf web-skeleton:*max-upstream-header-count* nil
+                     web-skeleton:*max-upstream-header-line-length* nil
+                     web-skeleton:*max-upstream-total-header-bytes* nil
+                     web-skeleton:*max-header-line-length* (fourth saved))))
+      (unwind-protect
+           (progn
+             (dolist (case (list (list "a field line over 8 KiB" (list long-line)
+                                       '*max-upstream-header-line-length* 16384)
+                                 (list "101 fields" many-fields
+                                       '*max-upstream-header-count* 200)
+                                 (list "field lines over 64 KiB" big-lines
+                                       '*max-upstream-total-header-bytes* (* 128 1024))))
+               (destructuring-bind (name lines knob value) case
+                 (reset)
+                 (check (format nil "upstream head, ~a: refused at the defaults" name)
+                        (list (buffered (head lines)) (streamed (head lines)))
+                        '((502 :refused) :refused))
+                 (setf (symbol-value knob) value)
+                 (check (format nil "upstream head, ~a: read with ~(~a~) raised" name knob)
+                        (list (buffered (head lines)) (streamed (head lines)))
+                        '((200 "ok") (200 ("ok"))))))
+             ;; Raised for the upstream, the client's limit stays put.
+             (reset)
+             (setf web-skeleton:*max-upstream-header-line-length* 16384)
+             (with-test-server
+                 (:handler (lambda (req) (declare (ignore req))
+                             (make-text-response 200 "ok")))
+               (check "upstream head: a client's long line is still refused"
+                      (let ((answer (%exchange-or-why
+                                     (%ascii (concatenate 'string
+                                                          "GET / HTTP/1.1" *crlf*
+                                                          "Host: x" *crlf*
+                                                          long-line *crlf* *crlf*)))))
+                        (and (stringp answer) (search "HTTP/1.1 431" answer) t))
+                      t))
+             ;; Left NIL, the upstream limit is the inbound knob's.
+             (reset)
+             (setf web-skeleton:*max-header-line-length* 16384)
+             (check "upstream head: NIL follows the inbound knob"
+                    (buffered (head (list long-line)))
+                    '(200 "ok")))
+        (setf web-skeleton:*max-upstream-header-count* (first saved)
+              web-skeleton:*max-upstream-header-line-length* (second saved)
+              web-skeleton:*max-upstream-total-header-bytes* (third saved)
+              web-skeleton:*max-header-line-length* (fourth saved))))
+    ;; Checked at the start, on the calling thread, so a LET reaches it.
+    ;; The invalid :HOST, as in the other boot checks, keeps a reverted
+    ;; check from starting a server.
+    (dolist (name '(*max-upstream-header-count*
+                    *max-upstream-header-line-length*
+                    *max-upstream-total-header-bytes*))
+      (check (format nil "boot: ~(~a~) as a string is refused by name" name)
+             (progv (list name) (list "100")
+               (let ((msg (attempt (web-skeleton:start-server
+                                    :host #(1 2 3) :port 0 :workers 1))))
+                 (and (stringp msg)
+                      (search (string-downcase (symbol-name name)) msg)
+                      t)))
+             t))))
+
 (defun test-harness-fetch-stream-plain-write-timeout-e2e ()
   "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
    the request, after *FETCH-TIMEOUT*.
@@ -8582,6 +8710,7 @@
   (test-harness-fetch-stream-plain-write-timeout-e2e)
   (test-harness-fetch-bodiless-status-kept-alive-e2e)
   (test-harness-fetch-non-chunked-coding-e2e)
+  (test-harness-upstream-header-limits-e2e)
   (test-harness-a-worker-left-behind-stays-with-its-run)
   (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)

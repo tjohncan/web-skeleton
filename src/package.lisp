@@ -145,6 +145,9 @@
            #:*max-outbound-response-size*
            #:*max-streaming-line-size*
            #:*max-interim-responses*
+           #:*max-upstream-header-count*
+           #:*max-upstream-header-line-length*
+           #:*max-upstream-total-header-bytes*
            #:*json-max-depth*
            #:*json-max-string-length*
            #:*max-ws-payload-size*

@@ -2929,6 +2929,16 @@
     (error "start-server: *listen-backlog* is ~s; it must be a positive ~
             integer (the kernel clamps it to net.core.somaxconn)."
            *listen-backlog*))
+  ;; Tenth. Read when an upstream's head arrives, so a bad value would fail
+  ;; every fetch with a 502 that says nothing about the setting.
+  (dolist (name '(*max-upstream-header-count*
+                  *max-upstream-header-line-length*
+                  *max-upstream-total-header-bytes*))
+    (let ((value (symbol-value name)))
+      (unless (or (null value) (and (integerp value) (plusp value)))
+        (error "start-server: ~(~a~) is ~s; it must be a positive integer, ~
+                or NIL for the inbound limit's value."
+               name value))))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
