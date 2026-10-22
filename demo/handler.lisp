@@ -44,6 +44,17 @@
    It is fixed for the life of the process, and the page it lands on is a
    cached file.")
 
+(defvar *public-url* nil
+  "The demo's own public URL, absolute, or NIL when the deployment has not
+   said what it is.
+
+   Open Graph consumers want an absolute og:image, and some ignore a relative
+   one, but the server cannot know the name it is reached by: behind a proxy,
+   the Host a request carries is the proxy's business, and a guess baked into
+   a cached page would be wrong for everyone it was wrong for once. So the
+   tag is written only when the deployment supplies the URL, and left out
+   otherwise.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Self-address for the /demo-fetch example
 ;;; ---------------------------------------------------------------------------
@@ -329,10 +340,7 @@
    and refusing the shape costs one comparison."
   (cond
     ((null *backlink-url*) "")
-    ((not (or (and (> (length *backlink-url*) 8)
-                   (string= "https://" *backlink-url* :end2 8))
-              (and (> (length *backlink-url*) 7)
-                   (string= "http://" *backlink-url* :end2 7))))
+    ((not (%http-url-p *backlink-url*))
      (log-warn "backlink ignored: ~s is not an http or https URL"
                *backlink-url*)
      "")
@@ -340,6 +348,25 @@
      (format nil "<a class=\"backlink\" href=\"~a\">&#8627; ~a</a>"
              (%escape-html-attr *backlink-url*)
              (%escape-html-attr (%backlink-display *backlink-url*))))))
+
+(defun %http-url-p (url)
+  "T if URL begins with http:// or https:// and has something after it."
+  (or (and (> (length url) 8) (string= "https://" url :end2 8))
+      (and (> (length url) 7) (string= "http://" url :end2 7))))
+
+(defun %og-image-html ()
+  "The og:image tag, with the image's absolute URL under *PUBLIC-URL*, or
+   the empty string when no public URL was given or it is not an http or
+   https one. Empty for the reason %BACKLINK-HTML gives: the placeholder is
+   replaced either way."
+  (cond
+    ((null *public-url*) "")
+    ((not (%http-url-p *public-url*))
+     (log-warn "public URL ignored: ~s is not an http or https URL" *public-url*)
+     "")
+    (t
+     (format nil "<meta property=\"og:image\" content=\"~a/og-image.png\">"
+             (%escape-html-attr (string-right-trim "/" *public-url*))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The bench — refusals, run against the real parser
@@ -1332,7 +1359,7 @@
 
 (defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
                         (instance (bytes-to-hex (random-bytes 2)))
-                        backlink)
+                        backlink public-url)
   "Start the demo server.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
@@ -1353,6 +1380,9 @@
    to the collection; a page served from nowhere in particular should not
    invent one.
 
+   PUBLIC-URL is the demo's own absolute URL, or NIL. Given, the page carries
+   an og:image under it; see *PUBLIC-URL*.
+
    The pages are read from demo/static/ beside the demo's system definition,
    wherever the process was started, and a directory with no index.html is
    refused rather than served as an empty site.
@@ -1370,7 +1400,8 @@
   (setf *demo-host* (%self-fetch-host host)
         *demo-port* port)
   (setf *instance* instance
-        *backlink-url* backlink)
+        *backlink-url* backlink
+        *public-url* public-url)
   (setf *started-at* (get-universal-time)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0)
@@ -1401,7 +1432,8 @@
     (load-static-files static
                        :substitutions
                        `(("robots.txt" ("are smart" . "robots are cool and smart"))
-                         ("index.html" ("__BACKLINK__" . ,(%backlink-html))))))
+                         ("index.html" ("__BACKLINK__" . ,(%backlink-html))
+                                       ("__OG_IMAGE__" . ,(%og-image-html))))))
   ;; The fan-out can only be as prompt as the workers wake: a worker with no
   ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
   ;; returns. The default second is fine for a server and far too slow for a

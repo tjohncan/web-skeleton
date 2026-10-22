@@ -65,17 +65,24 @@ function connect(onOpen) {
   }
   appendLog('[status] connecting...', 'status');
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  ws = new WebSocket(proto + location.host + '/ws');
-  ws.onopen = function() {
+  // Each handler below acts only while SOCK is still the page's socket. A
+  // post made while the last one is closing opens this one, and that one's
+  // events, its close above all, must not land here: clearing this socket's
+  // worker row, counting a reconnect, scheduling another.
+  const sock = new WebSocket(proto + location.host + '/ws');
+  ws = sock;
+  sock.onopen = function() {
+    if (sock !== ws) return;
     reconnectAttempts = 0;
     appendLog('[status] connected', 'status');
     // Ask which worker owns this socket. Binary, because the bulletin box
     // sends text and only text — so a control frame cannot collide with
     // anything a visitor is able to type, in either direction.
-    ws.send(new TextEncoder().encode('worker'));
+    sock.send(new TextEncoder().encode('worker'));
     if (onOpen) onOpen();
   };
-  ws.onmessage = function(e) {
+  sock.onmessage = function(e) {
+    if (sock !== ws) return;
     // A posted line is four fields on three TABs — sequence, stamp, sender,
     // text — parsed below.
     //
@@ -116,7 +123,8 @@ function connect(onOpen) {
       appendLog(e.data, 'recv');
     }
   };
-  ws.onclose = function() {
+  sock.onclose = function() {
+    if (sock !== ws) return;
     // The worker and handle belonged to that socket. A reconnect may land on
     // another worker under a new serial, and asks again when it opens; until
     // then — and for good, once reconnecting gives up — no row is this page's
@@ -129,13 +137,25 @@ function connect(onOpen) {
       appendLog('[status] disconnected — reconnecting (' + reconnectAttempts + '/' + maxReconnectAttempts + ')...', 'status');
       setTimeout(connect, 2000);
     } else {
-      appendLog('[status] disconnected', 'status');
+      // A post opens a socket from here, so the line says how to get back.
+      appendLog('[status] disconnected — post a line to reconnect', 'status');
     }
   };
-  ws.onerror = function(e) {
+  sock.onerror = function(e) {
+    if (sock !== ws) return;
     appendLog('[error] connection error', 'err');
   };
 }
+
+// Back in view after reconnecting gave up: one more try, as a post would make,
+// so a page left in a background tab through an outage finds its way back.
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'visible'
+      && reconnectAttempts >= maxReconnectAttempts
+      && (!ws || ws.readyState === 3)) {
+    connect();
+  }
+});
 
 // No local echo. Your own line arrives the way everyone else's does — posted
 // to the shared buffer, then handed out by each worker on its own next tick.
@@ -273,6 +293,9 @@ function showPanel(name) {
   Array.prototype.forEach.call(tabs.querySelectorAll('.tab'), function (t) {
     const on = t.getAttribute('data-panel') === name;
     t.setAttribute('aria-selected', on ? 'true' : 'false');
+    // Roving tabindex, as WAI-ARIA's tabs pattern has it: Tab reaches the
+    // selected tab and leaves the list, and the arrow keys move within it.
+    t.tabIndex = on ? 0 : -1;
   });
   ['x-ray', 'x-periments'].forEach(function (id) {
     document.getElementById(id).hidden = (id !== name);
@@ -283,6 +306,25 @@ function showPanel(name) {
 tabs.addEventListener('click', function (e) {
   const t = e.target.closest('.tab');
   if (t) showPanel(t.getAttribute('data-panel'));
+});
+
+// Left and Right move to the neighbouring tab, wrapping; Home and End to the
+// first and the last. The tab moved to is selected as it takes focus, the
+// pattern's automatic activation: both panels are already in the page, so
+// showing one costs nothing.
+tabs.addEventListener('keydown', function (e) {
+  const all = Array.prototype.slice.call(tabs.querySelectorAll('.tab'));
+  const at = all.indexOf(document.activeElement);
+  if (at < 0) return;
+  let to = null;
+  if (e.key === 'ArrowRight') to = (at + 1) % all.length;
+  else if (e.key === 'ArrowLeft') to = (at - 1 + all.length) % all.length;
+  else if (e.key === 'Home') to = 0;
+  else if (e.key === 'End') to = all.length - 1;
+  if (to === null) return;
+  e.preventDefault();
+  all[to].focus();
+  showPanel(all[to].getAttribute('data-panel'));
 });
 
 

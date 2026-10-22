@@ -81,7 +81,8 @@
 ;; WS_BACKLINK_URL is WS_ prefixed like the rest of this file's variables,
 ;; though it is the same idea as a BACKLINK_URL an operator may already set
 ;; elsewhere. Absent means absent: no link is rendered, rather than a link to
-;; nowhere.
+;; nowhere. WS_PUBLIC_URL, the demo's own public URL, is the same: given, the
+;; page carries an og:image under it, and absent it carries none.
 (defun env-string (name)
   (let ((v (sb-ext:posix-getenv name)))
     (and v (plusp (length v)) v)))
@@ -92,4 +93,5 @@
          :port     (env-int  "WS_PORT" 8081)
          :workers  (env-int  "WS_WORKERS" 4)
          :backlink (env-string "WS_BACKLINK_URL")
+         :public-url (env-string "WS_PUBLIC_URL")
          (when instance (list :instance instance))))

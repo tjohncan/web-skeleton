@@ -105,6 +105,27 @@
                  (format nil "~a, as the fetch path reads the URL" why))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The og:image tag: absolute under the public URL the deployment gives, and
+;;; left out when it gives none, or gives something that is not http(s).
+;;; ---------------------------------------------------------------------------
+
+(format t "~%The og:image tag~%")
+(flet ((og (url)
+         (let ((web-skeleton-demo::*public-url* url))
+           (web-skeleton-demo::%og-image-html))))
+  (owed (og nil) "" "no public URL, no tag")
+  (owed (og "https://demo.example.com/")
+        "<meta property=\"og:image\" content=\"https://demo.example.com/og-image.png\">"
+        "a public URL, the image under it")
+  (owed (og "https://demo.example.com")
+        "<meta property=\"og:image\" content=\"https://demo.example.com/og-image.png\">"
+        "the same without a trailing slash")
+  (owed (og "https://demo.example.com/a\"b&c")
+        "<meta property=\"og:image\" content=\"https://demo.example.com/a&quot;b&amp;c/og-image.png\">"
+        "a quote and an ampersand escaped")
+  (owed (og "javascript:alert(1)") "" "not http or https, no tag"))
+
+;;; ---------------------------------------------------------------------------
 ;;; Before START-DEMO, and an empty batch for the fan-out.
 ;;; ---------------------------------------------------------------------------
 

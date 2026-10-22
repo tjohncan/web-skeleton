@@ -117,7 +117,7 @@ h2 {
   color: var(--bone-dim);
   border-collapse: collapse;
   width: 100%;
-  max-width: 40em;
+  max-width: 64em;
 }
 
 .limbs th {
@@ -319,7 +319,6 @@ h2 {
    fixed-width, so the slack lands in the third, which is the one that grows. */
 .scroll-x { overflow-x: auto; }
 
-.limbs { max-width: 64em; }
 .limbs th:nth-child(1), .limbs td:nth-child(1),
 .limbs th:nth-child(2), .limbs td:nth-child(2) { white-space: nowrap; }
 .limbs th:nth-child(1), .limbs td:nth-child(1) { width: 5em; }
