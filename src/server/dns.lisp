@@ -202,7 +202,10 @@
 
    The cache holds successes only, and never outlives a policy change:
    *FETCH-ADDRESS-FILTER* is re-consulted on every cache hit, so a cached
-   address cannot become a way around the filter.")
+   address cannot become a way around the filter.
+
+   Whole seconds, since an entry's expiry is a time of day in seconds;
+   START-SERVER refuses a fraction.")
 
 (defparameter *dns-cache-max-entries* 256
   "Maximum hostnames cached per worker. On overflow, expired entries are

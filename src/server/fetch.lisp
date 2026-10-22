@@ -80,7 +80,9 @@
   (answer nil))
 
 (defparameter *fetch-timeout* 30
-  "Seconds. A total on the HTTP-FETCH path, both schemes: the inbound
+  "Seconds, whole: the fetch path adds it to GET-UNIVERSAL-TIME, and
+   START-SERVER refuses a fraction. A total on the HTTP-FETCH path, both
+   schemes: the inbound
    parks in :AWAITING and the reaper bounds the whole exchange, handshake
    included, however many reads and writes it took.
 
@@ -2086,7 +2088,12 @@
    Connection Attempt Delay: an address that has not answered in that time
    has lost a SYN at least once, and a black-holed one, such as an IPv6
    route that goes nowhere, would otherwise hold the fetch to its whole
-   *FETCH-TIMEOUT*. The last address is given the rest of that.")
+   *FETCH-TIMEOUT*. The last address is given the rest of that.
+
+   Whole seconds, since the event loop's connect deadline is a time of
+   day in seconds: START-SERVER refuses a fraction, RFC 8305's 250 ms
+   included, rather than let it fail every fetch to a name with more than
+   one address.")
 
 (defun blocking-connect-to-any (addresses port &key socket-setup)
   "Connect, blocking, to the first of ADDRESSES, (IP . FAMILY) in order,

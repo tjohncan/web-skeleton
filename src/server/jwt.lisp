@@ -10,7 +10,9 @@
 
 (defparameter *jwt-clock-skew* 60
   "Seconds of clock skew tolerance for JWT exp/nbf checks.
-   Accounts for clock drift between the token issuer and this server.")
+   Accounts for clock drift between the token issuer and this server.
+   Whole seconds: added to the clock, a fraction would turn it into a
+   float that resolves only to minutes, so START-SERVER refuses one.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWKS parsing

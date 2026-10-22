@@ -829,7 +829,10 @@
            (/= *worker-generation* *run-generation*))))
 
 (defparameter *drain-timeout* 5
-  "Seconds to wait for connections to drain during graceful shutdown.")
+  "Seconds to wait for connections to drain during graceful shutdown.
+   Whole seconds: added to the clock, a fraction would turn the deadline
+   into a float that resolves only to minutes, so START-SERVER refuses
+   one.")
 
 (defparameter *worker-wake-interval* 1
   "Seconds a worker's event loop may sleep in epoll_wait before waking to
@@ -2847,7 +2850,12 @@
   ;; disappears, and an echo handler is handed a message it is then
   ;; refused permission to return. Checked at startup rather than at send
   ;; time because a misconfiguration should not wait for the first
-  ;; maximal message to reveal itself.
+  ;; maximal message to reveal itself. The message size is checked by
+  ;; name first, since the comparison reads it.
+  (unless (and (integerp *max-ws-message-size*) (plusp *max-ws-message-size*))
+    (error "start-server: *max-ws-message-size* is ~s; it must be a positive ~
+            integer."
+           *max-ws-message-size*))
   (unless (and (integerp *max-write-backlog*)
                (>= *max-write-backlog* (+ *max-ws-message-size* 10)))
     (error "start-server: *max-write-backlog* is ~s and ~
@@ -2866,12 +2874,15 @@
   ;; and the only remaining bound is the idle timeout, which the fetch
   ;; keeps fresh. Checked at boot rather than at the first parked request,
   ;; for the reason the two above give: a misconfiguration should not wait
-  ;; for the shape that reveals it.
-  (unless (and (realp *fetch-timeout*) (plusp *fetch-timeout*))
-    (error "start-server: *fetch-timeout* is ~s; it must be positive. It is ~
-            the deadline on every phase of an outbound fetch and the only ~
-            thing that answers a parked caller when an upstream goes quiet ~
-            — there is no setting that disables it."
+  ;; for the shape that reveals it. Whole seconds, since the fetch path adds
+  ;; it to GET-UNIVERSAL-TIME; the eleventh says why that rules out a
+  ;; fraction.
+  (unless (and (integerp *fetch-timeout*) (plusp *fetch-timeout*))
+    (error "start-server: *fetch-timeout* is ~s; it must be a positive whole ~
+            number of seconds. It is the deadline on every phase of an ~
+            outbound fetch and the only thing that answers a parked caller ~
+            when an upstream goes quiet — there is no setting that disables ~
+            it."
            *fetch-timeout*))
   ;; Fourth invariant, same place and the same argument as the three
   ;; above. A non-function :ON-TICK raises on the first pass of every
@@ -2948,36 +2959,63 @@
                 or NIL for the inbound limit's value."
                name value))))
   ;; Eleventh. The timeouts and intervals the idle sweep, the ping pass,
-  ;; the keepalive tick, the fetch path and the drain read, and the count
-  ;; of missed pongs. Each is read on a worker. A value that is not a
-  ;; number raises there: in the sweep or a tick it reaches RUN-WORKER's
-  ;; backstop, so the worker restarts, dropping every connection it held,
-  ;; and does it again on the next pass; in a fetch it is a 502 that says
-  ;; nothing about the setting. Where a setting's docstring names an off,
-  ;; 0 is it.
+  ;; the keepalive tick, the fetch path, the drain and JWT-VERIFY read, and
+  ;; the sizes and counts the read path, the WebSocket parser, the fetch
+  ;; path and JSON-PARSE hold their input to. Each is read on a worker. A
+  ;; value that is not a number raises there: in the sweep, a tick or an
+  ;; accept it reaches RUN-WORKER's backstop, so the worker restarts,
+  ;; dropping every connection it held, and does it again on the next pass;
+  ;; anywhere else it fails every request, fetch or token it touches, with
+  ;; nothing that names the setting. Where a setting's docstring names an
+  ;; off, 0 is it, and 0 is allowed where it means something: no request
+  ;; body, no limit on connections, no interim response.
+  ;;
+  ;; A fraction is fine for a setting held against a difference of two
+  ;; clock readings. One added to GET-UNIVERSAL-TIME takes whole seconds:
+  ;; the deadline lands in an integer slot, and a float at the clock's
+  ;; magnitude would resolve only to 256 seconds besides.
   (loop for (name kind) in '((*idle-timeout* :seconds)
                              (*ws-idle-timeout* :seconds)
                              (*ws-message-timeout* :seconds)
                              (*stream-idle-timeout* :seconds)
                              (*linger-timeout* :seconds)
                              (*stream-keepalive-interval* :seconds)
-                             (*dns-cache-ttl* :seconds)
-                             (*drain-timeout* :seconds)
                              (*ws-ping-interval* :positive-seconds)
-                             (*connect-fallback-delay* :positive-seconds)
                              (*worker-wake-interval* :positive-seconds)
-                             (*ws-max-missed-pongs* :count))
+                             (*dns-cache-ttl* :whole-seconds)
+                             (*drain-timeout* :whole-seconds)
+                             (*jwt-clock-skew* :whole-seconds)
+                             (*connect-fallback-delay* :positive-whole-seconds)
+                             (*max-request-line-length* :positive-count)
+                             (*max-header-count* :positive-count)
+                             (*max-header-line-length* :positive-count)
+                             (*max-total-header-bytes* :positive-count)
+                             (*max-ws-payload-size* :positive-count)
+                             (*max-outbound-response-size* :positive-count)
+                             (*max-streaming-line-size* :positive-count)
+                             (*dns-cache-max-entries* :positive-count)
+                             (*json-max-depth* :positive-count)
+                             (*json-max-string-length* :positive-count)
+                             (*ws-max-missed-pongs* :positive-count)
+                             (*max-body-size* :count)
+                             (*max-connections* :count)
+                             (*max-interim-responses* :count))
         for value = (symbol-value name)
         unless (ecase kind
                  (:seconds (and (realp value) (>= value 0)))
                  (:positive-seconds (and (realp value) (plusp value)))
-                 (:count (and (integerp value) (plusp value))))
+                 ((:whole-seconds :count) (and (integerp value) (>= value 0)))
+                 ((:positive-whole-seconds :positive-count)
+                  (and (integerp value) (plusp value))))
           do (error "start-server: ~(~a~) is ~s; it must be ~a."
                     name value
                     (ecase kind
                       (:seconds "a number of seconds, 0 or more")
                       (:positive-seconds "a positive number of seconds")
-                      (:count "a positive integer"))))
+                      (:whole-seconds "a whole number of seconds, 0 or more")
+                      (:positive-whole-seconds "a positive whole number of seconds")
+                      (:count "an integer, 0 or more")
+                      (:positive-count "a positive integer"))))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
