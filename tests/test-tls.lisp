@@ -668,11 +668,6 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
-(defconstant +so-sndbuf+ 7
-  "SO_SNDBUF. Defined here rather than in epoll.lisp because nothing the
-   framework does needs it — only this test, which has to make a socket
-   small enough to block.")
-
 (defun test-tls-write-retry-after-gc ()
   "A blocked SSL_write, a full GC, and then the retry — the exact sequence
    the foreign staging buffer exists for.
@@ -1315,8 +1310,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
              (write-sequence
               (sb-ext:string-to-octets
                (concatenate 'string
-                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" "")
-                            (apply #'%crlf
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" "")
+                            (apply #'%crlf-lines
                                    (append (loop for c in corpus
                                                  append (list (format nil "~x" (length c))
                                                               c))
@@ -1667,7 +1662,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    "https upload"
    (lambda (dir)
      (let* ((body (%pseudo-random-bytes (* 1024 1024) 81))
-            (expected (format nil "got:~d:~a" (length body) (%sha256-hex body)))
+            (expected (format nil "got:~d:~a" (length body) (sha256-hex body)))
             (lock (sb-thread:make-mutex :name "https-upload"))
             (aborts nil)
             (port-box (list nil)))
@@ -1734,7 +1729,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                              (%read-relayed-request peer)
                                            (when got
                                              (answer peer 200 (format nil "got:~d:~a" (length got)
-                                                                      (%sha256-hex got))))
+                                                                      (sha256-hex got))))
                                            (list head got)))
                                        :chunk-size chunk-size)
                            (check (format nil "https upload ~a: framed as it arrived" path)

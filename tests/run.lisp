@@ -130,6 +130,24 @@
   "CRLF string for constructing test request data.")
 
 ;;; ---------------------------------------------------------------------------
+;;; Linux numbers the tests use
+;;;
+;;; Beside the SOL_SOCKET, SO_ and EPOLL numbers epoll.lisp defines for the
+;;; framework. These are here rather than there because nothing the
+;;; framework does needs them: only tests that shrink a buffer to make a
+;;; socket block, close one with a reset, or wait for bytes to arrive.
+;;; ---------------------------------------------------------------------------
+
+(defconstant +so-sndbuf+ 7 "SO_SNDBUF: a socket's send buffer size.")
+(defconstant +so-rcvbuf+ 8 "SO_RCVBUF: a socket's receive buffer size.")
+(defconstant +so-linger+ 13 "SO_LINGER: what close(2) does with unsent data.")
+(defconstant +fionread+ #x541B
+  "FIONREAD: the ioctl that answers how many bytes a receive buffer holds.")
+(defconstant +epollrdhup+ #x2000
+  "EPOLLRDHUP: the peer has ended its side of the stream, by a FIN or a
+   reset.")
+
+;;; ---------------------------------------------------------------------------
 ;;; Scratch paths
 ;;; ---------------------------------------------------------------------------
 

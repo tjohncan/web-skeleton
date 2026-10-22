@@ -1031,7 +1031,7 @@
        (error () nil)))
    :name name))
 
-(defun %crlf (&rest lines)
+(defun %crlf-lines (&rest lines)
   "LINES joined by CRLF, with a trailing CRLF. Hand-written wire bytes: the
    chunk boundaries a test asserts on have to be the test's choice, not
    whatever an encoder picked on the day."
@@ -1074,7 +1074,7 @@
                    (%canned-upstream
                     listener
                     (concatenate 'string
-                                 (%crlf "HTTP/1.1 200 OK"
+                                 (%crlf-lines "HTTP/1.1 200 OK"
                                         "Content-Type: text/plain"
                                         "")
                                  "close-framed-body")
@@ -1141,7 +1141,7 @@
                    (%canned-upstream
                     listener
                     (concatenate 'string
-                                 (%crlf "HTTP/1.1 200 OK"
+                                 (%crlf-lines "HTTP/1.1 200 OK"
                                         (format nil "Content-Disposition: ~a"
                                                 disposition)
                                         "Content-Length: 2"
@@ -1397,7 +1397,7 @@
    Framed here rather than run through the encoder: a test asserting on
    chunk boundaries has to choose them, not inherit whatever the encoder
    picked on the day."
-  (apply #'%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+  (apply #'%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
          (append (loop for payload in *chunked-corpus*
                        append (list (format nil "~x" (length payload)) payload))
                  (list "0" ""))))
@@ -1598,7 +1598,7 @@
     (multiple-value-bind (status body)
         (%chunked-upstream-fetch
          ;; Chunks, then the close. No "0" terminator.
-         (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+         (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
                 "2" "aa" "3" "bbb")
          chunks final fires)
       (declare (ignore body))
@@ -1654,9 +1654,9 @@
                    (%canned-upstream
                     listener
                     (concatenate 'string
-                                 (%crlf "HTTP/1.1 200 OK"
+                                 (%crlf-lines "HTTP/1.1 200 OK"
                                         "Transfer-Encoding: chunked" "")
-                                 (apply #'%crlf
+                                 (apply #'%crlf-lines
                                         (append
                                          (loop for c in corpus
                                                append (list (format nil "~x" (length c))
@@ -2690,18 +2690,18 @@
                               collect (format nil "{\"token\":~d}~c" i #\Newline))))
              (ecase framing
                (:close
-                (cons (%crlf "HTTP/1.1 200 OK"
+                (cons (%crlf-lines "HTTP/1.1 200 OK"
                              "Content-Type: application/x-ndjson" "")
                       (loop for line in lines append (list line 0.3))))
                (:chunked
                 (append
-                 (list (%crlf "HTTP/1.1 200 OK"
+                 (list (%crlf-lines "HTTP/1.1 200 OK"
                               "Content-Type: application/x-ndjson"
                               "Transfer-Encoding: chunked" ""))
                  (loop for line in lines
-                       append (list (%crlf (format nil "~x" (length line)) line)
+                       append (list (%crlf-lines (format nil "~x" (length line)) line)
                                     0.3))
-                 (list (%crlf "0" "")))))))
+                 (list (%crlf-lines "0" "")))))))
          (arrivals (port)
            ;; (SECONDS . LINE) for each line, in the order they came.
            (let ((start (get-internal-real-time))
@@ -2744,11 +2744,11 @@
    tells the two apart."
   (format t "~%Harness: a 304 or 204 from an upstream that keeps the connection~%")
   (dolist (case (list (list "304 with a Content-Length"
-                            (%crlf "HTTP/1.1 304 Not Modified" "ETag: \"v1\""
+                            (%crlf-lines "HTTP/1.1 304 Not Modified" "ETag: \"v1\""
                                    "Content-Length: 1234" "")
                             304)
                       (list "204 with no framing at all"
-                            (%crlf "HTTP/1.1 204 No Content" "")
+                            (%crlf-lines "HTTP/1.1 204 No Content" "")
                             204)))
     (destructuring-bind (name head status) case
       (%call-with-scripted-upstream
@@ -2792,7 +2792,7 @@
   (format t "~%Harness: a transfer coding other than chunked ends at the close~%")
   (let ((buf (concatenate '(vector (unsigned-byte 8))
                           (sb-ext:string-to-octets
-                           (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                           (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
                                   "Connection: close" "")
                            :external-format :ascii)
                           #(#x1F #x8B #x08 #x00))))
@@ -2801,7 +2801,7 @@
                      buf (length buf) :get))
            nil))
   (dolist (case (list (list "gzip"
-                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
                                    "Connection: close" "")
                             "{\"a\":1}")
                       ;; A length shorter than the body, so a reader that
@@ -2809,7 +2809,7 @@
                       ;; answer "hel" and fail here, where an equal length
                       ;; could not tell the two apart.
                       (list "identity beside a Content-Length"
-                            (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: identity"
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: identity"
                                    "Content-Length: 3" "Connection: close" "")
                             "hello")))
     (destructuring-bind (name head body) case
@@ -2874,7 +2874,7 @@
                       web-skeleton:*max-upstream-total-header-bytes*
                       web-skeleton:*max-header-line-length*)))
     (labels ((head (lines)
-               (apply #'%crlf "HTTP/1.1 200 OK"
+               (apply #'%crlf-lines "HTTP/1.1 200 OK"
                       (append lines (list "Connection: close" ""))))
              (buffered (head)
                ;; HTTP-FETCH's answer to the client: (code body).
@@ -4828,11 +4828,11 @@
                                               :initial-element
                                               (code-char (+ 65 (mod i 26))))))
          (expected (apply #'concatenate 'string payloads))
-         (script (append (list (%crlf "HTTP/1.1 200 OK"
+         (script (append (list (%crlf-lines "HTTP/1.1 200 OK"
                                       "Transfer-Encoding: chunked" ""))
                          (loop for p in payloads
-                               collect (%crlf (format nil "~x" chunk-size) p))
-                         (list (%crlf "0" ""))))
+                               collect (%crlf-lines (format nil "~x" chunk-size) p))
+                         (list (%crlf-lines "0" ""))))
          (saved-backlog web-skeleton:*max-write-backlog*)
          (saved-ws-message web-skeleton:*max-ws-message-size*))
     ;; Global, not bound: the worker threads read them, and a LET here
@@ -4851,11 +4851,11 @@
                    (make-stream-response
                     :on-open
                     (lambda (client)
-                      ;; SO_SNDBUF: the kernel doubles it and keeps its own
+                      ;; The kernel doubles a send buffer and keeps its own
                       ;; floor, so this asks for as small as it will give.
                       (web-skeleton::set-socket-option-int
                        (web-skeleton::connection-fd client)
-                       web-skeleton::+sol-socket+ 7 4096)
+                       web-skeleton::+sol-socket+ +so-sndbuf+ 4096)
                       (fetch-into
                        client
                        (http-fetch
@@ -4876,11 +4876,11 @@
                                                'sb-bsd-sockets:inet6-socket
                                                'sb-bsd-sockets:inet-socket)
                                            :type :stream :protocol :tcp)))
-                ;; SO_RCVBUF, set before the connect so the window the
+                ;; The receive buffer, set before the connect so the window the
                 ;; server sees is the small one from the start.
                 (web-skeleton::set-socket-option-int
                  (sb-bsd-sockets:socket-file-descriptor socket)
-                 web-skeleton::+sol-socket+ 8 4096)
+                 web-skeleton::+sol-socket+ +so-rcvbuf+ 4096)
                 (sb-bsd-sockets:socket-connect socket *test-host* *test-port*)
                 (let ((stream (sb-bsd-sockets:socket-make-stream
                                socket :input t :output t
@@ -5828,9 +5828,6 @@
       (setf x (mod (+ (* x 1103515245) 12345) 2147483648)
             (aref v i) (ldb (byte 8 16) x)))))
 
-(defun %sha256-hex (bytes)
-  (bytes-to-hex (sha256 (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
-
 (defun test-harness-receive-body-e2e ()
   "A received body, end to end: handed to ON-DATA as it arrives, answered
    by ON-END, ended by ON-ABORT exactly once on every way it can fail.
@@ -5893,7 +5890,7 @@
                                  (funcall end acc)
                                  (make-text-response
                                   200 (format nil "~a:~d:~a" path (length acc)
-                                              (%sha256-hex acc)))))
+                                              (sha256-hex acc)))))
                            :on-abort
                            (lambda (conn reason)
                              (declare (ignore conn))
@@ -5945,7 +5942,7 @@
                                           "Connection: close")
                                     body)))
             (check "received: a 4 MiB body arrives whole and in order"
-                   (and (search (format nil "/recv-cl:4194304:~a" (%sha256-hex body))
+                   (and (search (format nil "/recv-cl:4194304:~a" (sha256-hex body))
                                 answer)
                         t)
                    t)
@@ -5962,7 +5959,7 @@
                                     (%ascii (format nil "~a0~a~a" *crlf* *crlf* *crlf*)))))
             (check "received: one 3 MiB chunk is handed over as it lands"
                    (and (search (format nil "/recv-one-chunk:3145728:~a"
-                                        (%sha256-hex body))
+                                        (sha256-hex body))
                                 answer)
                         t)
                    t)
@@ -6231,8 +6228,8 @@
           (check "paused: every part reached the upstream"
                  (length parts) 5)
           (check "paused: in order, together the body"
-                 (%sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) parts))
-                 (%sha256-hex body)))
+                 (sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) parts))
+                 (sha256-hex body)))
         (check "paused: the body paused for the parts it forwarded"
                (<= 1 pauses 4) t)
         (check "paused: ON-DATA was not called while a pause held"
@@ -6434,7 +6431,7 @@
          (expected (sb-ext:octets-to-string
                     (sb-ext:string-to-octets
                      (format nil "fields:title=hello,note=Zoë;files:upload:~d:~a"
-                             (length file) (%sha256-hex file))
+                             (length file) (sha256-hex file))
                      :external-format :utf-8)
                     :external-format :latin-1)))
     (flet ((aborted (path)
@@ -6501,7 +6498,7 @@
                       (cond
                         ((form-part-filename part)
                          (push (format nil "~a:~d:~a" (form-part-name part)
-                                       (fill-pointer current) (%sha256-hex current))
+                                       (fill-pointer current) (sha256-hex current))
                                files)
                          nil)
                         ;; A field that decides whether the rest is wanted.
@@ -6750,8 +6747,8 @@
         (let ((pieces (reverse (sb-thread:with-mutex (lock) stored))))
           (check "paused form: every piece reached the upstream" (length pieces) 6)
           (check "paused form: in order, together the file"
-                 (%sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
-                 (%sha256-hex file)))
+                 (sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
+                 (sha256-hex file)))
         (check "paused form: no callback was called while a pause held" while-paused 0)))))
 
 (defun test-harness-body-refused-from-inside-its-callback-e2e ()
@@ -6882,7 +6879,7 @@
                               (cond (early-status)
                                     (silent (hold-until-released))
                                     (t (answer 200 (format nil "got:~d:~a" (length body)
-                                                           (%sha256-hex body)))))
+                                                           (sha256-hex body)))))
                               (list head body)))
                      (block %upload-upstream-read
                        ;; The head.
@@ -7020,7 +7017,7 @@
                    (t
                     (forward-body (http-fetch :put (upstream-url) :body :stream :then #'then)
                                   :max-size nil :on-abort #'note-abort)))))))
-        (let ((expected (format nil "got:~d:~a" (length body) (%sha256-hex body))))
+        (let ((expected (format nil "got:~d:~a" (length body) (sha256-hex body))))
           ;; ---- forwarded whole, framed as it arrived ----
           (multiple-value-bind (answer seen) (through "/length")
             (check "length: the upstream was told the length the client declared"
@@ -7166,7 +7163,7 @@
             (check "file: the upstream received the file, and only the file, whole"
                    (and seen (equalp (second seen) file)) t)
             (check "file: the client heard the upstream's answer"
-                   (and (search (format nil "got:~d:~a" (length file) (%sha256-hex file)) answer)
+                   (and (search (format nil "got:~d:~a" (length file) (sha256-hex file)) answer)
                         t)
                    t)
             (check "file: the fields either side of it reached :on-end"
@@ -7177,7 +7174,7 @@
               (check "empty: the upstream got a request with an empty body"
                      (and seen (equalp (second seen) empty)) t)
               (check "empty: and the client its answer"
-                     (and (search (format nil "got:0:~a" (%sha256-hex empty)) answer) t) t)
+                     (and (search (format nil "got:0:~a" (sha256-hex empty)) answer) t) t)
               (check "empty: the fields reached :on-end"
                      (fields-of "/empty") '(("title" . "before") ("note" . "after")))))
           (check "nothing aborted either form" aborts nil))))))
@@ -7259,7 +7256,7 @@
                             (check "moving: and the client heard the upstream"
                                    (and (search "HTTP/1.1 200" answer)
                                         (search (format nil "got:~d:~a" (length whole)
-                                                        (%sha256-hex whole))
+                                                        (sha256-hex whole))
                                                 answer)
                                         t)
                                    t)))
@@ -7377,7 +7374,7 @@
               (check "two: the client was answered with what A answered"
                      (and seen-a
                           (search (format nil "a:got:~d:~a" (length (second seen-a))
-                                          (%sha256-hex (second seen-a)))
+                                          (sha256-hex (second seen-a)))
                                   reply)
                           t)
                      t)
@@ -7585,7 +7582,7 @@
                (check "tick: the upstream had the whole body, in order"
                       (and seen (equalp (second seen) whole)) t)
                (check "tick: and the client was answered with what it said"
-                      (and (search (format nil "got:~d:~a" (length whole) (%sha256-hex whole))
+                      (and (search (format nil "got:~d:~a" (length whole) (sha256-hex whole))
                                    answer)
                            t)
                       t)
@@ -7685,7 +7682,7 @@
                (sb-thread:join-thread thread :timeout 10 :default nil)
                (check "refused: answered from the name's next address"
                       (and (search "HTTP/1.1 200" answer)
-                           (search (format nil "got:5:~a" (%sha256-hex (%ascii "hello")))
+                           (search (format nil "got:5:~a" (sha256-hex (%ascii "hello")))
                                    answer)
                            t)
                       t)))
@@ -7724,7 +7721,7 @@
                              (and seen (equalp (second seen) body)) t)
                       (check "black hole: and the client heard its answer"
                              (and (search (format nil "got:~d:~a" (length body)
-                                                  (%sha256-hex body))
+                                                  (sha256-hex body))
                                           answer)
                                   t)
                              t)

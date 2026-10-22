@@ -9,7 +9,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun crlf (&rest strings)
-  "Join STRINGS with CRLF and append CRLFCRLF (header terminator)."
+  "STRINGS as a head: joined with CRLF, then the CRLFCRLF that ends it.
+   %CRLF-LINES, in test-harness.lisp, ends each line with one CRLF and adds
+   no blank line of its own."
   (with-output-to-string (s)
     (loop for (str . rest) on strings
           do (write-string str s)
@@ -4818,9 +4820,14 @@
                       ;; Once untimed, so the Date line cache and any
                       ;; first-call setup are not counted.
                       (serve-static request)
-                      (let ((before (sb-ext:get-bytes-consed)))
-                        (serve-static request)
-                        (- (sb-ext:get-bytes-consed) before)))))
+                      ;; The least of three. GET-BYTES-CONSED counts the
+                      ;; whole process, and another thread, a finalizer or a
+                      ;; reader an earlier test abandoned, can allocate in
+                      ;; the window; the least is the call's own cost.
+                      (loop repeat 3
+                            minimize (let ((before (sb-ext:get-bytes-consed)))
+                                       (serve-static request)
+                                       (- (sb-ext:get-bytes-consed) before))))))
              (check "control: a whole-file GET allocates under 64 KiB"
                     (< (consed) 65536) t)
              (check "a whole-file range allocates under 64 KiB, not the file"
@@ -6826,12 +6833,12 @@
                                       :initial-element 88))))
                (web-skeleton::set-nonblocking ffd)
                (web-skeleton::set-nonblocking ofd)
-               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
-               ;; Both sides shrunk so neither can swallow the big frame whole.
+               ;; Both sides' send buffers shrunk, so neither can swallow the
+               ;; big frame whole.
                (web-skeleton::set-socket-option-int
-                ffd web-skeleton::+sol-socket+ 7 2048)
+                ffd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (web-skeleton::set-socket-option-int
-                ofd web-skeleton::+sol-socket+ 7 2048)
+                ofd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                       (web-skeleton::*epoll-fd* epfd)
                       (conn (web-skeleton::make-connection
@@ -7429,9 +7436,8 @@
                                       (logior web-skeleton::+epollin+
                                               web-skeleton::+epollet+))
              (sb-bsd-sockets:socket-send client body nil)
-             ;; Give the bytes a moment to cross loopback, then let the
-             ;; read path drain them.
-             (sleep 0.1)
+             ;; Every byte across loopback, then the read path drains them.
+             (%await-arrival out-fd :bytes (length body))
              (web-skeleton::handle-outbound-read conn epfd)
 
              (check "pause: the walk stopped at the chunk it paused on"
@@ -7472,12 +7478,12 @@
                  (check "resume: the last buffered chunk"
                         (reverse seen) '("aa" "bb" "cc"))
                  ;; Paused, bytes in the kernel produce no wake-up at all.
-                 (sb-bsd-sockets:socket-send
-                  client
-                  (web-skeleton::encode-chunk
-                   (sb-ext:string-to-octets "dd" :external-format :ascii))
-                  nil)
-                 (sleep 0.1)
+                 ;; Waited for until they are in, so the nothing below is
+                 ;; asserted with data waiting.
+                 (let ((dd (web-skeleton::encode-chunk
+                            (sb-ext:string-to-octets "dd" :external-format :ascii))))
+                   (sb-bsd-sockets:socket-send client dd nil)
+                   (%await-arrival out-fd :bytes (length dd)))
                  (check "pause: a paused fd is not reported, with data waiting"
                         (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
                  ;; With the buffer walked dry, the resume goes on to read.
@@ -8239,6 +8245,50 @@
           (sb-bsd-sockets:socket-close listener)
           (values server client))))))
 
+(defun %bytes-buffered (fd)
+  "How many bytes FD's receive buffer holds, by FIONREAD, or 0 when the
+   ioctl fails, as it can on a socket a reset has ended."
+  (sb-alien:with-alien ((n sb-alien:int 0))
+    (if (zerop (sb-alien:alien-funcall
+                (sb-alien:extern-alien
+                 "ioctl" (function sb-alien:int sb-alien:int sb-alien:unsigned-long
+                                   (* sb-alien:int)))
+                fd +fionread+ (sb-alien:addr n)))
+        n
+        0)))
+
+(defun %peer-ended-p (fd)
+  "T when FD's peer has ended its side of the stream, by a FIN or a reset:
+   asked once, without waiting, of a level-triggered watch on an epoll set
+   of its own."
+  (let ((epfd (web-skeleton::epoll-create))
+        (evbuf (make-array web-skeleton::+epoll-event-size+
+                           :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (progn
+           (web-skeleton::epoll-add epfd fd +epollrdhup+)
+           (plusp (web-skeleton::epoll-wait epfd evbuf 1 0)))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun %await-arrival (fd &key (bytes 1) fin (seconds 2))
+  "T once FD's receive buffer holds BYTES bytes and, with FIN, its peer's
+   end of stream behind them; NIL if SECONDS pass first.
+
+   For a test that sends and then calls a read path directly, where a fixed
+   sleep would guess how long loopback takes, and a loaded runner can take
+   longer. Neither question consumes anything: FIONREAD only counts, and the
+   end of stream is asked of an epoll set of the helper's own, so the
+   edge-triggered one the test drives the connection through is untouched."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second))))
+    (loop
+      (when (and (>= (%bytes-buffered fd) bytes)
+                 (or (not fin) (%peer-ended-p fd)))
+        (return t))
+      (when (> (get-internal-real-time) deadline)
+        (return nil))
+      (sleep 0.005))))
+
 (defun test-ws-handler-push-and-return ()
   (format t "~%ws handler push and return~%")
   (multiple-value-bind (server client) (%loopback-pair)
@@ -8268,11 +8318,11 @@
                              (web-skeleton::ws-send c pushed)
                              returned)))
              (web-skeleton::set-nonblocking server-fd)
-             ;; SO_SNDBUF is 7 on Linux. The kernel doubles the value and
-             ;; enforces its own floor, so this asks for "as small as you
-             ;; will give me" rather than an exact size.
+             ;; The send buffer. The kernel doubles the value and enforces
+             ;; its own floor, so this asks for "as small as you will give
+             ;; me" rather than an exact size.
              (web-skeleton::set-socket-option-int
-              server-fd web-skeleton::+sol-socket+ 7 2048)
+              server-fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd server-fd
                                       (logior web-skeleton::+epollin+
@@ -8369,7 +8419,7 @@
                           :last-active (get-universal-time))))
                (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
                (%reset-socket client)
-               (sleep 0.05)
+               (%await-arrival (web-skeleton::socket-fd server) :bytes 0 :fin t)
                conn)))
          (log-of (thunk)
            (let ((web-skeleton:*log-stream* (make-string-output-stream)))
@@ -10174,7 +10224,7 @@
                                                 :initial-element 66)
                                out)
                (finish-output out))
-             (sleep 0.1)
+             (%await-arrival fd :bytes (+ (length head) 4096))
              (check "precondition: the default read cap is below the request"
                     (< (web-skeleton::connection-read-cap conn) (+ (length head) 4096))
                     t)
@@ -11852,9 +11902,9 @@
                          :last-active (get-universal-time))))
              (web-skeleton::set-nonblocking fd)
              (when back-up
-               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+               ;; A send buffer as small as the kernel will give.
                (web-skeleton::set-socket-option-int
-                fd web-skeleton::+sol-socket+ 7 2048)
+                fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (web-skeleton::connection-append-write
                 conn (make-array (* 512 1024)
                                  :element-type '(unsigned-byte 8)
@@ -12112,9 +12162,9 @@
                                       :initial-element 80)))
                   (flushed :unset))
              (web-skeleton::set-nonblocking tgt-fd)
-             ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
+             ;; A send buffer as small as the kernel will give.
              (web-skeleton::set-socket-option-int
-              tgt-fd web-skeleton::+sol-socket+ 7 2048)
+              tgt-fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
              (web-skeleton::register-connection target)
              (web-skeleton::epoll-add epfd tgt-fd
                                       (logior web-skeleton::+epollin+
@@ -12196,7 +12246,7 @@
              (write-sequence client-bytes stream)
              (force-output stream)
              (sb-bsd-sockets:socket-shutdown client :direction :output)
-             (sleep 0.1)
+             (%await-arrival fd :bytes (length client-bytes) :fin t)
              (loop while (and (< wake-ups 50)
                               (>= (web-skeleton::connection-fd conn) 0))
                    do (incf wake-ups)
@@ -12305,7 +12355,7 @@
                ;; handler's return value, or the two fds would both hold
                ;; remainders and the assertion could not tell them apart.
                (web-skeleton::set-socket-option-int
-                b-fd web-skeleton::+sol-socket+ 7 2048)
+                b-fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (web-skeleton::register-connection conn-a)
                (web-skeleton::register-connection conn-b)
                (web-skeleton::epoll-add epfd a-fd
@@ -12316,10 +12366,11 @@
                                                 web-skeleton::+epollet+))
                (let ((stream (sb-bsd-sockets:socket-make-stream
                               a-client :input t :output t
-                              :element-type '(unsigned-byte 8))))
-                 (write-sequence (make-test-ws-frame "ping-a") stream)
-                 (force-output stream))
-               (sleep 0.1)
+                              :element-type '(unsigned-byte 8)))
+                     (frame (make-test-ws-frame "ping-a")))
+                 (write-sequence frame stream)
+                 (force-output stream)
+                 (%await-arrival a-fd :bytes (length frame)))
                ;; Recording starts after the setup so what is counted is the
                ;; read path's own arming and not EPOLL-ADD's.
                (setf (symbol-function 'web-skeleton::epoll-modify)
@@ -13532,7 +13583,12 @@
                    :external-format :utf-8)
                   stream)
                  (force-output stream)
-                 (sleep 0.3))
+                 ;; The refusal's head read back, so the server is done
+                 ;; with the request before the count is read.
+                 (read-until-bounded
+                  stream :seconds 5
+                  :until (lambda (buf fill)
+                           (web-skeleton::scan-crlf-crlf buf 0 fill))))
             (ignore-errors (close stream))
             (ignore-errors (sb-bsd-sockets:socket-close sock))))
         (check "the handler never ran for the refused request"
@@ -13589,8 +13645,7 @@
    send RST, which is how a client looks when it crashes or its network drops
    it. Signals if the option does not take: a close that quietly sent a FIN
    instead would pass any test built on this, whether the server handled a
-   reset or not. SOL_SOCKET is 1 and SO_LINGER is 13 on Linux, the one
-   platform the framework runs on."
+   reset or not."
   (let ((fd (sb-bsd-sockets:socket-file-descriptor socket)))
     (sb-alien:with-alien ((linger (array sb-alien:int 2)))
       (setf (sb-alien:deref linger 0) 1
@@ -13601,7 +13656,8 @@
                        (function sb-alien:int sb-alien:int sb-alien:int
                                  sb-alien:int sb-alien:system-area-pointer
                                  sb-alien:unsigned))
-                      fd 1 13 (sb-alien:alien-sap linger) 8))
+                      fd web-skeleton::+sol-socket+ +so-linger+
+                      (sb-alien:alien-sap linger) 8))
         (error "setsockopt SO_LINGER failed on fd ~d" fd)))
     (sb-bsd-sockets:socket-close socket)))
 
