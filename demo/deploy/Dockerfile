@@ -2,11 +2,12 @@
 #
 #   docker build -f demo/deploy/Dockerfile -t web-skeleton-demo .
 #
-# Debian rather than Alpine, deliberately. Hostname resolution shells out to
-# `getent ahosts`, which is glibc's. Busybox ships a getent whose output this
-# parser has never been tested against, and the failure would be a server that
-# starts cleanly and cannot resolve anything, with nothing in the log to say
-# why. One base image is one thing to get wrong.
+# Debian rather than Alpine, deliberately. Hostname resolution runs
+# `getent ahosts -- HOST`, written for glibc's getent. Alpine's comes from
+# musl-utils, which does not take `--` as the end of its options: it looks
+# `--` up as a hostname, finds none and stops there, so a server on Alpine
+# starts cleanly and then resolves no hostname at all, with nothing in the log
+# to say why. One base image is one thing to get wrong.
 #
 # bookworm's SBCL is 2.2.9, the oldest the suite is run on, and it serves an
 # application that fetches by hostname as well as this demo, which does not.

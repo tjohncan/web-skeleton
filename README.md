@@ -21,9 +21,10 @@ It is the network and protocol layer; applications must bring their own flesh.
 - `getent` on PATH, glibc's, which every glibc distro ships (used via
   `sb-ext:run-program` for non-blocking hostname resolution). Its
   `ahosts` output is what the parser reads, and the name is passed after
-  `--`, which glibc's getent honours. Other getents are untested,
-  Alpine's among them (musl itself ships none; Alpine's comes from its
-  musl-utils package), which is why the demo's image is Debian.
+  `--`, which glibc's getent honours. Alpine's does not: it comes from
+  the musl-utils package (musl itself ships none) and looks the `--` up
+  as a name, so no hostname resolves there, which is why the demo's
+  image is Debian. Other getents are untested.
 
 SBCL built-ins used:
  `sb-bsd-sockets` (TCP),
