@@ -7021,8 +7021,16 @@
         (state (sb-ext:seed-random-state 6455)))
     (flet ((try (v)
              (let ((ours (web-skeleton::utf-8-well-formed-p v))
+                   ;; SBCL's verdict: decoded without an error, and encoded
+                   ;; back to the same bytes. The decoded string has to be
+                   ;; used: a compiler may delete a call to OCTETS-TO-STRING
+                   ;; whose value goes nowhere, and the decoding error with it,
+                   ;; which would make every sequence look well formed.
                    (sbcl (handler-case
-                             (progn (sb-ext:octets-to-string v :external-format :utf-8) t)
+                             (equalp (sb-ext:string-to-octets
+                                      (sb-ext:octets-to-string v :external-format :utf-8)
+                                      :external-format :utf-8)
+                                     v)
                            (error () nil))))
                (unless (eq ours sbcl)
                  (push (coerce v 'list) disagreements)))))
