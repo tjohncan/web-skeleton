@@ -946,9 +946,16 @@ continuation feeds the handler that returned it and nothing else. A
 
 It returns `T`, or signals — a wrong state, a second argument that is not
 a continuation, no event loop, or a fetch already outstanding on that
-connection. A signalling call has done nothing and the callback does not
-fire, so `:then` can never run before `fetch-into` returns. `:then`'s
-return value is discarded here; there is no parked request to answer.
+connection. It signals as well for a fetch that cannot be started: a URL
+that does not parse, `https://` without web-skeleton-tls, an IP literal
+`*fetch-address-filter*` refuses, or an address the kernel will not dial
+when the dial is made inside the call, for an IP literal or a name the DNS
+cache answers. A name that has to be looked up is dialed after
+`fetch-into` has returned, and a refusal of its address reaches `:then`
+instead, as the abort sentinel. A signalling call has done nothing and
+the callback does not fire, so `:then` can never run before `fetch-into`
+returns. `:then`'s return value is discarded here; there is no parked
+request to answer.
 
 **When the fetch ends, the framework decides what becomes of your
 connection.** What it decides depends on the connection's kind and on how
@@ -2190,9 +2197,13 @@ never be held whole:
 - **An upstream that answers first has answered the client.** One that
   refuses an upload at its head, a 413 or a 401, answers before the body
   has all gone, and so does one that fails partway. `:then` hears that
-  answer, and the rest of the body is refused with what `:then` returned
-  if that is an `http-response`, or 502 if not. A connection that fails
-  reaches `:then` as the abort sentinel, and the client is answered 502.
+  answer, and as soon as it returns the rest of the body is refused with
+  what it returned if that is an `http-response`, or 502 if not, whether
+  or not the client is still sending. A connection that fails reaches
+  `:then` as the abort sentinel, and so does one that cannot be made at
+  all, to an address the kernel will not dial: `:then`'s answer to it is
+  the client's, or 502. A `:then` that raises is a 500. The body's
+  `:on-abort` hears `:refused` when it is refused in any of these ways.
 - **The answer is read as the body goes out.** `:on-body` gets an early
   answer's chunks as they arrive, as it gets any fetch's. A `:pause` from
   it holds the answer and not the request: the body goes on going out, and
@@ -2206,21 +2217,32 @@ never be held whole:
   uploads": a piece at a time, each piece its own request.
 
 **By hand.** `forward-body` is `receive-body` and the three calls a streamed
-fetch has:
+fetch has, with a `:then` that refuses the body when the upstream has
+answered before it ended. In outline:
 
 ```lisp
-(let ((put (http-fetch :put (object-url) :body :stream :then #'stored-or-502)))
+(let* ((conn nil)
+       (put (http-fetch :put (object-url) :body :stream
+                        :then (lambda (status headers body)
+                                (let ((answer (stored-or-502 status headers body)))
+                                  ;; Refused if the body is still arriving;
+                                  ;; a no-op once it has ended.
+                                  (when conn (body-refuse conn answer))
+                                  answer)))))
   (receive-body
-   :on-data (lambda (conn bytes)
-              (unless (fetch-started-p put)
-                (fetch-into conn put :failure-disposition :keep))
-              (let ((sent (fetch-send put bytes)))
-                (cond ((eq sent t) nil)                ; with the kernel: go on
-                      ((null sent) :pause)             ; resumed when it drains
-                      (t (make-error-response 502))))) ; the fetch is over
-   :on-end (lambda (conn)
-             (declare (ignore conn))
-             put)))                                    ; answered by the upstream
+   :on-data (lambda (c bytes)
+              (setf conn c)
+              (if (and (not (fetch-started-p put))
+                       (not (ignore-errors
+                             (fetch-into c put :failure-disposition :keep))))
+                  (make-error-response 502)          ; the fetch could not start
+                  (let ((sent (fetch-send put bytes)))
+                    (cond ((eq sent t) nil)          ; with the kernel: go on
+                          ((null sent) :pause)       ; resumed when it drains
+                          (t (make-error-response 502)))))) ; the fetch is over
+   :on-end (lambda (c)
+             (declare (ignore c))
+             put)))                                  ; answered by the upstream
 ```
 
 - **`(fetch-send fetch bytes)`** sends the next piece of the body, a chunk

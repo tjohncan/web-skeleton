@@ -7003,11 +7003,16 @@
    its pace — the body pauses, the upload's queue never passes
    *MAX-WRITE-BACKLOG*, and the body still arrives whole. One that answers
    before the body is sent answers the client, and one that hangs up
-   partway is a 502. A client that hangs up partway leaves the upstream a
-   request that ended short, never one that reads as whole."
+   partway is a 502, both at once to a client that has sent part of its
+   body and stopped, its body refused; a :THEN that raises there is a 500.
+   An upstream that cannot be dialed at all is a 502 as well, :THEN
+   hearing the abort sentinel. A client that hangs up partway leaves the
+   upstream a request that ended short, never one that reads as whole, and
+   a body still going upstream when the server drains ends as :SHUTDOWN."
   (format t "~%Harness: a request body forwarded upstream as it arrives~%")
   (let* ((lock (sb-thread:make-mutex :name "streamed-e2e"))
          (aborts nil)
+         (thens nil)
          (most-queued 0)
          (pauses 0)
          (upstream-port (list nil))
@@ -7019,6 +7024,14 @@
                (if (eql status 200)
                    (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
                    (make-error-response (or status 502))))
+             (then-for (path)
+               ;; THEN, noting the status it heard for PATH.
+               (lambda (status headers b)
+                 (sb-thread:with-mutex (lock) (push (cons path status) thens))
+                 (then status headers b)))
+             (thens-for (path)
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . s) in thens when (string= p path) collect s)))
              (upstream-url () (format nil "http://127.0.0.1:~d/up" (first upstream-port)))
              (aborts-for (path)
                (sb-thread:with-mutex (lock)
@@ -7043,7 +7056,21 @@
                                               :seconds 30)))
                    (values answer
                            (handler-case (sb-thread:join-thread thread :timeout 20)
-                             (error () nil)))))))
+                             (error () nil))))))
+             (part-then-wait (path part &rest upstream-args)
+               ;; What the client hears for the head of BODY posted to PATH
+               ;; and its first PART bytes, sending nothing more, with a
+               ;; fresh upstream given UPSTREAM-ARGS. The client keeps its
+               ;; side open, so the body is neither complete nor abandoned:
+               ;; an answer has to come of the upstream alone.
+               (multiple-value-bind (port thread) (apply #'%upload-upstream upstream-args)
+                 (setf (first upstream-port) port)
+                 (let* ((request (%form-post-bytes path body :headers '("Connection: close")))
+                        (head-end (+ (web-skeleton::scan-crlf-crlf request 0 (length request)) 4)))
+                   (prog1 (%exchange-or-why (subseq request 0 (+ head-end part))
+                                            :half-close nil :seconds 10)
+                     (handler-case (sb-thread:join-thread thread :timeout 20)
+                       (error () nil)))))))
       (with-test-server
           (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
            :body-handler
@@ -7053,6 +7080,16 @@
                         (declare (ignore conn))
                         (sb-thread:with-mutex (lock) (push (cons path reason) aborts))))
                  (cond
+                   ((string= path "/unreachable")
+                    (forward-body (http-fetch :put "http://255.255.255.255:9/up" :body :stream
+                                              :then (then-for path))
+                                  :max-size nil :on-abort #'note-abort))
+                   ((string= path "/early-raise")
+                    (forward-body (http-fetch :put (upstream-url) :body :stream
+                                              :then (lambda (status headers b)
+                                                      (declare (ignore status headers b))
+                                                      (error "a :then that raises")))
+                                  :max-size nil :on-abort #'note-abort))
                    ((string= path "/length")
                     (forward-body (http-fetch :put (upstream-url) :body :stream
                                               :content-length (parse-integer
@@ -7109,14 +7146,34 @@
             (check "slow: and the upload's queue stayed within *max-write-backlog*"
                    (<= most-queued web-skeleton:*max-write-backlog*) t))
           ;; ---- an upstream that answers first ----
-          (let ((answer (through "/early" :early-status 413 :pace 0.005)))
-            (check "early: the upstream's answer reached the client"
+          ;; Each client sends part of its body and then nothing, so the
+          ;; answer cannot wait for a run of the body to carry it, nor the
+          ;; body be complete before it, however much the sockets hold.
+          (let ((answer (part-then-wait "/early" (* 64 1024) :early-status 413)))
+            (check "early: the upstream's answer reached a client that had stopped sending"
                    (and (search "HTTP/1.1 413" answer) t) t))
           (check "early: and the rest of the body was refused" (aborted "/early") '(:refused))
+          (let ((answer (part-then-wait "/early-raise" (* 64 1024) :early-status 413)))
+            (check "early, :then raising: the client is answered 500"
+                   (and (search "HTTP/1.1 500" answer) t) t))
+          (check "early, :then raising: and the rest of the body was refused"
+                 (aborted "/early-raise") '(:refused))
           ;; ---- an upstream that hangs up partway ----
-          (let ((answer (through "/fail" :close-after (* 256 1024))))
-            (check "fail: an upstream that hangs up partway is a 502 to the client"
+          (let ((answer (part-then-wait "/fail" (* 320 1024) :close-after (* 256 1024))))
+            (check "fail: an upstream that hangs up partway is a 502 to a client that had stopped sending"
                    (and (search "HTTP/1.1 502" answer) t) t))
+          (check "fail: and the rest of the body was refused" (aborted "/fail") '(:refused))
+          ;; ---- an upstream that cannot be dialed at all ----
+          ;; A TCP connect to a broadcast address fails in the connect
+          ;; itself, with ENETUNREACH, inside FETCH-INTO.
+          (let ((answer (%exchange-or-why (%form-post-bytes "/unreachable" (subseq body 0 1000)
+                                                            :headers '("Connection: close"))
+                                          :seconds 10)))
+            (check "unreachable: a connect refused at once is a 502"
+                   (and (search "HTTP/1.1 502" answer) t) t))
+          (check "unreachable: :then heard the abort sentinel, once"
+                 (thens-for "/unreachable") '(nil))
+          (check "unreachable: and the body was refused" (aborted "/unreachable") '(:refused))
           ;; ---- a client that leaves partway ----
           ;; The upstream must not be left holding what reads as a whole
           ;; upload: no chunked terminator, and short of a declared length.
@@ -7140,7 +7197,43 @@
                  (aborted "/gone") '(:disconnected))
           (check "nothing aborted the bodies forwarded whole"
                  (list (aborts-for "/length") (aborts-for "/chunked") (aborts-for "/slow"))
-                 '(nil nil nil)))))))
+                 '(nil nil nil))))
+      ;; ---- a body still going upstream when the server drains ----
+      ;; The drain closes the fetch on its way to closing the connection,
+      ;; and the body ends as the drain ends every body still arriving, not
+      ;; as refused by the fetch's end. The check is made once
+      ;; WITH-TEST-SERVER's teardown has drained it.
+      (let ((release (list nil)) (thread nil) (socket nil) (stream nil))
+        (unwind-protect
+             (progn
+               (with-test-server
+                   (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                    :body-handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (forward-body (http-fetch :put (upstream-url) :body :stream :then #'then)
+                                    :max-size nil
+                                    :on-abort (lambda (conn reason)
+                                                (declare (ignore conn))
+                                                (sb-thread:with-mutex (lock)
+                                                  (push (cons "/drain" reason) aborts))))))
+                 (multiple-value-bind (port upstream)
+                     (%upload-upstream :stall-after 1 :release release)
+                   (setf (first upstream-port) port
+                         thread upstream))
+                 (multiple-value-setq (socket stream) (%raw-connect))
+                 (write-sequence (%ascii (format nil "POST /drain HTTP/1.1~aHost: x~a~
+                                                      Content-Length: 1000~a~a0123456789"
+                                                 *crlf* *crlf* *crlf* *crlf*))
+                                 stream)
+                 (force-output stream)
+                 (sleep 0.3))
+               (check "drain: a body still going upstream hears :shutdown"
+                      (aborted "/drain") '(:shutdown)))
+          (setf (car release) t)
+          (when thread (handler-case (sb-thread:join-thread thread :timeout 10) (error () nil)))
+          (when stream (ignore-errors (close stream)))
+          (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
 
 (defun test-harness-form-file-forwarded-e2e ()
   "One file of a form forwarded upstream as it arrives, end to end: its

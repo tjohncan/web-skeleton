@@ -1910,6 +1910,13 @@
        application's handle on one exchange, and FETCH-SEND writes through
        it, so a second start would be two exchanges under one name.
 
+   A fetch that passes them and still cannot be started signals what
+   stopped it: a URL that does not parse, HTTPS without web-skeleton-tls,
+   an IP literal *FETCH-ADDRESS-FILTER* refuses, or a dial the kernel
+   refuses inside the call, which is where an IP literal and a name the
+   DNS cache answers are dialed. A name that has to be looked up is dialed
+   later, and a refusal there reaches :THEN as the abort sentinel.
+
    Signalling rather than returning NIL because a call from the wrong
    state is a programming error whose silent failure mode is a connection
    that produces nothing — which is the defect this function exists to
@@ -3041,11 +3048,14 @@
    the upstream's pace. FETCH's body is finished when the request's is.
 
    An upstream that answers before the body is all sent — a 413, a 401 —
-   has answered the client: the rest of the body is refused with what
-   :THEN returned, if that is an HTTP-RESPONSE, or 502. A failure answers
-   502 the same way, since :THEN hears it as the abort sentinel and its
-   answer is the client's. ON-ABORT is RECEIVE-BODY's, and MAX-SIZE caps
-   the body as RECEIVE-BODY's does.
+   has answered the client: as soon as :THEN returns, the rest of the body
+   is refused with what it returned, if that is an HTTP-RESPONSE, or 502,
+   whether or not the client is still sending. A failure is answered the
+   same way, :THEN hearing it as the abort sentinel, and so is a fetch
+   that cannot be started at all, a connect the kernel refuses at once
+   among them. A :THEN that raises is a 500. ON-ABORT is RECEIVE-BODY's,
+   and hears :REFUSED for a body refused in any of these ways. MAX-SIZE
+   caps the body as RECEIVE-BODY's does.
 
    FETCH must be streamed (:BODY :STREAM) and not yet started."
   (unless (http-fetch-continuation-stream-body fetch)
@@ -3055,29 +3065,62 @@
   (when (fetch-started-p fetch)
     (error "forward-body: the fetch to ~a has already been started"
            (http-fetch-continuation-url fetch)))
-  (flet ((early-answer ()
-           (let ((answer (http-fetch-continuation-answer fetch)))
-             (if (typep answer 'http-response)
-                 answer
-                 (make-error-response 502)))))
-    (receive-body
-     :max-size max-size
-     :on-data (lambda (conn bytes)
-                (unless (fetch-started-p fetch)
-                  ;; :KEEP, so a failure reaches the client as :THEN's
-                  ;; answer rather than as a closed connection.
-                  (fetch-into conn fetch :failure-disposition :keep))
-                (let ((sent (fetch-send fetch bytes)))
-                  (cond ((eq sent t) nil)
-                        ((null sent) :pause)
-                        (t (early-answer)))))
-     :on-end (lambda (conn)
-               (declare (ignore conn))
-               ;; A body that had no bytes never started FETCH; finished,
-               ;; it starts here as an ordinary answer, its body empty.
-               (fetch-finish fetch)
-               fetch)
-     :on-abort on-abort)))
+  (let ((then (http-fetch-continuation-callback fetch))
+        (plan nil)
+        ;; The connection FETCH was started for, from its first run on.
+        (target nil))
+    (labels ((answer-for (answer)
+               (if (typep answer 'http-response)
+                   answer
+                   (make-error-response 502)))
+             (start (conn)
+               ;; T once FETCH has started for CONN. :KEEP, so a failure
+               ;; reaches the client as :THEN's answer rather than as a
+               ;; closed connection.
+               (setf target conn)
+               (handler-case (fetch-into conn fetch :failure-disposition :keep)
+                 ;; FETCH-INTO signals a fetch that could not be started,
+                 ;; having done nothing. Here it ends as a fetch that fails
+                 ;; later does, and as a handler's fetch that fails to
+                 ;; start does: :THEN hears the abort sentinel, and its
+                 ;; answer refuses the body.
+                 (error (e)
+                   (log-error "fetch setup failed: ~a" e)
+                   (finish-fetch (http-fetch-continuation-callback fetch) :aborted)
+                   nil))))
+      ;; :THEN, and then, if the body FETCH was started for is still
+      ;; arriving, the rest of it refused with :THEN's answer: the fetch has
+      ;; ended first, answered early or failed. Refused as it ends, rather
+      ;; than at the body's next run, which a client that has stopped
+      ;; sending for now may not send before *BODY-STALL-TIMEOUT* ends the
+      ;; body unanswered. The answer starts as a 500, which is what it stays
+      ;; when :THEN raises. Not in a drain, which closes the fetch on its way
+      ;; to closing the connection, and ends the body as :SHUTDOWN.
+      (setf (http-fetch-continuation-callback fetch)
+            (lambda (status headers body)
+              (let ((answer (make-error-response 500)))
+                (unwind-protect (setf answer (funcall then status headers body))
+                  (when (and target
+                             (eq (connection-body-receiver target) plan)
+                             (not (worker-stopping-p)))
+                    (body-refuse target (answer-for answer)))))))
+      (setf plan
+            (receive-body
+             :max-size max-size
+             :on-data (lambda (conn bytes)
+                        (when (or (fetch-started-p fetch) (start conn))
+                          (let ((sent (fetch-send fetch bytes)))
+                            (cond ((eq sent t) nil)
+                                  ((null sent) :pause)
+                                  (t (answer-for (http-fetch-continuation-answer fetch)))))))
+             :on-end (lambda (conn)
+                       (declare (ignore conn))
+                       ;; A body that had no bytes never started FETCH;
+                       ;; finished, it starts here as an ordinary answer, its
+                       ;; body empty.
+                       (fetch-finish fetch)
+                       fetch)
+             :on-abort on-abort)))))
 
 (defun fetch-resume (conn)
   "Resume an outbound response that ON-BODY paused.
