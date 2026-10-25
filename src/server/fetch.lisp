@@ -1860,8 +1860,16 @@
    upload forwarded a part at a time, each part a fetch. ON-DATA starts
    the fetch and answers :PAUSE; the fetch's :THEN resumes the body with
    BODY-RESUME, or refuses it with BODY-REFUSE. The fetch's result goes to
-   :THEN alone, the connection being the one whose life bounds it — a
-   client that leaves takes the fetch down with it.
+   :THEN alone, the body being what bounds it — a client that leaves takes
+   the fetch down with it, and so does the body's end.
+
+   A detached fetch lasts no longer than what it was started for. One
+   still running once that has ended — the body complete and answered by
+   its ON-END, the stream closed and its response sent, the connection
+   closed — is closed then, :THEN hearing the abort sentinel, and nothing
+   is applied to the connection, which may be on to its next request. A
+   fetch whose result matters is one to wait for: a body pauses on it, or
+   ON-END answers with it, and a stream is closed from its :THEN.
 
    A streamed fetch (:BODY :STREAM) is the other shape for that case: one
    request, its body sent with FETCH-SEND as ON-DATA is handed it. A NIL
@@ -3633,6 +3641,11 @@
      :websocket           delivered   nothing; the app owns its framing
      :websocket           aborted     a 1011 close frame, unless the caller
                                       passed :FAILURE-DISPOSITION :KEEP
+
+   The target a row is applied to is what the fetch was started for: a
+   fetch does not outlive that (END-DETACHED-FETCHES), so a body's fetch
+   never reaches the stream the body was answered with, and no fetch
+   reaches the next request on the connection.
 
    The two aborted rows with an 'unless' are the ones a caller can
    override, and the asymmetry with :STREAMING is the argument. On

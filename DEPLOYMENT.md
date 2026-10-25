@@ -977,6 +977,18 @@ happy path will not have a failure path, and a `:then` that only closes on
 success leaves a failed stream open until `*stream-idle-timeout*` — or a
 failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
 
+**A fetch lasts no longer than what it was started for.** A body's fetch
+ends with the body, once `:on-end` has answered, unless `:on-end` answers
+with that fetch. A stream's fetch ends once the stream has closed and its
+response has gone, and any fetch ends with its connection. One still
+running then is closed, its `:then` hearing the abort sentinel, and
+nothing in the table is applied: what it was for has gone, and the
+connection may be on to its next request, or to the stream a body was
+answered with. A `:then` that answers that sentinel with another
+`fetch-into` on the connection is refused. A fetch whose result matters is
+one to wait for: a body pauses on it, or `:on-end` answers with it, and a
+relay closes its stream from `:then`.
+
 "Failed" above is the framework's `:aborted` outcome, which is the word the
 source uses and the one you will see in a log line. It is spelled out here
 because the parameter is named `:failure-disposition` and the outcome
@@ -1966,9 +1978,9 @@ and answers the request from `:on-end`:
   the body from outside `:on-data` instead. Both are calls on the worker
   that owns the connection, and both are no-ops once the body has ended or
   the client has gone, so a late callback need not check first.
-- **The fetch is `fetch-into` on the receiving connection.** The
-  connection bounds it — a client that leaves takes the fetch down — and
-  its result goes to `:then`, which resumes or refuses:
+- **The fetch is `fetch-into` on the receiving connection.** The body
+  bounds it — a client that leaves takes the fetch down, and so does the
+  body's end — and its result goes to `:then`, which resumes or refuses:
 
   ```lisp
   :on-data (lambda (conn bytes)

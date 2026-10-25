@@ -1215,6 +1215,46 @@
     ((:eof :ok-eof) (close-connection conn epoll-fd))
     (t nil)))
 
+(defun end-detached-fetches (conn epoll-fd)
+  "Close the detached fetch still aimed at CONN, if there is one, its
+   :THEN hearing the abort sentinel, and clear what such a fetch leaves on
+   CONN: the outstanding marker, the failure disposition, a wait on its
+   request draining, and the link to it from a relay's pause.
+
+   For when what the fetch was started for has ended: the connection
+   closing, a body ON-END has answered, a request whose response has gone
+   with the connection kept for the next. A fetch outliving that would
+   deliver to what followed: end the next request's body for a fetch it
+   never started, close the stream a body was answered with, or have the
+   next request's own FETCH-INTO refused as one already outstanding.
+
+   The outbound is found by walking the table, since nothing parked on it
+   to reach it through. Missed, it would outlive what it was fetching for,
+   and a paused one, subscribed to no events, would never be woken: a leak
+   with no end. The walk is made only when the marker says there is one to
+   find, so a connection that started none pays nothing for it.
+
+   The marker is cleared once the outbound is closed, not before: a :THEN
+   that answers the sentinel by starting another fetch into CONN is
+   refused as one already outstanding, since there is nothing left for a
+   fetch to be for."
+  (when (connection-fetch-outstanding conn)
+    (let ((target-fd (connection-fd conn))
+          (orphans nil))
+      (maphash (lambda (k out)
+                 (declare (ignore k))
+                 (when (and (connection-outbound-p out)
+                            (eq (connection-fetch-sink out) :detached)
+                            (= (connection-inbound-fd out) target-fd))
+                   (push out orphans)))
+               *connections*)
+      (dolist (out orphans)
+        (close-outbound out epoll-fd)))
+    (setf (connection-fetch-outstanding conn) nil))
+  (setf (connection-fetch-failure-disposition conn) :close
+        (connection-send-waiting conn) nil
+        (connection-paused-outbound-fd conn) -1))
+
 (defun close-connection (conn epoll-fd &optional (reason :closed))
   "Remove from epoll, unregister, close fd.
 
@@ -1249,34 +1289,8 @@
             (let ((out-conn (lookup-connection out-fd)))
               (when out-conn
                 (close-outbound out-conn epoll-fd))))))
-      ;; A detached fetch's outbound is not reachable through AWAITING-FD —
-      ;; nothing was parked — so it has to be found by walking. Without
-      ;; this the outbound outlives the connection it was fetching into,
-      ;; and a paused one is subscribed to no events, so nothing ever wakes
-      ;; it: a permanent leak rather than a delayed one.
-      ;;
-      ;; The marker is cleared *first*, and that is load-bearing. Teardown
-      ;; runs while this connection is still :STREAMING with a live fd —
-      ;; CONNECTION-CLOSE, which sets the fd to -1, is several lines below.
-      ;; So DELIVER-DETACHED would find it :STREAMING, apply the aborted
-      ;; disposition, and call CLOSE-CONNECTION on the connection already
-      ;; being closed one frame up. Clearing the marker suppresses that,
-      ;; and is correct on its own terms: the disposition answers what a
-      ;; failed upstream does to a connection, and when the connection is
-      ;; what failed, applying it is circular.
-      (when (connection-fetch-outstanding conn)
-        (setf (connection-fetch-outstanding conn) nil)
-        (let ((target-fd fd)
-              (orphans nil))
-          (maphash (lambda (k out)
-                     (declare (ignore k))
-                     (when (and (connection-outbound-p out)
-                                (eq (connection-fetch-sink out) :detached)
-                                (= (connection-inbound-fd out) target-fd))
-                       (push out orphans)))
-                   *connections*)
-          (dolist (out orphans)
-            (close-outbound out epoll-fd))))
+      ;; And a detached fetch aimed at it, which nothing parked to reach.
+      (end-detached-fetches conn epoll-fd)
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
@@ -1657,6 +1671,13 @@
         (error "receive-body: :on-end returned ~:[:UPGRADE~;a WS-UPGRADE~]; a ~
                 request whose body was received cannot switch protocols"
                (ws-upgrade-p answer)))
+      ;; A fetch started for the body, and still running now the body has
+      ;; ended, is ended with it — unless the answer is that fetch, which
+      ;; the request is answered with (ADOPT-FETCH). Before the answer is
+      ;; set out, so a stream it starts is the stream's own to fetch into.
+      (unless (and (typep answer 'http-fetch-continuation)
+                   (fetch-started-p answer))
+        (end-detached-fetches conn epoll-fd))
       (multiple-value-bind (response upgrade-p)
           (classify-response request answer)
         (carry-out-response conn epoll-fd request response upgrade-p)))))
@@ -2097,6 +2118,10 @@
                   (let* ((consumed (connection-request-end conn))
                          (buffered (connection-read-pos conn))
                          (extra (- buffered consumed)))
+                    ;; First, while the connection is still this request's:
+                    ;; a fetch started for it, into a stream that has
+                    ;; closed, is ended with it.
+                    (end-detached-fetches conn epoll-fd)
                     (when (> extra 0)
                       (replace (connection-read-buf conn)
                                (connection-read-buf conn)
@@ -2139,6 +2164,9 @@
               (let* ((http-end (connection-request-end conn))
                      (buffered (connection-read-pos conn))
                      (extra (- buffered http-end)))
+                ;; As the keep-alive reset two arms up does, so the two
+                ;; agree on every field.
+                (end-detached-fetches conn epoll-fd)
                 (when (> extra 0)
                   (replace (connection-read-buf conn) (connection-read-buf conn)
                            :start1 0 :start2 http-end :end2 buffered))

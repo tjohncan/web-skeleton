@@ -8231,6 +8231,261 @@
                   closes 1))
       (setf (symbol-function 'web-skeleton::close-connection) real))))
 
+(defun %held-upstream ()
+  "A listener on an ephemeral port playing an upstream that takes one
+   connection, reads what arrives first, and then waits for the CAR of the
+   box it returns: :ANSWER sends a 200 whose body is ok, and anything else
+   hangs up, as ten seconds without either does. Returns
+   (values PORT BOX THREAD)."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (box (list nil)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (values
+     (nth-value 1 (sb-bsd-sockets:socket-name listener))
+     box
+     (sb-thread:make-thread
+      (lambda ()
+        (unwind-protect
+             (handler-case
+                 (let ((s (sb-bsd-sockets:socket-accept listener))
+                       (piece (make-array 4096 :element-type '(unsigned-byte 8))))
+                   (sb-bsd-sockets:socket-receive s piece nil)
+                   (loop repeat 200 until (car box) do (sleep 0.05))
+                   (when (eq (car box) :answer)
+                     (sb-bsd-sockets:socket-send
+                      s (%ascii (format nil "HTTP/1.1 200 OK~aContent-Length: 2~a~aok"
+                                        *crlf* *crlf* *crlf*))
+                      nil)
+                     (sleep 0.2))
+                   (sb-bsd-sockets:socket-close s))
+               (error () nil))
+          (ignore-errors (sb-bsd-sockets:socket-close listener))))
+      :name "held-upstream"))))
+
+(defun test-harness-a-fetch-ends-with-what-it-was-started-for-e2e ()
+  "A detached fetch lasts no longer than what it was started for, so
+   nothing it does afterwards reaches what followed it on the connection.
+
+   On one keep-alive connection, /a's ON-DATA starts a fetch carrying its
+   first run and does not wait for it, and ON-END answers at once. The
+   fetch is ended with the body, its :THEN hearing the abort sentinel, and
+   its upstream hanging up later is nothing to /b, which follows with half
+   its body, starts a fetch of its own to wait on, and has the rest sent
+   after the hang-up: /b is answered, and its ON-ABORT hears nothing.
+
+   On another, /s1 relays an upstream into a stream and closes the stream
+   at once. Its fetch is ended once the stream's response has gone, and
+   /s2, next on the connection, starts a relay of its own rather than being
+   refused one as already outstanding.
+
+   /c's ON-DATA starts a fetch as /a's does, and ON-END answers with a
+   stream that stays open. The fetch ended with the body, so its upstream
+   answering afterwards does not close the stream.
+
+   /retry relays into a stream whose client then leaves, and its :THEN
+   answers the abort sentinel by starting the fetch again. That is refused,
+   as a fetch already outstanding, and no outbound is left running into a
+   connection that has closed."
+  (format t "~%Harness: a detached fetch ends with what it was started for~%")
+  (let* ((lock (sb-thread:make-mutex :name "fetch-ends"))
+         (notes nil)
+         (port-box (list nil))
+         (terminator (format nil "0~a~a" *crlf* *crlf*)))
+    (labels ((note (&rest what)
+               (sb-thread:with-mutex (lock) (push what notes)))
+             (notes-of (path)
+               (sb-thread:with-mutex (lock)
+                 (reverse (loop for n in notes
+                                when (equal (first n) path) collect (rest n)))))
+             (url () (format nil "http://127.0.0.1:~d/up" (first port-box)))
+             (then-for (path)
+               (lambda (status headers body)
+                 (declare (ignore headers body))
+                 (note path :then status)
+                 nil))
+             (send (stream text)
+               (write-sequence (%ascii text) stream)
+               (force-output stream))
+             (post-head (path length)
+               (format nil "POST ~a HTTP/1.1~aHost: x~aContent-Length: ~d~a~a"
+                       path *crlf* *crlf* length *crlf* *crlf*))
+             (read-for (stream marker seconds)
+               ;; (values TEXT REASON): what arrives until MARKER has, or
+               ;; SECONDS pass.
+               (multiple-value-bind (buf reason)
+                   (read-until-bounded stream
+                                       :until (lambda (b n)
+                                                (search (%ascii marker) b :end2 n))
+                                       :seconds seconds)
+                 (values (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                  :external-format :latin-1)
+                         reason))))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (handler-case
+                               (fetch-into
+                                c (http-fetch
+                                   :get (url)
+                                   :then (if (string= path "/retry")
+                                             ;; The sentinel answered by
+                                             ;; trying again.
+                                             (lambda (s h b)
+                                               (declare (ignore h b))
+                                               (note path :then s)
+                                               (unless s
+                                                 (handler-case
+                                                     (fetch-into c (http-fetch :get (url)
+                                                                               :then (then-for path)))
+                                                   (error () (note path :again-refused))))
+                                               nil)
+                                             (then-for path))))
+                             (error (e) (note path :refused (princ-to-string e))))
+                           (stream-send c (%ascii (format nil "from ~a" path)))
+                           (when (string= path "/s1")
+                             (stream-close c))))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req))
+                   (started nil))
+               (receive-body
+                :on-data (lambda (conn bytes)
+                           (unless started
+                             (setf started t)
+                             (if (string= path "/b")
+                                 ;; Waited for: the body pauses on it.
+                                 (handler-case
+                                     (progn
+                                       (fetch-into conn
+                                                   (http-fetch :get (url)
+                                                               :then (lambda (s h b)
+                                                                       (declare (ignore h b))
+                                                                       (note path :then s)
+                                                                       (body-resume conn)
+                                                                       nil)))
+                                       :pause)
+                                   (error (e) (note path :refused (princ-to-string e)) nil))
+                                 ;; Not waited for.
+                                 (progn
+                                   (fetch-into conn (http-fetch :put (url) :body bytes
+                                                                :then (then-for path)))
+                                   nil))))
+                :on-end (lambda (conn)
+                          (declare (ignore conn))
+                          (if (string= path "/c")
+                              (make-stream-response
+                               :on-open (lambda (c) (stream-send c (%ascii "first"))))
+                              (make-text-response 200 (format nil "done ~a" path))))
+                :on-abort (lambda (conn reason)
+                            (declare (ignore conn))
+                            (note path :aborted reason))))))
+        ;; ---- a body's fetch, and the next request ----
+        (multiple-value-bind (port-a box-a thread-a) (%held-upstream)
+          (setf (first port-box) port-a)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "~ahello" (post-head "/a" 5)))
+                   (check "body: /a is answered at once"
+                          (nth-value 1 (read-for stream "done /a" 5)) :satisfied)
+                   (multiple-value-bind (port-b box-b thread-b) (%held-upstream)
+                     (setf (first port-box) port-b
+                           (car box-b) :answer)
+                     (send stream (format nil "~a01234" (post-head "/b" 10)))
+                     (sleep 0.3)
+                     (setf (car box-a) :hang-up)
+                     (sleep 0.3)
+                     (handler-case (send stream "56789") (error () nil))
+                     (check "body: /b, next on the connection, is answered"
+                            (nth-value 1 (read-for stream "done /b" 5)) :satisfied)
+                     (handler-case (sb-thread:join-thread thread-b :timeout 10) (error () nil))))
+              (setf (car box-a) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-a :timeout 10) (error () nil)))
+        (check "body: /a's fetch, not waited for, heard the abort sentinel"
+               (notes-of "/a") '((:then nil)))
+        (check "body: /b's own fetch was started and waited for, and nothing ended /b"
+               (notes-of "/b") '((:then 200)))
+        ;; ---- a stream's fetch, and the next stream ----
+        (multiple-value-bind (port-1 box-1 thread-1) (%held-upstream)
+          (setf (first port-box) port-1)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "GET /s1 HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                   (check "stream: /s1 closes itself"
+                          (nth-value 1 (read-for stream terminator 5)) :satisfied)
+                   (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+                     (setf (first port-box) port-2
+                           (car box-2) :answer)
+                     (send stream (format nil "GET /s2 HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                     (multiple-value-bind (text reason) (read-for stream terminator 5)
+                       (check "stream: /s2, next on the connection, relays and ends"
+                              (list reason (and (search "from /s2" text) t))
+                              '(:satisfied t)))
+                     (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil))))
+              (setf (car box-1) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        (check "stream: /s1's fetch was ended with its stream"
+               (notes-of "/s1") '((:then nil)))
+        (check "stream: /s2's relay was started, not refused, and delivered"
+               (notes-of "/s2") '((:then 200)))
+        ;; ---- a body's fetch, and the stream the body is answered with ----
+        (multiple-value-bind (port-c box-c thread-c) (%held-upstream)
+          (setf (first port-box) port-c)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "~ahello" (post-head "/c" 5)))
+                   (check "answered with a stream: the stream begins"
+                          (nth-value 1 (read-for stream "first" 5)) :satisfied)
+                   (setf (car box-c) :answer)
+                   (check "answered with a stream: its upstream answering does not close it"
+                          (nth-value 1 (read-for stream terminator 1.5)) :deadline))
+              (setf (car box-c) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-c :timeout 10) (error () nil)))
+        (check "answered with a stream: /c's fetch heard the abort sentinel"
+               (notes-of "/c") '((:then nil)))
+        ;; ---- a stream's client leaving, and a :THEN that tries again ----
+        (multiple-value-bind (port-r box-r thread-r) (%held-upstream)
+          (setf (first port-box) port-r)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "GET /retry HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                   ;; The census is published once a second, so its outbound
+                   ;; is waited for here, and its count below is not one
+                   ;; from before the relay began.
+                   (check "leaving: the relay begins"
+                          (list (nth-value 1 (read-for stream "from /retry" 5))
+                                (census-await :outbound 1))
+                          '(:satisfied 1)))
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          ;; Asked first, well inside the ten seconds after which the
+          ;; upstream hangs up and would take a fetch left running with it.
+          (check "leaving: no outbound is left running"
+                 (census-await :outbound 0) 0)
+          (check "leaving: a fetch into the closing connection, from the sentinel, was refused"
+                 (loop repeat 100
+                       until (member '(:again-refused) (notes-of "/retry") :test #'equal)
+                       do (sleep 0.05)
+                       finally (return (notes-of "/retry")))
+                 '((:then nil) (:again-refused)))
+          (setf (car box-r) :hang-up)
+          (handler-case (sb-thread:join-thread thread-r :timeout 10) (error () nil)))))))
+
 (defun %stop-verdict-pass (&optional target-disposition)
   "One HANDLE-OUTBOUND-READ pass over a complete chunked response whose
    :ON-BODY returns :STOP on the first chunk and NIL on the rest.
@@ -9014,6 +9269,7 @@
   (test-harness-a-response-is-written-from-its-read-e2e)
   (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
+  (test-harness-a-fetch-ends-with-what-it-was-started-for-e2e)
   (test-fetch-stop-ends-the-pass-at-its-chunk)
   (test-fetch-stop-ignores-the-failure-disposition)
   (test-fetch-failure-disposition-both-directions)
