@@ -551,6 +551,61 @@
       (check-error "duplicate Host rejected"
                    (web-skeleton::connection-parse-request conn)))))
 
+(defun test-host-field ()
+  "A request's Host is held to RFC 9110 §7.2 by CONNECTION-PARSE-HEAD: one
+   field, whatever the version, and its value host[:port].
+
+   Accepted: a name, an IPv4 address, a bracketed IPv6 address or
+   IPvFuture, each with a port or without, and an empty value or an empty
+   port, which the grammar allows. Refused: what a handler building a URL
+   from Host could be handed in its place — a path, a query, markup,
+   userinfo, a space, a second port, a port that is not digits, a broken
+   escape, a name not in ASCII, an IPv6 address outside brackets or with a
+   zone identifier — and a second Host at HTTP/1.0 as at HTTP/1.1."
+  (format t "~%Host: one field, and host[:port]~%")
+  (flet ((verdict (&rest lines)
+           ;; :OK for a head of LINES that CONNECTION-PARSE-HEAD accepts, or
+           ;; the status it refuses the head with. A connection of its own
+           ;; each time, since a parsed request stays on the connection.
+           (let* ((bytes (sb-ext:string-to-octets (apply #'crlf lines)
+                                                  :external-format :utf-8))
+                  (conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+             (setf (web-skeleton::connection-read-buf conn) bytes
+                   (web-skeleton::connection-read-pos conn) (length bytes)
+                   (web-skeleton::connection-header-end conn)
+                   (web-skeleton::scan-crlf-crlf bytes 0 (length bytes)))
+             (handler-case (progn (web-skeleton::connection-parse-head conn) :ok)
+               (http-parse-error (e) (http-parse-error-status e))))))
+    (flet ((host (value)
+             (verdict "GET / HTTP/1.1" (format nil "Host: ~a" value))))
+      (dolist (value '("example.com" "localhost" "x" "EXAMPLE.COM." "a_b-c~d.example"
+                       "!$&'()*+,;=.example" "xn--bcher-kva.example" "%41b.example"
+                       "127.0.0.1" "example.com:8080" "127.0.0.1:80" "x:" "" ":8080"
+                       "[::1]" "[::1]:8080" "[2001:db8::1]" "[::ffff:127.0.0.1]:80"
+                       "[v1.x]" "[V7.a:b]"))
+        (check (format nil "host: ~s is accepted" value) (host value) :ok))
+      (dolist (value '("a b" "evil.example/x?y" "x?y" "x#y" "x\"><b>" "<x>"
+                       "x\\y" "x{y}" "x|y" "x^y" "x`y"
+                       "u:p@x" "@x" "x:80:90" "x:abc" "x:-80" "x: 80"
+                       "%zz.example" "%4" "é.example"
+                       "::1" "::1:8080" "[::1" "[::1]x" "[::1]]" "x]"
+                       "[x]" "[]" "[fe80::1%25eth0]" "[v.x]" "[vz.x]" "[v1.]"))
+        (check (format nil "host: ~s is refused 400" value) (host value) 400)))
+    (check "host: two at HTTP/1.0 are refused 400"
+           (verdict "GET / HTTP/1.0" "Host: a.example" "Host: b.example") 400)
+    (check "host: two at HTTP/1.1 are refused 400, the same name twice too"
+           (list (verdict "GET / HTTP/1.1" "Host: a.example" "Host: b.example")
+                 (verdict "GET / HTTP/1.1" "Host: a.example" "Host: a.example"))
+           '(400 400))
+    (check "host: a malformed one at HTTP/1.0 is refused 400"
+           (verdict "GET / HTTP/1.0" "Host: a b") 400)
+    (check "control: one at HTTP/1.0 is accepted, and so is none"
+           (list (verdict "GET / HTTP/1.0" "Host: a.example")
+                 (verdict "GET / HTTP/1.0" "Accept: */*"))
+           '(:ok :ok))
+    (check "control: none at HTTP/1.1 is refused 400"
+           (verdict "GET / HTTP/1.1" "Accept: */*") 400)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Expect: 100-continue tests
 ;;; ---------------------------------------------------------------------------
@@ -15157,6 +15212,7 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
+  (test-host-field)
   (test-upstream-field-values)
   (test-transfer-encoding-rules)
   (test-chunked-request-body)

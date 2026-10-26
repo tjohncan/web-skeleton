@@ -459,6 +459,43 @@
       (check "no fields: at 1.1 it is refused for its missing Host"
              (status-line (exchange "GET / HTTP/1.1")) "HTTP/1.1 400"))))
 
+(defun test-harness-host-field-e2e ()
+  "Host on the wire, checked before any handler is called: a Host that is
+   host[:port] reaches the handler as it was sent, and one that is not, or
+   a second Host at HTTP/1.0, is answered 400 with the handler never
+   called."
+  (format t "~%Harness: the Host field, held to host[:port]~%")
+  (let ((lock (sb-thread:make-mutex :name "host-e2e"))
+        (seen nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (sb-thread:with-mutex (lock) (push (get-header req "host") seen))
+                    (make-text-response 200 "ok")))
+      (flet ((exchange (&rest lines)
+               (let ((answer (%exchange-or-why
+                              (%ascii (format nil "~{~a~a~}~a"
+                                              (loop for line in lines
+                                                    append (list line *crlf*))
+                                              *crlf*)))))
+                 (subseq answer 0 (min 12 (length answer))))))
+        (check "host: a name with a port reaches the handler"
+               (exchange "GET / HTTP/1.1" "Host: example.com:8080" "Connection: close")
+               "HTTP/1.1 200")
+        (check "host: and so does a bracketed IPv6 address with one"
+               (exchange "GET / HTTP/1.1" "Host: [::1]:8080" "Connection: close")
+               "HTTP/1.1 200")
+        (dolist (value '("x\"><b>" "evil.example/x?y" "u:p@x" "x:80:90" "a b"))
+          (check (format nil "host: ~s is answered 400" value)
+                 (exchange "GET / HTTP/1.1" (format nil "Host: ~a" value)
+                           "Connection: close")
+                 "HTTP/1.1 400"))
+        (check "host: two at HTTP/1.0 are answered 400"
+               (exchange "GET / HTTP/1.0" "Host: a.example" "Host: b.example")
+               "HTTP/1.1 400")
+        (check "host: the handler saw the valid ones, as sent, and no other"
+               (sb-thread:with-mutex (lock) (reverse seen))
+               '("example.com:8080" "[::1]:8080"))))))
+
 (defun test-harness-content-length-spellings-e2e ()
   "Every spelling of a Content-Length field is read alike by both of its
    readers, or refused with the connection closed.
@@ -9189,6 +9226,7 @@
   (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
   (test-harness-a-head-with-no-fields-e2e)
+  (test-harness-host-field-e2e)
   (test-harness-content-length-spellings-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)

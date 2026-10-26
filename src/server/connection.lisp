@@ -2163,6 +2163,69 @@
 ;;; Parse the buffered request
 ;;; ---------------------------------------------------------------------------
 
+(defun %reg-name-char-p (c)
+  "True for a character a reg-name holds as itself: RFC 3986's unreserved
+   characters and sub-delims, all of them ASCII."
+  (or (char<= #\a c #\z) (char<= #\A c #\Z) (char<= #\0 c #\9)
+      (find c "-._~!$&'()*+,;=")))
+
+(defun %reg-name-p (s start end)
+  "True when S[START, END) is an RFC 3986 reg-name: characters
+   %REG-NAME-CHAR-P accepts and %XX escapes of two hex digits, any number
+   of them or none."
+  (loop with i = start
+        while (< i end)
+        do (let ((c (char s i)))
+             (cond ((%reg-name-char-p c) (incf i))
+                   ((and (char= c #\%)
+                         (<= (+ i 3) end)
+                         (hex-digit-value (char-code (char s (+ i 1))))
+                         (hex-digit-value (char-code (char s (+ i 2)))))
+                    (incf i 3))
+                   (t (return nil))))
+        finally (return t)))
+
+(defun %ip-future-p (s)
+  "True when S is RFC 3986's IPvFuture: v, hex digits, a dot, and then
+   unreserved characters, sub-delims and colons."
+  (let ((dot (position #\. s)))
+    (and dot
+         (> dot 1)
+         (< (1+ dot) (length s))
+         (char-equal (char s 0) #\v)
+         (loop for i from 1 below dot
+               always (hex-digit-value (char-code (char s i))))
+         (loop for i from (1+ dot) below (length s)
+               always (or (%reg-name-char-p (char s i))
+                          (char= (char s i) #\:))))))
+
+(defun host-field-valid-p (value)
+  "True when VALUE, a Host field's value, is what RFC 9110 §7.2 allows: a
+   host, then optionally a colon and a port of digits.
+
+   The host is RFC 3986's: an IPv6 address or an IPvFuture in brackets,
+   checked by PARSE-IPV6-LITERAL and %IP-FUTURE-P, or a reg-name, which
+   covers an IPv4 address as well. A reg-name may be empty, and so may the
+   port: an empty Host is what a client sends for a target with no
+   authority. An IPv6 address outside brackets is not a host, nor is one
+   with a zone identifier inside them."
+  (let* ((len (length value))
+         (host-end
+           (if (and (plusp len) (char= (char value 0) #\[))
+               (let ((close (position #\] value)))
+                 (and close
+                      (let ((inside (subseq value 1 close)))
+                        (or (parse-ipv6-literal inside)
+                            (%ip-future-p inside)))
+                      (1+ close)))
+               (let ((end (or (position #\: value) len)))
+                 (and (%reg-name-p value 0 end) end)))))
+    (and host-end
+         (or (= host-end len)
+             (and (char= (char value host-end) #\:)
+                  (loop for i from (1+ host-end) below len
+                        always (char<= #\0 (char value i) #\9)))))))
+
 (defun connection-parse-head (conn)
   "Parse the head of CONN's request from the read buffer — request line
    and headers, without the body — and set the connection's request field
@@ -2176,13 +2239,18 @@
   (let* ((body-start (+ (connection-header-end conn) 4))
          (request (parse-request-bytes (connection-read-buf conn)
                                        0 body-start)))
-    ;; RFC 7230 §5.4: HTTP/1.1 requests MUST have exactly one Host header
-    (when (string= (http-request-version request) "1.1")
-      (let ((host-count (length (get-headers request "host"))))
-        (when (zerop host-count)
-          (http-parse-error "missing Host header in HTTP/1.1 request"))
-        (when (> host-count 1)
-          (http-parse-error "duplicate Host header"))))
+    ;; RFC 9112 §3.2: a 400 for an HTTP/1.1 request with no Host, and for
+    ;; any request with more than one Host field line or a Host that is
+    ;; not host[:port]. Any request, HTTP/1.0 too: a handler reads Host the
+    ;; same way on both, and two of them are the split by which a proxy in
+    ;; front routes a request by one name and the handler sees another.
+    (let ((hosts (get-headers request "host")))
+      (when (and (null hosts) (string= (http-request-version request) "1.1"))
+        (http-parse-error "missing Host header in HTTP/1.1 request"))
+      (when (rest hosts)
+        (http-parse-error "duplicate Host header"))
+      (when (and hosts (not (host-field-valid-p (first hosts))))
+        (http-parse-error "malformed Host header")))
     (setf (connection-request conn) request)
     request))
 

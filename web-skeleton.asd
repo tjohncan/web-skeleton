@@ -39,6 +39,7 @@
                                                             "src/log"
                                                             "src/epoll"
                                                             "src/address"
+                                                            "src/algorithms/hex"
                                                             "src/server/http"
                                                             "src/server/chunked"))
                (:file "src/server/websocket" :depends-on ("src/counters" "src/package"

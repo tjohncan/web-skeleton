@@ -268,3 +268,131 @@
     (:inet  (and (= (length bytes) 4)  (ipv4-public-p bytes)))
     (:inet6 (and (= (length bytes) 16) (ipv6-public-p bytes)))
     (otherwise nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; IP literal parsers
+;;;
+;;; Used by PARSE-URL (to recognize bracketed IPv6 literals), by
+;;; INITIATE-HTTP-FETCH (to skip DNS entirely when the host is already an
+;;; address), and by HOST-FIELD-VALID-P (to check a request's bracketed
+;;; Host). Returning NIL on any failure — callers fall through to the next
+;;; case, never error.
+;;; ---------------------------------------------------------------------------
+
+(defun parse-ipv4-literal (str)
+  "Parse STR as a strict dotted-quad IPv4 address. Returns a 4-byte
+   vector on success, NIL on any failure. Rejects leading zeros (except
+   the bare '0'), out-of-range octets, wrong segment count, non-digits."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv4-literal nil))
+  (let ((parts '())
+        (start 0)
+        (len (length str)))
+    (dotimes (i (1+ len))
+      (when (or (= i len) (char= (char str i) #\.))
+        (let ((piece (subseq str start i)))
+          (when (zerop (length piece))
+            (return-from parse-ipv4-literal nil))
+          (when (and (> (length piece) 1) (char= (char piece 0) #\0))
+            (return-from parse-ipv4-literal nil))
+          (unless (every (lambda (c) (char<= #\0 c #\9)) piece)
+            (return-from parse-ipv4-literal nil))
+          (let ((val (parse-integer piece)))
+            (unless (<= 0 val 255)
+              (return-from parse-ipv4-literal nil))
+            (push val parts)))
+        (setf start (1+ i))))
+    (when (= (length parts) 4)
+      (make-array 4 :element-type '(unsigned-byte 8)
+                    :initial-contents (nreverse parts)))))
+
+(defun %ipv6-groups-to-bytes (groups)
+  "Convert a list of eight 16-bit integers to a 16-byte vector (network
+   byte order — big-endian)."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8))))
+    (loop for g in groups
+          for i from 0 by 2
+          do (setf (aref out i)       (logand #xFF (ash g -8))
+                   (aref out (1+ i))  (logand #xFF g)))
+    out))
+
+(defun %parse-ipv6-group (s)
+  "Parse 1-4 hex digits as an integer 0-65535, or return NIL."
+  (and (<= 1 (length s) 4)
+       (every (lambda (c)
+                (or (char<= #\0 c #\9)
+                    (char<= #\a c #\f)
+                    (char<= #\A c #\F)))
+              s)
+       (parse-integer s :radix 16)))
+
+(defun %split-ipv6-groups (s)
+  "Split S on colons into a list of substrings. Empty S returns NIL."
+  (when (zerop (length s))
+    (return-from %split-ipv6-groups nil))
+  (let ((groups '())
+        (start 0))
+    (dotimes (i (1+ (length s)) (nreverse groups))
+      (when (or (= i (length s)) (char= (char s i) #\:))
+        (push (subseq s start i) groups)
+        (setf start (1+ i))))))
+
+(defun %ipv6-maybe-unfold-ipv4-tail (groups)
+  "If the last entry of GROUPS is a dotted-quad IPv4 literal, expand
+   it to two 16-bit hex-string groups and return the new list.
+   Otherwise return GROUPS unchanged. Supports the IPv4-mapped and
+   IPv4-compatible IPv6 address forms (RFC 4291 §2.5.5) — e.g.
+   '::ffff:127.0.0.1' — so PARSE-IPV6-LITERAL and IS-PUBLIC-ADDRESS-P
+   agree on URL-literal classification.
+
+   The last-contains-dot branch uses OR so a failed PARSE-IPV4-LITERAL
+   falls back to GROUPS unchanged (the downstream %PARSE-IPV6-GROUP
+   then rejects the dotted tail as non-hex). Returning NIL on a
+   failed unfold would mask the rejection and let PARSE-IPV6-LITERAL
+   silently accept malformed literals like '::1.2.3' as '::'."
+  (let ((last (car (last groups))))
+    (if (and last (find #\. last))
+        (or (let ((v4 (parse-ipv4-literal last)))
+              (when v4
+                (let ((hi (logior (ash (aref v4 0) 8) (aref v4 1)))
+                      (lo (logior (ash (aref v4 2) 8) (aref v4 3))))
+                  (append (butlast groups)
+                          (list (format nil "~x" hi)
+                                (format nil "~x" lo))))))
+            groups)
+        groups)))
+
+(defun parse-ipv6-literal (str)
+  "Parse STR as an IPv6 literal. Returns a 16-byte vector on success,
+   NIL on failure. Handles :: compression and the IPv4-mapped /
+   IPv4-compatible tail form (::ffff:1.2.3.4 — RFC 4291 §2.5.5).
+   Does not handle zone identifiers (fe80::1%eth0) — rare in URL
+   contexts and v1 rejects them cleanly."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv6-literal nil))
+  (let ((dcolon (search "::" str)))
+    (cond
+      ;; "::" compression present
+      (dcolon
+       (let* ((prefix (subseq str 0 dcolon))
+              (suffix (subseq str (+ dcolon 2)))
+              (pre (if (zerop (length prefix)) '() (%split-ipv6-groups prefix)))
+              (suf (if (zerop (length suffix)) '() (%split-ipv6-groups suffix)))
+              (suf (%ipv6-maybe-unfold-ipv4-tail suf))
+              (pre-vals (mapcar #'%parse-ipv6-group pre))
+              (suf-vals (mapcar #'%parse-ipv6-group suf))
+              (filled (+ (length pre-vals) (length suf-vals))))
+         (when (and (every #'identity pre-vals)
+                    (every #'identity suf-vals)
+                    (<= filled 7))
+           (%ipv6-groups-to-bytes
+            (append pre-vals
+                    (make-list (- 8 filled) :initial-element 0)
+                    suf-vals)))))
+      ;; No "::" — must be exactly 8 groups (or 6 groups + IPv4 tail)
+      (t
+       (let* ((groups (%ipv6-maybe-unfold-ipv4-tail
+                       (%split-ipv6-groups str)))
+              (vals (mapcar #'%parse-ipv6-group groups)))
+         (when (and (= (length vals) 8) (every #'identity vals))
+           (%ipv6-groups-to-bytes vals)))))))
