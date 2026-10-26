@@ -1698,10 +1698,16 @@
                (ws-upgrade-p answer)))
       ;; A fetch started for the body, and still running now the body has
       ;; ended, is ended with it — unless the answer is that fetch, which
-      ;; the request is answered with (ADOPT-FETCH). Before the answer is
-      ;; set out, so a stream it starts is the stream's own to fetch into.
+      ;; the request is answered with (ADOPT-FETCH): started for CONN and
+      ;; not yet over. One that is over has answered already, and a fetch
+      ;; started into the body after it is another, ended here as any is.
+      ;; Before the answer is set out, so a stream it starts is the
+      ;; stream's own to fetch into.
       (unless (and (typep answer 'http-fetch-continuation)
-                   (fetch-started-p answer))
+                   (fetch-started-p answer)
+                   (not (http-fetch-continuation-ended answer))
+                   (= (http-fetch-continuation-target-fd answer)
+                      (connection-fd conn)))
         (end-detached-fetches conn epoll-fd))
       (multiple-value-bind (response upgrade-p)
           (classify-response request answer)

@@ -8322,6 +8322,15 @@
    stream that stays open. The fetch ended with the body, so its upstream
    answering afterwards does not close the stream.
 
+   /adopt's body goes into a streamed fetch whose upstream answers at the
+   head, and once that fetch has answered, the body starts another and
+   does not wait for it. ON-END answers with the first, which has ended.
+   The second is still running, and is ended with the body all the same,
+   so its upstream hanging up later is nothing to /next, which follows on
+   the connection. /adopt-stream is the same with the first fetch's answer
+   a stream: the second is ended before the stream begins, so its upstream
+   answering does not close the stream.
+
    /retry relays into a stream whose client then leaves, and its :THEN
    answers the abort sentinel by starting the fetch again. That is refused,
    as a fetch already outstanding, and no outbound is left running into a
@@ -8330,6 +8339,8 @@
   (let* ((lock (sb-thread:make-mutex :name "fetch-ends"))
          (notes nil)
          (port-box (list nil))
+         ;; /adopt's two upstreams: the one that answers first, the other.
+         (adopt-ports (list nil nil))
          (terminator (format nil "0~a~a" *crlf* *crlf*)))
     (labels ((note (&rest what)
                (sb-thread:with-mutex (lock) (push what notes)))
@@ -8521,7 +8532,120 @@
                        finally (return (notes-of "/retry")))
                  '((:then nil) (:again-refused)))
           (setf (car box-r) :hang-up)
-          (handler-case (sb-thread:join-thread thread-r :timeout 10) (error () nil)))))))
+          (handler-case (sb-thread:join-thread thread-r :timeout 10) (error () nil))))
+      ;; ---- answered with a fetch that has ended, another still running ----
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (if (string= path "/next")
+                   ;; A body with no fetch of its own.
+                   (receive-body
+                    :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                    :on-end (lambda (conn)
+                              (declare (ignore conn))
+                              (make-text-response 200 "done /next"))
+                    :on-abort (lambda (conn reason)
+                                (declare (ignore conn))
+                                (note path :aborted reason)))
+                   ;; /adopt and /adopt-stream, whose first fetch answers
+                   ;; with a stream that stays open.
+                   (let ((first-fetch
+                           (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                                    (first adopt-ports))
+                                       :body :stream
+                                       :then (lambda (s h b)
+                                               (declare (ignore h b))
+                                               (note path :first s)
+                                               (if (string= path "/adopt-stream")
+                                                   (make-stream-response
+                                                    :on-open (lambda (c)
+                                                               (stream-send
+                                                                c (%ascii "first answered"))))
+                                                   (make-text-response 200 "first answered"))))))
+                     (receive-body
+                      :on-data (lambda (conn bytes)
+                                 (if (fetch-started-p first-fetch)
+                                     ;; It has answered, so the rest goes
+                                     ;; nowhere, and the body starts a fetch
+                                     ;; of its own that it does not wait for.
+                                     (when (eq (fetch-send first-fetch bytes) :ended)
+                                       (handler-case
+                                           (fetch-into conn
+                                                       (http-fetch
+                                                        :get (format nil "http://127.0.0.1:~d/up"
+                                                                     (second adopt-ports))
+                                                        :then (then-for (format nil "~a-second"
+                                                                                path))))
+                                         (error (e) (note path :refused (princ-to-string e)))))
+                                     (progn
+                                       (fetch-into conn first-fetch :failure-disposition :keep)
+                                       (fetch-send first-fetch bytes)))
+                                 nil)
+                      :on-end (lambda (conn) (declare (ignore conn)) first-fetch)
+                      :on-abort (lambda (conn reason)
+                                  (declare (ignore conn))
+                                  (note path :aborted reason))))))))
+        (multiple-value-bind (port-1 thread-1) (%upload-upstream :early-status 200)
+          (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+            (setf (first adopt-ports) port-1
+                  (second adopt-ports) port-2)
+            (multiple-value-bind (socket stream) (%raw-connect)
+              (unwind-protect
+                   (progn
+                     (send stream (format nil "~a01234" (post-head "/adopt" 10)))
+                     ;; The rest once the first fetch has answered.
+                     (loop repeat 100 until (notes-of "/adopt") do (sleep 0.05))
+                     (send stream "56789")
+                     (check "adopt: answered with the fetch that answered first"
+                            (nth-value 1 (read-for stream "first answered" 5)) :satisfied)
+                     (check "adopt: the fetch started after it was ended with the body"
+                            (loop repeat 40
+                                  until (notes-of "/adopt-second")
+                                  do (sleep 0.05)
+                                  finally (return (notes-of "/adopt-second")))
+                            '((:then nil)))
+                     (send stream (format nil "~a01234" (post-head "/next" 10)))
+                     (sleep 0.3)
+                     (setf (car box-2) :hang-up)
+                     (sleep 0.3)
+                     (handler-case (send stream "56789") (error () nil))
+                     (check "adopt: /next, next on the connection, is answered"
+                            (nth-value 1 (read-for stream "done /next" 5)) :satisfied))
+                (setf (car box-2) :hang-up)
+                (ignore-errors (close stream :abort t))
+                (ignore-errors (sb-bsd-sockets:socket-close socket))))
+            (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil)))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        ;; The same, answered with a stream: the fetch the body started
+        ;; after the first answered is ended before the stream begins, so
+        ;; its upstream answering does not close the stream.
+        (multiple-value-bind (port-1 thread-1) (%upload-upstream :early-status 200)
+          (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+            (setf (first adopt-ports) port-1
+                  (second adopt-ports) port-2)
+            (multiple-value-bind (socket stream) (%raw-connect)
+              (unwind-protect
+                   (progn
+                     (send stream (format nil "~a01234" (post-head "/adopt-stream" 10)))
+                     (loop repeat 100 until (notes-of "/adopt-stream") do (sleep 0.05))
+                     (send stream "56789")
+                     (check "adopt, a stream: the stream the first fetch answered with begins"
+                            (nth-value 1 (read-for stream "first answered" 5)) :satisfied)
+                     (setf (car box-2) :answer)
+                     (check "adopt, a stream: the other fetch's upstream answering does not close it"
+                            (nth-value 1 (read-for stream terminator 1.5)) :deadline))
+                (setf (car box-2) :hang-up)
+                (ignore-errors (close stream :abort t))
+                (ignore-errors (sb-bsd-sockets:socket-close socket))))
+            (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil)))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        (check "adopt, a stream: the other fetch heard the abort sentinel"
+               (notes-of "/adopt-stream-second") '((:then nil)))
+        (check "adopt: each first fetch answered at the head, and nothing ended /next"
+               (list (notes-of "/adopt") (notes-of "/adopt-stream") (notes-of "/next"))
+               '(((:first 200)) ((:first 200)) nil))))))
 
 (defun %stop-verdict-pass (&optional target-disposition)
   "One HANDLE-OUTBOUND-READ pass over a complete chunked response whose

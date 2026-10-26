@@ -2892,17 +2892,22 @@
     (error "a fetch started for fd ~d cannot answer the request on fd ~d"
            (http-fetch-continuation-target-fd fetch) (connection-fd conn)))
   (fetch-finish fetch)
-  (setf (connection-fetch-outstanding conn) nil
-        (connection-send-waiting conn) nil)
   (if (http-fetch-continuation-ended fetch)
+      ;; What FETCH left on CONN was cleared as it ended (DELIVER-DETACHED).
+      ;; A marker set since belongs to another fetch, started into the body
+      ;; after this one had answered, and is not this one's to clear: that
+      ;; fetch ends with the request, as any other does.
       (values :answer (if (http-fetch-continuation-answered fetch)
                           (http-fetch-continuation-answer fetch)
                           (make-error-response 502)))
       (let ((carrier (http-fetch-continuation-carrier fetch)))
         ;; From here the fetch is a parked one: its result answers CONN, a
         ;; failure answers CONN 502, and the :AWAITING sweep bounds the wait
-        ;; once the request has all gone out (see BEGIN-RESPONSE-READ).
-        (setf (http-fetch-continuation-sink fetch) :inbound
+        ;; once the request has all gone out (see BEGIN-RESPONSE-READ). The
+        ;; marker and a wait on its request draining are FETCH's, and go.
+        (setf (connection-fetch-outstanding conn) nil
+              (connection-send-waiting conn) nil
+              (http-fetch-continuation-sink fetch) :inbound
               (connection-fetch-sink carrier) :inbound
               (connection-state conn) :awaiting
               (connection-awaiting-fd conn) (connection-fd carrier)
