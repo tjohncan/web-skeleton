@@ -7272,6 +7272,121 @@
           (when stream (ignore-errors (close stream)))
           (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
 
+(defun test-harness-forward-body-unstartable-as-the-server-stops-e2e ()
+  "FORWARD-BODY whose fetch cannot start, at the moment the server begins
+   to stop. The address filter refuses the first dial and starts the
+   shutdown in the same call, as a SIGTERM landing then would. The body is
+   then the drain's to end, and nothing more of it is read for the fetch:
+   it is not dialed again for the body's next run, its :THEN hears the
+   abort sentinel once, and ON-ABORT hears :SHUTDOWN.
+
+   The body is one write of 300 KiB, more than one window, so its next run
+   is in the kernel as the first is handed over. The upstream is a
+   listener that accepts nothing: a second dial, were there one, would
+   connect into its backlog."
+  (format t "~%Harness: forward-body's fetch refused as the server stops~%")
+  (let ((saved web-skeleton:*fetch-address-filter*)
+        (lock (sb-thread:make-mutex :name "unstartable-at-stop"))
+        (dials 0)
+        (thens nil)
+        (aborts nil)
+        (listener (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore ip family host))
+            (let ((n (sb-thread:with-mutex (lock) (incf dials))))
+              (if (= n 1)
+                  (progn (setf web-skeleton::*shutdown* t) nil)
+                  t))))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 4)
+           (with-test-server
+               (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                :body-handler
+                (lambda (req)
+                  (declare (ignore req))
+                  (forward-body
+                   (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                            (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+                               :body :stream
+                               :then (lambda (status headers body)
+                                       (declare (ignore headers body))
+                                       (sb-thread:with-mutex (lock) (push status thens))
+                                       (make-error-response 502)))
+                   :max-size nil
+                   :on-abort (lambda (conn reason)
+                               (declare (ignore conn))
+                               (sb-thread:with-mutex (lock) (push reason aborts))))))
+             (%exchange-or-why (%form-post-bytes "/up" (%pseudo-random-bytes (* 300 1024) 23)
+                                                 :headers '("Connection: close"))
+                               :seconds 10))
+           ;; Read once WITH-TEST-SERVER's teardown has drained and joined
+           ;; the worker.
+           (sb-thread:with-mutex (lock)
+             (check "unstartable at the stop: the fetch was dialed once" dials 1)
+             (check "unstartable at the stop: :then heard the abort sentinel once"
+                    thens '(nil))
+             (check "unstartable at the stop: the drain ended the body" aborts '(:shutdown))))
+      (setf web-skeleton:*fetch-address-filter* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-harness-a-send-before-its-fetch-starts-e2e ()
+  "A body whose ON-DATA sends its run with FETCH-SEND before the fetch has
+   started, then starts it, and pauses on the send's NIL, an order
+   FETCH-SEND allows. The run held for the fetch goes out once the
+   upstream has connected, and the body is resumed then, as a pause on
+   any NIL is, and the upload is answered by the upstream with what was
+   sent whole.
+
+   *FETCH-TIMEOUT* is 4 here, so a body never resumed would be ended by
+   its upload's deadline, unanswered, well inside the client's wait."
+  (format t "~%Harness: a body that sends before its fetch starts~%")
+  (let ((saved web-skeleton:*fetch-timeout*)
+        (upstream-port (list nil))
+        (body (%pseudo-random-bytes 300000 29)))
+    (setf web-skeleton:*fetch-timeout* 4)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (declare (ignore req))
+                (let ((put (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                                    (first upstream-port))
+                                       :body :stream
+                                       :then (lambda (status headers b)
+                                               (declare (ignore headers))
+                                               (if (eql status 200)
+                                                   (make-text-response
+                                                    200 (sb-ext:octets-to-string
+                                                         b :external-format :latin-1))
+                                                   (make-error-response 502))))))
+                  (receive-body
+                   :max-size nil
+                   :on-data (lambda (conn bytes)
+                              (let ((sent (fetch-send put bytes)))
+                                (unless (fetch-started-p put)
+                                  (fetch-into conn put))
+                                (cond ((eq sent t) nil)
+                                      ((null sent) :pause)
+                                      (t (make-error-response 502)))))
+                   :on-end (lambda (conn) (declare (ignore conn)) put)))))
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why (%form-post-bytes "/up" body
+                                                               :headers '("Connection: close"))
+                                             :seconds 15)))
+               (check "sent first: the upload is answered by the upstream, whole"
+                      (and (search (format nil "got:~d:~a" (length body) (sha256-hex body))
+                                   answer)
+                           t)
+                      t))
+             (handler-case (sb-thread:join-thread thread :timeout 10) (error () nil))))
+      (setf web-skeleton:*fetch-timeout* saved))))
+
 (defun test-harness-form-file-forwarded-e2e ()
   "One file of a form forwarded upstream as it arrives, end to end: its
    runs sent with FETCH-SEND from :ON-PART-DATA, :ON-END answering with
@@ -9422,6 +9537,8 @@
   (test-harness-receive-multipart-paused-e2e)
   (test-harness-body-refused-from-inside-its-callback-e2e)
   (test-harness-streamed-request-body-e2e)
+  (test-harness-forward-body-unstartable-as-the-server-stops-e2e)
+  (test-harness-a-send-before-its-fetch-starts-e2e)
   (test-harness-form-file-forwarded-e2e)
   (test-harness-streamed-request-body-timing-e2e)
   (test-harness-then-answers-with-a-started-fetch-e2e)

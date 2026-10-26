@@ -1880,18 +1880,26 @@
     (error "fetch-into: fd ~d already has a detached fetch outstanding"
            (connection-fd connection)))
   (setf (http-fetch-continuation-sink continuation) :detached)
-  ;; Both marked before dialing and both cleared by the setup-failure path
+  ;; All three marked before dialing and cleared by the setup-failure path
   ;; below, so a refused call leaves the connection exactly as it found it.
   ;; :CLOSE is the resting value as well as the default, so restoring it is
   ;; restoring the connection rather than overwriting a choice — and the
   ;; slot is unread anyway while no fetch is outstanding.
+  ;;
+  ;; The wait is marked when a streamed fetch arrives holding what was sent
+  ;; before it started. Each such send answered NIL with no connection yet
+  ;; to mark the wait on, and a body that paused on it is waiting for those
+  ;; pieces to drain: RELEASE-SEND-WAITER resumes it when they have.
   (setf (connection-fetch-outstanding connection) t
         (connection-fetch-failure-disposition connection) failure-disposition
-        (connection-send-waiting connection) nil)
+        (connection-send-waiting connection)
+        (and (http-fetch-continuation-stream-body continuation)
+             (plusp (http-fetch-continuation-pending-bytes continuation))))
   (handler-case (initiate-fetch connection *epoll-fd* continuation)
     (error (e)
       (setf (connection-fetch-outstanding connection) nil
-            (connection-fetch-failure-disposition connection) :close)
+            (connection-fetch-failure-disposition connection) :close
+            (connection-send-waiting connection) nil)
       (error e)))
   t)
 
@@ -2994,11 +3002,16 @@
             (receive-body
              :max-size max-size
              :on-data (lambda (conn bytes)
-                        (when (or (fetch-started-p fetch) (start conn))
-                          (let ((sent (fetch-send fetch bytes)))
-                            (cond ((eq sent t) nil)
-                                  ((null sent) :pause)
-                                  (t (answer-for (http-fetch-continuation-answer fetch)))))))
+                        (if (or (fetch-started-p fetch) (start conn))
+                            (let ((sent (fetch-send fetch bytes)))
+                              (cond ((eq sent t) nil)
+                                    ((null sent) :pause)
+                                    (t (answer-for (http-fetch-continuation-answer fetch)))))
+                            ;; FETCH could not start, and has ended: :THEN's
+                            ;; answer has refused the body, or in a drain the
+                            ;; drain ends it. Nothing more is read for it,
+                            ;; since the next run would start FETCH again.
+                            :pause))
              :on-end (lambda (conn)
                        (declare (ignore conn))
                        ;; A body that had no bytes never started FETCH;
