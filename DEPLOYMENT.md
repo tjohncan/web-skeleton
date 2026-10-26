@@ -2289,14 +2289,18 @@ answered before it ended. In outline:
   standing still, not the upload. Each piece sent, and each piece the
   upstream takes, moves the deadline out, so an upload takes as long as it
   keeps moving. If the upstream stops reading, the fetch ends once that
-  long has passed and the client is answered 502. If the client stops
-  sending, the fetch ends the same way; the client is answered 502 if it
-  sends again, and is ended as a stall under `*body-stall-timeout*` if it
-  does not. Once the body has all been written to the socket, the answer is
-  waited for under `*fetch-timeout*` as any fetch's is, and a request
-  answered with the fetch is answered 504 if it does not come. That wait
-  includes the time the upstream takes to read what the kernel was still
-  holding for it, which over a slow link can be seconds.
+  long has passed, and the client is answered at once with `:then`'s
+  answer to the abort sentinel, or 502. If the client stops sending,
+  `*body-stall-timeout*` measures the same quiet: the fetch ends the same
+  way if its deadline comes first or with the stall, as at the defaults,
+  and if the stall comes first the connection is closed unanswered and
+  `:on-abort` hears `:stalled`. By hand, a `:then` that does not refuse
+  the body leaves the client to be answered from the next `fetch-send`,
+  which answers `:ended`. Once the body has all been written to the socket,
+  the answer is waited for under `*fetch-timeout*` as any fetch's is, and a
+  request answered with the fetch is answered 504 if it does not come. That
+  wait includes the time the upstream takes to read what the kernel was
+  still holding for it, which over a slow link can be seconds.
 
 ### Form body decoding
 

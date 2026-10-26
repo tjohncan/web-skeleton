@@ -11364,6 +11364,153 @@
     (check "sweep: a request body standing still past its deadline ends the fetch, and 502"
            (sweep :deadline-in -5) '(:write-response "HTTP/1.1 502 Bad Gateway" nil))))
 
+(defun test-sweep-acts-only-on-what-is-still-due ()
+  "The sweep collects what is due and then acts on it, and each connection
+   is judged again when its turn comes.
+
+   A received body standing still past *BODY-STALL-TIMEOUT*, and a detached
+   fetch into its connection past its own deadline in the same sweep, as
+   FORWARD-BODY's upload and the body it forwards are at equal settings.
+   The fetch's end is acted on first, and its :THEN refuses the body with a
+   502, as FORWARD-BODY's does. The body was collected as stalled, but by
+   its turn it has been answered, so it is not closed under its answer, and
+   ON-ABORT's :REFUSED is the truth. Control: the same body with no fetch
+   into it is closed as stalled.
+
+   And two detached fetches past their deadlines, each into a body of its
+   own and each :THEN stopping the other, so whichever ends first stops
+   the second. The second was collected as expired, but by its turn the
+   application has stopped it, and a stopped fetch leaves its connection
+   as it was: only the first fetch's body is ended, by that fetch's own
+   failure."
+  (format t "~%The sweep: what is due is judged again at its turn~%")
+  (labels ((receiving (now &rest slots)
+             ;; A connection receiving a body of 100000 bytes, on a
+             ;; descriptor of its own, with SLOTS over the defaults.
+             (let ((head (sb-ext:string-to-octets
+                          (format nil "POST /up HTTP/1.1~aHost: x~a~
+                                       Content-Length: 100000~a~a"
+                                  *crlf* *crlf* *crlf* *crlf*)
+                          :external-format :latin-1)))
+               (apply #'web-skeleton::make-connection
+                      (append slots
+                              (list :fd (web-skeleton::epoll-create)
+                                    :state :read-body
+                                    :request (web-skeleton::parse-request-bytes
+                                              head 0 (length head))
+                                    :last-active now
+                                    :body-progress-at now)))))
+           (detached-into (target now &rest slots)
+             ;; A detached fetch into TARGET past its deadline, on a
+             ;; descriptor of its own, with SLOTS over the defaults.
+             (apply #'web-skeleton::make-connection
+                    (append slots
+                            (list :fd (web-skeleton::epoll-create)
+                                  :state :out-read :outbound-p t
+                                  :inbound-fd (web-skeleton::connection-fd target)
+                                  :fetch-sink :detached
+                                  :fetch-deadline (- now 5)
+                                  :last-active now))))
+           (sweep-once (epfd now registered)
+             ;; Put REGISTERED on the table, and in EPFD's interest as the
+             ;; event loop would, and sweep once.
+             (dolist (conn registered)
+               (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
+                                        (logior web-skeleton::+epollin+
+                                                web-skeleton::+epollet+))
+               (web-skeleton::register-connection conn))
+             (web-skeleton::sweep-idle-connections epfd now))
+           (on-a-table (fn)
+             ;; FN called with an epoll fd and the time, inside a
+             ;; connection table of its own. FN answers its result and the
+             ;; connections it made, which are closed afterwards: closing
+             ;; one the sweep closed already is a no-op.
+             (let ((epfd (web-skeleton::epoll-create))
+                   (conns nil))
+               (unwind-protect
+                    (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                          (web-skeleton::*epoll-fd* epfd)
+                          (web-skeleton:*log-stream* (make-broadcast-stream)))
+                      (multiple-value-bind (result made)
+                          (funcall fn epfd (get-universal-time))
+                        (setf conns made)
+                        result))
+                 (dolist (conn conns)
+                   (ignore-errors (web-skeleton::connection-close conn)))
+                 (ignore-errors (web-skeleton::%close epfd)))))
+           (stalled-body (&key with-fetch)
+             ;; A received body stalled past its clock and, WITH-FETCH, a
+             ;; detached fetch into it past its deadline whose :THEN refuses
+             ;; the body. Answers the body's state, the status line queued on
+             ;; it, and what its ON-ABORT heard.
+             (on-a-table
+              (lambda (epfd now)
+                (let* ((heard nil)
+                       (in (receiving now
+                                      :last-active (- now 60)
+                                      :body-progress-at (- now web-skeleton:*body-stall-timeout* 5)
+                                      :fetch-outstanding with-fetch
+                                      :fetch-failure-disposition :keep
+                                      :body-receiver
+                                      (receive-body
+                                       :on-data (lambda (conn bytes)
+                                                  (declare (ignore conn bytes))
+                                                  nil)
+                                       :on-end (lambda (conn) (declare (ignore conn)) nil)
+                                       :on-abort (lambda (conn reason)
+                                                   (declare (ignore conn))
+                                                   (setf heard reason)))))
+                       (out (detached-into in now
+                                           :state :out-send
+                                           :fetch-callback
+                                           (lambda (status headers body)
+                                             (declare (ignore status headers body))
+                                             (body-refuse in (make-error-response 502))
+                                             nil))))
+                  (sweep-once epfd now (if with-fetch (list in out) (list in)))
+                  (values (list (web-skeleton::connection-state in)
+                                (and (plusp (web-skeleton::connection-write-pending in))
+                                     (let ((text (sb-ext:octets-to-string
+                                                  (web-skeleton::connection-write-buf in)
+                                                  :external-format :latin-1)))
+                                       (subseq text 0 (search *crlf* text))))
+                                heard)
+                          (list in out)))))))
+    (check "sweep: a stalled body answered by its fetch's end keeps its answer"
+           (stalled-body :with-fetch t)
+           '(:write-response "HTTP/1.1 502 Bad Gateway" :refused))
+    (check "control: with no fetch into it, the stalled body is closed as stalled"
+           (stalled-body) '(:closing nil :stalled))
+    (check "sweep: a fetch stopped before its turn leaves its body as it was"
+           (on-a-table
+            (lambda (epfd now)
+              (let* ((bodies (loop repeat 2
+                                   collect (receiving
+                                            now
+                                            :fetch-outstanding t
+                                            :body-receiver
+                                            (receive-body
+                                             :on-data (lambda (conn bytes)
+                                                        (declare (ignore conn bytes))
+                                                        nil)
+                                             :on-end (lambda (conn)
+                                                       (declare (ignore conn))
+                                                       nil)))))
+                     (fetches (mapcar (lambda (body) (detached-into body now)) bodies)))
+                (flet ((stopping (other)
+                         (lambda (status headers body)
+                           (declare (ignore status headers body))
+                           (web-skeleton::stop-fetch other epfd)
+                           nil)))
+                  (setf (web-skeleton::connection-fetch-callback (first fetches))
+                        (stopping (second fetches))
+                        (web-skeleton::connection-fetch-callback (second fetches))
+                        (stopping (first fetches))))
+                (sweep-once epfd now (append bodies fetches))
+                (values (sort (mapcar #'web-skeleton::connection-state bodies) #'string<)
+                        (append bodies fetches)))))
+           '(:closing :read-body))))
+
 (defun test-body-handler-validated-at-boot ()
   "START-SERVER refuses a :BODY-HANDLER it could not call, and a
    *BODY-STALL-TIMEOUT* that would leave an accepted body with no time
@@ -15025,6 +15172,7 @@
   (test-receive-multipart-pauses-where-it-falls)
   (test-streamed-fetch-contract)
   (test-streamed-fetch-sweep)
+  (test-sweep-acts-only-on-what-is-still-due)
   (test-unfinishable-request-closes)
   (test-declared-body-is-not-preallocated)
   (test-unterminated-head-refused-at-its-budget)

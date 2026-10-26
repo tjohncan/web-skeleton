@@ -438,6 +438,149 @@
     (epoll-modify epoll-fd (connection-fd conn)
                   (logior +epollout+ +epollet+))))
 
+(defun connect-late-p (conn now)
+  "True when CONN, still on the table, is an outbound connect given its
+   *CONNECT-FALLBACK-DELAY* by NOW and not answered, with the name's other
+   addresses still to try."
+  (and (connection-outbound-p conn)
+       (eq (connection-state conn) :out-connecting)
+       (connection-fallback-addresses conn)
+       (plusp (connection-connect-deadline conn))
+       (> now (connection-connect-deadline conn))
+       (eq (lookup-connection (connection-fd conn)) conn)))
+
+(defun fetch-expired-p (conn now)
+  "True when CONN, still on the table, is an outbound past its fetch
+   deadline at NOW that nothing but the sweep will end.
+
+   A detached outbound has no parked inbound, so the :AWAITING reap that
+   bounds every other fetch cannot see it. Nothing else would: it is not
+   idle — it is waiting on an upstream — and a paused one is subscribed to
+   no epoll events at all, so no wake-up is coming either. Left alone, a
+   hung upstream strands the outbound socket and the app's callback never
+   fires. A pause whose target is still draining is the target's stall
+   timeout's to bound, not this one's — see PAUSED-BEHIND-A-BACKLOG-P.
+
+   An outbound still sending a streamed request body is bound the same way
+   whoever it answers to: its deadline moves out whenever the body does
+   (NOTE-REQUEST-PROGRESS), so what it bounds is the body standing still."
+  (and (connection-outbound-p conn)
+       (or (eq (connection-fetch-sink conn) :detached)
+           (eq (connection-state conn) :out-send))
+       (plusp (connection-fetch-deadline conn))
+       (> now (connection-fetch-deadline conn))
+       (not (paused-behind-a-backlog-p conn))
+       (eq (lookup-connection (connection-fd conn)) conn)))
+
+(defun inbound-overdue (conn now)
+  "What CONN, an inbound still on the table, is due at NOW, as the list
+   SWEEP-IDLE-CONNECTIONS ends it from: :STALLED, :WS-LATE, :BODY-STALLED
+   or :IDLE, or NIL when nothing is."
+  (let* ((state (connection-state conn))
+         ;; A body a body handler accepted, still arriving: timed on its
+         ;; progress rather than from the start of the request. See
+         ;; *BODY-STALL-TIMEOUT*.
+         (body-clock
+           (and (member state '(:read-body :sending-100-continue))
+                (plusp (connection-body-progress-at conn))))
+         ;; A received body paused on a fetch it started into this
+         ;; connection: the application is waiting on that fetch, whose own
+         ;; deadline bounds it and whose failure disposition ends the body.
+         ;; The stall clock resumes when the fetch is over, from the pause.
+         (waiting-on-fetch
+           (and body-clock
+                (connection-body-paused conn)
+                (connection-fetch-outstanding conn)))
+         ;; Parked on a fetch whose streamed request is still going out: the
+         ;; outbound's own bound is on that, and this one's wait for the
+         ;; answer starts when the request has gone (BEGIN-RESPONSE-READ).
+         (awaiting-a-send
+           (and (eq state :awaiting)
+                (let ((out (lookup-connection (connection-awaiting-fd conn))))
+                  (and out (eq (connection-state out) :out-send)))))
+         (timeout (cond
+                    (body-clock *body-stall-timeout*)
+                    ((eq state :websocket) *ws-idle-timeout*)
+                    ;; A stream and a parked inbound are different
+                    ;; judgments. *FETCH-TIMEOUT* asks how long an upstream
+                    ;; may take to answer; this asks how long an app may
+                    ;; produce nothing before its stream is presumed dead.
+                    ;; Reusing either *IDLE-TIMEOUT* or *WS-IDLE-TIMEOUT*
+                    ;; would be wrong in opposite directions — ten seconds
+                    ;; reaps healthy streams, a day holds dead ones.
+                    ((eq state :streaming) *stream-idle-timeout*)
+                    ((eq state :awaiting)  *fetch-timeout*)
+                    ;; Measured from the start of the linger; discarded
+                    ;; bytes do not refresh it.
+                    ((eq state :lingering) *linger-timeout*)
+                    (t                     *idle-timeout*)))
+         ;; A stream is judged on when its app last produced, not on when
+         ;; the connection last saw an event. HANDLE-CLIENT-WRITE bumps
+         ;; LAST-ACTIVE on EPOLLOUT entry, so a draining backlog would keep
+         ;; refreshing the deadline of a stream whose producer stopped — the
+         ;; conflation WRITE-PROGRESS-AT exists to break, one level up and
+         ;; in another knob.
+         ;;
+         ;; A queue still moving counts as well. A producer that sent a
+         ;; burst and waits on it — a paused relay among them — has not gone
+         ;; quiet, its peer is reading. A queue that stops moving is the
+         ;; stall arm's, which is checked first.
+         (since (cond
+                  ((eq state :streaming)
+                   (if (plusp (connection-write-pending conn))
+                       (max (connection-stream-produced-at conn)
+                            (connection-write-progress-at conn))
+                       (connection-stream-produced-at conn)))
+                  (body-clock (connection-body-progress-at conn))
+                  (t (connection-last-active conn))))
+         (verdict
+           (cond
+             ;; Stall is checked first: a connection can be both, and
+             ;; closing it for the reason that is actually wrong with it
+             ;; makes the log line worth reading. Measured from the last
+             ;; forward progress on the backlog, never from LAST-ACTIVE —
+             ;; HANDLE-CLIENT-WRITE bumps that on EPOLLOUT entry, which
+             ;; would refresh the deadline of precisely the stuck
+             ;; connection. Any connection sitting on a backlog, not just a
+             ;; WebSocket one. A test naming :WEBSOCKET would leave the
+             ;; state most likely to build a backlog — a long-lived stream
+             ;; — the one state with no stall bound, falling through to an
+             ;; idle test measured on LAST-ACTIVE, the clock this exists to
+             ;; avoid. Asking "is there a backlog and has it moved" needs
+             ;; no list of states to keep up to date.
+             ;; :AWAITING is the one exclusion, and not because of its
+             ;; state so much as because it already has a more specific
+             ;; answer: DELIVER-AWAITING-TIMEOUT's 504 is the documented
+             ;; floor under every way a fetch can strand, and a stall close
+             ;; would take that away and hand the client a bare disconnect
+             ;; instead. The state is also supposed to have nothing
+             ;; pending, so excluding it costs nothing that should ever
+             ;; exist.
+             ((and (not (eq state :awaiting))
+                   (plusp *write-stall-timeout*)
+                   (plusp (connection-write-pending conn))
+                   (> (- now (connection-write-progress-at conn))
+                      *write-stall-timeout*))
+              :stalled)
+             ;; A WebSocket message begun and not finished in time. Its own
+             ;; clock, since a message's fragments do not move LAST-ACTIVE
+             ;; and a ping answered keeps the connection alive. See
+             ;; *WS-MESSAGE-TIMEOUT*.
+             ((and (eq state :websocket)
+                   (plusp *ws-message-timeout*)
+                   (plusp (connection-ws-message-at conn))
+                   (> (- now (connection-ws-message-at conn))
+                      *ws-message-timeout*))
+              :ws-late)
+             (waiting-on-fetch nil)
+             (awaiting-a-send nil)
+             ((and (> timeout 0)
+                   (> (- now since) timeout))
+              (if body-clock :body-stalled :idle)))))
+    (and verdict
+         (eq (lookup-connection (connection-fd conn)) conn)
+         verdict)))
+
 (defun sweep-idle-connections (epoll-fd now)
   "Close connections that have been idle too long.
    HTTP uses *idle-timeout*. WebSocket uses *ws-idle-timeout*. A request
@@ -451,7 +594,17 @@
    question from idleness and the idle timeouts cannot answer it: they
    are measured on LAST-ACTIVE, which a peer that has stopped reading
    keeps fresh merely by continuing to send, and they are long by design
-   on exactly the long-lived states most likely to build a backlog."
+   on exactly the long-lived states most likely to build a backlog.
+
+   What is due is collected in one walk of the table and acted on after
+   it, and each connection is judged again when its turn comes. Acting on
+   one connection can reach others: an expired fetch's :THEN is
+   application code, and FORWARD-BODY's refuses the body the fetch was
+   started for. By its turn a connection may have been answered, closed or
+   moved on, and acting on what it was collected as would undo that — a
+   stall close taking down the answer an expired fetch had just queued for
+   the body, when the two come due in the same sweep. One no longer due is
+   left for the next sweep to judge."
   (let ((idle nil)
         (stalled nil)
         (body-stalled nil)
@@ -460,175 +613,43 @@
         (detached-expired nil))
     (maphash (lambda (fd conn)
                (declare (ignore fd))
-               ;; A connect given its *CONNECT-FALLBACK-DELAY* and not
-               ;; answered, with the name's other addresses still to try.
-               (when (and (connection-outbound-p conn)
-                          (eq (connection-state conn) :out-connecting)
-                          (connection-fallback-addresses conn)
-                          (plusp (connection-connect-deadline conn))
-                          (> now (connection-connect-deadline conn)))
+               (when (connect-late-p conn now)
                  (push conn connect-late))
-               ;; A detached outbound has no parked inbound, so the
-               ;; :AWAITING reap that bounds every other fetch cannot see
-               ;; it. Nothing else would: it is not idle — it is waiting on
-               ;; an upstream — and a paused one is subscribed to no epoll
-               ;; events at all, so no wake-up is coming either. Without
-               ;; this arm a hung upstream strands the outbound socket and
-               ;; the app's callback never fires. A pause whose target is
-               ;; still draining is the target's stall timeout's to bound,
-               ;; not this one's — see PAUSED-BEHIND-A-BACKLOG-P.
-               ;; An outbound still sending a streamed request body is bound
-               ;; the same way whoever it answers to: its deadline moves out
-               ;; whenever the body does (NOTE-REQUEST-PROGRESS), so what it
-               ;; bounds is the body standing still.
-               (when (and (connection-outbound-p conn)
-                          (or (eq (connection-fetch-sink conn) :detached)
-                              (eq (connection-state conn) :out-send))
-                          (plusp (connection-fetch-deadline conn))
-                          (> now (connection-fetch-deadline conn))
-                          (not (paused-behind-a-backlog-p conn)))
+               (when (fetch-expired-p conn now)
                  (push conn detached-expired))
                ;; Every other outbound is cleaned up via its paired
                ;; inbound's :awaiting timeout — see close-connection
                (unless (connection-outbound-p conn)
-                 (let* ((state (connection-state conn))
-                        ;; A body a body handler accepted, still arriving:
-                        ;; timed on its progress rather than from the start
-                        ;; of the request. See *BODY-STALL-TIMEOUT*.
-                        (body-clock
-                          (and (member state '(:read-body :sending-100-continue))
-                               (plusp (connection-body-progress-at conn))))
-                        ;; A received body paused on a fetch it started into
-                        ;; this connection: the application is waiting on that
-                        ;; fetch, whose own deadline bounds it and whose
-                        ;; failure disposition ends the body. The stall clock
-                        ;; resumes when the fetch is over, from the pause.
-                        (waiting-on-fetch
-                          (and body-clock
-                               (connection-body-paused conn)
-                               (connection-fetch-outstanding conn)))
-                        ;; Parked on a fetch whose streamed request is still
-                        ;; going out: the outbound's own bound is on that,
-                        ;; and this one's wait for the answer starts when the
-                        ;; request has gone (BEGIN-RESPONSE-READ).
-                        (awaiting-a-send
-                          (and (eq state :awaiting)
-                               (let ((out (lookup-connection
-                                           (connection-awaiting-fd conn))))
-                                 (and out (eq (connection-state out) :out-send)))))
-                        (timeout (cond
-                                   (body-clock *body-stall-timeout*)
-                                   ((eq state :websocket) *ws-idle-timeout*)
-                                   ;; A stream and a parked inbound are
-                                   ;; different judgments. *FETCH-TIMEOUT*
-                                   ;; asks how long an upstream may take to
-                                   ;; answer; this asks how long an app may
-                                   ;; produce nothing before its stream is
-                                   ;; presumed dead. Reusing either
-                                   ;; *IDLE-TIMEOUT* or *WS-IDLE-TIMEOUT*
-                                   ;; would be wrong in opposite directions
-                                   ;; — ten seconds reaps healthy streams, a
-                                   ;; day holds dead ones.
-                                   ((eq state :streaming) *stream-idle-timeout*)
-                                   ((eq state :awaiting)  *fetch-timeout*)
-                                   ;; Measured from the start of the linger;
-                                   ;; discarded bytes do not refresh it.
-                                   ((eq state :lingering) *linger-timeout*)
-                                   (t                     *idle-timeout*)))
-                        ;; A stream is judged on when its app last
-                        ;; produced, not on when the connection last saw
-                        ;; an event. HANDLE-CLIENT-WRITE bumps LAST-ACTIVE
-                        ;; on EPOLLOUT entry, so a draining backlog would
-                        ;; keep refreshing the deadline of a stream whose
-                        ;; producer stopped — the conflation
-                        ;; WRITE-PROGRESS-AT exists to break, one level
-                        ;; up and in another knob.
-                        ;;
-                        ;; A queue still moving counts as well. A producer
-                        ;; that sent a burst and waits on it — a paused
-                        ;; relay among them — has not gone quiet, its peer
-                        ;; is reading. A queue that stops moving is the
-                        ;; stall arm's, which is checked first.
-                        (since (cond
-                                 ((eq state :streaming)
-                                  (if (plusp (connection-write-pending conn))
-                                      (max (connection-stream-produced-at conn)
-                                           (connection-write-progress-at conn))
-                                      (connection-stream-produced-at conn)))
-                                 (body-clock (connection-body-progress-at conn))
-                                 (t (connection-last-active conn)))))
-                   (cond
-                     ;; Stall is checked first: a connection can be both,
-                     ;; and closing it for the reason that is actually
-                     ;; wrong with it makes the log line worth reading.
-                     ;; Measured from the last forward progress on the
-                     ;; backlog, never from LAST-ACTIVE — HANDLE-CLIENT-WRITE
-                     ;; bumps that on EPOLLOUT entry, which would refresh
-                     ;; the deadline of precisely the stuck connection.
-                     ;; Any connection sitting on a backlog, not just a
-                     ;; WebSocket one. A test naming :WEBSOCKET would leave
-                     ;; the state most likely to build a backlog — a
-                     ;; long-lived stream — the one state with no stall
-                     ;; bound, falling through to an idle test measured on
-                     ;; LAST-ACTIVE, the clock this exists to avoid. Asking
-                     ;; "is there a backlog and has it moved" needs no list
-                     ;; of states to keep up to date.
-                     ;; :AWAITING is the one exclusion, and not because of
-                     ;; its state so much as because it already has a more
-                     ;; specific answer: DELIVER-AWAITING-TIMEOUT's 504 is
-                     ;; the documented floor under every way a fetch can
-                     ;; strand, and a stall close would take that away and
-                     ;; hand the client a bare disconnect instead. The
-                     ;; state is also supposed to have nothing pending, so
-                     ;; excluding it costs nothing that should ever exist.
-                     ((and (not (eq state :awaiting))
-                           (plusp *write-stall-timeout*)
-                           (plusp (connection-write-pending conn))
-                           (> (- now (connection-write-progress-at conn))
-                              *write-stall-timeout*))
-                      (push conn stalled))
-                     ;; A WebSocket message begun and not finished in time.
-                     ;; Its own clock, since a message's fragments do not
-                     ;; move LAST-ACTIVE and a ping answered keeps the
-                     ;; connection alive. See *WS-MESSAGE-TIMEOUT*.
-                     ((and (eq state :websocket)
-                           (plusp *ws-message-timeout*)
-                           (plusp (connection-ws-message-at conn))
-                           (> (- now (connection-ws-message-at conn))
-                              *ws-message-timeout*))
-                      (push conn ws-late))
-                     (waiting-on-fetch nil)
-                     (awaiting-a-send nil)
-                     ((and (> timeout 0)
-                           (> (- now since) timeout))
-                      (if body-clock
-                          (push conn body-stalled)
-                          (push conn idle)))))))
+                 (case (inbound-overdue conn now)
+                   (:stalled      (push conn stalled))
+                   (:ws-late      (push conn ws-late))
+                   (:body-stalled (push conn body-stalled))
+                   (:idle         (push conn idle)))))
              *connections*)
     (dolist (conn detached-expired)
-      (if (eq (connection-state conn) :out-send)
-          (log-warn "fetch request body made no progress for ~ds on outbound ~
-                     fd ~d — aborting"
-                    *fetch-timeout* (connection-fd conn))
-          (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
-                    *fetch-timeout* (connection-fd conn)))
-      ;; Through DELIVER-FETCH-ERROR so the app's callback fires its abort
-      ;; exactly once and the target gets DELIVER-DETACHED's disposition,
-      ;; rather than a bare close that leaves the stream open and the
-      ;; callback never run.
-      (handler-case
-          (deliver-fetch-error conn epoll-fd
-                               (if (eq (connection-state conn) :out-send)
-                                   "request body stalled"
-                                   "detached fetch timed out"))
-        (error (e)
-          (log-warn "detached fetch timeout: could not abort fd ~d: ~a"
-                    (connection-fd conn) e)
-          (close-outbound conn epoll-fd))))
+      (when (fetch-expired-p conn now)
+        (if (eq (connection-state conn) :out-send)
+            (log-warn "fetch request body made no progress for ~ds on outbound ~
+                       fd ~d — aborting"
+                      *fetch-timeout* (connection-fd conn))
+            (log-warn "detached fetch exceeded ~ds on outbound fd ~d — aborting"
+                      *fetch-timeout* (connection-fd conn)))
+        ;; Through DELIVER-FETCH-ERROR so the app's callback fires its abort
+        ;; exactly once and the target gets DELIVER-DETACHED's disposition,
+        ;; rather than a bare close that leaves the stream open and the
+        ;; callback never run.
+        (handler-case
+            (deliver-fetch-error conn epoll-fd
+                                 (if (eq (connection-state conn) :out-send)
+                                     "request body stalled"
+                                     "detached fetch timed out"))
+          (error (e)
+            (log-warn "detached fetch timeout: could not abort fd ~d: ~a"
+                      (connection-fd conn) e)
+            (close-outbound conn epoll-fd)))))
     (dolist (conn connect-late)
       ;; After the expired fetches, any of which may have been this one.
-      (when (and (eq (lookup-connection (connection-fd conn)) conn)
-                 (eq (connection-state conn) :out-connecting))
+      (when (connect-late-p conn now)
         (let ((why (format nil "no connect in ~ds" *connect-fallback-delay*)))
           (handler-case
               (unless (fall-back-to-next-address conn epoll-fd why)
@@ -638,50 +659,54 @@
                         (connection-fd conn) e)
               (close-outbound conn epoll-fd))))))
     (dolist (conn stalled)
-      (log-info "write stalled ~ds fd ~d (~a, ~d bytes pending) — closing"
-                *write-stall-timeout* (connection-fd conn)
-                (connection-state conn)
-                (connection-write-pending conn))
-      (close-connection conn epoll-fd :stalled))
+      (when (eq (inbound-overdue conn now) :stalled)
+        (log-info "write stalled ~ds fd ~d (~a, ~d bytes pending) — closing"
+                  *write-stall-timeout* (connection-fd conn)
+                  (connection-state conn)
+                  (connection-write-pending conn))
+        (close-connection conn epoll-fd :stalled)))
     (dolist (conn body-stalled)
-      (log-info "request body stalled ~ds fd ~d (~d bytes buffered) — closing"
-                *body-stall-timeout* (connection-fd conn)
-                (connection-read-pos conn))
-      (close-connection conn epoll-fd :stalled))
+      (when (eq (inbound-overdue conn now) :body-stalled)
+        (log-info "request body stalled ~ds fd ~d (~d bytes buffered) — closing"
+                  *body-stall-timeout* (connection-fd conn)
+                  (connection-read-pos conn))
+        (close-connection conn epoll-fd :stalled)))
     (dolist (conn ws-late)
-      (log-info "ws message unfinished after ~ds fd ~d (~d bytes held) — closing 1008"
-                *ws-message-timeout* (connection-fd conn)
-                (+ (connection-ws-frag-total conn) (connection-read-pos conn)))
-      ;; What the message holds is let go now, not once the close frame
-      ;; has gone out. A peer slow to read that holds the frame back is
-      ;; then holding nothing more than its backlog.
-      (setf (connection-ws-frag-buf conn) nil
-            (connection-ws-frag-total conn) 0)
-      (handler-case (let ((*epoll-fd* epoll-fd))
-                      (ws-close conn 1008))
-        (error (e)
-          (log-warn "ws message timeout: could not close fd ~d with 1008: ~a"
-                    (connection-fd conn) e)
-          (close-connection conn epoll-fd :idle))))
+      (when (eq (inbound-overdue conn now) :ws-late)
+        (log-info "ws message unfinished after ~ds fd ~d (~d bytes held) — closing 1008"
+                  *ws-message-timeout* (connection-fd conn)
+                  (+ (connection-ws-frag-total conn) (connection-read-pos conn)))
+        ;; What the message holds is let go now, not once the close frame
+        ;; has gone out. A peer slow to read that holds the frame back is
+        ;; then holding nothing more than its backlog.
+        (setf (connection-ws-frag-buf conn) nil
+              (connection-ws-frag-total conn) 0)
+        (handler-case (let ((*epoll-fd* epoll-fd))
+                        (ws-close conn 1008))
+          (error (e)
+            (log-warn "ws message timeout: could not close fd ~d with 1008: ~a"
+                      (connection-fd conn) e)
+            (close-connection conn epoll-fd :idle)))))
     (dolist (conn idle)
-      (log-debug "idle timeout fd ~d (~a)"
-                 (connection-fd conn) (connection-state conn))
-      ;; Collect-then-act: nothing here queues a write inside the MAPHASH
-      ;; above, because DELIVER-AWAITING-TIMEOUT tears down the paired
-      ;; outbound and that mutates the table being walked.
-      (if (eq (connection-state conn) :awaiting)
-          ;; A failure to answer must not be worse than not trying. If
-          ;; anything in the 504 path signals — a write buffer that was
-          ;; not drained after all, a serializer refusing a header — fall
-          ;; back to a bare close, rather than letting it escape into
-          ;; RUN-EVENT-LOOP, which has
-          ;; no handler and would restart the worker mid-sweep.
-          (handler-case (deliver-awaiting-timeout conn epoll-fd)
-            (error (e)
-              (log-warn "awaiting timeout: could not answer 504 on fd ~d: ~a"
-                        (connection-fd conn) e)
-              (close-connection conn epoll-fd :idle)))
-          (close-connection conn epoll-fd :idle)))))
+      (when (eq (inbound-overdue conn now) :idle)
+        (log-debug "idle timeout fd ~d (~a)"
+                   (connection-fd conn) (connection-state conn))
+        ;; Collect-then-act: nothing here queues a write inside the MAPHASH
+        ;; above, because DELIVER-AWAITING-TIMEOUT tears down the paired
+        ;; outbound and that mutates the table being walked.
+        (if (eq (connection-state conn) :awaiting)
+            ;; A failure to answer must not be worse than not trying. If
+            ;; anything in the 504 path signals — a write buffer that was
+            ;; not drained after all, a serializer refusing a header — fall
+            ;; back to a bare close, rather than letting it escape into
+            ;; RUN-EVENT-LOOP, which has
+            ;; no handler and would restart the worker mid-sweep.
+            (handler-case (deliver-awaiting-timeout conn epoll-fd)
+              (error (e)
+                (log-warn "awaiting timeout: could not answer 504 on fd ~d: ~a"
+                          (connection-fd conn) e)
+                (close-connection conn epoll-fd :idle)))
+            (close-connection conn epoll-fd :idle))))))
 
 (defun keepalive-streams (epoll-fd now)
   "Send the keepalive bytes of any :STREAMING connection that has gone
