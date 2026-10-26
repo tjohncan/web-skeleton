@@ -184,6 +184,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
    which relay mode sends to the client as-is — the way to arrange a
    response bigger than one TLS record, and bigger than the read buffer.
 
+   Relay mode runs non-blocking, -nbio. Blocking, s_server can stop for
+   good after its first record on a loaded host, held in a read on the
+   socket waiting for a record from a client that sends none, and the rest
+   of the file is never relayed. Non-blocking, that read gives up at once
+   and the relay goes on.
+
    Not -HTTP, which looks like the obvious way to serve a large file and
    is not: it truncates at around 10 KB against a reader that consumes in
    4 KiB steps driven by epoll, while delivering the whole file to
@@ -205,7 +211,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                        "-cert" (format nil "~a/~a.pem" dir leaf)
                        "-key"  (format nil "~a/~a.key" dir leaf)
                        "-quiet")
-                 (if relay-file (list "-naccept" "1") (list "-www")))
+                 (if relay-file (list "-naccept" "1" "-nbio") (list "-www")))
                 :wait nil :output nil :error nil
                 :directory dir :search t
                 :input (and relay-file (pathname relay-file)))))
@@ -566,6 +572,17 @@ printf 'TAIL-MARKER\\n' >> body.txt
                 (when port
                   (multiple-value-bind (ssl socket)
                       (%tls-connect-retrying "right.test" port)
+                    ;; The peer sends the whole response and exits before
+                    ;; the first read, so every record waits behind one
+                    ;; readability edge: the shape the trap needs, where a
+                    ;; drain that stops early gets no second event. Read
+                    ;; while the peer is still sending, each record can
+                    ;; bring an edge of its own, and the next one rescues a
+                    ;; drain that stopped. Ten seconds at most; a peer
+                    ;; still running then is read as it sends.
+                    (loop repeat 200
+                          while (eq (sb-ext:process-status *tls-peer-process*) :running)
+                          do (sleep 0.05))
                     (let ((epfd (web-skeleton::epoll-create)))
                       (unwind-protect
                            (let* ((fd (web-skeleton::socket-fd socket))
@@ -600,10 +617,10 @@ printf 'TAIL-MARKER\\n' >> body.txt
                              ;; Quiet is five seconds without an event. Bytes
                              ;; stranded inside OpenSSL raise no event ever,
                              ;; so the stall is caught at any length of wait;
-                             ;; what a short one catches as well is s_server
-                             ;; pausing mid-body on a loaded host, which is
-                             ;; the peer being slow and not the read losing
-                             ;; bytes.
+                             ;; the length is for a peer the wait above gave
+                             ;; up on, still sending on a loaded host, which
+                             ;; is the peer being slow and not the read
+                             ;; losing bytes.
                              (loop repeat 200
                                    while (not (member (first verdicts)
                                                       '(:eof :ok-eof)))
