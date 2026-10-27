@@ -977,6 +977,11 @@ happy path will not have a failure path, and a `:then` that only closes on
 success leaves a failed stream open until `*stream-idle-timeout*` — or a
 failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
 
+Under `forward-body`, which passes `:keep`, every row leaves the body to
+`forward-body` itself: it refuses a body still arriving with `:then`'s
+answer whichever way the fetch ended, a stop included (see "Sending a
+request body as it is produced").
+
 **A fetch lasts no longer than what it was started for.** A body's fetch
 ends with the body, once `:on-end` has answered, unless `:on-end` answers
 with that fetch. A stream's fetch ends once the stream has closed and its
@@ -2219,7 +2224,10 @@ never be held whole:
 - **The answer is read as the body goes out.** `:on-body` gets an early
   answer's chunks as they arrive, as it gets any fetch's. A `:pause` from
   it holds the answer and not the request: the body goes on going out, and
-  the answer is read again from `fetch-resume`.
+  the answer is read again from `fetch-resume`. A `:stop` ends the fetch,
+  and the rest of the body has nowhere to go: `:then` hears the abort
+  sentinel, as for a failure, its answer refuses the body, and `:on-abort`
+  hears `:refused`.
 - **Framing.** A fetch that declares `:content-length` sends exactly that
   many bytes, framed by `Content-Length`; without it the body is sent
   chunked. Some upstreams take only the first. S3's PutObject is one, and so

@@ -6926,7 +6926,8 @@
                  (loop for (p . w) in calls when (string= p "/mp") collect w))
                '("one"))))))
 
-(defun %upload-upstream (&key (pace 0) early-status close-after stall-after silent release)
+(defun %upload-upstream (&key (pace 0) early-status early-chunk close-after stall-after
+                              silent release)
   "A listener on an ephemeral port playing an upstream that receives an
    upload, once. Returns (values PORT THREAD); the thread's result is
    (HEAD BODY), the request head as a string and the body decoded.
@@ -6935,7 +6936,9 @@
    its terminator — at most 16 KiB a read and PACE seconds between reads,
    and answers 200 with got:<length>:<sha-256> of what it received.
    EARLY-STATUS answers with that status as soon as the head has arrived
-   and then reads on, as an upstream refusing an upload does. CLOSE-AFTER
+   and then reads on, as an upstream refusing an upload does. With
+   EARLY-CHUNK that answer is chunked, EARLY-CHUNK its first chunk and the
+   rest never sent, as an upstream streaming its answer would. CLOSE-AFTER
    hangs up once that many bytes of body have arrived, answering nothing.
    STALL-AFTER stops reading once that many have, holding the connection
    open and answering nothing until the CAR of RELEASE is true, or ten
@@ -6972,6 +6975,13 @@
                                                            status *crlf* (length text) *crlf*
                                                            *crlf* *crlf* text))))
                                 (sb-bsd-sockets:socket-send s bytes nil)))
+                            (begin-chunked (status chunk)
+                              (sb-bsd-sockets:socket-send
+                               s (%ascii (format nil "HTTP/1.1 ~d X~aTransfer-Encoding: chunked~a~a~
+                                                      ~x~a~a~a"
+                                                 status *crlf* *crlf* *crlf*
+                                                 (length chunk) *crlf* chunk *crlf*))
+                               nil))
                             (hold-until-released ()
                               (loop repeat 200 until (car release) do (sleep 0.05))
                               (sb-bsd-sockets:socket-close s))
@@ -6991,7 +7001,9 @@
                        (setf head (sb-ext:octets-to-string buf :end (+ head-end 4)
                                                                :external-format :latin-1))
                        (when early-status
-                         (answer early-status "refused"))
+                         (if early-chunk
+                             (begin-chunked early-status early-chunk)
+                             (answer early-status "refused")))
                        ;; The body.
                        (let* ((start (+ head-end 4))
                               (declared (let ((at (search "content-length: " head :test #'char-equal)))
@@ -7041,7 +7053,9 @@
    *MAX-WRITE-BACKLOG*, and the body still arrives whole. One that answers
    before the body is sent answers the client, and one that hangs up
    partway is a 502, both at once to a client that has sent part of its
-   body and stopped, its body refused; a :THEN that raises there is a 500.
+   body and stopped, its body refused; a :THEN that raises there is a 500,
+   and when :ON-BODY stops the upstream's answer, the client hears :THEN's
+   answer to the abort sentinel.
    An upstream that cannot be dialed at all is a 502 as well, :THEN
    hearing the abort sentinel. A client that hangs up partway leaves the
    upstream a request that ended short, never one that reads as whole, and
@@ -7127,6 +7141,20 @@
                                                       (declare (ignore status headers b))
                                                       (error "a :then that raises")))
                                   :max-size nil :on-abort #'note-abort))
+                   ;; :THEN's own answer, so the client can be seen to hear
+                   ;; it rather than a 502 of the framework's.
+                   ((string= path "/early-stop")
+                    (forward-body (http-fetch :put (upstream-url) :body :stream
+                                              :on-body (lambda (conn chunk)
+                                                         (declare (ignore conn chunk))
+                                                         :stop)
+                                              :then (lambda (status headers b)
+                                                      (declare (ignore headers b))
+                                                      (sb-thread:with-mutex (lock)
+                                                        (push (cons path status) thens))
+                                                      (make-text-response
+                                                       202 (format nil "then heard ~s" status))))
+                                  :max-size nil :on-abort #'note-abort))
                    ((string= path "/length")
                     (forward-body (http-fetch :put (upstream-url) :body :stream
                                               :content-length (parse-integer
@@ -7195,6 +7223,17 @@
                    (and (search "HTTP/1.1 500" answer) t) t))
           (check "early, :then raising: and the rest of the body was refused"
                  (aborted "/early-raise") '(:refused))
+          ;; :on-body stops the answer at its first chunk, which ends the
+          ;; fetch the body was going to. Chunked, since :on-body is handed
+          ;; a chunked answer's chunks and no other answer's bytes.
+          (let ((answer (part-then-wait "/early-stop" (* 64 1024)
+                                        :early-status 200 :early-chunk "first")))
+            (check "early, stopped: the client that had stopped sending hears :then's answer"
+                   (and (search "HTTP/1.1 202" answer) (search "then heard NIL" answer) t) t))
+          (check "early, stopped: :then heard the abort sentinel, once"
+                 (thens-for "/early-stop") '(nil))
+          (check "early, stopped: and the rest of the body was refused"
+                 (aborted "/early-stop") '(:refused))
           ;; ---- an upstream that hangs up partway ----
           (let ((answer (part-then-wait "/fail" (* 320 1024) :close-after (* 256 1024))))
             (check "fail: an upstream that hangs up partway is a 502 to a client that had stopped sending"

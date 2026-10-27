@@ -2947,9 +2947,10 @@
    whether or not the client is still sending. A failure is answered the
    same way, :THEN hearing it as the abort sentinel, and so is a fetch
    that cannot be started at all, a connect the kernel refuses at once
-   among them. A :THEN that raises is a 500. ON-ABORT is RECEIVE-BODY's,
-   and hears :REFUSED for a body refused in any of these ways. MAX-SIZE
-   caps the body as RECEIVE-BODY's does.
+   among them, and one that FETCH's :ON-BODY stops: the rest of the body
+   has nowhere to go. A :THEN that raises is a 500. ON-ABORT is
+   RECEIVE-BODY's, and hears :REFUSED for a body refused in any of these
+   ways. MAX-SIZE caps the body as RECEIVE-BODY's does.
 
    FETCH must be streamed (:BODY :STREAM) and not yet started."
   (unless (http-fetch-continuation-stream-body fetch)
