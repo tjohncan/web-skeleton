@@ -131,7 +131,7 @@ src/
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
   json.lisp        JSON parser and serializer (RFC 8259)
   random.lisp      Crypto random bytes and tokens (/dev/urandom)
-  address.lisp     IP address classification (SSRF allowlisting)
+  address.lisp     IP address classification (SSRF allowlisting), IP literal parsers
   store.lisp       Concurrent keyed store with optional reaper
   tls.lisp         libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/

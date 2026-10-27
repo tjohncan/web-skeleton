@@ -39,6 +39,10 @@
 ;;; DEPLOYMENT.md "Fetch URL safety (SSRF)" carries the rest: what a
 ;;; refusal does to an in-flight fetch, and why an allowlist of upstream
 ;;; hosts is better still where the app can name them.
+;;;
+;;; The file ends with the IP literal parsers, PARSE-IPV4-LITERAL and
+;;; PARSE-IPV6-LITERAL, which read an address out of a URL, getent's
+;;; output or a request's Host: a section of their own, below.
 ;;; ===========================================================================
 
 (defun format-ip (bytes)
