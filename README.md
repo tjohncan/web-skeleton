@@ -16,15 +16,11 @@ It is the network and protocol layer; applications must bring their own flesh.
 ## Requirements
 
 - SBCL (Steel Bank Common Lisp), 2.2.9 or later — the oldest the suite is
-  run on
+  run on. 2.2.9 has a compiler bug that code built with it should steer
+  clear of: see DEPLOYMENT.md, "Environment".
 - Linux
-- `getent` on PATH, glibc's, which every glibc distro ships (used via
-  `sb-ext:run-program` for non-blocking hostname resolution). Its
-  `ahosts` output is what the parser reads, and the name is passed after
-  `--`, which glibc's getent honours. Alpine's does not: it comes from
-  the musl-utils package (musl itself ships none) and looks the `--` up
-  as a name, so no hostname resolves there, which is why the demo's
-  image is Debian. Other getents are untested.
+- `getent` on PATH, glibc's, for hostname resolution; Alpine's will not
+  do (DEPLOYMENT.md, "Environment", says why)
 
 SBCL built-ins used:
  `sb-bsd-sockets` (TCP),

@@ -2404,3 +2404,68 @@ End-to-end tests are slower than unit-style tests
 Use unit-style tests for handler logic,
 end-to-end for the request/response path itself
 and for anything that depends on the event loop or graceful shutdown machinery.
+
+## Environment
+
+What web-skeleton needs from the machine it runs on.
+
+### SBCL
+
+2.2.9 is the oldest SBCL the suite runs on, and the one Debian 12 and
+Ubuntu 24.04 package.
+
+**SBCL 2.2.4 through 2.2.9 can miscompile a closure's store, and the heap
+pays for it later.** A store into an object made by the enclosing
+function, a list say, loses the garbage collector's store barrier when
+the value stored is the closure's own argument (SBCL bug lp#1982608,
+fixed in 2.2.10). That holds in straight-line code. In a closure that
+runs later the argument can be younger than the object, and a collection
+then moves the argument and leaves the object pointing where it was. The
+damage shows at a time and place unrelated to the store: a memory fault
+in code that did nothing wrong, or a crash inside the collector.
+
+The shape is a callback that stores what it is handed into a box made
+around it, for another callback to read later:
+
+```lisp
+(let ((box (list nil)))
+  (http-fetch :get url
+              :then (lambda (status headers body)
+                      (declare (ignore status headers))
+                      (setf (car box) body)            ; BODY, into BOX
+                      (make-text-response 200 "fetched"))))
+```
+
+A variable the callbacks share keeps its barrier, and is the way to hand
+a value from one callback to another on 2.2.9:
+
+```lisp
+(let ((fetched nil))
+  (http-fetch :get url
+              :then (lambda (status headers body)
+                      (declare (ignore status headers))
+                      (setf fetched body)
+                      (make-text-response 200 "fetched"))))
+```
+
+A fixnum, a character or NIL is not a pointer and loses nothing either
+way. web-skeleton's own code, its TLS system and the demo have no store
+of the first shape. Code built on them with 2.2.9 should keep to the
+second, or be built with 2.2.10 or later.
+
+### getent
+
+Hostnames are resolved by running `getent ahosts` with
+`sb-ext:run-program`, so a lookup never blocks a worker, and the getent
+on PATH must be glibc's, which every glibc distribution ships. Its
+`ahosts` output is what the parser reads, and the name is passed after
+`--`, which glibc's getent honours. Alpine's does not: it comes from the
+musl-utils package (musl itself ships none) and looks the `--` up as a
+name, so no hostname resolves there, which is why the demo's image is
+Debian. Other getents are untested.
+
+### libssl
+
+Outbound TLS is the optional `web-skeleton-tls` system, which loads
+libssl, and it needs a CA bundle to verify against: see
+"TLS trust anchors" above.
