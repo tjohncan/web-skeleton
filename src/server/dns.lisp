@@ -434,11 +434,16 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun deliver-dns-error (dns-conn epoll-fd &optional (reason "DNS lookup failed"))
-  "DNS lookup failed — no usable address, getent gave up, or a parse
-   error. Ends the fetch the way every other outbound failure ends: the
-   parked inbound is answered 502, a detached one gets its callback's
-   abort sentinel and DELIVER-DETACHED's disposition, and CLOSE-OUTBOUND
-   reaps the getent child either way.
+  "A fetch to a name ended in its lookup — no usable address, getent gave
+   up, or a parse error — or just after it, at an address the lookup gave
+   that could not be dialed. Ends the fetch the way every other outbound
+   failure ends: the parked inbound is answered 502, a detached one gets
+   its callback's abort sentinel and DELIVER-DETACHED's disposition, and
+   CLOSE-OUTBOUND reaps the getent child either way.
+
+   REASON is what the log says ended the fetch. The default is for a
+   lookup that failed; a caller whose lookup worked passes what failed
+   instead, so an operator is not sent to debug a resolver that worked.
 
    Delegates rather than restating. A copy that knew only about a parked
    inbound would leave a FETCH-INTO to a name that does not resolve with
@@ -518,9 +523,12 @@
                     (setf chained t))
                 (error (e)
                   ;; dns-then failed — callback still on dns-conn, so
-                  ;; close-outbound fires the cleanup sentinel.
+                  ;; close-outbound fires the cleanup sentinel. The
+                  ;; resolver worked, so the fetch ends with what failed
+                  ;; after it, most often an address the kernel would not
+                  ;; dial, and not with "DNS lookup failed".
                   (log-warn "dns: chain to TCP failed: ~a" e)
-                  (deliver-dns-error dns-conn epoll-fd)))
+                  (deliver-dns-error dns-conn epoll-fd (princ-to-string e))))
               (when chained
                 ;; The new outbound carries the callback now. Clear it here
                 ;; so close-outbound doesn't double-fire.

@@ -9527,6 +9527,83 @@
         (check "dns teardown: the failed close is not taken for a failed lookup"
                (fourth failed) 1)))))
 
+(defun test-dns-dial-failure-is-not-a-lookup-failure ()
+  "A name that resolved, to an address that could not then be dialed, is
+   not logged as a lookup that failed.
+
+   DNS-THEN signals CONNECT-FAILED-AT-ONCE here, as INITIATE-HTTP-FETCH-
+   TO-ADDRESS does when the kernel refuses the name's last address at
+   once. The fetch fails as any failed fetch does, its target's
+   disposition applied. What is under test is the line that says why:
+   told \"DNS lookup failed\", an operator goes and debugs a resolver that
+   worked.
+
+   The control is a lookup that did fail, read through the same capture,
+   so a capture that caught nothing, or a label that never changes, fails
+   it."
+  (format t "~%DNS: an address that cannot be dialed is not a failed lookup~%")
+  (flet ((run (output dns-then)
+           ;; (values ENDED-WITH TARGET-STATE) for HANDLE-DNS-READY on a
+           ;; detached fetch whose getent wrote OUTPUT: what the fetch error
+           ;; line said ended the fetch, and what became of its target.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (targetfd (web-skeleton::epoll-create))
+                 (proc (sb-ext:run-program "/bin/true" nil :output :stream :wait t)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                         (web-skeleton:*log-level* :warn)
+                         (web-skeleton:*log-stream* (make-string-output-stream))
+                         (bytes (sb-ext:string-to-octets output :external-format :ascii))
+                         (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                         (target (web-skeleton::make-connection
+                                  :fd targetfd :state :websocket
+                                  :fetch-outstanding t
+                                  :fetch-failure-disposition :close
+                                  :last-active (get-universal-time)))
+                         (dns-conn (web-skeleton::make-connection
+                                    :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
+                                    :state :out-dns :outbound-p t :fetch-sink :detached
+                                    :inbound-fd targetfd :dns-host "undialable.example"
+                                    :dns-then dns-then
+                                    :fetch-callback (lambda (s h b)
+                                                      (declare (ignore s h b))
+                                                      nil)
+                                    :last-active (get-universal-time))))
+                    (replace buf bytes)
+                    (setf (web-skeleton::connection-read-buf dns-conn) buf
+                          (web-skeleton::connection-read-pos dns-conn) (length bytes))
+                    (web-skeleton::register-connection target)
+                    (web-skeleton::register-connection dns-conn)
+                    (web-skeleton::handle-dns-ready dns-conn epfd)
+                    (let* ((log (get-output-stream-string web-skeleton:*log-stream*))
+                           (at (search "fetch error fd " log))
+                           (from (and at (search ": " log :start2 at))))
+                      (values (and from
+                                   (subseq log (+ from 2)
+                                           (position #\Newline log :start from)))
+                              (web-skeleton::connection-state target))))
+               (ignore-errors (sb-ext:process-close proc))
+               (ignore-errors (web-skeleton::%close targetfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+    ;; The control: getent named no address.
+    (multiple-value-bind (ended state)
+        (run "" (lambda (ip family &optional fallbacks)
+                  (declare (ignore ip family fallbacks))
+                  (error "dns-then: called for a name with no address")))
+      (check "dns control: a lookup that found nothing is logged as one"
+             ended "DNS lookup failed")
+      (check "dns control: and the fetch failed" state :closing))
+    ;; The claim: getent named one, and the kernel would not dial it.
+    (multiple-value-bind (ended state)
+        (run (format nil "255.255.255.255 STREAM undialable.example~%")
+             (lambda (ip family &optional fallbacks)
+               (declare (ignore family fallbacks))
+               (error 'web-skeleton::connect-failed-at-once
+                      :address ip :why "ENETUNREACH (101)")))
+      (check "dns dial: the fetch ends with the dial that failed, not the lookup"
+             ended "connect to 255.255.255.255: ENETUNREACH (101)")
+      (check "dns dial: and it failed as any fetch does" state :closing))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Transfer-Encoding: the rules, and the codes they answer with
 ;;; ---------------------------------------------------------------------------
@@ -15254,6 +15331,7 @@
   (test-dns-child-closed-only-once-dead)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
+  (test-dns-dial-failure-is-not-a-lookup-failure)
   (test-documented-settings-are-exported)
   (test-errno-names)
   (test-format-peer-addr)
