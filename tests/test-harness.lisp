@@ -7779,7 +7779,13 @@
          (lock (sb-thread:make-mutex :name "paused-answer"))
          (body (%pseudo-random-bytes (* 4 1024 1024) 99))
          (body-done (list nil))
-         (out-box (list nil))
+         ;; The outbound :ON-BODY paused, for :ON-TICK to resume. A variable
+         ;; the two closures share, not a (LIST NIL) box: SBCL 2.2.4 to 2.2.9
+         ;; drop the GC store barrier when a closure stores its argument into
+         ;; a cons its enclosing function made (lp#1982608, fixed in 2.2.10),
+         ;; and the connection stored here is young, so a collection could
+         ;; move it and leave the box pointing where it was.
+         (out-conn nil)
          (resumed nil)
          (chunks '())
          (upstream-port (list nil)))
@@ -7799,8 +7805,8 @@
                                                        chunk :external-format :latin-1)
                                                       resumed)
                                                 chunks))
-                                        (unless (first out-box)
-                                          (setf (first out-box) conn)
+                                        (unless out-conn
+                                          (setf out-conn conn)
                                           :pause))
                              :then (lambda (status headers b)
                                      (declare (ignore headers b))
@@ -7808,9 +7814,9 @@
                  :max-size nil))
               :on-tick (lambda (worker-id)
                          (declare (ignore worker-id))
-                         (when (and (first out-box) (car body-done) (not resumed))
+                         (when (and out-conn (car body-done) (not resumed))
                            (setf resumed t)
-                           (fetch-resume (first out-box)))))
+                           (fetch-resume out-conn))))
            (multiple-value-bind (port thread) (%answering-upstream body-done)
              (setf (first upstream-port) port)
              (let ((answer (%exchange-or-why (%form-post-bytes "/up" body
