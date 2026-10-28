@@ -2409,6 +2409,23 @@
                (and (eq status :external) (boundp symbol) t)
                t)))))
 
+(defun test-descriptor-limit ()
+  "RAISE-DESCRIPTOR-LIMIT leaves the soft limit at the hard one, and
+   DESCRIPTORS-NEARLY-OUT-P answers for the last eighth of the limit it is
+   given, and for nothing when there is none."
+  (format t "~%Descriptor limit~%")
+  (multiple-value-bind (now before) (web-skeleton::raise-descriptor-limit)
+    (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
+      (check "the soft limit is raised to the hard one" (list now soft) (list hard hard))
+      (check "and what it was is reported, no higher" (<= before now) t)))
+  (let ((web-skeleton::*descriptor-limit* 1024))
+    (check "below the last eighth, a descriptor is not short"
+           (web-skeleton::descriptors-nearly-out-p 895) nil)
+    (check "in it, it is" (web-skeleton::descriptors-nearly-out-p 896) t))
+  (let ((web-skeleton::*descriptor-limit* nil))
+    (check "with no limit recorded, nothing is short"
+           (web-skeleton::descriptors-nearly-out-p 100000) nil)))
+
 (defun test-errno-names ()
   "ERRNO-NAME's numbers are the C library's. Each is checked against
    strerror's text for that number, the reference the platform itself
@@ -15334,6 +15351,7 @@
   (test-dns-dial-failure-is-not-a-lookup-failure)
   (test-documented-settings-are-exported)
   (test-errno-names)
+  (test-descriptor-limit)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)

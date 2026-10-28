@@ -4789,6 +4789,51 @@
                         while i count t do (setf start (1+ i)))))
       (check "and the log says so once, not fifty times" lines 1))))
 
+(defun test-harness-descriptor-limit-e2e ()
+  "A server close to its descriptor limit answers 503, as at
+   *MAX-CONNECTIONS*, rather than running out and leaving clients the
+   kernel has connected unanswered.
+
+   START-SERVER records the soft limit it raised. Set to 1, every
+   descriptor an accept can return is past it, and is refused; set back,
+   the next is served."
+  (format t "~%Harness: a server near its descriptor limit answers 503~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream)))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "")))
+           (let ((recorded web-skeleton::*descriptor-limit*))
+             (check "start-server records the soft limit it left in force"
+                    recorded (nth-value 0 (web-skeleton::descriptor-limits)))
+             (unwind-protect
+                  (progn
+                    (setf web-skeleton::*descriptor-limit* 1)
+                    (multiple-value-bind (status headers body)
+                        (request-expecting-refusal)
+                      (check "near the limit, a new connection gets 503" status 503)
+                      (check "with Retry-After"
+                             (cdr (assoc "retry-after" headers :test #'string-equal))
+                             "2")
+                      (check "and the refusal's body"
+                             (and body (search "connection limit" body) t) t))
+                    (request-expecting-refusal))
+               (setf web-skeleton::*descriptor-limit* recorded))
+             (check "control: at the real limit the next one is served"
+                    (nth-value 0 (test-http-request :get "/"))
+                    200)))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (let* ((text (get-output-stream-string log))
+           (lines (loop with start = 0
+                        for i = (search "descriptors nearly out" text :start2 start)
+                        while i count t do (setf start (1+ i)))))
+      (check "the log names the limit met, once for two refusals" lines 1)
+      (check "and not the connection limit"
+             (and (search "connection limit reached" text) t) nil))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -9533,6 +9578,7 @@
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
   (test-harness-refusals-are-reported-not-logged-each)
+  (test-harness-descriptor-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-write-backlog-minimum-rejected)

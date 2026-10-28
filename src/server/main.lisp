@@ -275,7 +275,30 @@
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *max-connections* 10000
-  "Maximum connections per worker. New accepts are refused when full.")
+  "Maximum connections per worker. New accepts are refused when full, and
+   when the process is close to its descriptor limit: see
+   DESCRIPTORS-NEARLY-OUT-P.")
+
+(defvar *descriptor-limit* nil
+  "The process's soft descriptor limit, as START-SERVER left it after
+   raising it to the hard limit. NIL before a server has started, when
+   ACCEPT-CONNECTION refuses on *MAX-CONNECTIONS* alone. Process-wide,
+   like the limit: every worker's descriptors count against it.")
+
+(defun descriptors-nearly-out-p (fd)
+  "Whether FD, just accepted, is in the last eighth of *DESCRIPTOR-LIMIT*.
+
+   The kernel hands out the lowest free descriptor, so a new one's number
+   is a count of the process's open descriptors, every worker's sockets,
+   pipes and files alike, and the check costs nothing to keep. An eighth
+   is kept back for the connections already held, whose fetches, DNS
+   lookups and files need descriptors of their own. Without it a server
+   under a soft limit of 1024 runs out at about a thousand connections:
+   accept(2) fails with EMFILE, and clients the kernel has already
+   connected wait unanswered. With it they are answered 503, as at
+   *MAX-CONNECTIONS*."
+  (let ((limit *descriptor-limit*))
+    (and limit (>= fd (- limit (floor limit 8))))))
 
 (defparameter *connection-limit-response*
   (let* ((body (sb-ext:string-to-octets
@@ -1107,19 +1130,26 @@
             (return))))))
   (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
 
-(defun report-refusal ()
-  "Log a refusal at the connection limit: the first at once, then at most
+(defun report-refusal (limit)
+  "Log a refusal at LIMIT, :CONNECTIONS for *MAX-CONNECTIONS* or
+   :DESCRIPTORS for *DESCRIPTOR-LIMIT*: the first at once, then at most
    once a minute per worker with a count of the ones in between, through
    LOG-THROTTLED.
 
    A refusal happens only when a worker is out of room, which is when a
    flood of connections is likeliest, and a line per refusal would have
    every worker queueing on the log lock in it. The line says refusals are
-   happening; CONNECTION-CENSUS counts every one of them under :REFUSED."
-  (log-throttled :warn :connection-limit
-                 "connection limit reached (~d), refusing new accepts; counted ~
-                  in full under :refused in the census"
-                 *max-connections*))
+   happening, and which limit is the one met; CONNECTION-CENSUS counts
+   every one of them under :REFUSED."
+  (if (eq limit :descriptors)
+      (log-throttled :warn :descriptor-limit
+                     "descriptors nearly out (limit ~d), refusing new ~
+                      accepts; counted in full under :refused in the census"
+                     *descriptor-limit*)
+      (log-throttled :warn :connection-limit
+                     "connection limit reached (~d), refusing new accepts; ~
+                      counted in full under :refused in the census"
+                     *max-connections*)))
 
 (defun accept-pending (listener-socket epoll-fd)
   "Accept every connection waiting on the listener. Returns NIL once the
@@ -1144,27 +1174,36 @@
    Returns T if a connection was accepted, NIL if none pending (EAGAIN),
    and :FAILED if the accept itself failed — EMFILE, ENFILE, ENOMEM —
    with connections possibly still queued behind it; see ACCEPT-PENDING.
-   Refuses the connection with a 503 if the per-worker limit is reached."
+   Refuses the connection with a 503 if the per-worker limit is reached,
+   or the process's descriptors nearly are."
   (let ((client-socket (handler-case
                           (sb-bsd-sockets:socket-accept listener-socket)
                         (error (e)
-                          (log-error "socket-accept failed: ~a" e)
-                          (sleep 0.1) ; backoff to avoid log-spin on EMFILE
+                          ;; Throttled, as a line a client can cause at
+                          ;; will. Nothing waits here: ACCEPT-PENDING stops
+                          ;; at the failure, and it is tried again on the
+                          ;; tick or the next connection's arrival, so it
+                          ;; cannot spin.
+                          (log-throttled :error :accept-failed
+                                         "socket-accept failed: ~a" e)
                           (return-from accept-connection :failed)))))
     (unless client-socket
       (return-from accept-connection nil))
-    ;; Enforce per-worker connection limit
-    (when (and (> *max-connections* 0)
-               (>= (hash-table-count *connections*) *max-connections*))
-      (report-refusal)
-      (note-refused)
-      ;; And a response: REFUSE-CONNECTION writes a pre-built 503 straight to
-      ;; the socket, so nothing downstream of here would count it. It is the
-      ;; plainest case of a refusal no handler ran for, which is what the
-      ;; census promises to count.
-      (note-response 503)
-      (refuse-connection client-socket)
-      (return-from accept-connection t))
+    (let ((limit (cond ((and (> *max-connections* 0)
+                             (>= (hash-table-count *connections*) *max-connections*))
+                        :connections)
+                       ((descriptors-nearly-out-p (socket-fd client-socket))
+                        :descriptors))))
+      (when limit
+        (report-refusal limit)
+        (note-refused)
+        ;; And a response: REFUSE-CONNECTION writes a pre-built 503 straight
+        ;; to the socket, so nothing downstream of here would count it. It is
+        ;; the plainest case of a refusal no handler ran for, which is what
+        ;; the census promises to count.
+        (note-response 503)
+        (refuse-connection client-socket)
+        (return-from accept-connection t)))
     (handler-case
         (let ((conn (make-client-connection client-socket))
               (registered nil)
@@ -3125,6 +3164,12 @@
                                  port)))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
+                  ;; Before the workers, which read it at every accept.
+                  (multiple-value-bind (limit before) (raise-descriptor-limit)
+                    (setf *descriptor-limit* limit)
+                    (if (> limit before)
+                        (log-info "descriptor limit ~d, raised from ~d" limit before)
+                        (log-info "descriptor limit ~d" limit)))
                   ;; Accumulate threads incrementally rather than via LOOP
                   ;; COLLECT: if MAKE-THREAD raises on iteration N, the
                   ;; partial list in THREADS still covers workers 0..N-1 so

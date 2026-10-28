@@ -193,6 +193,19 @@
   (optval (sb-alien:* t))
   (optlen (sb-alien:* sb-alien:unsigned-int)))
 
+(sb-alien:define-alien-routine ("getrlimit" %getrlimit) sb-alien:int
+  (resource sb-alien:int)
+  (rlim (sb-alien:* t)))
+
+(sb-alien:define-alien-routine ("setrlimit" %setrlimit) sb-alien:int
+  (resource sb-alien:int)
+  (rlim (sb-alien:* t)))
+
+(defconstant +rlimit-nofile+ 7
+  "getrlimit(2)'s RESOURCE for the number of open descriptors, 7 on
+   x86-64 and arm64 alike. Its struct rlimit is two 64-bit counts, the
+   soft limit and then the hard one.")
+
 ;;; ===========================================================================
 ;;; Lisp wrappers — these are the public interface
 ;;; ===========================================================================
@@ -353,6 +366,40 @@
                                  (sb-sys:vector-sap buf) 16)))
         (when (< result 0)
           (error "setsockopt SO_SNDTIMEO failed: ~a" (errno-string (get-errno))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Descriptor limit
+;;; ---------------------------------------------------------------------------
+
+(defun descriptor-limits ()
+  "The process's RLIMIT_NOFILE, as (values SOFT HARD)."
+  (let ((buf (make-array 2 :element-type '(unsigned-byte 64) :initial-element 0)))
+    (sb-sys:with-pinned-objects (buf)
+      (when (< (%getrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
+        (error "getrlimit failed: ~a" (errno-string (get-errno)))))
+    (values (aref buf 0) (aref buf 1))))
+
+(defun raise-descriptor-limit ()
+  "Raise the soft descriptor limit to the hard one. Returns the soft limit
+   in force afterwards, and the one before it as a second value.
+
+   The soft limit is commonly 1024, systemd's default for a service and
+   many a container's, while the hard limit is far higher: the soft one
+   is kept low for programs that wait with select(2), which cannot take a
+   descriptor past 1024. Nothing here does: the event loop waits with
+   epoll, and SBCL's own waits use poll(2). Left at 1024, a server runs
+   out of descriptors long before *MAX-CONNECTIONS*. A process may raise
+   its soft limit as far as the hard one without privilege, and one the
+   kernel refuses to raise is left as it was."
+  (multiple-value-bind (soft hard) (descriptor-limits)
+    (if (>= soft hard)
+        (values soft soft)
+        (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                 :initial-contents (list hard hard))))
+          (sb-sys:with-pinned-objects (buf)
+            (if (< (%setrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
+                (values soft soft)
+                (values hard soft)))))))
 
 (defun get-socket-option-int (fd level optname)
   "Get an integer-valued socket option."

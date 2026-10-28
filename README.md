@@ -660,7 +660,7 @@ read about here.
   parks, the outbound uses the same epoll, and one `*fetch-timeout*`
   bounds the whole exchange. For `https://` that includes the TLS
   handshake and every encrypted read and write. What remains below is
-  either your code or a deliberate sleep.
+  your code, or the one API that blocks by design.
 
   - **`http-fetch-stream`, both schemes**, blocks and has **no total
     deadline of any kind**. `SO_RCVTIMEO` bounds each individual read, so
@@ -672,12 +672,6 @@ read about here.
     for as long as they run, with no bound. Inherent rather than a
     shortcoming — that is your code on the worker thread — but it is the
     same worker.
-  - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
-    keep `EMFILE` from spinning the log. Under fd exhaustion that is a
-    worker doing nothing else, 100 ms at a time. The connections still
-    queued behind the failure are retried on the worker's one-second tick
-    until the backlog drains, since an edge-triggered listener reports no
-    event for connections that are already waiting.
 - **TLS renegotiation mid-transfer is handled but not exercised.** OpenSSL
   can answer a read with "I need to write first" and a write with "I need
   to read first" — a renegotiation or a post-handshake message. The state
@@ -726,7 +720,7 @@ All configurable via `setf` before calling `start-server`.
 | `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it. Validated when the server starts |
 | `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path. Validated when the server starts                                                                                                            |
 | `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame. Validated when the server starts |
-| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, and a WebSocket's to its payload cap until the frame is consumed, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing. `0` is no limit. Validated when the server starts |
+| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, and a WebSocket's to its payload cap until the frame is consumed, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing. `0` is no limit. Validated when the server starts. New accepts are refused the same way when the process is nearly out of descriptors, whatever this is: see "Descriptors" in DEPLOYMENT.md's Environment section |
 | `*listen-backlog*`             | `128`     | Each worker's accept queue: connections the kernel has completed and holds until the worker accepts them. Per worker, since each binds its own `SO_REUSEPORT` listener, so the server's is this × workers. Linux clamps it to `net.core.somaxconn`, so raise that too to raise this. Overflow shows only as clients' SYN retransmits, so a reverse proxy that opens bursts of connections at a server with few workers is the case for raising it. Validated when the server starts |
 | `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. Validated when the server starts, so a deployment that trims this below the message size is told at boot rather than at the first maximal message. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |

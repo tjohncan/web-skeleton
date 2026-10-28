@@ -22,6 +22,23 @@
 # proxying to its own loopback port — not one nginx per application.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Descriptors
+#
+# Every proxied connection costs nginx two descriptors, the client's and the
+# upstream's, and a WebSocket holds both for as long as it is open. Its
+# ceiling is worker_connections, in the events block of nginx.conf (768 in
+# Debian's), and its descriptor limit worker_rlimit_nofile, in the main
+# context. Size both to the sockets you mean to hold, or nginx refuses
+# connections past them and logs "worker_connections are not enough".
+#
+# A client that opens connections and sends nothing is nginx's to bound:
+# client_header_timeout (60 s by default) closes them, and they never reach
+# the application. WebSockets do, one upstream connection each, and
+# limit_conn below caps them per address. The application answers 503 as it
+# nears its own descriptor limit (DEPLOYMENT.md, "Descriptors").
+# ---------------------------------------------------------------------------
+
 # The upgrade pair, hoisted because it has to live in the http block.
 # "Connection: upgrade" must be sent only for requests that asked to upgrade;
 # sending it on every request breaks keep-alive for ordinary ones.

@@ -223,7 +223,7 @@ specific status, not a blanket 400:
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
 | `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
 | `501 Not Implemented` | A method not in the accepted set, or a transfer coding that is legal and unimplemented — `gzip`, or `gzip, chunked` (RFC 7230 §3.3.1). A bare final `chunked` is accepted |
-| `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
+| `503 Service Unavailable` | The worker is at `*max-connections*`, or the process is nearly out of descriptors (see "Descriptors" under "Environment") — carries `Retry-After: 2` |
 | `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed. For a request answered with a streamed fetch, the wait starts once its body has gone; see "Sending a request body as it is produced" |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
@@ -2477,3 +2477,28 @@ Debian. Other getents are untested.
 Outbound TLS is the optional `web-skeleton-tls` system, which loads
 libssl, and it needs a CA bundle to verify against: see
 "TLS trust anchors" above.
+
+### Descriptors
+
+Every connection is a descriptor, and so is each fetch's socket and DNS
+pipe. `start-server` raises the process's soft descriptor limit to its
+hard limit and logs both. The soft limit is commonly 1024, systemd's
+default for a service and many a container's, which would run out at
+about a thousand connections, long before `*max-connections*`; the hard
+limit is usually hundreds of thousands. Raising it is safe here because
+nothing in the process waits with `select(2)`, the reason soft limits
+are kept low.
+
+Whatever the limit, a server close to it answers new connections `503`,
+as it does at `*max-connections*`. Once the descriptors in use reach
+seven-eighths of the limit, a new connection is refused, and the eighth
+kept back is for the connections already open, whose fetches and
+lookups need descriptors too. The census counts these refusals under
+`:refused`, and the log says which limit was met.
+
+A hard limit too low for the connections you mean to hold is raised
+where the process is started: `LimitNOFILE=` in a systemd unit,
+`ulimits: nofile:` in a compose file, or `ulimit -Hn` in the shell that
+starts it. A proxy in front holds a descriptor for each side of every
+connection it carries, so it needs a limit of its own, as nginx's
+`worker_rlimit_nofile` and `worker_connections` set.
