@@ -717,6 +717,30 @@
       (replace buf buf :start1 0 :start2 pos :end2 end))
     (setf (connection-read-pos conn) remaining)))
 
+(defun ws-frag-append (conn payload)
+  "Copy PAYLOAD, a continuation fragment's, onto the end of CONN's
+   fragmented message. The caller has checked that the message stays
+   within *MAX-WS-MESSAGE-SIZE*.
+
+   One buffer, not a list of the fragments. A fragment may be empty and
+   still cost its peer six bytes on the wire, so a list would grow a cell
+   and a vector for every one while the byte total, and the cap on it,
+   stood still: an unbounded message. The buffer holds what the total
+   counts and no more than the cap; it doubles as it grows, so a message
+   in many small fragments is copied a constant number of times over."
+  (let* ((buf (connection-ws-frag-buf conn))
+         (total (connection-ws-frag-total conn))
+         (need (+ total (length payload))))
+    (when (> need (length buf))
+      (let ((grown (make-array (min *max-ws-message-size*
+                                    (max need (* 2 (length buf))))
+                               :element-type '(unsigned-byte 8))))
+        (replace grown buf :end2 total)
+        (setf buf grown
+              (connection-ws-frag-buf conn) grown)))
+    (replace buf payload :start1 total)
+    (setf (connection-ws-frag-total conn) need)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket event handler
 ;;;
@@ -864,7 +888,7 @@
                        (progn
                          (setf (connection-ws-frag-opcode conn) opcode
                                (connection-ws-frag-buf conn)
-                               (list (ws-frame-payload frame))
+                               (ws-frame-payload frame)
                                (connection-ws-frag-total conn) len)
                          (log-debug "ws frag start opcode ~d fd ~d"
                                     opcode (connection-fd conn)))))))
@@ -874,24 +898,23 @@
                (log-throttled :warn :ws-fragment "ws continuation without start fd ~d"
                          (connection-fd conn))
                (return-from websocket-on-read (close-with 1002)))
-             ;; Accumulate fragment — O(1) running total instead of re-scanning
-             (push (ws-frame-payload frame) (connection-ws-frag-buf conn))
-             (incf (connection-ws-frag-total conn) (length (ws-frame-payload frame)))
-             (when (> (connection-ws-frag-total conn) *max-ws-message-size*)
-               (log-throttled :warn :ws-fragment "ws fragmented message too large (~d bytes) fd ~d"
-                         (connection-ws-frag-total conn) (connection-fd conn))
-               (setf (connection-ws-frag-buf conn) nil
-                     (connection-ws-frag-total conn) 0)
-               (return-from websocket-on-read (close-with 1009)))
+             (let ((total (+ (connection-ws-frag-total conn)
+                             (length (ws-frame-payload frame)))))
+               (when (> total *max-ws-message-size*)
+                 (log-throttled :warn :ws-fragment "ws fragmented message too large (~d bytes) fd ~d"
+                                total (connection-fd conn))
+                 (setf (connection-ws-frag-buf conn) nil
+                       (connection-ws-frag-total conn) 0)
+                 (return-from websocket-on-read (close-with 1009))))
+             (ws-frag-append conn (ws-frame-payload frame))
              (when (ws-frame-fin frame)
-               ;; Final fragment — reassemble and deliver
-               (let* ((chunks (nreverse (connection-ws-frag-buf conn)))
-                      (total (connection-ws-frag-total conn))
-                      (payload (make-array total :element-type '(unsigned-byte 8)))
-                      (offset 0))
-                 (dolist (chunk chunks)
-                   (replace payload chunk :start1 offset)
-                   (incf offset (length chunk)))
+               ;; Final fragment — deliver the message, the buffer itself
+               ;; when it is exactly full
+               (let* ((total (connection-ws-frag-total conn))
+                      (buf (connection-ws-frag-buf conn))
+                      (payload (if (= total (length buf))
+                                   buf
+                                   (subseq buf 0 total))))
                  (setf (connection-ws-frag-buf conn) nil
                        (connection-ws-frag-total conn) 0)
                  (log-debug "ws frag complete opcode ~d (~d bytes) fd ~d"

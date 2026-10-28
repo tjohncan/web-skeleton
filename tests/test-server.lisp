@@ -7324,7 +7324,7 @@
                          (conn (web-skeleton::make-connection
                                 :fd connfd :state :websocket :last-active now)))
                     (setf (web-skeleton::connection-ws-frag-buf conn)
-                          (list (make-array 1000 :element-type '(unsigned-byte 8)))
+                          (make-array 1000 :element-type '(unsigned-byte 8))
                           (web-skeleton::connection-ws-frag-total conn) 1000
                           (web-skeleton::connection-ws-message-at conn) (- now age))
                     (web-skeleton::epoll-add epfd connfd (logior web-skeleton::+epollin+

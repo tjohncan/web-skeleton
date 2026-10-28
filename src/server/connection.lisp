@@ -431,8 +431,10 @@
   (linger         nil :type boolean)
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
-  (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
-  (ws-frag-total  0  :type fixnum)            ; running total bytes in frag-buf
+  ;; The fragments so far, one after another in [0, WS-FRAG-TOTAL), or NIL
+  ;; while no fragmented message is arriving. See WS-FRAG-APPEND.
+  (ws-frag-buf   nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (ws-frag-total  0  :type fixnum)            ; bytes of frag-buf in use
   ;; Universal time the WebSocket message still arriving began: its first
   ;; fragment, or the first bytes of a frame not yet whole. 0 while no
   ;; message is unfinished. *WS-MESSAGE-TIMEOUT* is measured from it.

@@ -3332,6 +3332,73 @@
         (check "oversized control frame: the connection closes" action :close)
         (check "oversized control frame: with 1002, not 1009" code 1002)))))
 
+(defun test-ws-fragments-are-held-as-their-bytes ()
+  "A fragmented message holds what its fragments carry, and no more than
+   *MAX-WS-MESSAGE-SIZE* of it, however many fragments there are.
+
+   An empty continuation adds nothing to the message and still costs its
+   peer six bytes, so a message kept fragment by fragment would grow with
+   every one while its byte count, and the cap on it, stood still. Twenty
+   thousand of them are fed here behind a one-byte first fragment, and the
+   message is still one byte held.
+
+   Then the bytes themselves: three hundred one-byte fragments arrive as
+   the message they spell, and a message exactly at the cap is delivered
+   while one byte over it closes 1009."
+  (format t "~%ws: fragments are held as their bytes~%")
+  (flet ((feed (frames &optional handler)
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :websocket :last-active 0))
+                 (buf (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                             frames)))
+             (setf (web-skeleton::connection-read-buf conn) buf
+                   (web-skeleton::connection-read-pos conn) (length buf))
+             (multiple-value-bind (action response)
+                 (web-skeleton::websocket-on-read
+                  conn (or handler (lambda (c f) (declare (ignore c f)) nil)))
+               (values conn action
+                       (and response
+                            (>= (length response) 4)
+                            (logior (ash (aref response 2) 8)
+                                    (aref response 3)))))))
+         (octets (&rest bytes)
+           (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+    (let ((conn (feed (cons (make-masked-frame nil 2 (octets 7))
+                            (loop repeat 20000
+                                  collect (make-masked-frame nil 0 (octets)))))))
+      (check "empty fragments: the message is still arriving"
+             (web-skeleton::connection-ws-frag-total conn) 1)
+      (check "empty fragments: and one byte is all it holds"
+             (length (web-skeleton::connection-ws-frag-buf conn)) 1))
+    (let ((got nil))
+      (feed (append (list (make-masked-frame nil 2 (octets 0)))
+                    (loop for i from 1 below 299
+                          collect (make-masked-frame nil 0 (octets (mod i 256))))
+                    (list (make-masked-frame t 0 (octets (mod 299 256)))))
+            (lambda (c f) (declare (ignore c)) (setf got (ws-frame-payload f)) nil))
+      (check "one-byte fragments: the message they spell"
+             (equalp got (coerce (loop for i below 300 collect (mod i 256))
+                                 '(simple-array (unsigned-byte 8) (*))))
+             t))
+    (let ((web-skeleton:*max-ws-message-size* 8)
+          (got nil))
+      (multiple-value-bind (conn action)
+          (feed (list (make-masked-frame nil 2 (octets 1 2 3))
+                      (make-masked-frame nil 0 (octets 4 5 6 7))
+                      (make-masked-frame t 0 (octets 8)))
+                (lambda (c f) (declare (ignore c)) (setf got (ws-frame-payload f)) nil))
+        (declare (ignore conn))
+        (check "at the cap: delivered" action nil)
+        (check "at the cap: whole" (equalp got (octets 1 2 3 4 5 6 7 8)) t))
+      (multiple-value-bind (conn action code)
+          (feed (list (make-masked-frame nil 2 (octets 1 2 3 4))
+                      (make-masked-frame nil 0 (octets 5 6 7 8))
+                      (make-masked-frame t 0 (octets 9))))
+        (check "over the cap: closed" action :close)
+        (check "over the cap: with 1009" code 1009)
+        (check "over the cap: and nothing held"
+               (web-skeleton::connection-ws-frag-buf conn) nil)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; A verdict the discard loop must not spin on
 ;;; ---------------------------------------------------------------------------
@@ -5729,6 +5796,7 @@
   (test-stream-close-refuses-a-foreign-connection)
   (test-cpu-count-parsers)
   (test-ws-oversized-frame-close-code)
+  (test-ws-fragments-are-held-as-their-bytes)
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
   (test-log-level-validated-at-boot)
