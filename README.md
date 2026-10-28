@@ -99,6 +99,7 @@ sbcl
 (web-skeleton-tests:test-algorithms)        ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
 (web-skeleton-tests:test-json)              ; JSON parser and serializer
 (web-skeleton-tests:test-server)            ; HTTP, URL, query, routing, JWT
+(web-skeleton-tests:test-connections)       ; request bodies, connection life, the runtime
 (web-skeleton-tests:test-store)             ; concurrent store and reaper
 (web-skeleton-tests:test-properties)        ; generated-input properties, cross-path parity
 (web-skeleton-tests:test-harness)           ; live-server test harness round-trips
@@ -166,6 +167,7 @@ tests/
   test-algorithms.lisp   SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
+  test-connections.lisp  Request bodies, a connection's life, the runtime
   test-store.lisp        Concurrent store and reaper tests
   test-properties.lisp   Generated-input properties; buffered/streaming parity
   test-harness.lisp      Test harness self-tests (live-server round-trips)

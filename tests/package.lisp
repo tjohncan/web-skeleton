@@ -4,6 +4,7 @@
            #:test-algorithms
            #:test-json
            #:test-server
+           #:test-connections
            #:test-store
            #:test-harness
            #:test-tls

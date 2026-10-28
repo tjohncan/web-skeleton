@@ -391,7 +391,8 @@
         (total-failed 0))
     (setf *all-failed-names* nil
           *tests-skipped* 0)
-    (dolist (suite '(test-algorithms test-json test-server test-store test-properties
+    (dolist (suite '(test-algorithms test-json test-server test-connections
+                     test-store test-properties
                      test-harness test-tls))
       (unless (funcall suite)
         (setf all-passed nil))
