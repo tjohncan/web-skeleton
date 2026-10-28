@@ -2497,7 +2497,10 @@ There, every child process SBCL starts closes descriptors one at a time
 up to the limit before it runs, and its worker waits: about 12 ms at
 46,080, and 130 ms at 524,288. getent is one such child for every fetch
 to a hostname. On such a host `start-server` says so in a WARN at start,
-and `*dns-cache-ttl*` starts fewer of them. Nothing in the process waits
+whether it raised the limit or the process was started with a high one,
+as some container runtimes start it at 1,048,576; it names the limit the
+settings need, which can be set where the process starts, and
+`*dns-cache-ttl*` starts fewer children. Nothing in the process waits
 with `select(2)`, the other reason soft limits are kept low.
 
 Whatever the limit, a server close to it answers new connections `503`,

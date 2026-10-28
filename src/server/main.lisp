@@ -3178,21 +3178,25 @@
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
                   ;; Before the workers, which read it at every accept.
-                  (multiple-value-bind (limit before)
-                      (raise-descriptor-limit (descriptors-wanted workers))
-                    (setf *descriptor-limit* limit)
-                    (cond ((<= limit before)
-                           (log-info "descriptor limit ~d" limit))
-                          ((close-range-available-p)
-                           (log-info "descriptor limit ~d, raised from ~d" limit before))
-                          (t
-                           (log-warn "descriptor limit ~d, raised from ~d. This ~
-                                      kernel has no close_range(2), so each child ~
-                                      process, getent's for every lookup, closes ~
-                                      descriptors up to ~d while its worker waits; ~
-                                      *dns-cache-ttl* starts fewer, and a lower ~
-                                      *max-connections* a smaller limit"
-                                     limit before limit))))
+                  (let ((wanted (descriptors-wanted workers)))
+                    (multiple-value-bind (limit before) (raise-descriptor-limit wanted)
+                      (setf *descriptor-limit* limit)
+                      (let ((raised (when (> limit before)
+                                      (format nil ", raised from ~d" before))))
+                        ;; A limit the process started with counts as much
+                        ;; as one raised here: a container runtime may hand
+                        ;; it 1048576 already.
+                        (if (or (<= limit 1024) (close-range-available-p))
+                            (log-info "descriptor limit ~d~@[~a~]" limit raised)
+                            (log-warn "descriptor limit ~d~@[~a~]. This kernel has ~
+                                       no close_range(2), so each child process, ~
+                                       getent's for every lookup, closes descriptors ~
+                                       up to ~d while its worker waits; ~
+                                       *dns-cache-ttl* starts fewer~@[, and these ~
+                                       settings need a limit of ~d, which can be set ~
+                                       where the process is started~]"
+                                      limit raised limit
+                                      (and wanted (> limit wanted) wanted))))))
                   ;; Accumulate threads incrementally rather than via LOOP
                   ;; COLLECT: if MAKE-THREAD raises on iteration N, the
                   ;; partial list in THREADS still covers workers 0..N-1 so
