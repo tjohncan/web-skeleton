@@ -3399,6 +3399,80 @@
         (check "over the cap: and nothing held"
                (web-skeleton::connection-ws-frag-buf conn) nil)))))
 
+(defun test-small-writes-are-queued-joined ()
+  "Pongs to a stream of empty pings are queued in vectors of a few hundred
+   bytes, not one apiece.
+
+   *MAX-WRITE-BACKLOG* counts bytes, and an empty ping's pong is two of
+   them, while a queued segment of its own costs a cell and a vector
+   header besides: a peer that pings and never reads would have a backlog
+   that holds many times what it counts. Twenty thousand empty pings are
+   fed here. The first pong is the head and the rest join behind it into
+   +QUEUE-MERGE-LIMIT+-byte vectors, and the bytes are every pong in
+   order.
+
+   What is joined is copied, never written into: a vector handed to the
+   queue is the same after another has joined it, as a shared one, the
+   pre-built ping frame or a static response, must be. A WRITE-SPAN is
+   never joined."
+  (format t "~%Write queue: small writes are joined~%")
+  (let* ((n 20000)
+         (conn (web-skeleton::make-connection
+                :fd -1 :state :websocket :last-active 0))
+         (buf (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                     (loop repeat n
+                           collect (make-masked-frame t 9 #())))))
+    (setf (web-skeleton::connection-read-buf conn) buf
+          (web-skeleton::connection-read-pos conn) (length buf))
+    (check "empty pings: read without a close"
+           (web-skeleton::websocket-on-read
+            conn (lambda (c f) (declare (ignore c f)) nil))
+           nil)
+    (check "empty pings: every pong counted"
+           (web-skeleton::connection-write-pending conn) (* 2 n))
+    (check "empty pings: the pongs behind the head in vectors of the limit"
+           (length (web-skeleton::connection-write-queue conn))
+           (ceiling (* 2 (1- n)) web-skeleton::+queue-merge-limit+))
+    (check "empty pings: and the bytes are every pong, in order"
+           (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                                    :adjustable t :fill-pointer 0)))
+             (flet ((take (bytes start end)
+                      (loop for i from start below end
+                            do (vector-push-extend (aref bytes i) out))))
+               (take (web-skeleton::connection-write-buf conn)
+                     (web-skeleton::connection-write-pos conn)
+                     (web-skeleton::connection-write-end conn))
+               (dolist (segment (web-skeleton::connection-write-queue conn))
+                 (multiple-value-call #'take
+                   (web-skeleton::segment-bounds segment))))
+             (and (= (length out) (* 2 n))
+                  (loop for i from 0 below (length out) by 2
+                        always (and (= (aref out i) #x8A)
+                                    (zerop (aref out (1+ i)))))))
+           t))
+  (flet ((octets (&rest bytes)
+           (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
+    (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+          (shared (octets 2 3))
+          (file (make-array 8 :element-type '(unsigned-byte 8) :initial-element 9)))
+      (web-skeleton::connection-append-write conn (octets 1))
+      (web-skeleton::connection-append-write conn shared)
+      (web-skeleton::connection-append-write conn (octets 4))
+      (web-skeleton::%queue-tail conn (web-skeleton::make-write-span file 2 5))
+      (web-skeleton::connection-append-write conn (octets 5))
+      (check "joined: a vector handed over is not written into"
+             (equalp shared (octets 2 3)) t)
+      (check "joined: it is copied into the tail with the next"
+             (equalp (first (web-skeleton::connection-write-queue conn))
+                     (octets 2 3 4))
+             t)
+      (check "joined: a span is not joined, before or after"
+             (mapcar #'web-skeleton::segment-length
+                     (web-skeleton::connection-write-queue conn))
+             '(3 3 1))
+      (check "joined: and the file under it is untouched"
+             (every (lambda (b) (= b 9)) file) t))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; A verdict the discard loop must not spin on
 ;;; ---------------------------------------------------------------------------
@@ -5797,6 +5871,7 @@
   (test-cpu-count-parsers)
   (test-ws-oversized-frame-close-code)
   (test-ws-fragments-are-held-as-their-bytes)
+  (test-small-writes-are-queued-joined)
   (test-discard-available-want-write)
   (test-fetch-timeout-validated-at-boot)
   (test-log-level-validated-at-boot)

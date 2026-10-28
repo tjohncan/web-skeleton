@@ -6192,11 +6192,13 @@
       (check "append: queued counts only the tail"
              (web-skeleton::connection-write-queued conn) 6)
 
-      ;; --- Order is preserved across a third ---
+      ;; --- Order is preserved across a third, joined to the second, and
+      ;; a fourth too large to join ---
       (web-skeleton::connection-append-write conn (bytes "third"))
+      (web-skeleton::connection-append-write conn (bytes (make-string 300 :initial-element #\x)))
       (check "append: queue holds tail vectors oldest first"
              (mapcar #'str (web-skeleton::connection-write-queue conn))
-             '("world!" "third"))
+             (list "world!third" (make-string 300 :initial-element #\x)))
 
       ;; --- QUEUE-WRITE's guard counts the queue, not just the head ---
       ;; Drain the head only; a queue remains. A guard that subtracted
@@ -6214,22 +6216,22 @@
       (check "promote: first promotion takes the oldest"
              (progn (web-skeleton::connection-promote-write conn)
                     (str (web-skeleton::connection-write-buf conn)))
-             "world!")
+             "world!third")
       (check "promote: promotion resets the head offsets"
              (list (web-skeleton::connection-write-pos conn)
                    (web-skeleton::connection-write-end conn))
-             '(0 6))
+             '(0 11))
       (check "promote: second promotion takes the next"
-             (progn (setf (web-skeleton::connection-write-pos conn) 6)
+             (progn (setf (web-skeleton::connection-write-pos conn) 11)
                     (web-skeleton::connection-promote-write conn)
-                    (str (web-skeleton::connection-write-buf conn)))
-             "third")
+                    (length (web-skeleton::connection-write-buf conn)))
+             300)
       (check "promote: queued returns to zero when the tail empties"
              (web-skeleton::connection-write-queued conn) 0)
       (check "promote: tail pointer is released with the last cons"
              (web-skeleton::connection-write-queue-tail conn) nil)
       (check "promote: empty queue reports nothing to promote"
-             (progn (setf (web-skeleton::connection-write-pos conn) 5)
+             (progn (setf (web-skeleton::connection-write-pos conn) 300)
                     (web-skeleton::connection-promote-write conn))
              nil))
 

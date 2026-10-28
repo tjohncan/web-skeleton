@@ -146,7 +146,8 @@
   ;; Vectors queued behind write-buf, oldest first. write-buf is the head
   ;; of the queue and these follow it; CONNECTION-ON-WRITE promotes the
   ;; next one each time the head drains. Held by reference and never
-  ;; written into — see CONNECTION-APPEND-WRITE for why that matters.
+  ;; written into — see CONNECTION-APPEND-WRITE for why that matters —
+  ;; though small ones are joined into a fresh vector: see %QUEUE-TAIL.
   (write-queue      nil :type list)
   (write-queue-tail nil :type list)          ; last cons of write-queue, for O(1) append
   (write-queued     0   :type fixnum)        ; unsent bytes in write-queue, head excluded
@@ -2336,7 +2337,8 @@
    Per connection, so the worst case is this times *MAX-CONNECTIONS*
    times worker count — the same arithmetic as the read buffers, and
    it needs every connection to be simultaneously backed up to get
-   there. Lower it if the deployment has many connections and a
+   there. What a backlog holds stays near what this counts, however
+   small its writes: %QUEUE-TAIL joins them. Lower it if the deployment has many connections and a
    generous ulimit; raise it for few connections and bursty output.")
 
 (defvar *epoll-fd* nil
@@ -2489,15 +2491,42 @@
        t)
       (t (%queue-tail conn bytes) t))))
 
+(defconstant +queue-merge-limit+ 256
+  "Bytes up to which %QUEUE-TAIL joins a byte vector to the one queued
+   before it.")
+
 (defun %queue-tail (conn segment)
   "Put SEGMENT, a byte vector or a WRITE-SPAN, on the tail of CONN's write
    queue. No bound check — whether a bound applies is the caller's
-   question, and the two callers answer it differently."
-  (let ((cell (list segment)))
-    (if (connection-write-queue-tail conn)
-        (setf (cdr (connection-write-queue-tail conn)) cell)
-        (setf (connection-write-queue conn) cell))
-    (setf (connection-write-queue-tail conn) cell))
+   question, and the two callers answer it differently.
+
+   A byte vector that would make, with the byte vector at the tail, no
+   more than +QUEUE-MERGE-LIMIT+ bytes is joined to it instead: the tail
+   cell takes a fresh vector holding both, and neither is written into.
+   *MAX-WRITE-BACKLOG* counts bytes, while each queued segment costs a
+   cell and a vector header besides. Kept one apiece, segments of a few
+   bytes would cost many times what is counted, and a peer can have them
+   made: every ping it sends is answered with a pong, two bytes long when
+   the ping is empty. Joined, any two neighbouring byte vectors hold more
+   than the limit between them, so what the queue holds stays within a
+   fraction of what it counts, at a copy of no more than the limit for
+   each segment joined.
+
+   Only the tail cell is replaced, never the head, which the writer may
+   be partway through, and the tail is always a cell not yet promoted:
+   CONNECTION-PROMOTE-WRITE releases it with the last one."
+  (let ((tail (connection-write-queue-tail conn)))
+    (if (and tail
+             (typep segment '(simple-array (unsigned-byte 8) (*)))
+             (typep (car tail) '(simple-array (unsigned-byte 8) (*)))
+             (<= (+ (length (car tail)) (length segment)) +queue-merge-limit+))
+        (setf (car tail) (concatenate '(simple-array (unsigned-byte 8) (*))
+                                      (car tail) segment))
+        (let ((cell (list segment)))
+          (if tail
+              (setf (cdr tail) cell)
+              (setf (connection-write-queue conn) cell))
+          (setf (connection-write-queue-tail conn) cell))))
   (incf (connection-write-queued conn) (segment-length segment))
   t)
 
