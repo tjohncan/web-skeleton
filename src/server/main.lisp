@@ -281,9 +281,20 @@
 
 (defvar *descriptor-limit* nil
   "The process's soft descriptor limit, as START-SERVER left it after
-   raising it to the hard limit. NIL before a server has started, when
+   raising it to what DESCRIPTORS-WANTED says the settings need. NIL
+   before a server has started, when
    ACCEPT-CONNECTION refuses on *MAX-CONNECTIONS* alone. Process-wide,
    like the limit: every worker's descriptors count against it.")
+
+(defun descriptors-wanted (workers)
+  "The descriptor limit WORKERS workers need to reach *MAX-CONNECTIONS*
+   each before DESCRIPTORS-NEARLY-OUT-P refuses: their connections, which
+   count every outbound socket and DNS pipe too, and 64 more for each
+   worker and the process for listeners, epoll and the rest, with the
+   eighth kept back on top. NIL when *MAX-CONNECTIONS* is 0, no limit,
+   for which START-SERVER takes the hard limit."
+  (when (plusp *max-connections*)
+    (ceiling (* 8 (+ (* workers *max-connections*) (* 64 (1+ workers)))) 7)))
 
 (defun descriptors-nearly-out-p (fd)
   "Whether FD, just accepted, is in the last eighth of *DESCRIPTOR-LIMIT*.
@@ -3167,11 +3178,21 @@
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
                   ;; Before the workers, which read it at every accept.
-                  (multiple-value-bind (limit before) (raise-descriptor-limit)
+                  (multiple-value-bind (limit before)
+                      (raise-descriptor-limit (descriptors-wanted workers))
                     (setf *descriptor-limit* limit)
-                    (if (> limit before)
-                        (log-info "descriptor limit ~d, raised from ~d" limit before)
-                        (log-info "descriptor limit ~d" limit)))
+                    (cond ((<= limit before)
+                           (log-info "descriptor limit ~d" limit))
+                          ((close-range-available-p)
+                           (log-info "descriptor limit ~d, raised from ~d" limit before))
+                          (t
+                           (log-warn "descriptor limit ~d, raised from ~d. This ~
+                                      kernel has no close_range(2), so each child ~
+                                      process, getent's for every lookup, closes ~
+                                      descriptors up to ~d while its worker waits; ~
+                                      *dns-cache-ttl* starts fewer, and a lower ~
+                                      *max-connections* a smaller limit"
+                                     limit before limit))))
                   ;; Accumulate threads incrementally rather than via LOOP
                   ;; COLLECT: if MAKE-THREAD raises on iteration N, the
                   ;; partial list in THREADS still covers workers 0..N-1 so

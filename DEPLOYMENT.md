@@ -2481,13 +2481,24 @@ libssl, and it needs a CA bundle to verify against: see
 ### Descriptors
 
 Every connection is a descriptor, and so is each fetch's socket and DNS
-pipe. `start-server` raises the process's soft descriptor limit to its
-hard limit and logs both. The soft limit is commonly 1024, systemd's
-default for a service and many a container's, which would run out at
-about a thousand connections, long before `*max-connections*`; the hard
-limit is usually hundreds of thousands. Raising it is safe here because
-nothing in the process waits with `select(2)`, the reason soft limits
-are kept low.
+pipe. The soft descriptor limit is commonly 1024, systemd's default for
+a service and many a container's, which would run out at about a
+thousand connections, long before `*max-connections*`, while the hard
+limit is usually hundreds of thousands. So `start-server` raises the
+soft limit to what the settings need, workers × `*max-connections*`
+with room on top, as far as the hard limit allows, and logs it: 46,080
+for four workers at the defaults. With `*max-connections*` at 0 it
+raises it to the hard limit.
+
+It raises no further than that because a high limit has a cost where
+the kernel lacks `close_range(2)`, before Linux 5.9 (RHEL 8, Ubuntu
+20.04's original kernel) or under a seccomp profile older than the call.
+There, every child process SBCL starts closes descriptors one at a time
+up to the limit before it runs, and its worker waits: about 12 ms at
+46,080, and 130 ms at 524,288. getent is one such child for every fetch
+to a hostname. On such a host `start-server` says so in a WARN at start,
+and `*dns-cache-ttl*` starts fewer of them. Nothing in the process waits
+with `select(2)`, the other reason soft limits are kept low.
 
 Whatever the limit, a server close to it answers new connections `503`,
 as it does at `*max-connections*`. Once the descriptors in use reach

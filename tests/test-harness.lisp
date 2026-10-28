@@ -4822,7 +4822,8 @@
    the next is served."
   (format t "~%Harness: a server near its descriptor limit answers 503~%")
   (let ((saved-stream web-skeleton::*log-stream*)
-        (log (make-string-output-stream)))
+        (log (make-string-output-stream))
+        (before (multiple-value-list (web-skeleton::descriptor-limits))))
     (setf web-skeleton::*log-stream* log)
     (unwind-protect
          (with-test-server
@@ -4832,6 +4833,12 @@
            (let ((recorded web-skeleton::*descriptor-limit*))
              (check "start-server records the soft limit it left in force"
                     recorded (nth-value 0 (web-skeleton::descriptor-limits)))
+             ;; One worker's need, not the hard limit: where close_range(2)
+             ;; is missing, every child would close descriptors up to it.
+             (check "and raised it to what its one worker needs, no further"
+                    recorded
+                    (max (first before)
+                         (min (second before) (web-skeleton::descriptors-wanted 1))))
              (unwind-protect
                   (progn
                     (setf web-skeleton::*descriptor-limit* 1)

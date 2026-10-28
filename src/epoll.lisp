@@ -379,27 +379,53 @@
         (error "getrlimit failed: ~a" (errno-string (get-errno)))))
     (values (aref buf 0) (aref buf 1))))
 
-(defun raise-descriptor-limit ()
-  "Raise the soft descriptor limit to the hard one. Returns the soft limit
-   in force afterwards, and the one before it as a second value.
+(defun raise-descriptor-limit (&optional wanted)
+  "Raise the soft descriptor limit to WANTED, or as near as the hard limit
+   allows, and to the hard limit itself when WANTED is NIL. Never lowers
+   it. Returns the soft limit in force afterwards, and the one before it
+   as a second value.
 
    The soft limit is commonly 1024, systemd's default for a service and
-   many a container's, while the hard limit is far higher: the soft one
-   is kept low for programs that wait with select(2), which cannot take a
-   descriptor past 1024. Nothing here does: the event loop waits with
-   epoll, and SBCL's own waits use poll(2). Left at 1024, a server runs
-   out of descriptors long before *MAX-CONNECTIONS*. A process may raise
-   its soft limit as far as the hard one without privilege, and one the
-   kernel refuses to raise is left as it was."
+   many a container's, while the hard limit is far higher. Left at 1024,
+   a server runs out of descriptors long before *MAX-CONNECTIONS*. The
+   soft limit is kept low for two kinds of program, and the cost of each
+   is why this raises to what is wanted rather than to the hard limit:
+   - one that waits with select(2), which cannot take a descriptor past
+     1024. Nothing here does: the event loop waits with epoll, and SBCL's
+     own waits use poll(2).
+   - one that closes every descriptor up to the limit before it execs a
+     child. SBCL's RUN-PROGRAM does, where the kernel lacks close_range(2),
+     and the worker that starts getent waits while it does: about 130 ms
+     a child at a limit of 524288. See CLOSE-RANGE-AVAILABLE-P.
+   A process may raise its soft limit as far as the hard one without
+   privilege, and one the kernel refuses to raise is left as it was."
   (multiple-value-bind (soft hard) (descriptor-limits)
-    (if (>= soft hard)
-        (values soft soft)
-        (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
-                                 :initial-contents (list hard hard))))
-          (sb-sys:with-pinned-objects (buf)
-            (if (< (%setrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
-                (values soft soft)
-                (values hard soft)))))))
+    (let ((target (max soft (if wanted (min wanted hard) hard))))
+      (if (= target soft)
+          (values soft soft)
+          (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                   :initial-contents (list target hard))))
+            (sb-sys:with-pinned-objects (buf)
+              (if (< (%setrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
+                  (values soft soft)
+                  (values target soft))))))))
+
+(sb-alien:define-alien-routine ("syscall" %syscall-3) sb-alien:long
+  (number sb-alien:long)
+  (a sb-alien:unsigned-long)
+  (b sb-alien:unsigned-long)
+  (c sb-alien:unsigned-long))
+
+(defconstant +sys-close-range+ 436
+  "close_range(2)'s syscall number, 436 on x86-64 and arm64 alike.")
+
+(defun close-range-available-p ()
+  "Whether the kernel has close_range(2), and a seccomp profile lets it
+   through. Asked with an empty range, from the largest descriptor number
+   to itself, which closes nothing. Linux has it from 5.9. Without it,
+   SBCL's RUN-PROGRAM closes descriptors one at a time up to the soft limit
+   in each child before it execs."
+  (zerop (%syscall-3 +sys-close-range+ #xFFFFFFFF #xFFFFFFFF 0)))
 
 (defun get-socket-option-int (fd level optname)
   "Get an integer-valued socket option."

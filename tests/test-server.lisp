@@ -2501,14 +2501,39 @@
            t)))
 
 (defun test-descriptor-limit ()
-  "RAISE-DESCRIPTOR-LIMIT leaves the soft limit at the hard one, and
-   DESCRIPTORS-NEARLY-OUT-P answers for the last eighth of the limit it is
-   given, and for nothing when there is none."
+  "RAISE-DESCRIPTOR-LIMIT raises the soft limit to what it is asked for,
+   no further and never lower; DESCRIPTORS-WANTED is what the settings
+   need; and DESCRIPTORS-NEARLY-OUT-P answers for the last eighth of the
+   limit it is given, and for nothing when there is none.
+
+   Not raised to the hard limit, which is what START-SERVER does with no
+   *MAX-CONNECTIONS*: where close_range(2) is missing, every child process
+   would then close that many descriptors, the suite's getent lookups
+   among them."
   (format t "~%Descriptor limit~%")
-  (multiple-value-bind (now before) (web-skeleton::raise-descriptor-limit)
-    (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
-      (check "the soft limit is raised to the hard one" (list now soft) (list hard hard))
-      (check "and what it was is reported, no higher" (<= before now) t)))
+  (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
+    (check "a limit below the soft one leaves it as it is"
+           (multiple-value-list (web-skeleton::raise-descriptor-limit 1))
+           (list soft soft))
+    (if (< soft hard)
+        (progn
+          (check "one above it is what the soft limit becomes"
+                 (multiple-value-list (web-skeleton::raise-descriptor-limit (1+ soft)))
+                 (list (1+ soft) soft))
+          (check "as the kernel reports it, the hard limit unchanged"
+                 (multiple-value-list (web-skeleton::descriptor-limits))
+                 (list (1+ soft) hard)))
+        (check "control: at the hard limit already, nothing is raised"
+               (nth-value 0 (web-skeleton::raise-descriptor-limit (1+ soft)))
+               soft)))
+  (let ((web-skeleton::*max-connections* 10000))
+    (check "four workers at the default connection limit want 46,080"
+           (web-skeleton::descriptors-wanted 4) 46080))
+  (let ((web-skeleton::*max-connections* 0))
+    (check "no connection limit wants the hard limit"
+           (web-skeleton::descriptors-wanted 4) nil))
+  (check "close_range is asked about without error"
+         (typep (web-skeleton::close-range-available-p) 'boolean) t)
   (let ((web-skeleton::*descriptor-limit* 1024))
     (check "below the last eighth, a descriptor is not short"
            (web-skeleton::descriptors-nearly-out-p 895) nil)
