@@ -327,8 +327,10 @@
                                *STREAM-KEEPALIVE-INTERVAL* for why the
                                framework cannot invent these.
 
-   HEADERS is an alist. Content-Length and Transfer-Encoding are refused
-   — the framework owns framing for a stream."
+   HEADERS is an alist, sent as given, so a name may repeat, as
+   Set-Cookie has to for two cookies. Content-Length and
+   Transfer-Encoding are refused — the framework owns framing for a
+   stream."
   ;; An empty keepalive fires on schedule and sends nothing, forever:
   ;; FRAME-STREAM-BYTES returns NIL for an empty payload on both paths,
   ;; correctly, and the sweep skips it. The only symptom would be streams
@@ -339,8 +341,11 @@
     (error "make-stream-response: :keepalive is empty — that sends nothing ~
             on every interval forever. Pass NIL to decline a keepalive."))
   (let ((resp (make-http-response :status status)))
-    (loop for (name . value) in headers
-          do (set-response-header resp name value))
+    ;; As given, so a name may repeat: Set-Cookie must, one field a cookie,
+    ;; and Link often does. WS-UPGRADE's :HEADERS go out the same way.
+    (setf (http-response-headers resp)
+          (loop for (name . value) in headers
+                collect (cons (string-downcase name) value)))
     (%make-stream-response :response resp
                            :on-open on-open
                            :on-close on-close
@@ -711,7 +716,11 @@
    emission is the terminator."
   (make-stream-response
    :status 200
-   :headers (append headers
+   :headers (append (remove-if (lambda (name)
+                                 (member name '("content-type" "cache-control"
+                                                "x-accel-buffering")
+                                         :test #'string-equal))
+                               headers :key #'car)
                     (list (cons "content-type" "text/event-stream")
                           (cons "cache-control" "no-cache")
                           (cons "x-accel-buffering" "no")))

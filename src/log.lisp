@@ -90,19 +90,42 @@
             (*print-level* 8))
         (handler-case
             (progn
-              (format stream "~a [~a] ~?~%"
+              (format stream "~a [~a] ~a~%"
                       (timestamp)
                       (string-upcase (symbol-name level))
-                      format-string args)
+                      (escape-control-characters
+                       (format nil "~?" format-string args)))
               (force-output stream))
           (error ()
             (ignore-errors
              (format *error-output*
-                     "~a [~a] (log stream failed) ~?~%"
+                     "~a [~a] (log stream failed) ~a~%"
                      (timestamp)
                      (string-upcase (symbol-name level))
-                     format-string args)
+                     (escape-control-characters
+                      (format nil "~?" format-string args)))
              (force-output *error-output*))))))))
+
+(defun escape-control-characters (string)
+  "STRING with each control character written as \\xNN, its code in hex:
+   C0, DEL and C1 alike, so a line break or a terminal escape in it reads
+   as text.
+
+   Done here, once for every line, because what a line says is often a
+   client's: a header value, a path, a JSON parser's complaint about the
+   character it met. A raw line feed in it would end the line and start a
+   forged one, and an ESC would reach the terminal of anyone tailing the
+   log. One call is one line, whatever it is given."
+  (flet ((control-p (c)
+           (let ((code (char-code c)))
+             (or (< code 32) (<= 127 code 159)))))
+    (if (notany #'control-p string)
+        string
+        (with-output-to-string (out)
+          (loop for c across string
+                do (if (control-p c)
+                       (format out "\\x~2,'0X" (char-code c))
+                       (write-char c out)))))))
 
 (defvar *log-throttle* nil
   "This worker's throttled log lines, a hash table from a kind to

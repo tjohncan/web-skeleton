@@ -1,3 +1,6 @@
+;;; The demo as one executable. It carries the code but not the demo's
+;;; pages: it reads demo/static/ from where it was built, so it runs where
+;;; that tree is. Built with libssl present, it needs libssl when it starts.
 (require :asdf)
 (push *default-pathname-defaults* asdf:*central-registry*)
 (asdf:load-system "web-skeleton-demo")

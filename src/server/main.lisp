@@ -1012,9 +1012,11 @@
                      (http-request-path request))
            (values (make-websocket-handshake-response request upgrade) t))
          (progn
-           (log-warn "~a ~a -> 400 bad upgrade"
-                     (http-request-method request)
-                     (http-request-path request))
+           ;; Throttled: a GET to the route with no upgrade headers is all
+           ;; it takes, from curl, a crawler or a probe.
+           (log-throttled :warn :bad-upgrade "~a ~a -> 400 bad upgrade"
+                          (http-request-method request)
+                          (http-request-path request))
            ;; RFC 6455 §4.4: MUST include supported version on rejection
            (let ((resp (make-error-response 400)))
              (set-response-header resp "sec-websocket-version" "13")

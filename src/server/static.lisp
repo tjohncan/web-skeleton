@@ -385,11 +385,15 @@
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
    Additive — can be called multiple times. Collisions: last wins.
+   All or nothing: a call that signals, at the cap, a substitutions key or
+   a header value, leaves the cache as it found it.
    Dotfiles and dot-directories are skipped (.git/, .env) — except
    the RFC 8615 /.well-known/ namespace, which is served.
 
    MAX-TOTAL-BYTES caps the whole tree, default 256 MiB, and signals with
-   the offending path and the running total when crossed. The cache is
+   the offending path and the running total when crossed. A file is
+   measured before it is read, so one larger than the heap is refused by
+   name rather than exhausting it. The cache is
    resident for the life of the process, so pointing this at a directory
    holding a 4 GB video buys a 4 GB resident set — discovered at deploy
    time, on the box, rather than here. Range support makes that likelier
@@ -413,10 +417,9 @@
              \"public, max-age=31536000, immutable\"
              \"public, max-age=60\")))
 
-   The resolved string is validated by SERIALIZE-HTTP-MESSAGE on
-   the first request serving, so a value containing CR / LF / NUL
-   raises a pointed error at response-build time rather than going
-   on the wire.
+   The resolved string is validated by SERIALIZE-HTTP-MESSAGE as each
+   file's responses are built, here, so a value containing CR / LF / NUL
+   fails this call rather than going on the wire.
 
    SUBSTITUTIONS is an optional list of per-file literal-string rewrites
    applied at load time, before the ETag is computed:
@@ -455,7 +458,18 @@
                                   :name :wild :type :wild)
                    (sb-ext:parse-native-namestring base)))
             (count 0)
-            (total-bytes 0))
+            (total-bytes 0)
+            ;; This call's files, merged into *STATIC-CACHE* only once the
+            ;; walk and the substitutions check have both succeeded.
+            (loaded (make-hash-table :test #'equal)))
+        (flet ((over-cap (url-path total)
+                 (error "load-static-files: ~a brings the tree to ~
+                         ~d bytes, over the ~d-byte cap. Raise ~
+                         :max-total-bytes, or serve large media from ~
+                         the reverse proxy directly — this cache holds ~
+                         every file in the process for its whole life, ~
+                         and there is no serve-from-disk path."
+                        url-path total max-total-bytes)))
         ;; First pass: load all files (skip directories)
         (dolist (file (directory wild))
           (when (and (pathname-name file)
@@ -480,7 +494,14 @@
                    ;; HIDDEN-PATH-COMPONENT-P.
                    (unless (hidden-path-component-p relative)
                      (let* ((url-path (concatenate 'string "/" relative))
-                            (raw-content (read-file-bytes file))
+                            ;; Measured first: the cap exists for the file
+                            ;; too big to hold, which reading it would
+                            ;; have to hold.
+                            (size (with-open-file (s file :element-type '(unsigned-byte 8))
+                                    (file-length s)))
+                            (raw-content (if (> (+ total-bytes size) max-total-bytes)
+                                             (over-cap url-path (+ total-bytes size))
+                                             (read-file-bytes file)))
                             (rules (and subs-table (gethash url-path subs-table)))
                             (content (if rules
                                          (apply-substitutions raw-content rules)
@@ -493,21 +514,15 @@
                             (response (build-static-response mime content mtime cc)))
                        (when (gethash url-path *static-cache*)
                          (log-debug "static: replacing ~a" url-path))
-                       (setf (gethash url-path *static-cache*) response)
+                       (setf (gethash url-path loaded) response)
                        (incf count)
                        (incf total-bytes (length content))
-                       ;; Checked after the increment so the reported
-                       ;; total includes the file that crossed the line —
-                       ;; the operator wants to know what it costs, not
-                       ;; what it cost before.
+                       ;; Again after the substitutions, which can grow a
+                       ;; file. The total includes the file that crossed
+                       ;; the line — the operator wants to know what it
+                       ;; costs, not what it cost before.
                        (when (> total-bytes max-total-bytes)
-                         (error "load-static-files: ~a brings the tree to ~
-                                 ~d bytes, over the ~d-byte cap. Raise ~
-                                 :max-total-bytes, or serve large media from ~
-                                 the reverse proxy directly — this cache holds ~
-                                 every file in the process for its whole life, ~
-                                 and there is no serve-from-disk path."
-                                url-path total-bytes max-total-bytes))
+                         (over-cap url-path total-bytes))
                        (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content))))))))))
         ;; Validate every :substitutions file key matched a file we
         ;; actually loaded. Runs before alias generation so aliases
@@ -515,9 +530,12 @@
         (when subs-table
           (maphash (lambda (key rules)
                      (declare (ignore rules))
-                     (unless (gethash key *static-cache*)
+                     (unless (gethash key loaded)
                        (error "substitutions: ~s is not a loaded file" key)))
                    subs-table))
+        (maphash (lambda (url-path response)
+                   (setf (gethash url-path *static-cache*) response))
+                 loaded))
         ;; Second pass: register extensionless aliases for .html files
         ;; e.g., /login.html also serves at /login
         ;; Actual files take priority — don't overwrite existing entries

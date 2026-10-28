@@ -1262,7 +1262,8 @@
    LOG-THROTTLED logs the first of a kind at once and then at most once a
    minute per worker, with a count of the ones held back. The first half
    drives it directly; the second sends twenty requests with an unknown
-   method to a real server and counts the lines its worker wrote."
+   method to a real server and counts the lines its worker wrote, and the
+   third twenty plain GETs to a route that upgrades."
   (format t "~%Harness: a flood of bad requests logs a line, not a flood~%")
   (let ((out (make-string-output-stream)))
     (let ((web-skeleton::*log-stream* out)
@@ -1311,6 +1312,28 @@
       (check "twenty malformed requests log one parse-error line"
              (loop with n = 0 and start = 0
                    for at = (search "parse error fd" text :start2 start)
+                   while at do (incf n) (setf start (1+ at))
+                   finally (return n))
+             1)))
+  ;; A GET with no upgrade headers to a route that upgrades.
+  (let ((saved web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log)
+           (with-test-server
+               (:handler (lambda (req) (declare (ignore req)) :upgrade))
+             (dotimes (i 20)
+               (push (attempt (values (test-http-request :get "/ws")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved))
+    (let ((text (get-output-stream-string log)))
+      (check "control: every plain GET to the upgrade route was a 400"
+             (every (lambda (s) (eql s 400)) statuses) t)
+      (check "twenty of them log one bad-upgrade line"
+             (loop with n = 0 and start = 0
+                   for at = (search "bad upgrade" text :start2 start)
                    while at do (incf n) (setf start (1+ at))
                    finally (return n))
              1))))

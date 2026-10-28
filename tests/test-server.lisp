@@ -2409,6 +2409,97 @@
                (and (eq status :external) (boundp symbol) t)
                t)))))
 
+(defun test-static-load-measures-first-and-keeps-nothing-it-refuses ()
+  "LOAD-STATIC-FILES refuses a file over :MAX-TOTAL-BYTES by name before
+   reading it, so one larger than any heap gets the cap's error rather
+   than a heap exhaustion. And a load that signals leaves *STATIC-CACHE*
+   as it found it, rather than holding the files walked before the error.
+
+   The large file is sparse, 64 GiB long and holding one byte, so it
+   costs no disk."
+  (format t "~%Static: a load measures first, and keeps nothing it refuses~%")
+  (let* ((dir (format nil "/tmp/wsk-static-cap-~d/"
+                      (random 1000000000 (make-random-state t))))
+         (small (concatenate 'string dir "a.css"))
+         (big (concatenate 'string dir "video.mp4")))
+    (ensure-directories-exist dir)
+    (unwind-protect
+         (progn
+           (with-open-file (s small :direction :output :if-exists :supersede)
+             (write-string "body { color: red }" s))
+           (let ((web-skeleton::*static-cache* (make-hash-table :test #'equal)))
+             (setf (gethash "/kept" web-skeleton::*static-cache*) :kept)
+             ;; The control first: with no large file, a substitutions key
+             ;; that names nothing fails the load after every file has
+             ;; been walked.
+             (check "control: a key naming no file fails the load"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                dir :substitutions '(("nope.js" ("a" . "b"))))
+                               :loaded)
+                      (error () :refused))
+                    :refused)
+             (check "and the files walked before it are not kept"
+                    (%sorted-keys web-skeleton::*static-cache*)
+                    '("/kept"))
+             (with-open-file (s big :direction :output :if-exists :supersede
+                                    :element-type '(unsigned-byte 8))
+               (file-position s (1- (* 64 1024 1024 1024)))
+               (write-byte 0 s))
+             (check "a file larger than the heap is refused by the cap, by name"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                dir :max-total-bytes 1000)
+                               :loaded)
+                      (storage-condition () :heap-exhausted)
+                      (error (e)
+                        (if (and (search "video.mp4" (princ-to-string e))
+                                 (search "cap" (princ-to-string e)))
+                            :cap
+                            (princ-to-string e))))
+                    :cap)
+             (check "and nothing of that load is kept either"
+                    (%sorted-keys web-skeleton::*static-cache*)
+                    '("/kept"))))
+      (ignore-errors (delete-file big))
+      (ignore-errors (delete-file small))
+      (ignore-errors (sb-ext:delete-directory dir)))))
+
+(defun %sorted-keys (table)
+  "TABLE's keys, sorted."
+  (sort (loop for k being the hash-keys of table collect k) #'string<))
+
+(defun test-a-log-line-escapes-control-characters ()
+  "A log line carries a control character as \\xNN text, so what a client
+   put in a value cannot end the line and forge another, nor reach a
+   terminal as an escape. JSON-PARSE's complaint about an escape
+   followed by a raw line feed is the shape a client can send at will."
+  (format t "~%Log: one call is one line~%")
+  (flet ((logged (thunk)
+           (let ((web-skeleton:*log-stream* (make-string-output-stream))
+                 (web-skeleton:*log-level* :info))
+             (funcall thunk)
+             (get-output-stream-string web-skeleton:*log-stream*))))
+    (let ((text (logged (lambda ()
+                          (handler-case
+                              (web-skeleton:json-parse
+                               (coerce (list #\" #\\ #\Newline #\X #\") 'string))
+                            (error (e) (web-skeleton::log-warn "error fd 9: ~a" e)))))))
+      (check "a line feed from the input does not end the line"
+             (count #\Newline text) 1)
+      (check "it reads as its code"
+             (and (search "\\x0A" text) t) t))
+    (let ((text (logged (lambda ()
+                          (web-skeleton::log-info "a~cb~cc" (code-char 27)
+                                                  (code-char #x9B))))))
+      (check "ESC and a C1 control are written as codes"
+             (and (search "a\\x1Bb\\x9Bc" text) t) t))
+    (check "control: a line without one is written as it is"
+           (and (search "plain: 100% ok"
+                        (logged (lambda () (web-skeleton::log-info "plain: 100% ok"))))
+                t)
+           t)))
+
 (defun test-descriptor-limit ()
   "RAISE-DESCRIPTOR-LIMIT leaves the soft limit at the hard one, and
    DESCRIPTORS-NEARLY-OUT-P answers for the last eighth of the limit it is
@@ -7867,7 +7958,36 @@
                   :chunked)
                  :external-format :latin-1)))
       (check "sse: the protocol's content type is not overridable"
-             (and (search "content-type: text/event-stream" head) t) t))))
+             (and (search "content-type: text/event-stream" head) t) t)
+      (check "sse: and the caller's is not sent beside it"
+             (search "text/plain" head) nil))))
+
+(defun test-stream-headers-repeat ()
+  "A name a streamed response's :HEADERS repeats goes out each time: two
+   cookies are two Set-Cookie fields, and a stream that kept only the last
+   would set one of them without a word.
+
+   A function of its own rather than more of TEST-SSE, which is already as
+   large as SBCL 2.2.9's compiler takes in a 1 GiB heap."
+  (format t "~%Streamed responses keep a repeated header~%")
+  (flet ((head-of (sresp)
+             (sb-ext:octets-to-string
+              (web-skeleton::format-streaming-head
+               (web-skeleton::stream-response-response sresp) :chunked)
+              :external-format :latin-1))
+           (count-of (needle text)
+             (loop with start = 0
+                   for i = (search needle text :start2 start)
+                   while i count t do (setf start (1+ i)))))
+      (let ((headers '(("Set-Cookie" . "a=1") ("set-cookie" . "b=2"))))
+        (check "stream: a repeated name goes out each time"
+               (count-of "set-cookie: " (head-of (web-skeleton:make-stream-response
+                                                  :headers headers)))
+               2)
+        (check "sse: and on an SSE response too"
+               (count-of "set-cookie: " (head-of (web-skeleton:make-sse-response
+                                                  :headers headers)))
+               2))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Stream lifecycle
@@ -9657,6 +9777,8 @@
   (test-documented-settings-are-exported)
   (test-errno-names)
   (test-descriptor-limit)
+  (test-a-log-line-escapes-control-characters)
+  (test-static-load-measures-first-and-keeps-nothing-it-refuses)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
@@ -9679,6 +9801,7 @@
   (test-stream-head-request)
   (test-stream-keepalive-and-idle)
   (test-sse)
+  (test-stream-headers-repeat)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
