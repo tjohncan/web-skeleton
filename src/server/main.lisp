@@ -1241,7 +1241,10 @@
               (unregister-connection conn)))
           t)
       (error (e)
-        (log-error "accept failed: ~a" e)
+        ;; Throttled with a failed accept: ACCEPT-PENDING goes on to the
+        ;; next queued connection, and a set-up failing for one is likely
+        ;; to fail for each.
+        (log-throttled :error :accept-failed "accept failed: ~a" e)
         (ignore-errors (sb-bsd-sockets:socket-close client-socket))
         t))))
 

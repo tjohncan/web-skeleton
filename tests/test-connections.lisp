@@ -3799,15 +3799,19 @@
    connections already waiting, so one left in the backlog waits for the
    next client to arrive. The set-up is made to fail here by an epoll fd
    that is not one, which EPOLL-ADD refuses; two clients are queued, and
-   the backlog is empty afterwards, with nothing left in the table."
+   the backlog is empty afterwards, with nothing left in the table. The
+   failure is logged once for the two, throttled as a failed accept is,
+   since one that fails for a connection is likely to fail for each."
   (format t "~%accept: on past a connection it could not set up~%")
   (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
          (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
          (clients (loop repeat 2
                         collect (make-instance 'sb-bsd-sockets:inet-socket
                                                :type :stream :protocol :tcp)))
+         (log (make-string-output-stream))
          (web-skeleton::*connections* (make-hash-table :test #'eql))
-         (web-skeleton:*log-stream* (make-broadcast-stream)))
+         (web-skeleton:*log-stream* log)
+         (web-skeleton::*log-throttle* (make-hash-table :test #'eq)))
     (unwind-protect
          (progn
            (dolist (c clients)
@@ -3820,7 +3824,13 @@
                     (and left t))
                   nil)
            (check "set-up failing: and none in the table"
-                  (hash-table-count web-skeleton::*connections*) 0))
+                  (hash-table-count web-skeleton::*connections*) 0)
+           (check "set-up failing: logged once for the two"
+                  (let ((text (get-output-stream-string log)))
+                    (loop with start = 0
+                          for at = (search "accept failed" text :start2 start)
+                          while at count t do (setf start (1+ at))))
+                  1))
       (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
       (ignore-errors (sb-bsd-sockets:socket-close listener)))))
 
