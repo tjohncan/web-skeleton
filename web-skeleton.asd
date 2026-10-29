@@ -96,6 +96,7 @@
                                                       "src/server/http"
                                                       "src/server/connection"))
                (:file "src/server/multipart" :depends-on ("src/package"
+                                                           "src/json"
                                                            "src/server/http"
                                                            "src/server/connection"
                                                            "src/server/body"))

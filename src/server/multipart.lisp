@@ -132,12 +132,12 @@
    choice two readers make differently."
   (let ((len (length value))
         (i (or (position #\; value) (length value)))
-        (params '())
-        ;; The names so far, to find one given twice. A table, not a search
-        ;; of PARAMS: a part head of the default 16 KiB holds thousands of
-        ;; parameters, and each searching all those before it costs the
-        ;; square of their count in worker time.
-        (seen (make-hash-table :test #'equal)))
+        ;; Checked for a name given twice once all are read, by
+        ;; FIRST-REPEATED-KEY: a part head of the default 16 KiB holds
+        ;; thousands of parameters, and each searching those before it, or a
+        ;; table of them a client can aim at one bucket, costs the square
+        ;; of their count in worker time.
+        (params '()))
     (labels ((fail (what &rest args)
                (http-parse-error "~a: ~?" context what args))
              (skip-ows ()
@@ -176,11 +176,12 @@
                                 (fail "parameter ~a has no value" (%excerpt name)))
                               (prog1 (subseq value i text-end)
                                 (setf i text-end))))))
-              (when (gethash name seen)
-                (fail "parameter ~a given twice" (%excerpt name)))
-              (setf (gethash name seen) t)
-              (push (cons name text) params))))))
-    (nreverse params)))
+              (push (cons name text) params)))))
+      (setf params (nreverse params))
+      (let ((repeat (first-repeated-key params)))
+        (when repeat
+          (fail "parameter ~a given twice" (%excerpt (car repeat))))))
+    params))
 
 (defun %boundary-char-p (char)
   "True for a character RFC 2046 §5.1.1 allows in a boundary."

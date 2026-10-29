@@ -331,6 +331,52 @@
                   t))
       (setf web-skeleton:*json-max-string-length* saved))))
 
+(defun test-json-first-repeated-key ()
+  "FIRST-REPEATED-KEY, which JSON-PARSE and multipart's parameters find a
+   repeated name with, answers the repeat a reader going in order meets
+   first, and agrees with that reader on keys drawn at random.
+
+   It sorts where a table of the keys seen would hash them, since a client
+   can aim names at one bucket of SBCL's string hash. What that buys is
+   time on such names, which needs names searched for against one SBCL's
+   hash to show; what is checked here is that the sort answers as the
+   table did."
+  (format t "~%JSON: the first repeated key~%")
+  (flet ((naive (entries)
+           ;; A reader going in order, remembering every key so far.
+           (loop for (entry . rest) on entries
+                 for seen = (list (car entry)) then (cons (car entry) seen)
+                 for next = (first rest)
+                 when (and next (member (car next) seen :test #'string=))
+                   return next)))
+    (check "repeat: none among distinct keys, a prefix of another included"
+           (web-skeleton::first-repeated-key '(("a" . 0) ("ab" . 1) ("b" . 2)))
+           nil)
+    (check "repeat: none in one key, or none"
+           (list (web-skeleton::first-repeated-key '(("a" . 0)))
+                 (web-skeleton::first-repeated-key '()))
+           '(nil nil))
+    (check "repeat: of two, the one met first"
+           (web-skeleton::first-repeated-key
+            '(("a" . 1) ("b" . 7) ("b" . 9) ("a" . 13)))
+           '("b" . 9))
+    (check "repeat: of a key three times, its second"
+           (web-skeleton::first-repeated-key '(("x" . 1) ("x" . 2) ("x" . 3)))
+           '("x" . 2))
+    (check "repeat: json-parse names that key, where it is"
+           (handler-case (progn (json-parse "{\"a\":1,\"b\":2,\"b\":3,\"a\":4}") nil)
+             (error (e) (princ-to-string e)))
+           "json: duplicate key \"b\" at 13")
+    (let ((*random-state* (sb-ext:seed-random-state 1031))
+          (disagreements 0))
+      (dotimes (trial 500)
+        (let ((entries (loop for i below (random 12)
+                             collect (cons (string (code-char (+ 97 (random 6)))) i))))
+          (unless (equal (web-skeleton::first-repeated-key entries) (naive entries))
+            (incf disagreements))))
+      (check "repeat: as a reader in order finds it, on 500 random key lists"
+             disagreements 0))))
+
 (defun test-json ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -339,5 +385,6 @@
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-serialize)
+  (test-json-first-repeated-key)
   (report-suite "JSON")
   (zerop *tests-failed*))

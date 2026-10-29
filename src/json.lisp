@@ -296,6 +296,34 @@
        (json-parse-number str pos))
       (t (error "json: unexpected character '~a' at ~d" ch pos)))))
 
+(defun first-repeated-key (entries)
+  "The entry of ENTRIES, conses whose cars are strings, given in the order
+   they were read, whose car repeats an earlier entry's: the earliest such,
+   or NIL.
+
+   By sorting and comparing neighbours, not by a hash table of what was
+   seen. The keys are a client's to choose, and SBCL's string hash takes
+   no secret: on 2.2.9 a client can compute keys that all fall in one
+   bucket and make each lookup walk every key before it, the square of
+   their count. A merge sort costs its N log N comparisons whatever the
+   keys. Used for JSON-PARSE's object keys and for multipart's header
+   parameters."
+  (when (rest entries)
+    (let ((sorted (stable-sort (loop for entry in entries
+                                     for i from 0
+                                     collect (cons i entry))
+                               #'string< :key #'cadr))
+          (found nil))
+      ;; Stable, so within a run of one key the entries keep the order they
+      ;; were read in, and each after the first is a repeat. The earliest
+      ;; repeat is the one a reader going in order meets first.
+      (loop for (a b) on sorted
+            while b
+            when (and (string= (cadr a) (cadr b))
+                      (or (null found) (< (car b) (car found))))
+              do (setf found b))
+      (cdr found))))
+
 (defun json-parse-object (str pos &optional (depth 0))
   "Parse a JSON object at POS. Returns (values JSON-OBJECT new-pos).
    Caller (json-parse-value) has already dispatched on the opening '{'.
@@ -316,7 +344,9 @@
   (when (char= (char str pos) #\})
     (return-from json-parse-object (values (make-json-object nil) (1+ pos))))
   (let ((pairs nil)
-        (seen (make-hash-table :test #'equal)))
+        ;; (key . position), newest first; checked for a repeat at the close
+        ;; brace by FIRST-REPEATED-KEY.
+        (keys nil))
     (loop
       (setf pos (json-skip-whitespace str pos))
       (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
@@ -327,9 +357,7 @@
         (error "json: expected string key at ~d" pos))
       (let ((key-pos pos))
         (multiple-value-bind (key new-pos) (json-parse-string str pos)
-          (when (gethash key seen)
-            (error "json: duplicate key ~s at ~d" key key-pos))
-          (setf (gethash key seen) t)
+          (push (cons key key-pos) keys)
           (setf pos (json-skip-whitespace str new-pos))
           (when (>= pos (length str))
             (error "json: unterminated object at ~d" pos))
@@ -345,6 +373,9 @@
             (cond
               ((char= (char str pos) #\,) (incf pos))
               ((char= (char str pos) #\})
+               (let ((repeat (first-repeated-key (nreverse keys))))
+                 (when repeat
+                   (error "json: duplicate key ~s at ~d" (car repeat) (cdr repeat))))
                (return (values (make-json-object (nreverse pairs)) (1+ pos))))
               (t (error "json: expected ',' or '}' at ~d" pos)))))))))
 
