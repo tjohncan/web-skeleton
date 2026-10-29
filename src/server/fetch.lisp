@@ -63,7 +63,8 @@
   ;; into or an inbound one is parked on; -1 before it starts.
   (target-fd -1 :type fixnum)
   ;; A streamed body's pieces sent before the outbound exists, framed and
-  ;; oldest first, which become its write queue after the request head.
+  ;; newest first, so a send adds one without walking those before it;
+  ;; reversed, they become its write queue after the request head.
   (pending nil :type list)
   (pending-bytes 0 :type fixnum)
   ;; Body bytes the application has sent, unframed — the count a declared
@@ -2158,7 +2159,7 @@
                  ;; held to the backlog bound as they came, so they join the
                  ;; queue without a second check.
                  (when streamed
-                   (dolist (piece (http-fetch-continuation-pending fetch-req))
+                   (dolist (piece (reverse (http-fetch-continuation-pending fetch-req)))
                      (%queue-tail out-conn piece))
                    (setf (http-fetch-continuation-pending fetch-req) nil
                          (http-fetch-continuation-pending-bytes fetch-req) 0))
@@ -2452,7 +2453,7 @@
               (parse-url (http-fetch-continuation-url fetch))
             (declare (ignore scheme))
             (when streamed
-              (let ((pieces (copy-list (connection-write-queue out))))
+              (let ((pieces (reverse (connection-write-queue out))))
                 (setf (http-fetch-continuation-pending fetch) pieces
                       (http-fetch-continuation-pending-bytes fetch)
                       (reduce #'+ pieces :key #'segment-length))))
@@ -2768,8 +2769,7 @@
                     signal to pause."
                    (http-fetch-continuation-url fetch)
                    (http-fetch-continuation-pending-bytes fetch) (length piece)))
-          (setf (http-fetch-continuation-pending fetch)
-                (append (http-fetch-continuation-pending fetch) (list piece)))
+          (push piece (http-fetch-continuation-pending fetch))
           (incf (http-fetch-continuation-pending-bytes fetch) (length piece))
           nil))))
 

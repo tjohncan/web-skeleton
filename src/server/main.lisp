@@ -1184,9 +1184,11 @@
 
 (defun accept-connection (listener-socket epoll-fd)
   "Accept a pending connection and register it with epoll.
-   Returns T if a connection was accepted, NIL if none pending (EAGAIN),
-   and :FAILED if the accept itself failed — EMFILE, ENFILE, ENOMEM —
-   with connections possibly still queued behind it; see ACCEPT-PENDING.
+   Returns T if a connection was taken off the backlog, NIL if none pending
+   (EAGAIN), and :FAILED if the accept itself failed — EMFILE, ENFILE,
+   ENOMEM — with connections possibly still queued behind it; see
+   ACCEPT-PENDING. One accepted and then closed because it could not be
+   set up counts as taken: those behind it are still to be accepted.
    Refuses the connection with a 503 if the per-worker limit is reached,
    or the process's descriptors nearly are."
   (let ((client-socket (handler-case
@@ -1241,7 +1243,7 @@
       (error (e)
         (log-error "accept failed: ~a" e)
         (ignore-errors (sb-bsd-sockets:socket-close client-socket))
-        nil))))
+        t))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Close and clean up a connection

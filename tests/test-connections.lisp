@@ -1901,9 +1901,23 @@
       (check "chunked: each send a chunk, and the finish its terminator"
              (sb-ext:octets-to-string
               (apply #'concatenate '(vector (unsigned-byte 8))
-                     (web-skeleton::http-fetch-continuation-pending f))
+                     (reverse (web-skeleton::http-fetch-continuation-pending f)))
               :external-format :latin-1)
              (format nil "3~aaaa~a0~a~a" *crlf* *crlf* *crlf* *crlf*)))
+    ;; Each piece held is added without walking those before it: fifty
+    ;; thousand sends, each through a NIL as a producer not pausing would,
+    ;; take well under a second, where a walk of the list each time takes
+    ;; seconds. Sent past NIL only to have many pieces held; the backlog is
+    ;; raised to hold them.
+    (let ((f (streamed :content-length 50000))
+          (web-skeleton:*max-write-backlog* most-positive-fixnum)
+          (start (get-internal-real-time)))
+      (dotimes (i 50000) (fetch-send f (bytes 1)))
+      (check "send: many pieces held, each added in constant time"
+             (list (length (web-skeleton::http-fetch-continuation-pending f))
+                   (< (- (get-internal-real-time) start)
+                      internal-time-units-per-second))
+             '(50000 t)))
     ;; ---- an ended fetch ----
     (let ((f (streamed)))
       (setf (web-skeleton::http-fetch-continuation-ended f) t)
@@ -3775,6 +3789,40 @@
                                 :host #(1 2 3) :port 0 :workers 1))))
              (and (stringp msg) (search "*listen-backlog*" msg) t))
            t)))
+
+(defun test-accept-goes-on-past-a-connection-it-could-not-set-up ()
+  "A connection accepted and then closed, because it could not be set up,
+   does not stop ACCEPT-PENDING: the connections queued behind it are
+   accepted too.
+
+   The listener is edge-triggered, and its event does not come again for
+   connections already waiting, so one left in the backlog waits for the
+   next client to arrive. The set-up is made to fail here by an epoll fd
+   that is not one, which EPOLL-ADD refuses; two clients are queued, and
+   the backlog is empty afterwards, with nothing left in the table."
+  (format t "~%accept: on past a connection it could not set up~%")
+  (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+         (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+         (clients (loop repeat 2
+                        collect (make-instance 'sb-bsd-sockets:inet-socket
+                                               :type :stream :protocol :tcp)))
+         (web-skeleton::*connections* (make-hash-table :test #'eql))
+         (web-skeleton:*log-stream* (make-broadcast-stream)))
+    (unwind-protect
+         (progn
+           (dolist (c clients)
+             (sb-bsd-sockets:socket-connect c #(127 0 0 1) port))
+           (check "set-up failing: ACCEPT-PENDING drains, nothing to retry"
+                  (web-skeleton::accept-pending listener -1) nil)
+           (check "set-up failing: no connection is left in the backlog"
+                  (let ((left (sb-bsd-sockets:socket-accept listener)))
+                    (when left (sb-bsd-sockets:socket-close left))
+                    (and left t))
+                  nil)
+           (check "set-up failing: and none in the table"
+                  (hash-table-count web-skeleton::*connections*) 0))
+      (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
 
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
@@ -5973,6 +6021,7 @@
   (test-log-level-validated-at-boot)
   (test-numeric-settings-validated-at-boot)
   (test-listen-backlog-reaches-the-listener)
+  (test-accept-goes-on-past-a-connection-it-could-not-set-up)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)
