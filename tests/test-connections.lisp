@@ -1722,6 +1722,100 @@
           (check "paused: no callback ran while a pause held" while-paused 0)
           (check "paused: and nothing was aborted" aborted nil))))))
 
+(defun test-received-form-holds-its-bytes ()
+  "A collected part that arrives a byte a read holds about what it counts.
+
+   The limit on what a received form collects counts bytes, while what a
+   part holds was kept a read at a time: a client sending a byte a packet
+   had each byte cost a cell and a vector besides, dozens of times what was
+   counted. Fifty thousand bytes of a part are read here one at a time, and
+   the heap measured across them, after a full collection either side, has
+   grown by less than eight bytes for each; kept a read at a time it grows
+   by about forty-eight. The part then arrives whole, in order.
+
+   The kernel stands in for the socket and is sized for the whole request
+   up front, so its own growth is not in the measure."
+  (format t "~%receive-multipart: a part a byte a read holds its bytes~%")
+  (let* ((n 60000)
+         (data (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                 (dotimes (i n v) (setf (aref v i) (mod (* i 31) 256)))))
+         (head-of-part (sb-ext:string-to-octets
+                        (format nil "--B0und~aContent-Disposition: form-data; name=\"big\"~a~a"
+                                *crlf* *crlf* *crlf*)
+                        :external-format :latin-1))
+         (tail (sb-ext:string-to-octets (format nil "~a--B0und--~a" *crlf* *crlf*)
+                                        :external-format :latin-1))
+         (form (concatenate '(simple-array (unsigned-byte 8) (*)) head-of-part data tail))
+         (request (sb-ext:string-to-octets
+                   (format nil "POST /f HTTP/1.1~aHost: x~a~
+                                Content-Type: multipart/form-data; boundary=B0und~a~
+                                Content-Length: ~d~a~a"
+                           *crlf* *crlf* *crlf* (length form) *crlf* *crlf*)
+                   :external-format :latin-1))
+         (kernel (make-array (+ (length request) (length form))
+                             :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+         (got nil)
+         (grown nil))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (receive-multipart
+                 req
+                 :on-end (lambda (c parts)
+                           (declare (ignore c))
+                           (setf got (form-part-body (first parts)))
+                           (make-text-response 200 "stored")))))
+            (web-skeleton:*log-stream* (make-broadcast-stream)))
+        (flet ((read-bytes (from to)
+                 (loop for i from from below to
+                       do (vector-push (aref form i) kernel)
+                          (web-skeleton::handle-client-read conn 999 nil nil))))
+          (%supply kernel request)
+          (web-skeleton::handle-client-read conn 999 nil nil)
+          ;; The part's head, and the first thousand bytes of its body, so
+          ;; what is measured is the part growing.
+          (read-bytes 0 (+ (length head-of-part) 1000))
+          (sb-ext:gc :full t)
+          (let ((before (sb-kernel:dynamic-usage))
+                (measured 50000))
+            (read-bytes (+ (length head-of-part) 1000)
+                        (+ (length head-of-part) 1000 measured))
+            (sb-ext:gc :full t)
+            (setf grown (/ (- (sb-kernel:dynamic-usage) before) measured)))
+          (loop for i from (+ (length head-of-part) 1000 50000) below (length form)
+                do (vector-push (aref form i) kernel))
+          (web-skeleton::handle-client-read conn 999 nil nil))))
+    (check "a byte a read: the part holds under eight bytes for each it counts"
+           (< grown 8) t)
+    (check "a byte a read: and arrives whole, in order" (equalp got data) t)))
+
+(defun test-multipart-parameters-in-linear-time ()
+  "A header value's parameters are read in time that grows with their
+   count, not its square.
+
+   Each parameter's name is checked against those before it, since one
+   given twice is refused, and a part head of the default 16 KiB holds
+   thousands of them. Forty thousand are read here in well under a second;
+   searched for one by one, they take seconds. One given twice is still
+   refused."
+  (format t "~%multipart: parameters read in linear time~%")
+  (let* ((n 40000)
+         (value (with-output-to-string (s)
+                  (write-string "form-data" s)
+                  (dotimes (i n) (format s "; p~d=v" i))))
+         (start (get-internal-real-time))
+         (params (web-skeleton::%parse-parameters value "test"))
+         (seconds (/ (- (get-internal-real-time) start)
+                     internal-time-units-per-second)))
+    (check "many parameters: every one read" (length params) n)
+    (check "many parameters: in well under a second" (< seconds 1) t)
+    (check "many parameters: one given twice is still refused"
+           (handler-case (progn (web-skeleton::%parse-parameters
+                                 (concatenate 'string value "; P17=w") "test")
+                                nil)
+             (http-parse-error (e) (http-parse-error-status e)))
+           400)))
+
 (defun test-streamed-fetch-contract ()
   "A fetch whose body the application streams: what HTTP-FETCH accepts,
    the head BUILD-OUTBOUND-REQUEST writes for one, and what FETCH-SEND and
@@ -5845,6 +5939,8 @@
   (test-multipart-parse)
   (test-receive-multipart-contract)
   (test-receive-multipart-pauses-where-it-falls)
+  (test-received-form-holds-its-bytes)
+  (test-multipart-parameters-in-linear-time)
   (test-streamed-fetch-contract)
   (test-streamed-fetch-sweep)
   (test-sweep-acts-only-on-what-is-still-due)

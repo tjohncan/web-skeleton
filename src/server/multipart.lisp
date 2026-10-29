@@ -132,7 +132,12 @@
    choice two readers make differently."
   (let ((len (length value))
         (i (or (position #\; value) (length value)))
-        (params '()))
+        (params '())
+        ;; The names so far, to find one given twice. A table, not a search
+        ;; of PARAMS: a part head of the default 16 KiB holds thousands of
+        ;; parameters, and each searching all those before it costs the
+        ;; square of their count in worker time.
+        (seen (make-hash-table :test #'equal)))
     (labels ((fail (what &rest args)
                (http-parse-error "~a: ~?" context what args))
              (skip-ows ()
@@ -171,8 +176,9 @@
                                 (fail "parameter ~a has no value" (%excerpt name)))
                               (prog1 (subseq value i text-end)
                                 (setf i text-end))))))
-              (when (assoc name params :test #'string=)
+              (when (gethash name seen)
                 (fail "parameter ~a given twice" (%excerpt name)))
+              (setf (gethash name seen) t)
               (push (cons name text) params))))))
     (nreverse params)))
 
@@ -652,17 +658,35 @@
       (:done
        (return (values :more end))))))
 
-(defun %join-runs (runs)
-  "RUNS, a list of byte vectors, as one."
+(defun %run-append (buf filled source start end)
+  "Copy SOURCE[START, END), a run of a part's body, onto BUF after its
+   first FILLED bytes. Returns BUF, or the larger vector that replaces it,
+   or NIL for an empty run onto NIL.
+
+   One buffer for a part's runs, not a list of them. A run is what one
+   read brought, and a client sending a byte at a time makes a run of
+   every byte: kept apiece, each would cost a cell and a vector header
+   besides, many times what the limit on collected bytes counts. The
+   buffer doubles as it grows, so it holds at most twice what it counts,
+   and a part in many runs is copied a constant number of times over."
+  (let ((need (+ filled (- end start))))
+    (when (> need (length buf))
+      (let ((grown (make-array (max need (* 2 (length buf)))
+                               :element-type '(unsigned-byte 8))))
+        (when buf
+          (replace grown buf :end2 filled))
+        (setf buf grown)))
+    (when buf
+      (replace buf source :start1 filled :start2 start :end2 end))
+    buf))
+
+(defun %run-bytes (buf filled)
+  "The FILLED bytes %RUN-APPEND has collected in BUF, as a vector of their
+   own length: BUF itself when it is exactly full."
   (cond
-    ((null runs) (make-array 0 :element-type '(unsigned-byte 8)))
-    ((null (rest runs)) (first runs))
-    (t (let ((out (make-array (reduce #'+ runs :key #'length)
-                              :element-type '(unsigned-byte 8)))
-             (at 0))
-         (dolist (run runs out)
-           (replace out run :start1 at)
-           (incf at (length run)))))))
+    ((null buf) (make-array 0 :element-type '(unsigned-byte 8)))
+    ((= filled (length buf)) buf)
+    (t (subseq buf 0 filled))))
 
 (defun %check-part-limits (who max-parts max-part-head-size)
   (unless (or (null max-parts) (and (integerp max-parts) (<= 0 max-parts)))
@@ -706,18 +730,20 @@
                                                  :max-part-head-size max-part-head-size))
          (pos 0)
          (parts '())
-         (runs '()))
+         (runs nil)
+         (filled 0))
     (loop
       (multiple-value-bind (event next source from to)
           (multipart-step parser body pos end)
         (setf pos next)
         (ecase event
           (:more (return))
-          (:part (setf runs '()))
-          (:data (push (subseq source from to) runs))
+          (:part (setf runs nil filled 0))
+          (:data (setf runs (%run-append runs filled source from to))
+                 (incf filled (- to from)))
           (:part-end
            (let ((part (multipart-parser-part parser)))
-             (setf (form-part-body part) (%join-runs (nreverse runs)))
+             (setf (form-part-body part) (%run-bytes runs filled))
              (push part parts))))))
     (unless (multipart-parser-done-p parser)
       (http-parse-error "multipart: the body ended before its close delimiter"))
@@ -823,7 +849,8 @@
                                        :max-part-head-size max-part-head-size))
         (collected '())
         (held 0)
-        (runs '())
+        (runs nil)
+        (filled 0)
         (streaming nil)
         (aborted nil)
         (plan nil))
@@ -879,7 +906,8 @@
                                (setf streaming t))
                               ((null verdict)
                                (setf streaming nil
-                                     runs '())
+                                     runs nil
+                                     filled 0)
                                (hold conn (multipart-parser-head-length parser)))
                               (t
                                (error "receive-multipart: :on-part answered ~s for ~
@@ -894,12 +922,14 @@
                                                (subseq source s e)))
                               (progn
                                 (hold conn (- e s))
-                                (push (subseq source s e) runs))))
+                                (setf runs (%run-append runs filled source s e))
+                                (incf filled (- e s)))))
                          (:part-end
                           (let ((part (multipart-parser-part parser)))
                             (unless streaming
-                              (setf (form-part-body part) (%join-runs (nreverse runs))
-                                    runs '())
+                              (setf (form-part-body part) (%run-bytes runs filled)
+                                    runs nil
+                                    filled 0)
                               (push part collected))
                             (when on-part-end
                               (answer (funcall on-part-end conn part)))))))))))
