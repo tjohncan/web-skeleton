@@ -2511,21 +2511,34 @@
    would then close that many descriptors, the suite's getent lookups
    among them."
   (format t "~%Descriptor limit~%")
+  ;; A soft limit at the hard one, as a container commonly starts with,
+  ;; leaves nothing to raise, so the test lowers it by two first: a process
+  ;; may always lower its soft limit, and raise it again as far as the hard
+  ;; one. Raised by one of the two, it stops short of the hard limit, which
+  ;; shows it went where it was asked and no further. The raise is then
+  ;; tested wherever the suite runs, and the limit put back however the
+  ;; test ends.
   (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
-    (check "a limit below the soft one leaves it as it is"
-           (multiple-value-list (web-skeleton::raise-descriptor-limit 1))
-           (list soft soft))
-    (if (< soft hard)
-        (progn
-          (check "one above it is what the soft limit becomes"
-                 (multiple-value-list (web-skeleton::raise-descriptor-limit (1+ soft)))
-                 (list (1+ soft) soft))
-          (check "as the kernel reports it, the hard limit unchanged"
-                 (multiple-value-list (web-skeleton::descriptor-limits))
-                 (list (1+ soft) hard)))
-        (check "control: at the hard limit already, nothing is raised"
-               (nth-value 0 (web-skeleton::raise-descriptor-limit (1+ soft)))
-               soft)))
+    (flet ((set-soft (n)
+             (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                      :initial-contents (list n hard))))
+               (sb-sys:with-pinned-objects (buf)
+                 (web-skeleton::%setrlimit web-skeleton::+rlimit-nofile+
+                                           (sb-sys:vector-sap buf))))))
+      (unwind-protect
+           (progn
+             (check "a limit below the soft one leaves it as it is"
+                    (multiple-value-list (web-skeleton::raise-descriptor-limit 1))
+                    (list soft soft))
+             (check "lowered by two, for the test"
+                    (set-soft (- soft 2)) 0)
+             (check "one above it is what the soft limit becomes"
+                    (multiple-value-list (web-skeleton::raise-descriptor-limit (1- soft)))
+                    (list (1- soft) (- soft 2)))
+             (check "as the kernel reports it, the hard limit unchanged"
+                    (multiple-value-list (web-skeleton::descriptor-limits))
+                    (list (1- soft) hard)))
+        (set-soft soft))))
   (let ((web-skeleton::*max-connections* 10000))
     (check "four workers at the default connection limit want 46,080"
            (web-skeleton::descriptors-wanted 4) 46080))
