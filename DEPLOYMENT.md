@@ -228,6 +228,12 @@ specific status, not a blanket 400:
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
 | `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
 
+**A `Host` that passes is still the client's.** The 400 holds it to the
+grammar, and the grammar allows characters that matter in a page: a
+reg-name may carry the sub-delims, `'`, `&`, `(` and `)` among them. Escape
+it before writing it into HTML, and check it against the names you serve
+before building a redirect, a link or an origin from it.
+
 **The 503 says overloaded, where silence would say crashed.** A worker at
 `*max-connections*` answers before it closes, so a client can tell a full
 instance from a gone one and has something to back off against. Two
