@@ -109,21 +109,23 @@
 (defun escape-control-characters (string)
   "STRING with each control character written as \\xNN, its code in hex:
    C0, DEL and C1 alike, so a line break or a terminal escape in it reads
-   as text.
+   as text. A backslash is written as \\x5C, as nginx's escape=default
+   writes it, so a \\x in a line is always one written here: a client's
+   own four characters \\x0A would otherwise read as a line feed it sent.
 
    Done here, once for every line, because what a line says is often a
    client's: a header value, a path, a JSON parser's complaint about the
    character it met. A raw line feed in it would end the line and start a
    forged one, and an ESC would reach the terminal of anyone tailing the
    log. One call is one line, whatever it is given."
-  (flet ((control-p (c)
+  (flet ((escaped-p (c)
            (let ((code (char-code c)))
-             (or (< code 32) (<= 127 code 159)))))
-    (if (notany #'control-p string)
+             (or (< code 32) (= code 92) (<= 127 code 159)))))
+    (if (notany #'escaped-p string)
         string
         (with-output-to-string (out)
           (loop for c across string
-                do (if (control-p c)
+                do (if (escaped-p c)
                        (format out "\\x~2,'0X" (char-code c))
                        (write-char c out)))))))
 

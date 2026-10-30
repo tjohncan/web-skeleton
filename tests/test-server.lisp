@@ -2472,7 +2472,8 @@
 (defun test-a-log-line-escapes-control-characters ()
   "A log line carries a control character as \\xNN text, so what a client
    put in a value cannot end the line and forge another, nor reach a
-   terminal as an escape. JSON-PARSE's complaint about an escape
+   terminal as an escape, and a backslash as \\x5C, so a client's own \\x0A
+   is not read as one of them. JSON-PARSE's complaint about an escape
    followed by a raw line feed is the shape a client can send at will."
   (format t "~%Log: one call is one line~%")
   (flet ((logged (thunk)
@@ -2494,6 +2495,13 @@
                                                   (code-char #x9B))))))
       (check "ESC and a C1 control are written as codes"
              (and (search "a\\x1Bb\\x9Bc" text) t) t))
+    ;; A client's own \x0A, four characters, is not taken for a line feed.
+    (let ((text (logged (lambda ()
+                          (web-skeleton::log-warn "bad path ~a" "/a\\x0Ab")))))
+      (check "a backslash is written as its code, so \\x is always an escape"
+             (list (and (search "/a\\x5Cx0Ab" text) t)
+                   (and (search "\\x0A" text) t))
+             '(t nil)))
     (check "control: a line without one is written as it is"
            (and (search "plain: 100% ok"
                         (logged (lambda () (web-skeleton::log-info "plain: 100% ok"))))
