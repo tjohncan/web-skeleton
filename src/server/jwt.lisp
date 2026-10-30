@@ -239,13 +239,13 @@
                ;;
                ;; It matters for the signature segment, the one part of
                ;; a token outside the signed input — "sig" and "sig=="
-               ;; decode to the same 64 bytes,
-               ;; so both verify and one signature gets two token
-               ;; strings. Padding the header or payload changes the
-               ;; bytes the signature is checked against, so those two
-               ;; defend themselves; the rule is applied to all three
-               ;; anyway because it is one rule, and this is already
-               ;; where a malformed token is turned away.
+               ;; decode to the same 64 bytes, so both verify and one
+               ;; signature gets two token strings. Padding the header
+               ;; or payload changes the bytes the signature is checked
+               ;; against, so those two defend themselves; the rule is
+               ;; applied to all three anyway because it is one rule,
+               ;; and this is already where a malformed token is turned
+               ;; away.
                ((char= c #\=)
                 (return-from jwt-split nil))
                ((char= c #\.)

@@ -3567,11 +3567,11 @@
   ;; 1xx deliberately does NOT appear here. Listed as "bodiless", a
   ;; 1xx would be returned by the reader as the final status — but
   ;; RFC 7231 §6.2 makes a 1xx interim by definition, so an upstream
-  ;; that sends one and then
-  ;; closes has not delivered a response at all, and reporting 103 as
-  ;; the result silently discards the real one. Interim handling is
-  ;; covered by TEST-INTERIM-RESPONSES, which asserts both that a 1xx
-  ;; is stepped over and that a lone 1xx followed by EOF raises.
+  ;; that sends one and then closes has not delivered a response at
+  ;; all, and reporting 103 as the result silently discards the real
+  ;; one. Interim handling is covered by TEST-INTERIM-RESPONSES,
+  ;; which asserts both that a 1xx is stepped over and that a lone
+  ;; 1xx followed by EOF raises.
   (dolist (spec '((204 "Content-Length: 500")
                   (304 "Content-Length: 500")
                   (304 "Transfer-Encoding: chunked")))
@@ -4132,11 +4132,10 @@
 
   ;; parse-chunked-size-line — the size parser stream-chunked-lines uses;
   ;; the buffered readers share parse-chunk-size-bytes, which reads the
-  ;; same grammar. Strict hex,
-  ;; strips chunk-extensions from ';' onwards, raises on garbage.
-  ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
-  ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
-  ;; parser-disagreement smuggling primitive against any stricter
+  ;; same grammar. Strict hex, strips chunk-extensions from ';' onwards,
+  ;; raises on garbage. A permissive :junk-allowed shape would accept
+  ;; 'xyz' as NIL (silently exit the decoder loop) and '-5' as -5 (same)
+  ;; — a parser-disagreement smuggling primitive against any stricter
   ;; downstream.
   (check "chunked size: plain hex"
          (web-skeleton::parse-chunked-size-line "a0") 160)
@@ -7137,11 +7136,11 @@
 ;;; The write-stall deadline
 ;;;
 ;;; *write-stall-timeout* bounds how long a connection may sit on a backlog
-;;; that is not moving. The
-;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
-;;; a day, and a peer that has stopped reading may still be sending, which
-;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
-;;; current — that is precisely the case the idle timeout would miss.
+;;; that is not moving. The idle sweep cannot answer that question:
+;;; *ws-idle-timeout* defaults to a day, and a peer that has stopped
+;;; reading may still be sending, which keeps LAST-ACTIVE fresh. So the
+;;; negative control here holds LAST-ACTIVE current — that is precisely the
+;;; case the idle timeout would miss.
 ;;;
 ;;; The sweep asks whether there is a backlog and whether it has moved,
 ;;; not what state the connection is in. A sweep naming :WEBSOCKET would

@@ -830,11 +830,11 @@
 ;;; crypto names back to their *-LISP originals, run the existing
 ;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-OCTET-CONTRACT /
 ;;; TEST-ECDSA functions unchanged (so the FIPS / RFC vectors and the input
-;;; contract live in exactly one place),
-;;; then restore via UNWIND-PROTECT. Safe only in a serial test runner.
-;;; If libssl isn't loaded, the swap still works — it just replaces
-;;; the thin SHA1/SHA256/ECDSA-VERIFY-P256 wrappers with their direct
-;;; *-LISP targets, which is effectively a no-op.
+;;; contract live in exactly one place), then restore via UNWIND-PROTECT.
+;;; Safe only in a serial test runner. If libssl isn't loaded, the swap
+;;; still works — it just replaces the thin SHA1/SHA256/ECDSA-VERIFY-P256
+;;; wrappers with their direct *-LISP targets, which is effectively a
+;;; no-op.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-pure-lisp-crypto ()

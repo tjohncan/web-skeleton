@@ -74,11 +74,10 @@
   ;; This worker's count of accepted connections at the time this one was
   ;; accepted. Together with the worker id it names a connection for as long
   ;; as the server runs, a crashed worker's restart included, which FD alone
-  ;; cannot do: an fd is unique only
-  ;; among the connections open right now, and the kernel hands the lowest
-  ;; free one to the next accept. A closed connection's fd belongs to a
-  ;; stranger within milliseconds, so anything that labels a peer by fd
-  ;; labels two different peers the same.
+  ;; cannot do: an fd is unique only among the connections open right now,
+  ;; and the kernel hands the lowest free one to the next accept. A closed
+  ;; connection's fd belongs to a stranger within milliseconds, so anything
+  ;; that labels a peer by fd labels two different peers the same.
   ;;
   ;; 0 for a connection this worker did not accept — an outbound fetch is a
   ;; connection too, and it is nobody's peer.
@@ -859,9 +858,9 @@
      usable address\" branch fires on a clean :EOF. When it has — a cached
      answer, a loaded box, any scheduling that lets it finish first — the
      two coalesce, and with the EOF dropped that branch is skipped. The
-     name it strands is one
-     whose every address *FETCH-ADDRESS-FILTER* refused, so the failure
-     lands on the SSRF-defense path and only sometimes.
+     name it strands is one whose every address *FETCH-ADDRESS-FILTER*
+     refused, so the failure lands on the SSRF-defense path and only
+     sometimes.
 
    Neither is rescued by epoll. A TCP peer calling close(2) does not set
    EPOLLHUP — that flag means both directions are down, and a FIN alone

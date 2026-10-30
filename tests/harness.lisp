@@ -159,9 +159,8 @@
 
    ON-TICK and BODY-HANDLER are passed through to START-SERVER unchanged,
    including NIL. Shutdown hooks are isolated: REGISTER-CLEANUP calls made
-   from inside
-   BODY (directly or via a handler) fire during this server's teardown
-   and do not leak into the caller's framework state. The outer
+   from inside BODY (directly or via a handler) fire during this server's
+   teardown and do not leak into the caller's framework state. The outer
    *SHUTDOWN-HOOKS* list is saved on entry and restored on exit.
 
    HOST is what the listener binds, a 4-byte IPv4 or 16-byte IPv6 vector as

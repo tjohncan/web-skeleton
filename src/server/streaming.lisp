@@ -382,10 +382,9 @@
    contract change: a cross-worker STREAM-SEND mostly succeeds, and
    applications may be relying on it accidentally. STREAM-CLOSE's guard
    changes no contract, since unguarded that call raises every time
-   anyway. The rule for all four
-   is in README.md under Limitations; this paragraph exists so that a
-   reader who has seen the other three enforce it does not infer that
-   this one does."
+   anyway. The rule for all four is in README.md under Limitations;
+   this paragraph exists so that a reader who has seen the other three
+   enforce it does not infer that this one does."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
   (unless (eq (connection-state conn) :streaming)
     (error "stream-send: fd ~d is in state ~a, not :streaming"

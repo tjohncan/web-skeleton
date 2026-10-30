@@ -83,9 +83,9 @@
 (defparameter *fetch-timeout* 30
   "Seconds, whole: the fetch path adds it to GET-UNIVERSAL-TIME, and
    START-SERVER refuses a fraction. A total on the HTTP-FETCH path, both
-   schemes: the inbound
-   parks in :AWAITING and the reaper bounds the whole exchange, handshake
-   included, however many reads and writes it took.
+   schemes: the inbound parks in :AWAITING and the reaper bounds the
+   whole exchange, handshake included, however many reads and writes it
+   took.
 
    Per phase everywhere else, which means HTTP-FETCH-STREAM and the
    blocking setup paths only. There it bounds DNS, connect, and each

@@ -1199,10 +1199,9 @@
    owns it, so each table has one reader and one writer, and the lock SBCL
    puts on a weak table — it synchronizes them for the collector's sake — is
    never contended. Weak on the key because nothing tells an application a
-   WebSocket closed: an entry
-   for a connection that has gone is dropped when the connection is
-   collected, so the table needs neither a registry nor a close notification
-   to stay the size of the live population.")
+   WebSocket closed: an entry for a connection that has gone is dropped when
+   the connection is collected, so the table needs neither a registry nor a
+   close notification to stay the size of the live population.")
 
 (defun %post-allowed-p (conn)
   "Spend one post from CONN's budget, or refuse. A token bucket: *POST-BURST*

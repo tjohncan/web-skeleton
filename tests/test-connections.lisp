@@ -2769,11 +2769,10 @@
    before and after.
 
    The precondition this pins down: auto-resume needs the target to have
-   *actually backed up*. STREAM-SEND
-   flushes inline, and a flush that completes arms nothing and so never
-   reaches HANDLE-CLIENT-WRITE — so a pause taken while the target's queue
-   was empty has no wake-up coming and still needs an explicit
-   FETCH-RESUME.
+   *actually backed up*. STREAM-SEND flushes inline, and a flush that
+   completes arms nothing and so never reaches HANDLE-CLIENT-WRITE — so a
+   pause taken while the target's queue was empty has no wake-up coming
+   and still needs an explicit FETCH-RESUME.
 
    Run against both target states. RESUME-PAUSED-OUTBOUND sits in
    HANDLE-CLIENT-WRITE's :DONE arm ahead of the state dispatch, and its own

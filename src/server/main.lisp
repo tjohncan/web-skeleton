@@ -282,9 +282,9 @@
 (defvar *descriptor-limit* nil
   "The process's soft descriptor limit, as START-SERVER left it after
    raising it to what DESCRIPTORS-WANTED says the settings need. NIL
-   before a server has started, when
-   ACCEPT-CONNECTION refuses on *MAX-CONNECTIONS* alone. Process-wide,
-   like the limit: every worker's descriptors count against it.")
+   before a server has started, when ACCEPT-CONNECTION refuses on
+   *MAX-CONNECTIONS* alone. Process-wide, like the limit: every
+   worker's descriptors count against it.")
 
 (defun descriptors-wanted (workers)
   "The descriptor limit WORKERS workers need to reach *MAX-CONNECTIONS*
@@ -404,9 +404,9 @@
    leaves the client mid-send. Closing then, with its bytes unread, makes
    Linux answer RST rather than FIN, which discards response bytes not yet
    sent and tells the peer the connection failed. See
-   BEGIN-LINGERING-CLOSE. Bounded by time
-   alone: the bytes are the client's to send, so draining them costs what
-   receiving them would have.")
+   BEGIN-LINGERING-CLOSE. Bounded by time alone: the bytes are the
+   client's to send, so draining them costs what receiving them would
+   have.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -2735,11 +2735,11 @@
 ;;; on the wasteful side rather than the over-subscribed one, which is the
 ;;; direction to fail in, and each parser carries its own assertions.
 ;;;
-;;; The parsing is
-;;; split from the reading because a machine that exposes cgroup files cannot
-;;; be relied on to exist: the tests drive the parsers with synthetic contents
-;;; so every branch is exercised deliberately, including the degradation path
-;;; that is all a cgroup-less host would ever reach.
+;;; The parsing is split from the reading because a machine that exposes
+;;; cgroup files cannot be relied on to exist: the tests drive the parsers
+;;; with synthetic contents so every branch is exercised deliberately,
+;;; including the degradation path that is all a cgroup-less host would ever
+;;; reach.
 ;;; ---------------------------------------------------------------------------
 
 (defun %read-first-line (path)

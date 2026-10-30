@@ -2038,13 +2038,12 @@
 
    On 2.4.11 and later SBCL collects a closed child itself, so there this
    passes whether or not the framework waits for the exit, and is a
-   control: two hundred real
-   lookups through the whole path, and nothing left behind. On an older
-   SBCL it is a detector, and not a perfect one. A zombie needs getent to
-   be still running at the moment its lookup ends, which is a race, so a
-   build that closes early can come through a lucky run clean.
-   TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child alive on purpose
-   and is the check that never misses, on any SBCL.
+   control: two hundred real lookups through the whole path, and nothing
+   left behind. On an older SBCL it is a detector, and not a perfect one.
+   A zombie needs getent to be still running at the moment its lookup
+   ends, which is a race, so a build that closes early can come through a
+   lucky run clean. TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child
+   alive on purpose and is the check that never misses, on any SBCL.
 
    Any answer is accepted from the fetch itself. What is under test is the
    child, and a lookup that resolved and then failed to connect ended the
@@ -8440,12 +8439,11 @@
   "A client that leaves mid-relay tears the outbound down, once.
 
    CLOSE-CONNECTION's detached-outbound arm reaches its outbound by
-   walking, because nothing was
-   parked and AWAITING-FD names nothing. The subtlety is that it runs while
-   the target is still :STREAMING with a live fd — CONNECTION-CLOSE is
-   several lines below — so a disposition applied here would find it
-   :STREAMING, take the aborted branch, and call CLOSE-CONNECTION on the
-   connection already being closed one frame up.
+   walking, because nothing was parked and AWAITING-FD names nothing. The
+   subtlety is that it runs while the target is still :STREAMING with a
+   live fd — CONNECTION-CLOSE is several lines below — so a disposition
+   applied here would find it :STREAMING, take the aborted branch, and call
+   CLOSE-CONNECTION on the connection already being closed one frame up.
 
    It terminates, which is what makes it worth asserting: the outer frame
    would resume holding a descriptor the inner call already closed. Counted
