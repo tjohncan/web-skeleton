@@ -3954,6 +3954,11 @@
           (setf (http-fetch-continuation-carrier fetch) nil
                 (http-fetch-continuation-ended fetch) t)))
       (finish-fetch (claim-fetch-callback conn) :aborted)
+      ;; The sentinel's :THEN may have closed the connection this fetch
+      ;; was into, and that teardown closes this outbound too: as in
+      ;; CLOSE-CONNECTION, FD may since be a descriptor of the callback's.
+      (unless (= (connection-fd conn) fd)
+        (return-from close-outbound))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)

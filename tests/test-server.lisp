@@ -9781,6 +9781,83 @@
              ended "connect to 255.255.255.255: ENETUNREACH (101)")
       (check "dns dial: and it failed as any fetch does" state :closing))))
 
+(defun test-a-then-that-closes-its-target-mid-teardown ()
+  "A teardown whose callback closed the connection itself leaves what the
+   callback opened afterwards alone.
+
+   A WebSocket is closed with a detached fetch still running into it. The
+   fetch's :THEN hears the abort sentinel and answers it with WS-CLOSE, as
+   the :KEEP relay contract asks; at a full backlog that closes the
+   target at once, from inside its own teardown, and the inner teardown
+   closes the outbound from inside CLOSE-OUTBOUND's. The :THEN then opens
+   two descriptors and registers them, and the kernel gives them the two
+   numbers just freed. Both outer calls go on with the numbers they read
+   on entry: an EPOLL_CTL_DEL with either would take a registration that
+   is no longer theirs, and that descriptor would hear nothing again.
+
+   Epoll descriptors stand in for the connections and the :THEN's own, as
+   in the awaiting sweep's test. The first check is what makes the rest
+   mean something: on numbers the :THEN did not reuse, a stale removal
+   fails harmlessly and the registrations would survive it anyway."
+  (format t "~%A :then that closes its target mid-teardown~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (target-fd (web-skeleton::epoll-create))
+         (out-fd (web-skeleton::epoll-create))
+         (events (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+         (fresh nil)
+         (heard 0))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (web-skeleton::*epoll-fd* epfd)
+                (web-skeleton::*max-write-backlog* 0)
+                (web-skeleton:*log-stream* (make-broadcast-stream))
+                (target (web-skeleton::make-connection
+                         :fd target-fd :state :websocket :last-active 0
+                         :fetch-outstanding t))
+                (out (web-skeleton::make-connection
+                      :fd out-fd :last-active 0 :outbound-p t
+                      :fetch-sink :detached :inbound-fd target-fd
+                      :fetch-callback
+                      (lambda (s h b)
+                        (declare (ignore s h b))
+                        (incf heard)
+                        (web-skeleton::ws-close target)
+                        (dotimes (i 2)
+                          (let ((fd (web-skeleton::epoll-create)))
+                            (push fd fresh)
+                            (web-skeleton::epoll-add epfd fd events)))
+                        nil))))
+           (dolist (conn (list target out))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
+                                      events))
+           (web-skeleton::close-connection target epfd)
+           (check "re-entered teardown: the :then heard the sentinel once"
+                  heard 1)
+           (check "re-entered teardown: its descriptors took the freed numbers"
+                  (sort (copy-list fresh) #'<) (sort (list target-fd out-fd) #'<))
+           (flet ((registered-p (fd)
+                    (handler-case (progn (web-skeleton::epoll-modify epfd fd events)
+                                         t)
+                      (error () nil))))
+             (check "re-entered teardown: the target's number keeps its new registration"
+                    (registered-p target-fd) t)
+             (check "re-entered teardown: the outbound's number keeps its new registration"
+                    (registered-p out-fd) t))
+           (check "re-entered teardown: both connections are gone"
+                  (list (web-skeleton::connection-fd target)
+                        (web-skeleton::connection-fd out)
+                        (hash-table-count web-skeleton::*connections*))
+                  '(-1 -1 0)))
+      ;; The connections' own numbers are closed by the teardown, and
+      ;; reused by FRESH when it has run.
+      (dolist (fd fresh)
+        (ignore-errors (web-skeleton::%close fd)))
+      (unless fresh
+        (ignore-errors (web-skeleton::%close target-fd))
+        (ignore-errors (web-skeleton::%close out-fd)))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -9814,6 +9891,7 @@
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-dns-dial-failure-is-not-a-lookup-failure)
+  (test-a-then-that-closes-its-target-mid-teardown)
   (test-documented-settings-are-exported)
   (test-errno-names)
   (test-descriptor-limit)

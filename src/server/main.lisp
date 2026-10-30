@@ -1373,6 +1373,13 @@
                 (close-outbound out-conn epoll-fd))))))
       ;; And a detached fetch aimed at it, which nothing parked to reach.
       (end-detached-fetches conn epoll-fd)
+      ;; Each step above runs application code, and a fetch's :THEN that
+      ;; answers the abort sentinel with WS-CLOSE closes CONN from inside
+      ;; it, at once at a full backlog. That inner call has done all that
+      ;; follows, and FD may since be a descriptor the callback opened:
+      ;; removed from epoll here, it would hear nothing again.
+      (unless (= (connection-fd conn) fd)
+        (return-from close-connection))
       (ignore-errors (epoll-remove epoll-fd fd))
       (unregister-connection conn)
       (maybe-reap-dns-process conn)
