@@ -2473,7 +2473,9 @@
   "A log line carries a control character as \\xNN text, so what a client
    put in a value cannot end the line and forge another, nor reach a
    terminal as an escape, and a backslash as \\x5C, so a client's own \\x0A
-   is not read as one of them. JSON-PARSE's complaint about an escape
+   is not read as one of them. The Unicode separators and bidirectional
+   controls, which a log viewer may break a line at or reorder it by, are
+   written as \\uXXXX. JSON-PARSE's complaint about an escape
    followed by a raw line feed is the shape a client can send at will."
   (format t "~%Log: one call is one line~%")
   (flet ((logged (thunk)
@@ -2502,6 +2504,32 @@
              (list (and (search "/a\\x5Cx0Ab" text) t)
                    (and (search "\\x0A" text) t))
              '(t nil)))
+    ;; A line separator a client sent reaches JSON-PARSE's complaint, which
+    ;; quotes the character it met.
+    (let ((text (logged (lambda ()
+                          (handler-case
+                              (web-skeleton:json-parse
+                               (coerce (list #\[ (code-char #x2028) #\]) 'string))
+                            (error (e) (web-skeleton::log-warn "error fd 9: ~a" e)))))))
+      (check "a line separator from the input is written as its code"
+             (list (and (search "\\u2028" text) t)
+                   (and (find (code-char #x2028) text) t))
+             '(t nil)))
+    (flet ((logged-as (codes)
+             (let ((text (logged (lambda ()
+                                   (web-skeleton::log-info
+                                    "<~a>" (map 'string #'code-char codes))))))
+               (subseq text (1+ (position #\< text)) (position #\> text :from-end t)))))
+      (check "the separators and bidirectional controls are written as \\uXXXX"
+             (logged-as '(#x061C #x200E #x200F #x2028 #x2029 #x202A #x202B
+                          #x202C #x202D #x202E #x2066 #x2067 #x2068 #x2069))
+             (concatenate 'string
+                          "\\u061C\\u200E\\u200F\\u2028\\u2029\\u202A\\u202B"
+                          "\\u202C\\u202D\\u202E\\u2066\\u2067\\u2068\\u2069"))
+      (check "control: their neighbours are written as they are"
+             (logged-as '(#x061B #x200D #x2027 #x202F #x2065 #x206A #xE9))
+             (map 'string #'code-char
+                  '(#x061B #x200D #x2027 #x202F #x2065 #x206A #xE9))))
     (check "control: a line without one is written as it is"
            (and (search "plain: 100% ok"
                         (logged (lambda () (web-skeleton::log-info "plain: 100% ok"))))

@@ -113,6 +113,13 @@
    writes it, so a \\x in a line is always one written here: a client's
    own four characters \\x0A would otherwise read as a line feed it sent.
 
+   The Unicode line and paragraph separators and the bidirectional
+   controls are written as \\uXXXX: U+2028 and U+2029, which a browser's
+   log viewer breaks a line at, and the marks, embeddings, overrides and
+   isolates (U+061C, U+200E-F, U+202A-E, U+2066-9), which reorder how the
+   rest of a line reads. Four digits rather than two, as \\x2028 would
+   read as \\x20 and then 28.
+
    Done here, once for every line, because what a line says is often a
    client's: a header value, a path, a JSON parser's complaint about the
    character it met. A raw line feed in it would end the line and start a
@@ -120,14 +127,17 @@
    log. One call is one line, whatever it is given."
   (flet ((escaped-p (c)
            (let ((code (char-code c)))
-             (or (< code 32) (= code 92) (<= 127 code 159)))))
+             (or (< code 32) (= code 92) (<= 127 code 159)
+                 (= code #x061C) (<= #x200E code #x200F)
+                 (<= #x2028 code #x202E) (<= #x2066 code #x2069)))))
     (if (notany #'escaped-p string)
         string
         (with-output-to-string (out)
           (loop for c across string
-                do (if (escaped-p c)
-                       (format out "\\x~2,'0X" (char-code c))
-                       (write-char c out)))))))
+                do (cond ((not (escaped-p c)) (write-char c out))
+                         ((< (char-code c) 256)
+                          (format out "\\x~2,'0X" (char-code c)))
+                         (t (format out "\\u~4,'0X" (char-code c)))))))))
 
 (defvar *log-throttle* nil
   "This worker's throttled log lines, a hash table from a kind to
