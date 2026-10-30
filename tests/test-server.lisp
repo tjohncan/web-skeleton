@@ -9826,21 +9826,28 @@
    the :KEEP relay contract asks; at a full backlog that closes the
    target at once, from inside its own teardown, and the inner teardown
    closes the outbound from inside CLOSE-OUTBOUND's. The :THEN then opens
-   two descriptors and registers them, and the kernel gives them the two
-   numbers just freed. Both outer calls go on with the numbers they read
-   on entry: an EPOLL_CTL_DEL with either would take a registration that
-   is no longer theirs, and that descriptor would hear nothing again.
+   two descriptors on the two numbers just freed and registers them, as
+   the kernel's lowest-free rule would have it. Both outer calls go on
+   with the numbers they read on entry: an EPOLL_CTL_DEL with either would
+   take a registration that is no longer theirs, and that descriptor would
+   hear nothing again.
 
    Epoll descriptors stand in for the connections and the :THEN's own, as
-   in the awaiting sweep's test. The first check is what makes the rest
-   mean something: on numbers the :THEN did not reuse, a stale removal
-   fails harmlessly and the registrations would survive it anyway."
+   in the awaiting sweep's test. The :THEN's are put on the freed numbers
+   with dup2 rather than left to the kernel, which would hand out a lower
+   number instead if a finalizer freed one meanwhile; one is freed below
+   them just before the teardown, so that case is the one run. The second
+   check is what makes the rest mean something: the :THEN's WS-CLOSE
+   closed both connections there and then, so the numbers were free to
+   take."
   (format t "~%A :then that closes its target mid-teardown~%")
   (let* ((epfd (web-skeleton::epoll-create))
+         (below (web-skeleton::epoll-create))
          (target-fd (web-skeleton::epoll-create))
          (out-fd (web-skeleton::epoll-create))
          (events (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
          (fresh nil)
+         (closed-at-once nil)
          (heard 0))
     (unwind-protect
          (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
@@ -9858,20 +9865,38 @@
                         (declare (ignore s h b))
                         (incf heard)
                         (web-skeleton::ws-close target)
-                        (dotimes (i 2)
+                        (setf closed-at-once
+                              (list (web-skeleton::connection-fd target)
+                                    (web-skeleton::lookup-connection target-fd)
+                                    (web-skeleton::lookup-connection out-fd)))
+                        (dolist (number (list target-fd out-fd))
+                          ;; Where the kernel's choice is the number
+                          ;; already, there is nothing to move.
                           (let ((fd (web-skeleton::epoll-create)))
-                            (push fd fresh)
-                            (web-skeleton::epoll-add epfd fd events)))
+                            (unless (= fd number)
+                              (unwind-protect
+                                   (unless (= (sb-alien:alien-funcall
+                                               (sb-alien:extern-alien
+                                                "dup2" (function sb-alien:int sb-alien:int
+                                                                 sb-alien:int))
+                                               fd number)
+                                              number)
+                                     (error "dup2 onto fd ~d failed" number))
+                                (web-skeleton::%close fd)))
+                            (push number fresh)
+                            (web-skeleton::epoll-add epfd number events)))
                         nil))))
            (dolist (conn (list target out))
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
                                       events))
+           (web-skeleton::%close below)
+           (setf below nil)
            (web-skeleton::close-connection target epfd)
            (check "re-entered teardown: the :then heard the sentinel once"
                   heard 1)
-           (check "re-entered teardown: its descriptors took the freed numbers"
-                  (sort (copy-list fresh) #'<) (sort (list target-fd out-fd) #'<))
+           (check "re-entered teardown: its ws-close closed both there and then"
+                  closed-at-once '(-1 nil nil))
            (flet ((registered-p (fd)
                     (handler-case (progn (web-skeleton::epoll-modify epfd fd events)
                                          t)
@@ -9886,12 +9911,14 @@
                         (hash-table-count web-skeleton::*connections*))
                   '(-1 -1 0)))
       ;; The connections' own numbers are closed by the teardown, and
-      ;; reused by FRESH when it has run.
+      ;; taken by FRESH when the :THEN has run.
       (dolist (fd fresh)
         (ignore-errors (web-skeleton::%close fd)))
       (unless fresh
         (ignore-errors (web-skeleton::%close target-fd))
         (ignore-errors (web-skeleton::%close out-fd)))
+      (when below
+        (ignore-errors (web-skeleton::%close below)))
       (ignore-errors (web-skeleton::%close epfd)))))
 
 ;;; ---------------------------------------------------------------------------
