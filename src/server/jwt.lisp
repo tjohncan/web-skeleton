@@ -10,7 +10,9 @@
 
 (defparameter *jwt-clock-skew* 60
   "Seconds of clock skew tolerance for JWT exp/nbf checks.
-   Accounts for clock drift between the token issuer and this server.")
+   Accounts for clock drift between the token issuer and this server.
+   Whole seconds: added to the clock, a fraction would turn it into a
+   float that resolves only to minutes, so START-SERVER refuses one.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; JWKS parsing
@@ -45,8 +47,9 @@
    containing two EC keys with the same kid — an accidental duplicate
    during a rotation window would make (FIND kid ...) silently pick
    whichever one sorted first, and that's rarely what the issuer
-   meant. Missing kty or crv are skipped cleanly (not type-erroring
-   on STRING= against NIL)."
+   meant. A key whose kty or crv is missing, or is not a string, is
+   skipped as one of another type is: RFC 7517 §5 has a JWK Set's
+   reader ignore the keys whose kty it does not understand."
   (let* ((jwks (json-parse json-string))
          (keys-array (json-get jwks "keys"))
          ;; "keys" must be an array. A JWKS with "keys": {} or a scalar is
@@ -61,7 +64,7 @@
           (loop for key-obj in keys-array
                 for kty = (json-get key-obj "kty")
                 for crv = (json-get key-obj "crv")
-                when (and kty crv
+                when (and (stringp kty) (stringp crv)
                           (string= kty "EC")
                           (string= crv "P-256"))
                 collect (let ((x-b64 (json-get key-obj "x"))
@@ -96,8 +99,8 @@
     ;; Only dedup explicit (non-empty) kids. RFC 7517 §4.5 says kid
     ;; is OPTIONAL; a minimal static JWKS or a rotation-window set
     ;; with two kidless keys is spec-legal. Treating the "" default
-    ;; as a real kid collapsed both into a single-slot collision and
-    ;; raised on legitimate input. jwt-verify's single-key fallback
+    ;; as a real kid would collapse both into a single-slot collision
+    ;; and raise on legitimate input. jwt-verify's single-key fallback
     ;; (no kid in the token) still works — it picks when the key
     ;; list has exactly one entry.
     (let ((seen (make-hash-table :test 'equal)))
@@ -117,12 +120,24 @@
   "Verify a JWT token string against a list of JWT-KEY structs.
    Returns the claims as a JSON-OBJECT if valid, NIL if invalid — read
    them with JWT-CLAIM (or JSON-GET, which JWT-CLAIM is a thin alias for).
-   Checks: algorithm is ES256, signature is valid, token is not expired.
+
+   Checks: the algorithm is ES256, the signature is valid, and exp and nbf
+   when they are present. Both are optional (RFC 7519 §4.1), so a token
+   that omits exp verifies and never expires; iss and aud are not checked
+   at all. A caller whose issuer can mint a token without exp checks for
+   it — DEPLOYMENT.md's \"JWT issuer and audience\" shows how.
 
    The claims value is always non-NIL on success, including for a token
-   whose payload is {}. It used to be a bare alist, so an empty-but-valid
-   claim set came back as NIL and was indistinguishable from a rejected
-   token at the call site."
+   whose payload is {}, so an empty but valid claim set cannot be taken
+   for a rejected token at the call site. A payload that is not a JSON
+   object (5, \"x\", [], null) is refused however it is signed: RFC 7519
+   §7.2 makes the claims set an object.
+
+   Anything that raises on the way, from a token that is not base64url
+   or JSON to a fault in the verifier itself, answers NIL, so attacker
+   input never reaches the caller as a condition. What raised is logged
+   at DEBUG, throttled, and never the token, so a fault in the verifier
+   can be told apart from a bad token."
   (handler-case
       (let ((parts (jwt-split token)))
         (unless (= (length parts) 3)
@@ -162,6 +177,11 @@
                                         (base64url-decode payload-b64)
                                         :external-format :utf-8)))
                    (now (jwt-current-time)))
+              ;; RFC 7519 §7.2 step 10. JSON-GET answers NIL on anything
+              ;; that is not an object, so without this a signed 5 would
+              ;; pass the exp and nbf checks and come back as the claims.
+              (unless (json-object-p claims)
+                (return-from jwt-verify nil))
               (let ((exp (json-get claims "exp")))
                 (when exp
                   (unless (numberp exp)
@@ -184,7 +204,10 @@
                                                 (jwt-key-x key) (jwt-key-y key)))
                   (return-from jwt-verify nil))
                 claims)))))
-    (error () nil)))
+    (error (e)
+      (log-throttled :debug :jwt-verify-raised
+                     "jwt-verify: ~a while verifying a token: ~a" (type-of e) e)
+      nil)))
 
 (defun jwt-claim (claims key)
   "Extract a claim value from the JSON-OBJECT returned by JWT-VERIFY."
@@ -216,13 +239,13 @@
                ;;
                ;; It matters for the signature segment, the one part of
                ;; a token outside the signed input — "sig" and "sig=="
-               ;; decode to the same 64 bytes,
-               ;; so both verify and one signature gets two token
-               ;; strings. Padding the header or payload changes the
-               ;; bytes the signature is checked against, so those two
-               ;; defend themselves; the rule is applied to all three
-               ;; anyway because it is one rule, and this is already
-               ;; where a malformed token is turned away.
+               ;; decode to the same 64 bytes, so both verify and one
+               ;; signature gets two token strings. Padding the header
+               ;; or payload changes the bytes the signature is checked
+               ;; against, so those two defend themselves; the rule is
+               ;; applied to all three anyway because it is one rule,
+               ;; and this is already where a malformed token is turned
+               ;; away.
                ((char= c #\=)
                 (return-from jwt-split nil))
                ((char= c #\.)

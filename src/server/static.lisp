@@ -24,62 +24,129 @@
     (when (and dot (or (null slash) (> dot (1+ slash))))
       (subseq path (1+ dot)))))
 
+(defparameter *mime-types*
+  '(;; Text. JavaScript is text/javascript (RFC 9239), for a classic script
+    ;; and an ES module alike: a browser refuses a module script, and an
+    ;; import(), served with a type that is not JavaScript's.
+    ("html" . "text/html; charset=utf-8")
+    ("htm"  . "text/html; charset=utf-8")
+    ("xhtml" . "application/xhtml+xml; charset=utf-8")
+    ("css"  . "text/css; charset=utf-8")
+    ("js"   . "text/javascript; charset=utf-8")
+    ("mjs"  . "text/javascript; charset=utf-8")
+    ("json" . "application/json; charset=utf-8")
+    ("map"  . "application/json; charset=utf-8") ; source maps
+    ("webmanifest" . "application/manifest+json; charset=utf-8")
+    ("txt"  . "text/plain; charset=utf-8")
+    ("md"   . "text/markdown; charset=utf-8")
+    ("csv"  . "text/csv; charset=utf-8")
+    ("xml"  . "application/xml; charset=utf-8")
+    ("rss"  . "application/rss+xml; charset=utf-8")
+    ("atom" . "application/atom+xml; charset=utf-8")
+    ("ics"  . "text/calendar; charset=utf-8")
+    ;; A <track> whose captions arrive as anything else is ignored.
+    ("vtt"  . "text/vtt; charset=utf-8")
+    ("m3u8" . "application/vnd.apple.mpegurl")
+    ;; Images
+    ("png"  . "image/png")
+    ("apng" . "image/apng")
+    ("jpg"  . "image/jpeg")
+    ("jpeg" . "image/jpeg")
+    ("gif"  . "image/gif")
+    ("svg"  . "image/svg+xml")
+    ("ico"  . "image/x-icon")
+    ("webp" . "image/webp")
+    ("avif" . "image/avif")
+    ("bmp"  . "image/bmp")
+    ("tif"  . "image/tiff")
+    ("tiff" . "image/tiff")
+    ;; Fonts
+    ("woff"  . "font/woff")
+    ("woff2" . "font/woff2")
+    ("ttf"   . "font/ttf")
+    ("otf"   . "font/otf")
+    ("eot"   . "application/vnd.ms-fontobject")
+    ;; Audio and video
+    ("mp3"  . "audio/mpeg")
+    ("ogg"  . "audio/ogg")
+    ("oga"  . "audio/ogg")
+    ("opus" . "audio/ogg")
+    ("wav"  . "audio/wav")
+    ("flac" . "audio/flac")
+    ("m4a"  . "audio/mp4")
+    ("aac"  . "audio/aac")
+    ("mp4"  . "video/mp4")
+    ("m4v"  . "video/mp4")
+    ("webm" . "video/webm")
+    ("ogv"  . "video/ogg")
+    ("mov"  . "video/quicktime")
+    ;; Documents and archives
+    ("pdf"  . "application/pdf")
+    ("zip"  . "application/zip")
+    ("gz"   . "application/gzip")
+    ;; WebAssembly: exactly application/wasm, since browsers refuse
+    ;; WebAssembly.instantiateStreaming() and compileStreaming() on any
+    ;; other Content-Type.
+    ("wasm" . "application/wasm"))
+  "The Content-Type MIME-TYPE-FOR-PATH answers for each extension it knows,
+   after *EXTRA-MIME-TYPES*.")
+
+(defparameter *extra-mime-types* nil
+  "Extension and Content-Type pairs MIME-TYPE-FOR-PATH consults before the
+   framework's table, for a type the table does not know or one it should
+   answer differently: '((\"glb\" . \"model/gltf-binary\")). An extension
+   is written without its dot and matched in any case. Read as each file
+   is loaded, so set it before LOAD-STATIC-FILES, which refuses an entry
+   that is not two strings.")
+
 (defun mime-type-for-path (path)
-  "Return the MIME type for a file path based on its extension."
+  "The Content-Type for a file path, by its extension, matched in any
+   case: *EXTRA-MIME-TYPES* first, then *MIME-TYPES*, and
+   application/octet-stream for an extension neither knows or a path with
+   none."
   (let ((ext (file-extension path)))
-    (if (null ext)
-        "application/octet-stream"
-        (let ((e (string-downcase ext)))
-          (cond
-            ;; Text
-            ((or (string= e "html") (string= e "htm"))
-             "text/html; charset=utf-8")
-            ((string= e "css")  "text/css; charset=utf-8")
-            ((string= e "js")   "application/javascript; charset=utf-8")
-            ((string= e "json") "application/json; charset=utf-8")
-            ((string= e "txt")  "text/plain; charset=utf-8")
-            ((string= e "xml")  "application/xml; charset=utf-8")
-            ((string= e "webmanifest") "application/manifest+json; charset=utf-8")
-            ((string= e "map")  "application/json; charset=utf-8") ; source maps
-            ;; Images
-            ((string= e "png")  "image/png")
-            ((or (string= e "jpg") (string= e "jpeg")) "image/jpeg")
-            ((string= e "gif")  "image/gif")
-            ((string= e "svg")  "image/svg+xml")
-            ((string= e "ico")  "image/x-icon")
-            ((string= e "webp") "image/webp")
-            ((string= e "avif") "image/avif")
-            ;; Fonts
-            ((string= e "woff")  "font/woff")
-            ((string= e "woff2") "font/woff2")
-            ((string= e "ttf")   "font/ttf")
-            ((string= e "otf")   "font/otf")
-            ;; Media / documents
-            ((string= e "mp4")  "video/mp4")
-            ((string= e "webm") "video/webm")
-            ((string= e "pdf")  "application/pdf")
-            ;; WebAssembly — must be exactly application/wasm: browsers
-            ;; refuse WebAssembly.instantiateStreaming() /
-            ;; compileStreaming() on any other Content-Type.
-            ((string= e "wasm") "application/wasm")
-            ;; Default
-            (t "application/octet-stream"))))))
+    (or (and ext
+             (or (cdr (assoc ext *extra-mime-types* :test #'string-equal))
+                 (cdr (assoc ext *mime-types* :test #'string-equal))))
+        "application/octet-stream")))
+
+(defun validate-extra-mime-types ()
+  "Refuse an *EXTRA-MIME-TYPES* that is not a list of (EXTENSION . TYPE)
+   strings, an extension without its dot. Each type goes on to the header
+   checks every static head gets when it is built.
+
+   An extension with a dot in it is refused rather than kept: the
+   extension a path is matched on is what follows its last dot, so \"tar.gz\"
+   would never match anything, and the file it was meant for would go out
+   as whatever \"gz\" is."
+  (unless (and (listp *extra-mime-types*)
+               (null (cdr (last *extra-mime-types*)))
+               (every (lambda (entry)
+                        (and (consp entry)
+                             (stringp (car entry))
+                             (plusp (length (car entry)))
+                             (not (find #\. (car entry)))
+                             (stringp (cdr entry))))
+                      *extra-mime-types*))
+    (error "load-static-files: *extra-mime-types* is ~s. It must be a list of ~
+            (extension . content-type) strings, each extension without its ~
+            dot, as in ((\"glb\" . \"model/gltf-binary\"))."
+           *extra-mime-types*)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Static file cache
 ;;; ---------------------------------------------------------------------------
 
 (defstruct static-entry
-  "Cached static file with pre-built responses. Three byte vectors:
-   the 200 GET (headers + body), the 200 HEAD (same headers, body
-   suppressed), and the 304 Not Modified (etag + cache-control only,
-   no body). ETAG is the content's SHA-256 hex wrapped in a quoted
-   string — a strong entity tag per RFC 7232 §2.3.
+  "Cached static file, kept as the pieces its responses are built from:
+   HEAD-PREFIX, the 200's status line and headers, which GET and HEAD
+   share; NOT-MODIFIED-PREFIX, the 304's (etag and cache-control, no
+   body); and CONTENT, the body. ETAG is the content's SHA-256 hex
+   wrapped in a quoted string — a strong entity tag per RFC 7232 §2.3.
 
-   HEADERS, BODY-OFFSET and CONTENT-LENGTH exist for Range requests
-   (RFC 7233). A 206 needs a fresh header set — a different
-   Content-Length plus a Content-Range — so the 200's header alist is
-   kept to build from.
+   HEADERS and CONTENT-LENGTH exist for Range requests (RFC 7233). A 206
+   needs a fresh header set — a different Content-Length plus a
+   Content-Range — so the 200's header alist is kept to build from.
 
    Stored in pieces rather than as finished responses, because a Date
    has to be current and these vectors are built once at startup and
@@ -88,14 +155,13 @@
    and the terminator can be appended after it and the body after that —
    the write queue takes them as separate vectors and copies nothing.
 
-   The pieces also retire an identity that used to be load-bearing:
-   BODY-OFFSET was where the body began inside the pre-built 200, and it
-   was exactly the length of the HEAD response because the two shared a
-   header block. Splicing anything into one and not the other would have
-   moved a body out from under a range slice — a 206 with a correct
-   status, a correct length, and content starting a few bytes early. The
-   body now lives in CONTENT on its own, so no offset depends on how long
-   the headers happen to be."
+   The body lives in CONTENT on its own, so no offset depends on how long
+   the headers happen to be. A body kept inside a pre-built 200 would
+   begin at an offset equal to the HEAD response's length, true only while
+   the two share a header block: splicing anything into one and not the
+   other would move a body out from under a range slice — a 206 with a
+   correct status, a correct length, and content starting a few bytes
+   early."
   (head-prefix           nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (not-modified-prefix   nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (content               nil :type (or null (simple-array (unsigned-byte 8) (*))))
@@ -112,6 +178,21 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Pre-build complete HTTP response bytes
 ;;; ---------------------------------------------------------------------------
+
+(defun static-head-prefix (status-line headers)
+  "STATUS-LINE and HEADERS serialized as a head without the blank line
+   that ends it, which every static response then supplies as the shared
+   +HEADER-TERMINATOR+.
+
+   Going through SERIALIZE-HTTP-MESSAGE rather than building the bytes
+   here keeps one implementation of header validation: the names and
+   values get the same tchar and CTL checks every other response gets.
+   Ending every static head at that one terminator vector gives the
+   framework one place to add what a head built ahead of time cannot know:
+   the Date line, and the Connection line QUEUE-FINAL-RESPONSE answers for
+   the connection it is sent on."
+  (let ((b (serialize-http-message status-line headers nil)))
+    (subseq b 0 (- (length b) 2))))
 
 (defun build-static-response (mime-type content file-mtime
                               &optional (cache-control "public, max-age=3600"))
@@ -146,19 +227,9 @@
           (list (cons "etag" etag)
                 (cons "cache-control" cache-control)
                 (cons "last-modified" (http-date file-mtime))))
-         ;; Serialize the whole message, then drop the two bytes of the
-         ;; blank line that ends the header block. What is left is a
-         ;; prefix a date line can be appended to. Going through
-         ;; SERIALIZE-HTTP-MESSAGE rather than building the bytes here
-         ;; keeps one implementation of header validation — the header
-         ;; names and values still get the same tchar and CTL checks
-         ;; every other response gets.
-         (head-prefix (let ((b (serialize-http-message "HTTP/1.1 200 OK"
-                                                       full-headers nil)))
-                        (subseq b 0 (- (length b) 2))))
-         (nm-prefix (let ((b (serialize-http-message "HTTP/1.1 304 Not Modified"
-                                                     not-modified-headers nil)))
-                      (subseq b 0 (- (length b) 2)))))
+         (head-prefix (static-head-prefix "HTTP/1.1 200 OK" full-headers))
+         (nm-prefix (static-head-prefix "HTTP/1.1 304 Not Modified"
+                                        not-modified-headers)))
     (make-static-entry
      :head-prefix head-prefix
      :not-modified-prefix nm-prefix
@@ -314,16 +385,20 @@
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
    Additive — can be called multiple times. Collisions: last wins.
+   All or nothing: a call that signals, at the cap, a substitutions key or
+   a header value, leaves the cache as it found it.
    Dotfiles and dot-directories are skipped (.git/, .env) — except
    the RFC 8615 /.well-known/ namespace, which is served.
 
    MAX-TOTAL-BYTES caps the whole tree, default 256 MiB, and signals with
-   the offending path and the running total when crossed. The cache is
+   the offending path and the running total when crossed. A file is
+   measured before it is read, so one larger than the heap is refused by
+   name rather than exhausting it. The cache is
    resident for the life of the process, so pointing this at a directory
    holding a 4 GB video buys a 4 GB resident set — discovered at deploy
    time, on the box, rather than here. Range support makes that likelier
    rather than less: serving large media is what Range is for, so the
-   invitation to keep large media next to the CSS is now in the box.
+   invitation to keep large media next to the CSS comes in the box.
    Per-call, not global, because the limit belongs to the tree being
    loaded and additive calls each bring their own.
 
@@ -342,10 +417,9 @@
              \"public, max-age=31536000, immutable\"
              \"public, max-age=60\")))
 
-   The resolved string is validated by SERIALIZE-HTTP-MESSAGE on
-   the first request serving, so a value containing CR / LF / NUL
-   raises a pointed error at response-build time rather than going
-   on the wire.
+   The resolved string is validated by SERIALIZE-HTTP-MESSAGE as each
+   file's responses are built, here, so a value containing CR / LF / NUL
+   fails this call rather than going on the wire.
 
    SUBSTITUTIONS is an optional list of per-file literal-string rewrites
    applied at load time, before the ETag is computed:
@@ -362,28 +436,46 @@
    A key that matches no loaded file signals ERROR — typos fail at
    deploy time rather than serving unsubstituted bytes. Escaping for
    the target format (HTML, JS, CSS) is the caller's responsibility."
+  (validate-extra-mime-types)
   (let ((dir-path (probe-file (pathname directory)))
         (subs-table (when substitutions
                       (validate-and-normalize-substitutions substitutions))))
     (unless dir-path
       (log-warn "static: directory not found: ~a" directory)
       (return-from load-static-files))
-    (let ((base (namestring dir-path)))
+    ;; Native namestrings, here and for each file, because a URL path is a
+    ;; filesystem name. NAMESTRING escapes what a Lisp pathname reads as
+    ;; syntax — [ ] * ? and \ — so a[1].txt would be keyed /a\[1].txt, a
+    ;; path no request names. Nothing parses those strings back as
+    ;; pathnames: the walk starts from BASE parsed as a native name, and
+    ;; each file is opened through the pathname DIRECTORY gave it.
+    (let ((base (sb-ext:native-namestring dir-path)))
       ;; Ensure trailing /
       (unless (char= (char base (1- (length base))) #\/)
         (setf base (concatenate 'string base "/")))
       (let ((wild (merge-pathnames
                    (make-pathname :directory '(:relative :wild-inferiors)
                                   :name :wild :type :wild)
-                   base))
+                   (sb-ext:parse-native-namestring base)))
             (count 0)
-            (total-bytes 0))
+            (total-bytes 0)
+            ;; This call's files, merged into *STATIC-CACHE* only once the
+            ;; walk and the substitutions check have both succeeded.
+            (loaded (make-hash-table :test #'equal)))
+        (flet ((over-cap (url-path total)
+                 (error "load-static-files: ~a brings the tree to ~
+                         ~d bytes, over the ~d-byte cap. Raise ~
+                         :max-total-bytes, or serve large media from ~
+                         the reverse proxy directly — this cache holds ~
+                         every file in the process for its whole life, ~
+                         and there is no serve-from-disk path."
+                        url-path total max-total-bytes)))
         ;; First pass: load all files (skip directories)
         (dolist (file (directory wild))
           (when (and (pathname-name file)
                      (> (length (pathname-name file)) 0)
                      (not (char= (char (pathname-name file) 0) #\.)))
-            (let ((fs-path (namestring file)))
+            (let ((fs-path (sb-ext:native-namestring file)))
               ;; SBCL's DIRECTORY resolves symlinks by default — a symlink
               ;; inside the tree that points outside (demo/static/leak ->
               ;; /etc/passwd) returns the resolved target path, which
@@ -402,7 +494,14 @@
                    ;; HIDDEN-PATH-COMPONENT-P.
                    (unless (hidden-path-component-p relative)
                      (let* ((url-path (concatenate 'string "/" relative))
-                            (raw-content (read-file-bytes fs-path))
+                            ;; Measured first: the cap exists for the file
+                            ;; too big to hold, which reading it would
+                            ;; have to hold.
+                            (size (with-open-file (s file :element-type '(unsigned-byte 8))
+                                    (file-length s)))
+                            (raw-content (if (> (+ total-bytes size) max-total-bytes)
+                                             (over-cap url-path (+ total-bytes size))
+                                             (read-file-bytes file)))
                             (rules (and subs-table (gethash url-path subs-table)))
                             (content (if rules
                                          (apply-substitutions raw-content rules)
@@ -415,21 +514,15 @@
                             (response (build-static-response mime content mtime cc)))
                        (when (gethash url-path *static-cache*)
                          (log-debug "static: replacing ~a" url-path))
-                       (setf (gethash url-path *static-cache*) response)
+                       (setf (gethash url-path loaded) response)
                        (incf count)
                        (incf total-bytes (length content))
-                       ;; Checked after the increment so the reported
-                       ;; total includes the file that crossed the line —
-                       ;; the operator wants to know what it costs, not
-                       ;; what it cost before.
+                       ;; Again after the substitutions, which can grow a
+                       ;; file. The total includes the file that crossed
+                       ;; the line — the operator wants to know what it
+                       ;; costs, not what it cost before.
                        (when (> total-bytes max-total-bytes)
-                         (error "load-static-files: ~a brings the tree to ~
-                                 ~d bytes, over the ~d-byte cap. Raise ~
-                                 :max-total-bytes, or serve large media from ~
-                                 the reverse proxy directly — this cache holds ~
-                                 every file in the process for its whole life, ~
-                                 and there is no serve-from-disk path."
-                                url-path total-bytes max-total-bytes))
+                         (over-cap url-path total-bytes))
                        (log-debug "static: ~a (~a, ~d bytes)" url-path mime (length content))))))))))
         ;; Validate every :substitutions file key matched a file we
         ;; actually loaded. Runs before alias generation so aliases
@@ -437,9 +530,12 @@
         (when subs-table
           (maphash (lambda (key rules)
                      (declare (ignore rules))
-                     (unless (gethash key *static-cache*)
+                     (unless (gethash key loaded)
                        (error "substitutions: ~s is not a loaded file" key)))
                    subs-table))
+        (maphash (lambda (url-path response)
+                   (setf (gethash url-path *static-cache*) response))
+                 loaded))
         ;; Second pass: register extensionless aliases for .html files
         ;; e.g., /login.html also serves at /login
         ;; Actual files take priority — don't overwrite existing entries
@@ -575,7 +671,7 @@
    that media players and download managers do not use. Anything
    unparseable also returns NIL: ignoring a Range is always a safe
    answer, where guessing at one is not."
-  ;; A zero-length resource used to short-circuit to NIL and serve a 200.
+  ;; A zero-length resource does not short-circuit to NIL and a 200.
   ;; RFC 7233 §2.1 makes a byte-range-spec unsatisfiable once its
   ;; first-byte-pos is at or past the current length, which for an empty
   ;; representation is true of every range there is — so the answer is the
@@ -670,9 +766,9 @@
    from, and appending it costs an entry on the queue rather than a
    rebuild of anything."
   ;; The prefixes were serialized at startup, so nothing downstream of here
-  ;; passes through FORMAT-RESPONSE and nothing counted these. Static files
-  ;; are most of a page's requests: uncounted, the census reported one
-  ;; response for a page load that made a dozen.
+  ;; passes through FORMAT-RESPONSE, and this is the one place to count
+  ;; them. Static files are most of a page's requests: uncounted, the
+  ;; census would report one response for a page load that made a dozen.
   (note-response (if (eq kind :not-modified) 304 200))
   (let ((prefix (ecase kind
                   ((:get :head) (static-entry-head-prefix entry))
@@ -684,14 +780,20 @@
 
 (defun range-response (entry first last)
   "Build a 206 Partial Content response covering the inclusive byte range
-   FIRST..LAST of ENTRY. The body is sliced out of the stored content —
-   the file lives in memory once.
+   FIRST..LAST of ENTRY, as segments: the serialized head, its blank line,
+   then the range as a WRITE-SPAN over the stored content.
+
+   The span is the point. The file lives in memory once, and a range of it
+   is a window on those bytes, not a copy: a SUBSEQ would cost the range per
+   request, held by the connection until its peer had read it all, and a
+   whole-file range from a slow reader is what a browser sends first for
+   <video>. A request allocates its head and nothing more, as a 200 does.
 
    Built per request, so unlike the pre-built responses it gets its Date
    through the ordinary header alist."
   (let* ((total (static-entry-content-length entry))
          (len (1+ (- last first)))
-         (body (subseq (static-entry-content entry) first (+ first len)))
+         (body (make-write-span (static-entry-content entry) first (+ first len)))
          (headers (append
                    (list (cons "date" (http-date)))
                    ;; Content-Length must describe the range, not the file.
@@ -701,15 +803,19 @@
                          (cons "content-range"
                                (format nil "bytes ~d-~d/~d" first last total))))))
     ;; Counted once the bytes exist, the order every producer keeps. Nothing
-    ;; in these headers can be refused today, but a response counted before
-    ;; its serialize is the shape FORMAT-RESPONSE's phantom had.
-    (prog1 (serialize-http-message "HTTP/1.1 206 Partial Content" headers body)
+    ;; in these headers can be refused, but a response counted before its
+    ;; serialize would be counted even when the serialize raised: a phantom
+    ;; 206 in the response counts.
+    (prog1 (list (static-head-prefix "HTTP/1.1 206 Partial Content" headers)
+                 +header-terminator+
+                 body)
       (note-response 206))))
 
 (defun range-not-satisfiable-response (entry)
-  "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4). The
-   Content-Range header reports the resource's true length with '*' as the
-   range, which is how a client learns what it should have asked for.
+  "Build a 416 Range Not Satisfiable response (RFC 7233 §4.4), as segments:
+   the head, then its blank line. The Content-Range header reports the
+   resource's true length with '*' as the range, which is how a client
+   learns what it should have asked for.
 
    Built per request rather than cached on the entry: 416 answers
    malformed client input, so it is a rare path and not worth a slot on
@@ -717,43 +823,122 @@
   (let ((etag (static-entry-etag entry)))
     ;; Counted once the bytes exist, as in RANGE-RESPONSE above.
     (prog1
-        (serialize-http-message
-         "HTTP/1.1 416 Range Not Satisfiable"
-         (append
-          (list (cons "date" (http-date))
-                (cons "content-range"
-                      (format nil "bytes */~d" (static-entry-content-length entry)))
-                (cons "content-length" "0")
-                (cons "accept-ranges" "bytes"))
-          ;; Omit the validator rather than emit an empty one: ETag's grammar
-          ;; has no empty form, so `etag: ""` would be malformed. Unreachable
-          ;; today (every entry is built with one) but a header that can only
-          ;; ever be well-formed is better than one that depends on that.
-          (when etag (list (cons "etag" etag))))
-         nil)
+        (list
+         (static-head-prefix
+          "HTTP/1.1 416 Range Not Satisfiable"
+          (append
+           (list (cons "date" (http-date))
+                 (cons "content-range"
+                       (format nil "bytes */~d" (static-entry-content-length entry)))
+                 (cons "content-length" "0")
+                 (cons "accept-ranges" "bytes"))
+           ;; Omit the validator rather than emit an empty one: ETag's
+           ;; grammar has no empty form, so `etag: ""` would be malformed.
+           ;; Unreachable (every entry is built with one), but a header that
+           ;; can only ever be well-formed is better than one that depends
+           ;; on that.
+           (when etag (list (cons "etag" etag)))))
+         +header-terminator+)
       (note-response 416))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Request serving
 ;;; ---------------------------------------------------------------------------
 
+(defun static-escape-required-p (byte)
+  "T for a byte a path spells as %XX, never as itself.
+
+   These are what a browser escapes when it writes a path, the WHATWG URL
+   path percent-encode set: controls, DEL, space, \", #, <, >, ?, `, {, }
+   and every byte of a non-ASCII character. % is here too, because a %
+   that stood for itself would be a second spelling of an escape.
+   Every other byte is written as itself, except that the punctuation
+   PATH-EITHER-SPELLING-BYTE-P names may be escaped as well."
+  (or (<= byte #x20)
+      (>= byte #x7F)
+      (member byte '(#x22 #x23 #x25 #x3C #x3E #x3F #x60 #x7B #x7D))))
+
+(defun static-path-spelling (raw)
+  "The file path RAW names, decoded, or NIL when RAW is not a spelling of
+   it that a browser sends, up to the case of an escape's hex digits.
+
+   Each byte is escaped or written as itself, as STATIC-ESCAPE-REQUIRED-P
+   says. An escape's hex digits may be in either case: RFC 3986 §2.1
+   counts the two as one URI, CANONICAL-PATH reads them as one path, and a
+   proxy may re-encode a path in lowercase. The one exception is the
+   punctuation PATH-EITHER-SPELLING-BYTE-P names, which a page's own
+   script may escape and a browser then sends as written, so either
+   spelling is accepted. Any other spelling — an escaped letter, digit,
+   '.' or '/' (%61, %2E, %2F), a % that starts no escape, or a byte
+   written as itself that has to be escaped — names no file.
+
+   That is what lets SERVE-STATIC sit behind a router. URL-DECODE maps
+   /admin.html, /%61dmin.html and /admin%2Ehtml to one file, and a
+   MATCH-PATH guard under :EXACT sees three different paths. A guard on
+   one spelling would be bypassed by the other two, and SERVE-STATIC
+   would then serve the guarded file. Accepting only what CANONICAL-PATH
+   reads as one path, every request that reaches a file is one the
+   router's literals compare the same way."
+  (let ((out (make-array (length raw) :element-type '(unsigned-byte 8)
+                                      :fill-pointer 0))
+        (len (length raw)))
+    ;; ASCII hex only, as in CANONICAL-PATH.
+    (flet ((hex (c)
+             (cond ((char<= #\0 c #\9) (- (char-code c) 48))
+                   ((char<= #\A c #\F) (- (char-code c) 55))
+                   ((char<= #\a c #\f) (- (char-code c) 87)))))
+      (loop with i = 0
+            while (< i len)
+            do (let ((c (char-code (char raw i))))
+                 (cond
+                   ((= c #x25)
+                    (let ((hi (and (< (+ i 2) len) (hex (char raw (1+ i)))))
+                          (lo (and (< (+ i 2) len) (hex (char raw (+ i 2))))))
+                      (unless (and hi lo)
+                        (return-from static-path-spelling nil))
+                      (let ((b (logior (ash hi 4) lo)))
+                        (unless (or (static-escape-required-p b)
+                                    (path-either-spelling-byte-p b))
+                          (return-from static-path-spelling nil))
+                        (vector-push b out))
+                      (incf i 3)))
+                   ((static-escape-required-p c)
+                    (return-from static-path-spelling nil))
+                   (t
+                    (vector-push c out)
+                    (incf i))))))
+    (handler-case (sb-ext:octets-to-string out :external-format :utf-8)
+      (sb-int:character-decoding-error () nil))))
+
 (defun serve-static (request)
   "Look up the request path in the static file cache.
-   Returns a pre-built HTTP response byte vector ready to write, or
-   NIL if the path is not cached. Serves GET and HEAD requests.
+   Returns a response ready to return from a handler or a fetch :THEN, or
+   NIL if the path is not cached. A 200, a HEAD and a 304 are a list of
+   byte vectors, the pre-built message in segments with a current Date. A
+   206 is a list too: its head, then a WRITE-SPAN over the cached file for
+   the range. So is a 416. Every head ends at the shared
+   +HEADER-TERMINATOR+, where QUEUE-FINAL-RESPONSE adds the Connection
+   line the connection calls for. Each is a whole message; a caller hands
+   it on rather than taking it apart. Serves GET and HEAD requests.
    Honors If-None-Match (RFC 7232) — a cached ETag match returns the
    pre-built 304 Not Modified response instead of the full body.
    Rejects paths containing '..'. Directories (paths ending in /)
-   try index.html as a fallback."
+   try index.html as a fallback.
+
+   A file is served at the spellings of its path a browser sends, which
+   CANONICAL-PATH reads as one, and at no other: see
+   STATIC-PATH-SPELLING. Its other names are the
+   aliases LOAD-STATIC-FILES registers — /x for x.html, /dir for
+   dir/index.html — and /dir/, which falls back to dir/index.html. A
+   route guarding a file has to cover each of those."
   (let ((method (http-request-method request)))
     (when (or (eq method :GET) (eq method :HEAD))
-      ;; Decode percent-encoding so /foo%20bar hits a cached /foo bar
-      ;; and %2e%2e cannot slip past the traversal check below. The
-      ;; cache is keyed on decoded filesystem paths, so this is the
-      ;; form that can actually match. Malformed encoding → NIL, which
-      ;; falls through to the app handler for a clean 404.
-      (let ((path (handler-case (url-decode (http-request-path request))
-                    (error () nil))))
+      ;; Decoded so /foo%20bar hits a cached /foo bar: the cache is keyed
+      ;; on decoded filesystem paths. Any spelling a browser does not send
+      ;; is NIL, which falls through to the app handler for a clean 404,
+      ;; and that includes %2E%2E, which cannot slip past the traversal
+      ;; check.
+      (let ((path (static-path-spelling (http-request-path request))))
         (when (and path (> (length path) 0))
           (unless (or (search "/../" path)
                       (and (>= (length path) 3)

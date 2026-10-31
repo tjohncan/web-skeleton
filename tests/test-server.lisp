@@ -9,7 +9,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun crlf (&rest strings)
-  "Join STRINGS with CRLF and append CRLFCRLF (header terminator)."
+  "STRINGS as a head: joined with CRLF, then the CRLFCRLF that ends it.
+   %CRLF-LINES, in test-harness.lisp, ends each line with one CRLF and adds
+   no blank line of its own."
   (with-output-to-string (s)
     (loop for (str . rest) on strings
           do (write-string str s)
@@ -114,20 +116,31 @@
   (format t "~%HTTP Date cache~%")
   ;; No cache bound is the state every existing test and every REPL call
   ;; runs in, and it must keep formatting.
-  (let ((web-skeleton::*http-date-cache* nil))
-    (check "date: no cache bound still formats correctly"
-           (string= (web-skeleton::http-date)
-                    (web-skeleton::%format-http-date (get-universal-time)))
-           t))
+  ;; Each of these reads the clock on both sides of the call, and takes
+  ;; either second: a second can turn between the call and a later read.
+  (flet ((formatted-within (thunk)
+           (let* ((before (get-universal-time))
+                  (got (funcall thunk))
+                  (after (get-universal-time)))
+             (or (string= got (web-skeleton::%format-http-date before))
+                 (string= got (web-skeleton::%format-http-date after))))))
+    (let ((web-skeleton::*http-date-cache* nil))
+      (check "date: no cache bound still formats correctly"
+             (formatted-within #'web-skeleton::http-date)
+             t))
+    (let ((web-skeleton::*http-date-cache* (cons 0 "")))
+      ;; A cold cache formats and fills.
+      (check "date: cold cache produces the right string"
+             (formatted-within #'web-skeleton::http-date)
+             t)))
   (let ((web-skeleton::*http-date-cache* (cons 0 "")))
-    ;; A cold cache formats and fills.
-    (check "date: cold cache produces the right string"
-           (string= (web-skeleton::http-date)
-                    (web-skeleton::%format-http-date (get-universal-time)))
-           t)
-    (check "date: cold cache records the second it built for"
-           (eql (car web-skeleton::*http-date-cache*) (get-universal-time))
-           t)
+    (let* ((before (get-universal-time))
+           (got (progn (web-skeleton::http-date)
+                       (car web-skeleton::*http-date-cache*)))
+           (after (get-universal-time)))
+      (check "date: cold cache records the second it built for"
+             (<= before got after)
+             t))
     ;; A hit is served without reformatting. Asserted through a sentinel
     ;; that formatting could never produce, and tolerant of the second
     ;; ticking between setup and call — rare, and a fresh format is the
@@ -400,26 +413,34 @@
     (check-error "Content-Length: +10 rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
 
-  ;; Content-Length digit cap is 10 decimal digits ≈ 9.3 GB, still
-  ;; orders of magnitude past any real *MAX-BODY-SIZE*. The cap
-  ;; cannot be reached via a legitimate value but bails early on
-  ;; attacker-supplied padding like 'Content-Length: 999999999999999'.
+  ;; Content-Length digit cap is 15 decimal digits, under 10^15 bytes:
+  ;; a fixnum, and past any body. A received body is never held, so a
+  ;; length in the tens of gigabytes is one a cap can admit; the digit
+  ;; cap bails early on a run of digits rather than on a size.
   (let* ((raw (concatenate 'string
                 "GET / HTTP/1.1" *crlf*
-                "Content-Length: 12345678901" *crlf*  ; 11 digits
+                "Content-Length: 1234567890123456" *crlf*  ; 16 digits
                 *crlf*))
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
-    (check-error "Content-Length 11 digits rejected"
+    (check-error "Content-Length 16 digits rejected"
                  (web-skeleton::scan-content-length bytes header-end)))
   (let* ((raw (concatenate 'string
                 "GET / HTTP/1.1" *crlf*
-                "Content-Length: 9999999999" *crlf*  ; 10 digits — allowed
+                "Content-Length: 999999999999999" *crlf*  ; 15 digits — allowed
                 *crlf*))
          (bytes (sb-ext:string-to-octets raw :external-format :ascii))
          (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
-    (check "Content-Length 10 digits accepted"
-           (web-skeleton::scan-content-length bytes header-end) 9999999999))
+    (check "Content-Length 15 digits accepted"
+           (web-skeleton::scan-content-length bytes header-end) 999999999999999))
+  (let* ((raw (concatenate 'string
+                "GET / HTTP/1.1" *crlf*
+                "Content-Length: 21474836480" *crlf*  ; 20 GiB, 11 digits
+                *crlf*))
+         (bytes (sb-ext:string-to-octets raw :external-format :ascii))
+         (header-end (web-skeleton::scan-crlf-crlf bytes 0 (length bytes))))
+    (check "Content-Length of a 20 GiB upload parses, for its cap to judge"
+           (web-skeleton::scan-content-length bytes header-end) 21474836480))
 
   ;; Content-Length parser agreement. scan-content-length is the fast
   ;; byte scanner used for pre-allocation; parse-headers-bytes populates
@@ -530,6 +551,61 @@
       (check-error "duplicate Host rejected"
                    (web-skeleton::connection-parse-request conn)))))
 
+(defun test-host-field ()
+  "A request's Host is held to RFC 9110 §7.2 by CONNECTION-PARSE-HEAD: one
+   field, whatever the version, and its value host[:port].
+
+   Accepted: a name, an IPv4 address, a bracketed IPv6 address or
+   IPvFuture, each with a port or without, and an empty value or an empty
+   port, which the grammar allows. Refused: what a handler building a URL
+   from Host could be handed in its place — a path, a query, markup,
+   userinfo, a space, a second port, a port that is not digits, a broken
+   escape, a name not in ASCII, an IPv6 address outside brackets or with a
+   zone identifier — and a second Host at HTTP/1.0 as at HTTP/1.1."
+  (format t "~%Host: one field, and host[:port]~%")
+  (flet ((verdict (&rest lines)
+           ;; :OK for a head of LINES that CONNECTION-PARSE-HEAD accepts, or
+           ;; the status it refuses the head with. A connection of its own
+           ;; each time, since a parsed request stays on the connection.
+           (let* ((bytes (sb-ext:string-to-octets (apply #'crlf lines)
+                                                  :external-format :utf-8))
+                  (conn (web-skeleton::make-connection :fd -1 :last-active 0)))
+             (setf (web-skeleton::connection-read-buf conn) bytes
+                   (web-skeleton::connection-read-pos conn) (length bytes)
+                   (web-skeleton::connection-header-end conn)
+                   (web-skeleton::scan-crlf-crlf bytes 0 (length bytes)))
+             (handler-case (progn (web-skeleton::connection-parse-head conn) :ok)
+               (http-parse-error (e) (http-parse-error-status e))))))
+    (flet ((host (value)
+             (verdict "GET / HTTP/1.1" (format nil "Host: ~a" value))))
+      (dolist (value '("example.com" "localhost" "x" "EXAMPLE.COM." "a_b-c~d.example"
+                       "!$&'()*+,;=.example" "xn--bcher-kva.example" "%41b.example"
+                       "127.0.0.1" "example.com:8080" "127.0.0.1:80" "x:" "" ":8080"
+                       "[::1]" "[::1]:8080" "[2001:db8::1]" "[::ffff:127.0.0.1]:80"
+                       "[v1.x]" "[V7.a:b]"))
+        (check (format nil "host: ~s is accepted" value) (host value) :ok))
+      (dolist (value '("a b" "evil.example/x?y" "x?y" "x#y" "x\"><b>" "<x>"
+                       "x\\y" "x{y}" "x|y" "x^y" "x`y"
+                       "u:p@x" "@x" "x:80:90" "x:abc" "x:-80" "x: 80"
+                       "%zz.example" "%4" "é.example"
+                       "::1" "::1:8080" "[::1" "[::1]x" "[::1]]" "x]"
+                       "[x]" "[]" "[fe80::1%25eth0]" "[v.x]" "[vz.x]" "[v1.]"))
+        (check (format nil "host: ~s is refused 400" value) (host value) 400)))
+    (check "host: two at HTTP/1.0 are refused 400"
+           (verdict "GET / HTTP/1.0" "Host: a.example" "Host: b.example") 400)
+    (check "host: two at HTTP/1.1 are refused 400, the same name twice too"
+           (list (verdict "GET / HTTP/1.1" "Host: a.example" "Host: b.example")
+                 (verdict "GET / HTTP/1.1" "Host: a.example" "Host: a.example"))
+           '(400 400))
+    (check "host: a malformed one at HTTP/1.0 is refused 400"
+           (verdict "GET / HTTP/1.0" "Host: a b") 400)
+    (check "control: one at HTTP/1.0 is accepted, and so is none"
+           (list (verdict "GET / HTTP/1.0" "Host: a.example")
+                 (verdict "GET / HTTP/1.0" "Accept: */*"))
+           '(:ok :ok))
+    (check "control: none at HTTP/1.1 is refused 400"
+           (verdict "GET / HTTP/1.1" "Accept: */*") 400)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Expect: 100-continue tests
 ;;; ---------------------------------------------------------------------------
@@ -554,19 +630,41 @@
            (disp "Host: localhost"
                  (format nil "Expect:~c100-continue" #\Tab))
            :100-continue)
-    ;; RFC 7231 §5.1.1: Expect is 1#expectation — a list. Comma
-    ;; terminates the 100-continue token just like ';' or CR.
-    (check "comma separator accepted"
-           (disp "Host: localhost" "Expect: 100-continue, x-foo=y") :100-continue)
-    (check "comma immediately after token"
-           (disp "Host: localhost" "Expect: 100-continue,x-foo=y") :100-continue)
-    ;; :NONE — no Expect header at all.
+    ;; RFC 9110 §10.1.1: Expect is #expectation, a list, and every
+    ;; member counts. The verdict is the set of members, never their
+    ;; order or which header carried them.
+    (check "a list of 100-continue alone is 100-continue"
+           (disp "Host: localhost" "Expect: 100-continue, 100-continue") :100-continue)
+    (check "empty list elements are the list grammar, not members"
+           (disp "Host: localhost" "Expect: 100-continue,,") :100-continue)
+    (check "100-continue in two headers is 100-continue"
+           (disp "Host: localhost" "Expect: 100-continue" "Expect: 100-continue")
+           :100-continue)
+    (check "another member after 100-continue → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue, x-foo=y") :unknown)
+    (check "another member before 100-continue → :unknown"
+           (disp "Host: localhost" "Expect: x-foo=y, 100-continue") :unknown)
+    (check "another member right after the comma → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue,x-foo=y") :unknown)
+    (check "another expectation in a second header → :unknown"
+           (disp "Host: localhost" "Expect: 100-continue" "Expect: foo") :unknown)
+    (check "another expectation in the first header → :unknown"
+           (disp "Host: localhost" "Expect: foo" "Expect: 100-continue") :unknown)
+    ;; :NONE — no expectation: no Expect header, or Expect headers whose
+    ;; lists are empty. RFC 9110 §5.6.1.2 has a recipient ignore empty
+    ;; list elements, so `Expect: ,` carries nothing a 417 could answer.
+    (check "an Expect header naming nothing → :none"
+           (disp "Host: localhost" "Expect: ,") :none)
+    (check "an empty Expect header → :none"
+           (disp "Host: localhost" "Expect:") :none)
+    (check "an empty element before 100-continue is still 100-continue"
+           (disp "Host: localhost" "Expect: , 100-continue") :100-continue)
     (check "no Expect header"
            (disp "Host: localhost" "Content-Length: 10") :none)
     (check "suffixed header name does not match"
            (disp "Host: localhost" "X-Expect: 100-continue") :none)
     ;; :UNKNOWN — Expect header present with a non-100-continue value.
-    ;; RFC 7231 §5.1.1 MAYs a 417 response on these; the framework
+    ;; RFC 9110 §10.1.1 MAYs a 417 response on these; the framework
     ;; chooses to always 417. Scanner just reports the classification,
     ;; the state machine handles the 417.
     (check "different expect value → :unknown"
@@ -574,7 +672,16 @@
     (check "100-continued (trailing garbage) → :unknown"
            (disp "Host: localhost" "Expect: 100-continued") :unknown)
     (check "x-custom-expectation → :unknown"
-           (disp "Host: localhost" "Expect: x-custom-expect") :unknown))
+           (disp "Host: localhost" "Expect: x-custom-expect") :unknown)
+    ;; :INVALID — a value this scan and PARSE-HEADERS-BYTES would read
+    ;; differently. A bare CR would end this scan's value at 100-continue,
+    ;; and a 100 Continue would go out for a request the parser refuses.
+    (check "a bare CR in the value → :invalid"
+           (disp "Host: localhost" (format nil "Expect: 100-continue~cX" #\Return))
+           :invalid)
+    (check "a bare LF in the value → :invalid"
+           (disp "Host: localhost" (format nil "Expect: 100-continue~cX" #\Newline))
+           :invalid))
   ;; Constant sanity — the pre-built bytes are exactly the status line.
   (let ((bytes web-skeleton::*http-100-continue-bytes*))
     (check "100 Continue ends with CRLFCRLF"
@@ -591,6 +698,248 @@
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP response builder tests
 ;;; ---------------------------------------------------------------------------
+
+(defun test-format-response-owns-framing ()
+  "FORMAT-RESPONSE sends only framing its bytes agree with.
+
+   A caller's Transfer-Encoding beside the computed Content-Length, a
+   caller's Content-Length that the body contradicts, a body on a 1xx, 204
+   or 304: each is two answers to where the response ends, and the reader
+   that comes next on a keep-alive connection takes one of them. Each is
+   refused. The controls are the shapes that agree with themselves and
+   must keep working."
+  (format t "~%format-response: framing is the serializer's~%")
+  (labels ((serialize (resp &rest keys)
+             (handler-case (sb-ext:octets-to-string
+                            (apply #'format-response resp keys)
+                            :external-format :utf-8)
+               (error () :refused)))
+           (resp (status &key body headers)
+             (web-skeleton::make-http-response :status status :body body
+                                               :headers headers))
+           (has (text needle)
+             (and (stringp text) (search needle text :test #'char-equal) t))
+           (count-matches (needle text)
+             (loop with start = 0
+                   for i = (search needle text :start2 start :test #'char-equal)
+                   while i count t do (setf start (1+ i)))))
+    ;; Refused.
+    (check "a caller's Transfer-Encoding is refused"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("Transfer-Encoding" . "chunked"))))
+           :refused)
+    (check "a caller's Content-Length the body contradicts is refused"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "4"))))
+           :refused)
+    (check "two caller Content-Lengths are refused, even agreeing ones"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "5")
+                                           ("Content-Length" . "5"))))
+           :refused)
+    (check "a Content-Length with a sign is not a length"
+           (serialize (resp 200 :body "hello"
+                                :headers '(("content-length" . "+5"))))
+           :refused)
+    ;; DIGIT-CHAR-P and PARSE-INTEGER both take any Unicode digit, so ٥
+    ;; (U+0665) would read as 5 and go out on the wire as it is.
+    (check "a Content-Length in other digits is not a length"
+           (serialize (resp 200 :body "hello"
+                                :headers (list (cons "content-length"
+                                                     (string (code-char #x665))))))
+           :refused)
+    (check "a bodiless GET answer cannot declare a length"
+           (serialize (resp 200 :headers '(("content-length" . "1234"))))
+           :refused)
+    (check "a 204 with a body is refused"
+           (serialize (make-text-response 204 "gone")) :refused)
+    (check "a 304 with a body is refused"
+           (serialize (make-text-response 304 "stale")) :refused)
+    (check "a 204 cannot declare a length"
+           (serialize (resp 204 :headers '(("content-length" . "0"))))
+           :refused)
+    ;; Accepted, as they agree.
+    (let ((text (serialize (resp 200 :body "hello"
+                                     :headers '(("content-length" . "5"))))))
+      (check "a caller's Content-Length that agrees is sent once"
+             (and (has text "content-length: 5")
+                  (= 1 (count-matches "content-length" text)))
+             t))
+    (check "a HEAD answer with no body may declare the GET's length"
+           (has (serialize (resp 200 :headers '(("content-length" . "1234")))
+                           :head-only-p t)
+                "content-length: 1234")
+           t)
+    (check "a 304 keeps a caller's Content-Length and sends no body"
+           (let ((text (serialize (resp 304 :headers '(("content-length" . "1234"))))))
+             (and (has text "content-length: 1234")
+                  (string= (subseq text (- (length text) 4))
+                           (coerce '(#\Return #\Newline #\Return #\Newline) 'string))))
+           t)
+    (check "a 204 with an empty body goes out with no Content-Length"
+           (has (serialize (make-text-response 204 "")) "content-length")
+           nil)
+    ;; The framework's own constructor, the obvious way to write these.
+    (dolist (status '(100 204 304))
+      (let ((text (serialize (make-error-response status))))
+        (check (format nil "make-error-response ~d: sent, ending at its blank line" status)
+               (and (stringp text)
+                    (= (+ (search (coerce '(#\Return #\Newline #\Return #\Newline)
+                                          'string)
+                                  text)
+                          4)
+                       (length text)))
+               t)
+        (check (format nil "make-error-response ~d: no Content-Length, no Content-Type"
+                       status)
+               (list (has text "content-length") (has text "content-type"))
+               '(nil nil))))
+    (check "make-error-response 404 still carries its text"
+           (has (serialize (make-error-response 404)) "404 Not Found") t)))
+
+(defun test-bodiless-statuses-on-the-wire ()
+  "A 304 from MAKE-ERROR-RESPONSE leaves a kept-alive connection where the
+   next response starts, and a relay that copies an upstream's framing
+   headers is answered 500 rather than sent with two framings.
+
+   The 304 is the obvious way to write one, and it carried a default body:
+   a reader honouring 304 framing took that body as the start of the next
+   response. The relay copies the upstream's Transfer-Encoding onto a body
+   :THEN received already decoded, which went out beside the computed
+   Content-Length."
+  (format t "~%bodiless statuses and copied framing, on the wire~%")
+  (let ((upstream-port nil))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (let ((path (http-request-path req)))
+             (cond
+               ((string= path "/304") (make-error-response 304))
+               ((string= path "/chunky")
+                (make-stream-response
+                 :on-open (lambda (c)
+                            (stream-send c (sb-ext:string-to-octets
+                                            "hello" :external-format :ascii))
+                            (stream-close c))))
+               ((string= path "/relay")
+                (http-fetch :get (format nil "http://127.0.0.1:~d/chunky"
+                                         upstream-port)
+                            :then (lambda (status headers body)
+                                    (let ((r (make-bytes-response status body)))
+                                      (dolist (h headers)
+                                        (set-response-header r (car h) (cdr h)))
+                                      r))))
+               (t (make-text-response 200 "ok"))))))
+      (setf upstream-port *test-port*)
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (write-sequence (sb-ext:string-to-octets
+                                (concatenate 'string
+                                             (crlf "GET /304 HTTP/1.1" "Host: x")
+                                             (crlf "GET /ok HTTP/1.1" "Host: x"
+                                                   "Connection: close"))
+                                :external-format :ascii)
+                               stream)
+               (force-output stream)
+               (let* ((text (sb-ext:octets-to-string
+                             (read-until-bounded stream :seconds 3)
+                             :external-format :latin-1))
+                      (blank (search (coerce '(#\Return #\Newline #\Return #\Newline)
+                                             'string)
+                                     text)))
+                 (check "pipelined: the 304 came first"
+                        (and (search "HTTP/1.1 304" text) (zerop (search "HTTP/1.1 304" text)) t)
+                        t)
+                 (check "pipelined: the next response starts at the 304's blank line"
+                        (and blank
+                             (eql (search "HTTP/1.1 200" text :start2 (+ blank 4))
+                                  (+ blank 4)))
+                        t)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close sock))))
+      (multiple-value-bind (status headers) (test-http-request :get "/relay")
+        (check "relay copying the upstream's Transfer-Encoding: answered 500"
+               status 500)
+        (check "relay: no Transfer-Encoding reached the client"
+               (assoc "transfer-encoding" headers :test #'string-equal) nil)))))
+
+(defun test-fetch-then-answers-like-a-handler ()
+  "A fetch :THEN can answer with whatever a handler can, SERVE-STATIC's
+   result included: ask an upstream, then serve a file.
+
+   COMPLETE-FETCH kept its own list of response shapes, and it lacked the
+   one SERVE-STATIC returns for a 200, a HEAD and a 304, a list of
+   segments. FORMAT-RESPONSE met the list and raised a type error, so
+   the request got a 500 that the same value returned from a handler
+   would not have. A Range request got through, because a 206 is a
+   single vector, which made the failure depend on request headers too.
+
+   A :THEN answering with a STREAM-RESPONSE stays a 500, now with a
+   message that says how to relay into a stream."
+  (format t "~%fetch :then answers the way a handler does~%")
+  (let* ((content (sb-ext:string-to-octets "0123456789abcdefghijklmnopqrstuvwxyz"
+                                           :external-format :ascii))
+         (entry (web-skeleton::build-static-response
+                 "text/plain; charset=utf-8" content 0))
+         (saved web-skeleton::*static-cache*)
+         (log (make-string-output-stream))
+         (saved-stream web-skeleton::*log-stream*))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
+           (let ((upstream-port nil))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (let ((path (http-request-path req)))
+                      (cond
+                        ((string= path "/auth") (make-text-response 200 "allowed"))
+                        ((string= path "/stream")
+                         (http-fetch :get (format nil "http://127.0.0.1:~d/auth"
+                                                  upstream-port)
+                                     :then (lambda (s h b)
+                                             (declare (ignore s h b))
+                                             (make-stream-response))))
+                        (t
+                         (http-fetch :get (format nil "http://127.0.0.1:~d/auth"
+                                                  upstream-port)
+                                     :then (lambda (s h b)
+                                             (declare (ignore h b))
+                                             (if (eql s 200)
+                                                 (serve-static req)
+                                                 (make-error-response 403)))))))))
+               (setf upstream-port *test-port*)
+               (multiple-value-bind (status headers body)
+                   (attempt (test-http-request :get "/data.txt"))
+                 (declare (ignore headers))
+                 (check "a :then answering with SERVE-STATIC's result is served"
+                        (list status body)
+                        (list 200 "0123456789abcdefghijklmnopqrstuvwxyz")))
+               (multiple-value-bind (status headers body)
+                   (attempt (test-http-request :head "/data.txt"))
+                 (check "and a HEAD through it gets the head alone"
+                        (list status
+                              (cdr (assoc "content-length" headers :test #'string-equal))
+                              (if (plusp (length body)) body :no-body))
+                        (list 200 "36" :no-body)))
+               (check "control: a Range request through the same :then, a 206"
+                      (attempt (values (test-http-request
+                                        :get "/data.txt"
+                                        :headers '(("range" . "bytes=0-9")))))
+                      206)
+               (check "a :then answering with a stream is still a 500"
+                      (attempt (values (test-http-request :get "/stream")))
+                      500))))
+      (setf web-skeleton::*static-cache* saved
+            web-skeleton::*log-stream* saved-stream))
+    (check "and its log line says how to relay into a stream"
+           (not (null (search "FETCH-INTO" (get-output-stream-string log))))
+           t)))
 
 (defun test-http-response ()
   (format t "~%HTTP Response~%")
@@ -806,9 +1155,9 @@
                                 (sb-ext:octets-to-string
                                  bytes :external-format :utf-8))))
              t))
-    ;; Non-ASCII value — UTF-8 encoded, copied as bytes. Old path
-    ;; crashed on (aref buf pos) := (char-code #\é) = 233 which is
-    ;; fine, but (char-code #\✓) = 10003 exceeded (unsigned-byte 8).
+    ;; Non-ASCII value — UTF-8 encoded, copied as bytes. Storing char
+    ;; codes directly would do for #\é (233) but not for #\✓ (10003),
+    ;; which exceeds (unsigned-byte 8).
     (let* ((bytes (serialize "HTTP/1.1 200 OK" '(("x" . "café ✓")) nil))
            (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
       (check "non-ASCII value UTF-8 encoded"
@@ -847,12 +1196,12 @@
     (check "204: no CL injected"
            (search "content-length" text :test #'char-equal) nil))
 
-  ;; 304 + CL: the bodiless-status exemption must skip the guard.
-  ;; Tests the exemption predicate directly — 304 is in the skip set.
-  (check "304+CL: truncation guard skipped"
-         (let ((status 304))
-           (or (<= 100 status 199) (= status 204) (= status 304)))
-         t)
+  ;; The statuses whose response ends at its blank line, as the
+  ;; serializer and the streaming head read them.
+  (check "status-without-body-p: 1xx, 204 and 304, and nothing else"
+         (mapcar #'web-skeleton::status-without-body-p
+                 '(100 101 199 200 204 205 299 304 404 500))
+         '(t t t nil t nil nil t nil nil))
 
   ;; HEAD byte-vector strip: scan-crlf-crlf + subseq truncates at
   ;; the header boundary, keeping CL in headers but removing body.
@@ -923,19 +1272,20 @@
          (sync (conn response)
            (web-skeleton::sync-close-after-p-from-response conn response)
            (web-skeleton::connection-close-after-p conn)))
-    ;; The inbound read cap used to be *max-body-size* verbatim, so one
-    ;; knob silently moved two budgets: an app tightening the body cap to
-    ;; 32 KiB also capped total request bytes at 32 KiB, and a request
-    ;; with large-but-legal headers died on the buffer with a 400 that
-    ;; blamed the body. Asserted as a strict inequality against the body
-    ;; cap rather than a literal, so the check survives retuned defaults.
+    ;; The inbound read cap is not *max-body-size* verbatim, which would
+    ;; let one knob silently move two budgets: an app tightening the body
+    ;; cap to 32 KiB would also cap total request bytes at 32 KiB, and a
+    ;; request with large-but-legal headers would die on the buffer with
+    ;; a 400 that blamed the body. Asserted as a strict inequality
+    ;; against the body cap rather than a literal, so the check survives
+    ;; retuned defaults.
     (let ((c (make-conn)))
       (check "read cap: inbound leaves room for headers beyond the body"
              (> (web-skeleton::connection-read-cap c)
                 (+ web-skeleton::*max-body-size*
                    web-skeleton::*max-total-header-bytes*))
              t)
-      ;; The tightened-body-cap case the aliasing broke, stated directly:
+      ;; The tightened-body-cap case aliasing would break, stated directly:
       ;; a 32 KiB body budget must still admit a full 64 KiB of headers.
       (let ((web-skeleton::*max-body-size* (* 32 1024)))
         (check "read cap: tight body cap still admits full headers"
@@ -960,10 +1310,10 @@
       (check "sync-close: no Connection header — no-op"
              (sync c (make-text-response 200 "x")) nil))
 
-    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every
-    ;; current call site reaches it with a drained buffer, so the
-    ;; invariant holds by construction — but by construction is a fact
-    ;; about today's callers, not about the function, and the caller who
+    ;; CONNECTION-QUEUE-WRITE is named "queue" but replaces. Every call
+    ;; site reaches it with a drained buffer, so the invariant holds by
+    ;; construction — but by construction is a fact about the callers,
+    ;; not about the function, and the caller who
     ;; gets it wrong would ship a truncated frame followed by a whole
     ;; one, surfacing as a protocol error somewhere unrelated.
     (let ((c (make-conn))
@@ -1011,8 +1361,8 @@
     (let ((r (make-text-response 200 "x")))
       (set-response-header r "connection" "close")
       (check "sync-close: nil inbound is safe"
-             (progn (web-skeleton::sync-close-after-p-from-response nil r)
-                    :ok)
+             (attempt (progn (web-skeleton::sync-close-after-p-from-response nil r)
+                             :ok))
              :ok))))
 
 ;;; ---------------------------------------------------------------------------
@@ -1039,6 +1389,19 @@
            (containsp "Max-Age=3600"
                       (build-cookie "k" "v" :max-age 3600))
            t)
+    ;; The attribute FORMAT writes with ~D, which prints a non-integer as
+    ;; it is. Broken state: the string goes out whole, and its Domain is a
+    ;; second attribute on the cookie.
+    (check-error "build-cookie: a string max-age is refused"
+                 (build-cookie "k" "v" :max-age "3600; Domain=evil.example"))
+    (check-error "build-cookie: a float max-age is refused"
+                 (build-cookie "k" "v" :max-age 3600.5))
+    ;; Zero and negative are integers, and RFC 6265 §5.2.2 gives them a
+    ;; meaning: expire at once. The check is a type, not a range.
+    (check "max-age 0 is rendered"
+           (containsp "Max-Age=0" (build-cookie "k" "v" :max-age 0)) t)
+    (check "max-age -1 is rendered"
+           (containsp "Max-Age=-1" (build-cookie "k" "v" :max-age -1)) t)
     ;; Domain
     (check "domain rendered"
            (containsp "Domain=example.com"
@@ -1134,7 +1497,37 @@
     (check-error "delete-cookie: semicolon in path"
                  (delete-cookie "s" :path "/; Secure"))
     (check-error "delete-cookie: semicolon in domain"
-                 (delete-cookie "s" :domain "evil.com; Secure"))))
+                 (delete-cookie "s" :domain "evil.com; Secure"))
+    ;; Secure on a deletion. A browser refuses a Set-Cookie for a
+    ;; __Secure- or __Host- name without it, deletions included, so the
+    ;; logout of a cookie BUILD-COOKIE made with its defaults was dropped
+    ;; and the session cookie stayed.
+    (check "delete: Secure by default, as build-cookie sets it"
+           (containsp "; Secure" (delete-cookie "session")) t)
+    (check "delete: :secure nil leaves it off"
+           (attempt (delete-cookie "session" :secure nil))
+           "session=; Path=/; Max-Age=0")
+    (check "delete: a __Host- cookie's deletion is one a browser accepts"
+           (delete-cookie "__Host-sid")
+           "__Host-sid=; Path=/; Max-Age=0; Secure")
+    ;; The prefixes' rules, refused where a browser would refuse them.
+    (check-error "delete-cookie: __Host- without Secure"
+                 (delete-cookie "__Host-sid" :secure nil))
+    (check-error "delete-cookie: __Host- with a Domain"
+                 (delete-cookie "__Host-sid" :domain "example.com"))
+    (check-error "delete-cookie: __Host- off the root path"
+                 (delete-cookie "__Host-sid" :path "/app"))
+    (check-error "delete-cookie: __secure-, any case, without Secure"
+                 (delete-cookie "__secure-x" :secure nil))
+    (check-error "build-cookie: __Host- without Secure"
+                 (build-cookie "__Host-sid" "v" :secure nil))
+    (check-error "build-cookie: __Host- off the root path"
+                 (build-cookie "__Host-sid" "v" :path "/app"))
+    (check-error "build-cookie: __Secure- without Secure"
+                 (build-cookie "__Secure-x" "v" :secure nil))
+    (check "build-cookie: a __Host- cookie with the defaults is built"
+           (build-cookie "__Host-sid" "abc123")
+           "__Host-sid=abc123; Path=/; HttpOnly; Secure; SameSite=Lax")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; HTTP client (fetch) tests — pure functions only, no networking
@@ -1247,6 +1640,22 @@
                (web-skeleton::parse-url "http://host:99999/"))
   (check-error "parse-url: port 0 rejected"
                (web-skeleton::parse-url "http://host:0/"))
+  ;; A port is digits alone (RFC 3986 port = *DIGIT). PARSE-INTEGER takes
+  ;; a sign, which would read +80 as 80. It takes surrounding whitespace
+  ;; too, but a space never reaches it: PARSE-URL refuses every byte at
+  ;; or below 0x20 first, which the two space checks pin.
+  (check-error "parse-url: a signed port rejected"
+               (web-skeleton::parse-url "http://host:+80/"))
+  (check-error "parse-url: a space before the port rejected"
+               (web-skeleton::parse-url "http://host: 80/"))
+  (check-error "parse-url: a space after the port rejected"
+               (web-skeleton::parse-url "http://host:80 /"))
+  (check-error "parse-url: a signed port after a v6 literal rejected"
+               (web-skeleton::parse-url "http://[::1]:+80/"))
+  (check-error "parse-url: anything else after a v6 literal rejected"
+               (web-skeleton::parse-url "http://[::1]x/"))
+  (check "parse-url: a plain port still reads"
+         (nth-value 2 (web-skeleton::parse-url "http://host:80/")) 80)
 
   ;; Authority terminates at '?' / '#' (RFC 3986 §3.2 / §3.4) —
   ;; without this, 'http://host?q=1' would parse the whole
@@ -1316,10 +1725,10 @@
     (check "ipv6 host rebracketed default port"
            (not (null (search "host: [2001:db8::1]" text))) t))
   ;; SCHEME exists in this builder for one observable reason: which port
-  ;; counts as default and is therefore left out of the Host header. It
-  ;; had no test, which is how a revert that stopped passing :SCHEME from
-  ;; the async fetch path went unnoticed — the fixture there binds an
-  ;; ephemeral port, where both schemes agree.
+  ;; counts as default and is therefore left out of the Host header. It is
+  ;; asserted here because the async fetch path's fixture binds an
+  ;; ephemeral port, where both schemes agree, so a caller that stopped
+  ;; passing :SCHEME would go unnoticed there.
   (let* ((bytes (web-skeleton::build-outbound-request
                  :GET "example.test" "/" :scheme :https :port 443))
          (text (sb-ext:octets-to-string bytes :external-format :utf-8)))
@@ -1523,51 +1932,31 @@
   ;; would parse as status 200 and masquerade as an HTTP response —
   ;; same shape as the parse-request-bytes version check on the inbound
   ;; side.
+  ;; One parser reads every status line, buffered and streaming, so this
+  ;; list is the whole acceptance set for both.
   (dolist (prefix '("FOOBAR 200 OK"          ; not HTTP
+                    "NOT-HTTP 418 Z"         ; another non-HTTP masquerade
                     "HTTP/2.0 200 OK"        ; wrong major
                     "HTTP/1.2 200 OK"        ; wrong minor
                     "HTTP/1.1  200 OK"       ; double space (missing SP after 1.1)
                     "http/1.1 200 OK"        ; wrong case
                     "HTTP/1.1"               ; no status
+                    "HTTP/1.1 20"            ; two digits
+                    "HTTP/1.1 99 OK"         ; two digits + junk
+                    "HTTP/1.1 600 OK"        ; out of 100-599
+                    "HTTP/1.1 099 OK"        ; out of 100-599
+                    "HTTP/1.1 2OO OK"        ; non-digit
                     ""))
     (let ((buf (sb-ext:string-to-octets
                 (concatenate 'string prefix *crlf*)
                 :external-format :ascii)))
       (check (format nil "status reject ~s" prefix)
              (web-skeleton::parse-response-status buf 0 (length buf)) nil)))
-
-  ;; String-level twin PARSE-STATUS-LINE-STRING is what the streaming
-  ;; path (stream-response-lines, over either transport) delegates to.
-  ;; Its acceptance set MUST match the buffered byte-level parse —
-  ;; without the prefix check, a non-HTTP upstream whose first line
-  ;; contains '<junk> 200' masquerades as HTTP status 200 on the
-  ;; streaming paths only, a parser-disagreement smuggling primitive.
-  ;; Cases parallel the buffered block above — if one parser drifts,
-  ;; both test groups should catch it.
-  (check "string status 200"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 200 OK") 200)
-  (check "string status 404"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 404 Not Found") 404)
-  (check "string status 302 http/1.0"
-         (web-skeleton::parse-status-line-string "HTTP/1.0 302 Found") 302)
-  (check "string status 204 no reason"
-         (web-skeleton::parse-status-line-string "HTTP/1.1 204") 204)
-  (dolist (line '("FUBAR 200 OK"             ; non-HTTP masquerade
-                  "NOT-HTTP 418 Z"           ; another non-HTTP masquerade
-                  "HTTP/2.0 200 OK"          ; wrong major
-                  "HTTP/1.2 200 OK"          ; wrong minor
-                  "HTTP/1.1  200 OK"         ; double space
-                  "http/1.1 200 OK"          ; wrong case
-                  "HTTP/1.1"                 ; no status digits
-                  "HTTP/1.1 20"              ; two digits
-                  "HTTP/1.1 99 OK"           ; two digits + junk
-                  "HTTP/1.1 600 OK"          ; out of 100-599
-                  "HTTP/1.1 099 OK"          ; out of 100-599
-                  "HTTP/1.1 2OO OK"          ; non-digit
-                  ""
-                  nil))
-    (check (format nil "string status reject ~s" line)
-           (web-skeleton::parse-status-line-string line) nil))
+  (let ((buf (sb-ext:string-to-octets
+              (concatenate 'string "HTTP/1.1 204" *crlf*)
+              :external-format :ascii)))
+    (check "status 204 with no reason phrase"
+           (web-skeleton::parse-response-status buf 0 (length buf)) 204))
 
   ;; defer-to-fetch is a thin readability wrapper over http-fetch; check
   ;; that it returns the same continuation the framework recognizes as
@@ -1752,8 +2141,7 @@
       (check "url: ipv6 root path"    path "/"))
     ;; https:// + IP literal is rejected. The covering rejection
     ;; tests live in test-fetch; this is here only to pin down that
-    ;; the DNS helper group's earlier https-with-bracketed-v6 case
-    ;; no longer parses successfully.
+    ;; https with a bracketed v6 host does not parse successfully.
     (check-error "url: https ipv6 rejected"
                  (web-skeleton::parse-url "https://[::1]:8443/v1"))))
 
@@ -1852,24 +2240,66 @@
          (is-public-address-p
           #(#x01 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
 
+  ;; The rest of 2001::/23, IETF Protocol Assignments, which is refused
+  ;; whole as 192.0.0.0/24 is. 2001:3::/32 is AMT and 2001:30::/28 the
+  ;; drone-ID prefix (RFC 9374), both marked reachable by the registry and
+  ;; both protocol machinery rather than anything fetched by URL; 2001:1ff::
+  ;; is the block's last /32. Broken state: the /23 clause is narrowed back
+  ;; to the named prefixes inside it, and these pass as public.
+  (check "v6 2001:3:: AMT, inside 2001::/23, is refused"
+         (is-public-address-p
+          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:30:: drone-ID prefix, inside 2001::/23, is refused"
+         (is-public-address-p
+          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 2001:1ff:: the last of 2001::/23 is refused"
+         (is-public-address-p
+          #(#x20 #x01 #x01 #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
+  ;; Outside global unicast, 2000::/3, nothing is public. A list of
+  ;; exceptions to public answers each of these public, because no clause
+  ;; names it. Broken state: the 2000::/3 test is gone and they pass as
+  ;; public.
+  (check "v6 100:0:0:1:: dummy prefix (RFC 9780) is refused"
+         (is-public-address-p
+          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 64:ff9b:1:: local-use translation (RFC 8215) is refused"
+         (is-public-address-p
+          #(0 #x64 #xff #x9b 0 1 0 0 0 0 0 0 8 8 8 8) :inet6) nil)
+  (check "v6 ::ffff:0:a.b.c.d IPv4-translated is refused"
+         (is-public-address-p
+          #(0 0 0 0 0 0 0 0 #xff #xff 0 0 8 8 8 8) :inet6) nil)
+  (check "v6 5f00:: SRv6 SIDs (RFC 9602) are refused"
+         (is-public-address-p
+          #(#x5f 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 4000::1, reserved space just past 2000::/3, is refused"
+         (is-public-address-p
+          #(#x40 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  (check "v6 1fff:ffff::, reserved space just before 2000::/3, is refused"
+         (is-public-address-p
+          #(#x1f #xff #xff #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+  ;; Inside it, the second documentation block. Broken state: only
+  ;; 2001:db8::/32 is named, and this passes as public.
+  (check "v6 3fff:fff:: documentation (RFC 9637) is refused"
+         (is-public-address-p
+          #(#x3f #xff #x0f #xff 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) nil)
+
   ;; The neighbours, so each clause is the prefix it claims and not a
-  ;; wider match sitting on top of 2001:: or 100::. Without these a
-  ;; too-broad guard would pass every assertion above it.
+  ;; wider match. Without these a too-broad guard would pass every
+  ;; assertion above it: the first address of 2000::/3, the first past
+  ;; 2001::/23, the first past 3fff::/20, and an ordinary allocation.
+  (check "v6 2000::1, the first of 2000::/3, is public"
+         (is-public-address-p
+          #(#x20 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 2001:200::1, the first past 2001::/23, is public"
+         (is-public-address-p
+          #(#x20 #x01 #x02 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
+  (check "v6 3fff:1000::1, the first past 3fff::/20, is public"
+         (is-public-address-p
+          #(#x3f #xff #x10 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
   (check "v6 2001:4860:: is public"
          (is-public-address-p
           #(#x20 #x01 #x48 #x60 0 0 0 0 0 0 0 0 0 0 #x88 #x88) :inet6) t)
-  (check "v6 2001:3:: is public"
-         (is-public-address-p
-          #(#x20 #x01 0 #x03 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
-  ;; A neighbour outside both /28s. 2001:30:: is unallocated space above
-  ;; ORCHIDv2 and is where the too-wide-guard control belongs — the
-  ;; previous control named 2001:20::, which is the reserved prefix itself.
-  (check "v6 2001:30:: is public"
-         (is-public-address-p
-          #(#x20 #x01 0 #x30 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) t)
-  (check "v6 100::/64 neighbour is public"
-         (is-public-address-p
-          #(#x01 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1) :inet6) t)
 
   ;; IPv4-mapped IPv6 — attacker cannot launder 127.0.0.1
   (check "v6 ::ffff:127.0.0.1 mapped loopback"
@@ -1948,6 +2378,257 @@
            (public-via-literal-p "fe80::1") nil)))
 
 ;;; ---------------------------------------------------------------------------
+;;; The configuration table, and errno names
+;;; ---------------------------------------------------------------------------
+
+(defun test-documented-settings-are-exported ()
+  "Every variable README's configuration table lists is external in
+   WEB-SKELETON and bound.
+
+   The table tells an application to SETF these before START-SERVER, and
+   one the package does not export is a reader error when the
+   application loads, under the single colon an application writes. The
+   rows are read from README.md itself, so a row added without its export
+   fails here."
+  (format t "~%Configuration table against the package~%")
+  (let ((names nil))
+    (with-open-file (in (asdf:system-relative-pathname "web-skeleton" "README.md")
+                        :external-format :utf-8)
+      (loop for line = (read-line in nil nil)
+            while line
+            do (when (and (> (length line) 4) (string= "| `*" line :end2 4))
+                 (let ((close (position #\` line :start 3)))
+                   (when close
+                     (pushnew (subseq line 3 close) names :test #'string=))))))
+    (check "settings: the configuration table was read"
+           (> (length names) 20) t)
+    (dolist (name (reverse names))
+      (multiple-value-bind (symbol status)
+          (find-symbol (string-upcase name) :web-skeleton)
+        (check (format nil "settings: ~a is exported and bound" name)
+               (and (eq status :external) (boundp symbol) t)
+               t)))))
+
+(defun test-static-load-measures-first-and-keeps-nothing-it-refuses ()
+  "LOAD-STATIC-FILES refuses a file over :MAX-TOTAL-BYTES by name before
+   reading it, so one larger than any heap gets the cap's error rather
+   than a heap exhaustion. And a load that signals leaves *STATIC-CACHE*
+   as it found it, rather than holding the files walked before the error.
+
+   The large file is sparse, 64 GiB long and holding one byte, so it
+   costs no disk."
+  (format t "~%Static: a load measures first, and keeps nothing it refuses~%")
+  (let* ((dir (format nil "/tmp/wsk-static-cap-~d/"
+                      (random 1000000000 (make-random-state t))))
+         (small (concatenate 'string dir "a.css"))
+         (big (concatenate 'string dir "video.mp4")))
+    (ensure-directories-exist dir)
+    (unwind-protect
+         (progn
+           (with-open-file (s small :direction :output :if-exists :supersede)
+             (write-string "body { color: red }" s))
+           (let ((web-skeleton::*static-cache* (make-hash-table :test #'equal)))
+             (setf (gethash "/kept" web-skeleton::*static-cache*) :kept)
+             ;; The control first: with no large file, a substitutions key
+             ;; that names nothing fails the load after every file has
+             ;; been walked.
+             (check "control: a key naming no file fails the load"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                dir :substitutions '(("nope.js" ("a" . "b"))))
+                               :loaded)
+                      (error () :refused))
+                    :refused)
+             (check "and the files walked before it are not kept"
+                    (%sorted-keys web-skeleton::*static-cache*)
+                    '("/kept"))
+             (with-open-file (s big :direction :output :if-exists :supersede
+                                    :element-type '(unsigned-byte 8))
+               (file-position s (1- (* 64 1024 1024 1024)))
+               (write-byte 0 s))
+             (check "a file larger than the heap is refused by the cap, by name"
+                    (handler-case
+                        (progn (web-skeleton::load-static-files
+                                dir :max-total-bytes 1000)
+                               :loaded)
+                      (storage-condition () :heap-exhausted)
+                      (error (e)
+                        (if (and (search "video.mp4" (princ-to-string e))
+                                 (search "cap" (princ-to-string e)))
+                            :cap
+                            (princ-to-string e))))
+                    :cap)
+             (check "and nothing of that load is kept either"
+                    (%sorted-keys web-skeleton::*static-cache*)
+                    '("/kept"))))
+      (ignore-errors (delete-file big))
+      (ignore-errors (delete-file small))
+      (ignore-errors (sb-ext:delete-directory dir)))))
+
+(defun %sorted-keys (table)
+  "TABLE's keys, sorted."
+  (sort (loop for k being the hash-keys of table collect k) #'string<))
+
+(defun test-a-log-line-escapes-control-characters ()
+  "A log line carries a control character as \\xNN text, so what a client
+   put in a value cannot end the line and forge another, nor reach a
+   terminal as an escape, and a backslash as \\x5C, so a client's own \\x0A
+   is not read as one of them. The Unicode separators and bidirectional
+   controls, which a log viewer may break a line at or reorder it by, are
+   written as \\uXXXX. JSON-PARSE's complaint about an escape
+   followed by a raw line feed is the shape a client can send at will."
+  (format t "~%Log: one call is one line~%")
+  (flet ((logged (thunk)
+           (let ((web-skeleton:*log-stream* (make-string-output-stream))
+                 (web-skeleton:*log-level* :info))
+             (funcall thunk)
+             (get-output-stream-string web-skeleton:*log-stream*))))
+    (let ((text (logged (lambda ()
+                          (handler-case
+                              (web-skeleton:json-parse
+                               (coerce (list #\" #\\ #\Newline #\X #\") 'string))
+                            (error (e) (web-skeleton::log-warn "error fd 9: ~a" e)))))))
+      (check "a line feed from the input does not end the line"
+             (count #\Newline text) 1)
+      (check "it reads as its code"
+             (and (search "\\x0A" text) t) t))
+    (let ((text (logged (lambda ()
+                          (web-skeleton::log-info "a~cb~cc" (code-char 27)
+                                                  (code-char #x9B))))))
+      (check "ESC and a C1 control are written as codes"
+             (and (search "a\\x1Bb\\x9Bc" text) t) t))
+    ;; A client's own \x0A, four characters, is not taken for a line feed.
+    (let ((text (logged (lambda ()
+                          (web-skeleton::log-warn "bad path ~a" "/a\\x0Ab")))))
+      (check "a backslash is written as its code, so \\x is always an escape"
+             (list (and (search "/a\\x5Cx0Ab" text) t)
+                   (and (search "\\x0A" text) t))
+             '(t nil)))
+    ;; A line separator a client sent reaches JSON-PARSE's complaint, which
+    ;; quotes the character it met.
+    (let ((text (logged (lambda ()
+                          (handler-case
+                              (web-skeleton:json-parse
+                               (coerce (list #\[ (code-char #x2028) #\]) 'string))
+                            (error (e) (web-skeleton::log-warn "error fd 9: ~a" e)))))))
+      (check "a line separator from the input is written as its code"
+             (list (and (search "\\u2028" text) t)
+                   (and (find (code-char #x2028) text) t))
+             '(t nil)))
+    (flet ((logged-as (codes)
+             (let ((text (logged (lambda ()
+                                   (web-skeleton::log-info
+                                    "<~a>" (map 'string #'code-char codes))))))
+               (subseq text (1+ (position #\< text)) (position #\> text :from-end t)))))
+      (check "the separators and bidirectional controls are written as \\uXXXX"
+             (logged-as '(#x061C #x200E #x200F #x2028 #x2029 #x202A #x202B
+                          #x202C #x202D #x202E #x2066 #x2067 #x2068 #x2069))
+             (concatenate 'string
+                          "\\u061C\\u200E\\u200F\\u2028\\u2029\\u202A\\u202B"
+                          "\\u202C\\u202D\\u202E\\u2066\\u2067\\u2068\\u2069"))
+      (check "control: their neighbours are written as they are"
+             (logged-as '(#x061B #x200D #x2027 #x202F #x2065 #x206A #xE9))
+             (map 'string #'code-char
+                  '(#x061B #x200D #x2027 #x202F #x2065 #x206A #xE9))))
+    (check "control: a line without one is written as it is"
+           (and (search "plain: 100% ok"
+                        (logged (lambda () (web-skeleton::log-info "plain: 100% ok"))))
+                t)
+           t)))
+
+(defun test-descriptor-limit ()
+  "RAISE-DESCRIPTOR-LIMIT raises the soft limit to what it is asked for,
+   no further and never lower; DESCRIPTORS-WANTED is what the settings
+   need; and DESCRIPTORS-NEARLY-OUT-P answers for the last eighth of the
+   limit it is given, and for nothing when there is none.
+
+   Not raised to the hard limit, which is what START-SERVER does with no
+   *MAX-CONNECTIONS*: where close_range(2) is missing, every child process
+   would then close that many descriptors, the suite's getent lookups
+   among them."
+  (format t "~%Descriptor limit~%")
+  ;; A soft limit at the hard one, as a container commonly starts with,
+  ;; leaves nothing to raise, so the test lowers it by two first: a process
+  ;; may always lower its soft limit, and raise it again as far as the hard
+  ;; one. Raised by one of the two, it stops short of the hard limit, which
+  ;; shows it went where it was asked and no further. The raise is then
+  ;; tested wherever the suite runs, and the limit put back however the
+  ;; test ends.
+  (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
+    (flet ((set-soft (n)
+             (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                      :initial-contents (list n hard))))
+               (sb-sys:with-pinned-objects (buf)
+                 (web-skeleton::%setrlimit web-skeleton::+rlimit-nofile+
+                                           (sb-sys:vector-sap buf))))))
+      (unwind-protect
+           (progn
+             (check "a limit below the soft one leaves it as it is"
+                    (multiple-value-list (web-skeleton::raise-descriptor-limit 1))
+                    (list soft soft))
+             (check "lowered by two, for the test"
+                    (set-soft (- soft 2)) 0)
+             (check "one above it is what the soft limit becomes"
+                    (multiple-value-list (web-skeleton::raise-descriptor-limit (1- soft)))
+                    (list (1- soft) (- soft 2)))
+             (check "as the kernel reports it, the hard limit unchanged"
+                    (multiple-value-list (web-skeleton::descriptor-limits))
+                    (list (1- soft) hard)))
+        (set-soft soft))))
+  (let ((web-skeleton::*max-connections* 10000))
+    (check "four workers at the default connection limit want 46,080"
+           (web-skeleton::descriptors-wanted 4) 46080))
+  (let ((web-skeleton::*max-connections* 0))
+    (check "no connection limit wants the hard limit"
+           (web-skeleton::descriptors-wanted 4) nil))
+  (check "close_range is asked about without error"
+         (typep (web-skeleton::close-range-available-p) 'boolean) t)
+  (let ((web-skeleton::*descriptor-limit* 1024))
+    (check "below the last eighth, a descriptor is not short"
+           (web-skeleton::descriptors-nearly-out-p 895) nil)
+    (check "in it, it is" (web-skeleton::descriptors-nearly-out-p 896) t))
+  (let ((web-skeleton::*descriptor-limit* nil))
+    (check "with no limit recorded, nothing is short"
+           (web-skeleton::descriptors-nearly-out-p 100000) nil)))
+
+(defun test-errno-names ()
+  "ERRNO-NAME's numbers are the C library's. Each is checked against
+   strerror's text for that number, the reference the platform itself
+   provides, so a transposed number, ENFILE's for EMFILE's say, cannot
+   name the wrong failure in a log line unnoticed."
+  (format t "~%errno names against strerror~%")
+  (dolist (case '((1 "EPERM" "Operation not permitted")
+                  (2 "ENOENT" "No such file or directory")
+                  (4 "EINTR" "Interrupted system call")
+                  (9 "EBADF" "Bad file descriptor")
+                  (11 "EAGAIN" "Resource temporarily unavailable")
+                  (12 "ENOMEM" "Cannot allocate memory")
+                  (13 "EACCES" "Permission denied")
+                  (17 "EEXIST" "File exists")
+                  (22 "EINVAL" "Invalid argument")
+                  (23 "ENFILE" "Too many open files in system")
+                  (24 "EMFILE" "Too many open files")
+                  (28 "ENOSPC" "No space left on device")
+                  (32 "EPIPE" "Broken pipe")
+                  (98 "EADDRINUSE" "Address already in use")
+                  (99 "EADDRNOTAVAIL" "Cannot assign requested address")
+                  (101 "ENETUNREACH" "Network is unreachable")
+                  (103 "ECONNABORTED" "Software caused connection abort")
+                  (104 "ECONNRESET" "Connection reset by peer")
+                  (105 "ENOBUFS" "No buffer space available")
+                  (107 "ENOTCONN" "Transport endpoint is not connected")
+                  (110 "ETIMEDOUT" "Connection timed out")
+                  (111 "ECONNREFUSED" "Connection refused")
+                  (113 "EHOSTUNREACH" "No route to host")
+                  (115 "EINPROGRESS" "Operation now in progress")))
+    (destructuring-bind (n name text) case
+      (check (format nil "errno ~d is ~a" n name)
+             (list (web-skeleton::errno-name n) (sb-int:strerror n))
+             (list name text))))
+  (check "errno: an unnamed one reads as its number"
+         (web-skeleton::errno-string 200) "errno 200"))
+
+;;; ---------------------------------------------------------------------------
 ;;; Peer address formatter — both families
 ;;; ---------------------------------------------------------------------------
 
@@ -1971,12 +2652,21 @@
          (web-skeleton::format-peer-addr
           #(#x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 80)
          "[2001:db8:0:0:0:0:0:1]:80")
+  ;; An IPv4 peer on an IPv6 wildcard listener arrives v4-mapped, and is
+  ;; logged with its IPv4 address readable: RFC 4291's x:x:x:x:x:x:d.d.d.d.
+  (check "v6: a v4-mapped peer keeps its dotted quad"
+         (web-skeleton::format-peer-addr
+          #(0 0 0 0 0 0 0 0 0 0 #xff #xff 127 0 0 1) 8080)
+         "[0:0:0:0:0:ffff:127.0.0.1]:8080")
+  (check "v6: an address merely ending in ffff and four bytes is not mapped"
+         (web-skeleton::format-ip #(0 0 0 0 0 0 0 0 0 1 #xff #xff 127 0 0 1))
+         "0:0:0:0:1:ffff:7f00:1")
   ;; Neither length — the fallback both functions share.
   (check "unknown length"
          (web-skeleton::format-peer-addr #(1 2 3) 80)
          "<addr>:80")
-  ;; FORMAT-PEER-ADDR is now FORMAT-IP plus brackets and a port, rather
-  ;; than a second implementation of the same sixteen-byte walk. Asserted
+  ;; FORMAT-PEER-ADDR is FORMAT-IP plus brackets and a port, rather than
+  ;; a second implementation of the same sixteen-byte walk. Asserted
   ;; as a relationship so the two cannot drift back apart: a log line
   ;; disagreeing with an address-filter decision about what an address
   ;; even looks like is a miserable thing to debug.
@@ -1997,10 +2687,9 @@
 
 (defun test-parse-error-status ()
   (format t "~%Parse error status codes~%")
-  ;; Every parse failure used to answer 400, including ones the framework
-  ;; understood perfectly and refused on their merits. 413 / 414 / 431
-  ;; were already in *status-reasons* and unreachable for exactly that
-  ;; reason. These assert the status the condition carries, which is what
+  ;; A parse failure is not always a 400: one the framework understands
+  ;; perfectly and refuses on its merits gets its own status — 413, 414,
+  ;; 431. These assert the status the condition carries, which is what
   ;; HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE.
   (flet ((status-of (thunk)
            (handler-case (progn (funcall thunk) :no-error)
@@ -2064,6 +2753,29 @@
                         (let ((b (req "PROPFIND / HTTP/1.1")))
                           (web-skeleton::parse-request-bytes b 0 (length b)))))
            501)
+    ;; 400 — a method that is not a token is malformed rather than
+    ;; unimplemented (RFC 9110 §9.1), whatever its bytes decode to. The
+    ;; first two differ only in being UTF-8: refused anywhere past the
+    ;; method, where the 501's message decodes it, they would part, 501
+    ;; and 400.
+    (flet ((method-then (&rest method-bytes)
+             (concatenate '(simple-array (unsigned-byte 8) (*))
+                          method-bytes (req " / HTTP/1.1"))))
+      (check "a method holding UTF-8 is 400, not 501"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 #xC3 #x89 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400)
+      (check "a method holding a byte that is not UTF-8 is 400"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 #xFF 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400)
+      (check "a method holding a delimiter is 400"
+             (status-of (lambda ()
+                          (let ((b (method-then 71 40 84)))
+                            (web-skeleton::parse-request-bytes b 0 (length b)))))
+             400))
     ;; 414 — the only part of a request line a client can grow at will is
     ;; the URI.
     (check "over-long request line is 414"
@@ -2175,6 +2887,24 @@
          (parse-query-string "")
          nil)
 
+  ;; An empty segment is no pair, as the WHATWG form parser skips it;
+  ;; "=" is one, an empty name with an empty value.
+  (check "a trailing & adds nothing"
+         (parse-query-string "a=1&")
+         '(("a" . "1")))
+  (check "a doubled & adds nothing"
+         (parse-query-string "a=1&&b=2")
+         '(("a" . "1") ("b" . "2")))
+  (check "a leading & adds nothing"
+         (parse-query-string "&a=1")
+         '(("a" . "1")))
+  (check "& alone is no pairs"
+         (parse-query-string "&")
+         nil)
+  (check "= alone is an empty name and value"
+         (parse-query-string "=")
+         '(("" . "")))
+
   ;; get-query-param via a parsed request
   (let ((req (parse-request (crlf "GET /search?q=common%20lisp&page=3 HTTP/1.1"
                                   "Host: localhost"))))
@@ -2231,7 +2961,92 @@
 
   (check "literal mismatch with capture"
          (match-path "/api/users/:id" "/api/posts/99")
-         nil))
+         nil)
+
+  ;; Literals are compared with the path as it arrived unless
+  ;; *MATCH-PATH-LITERALS* says :DECODED. /%61dmin is /admin to RFC 3986
+  ;; and not to a prefix check on HTTP-REQUEST-PATH, so by default the
+  ;; router reads the path the way the application's own checks do.
+  (check "literals: :exact is the default"
+         web-skeleton:*match-path-literals* :exact)
+  (check "literals :exact: an escaped spelling does not match"
+         (match-path "/admin" "/%61dmin") nil)
+  (check "literals :exact: nor does one escaped in a longer pattern"
+         (match-path "/admin/:id" "/%61dmin/7") nil)
+  (check "literals :exact: a non-ASCII literal is written as it arrives"
+         (match-path "/caf%C3%A9" "/caf%C3%A9") t)
+  (check "literals :exact: and its decoded spelling does not match"
+         (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") nil)
+  ;; The punctuation a page's encodeURIComponent escapes reads either way,
+  ;; on both sides, as CANONICAL-PATH says, and only that punctuation; an
+  ;; escape's hex digits read in either case.
+  (check "literals :exact: an escaped bracket matches the literal one"
+         (match-path "/chunks/[id].js" "/chunks/%5Bid%5D.js") t)
+  (check "literals :exact: and a pattern may be written escaped"
+         (match-path "/chunks/%5Bid%5D.js" "/chunks/[id].js") t)
+  (check "literals :exact: every sub-delim and : @ read either way"
+         (match-path "/a!$&'()*+,;=:@b" "/a%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40b") t)
+  ;; RFC 3986 §2.1: the case of an escape's hex digits is no part of the
+  ;; URI. A proxy re-encoding in lowercase names the same path.
+  (check "literals :exact: lowercase hex is the same spelling"
+         (match-path "/chunks/[id].js" "/chunks/%5bid%5d.js") t)
+  (check "literals :exact: and so is a lowercase non-ASCII escape"
+         (match-path "/caf%C3%A9" "/caf%c3%a9") t)
+  (check "literals :exact: in a pattern too"
+         (match-path "/caf%c3%A9" "/caf%C3%a9") t)
+  (check "literals :exact: but an escaped letter in lowercase hex still does not match"
+         (match-path "/jobs" "/%6aobs") nil)
+  (check "literals :exact: an escaped slash stays inside its segment"
+         (match-path "/a/b" "/a%2Fb") nil)
+  (check "literals :exact: in lowercase hex too"
+         (match-path "/a/b" "/a%2fb") nil)
+  (check "canonical-path: decodes only that punctuation, in either case"
+         (web-skeleton:canonical-path "/%5Bx%5D/%61%2F%25%20%3a")
+         "/[x]/%61%2F%25%20:")
+  (check "canonical-path: every other escape has its hex in uppercase"
+         (web-skeleton:canonical-path "/caf%c3%a9/%2e%2f%6a%Ab")
+         "/caf%C3%A9/%2E%2F%6A%AB")
+  (check "canonical-path: a % that starts no escape is left as it is"
+         (web-skeleton:canonical-path "/100%/%g1/%a")
+         "/100%/%g1/%a")
+  (check "canonical-path: a path with no escape is returned as is"
+         (let ((p "/plain/path")) (eq (web-skeleton:canonical-path p) p))
+         t)
+  (check "literals :exact: an escape that is not UTF-8 fails, not raises"
+         (attempt (match-path "/admin" "/%FF")) nil)
+  (check "literals :exact: a capture is still decoded"
+         (match-path "/files/:name" "/files/hello%20world")
+         '(("name" . "hello world")))
+  (let ((web-skeleton:*match-path-literals* :decoded))
+    (check "literals :decoded: an escaped spelling matches"
+           (match-path "/admin" "/%61dmin") t)
+    (check "literals :decoded: a non-ASCII literal matches its escapes"
+           (match-path (format nil "/caf~c" (code-char #xE9)) "/caf%C3%A9") t)
+    (check "literals :decoded: a capture is decoded as under :exact"
+           (match-path "/files/:name" "/files/hello%20world")
+           '(("name" . "hello world"))))
+  (let ((web-skeleton:*match-path-literals* :decode))
+    (check "literals: a value that is neither is refused"
+           (stringp (attempt (match-path "/admin" "/admin")))
+           t)))
+
+(defun test-match-path-literals-validated-at-boot ()
+  "START-SERVER refuses a *MATCH-PATH-LITERALS* that is neither :EXACT nor
+   :DECODED before it binds.
+
+   MATCH-PATH reads the variable on every call, so a typo would fail every
+   routed request rather than the boot. The :HOST is invalid for the
+   reason TEST-FETCH-TIMEOUT-VALIDATED-AT-BOOT gives: if the check is
+   reverted, MAKE-TCP-LISTENER refuses the host by name instead of a real
+   server starting inside the suite, and the message says which refusal
+   it was."
+  (format t "~%start-server: *match-path-literals* is checked at boot~%")
+  (let ((web-skeleton:*match-path-literals* :decode))
+    (check "boot: a *match-path-literals* that is neither is refused by name"
+           (let ((msg (attempt (web-skeleton:start-server
+                                :host #(1 2 3) :port 0 :workers 1))))
+             (and (stringp msg) (search "*match-path-literals*" msg) t))
+           t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Streaming fetch tests (no network — in-memory byte stream mock)
@@ -2285,27 +3100,25 @@
 
 (defun %response-corpus ()
   "Response byte-strings covering every framing the line reader decides
-   between, each with the result TLS-STREAM-RESPONSE produced for it.
-   Entries are (NAME METHOD BYTES EXPECTED).
+   between, each with its expected result. Entries are
+   (NAME METHOD BYTES EXPECTED).
 
-   EXPECTED is recorded, not derived. It was captured from
-   TLS-STREAM-RESPONSE through its READ-FN seam while that function still
-   existed, at all three granularities below, which agreed — so a single
-   recorded triple is not a lie about any of them. That capture is what
-   makes the deletion of ~450 lines checkable rather than hopeful, and it
-   is the whole reason the seam was put there."
+   EXPECTED is recorded, not derived: each triple is what an independent
+   implementation of this reader produced for the bytes, at all three
+   granularities below, which agreed — so a single recorded triple is not
+   a lie about any of them. The reader under test is held to an answer it
+   did not compute."
   (let* ((cr (string #\Return))
          (lf (string #\Newline))
          (crlf (concatenate 'string cr lf)))
     (flet ((raw (&rest parts)
              (ascii-bytes (apply #'concatenate 'string parts))))
       (list
-       ;; Byte counts here are load-bearing and were wrong once: a
-       ;; Content-Length longer than its body, or a chunk-size that
-       ;; misdescribes its chunk, makes the case test truncation under
-       ;; the name of the happy path. Three of these did, and the parity
-       ;; run still passed, because both readers agreed about the error.
-       ;; Count them.
+       ;; Byte counts here are load-bearing: a Content-Length longer
+       ;; than its body, or a chunk-size that misdescribes its chunk,
+       ;; makes the case test truncation under the name of the happy
+       ;; path — and a parity run still passes, because both readers
+       ;; agree about the error. Count them.
        (list "content-length" :GET               ; "one\ntwo\n" = 8
              (raw "HTTP/1.1 200 OK" crlf "Content-Length: 8" crlf crlf
                   "one" lf "two" lf)
@@ -2355,10 +3168,10 @@
   "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
    Returns (STATUS LINES RAISED-P).
 
-   RAISED-P rather than the condition text. The recorded expectations came
-   from a different implementation, which worded its truncation errors
-   differently; the claim under test is that the verdict and the lines
-   delivered before it survived the replacement, not the phrasing."
+   RAISED-P rather than the condition text. The recorded expectations come
+   from an independent implementation that words its truncation errors
+   its own way; the claim under test is the verdict and the lines
+   delivered before it, not the phrasing."
   (let ((lines nil))
     (handler-case
         (let ((status (web-skeleton::stream-response-lines
@@ -2371,16 +3184,21 @@
 
 (defun test-line-reader-over-read-fn ()
   "STREAM-RESPONSE-LINES over a READ-FN reproduces, on every framing and
-   at three byte-source granularities, what the deleted
-   TLS-STREAM-RESPONSE produced for the same bytes.
+   at three byte-source granularities, the recorded result for the same
+   bytes.
 
    The granularities are the part with teeth. READ-SEQUENCE fills a whole
    buffer, so a corpus driven only through a stream never splits a token
    across two fills and the reader's refill-and-resume paths go
    unexercised; :CHUNK 1 puts a boundary between every pair of bytes.
-   Measured: disabling the CRLF-straddle refill in READER-READ-LINE
-   leaves all ten whole-response cases passing and the rest of the suite
-   green, while failing nine of ten at :CHUNK 1."
+
+   The corpus's body lines end in bare LF or CR, so it never asks
+   READER-READ-LINE to join a CRLF split across two fills, and the head,
+   where every line ends in CRLF, is READER-READ-HEAD's. The CRLF body
+   case after the corpus is what does. Its expectation is stated rather
+   than recorded. Disabling the CRLF-straddle refill in READER-READ-LINE
+   leaves the whole corpus and the rest of the suite green, and fails
+   that case at :CHUNK 7 and :CHUNK 1."
   (format t "~%Shared line reader over a byte-source function~%")
   (dolist (chunk '(nil 7 1))
     (dolist (entry (%response-corpus))
@@ -2389,7 +3207,165 @@
                        (if chunk (format nil "chunk ~d" chunk) "whole")
                        name)
                (%run-line-reader raw method chunk)
-               expected)))))
+               expected))))
+  ;; At one byte per fill every CR is the last byte of its fill and its LF
+  ;; the first of the next, so the refill is all that keeps the pair one
+  ;; terminator rather than a line and an empty one.
+  (let* ((crlf (format nil "~c~c" #\Return #\Newline))
+         (raw (ascii-bytes (concatenate 'string
+                                        "HTTP/1.1 200 OK" crlf
+                                        "Content-Type: text/plain" crlf crlf
+                                        "one" crlf "two" crlf))))
+    (dolist (chunk '(nil 7 1))
+      (check (format nil "CRLF body lines [~a]"
+                     (if chunk (format nil "chunk ~d" chunk) "whole"))
+             (%run-line-reader raw :GET chunk)
+             '(200 ("one" "two") nil)))))
+
+(defun %latin-1-bytes (&rest parts)
+  "PARTS concatenated and encoded one byte per character, so a test can
+   write any byte as the character with that code."
+  (sb-ext:string-to-octets (apply #'concatenate 'string parts)
+                           :external-format :latin-1))
+
+(defun test-upstream-field-values ()
+  "An upstream's field value that is not UTF-8 is read as Latin-1, where a
+   request's is refused.
+
+   Obs-text is legal in a field value (RFC 9110 §5.5), and a Latin-1
+   Content-Disposition is the shape legacy servers send. Both sides keep
+   refusing what the policy is not about: a CTL in a value and a separator
+   in a name are framing, not charset."
+  (format t "~%Upstream field values: UTF-8, else Latin-1~%")
+  (let* ((crlf (format nil "~c~c" #\Return #\Newline))
+         (e9 (string (code-char #xE9)))
+         (filename (concatenate 'string "attachment; filename=\"r" e9
+                                "sum.pdf\""))
+         (field (%latin-1-bytes "Content-Disposition: " filename crlf crlf)))
+    ;; ATTEMPT answers a refusal as its text, so a string here is a raise.
+    (flet ((response-headers (buf)
+             (attempt (web-skeleton::parse-headers-bytes
+                       buf 0 (length buf) :invalid-utf-8 :latin-1)))
+           (value-of (result name)
+             ;; NIL for a refusal, so a raise fails the check that reads
+             ;; it rather than the ASSOC.
+             (when (listp result)
+               (cdr (assoc name result :test #'string=)))))
+      ;; The request side, unchanged: the same byte is refused.
+      (check "request field: a byte that is not UTF-8 is refused"
+             (let ((r (attempt (web-skeleton::parse-headers-bytes
+                                field 0 (length field)))))
+               (and (stringp r) (search "invalid UTF-8 in request" r) t))
+             t)
+      (let ((value (value-of (response-headers field) "content-disposition")))
+        (check "response field: a Latin-1 byte reads as its character"
+               value filename)
+        (check "response field: the Latin-1 reading gives the bytes back"
+               (and (stringp value)
+                    (equalp (sb-ext:string-to-octets
+                             value :external-format :latin-1)
+                            (subseq field 21 (- (length field) 4))))
+               t))
+      ;; Valid UTF-8 is read as UTF-8: C3 A9 is one é, not two characters.
+      (check "response field: valid UTF-8 reads as UTF-8, not byte by byte"
+             (value-of (response-headers
+                        (%latin-1-bytes "X-Name: caf" (string (code-char #xC3))
+                                        (string (code-char #xA9)) crlf crlf))
+                       "x-name")
+             (concatenate 'string "caf" e9))
+      (check "response field: a CTL in a value is still refused"
+             (stringp (response-headers
+                       (%latin-1-bytes "X-Name: a" (string (code-char 1)) "b"
+                                       crlf crlf)))
+             t)
+      (check "response field: a separator in a name is still refused"
+             (stringp (response-headers
+                       (%latin-1-bytes "X(Name): v" crlf crlf)))
+             t)
+      ;; The function both outbound paths read a head with.
+      (check "response head: status, the Latin-1 value and the framing"
+             (attempt
+               (let ((head (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                           "Content-Disposition: " filename
+                                           crlf "Content-Length: 2" crlf crlf)))
+                 (multiple-value-bind (status headers chunked-p te cl)
+                     (web-skeleton::parse-response-head
+                      head 0 (- (length head) 4))
+                   (list status
+                         (cdr (assoc "content-disposition" headers
+                                     :test #'string=))
+                         chunked-p te cl))))
+             (list 200 filename nil nil 2)))))
+
+(defun test-streaming-fetch-reads-the-buffered-head ()
+  "The streaming fetch reads a response head the way the buffered fetch
+   does, by handing it to the function COMPLETE-FETCH calls.
+
+   Each head below is answered alike by both paths, where a line-by-line
+   string reader would answer each one differently: it would end a line
+   at a bare LF, pass a CTL or a separator in a field it does not
+   inspect, take a head cut off by end of stream as finished, deliver the
+   body of a response whose status line is not HTTP's before refusing it,
+   and fail a Latin-1 value outright. Each case is run whole and at one
+   byte per fill, because READER-READ-HEAD finds the CRLFCRLF across
+   fills."
+  (format t "~%Streaming fetch reads the head the buffered fetch reads~%")
+  (let* ((cr (string #\Return))
+         (lf (string #\Newline))
+         (crlf (concatenate 'string cr lf))
+         (e9 (string (code-char #xE9))))
+    ;; (NAME BYTES STREAMED BUFFERED). STREAMED is %RUN-LINE-READER's
+    ;; (STATUS LINES RAISED-P). BUFFERED is the buffered path's view of
+    ;; the same bytes: the status of a head it finds and reads, :NO-HEAD
+    ;; for one it never finds — COMPLETE-FETCH answers that 502 at end of
+    ;; stream — or :REFUSED.
+    (dolist (spec
+             (list
+              (list "a Latin-1 value is read, not refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "Content-Disposition: r" e9 "sum" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(200 ("ok") nil) 200)
+              (list "a head of bare LFs never ends"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" lf
+                                    "Content-Type: text/plain" lf lf "ok" lf)
+                    '(nil nil t) :no-head)
+              (list "a CTL in a value is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "X-A: a" (string (code-char 1)) "b" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(nil nil t) :refused)
+              (list "a separator in a name is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf "X(A): v" crlf
+                                    "Content-Length: 3" crlf crlf "ok" lf)
+                    '(nil nil t) :refused)
+              (list "a head cut off by end of stream is refused"
+                    (%latin-1-bytes "HTTP/1.1 200 OK" crlf
+                                    "Content-Type: text/plain" crlf)
+                    '(nil nil t) :no-head)
+              (list "a status line that is not HTTP's is refused first"
+                    (%latin-1-bytes "FOO 200 OK" crlf crlf "body" lf)
+                    '(nil nil t) :refused)))
+      (destructuring-bind (name raw streamed buffered) spec
+        (dolist (chunk '(nil 1))
+          (check (format nil "streaming head [~a]: ~a"
+                         (if chunk "byte by byte" "whole") name)
+                 (%run-line-reader raw :GET chunk)
+                 streamed))
+        (check (format nil "buffered head: ~a" name)
+               (let ((header-end (web-skeleton::scan-crlf-crlf
+                                  raw 0 (length raw))))
+                 (if (null header-end)
+                     :no-head
+                     ;; A string is ATTEMPT's answer for a raise.
+                     (let ((r (attempt
+                                (multiple-value-list
+                                 (web-skeleton::parse-response-head
+                                  raw 0 header-end)))))
+                       (if (or (stringp r) (null (first r)))
+                           :refused
+                           (first r)))))
+               buffered)))))
 
 (defun test-streaming-fetch ()
   (format t "~%Streaming Fetch~%")
@@ -2588,14 +3564,14 @@
   ;; that would never arrive. Symmetric with complete-fetch's
   ;; exempt set on the buffered path.
   ;;
-  ;; 1xx deliberately does NOT appear here. It used to: 100 and 199
-  ;; were listed as "bodiless" and the reader returned them as the
-  ;; final status. That was the A1 defect — RFC 7231 §6.2 makes a 1xx
-  ;; interim by definition, so an upstream that sends one and then
-  ;; closes has not delivered a response at all, and reporting 103 as
-  ;; the result silently discards the real one. Interim handling is
-  ;; covered by TEST-INTERIM-RESPONSES, which asserts both that a 1xx
-  ;; is stepped over and that a lone 1xx followed by EOF raises.
+  ;; 1xx deliberately does NOT appear here. Listed as "bodiless", a
+  ;; 1xx would be returned by the reader as the final status — but
+  ;; RFC 7231 §6.2 makes a 1xx interim by definition, so an upstream
+  ;; that sends one and then closes has not delivered a response at
+  ;; all, and reporting 103 as the result silently discards the real
+  ;; one. Interim handling is covered by TEST-INTERIM-RESPONSES,
+  ;; which asserts both that a 1xx is stepped over and that a lone
+  ;; 1xx followed by EOF raises.
   (dolist (spec '((204 "Content-Length: 500")
                   (304 "Content-Length: 500")
                   (304 "Transfer-Encoding: chunked")))
@@ -2667,10 +3643,10 @@
 
   ;; Chunk-size line terminator strictness — reader-read-crlf-line
   ;; rejects bare LF and bare CR on the size line itself (RFC 7230
-  ;; §4.1). Before the fix, the lenient reader-read-line accepted
-  ;; any of CR / LF / CRLF; streaming decoded "5\nhello\n0\n\n" as
-  ;; valid while the buffered decode-chunked-body rejected the same
-  ;; bytes — a parser-disagreement primitive.
+  ;; §4.1). A lenient line reader accepting any of CR / LF / CRLF
+  ;; would decode "5\nhello\n0\n\n" as valid on the streaming path
+  ;; while the buffered decode-chunked-body rejected the same bytes —
+  ;; a parser-disagreement primitive.
   (let* ((raw (ascii-bytes (concatenate 'string
                 "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
                 "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
@@ -2691,8 +3667,8 @@
       (close stream)))
 
   ;; Bare CR inside a chunk-size line — CR not followed by LF is
-  ;; malformed. "5\rhello..." would previously have been read as
-  ;; chunk-size "5" with "hello" silently becoming chunk-data.
+  ;; malformed. Read leniently, "5\rhello..." would be chunk-size "5"
+  ;; with "hello" silently becoming chunk-data.
   (let* ((raw (ascii-bytes (concatenate 'string
                 "HTTP/1.1 200 OK" (string #\Return) (string #\Newline)
                 "Transfer-Encoding: chunked" (string #\Return) (string #\Newline)
@@ -2849,10 +3825,10 @@
 ;;;
 ;;; The framing predicate has to skip too. An interim carries no
 ;;; Content-Length, so anchoring on it makes a CL-framed 200 look
-;;; close-delimited — which is how the fetch used to hang for the full
-;;; *FETCH-TIMEOUT* against any upstream that keeps the connection alive.
-;;; The regression cases below (plain 200, 204, partial interim) matter as
-;;; much as the fix cases.
+;;; close-delimited — and the fetch would hang for the full *FETCH-TIMEOUT*
+;;; against any upstream that keeps the connection alive. The regression
+;;; cases below (plain 200, 204, partial interim) matter as much as the
+;;; interim cases.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-interim-responses ()
@@ -3067,7 +4043,8 @@
     (check "chunked decode empty" (length decoded) 0))
 
   ;; Truncation — no zero-size terminator (MITM RST mid-stream).
-  ;; The old decoder silently returned the partial body; now raise.
+  ;; Returning the partial body would pass a truncation off as the whole;
+  ;; the decoder raises.
   (let ((raw (ascii-bytes (concatenate 'string
                 "5" (string #\Return) (string #\Newline)
                 "hello" (string #\Return) (string #\Newline)))))
@@ -3153,12 +4130,12 @@
           '(("transfer-encoding" . "gzip")
             ("transfer-encoding" . "identity"))) nil)
 
-  ;; parse-chunked-size-line — shared by stream-chunked-lines and the
-  ;; buffered decode-chunked-body. Strict hex,
-  ;; strips chunk-extensions from ';' onwards, raises on garbage.
-  ;; A permissive :junk-allowed shape would accept 'xyz' as NIL
-  ;; (silently exit the decoder loop) and '-5' as -5 (same) — a
-  ;; parser-disagreement smuggling primitive against any stricter
+  ;; parse-chunked-size-line — the size parser stream-chunked-lines uses;
+  ;; the buffered readers share parse-chunk-size-bytes, which reads the
+  ;; same grammar. Strict hex, strips chunk-extensions from ';' onwards,
+  ;; raises on garbage. A permissive :junk-allowed shape would accept
+  ;; 'xyz' as NIL (silently exit the decoder loop) and '-5' as -5 (same)
+  ;; — a parser-disagreement smuggling primitive against any stricter
   ;; downstream.
   (check "chunked size: plain hex"
          (web-skeleton::parse-chunked-size-line "a0") 160)
@@ -3212,6 +4189,46 @@
     (check "ws-upgrade: valid base64 key accepted"
            (not (null (web-skeleton::websocket-upgrade-p
                        (ws-req "dGhlIHNhbXBsZSBub25jZQ==")))) t)
+    ;; Repeated fields. Connection and Upgrade are one comma list across
+    ;; every field of the name, so a proxy's own Connection: keep-alive
+    ;; ahead of the client's Connection: Upgrade still upgrades. The key
+    ;; and the version must be single: with two keys, which one the accept
+    ;; is computed from depends on the reader.
+    (flet ((with-headers (headers)
+             (web-skeleton::websocket-upgrade-p
+              (make-test-request :method :GET :headers headers))))
+      (let ((key '("sec-websocket-key" . "dGhlIHNhbXBsZSBub25jZQ=="))
+            (version '("sec-websocket-version" . "13")))
+        (check "ws-upgrade: Connection: Upgrade in a later field is read"
+               (and (with-headers (list '("host" . "localhost")
+                                        '("connection" . "keep-alive")
+                                        '("connection" . "Upgrade")
+                                        '("upgrade" . "websocket")
+                                        key version))
+                    t)
+               t)
+        (check "ws-upgrade: so is Upgrade: websocket in a later field"
+               (and (with-headers (list '("host" . "localhost")
+                                        '("connection" . "Upgrade")
+                                        '("upgrade" . "h2c")
+                                        '("upgrade" . "websocket")
+                                        key version))
+                    t)
+               t)
+        (check "ws-upgrade: a second Sec-WebSocket-Key refuses the upgrade"
+               (with-headers (list '("host" . "localhost")
+                                   '("connection" . "Upgrade")
+                                   '("upgrade" . "websocket")
+                                   key
+                                   '("sec-websocket-key" . "AAAAAAAAAAAAAAAAAAAAAA==")
+                                   version))
+               nil)
+        (check "ws-upgrade: so does a second Sec-WebSocket-Version"
+               (with-headers (list '("host" . "localhost")
+                                   '("connection" . "Upgrade")
+                                   '("upgrade" . "websocket")
+                                   key version version))
+               nil)))
     ;; 24 chars including one non-ASCII — passes the length check so
     ;; the charset check is actually exercised (not short-circuited).
     (check "ws-upgrade: non-ASCII in key rejected"
@@ -3230,9 +4247,8 @@
            nil)
     ;; The key is base64 over 16 fixed bytes, so its shape is fully
     ;; determined: 22 data characters then exactly "==". A flat alphabet
-    ;; sweep across all 24 admits '=' at any position, which accepted 24
-    ;; of them — while the comment above the loop claimed the positional
-    ;; strictness the loop did not have.
+    ;; sweep across all 24 admits '=' at any position, so it would accept
+    ;; 24 of them.
     (check "ws-upgrade: all-padding key rejected"
            (web-skeleton::websocket-upgrade-p
             (ws-req "========================"))
@@ -3250,13 +4266,13 @@
             (ws-req "dGhlIHNhbXBsZSBub25jZQA="))
            nil))
 
-  ;; *write-stall-timeout* used to document 0 as "disable", which set no
-  ;; deadline and left the write loop with no exit — a peer that stopped
-  ;; draining its receive window pinned the worker permanently, and the
-  ;; worker is every other connection on it, not just this one. An empty
-  ;; frame is used so the loop body never runs and no fd is touched:
-  ;; before the guard, 0 with nothing to write returned normally.
-  (let ((conn (web-skeleton::make-connection :fd -1 :last-active 0))
+  ;; *write-stall-timeout* 0 is refused, never read as "disable": with no
+  ;; deadline, a peer that stopped draining its receive window could hold
+  ;; a full backlog forever. An empty frame is used so no fd is touched
+  ;; and the guard is the only thing that can signal: without it, 0 with
+  ;; nothing to write would return normally.
+  (let ((conn (web-skeleton::make-connection :fd -1 :state :websocket
+                                             :last-active 0))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (check "ws-send: zero timeout refused"
            (let ((*write-stall-timeout* 0))
@@ -3277,10 +4293,10 @@
                (error () :error)))
            :sent))
 
-  ;; build-ws-close only accepts the send-allowed set per RFC 6455
-  ;; §7.4.1: 1000-1003, 1007-1014, 3000-4999. Clamp-on-receive is
-  ;; interop-friendly; send-strict is symmetric with the RFC's MUST
-  ;; NOT on 1004/1005/1006/1015.
+  ;; build-ws-close only accepts the set a close frame may carry, per RFC
+  ;; 6455 §7.4.1: 1000-1003, 1007-1014, 3000-4999 — the same set the
+  ;; receive path holds a peer to, and the RFC's MUST NOT on
+  ;; 1004/1005/1006/1015.
   (flet ((raises-p (thunk)
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
@@ -3388,17 +4404,44 @@
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame))))
              t))
     ;; RFC 6455 §5.1: client frames are masked. The mask bit is in byte 1,
-    ;; so the rejection needs nothing but the two header bytes — it used
-    ;; to sit below the availability test, which meant a peer could make
-    ;; us buffer a whole payload before we refused a frame we had already
-    ;; decided against. Header-only input proves the check no longer waits:
-    ;; before the hoist this returned (values NIL 0) asking for more bytes.
+    ;; so the rejection needs nothing but the two header bytes. Below the
+    ;; availability test it would let a peer make us buffer a whole
+    ;; payload before we refused a frame we had already decided against.
+    ;; Header-only input proves the check does not wait: placed after the
+    ;; availability test, it would return (values NIL 0) here, asking for
+    ;; more bytes.
     (let ((header-only (make-array 2 :element-type '(unsigned-byte 8)
                                      :initial-contents '(#x81 100))))
       (check "reject unmasked frame from header alone"
              (signals-error-p
               (lambda ()
                 (web-skeleton::try-parse-ws-frame header-only 0 2)))
+             t))
+    ;; A reserved opcode is refused from the header for the same reason:
+    ;; a masked frame with opcode 3 declaring 64 KiB, nothing of it here
+    ;; but its header, is refused rather than waited for. Opcode 11 too,
+    ;; which as a control frame would be held to 125 bytes, and the
+    ;; defined opcodes still wait for their payload.
+    (flet ((header-says (byte0)
+             ;; FIN, BYTE0's opcode, masked, 16-bit length 65535, a mask.
+             (let ((h (make-array 8 :element-type '(unsigned-byte 8)
+                                    :initial-contents (list byte0 (logior #x80 126)
+                                                            #xFF #xFF 1 2 3 4))))
+               (handler-case
+                   (multiple-value-bind (frame consumed)
+                       (web-skeleton::try-parse-ws-frame h 0 8)
+                     (list frame consumed))
+                 (error () :refused)))))
+      (check "reserved opcode 3 refused from its header"
+             (header-says #x83) :refused)
+      (check "reserved opcode 7 refused from its header"
+             (header-says #x87) :refused)
+      (check "a binary frame's header alone still waits for its payload"
+             (header-says #x82) '(nil 0)))
+    (let ((h (make-array 6 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x8B #x80 1 2 3 4))))
+      (check "reserved opcode 11 refused from its header"
+             (signals-error-p (lambda () (web-skeleton::try-parse-ws-frame h 0 6)))
              t))
     ;; And a masked frame with the same shortfall still asks for more,
     ;; so the hoist did not turn incompleteness into an error.
@@ -3464,6 +4507,95 @@
                    (logxor (aref payload i) (aref mask (logand i 3)))))
     frame))
 
+(defun test-websocket-read-buffer-gives-back-what-a-frame-grew ()
+  "A WebSocket's read buffer, grown by one large frame, goes back to 4 KiB
+   once the frame is consumed — and a large upgrade request's growth goes
+   at the upgrade.
+
+   The keep-alive reset shrinks an HTTP connection's buffer; nothing
+   shrank a WebSocket's, the connection type that lives longest. One
+   maximal message pinned ~64 KiB for the life of the socket, and a large
+   upgrade request (cookies, auth) could pin more. The control is a frame
+   not yet consumed, whose bytes the buffer must keep."
+  (format t "~%WebSocket: the read buffer gives back what a frame grew~%")
+  (flet ((conn-holding (bytes &optional (size 65550))
+           ;; A :WEBSOCKET connection whose read buffer has grown to SIZE and
+           ;; holds BYTES, as one that has just read them would.
+           (let ((conn (web-skeleton::make-connection
+                        :fd -1 :state :websocket :last-active 0))
+                 (buf (make-array size :element-type '(unsigned-byte 8))))
+             (replace buf bytes)
+             (setf (web-skeleton::connection-read-buf conn) buf
+                   (web-skeleton::connection-read-pos conn) (length bytes))
+             conn)))
+    (let* ((payload (make-array 60000 :element-type '(unsigned-byte 8)
+                                      :initial-element 120))
+           (frame (make-masked-frame t 2 payload))
+           (seen nil))
+      (let ((conn (conn-holding frame)))
+        (web-skeleton::websocket-on-read
+         conn (lambda (c f) (declare (ignore c)) (setf seen (length (ws-frame-payload f))) nil))
+        (check "control: the 60000-byte message was delivered" seen 60000)
+        (check "the buffer is back to 4 KiB once the frame is consumed"
+               (length (web-skeleton::connection-read-buf conn)) 4096))
+      (let ((conn (conn-holding (subseq frame 0 50000))))
+        (web-skeleton::websocket-on-read
+         conn (lambda (c f) (declare (ignore c f)) nil))
+        (check "control: a frame still arriving keeps its bytes"
+               (list (web-skeleton::connection-read-pos conn)
+                     (>= (length (web-skeleton::connection-read-buf conn)) 50000))
+               (list 50000 t)))))
+  ;; The upgrade. A request carrying 12 KiB of headers — two, each under
+  ;; *MAX-HEADER-LINE-LENGTH* — grows the buffer past 4 KiB; an :ON-TICK
+  ;; hook reads the upgraded connection's buffer length from the worker
+  ;; that owns it.
+  (let ((sizes nil)
+        (lock (sb-thread:make-mutex :name "ws-buffer")))
+    (with-test-server
+        (:handler (lambda (req) (declare (ignore req)) :upgrade)
+         :ws-handler (lambda (c f) (declare (ignore c f)) nil)
+         :on-tick (lambda (id)
+                    (declare (ignore id))
+                    (maphash (lambda (fd conn)
+                               (declare (ignore fd))
+                               (when (eq (web-skeleton::connection-state conn) :websocket)
+                                 (sb-thread:with-mutex (lock)
+                                   (pushnew (length (web-skeleton::connection-read-buf conn))
+                                            sizes))))
+                             web-skeleton::*connections*)))
+      (let* ((sock (connect-to-test-server))
+             (stream (sb-bsd-sockets:socket-make-stream
+                      sock :input t :output t :element-type '(unsigned-byte 8))))
+        (unwind-protect
+             (progn
+               (write-sequence
+                (sb-ext:string-to-octets
+                 (crlf "GET /ws HTTP/1.1" "Host: localhost"
+                       "Upgrade: websocket" "Connection: Upgrade"
+                       "Sec-WebSocket-Version: 13"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+                       (concatenate 'string "X-A: "
+                                    (make-string (* 6 1024) :initial-element #\a))
+                       (concatenate 'string "X-B: "
+                                    (make-string (* 6 1024) :initial-element #\b)))
+                 :external-format :ascii)
+                stream)
+               (force-output stream)
+               (read-until-bounded stream :seconds 3
+                                          :until (lambda (buf fill)
+                                                   (declare (ignore buf))
+                                                   (>= fill 12)))
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* 3 internal-time-units-per-second))))
+                 (loop until (or (sb-thread:with-mutex (lock) sizes)
+                                 (> (get-internal-real-time) deadline))
+                       do (sleep 0.05)))
+               (check "a large upgrade request's buffer goes back to 4 KiB"
+                      (sb-thread:with-mutex (lock) sizes)
+                      '(4096)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
+
 (defun test-websocket-fragmentation ()
   (format t "~%WebSocket Fragmentation~%")
 
@@ -3507,34 +4639,38 @@
                 (web-skeleton::try-parse-ws-frame frame 0 (length frame)))))
            t)
 
-    ;; Reserved close code handling on the receive side: clients can
-    ;; send any code and the server CLAMPS (not fails) on receive for
-    ;; interop. BUILD-WS-CLOSE on the send side is strict and rejects
-    ;; reserved codes — see the test-websocket section that covers
-    ;; BUILD-WS-CLOSE's allowed set directly. The clamp tests below
-    ;; exercise the receive classifier.
-    (check "close code 1004 clamped"
-           (web-skeleton::clamp-close-code 1004) 1000)
-    (check "close code 1005 clamped"
-           (web-skeleton::clamp-close-code 1005) 1000)
-    (check "close code 1006 clamped"
-           (web-skeleton::clamp-close-code 1006) 1000)
-    (check "close code 1015 clamped"
-           (web-skeleton::clamp-close-code 1015) 1000)
-    (check "close code 999 clamped"
-           (web-skeleton::clamp-close-code 999) 1000)
-    (check "close code 1000 passes"
-           (web-skeleton::clamp-close-code 1000) 1000)
-    (check "close code 1001 passes"
-           (web-skeleton::clamp-close-code 1001) 1001)
-    (check "close code 3000 passes"
-           (web-skeleton::clamp-close-code 3000) 3000)
-    (check "close code 5000 clamped"
-           (web-skeleton::clamp-close-code 5000) 1000)
-    (check "close code 65535 clamped"
-           (web-skeleton::clamp-close-code 65535) 1000)
-    (check "close code 4999 passes"
-           (web-skeleton::clamp-close-code 4999) 4999)
+    ;; A peer's close frame is answered by its status code. A code a
+    ;; close frame may carry is echoed; any other makes the frame
+    ;; malformed, and the answer is 1002, as for a 1-byte body. One code
+    ;; from each band on either side of every boundary, through
+    ;; WEBSOCKET-ON-READ, since the answer is what a peer sees.
+    (flet ((answer-to-close (code)
+             (let* ((payload (make-array 2 :element-type '(unsigned-byte 8)
+                                           :initial-contents
+                                           (list (ldb (byte 8 8) code)
+                                                 (ldb (byte 8 0) code))))
+                    (conn (web-skeleton::make-connection
+                           :fd -1 :state :websocket :last-active 0))
+                    (buf (copy-seq (make-masked-frame t 8 payload))))
+               (setf (web-skeleton::connection-read-buf conn) buf
+                     (web-skeleton::connection-read-pos conn) (length buf))
+               (multiple-value-bind (action response)
+                   (web-skeleton::websocket-on-read conn nil)
+                 (list action
+                       (when (and response (>= (length response) 4))
+                         (logior (ash (aref response 2) 8) (aref response 3))))))))
+      (dolist (code '(1000 1001 1003 1007 1011 1014 3000 4999))
+        (check (format nil "close code ~d is echoed" code)
+               (answer-to-close code) (list :close code)))
+      (dolist (code '(0 999 1004 1005 1006 1015 1016 2999 5000 65535))
+        (check (format nil "close code ~d is answered 1002" code)
+               (answer-to-close code) (list :close 1002))))
+    (dolist (code '(1000 1003 1007 1014 3000 4999))
+      (check (format nil "close code ~d is valid" code)
+             (web-skeleton::ws-close-code-valid-p code) t))
+    (dolist (code '(999 1004 1005 1006 1015 1016 2999 5000))
+      (check (format nil "close code ~d is not" code)
+             (web-skeleton::ws-close-code-valid-p code) nil))
 
     ;; Close frame with invalid UTF-8 reason — must fail with 1007
     ;; (RFC 6455 §5.5.1: reason text after the 2-byte code must be valid UTF-8)
@@ -3626,13 +4762,11 @@
       (check "fragment reassembly: concatenated payload"
              received-text "hello world"))
 
-    ;; Error-close preserves earlier batch responses. First text
-    ;; frame produces a handler response; second frame has an
-    ;; unknown opcode (5) which triggers close-with 1002. A naive
-    ;; (values :close (build-ws-close NNNN)) at each error site
-    ;; would drop the earlier response on the floor — the
-    ;; close-with helper funnels every error-close through the
-    ;; same concat-then-return path as the normal close branch.
+    ;; Error-close keeps earlier batch replies. The first text frame
+    ;; produces a handler reply; the second has an unknown opcode (5),
+    ;; which closes with 1002. The reply is on the write queue by then,
+    ;; ahead of where the caller puts the close frame, so a close cannot
+    ;; drop it.
     (let* ((good (make-masked-frame t 1 #(104 105)))  ; text "hi"
            (bad  (make-masked-frame t 5 #()))         ; unknown opcode 5
            (buf  (concatenate '(simple-array (unsigned-byte 8) (*))
@@ -3644,24 +4778,18 @@
             (web-skeleton::connection-read-pos conn) (length buf))
       (let ((handler (lambda (c frame)
                        (declare (ignore c frame))
-                       ;; Return raw bytes — websocket-on-read pushes
-                       ;; into RESPONSES.
                        reply)))
-        (multiple-value-bind (action response)
+        (multiple-value-bind (action close-frame)
             (web-skeleton::websocket-on-read conn handler)
           (check "error-close action :close" action :close)
-          ;; Response should contain BOTH the reply bytes and a
-          ;; close frame. Search for the literal "REPLY" prefix
-          ;; as the first response, and the 1002 status code in
-          ;; the close frame payload further down.
-          (check "error-close carries earlier response"
-                 (and response (search reply response)) 0)
-          (check "error-close carries close code 1002"
-                 (let ((close-start (+ (length reply) 2)))
-                   (and response
-                        (>= (length response) (+ close-start 2))
-                        (logior (ash (aref response close-start) 8)
-                                (aref response (1+ close-start)))))
+          (check "error-close: the earlier reply is queued"
+                 (equalp (web-skeleton::connection-write-buf conn) reply)
+                 t)
+          (check "error-close: the close frame carries 1002"
+                 (and close-frame
+                      (>= (length close-frame) 4)
+                      (logior (ash (aref close-frame 2) 8)
+                              (aref close-frame 3)))
                  1002))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -3781,8 +4909,8 @@
   ;;                     resolve to empty string — skipped by design)
   ;; Also verifies :CACHE-CONTROL function form receives the URL
   ;; path for per-file tailoring.
-  (let* ((scratch (merge-pathnames "tests/tmp-static/"
-                                    (truename ".")))
+  (let* ((scratch (sb-ext:parse-native-namestring
+                   (scratch-path "ws-static-aliases" "/")))
          (cc-seen nil))
     (ensure-directories-exist (merge-pathnames "sub/" scratch))
     (ensure-directories-exist (merge-pathnames ".well-known/" scratch))
@@ -3894,6 +5022,89 @@
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
+(defun test-static-range-copies-nothing ()
+  "A 206 for a static file allocates its head and not its body, and the
+   body still arrives whole and in place.
+
+   A range is a window on the cached file. As a copy it would cost the
+   range per request, held by the connection until its peer had read it
+   all, and `Range: bytes=0-` from a slow reader, what a browser sends
+   first for <video>, would hold a copy of the whole file per
+   connection. The 200 path already allocates nothing, so it is the
+   control.
+
+   The wire half sends each answer through a real socket, so the span is
+   taken through the write queue's promotion and not only through
+   SERVE-STATIC."
+  (format t "~%Static: a 206 allocates its head, not its body~%")
+  (let* ((size (* 1024 1024))
+         ;; Printable ASCII, varied by position so a slice from the wrong
+         ;; offset cannot match; the test client reads bodies as UTF-8.
+         (content (let ((v (make-array size :element-type '(unsigned-byte 8))))
+                    (dotimes (i size v) (setf (aref v i) (+ 32 (mod (* i 7) 95))))))
+         (saved web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (setf (gethash "/big.bin" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response
+                  "application/octet-stream" content 0))
+           (flet ((consed (&rest headers)
+                    (let ((request (make-test-request :method :GET
+                                                      :path "/big.bin"
+                                                      :headers headers)))
+                      ;; Once untimed, so the Date line cache and any
+                      ;; first-call setup are not counted.
+                      (serve-static request)
+                      ;; The least of three. GET-BYTES-CONSED counts the
+                      ;; whole process, and another thread, a finalizer or a
+                      ;; reader an earlier test abandoned, can allocate in
+                      ;; the window; the least is the call's own cost.
+                      (loop repeat 3
+                            minimize (let ((before (sb-ext:get-bytes-consed)))
+                                       (serve-static request)
+                                       (- (sb-ext:get-bytes-consed) before))))))
+             (check "control: a whole-file GET allocates under 64 KiB"
+                    (< (consed) 65536) t)
+             (check "a whole-file range allocates under 64 KiB, not the file"
+                    (< (consed (cons "range" "bytes=0-")) 65536) t)
+             (check "an offset range allocates under 64 KiB too"
+                    (< (consed (cons "range" "bytes=1-")) 65536) t))
+           (with-test-server
+               (:handler (lambda (req)
+                           (or (serve-static req) (make-error-response 404))))
+             (dolist (spec (list (list "bytes=0-" 0 size)
+                                 (list "bytes=1-" 1 size)
+                                 (list "bytes=1000-1999" 1000 2000)
+                                 (list (format nil "bytes=-~d" 4096)
+                                       (- size 4096) size)))
+               (destructuring-bind (range start end) spec
+                 (multiple-value-bind (status headers body)
+                     (attempt (test-http-request
+                               :get "/big.bin" :headers (list (cons "range" range))))
+                   (declare (ignore headers))
+                   (check (format nil "206 over the wire: ~a arrives whole" range)
+                          (list status
+                                (and (stringp body)
+                                     (equalp (sb-ext:string-to-octets
+                                              body :external-format :latin-1)
+                                             (subseq content start end))))
+                          (list 206 t)))))))
+      (setf web-skeleton::*static-cache* saved))))
+
+(defun %response-octets (response)
+  "RESPONSE as the bytes a client would read: a byte vector as it is, and a
+   list of segments — byte vectors and WRITE-SPANs, what SERVE-STATIC
+   returns — concatenated in order."
+  (if (consp response)
+      (apply #'concatenate '(vector (unsigned-byte 8))
+             (mapcar (lambda (segment)
+                       (multiple-value-bind (bytes start end)
+                           (web-skeleton::segment-bounds segment)
+                         (subseq bytes start end)))
+                     response))
+      response))
+
 (defun test-static-range ()
   (format t "~%Static Range (RFC 7233)~%")
 
@@ -3932,8 +5143,8 @@
     ;; An empty resource has no satisfiable range at all, which is the
     ;; definition of 416 rather than a reason to serve 200. RFC 7233 §2.1
     ;; puts every first-byte-pos at or past a zero length, and §4.4
-    ;; answers that with 416; this used to short-circuit to NIL and serve
-    ;; the full (empty) 200 instead. All three forms are checked because
+    ;; answers that with 416; a short-circuit to NIL would serve the full
+    ;; (empty) 200 instead. All three forms are checked because
     ;; only the suffix form needed telling — the other two reach
     ;; :unsatisfiable through the ordinary out-of-range branch, and a
     ;; later edit could break one without touching the others.
@@ -3967,11 +5178,10 @@
          (progn
            (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
            (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
-           ;; SERVE-STATIC answers either as one vector (the ranged and
-           ;; 416 paths, built per request) or as the segments a
-           ;; pre-built response is assembled from. What a client sees is
-           ;; the concatenation either way, and that is what these
-           ;; assertions are about.
+           ;; SERVE-STATIC answers as segments: a pre-built response's
+           ;; pieces, a 206's head and the span of the file it covers, or a
+           ;; 416's head. What a client sees is the concatenation, and that
+           ;; is what these assertions are about.
            (flet ((fetch (&rest headers)
                     (let ((r (serve-static
                               (make-test-request :method :GET
@@ -3979,10 +5189,7 @@
                                                  :headers headers))))
                       (and r
                            (sb-ext:octets-to-string
-                            (if (consp r)
-                                (apply #'concatenate
-                                       '(vector (unsigned-byte 8)) r)
-                                r)
+                            (%response-octets r)
                             :external-format :latin-1))))
                   (body-of (text)
                     (let ((i (search (format nil "~a~a~a~a"
@@ -4060,16 +5267,293 @@
                                     :headers (list (cons "range"
                                                          "bytes=0-3"))))))
                            (sb-ext:octets-to-string
-                            (if (consp r)
-                                (apply #'concatenate
-                                       '(vector (unsigned-byte 8)) r)
-                                r)
+                            (%response-octets r)
                             :external-format :latin-1))))
                (check "range: HEAD ignores range, stays 200"
                       (not (null (search "200 OK" head))) t)
                (check "range: HEAD emits no body"
                       (body-of head) ""))))
       (setf web-skeleton::*static-cache* saved))))
+
+(defun test-static-serves-what-the-router-sees ()
+  "A route guarding a static file covers every spelling that reaches it.
+
+   The documented shape — routes first, SERVE-STATIC as the fallback —
+   is only safe when the two read a path alike. MATCH-PATH under :EXACT
+   compares the spelling that arrived through CANONICAL-PATH, and
+   SERVE-STATIC serves a file only at the spellings that reads as one.
+   So the bracketed file is guarded at both of its spellings, the escaped
+   one a page's script sends included, and every other spelling of a
+   guarded file is a 404 here, not the file.
+
+   Requests go through PARSE-REQUEST, so the path is the parser's."
+  (format t "~%Static: a guard covers every spelling that reaches the file~%")
+  (let* ((dir (scratch-path "ws-static-spelling" "/"))
+         (saved-cache web-skeleton::*static-cache*)
+         (crlf (format nil "~c~c" #\Return #\Newline))
+         (e-acute (string (code-char #xE9))))
+    (flet ((write-file (name text)
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string dir name))))
+               (ensure-directories-exist path)
+               (with-open-file (s path :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+                 (write-sequence (sb-ext:string-to-octets
+                                  text :external-format :utf-8)
+                                 s))))
+           (app (request)
+             (let ((path (http-request-path request)))
+               (if (or (match-path "/admin" path)
+                       (match-path "/admin.html" path)
+                       (match-path "/admin/:file" path)
+                       (match-path "/vault[1].txt" path))
+                   (make-error-response 403)
+                   (or (serve-static request) (make-error-response 404)))))
+           (outcome (response)
+             (cond ((web-skeleton::http-response-p response)
+                    (web-skeleton::http-response-status response))
+                   (response :served)
+                   (t nil))))
+      (unwind-protect
+           (progn
+             (write-file "admin.html" "admin console")
+             (write-file "admin/report.txt" "secret report")
+             (write-file "a b.txt" "spaced")
+             (write-file (concatenate 'string "caf" e-acute ".txt") "accented")
+             (write-file "100%.txt" "percent")
+             (write-file "icon@2x.txt" "at sign")
+             (write-file "vault[1].txt" "locked")
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (web-skeleton::load-static-files dir)
+             (dolist (spec '(("/admin.html" 403)
+                             ("/admin" 403)
+                             ("/admin/report.txt" 403)
+                             ("/vault[1].txt" 403)
+                             ;; Other spellings of the guarded files. The
+                             ;; bracketed one is a spelling a page's script
+                             ;; sends, so it reaches the file, and the guard
+                             ;; covers it there.
+                             ("/%61dmin.html" 404)
+                             ("/%61dmin" 404)
+                             ("/admin%2Ehtml" 404)
+                             ("/%61dmin/report.txt" 404)
+                             ("/admin%2Freport.txt" 404)
+                             ("/vault%5B1%5D.txt" 403)
+                             ;; A browser's spellings of unguarded files.
+                             ("/a%20b.txt" :served)
+                             ("/caf%C3%A9.txt" :served)
+                             ("/100%25.txt" :served)
+                             ("/icon@2x.txt" :served)
+                             ("/icon%402x.txt" :served)
+                             ;; Lowercase hex, as a proxy may re-encode a
+                             ;; path: the same spellings, and the guard
+                             ;; covers the bracketed one there too.
+                             ("/caf%c3%a9.txt" :served)
+                             ("/vault%5b1%5d.txt" 403)
+                             ("/admin%2ehtml" 404)
+                             ("/admin%2freport.txt" 404)
+                             ("/ad%6din.html" 404)
+                             ;; And a spelling no browser sends.
+                             ("/100%.txt" 404)))
+               (destructuring-bind (target expected) spec
+                 (check (format nil "static spelling: ~a" target)
+                        (attempt
+                          (outcome (app (parse-request
+                                         (format nil "GET ~a HTTP/1.1~aHost: x~a~a"
+                                                 target crlf crlf crlf)))))
+                        expected))))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil))))
+  ;; The decoder on its own: the one spelling decodes, every other is NIL.
+  (dolist (spec `(("/admin.html" "/admin.html")
+                  ("/a%20b.txt" "/a b.txt")
+                  ("/caf%C3%A9" ,(format nil "/caf~c" (code-char #xE9)))
+                  ("/a+b,c;d=e:f@g!h" "/a+b,c;d=e:f@g!h")
+                  ("/a%2Bb%2Cc%3Bd%3De%3Af%40g%21h" "/a+b,c;d=e:f@g!h")
+                  ("/%5Bid%5D-abc.js" "/[id]-abc.js")
+                  ("/%5bid%5d-abc.js" "/[id]-abc.js")
+                  ("/%61dmin.html" nil)
+                  ("/ad%6din.html" nil)
+                  ("/%2E%2E/x" nil)
+                  ("/%2e%2e/x" nil)
+                  ("/caf%c3%a9" ,(format nil "/caf~c" (code-char #xE9)))
+                  ("/caf%C3%a9" ,(format nil "/caf~c" (code-char #xE9)))
+                  ("/100%" nil)
+                  ("/100%2" nil)
+                  ("/a\"b" nil)
+                  ("/%FF" nil)))
+    (destructuring-bind (raw expected) spec
+      (check (format nil "static-path-spelling ~s" raw)
+             (web-skeleton::static-path-spelling raw)
+             expected))))
+
+(defun test-static-names-with-pathname-syntax ()
+  "A file whose name holds pathname syntax is cached under the name the
+   filesystem gives it, and served at a browser's spelling of that name.
+
+   [ ] * ? and \\ mean something to a Lisp pathname — wildcards, and the
+   escape that keeps one literal — and NAMESTRING writes them escaped.
+   A key built from it reads /a\\[1].txt for the file a[1].txt, and no
+   request names that. Bundlers put brackets in route chunk names
+   ([slug], [id]), so this is ordinary build output.
+
+   The key set is compared whole, so an escaped key fails the check
+   rather than sitting beside the right one unnoticed."
+  (format t "~%Static: names that are pathname syntax~%")
+  (let* ((dir (scratch-path "ws-static-syntax" "/"))
+         (saved-cache web-skeleton::*static-cache*)
+         (crlf (format nil "~c~c" #\Return #\Newline)))
+    (flet ((write-file (name text)
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string dir name))))
+               (ensure-directories-exist path)
+               (with-open-file (s path :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+                 (write-sequence (sb-ext:string-to-octets
+                                  text :external-format :utf-8)
+                                 s))))
+           (body-at (target)
+             (let ((response
+                     (attempt
+                       (serve-static
+                        (parse-request
+                         (format nil "GET ~a HTTP/1.1~aHost: x~a~a"
+                                 target crlf crlf crlf))))))
+               (cond ((null response) :not-served)
+                     ((stringp response) response)
+                     (t (let ((text (sb-ext:octets-to-string
+                                     (%response-octets response)
+                                     :external-format :latin-1)))
+                          (subseq text (+ 4 (search (format nil "~a~a" crlf crlf)
+                                                    text)))))))))
+      (unwind-protect
+           (progn
+             (write-file "a[1].txt" "bracketed")
+             (write-file "b*c.txt" "starred")
+             (write-file "q?.txt" "questioned")
+             (write-file "back\\slash.txt" "backslashed")
+             (write-file "[slug]/page-1a2b.js" "chunk")
+             (write-file "plain.txt" "plain")
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (web-skeleton::load-static-files dir)
+             (check "static syntax: every file is keyed by its own name"
+                    (sort (loop for key being the hash-keys
+                                  of web-skeleton::*static-cache*
+                                collect key)
+                          #'string<)
+                    (sort (list "/a[1].txt" "/b*c.txt" "/q?.txt"
+                                "/back\\slash.txt" "/[slug]/page-1a2b.js"
+                                "/plain.txt")
+                          #'string<))
+             (dolist (spec '(("/a[1].txt" "bracketed")
+                             ("/b*c.txt" "starred")
+                             ("/q%3F.txt" "questioned")
+                             ("/[slug]/page-1a2b.js" "chunk")
+                             ("/plain.txt" "plain")
+                             ;; As a page's encodeURIComponent writes them,
+                             ;; which is what Next.js puts in its asset URLs.
+                             ("/a%5B1%5D.txt" "bracketed")
+                             ("/b%2Ac.txt" "starred")
+                             ("/%5Bslug%5D/page-1a2b.js" "chunk")))
+               (destructuring-bind (target expected) spec
+                 (check (format nil "static syntax: ~a is served" target)
+                        (body-at target) expected))))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil)))))
+
+(defun test-static-responses-carry-the-connection-line ()
+  "A static response tells its client what the connection will do, as a
+   dynamic one does: Connection: keep-alive to an HTTP/1.0 client that
+   asked to keep it, and Connection: close ahead of a close.
+
+   A static head is built at load time, before anyone knows which
+   connection it will go out on, so the line is added where it is queued.
+   Without it an HTTP/1.0 keep-alive client takes the response for the
+   last one and drops a connection the server was holding open for it.
+   Asserted over a live socket: the second request on the same connection
+   is the proof the keep-alive was honoured, and the 206 is there because
+   its head is built per request, by a different function."
+  (format t "~%Static: the Connection line a static response carries~%")
+  (let ((saved web-skeleton::*static-cache*))
+    (flet ((read-response (stream)
+             ;; One whole response: the head, then Content-Length bytes.
+             (sb-ext:octets-to-string
+              (read-until-bounded
+               stream :seconds 3
+               :until (lambda (b fill)
+                        (let ((hend (web-skeleton::scan-crlf-crlf b 0 fill)))
+                          (and hend
+                               (let* ((head (string-downcase
+                                             (sb-ext:octets-to-string
+                                              b :end hend :external-format :latin-1)))
+                                      (at (search "content-length: " head))
+                                      (len (if at
+                                               (parse-integer head :start (+ at 16)
+                                                                   :junk-allowed t)
+                                               0)))
+                                 (>= fill (+ hend 4 len)))))))
+              :external-format :latin-1))
+           (send (stream text)
+             (write-sequence (sb-ext:string-to-octets text :external-format :ascii)
+                             stream)
+             (force-output stream))
+           (raw-connect ()
+             (let ((socket (connect-to-test-server)))
+               (values socket
+                       (sb-bsd-sockets:socket-make-stream
+                        socket :input t :output t
+                        :element-type '(unsigned-byte 8))))))
+      (unwind-protect
+           (progn
+             (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+             (setf (gethash "/a.txt" web-skeleton::*static-cache*)
+                   (web-skeleton::build-static-response
+                    "text/plain" (sb-ext:string-to-octets "0123456789"
+                                                          :external-format :ascii)
+                    0))
+             (with-test-server
+                 (:handler (lambda (req)
+                             (or (serve-static req) (make-error-response 404))))
+               (multiple-value-bind (socket stream) (raw-connect)
+                 (unwind-protect
+                      (let ((ask (format nil "GET /a.txt HTTP/1.0~aConnection: keep-alive~a~a"
+                                         *crlf* *crlf* *crlf*)))
+                        (send stream ask)
+                        (let ((first (read-response stream)))
+                          (check "static: an HTTP/1.0 keep-alive client is told keep-alive"
+                                 (and (search "connection: keep-alive"
+                                              (string-downcase first))
+                                      t)
+                                 t))
+                        (send stream (format nil "GET /a.txt HTTP/1.0~aConnection: ~
+                                                  keep-alive~aRange: bytes=0-3~a~a"
+                                             *crlf* *crlf* *crlf* *crlf*))
+                        (let ((second (read-response stream)))
+                          (check "static: and the connection served a second request"
+                                 (and (search "206" second) t) t)
+                          (check "static: whose 206 head says keep-alive as well"
+                                 (and (search "connection: keep-alive"
+                                              (string-downcase second))
+                                      t)
+                                 t)))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))
+               (multiple-value-bind (socket stream) (raw-connect)
+                 (unwind-protect
+                      (progn
+                        (send stream (format nil "GET /a.txt HTTP/1.1~aHost: x~a~
+                                                  Connection: close~a~a"
+                                             *crlf* *crlf* *crlf* *crlf*))
+                        (check "static: a closing connection's response says close"
+                               (and (search "connection: close"
+                                            (string-downcase (read-response stream)))
+                                    t)
+                               t))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+        (setf web-skeleton::*static-cache* saved)))))
 
 (defun test-static-helpers ()
   (format t "~%Static Helpers~%")
@@ -4078,8 +5562,29 @@
          "text/html; charset=utf-8")
   (check "mime css"   (web-skeleton::mime-type-for-path "/style.css")
          "text/css; charset=utf-8")
+  ;; RFC 9239's type, for a classic script and an ES module alike: a
+  ;; browser refuses a module script served as anything but JavaScript.
   (check "mime js"    (web-skeleton::mime-type-for-path "/app.js")
-         "application/javascript; charset=utf-8")
+         "text/javascript; charset=utf-8")
+  (check "mime mjs"   (web-skeleton::mime-type-for-path "/app.mjs")
+         "text/javascript; charset=utf-8")
+  (check "mime mjs, in any case" (web-skeleton::mime-type-for-path "/APP.MJS")
+         "text/javascript; charset=utf-8")
+  ;; Captions, which a <track> ignores served as anything else.
+  (check "mime vtt"   (web-skeleton::mime-type-for-path "/captions.vtt")
+         "text/vtt; charset=utf-8")
+  (check "mime mp3"   (web-skeleton::mime-type-for-path "/song.mp3")
+         "audio/mpeg")
+  (check "mime ogg"   (web-skeleton::mime-type-for-path "/song.ogg")
+         "audio/ogg")
+  (check "mime ogv"   (web-skeleton::mime-type-for-path "/clip.ogv")
+         "video/ogg")
+  (check "mime csv"   (web-skeleton::mime-type-for-path "/data.csv")
+         "text/csv; charset=utf-8")
+  (check "mime zip"   (web-skeleton::mime-type-for-path "/bundle.zip")
+         "application/zip")
+  (check "mime eot"   (web-skeleton::mime-type-for-path "/font.eot")
+         "application/vnd.ms-fontobject")
   (check "mime png"   (web-skeleton::mime-type-for-path "/image.png")
          "image/png")
   (check "mime json"  (web-skeleton::mime-type-for-path "/data.json")
@@ -4104,6 +5609,68 @@
          "application/octet-stream")
   (check "mime no ext" (web-skeleton::mime-type-for-path "/LICENSE")
          "application/octet-stream")
+
+  ;; *EXTRA-MIME-TYPES* is consulted first: a type the table lacks, and an
+  ;; answer the table gives differently, in any case of extension.
+  (let ((web-skeleton:*extra-mime-types* '(("glb" . "model/gltf-binary")
+                                           ("JS" . "application/x-custom"))))
+    (check "extra mime: a type the table does not know"
+           (web-skeleton::mime-type-for-path "/scene.glb") "model/gltf-binary")
+    (check "extra mime: consulted before the table, in any case"
+           (web-skeleton::mime-type-for-path "/app.js") "application/x-custom")
+    (check "extra mime: and the table still answers the rest"
+           (web-skeleton::mime-type-for-path "/app.mjs")
+           "text/javascript; charset=utf-8"))
+  (flet ((refused-p (table)
+           (let ((web-skeleton:*extra-mime-types* table))
+             (handler-case (progn (web-skeleton::validate-extra-mime-types) nil)
+               (error (e) (and (search "*extra-mime-types*" (princ-to-string e)) t))))))
+    (check "extra mime: no table, and a table of strings, are accepted"
+           (list (refused-p nil) (refused-p '(("glb" . "model/gltf-binary"))))
+           '(nil nil))
+    ;; A dotted extension could never match: a path's extension is what
+    ;; follows its last dot.
+    (check "extra mime: an extension with a dot is refused"
+           (refused-p '(("tar.gz" . "application/gzip"))) t)
+    (check "extra mime: an empty extension is refused"
+           (refused-p '(("" . "text/plain"))) t)
+    (check "extra mime: a type that is not a string is refused"
+           (refused-p '(("glb" . :model))) t)
+    (check "extra mime: an entry that is not a pair is refused"
+           (refused-p '("glb")) t)
+    (check "extra mime: a table that is not a list is refused"
+           (refused-p "glb") t)
+    (check "extra mime: an improper list is refused"
+           (refused-p '(("glb" . "model/gltf-binary") . "x")) t))
+  ;; Through a load: the type reaches the file's response, and a malformed
+  ;; table is refused at the load rather than at the first request.
+  (let ((dir (scratch-path "ws-static-mime" "/"))
+        (saved-cache web-skeleton::*static-cache*))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (with-open-file (s (concatenate 'string dir "scene.glb")
+                              :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+             (write-sequence (sb-ext:string-to-octets "glTF" :external-format :ascii) s))
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
+           (let ((web-skeleton:*extra-mime-types* '(("glb" . "model/gltf-binary"))))
+             (web-skeleton::load-static-files dir))
+           (check "extra mime: a loaded file goes out with its type"
+                  (let ((entry (gethash "/scene.glb" web-skeleton::*static-cache*)))
+                    (and entry
+                         (cdr (assoc "content-type"
+                                     (web-skeleton::static-entry-headers entry)
+                                     :test #'string-equal))))
+                  "model/gltf-binary")
+           (check "extra mime: a malformed table is refused at the load"
+                  (let ((web-skeleton:*extra-mime-types* '(("tar.gz" . "application/gzip"))))
+                    (handler-case (progn (web-skeleton::load-static-files dir) :loaded)
+                      (error (e) (and (search "*extra-mime-types*" (princ-to-string e))
+                                      :refused))))
+                  :refused))
+      (setf web-skeleton::*static-cache* saved-cache)
+      (sb-ext:run-program "/bin/rm" (list "-rf" dir) :output nil :error nil)))
 
   (check "ext html" (web-skeleton::file-extension "/index.html") "html")
   (check "ext none" (web-skeleton::file-extension "/LICENSE") nil)
@@ -4139,6 +5706,142 @@
 ;;; JWT tests
 ;;; ---------------------------------------------------------------------------
 
+;;; A signer, for the tests alone. The framework verifies ES256 and signs
+;;; nothing, and a refusal is only shown to be for its own reason by a
+;;; token whose one fault is that reason: a header naming another alg, a
+;;; payload changed after signing, a claims set that is not an object, each
+;;; validly signed and unexpired. Built from the framework's own P-256
+;;; arithmetic, with RFC 6979's A.2.5 key and its nonce for "sample" so the
+;;; signer is checked against published answers before anything rests on it.
+;;; A test key, never a secret.
+
+(defparameter *test-es256-d*
+  #xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+  "RFC 6979 A.2.5's P-256 private key.")
+
+(defparameter *test-es256-k*
+  #xA6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60
+  "RFC 6979 A.2.5's nonce for SHA-256 over \"sample\"; reused for every
+   test signature, which a real signer must never do.")
+
+(defun %p256-times-g (k)
+  "K times the P-256 base point, affine, as (values X Y)."
+  (let ((p web-skeleton::+p256-p+))
+    (multiple-value-bind (x y z)
+        (web-skeleton::ec-mul-add k 0 web-skeleton::+p256-gx+ web-skeleton::+p256-gy+)
+      (let* ((zi (web-skeleton::mod-inv z p))
+             (zi2 (mod (* zi zi) p)))
+        (values (mod (* x zi2) p) (mod (* y zi2 zi) p))))))
+
+(defun %octets-32 (n)
+  "N as 32 big-endian bytes."
+  (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+    (loop for i from 31 downto 0
+          do (setf (aref v i) (ldb (byte 8 0) n)
+                   n (ash n -8)))
+    v))
+
+(defun %es256-sign (message)
+  "The 64-byte ES256 signature, r then s, of MESSAGE, a string, under
+   *TEST-ES256-D* with the nonce *TEST-ES256-K*."
+  (let* ((n web-skeleton::+p256-n+)
+         (z (web-skeleton::bytes-to-integer
+             (sha256 (sb-ext:string-to-octets message :external-format :ascii))))
+         (r (mod (%p256-times-g *test-es256-k*) n))
+         (s (mod (* (web-skeleton::mod-inv *test-es256-k* n)
+                    (+ z (* r *test-es256-d*)))
+                 n)))
+    (concatenate '(simple-array (unsigned-byte 8) (*)) (%octets-32 r) (%octets-32 s))))
+
+(defun %es256-test-key ()
+  "The JWT-KEY for *TEST-ES256-D*, kid \"test\"."
+  (multiple-value-bind (x y) (%p256-times-g *test-es256-d*)
+    (make-jwt-key :kid "test" :x (%octets-32 x) :y (%octets-32 y))))
+
+(defun %es256-token (header payload &key (signed-payload payload) flip-bit)
+  "A compact JWS of the JSON strings HEADER and PAYLOAD, signed over HEADER
+   and SIGNED-PAYLOAD: the same unless a test changes the payload after
+   signing. FLIP-BIT flips the signature's lowest bit."
+  (flet ((b64 (s) (base64url-encode (sb-ext:string-to-octets s :external-format :utf-8))))
+    (let ((sig (%es256-sign (format nil "~a.~a" (b64 header) (b64 signed-payload)))))
+      (when flip-bit
+        (setf (aref sig 63) (logxor (aref sig 63) 1)))
+      (format nil "~a.~a.~a" (b64 header) (b64 payload) (base64url-encode sig)))))
+
+(defun test-jwt-refusals-for-their-own-reasons ()
+  "Each refusal JWT-VERIFY makes, shown on a token whose one fault is the
+   one refused: signed by the key it is checked against, unexpired, and
+   otherwise valid, beside a token that is all of that and verifies. A
+   check written against an expired token, or a payload that is not JSON,
+   passes whichever check is missing."
+  (format t "~%JWT: each refusal for its own reason~%")
+  ;; The signer first, against RFC 6979 A.2.5, since every check below
+  ;; trusts it.
+  (multiple-value-bind (ux uy) (%p256-times-g *test-es256-d*)
+    (check "test signer: the public key is RFC 6979's"
+           (list ux uy)
+           (list #x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6
+                 #x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299)))
+  (check "test signer: \"sample\" signs to RFC 6979's r and s"
+         (bytes-to-hex (%es256-sign "sample"))
+         (string-downcase
+          (concatenate 'string
+                       "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716"
+                       "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")))
+  (let* ((keys (list (%es256-test-key)))
+         (now (web-skeleton::jwt-current-time))
+         (header "{\"alg\":\"ES256\",\"kid\":\"test\"}")
+         (payload (format nil "{\"sub\":\"alice\",\"exp\":~d}" (+ now 3600))))
+    (check "minted: the control verifies"
+           (jwt-claim (jwt-verify (%es256-token header payload) keys) "sub")
+           "alice")
+    (check "minted: another alg, validly signed, is refused"
+           (jwt-verify (%es256-token "{\"alg\":\"ES384\",\"kid\":\"test\"}" payload) keys)
+           nil)
+    (check "minted: a payload changed after signing is refused"
+           (jwt-verify (%es256-token header
+                                     (format nil "{\"sub\":\"mallory\",\"exp\":~d}" (+ now 3600))
+                                     :signed-payload payload)
+                       keys)
+           nil)
+    (check "minted: a signature with a bit flipped is refused"
+           (jwt-verify (%es256-token header payload :flip-bit t) keys)
+           nil)
+    (check "minted: an expired token is refused"
+           (jwt-verify (%es256-token header (format nil "{\"exp\":~d}" (- now 3600))) keys)
+           nil)
+    (check "minted: a token before its nbf is refused"
+           (jwt-verify (%es256-token header (format nil "{\"nbf\":~d}" (+ now 3600))) keys)
+           nil)
+    ;; [] parses to NIL, so it would come back as NIL either way; the
+    ;; others would come back as themselves.
+    (dolist (claims '("5" "\"alice\"" "true" "null" "[]" "[{\"sub\":\"alice\"}]"))
+      (check (format nil "minted: claims of ~a, not an object, are refused" claims)
+             (jwt-verify (%es256-token header claims) keys)
+             nil))
+    ;; A raise inside verification answers NIL like any bad token, and says
+    ;; at DEBUG what raised, so a fault in the verifier can be found.
+    (let ((real (symbol-function 'ecdsa-verify-p256))
+          (out (make-string-output-stream)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'ecdsa-verify-p256)
+                   (lambda (&rest args)
+                     (declare (ignore args))
+                     (error "a fault inside the verifier")))
+             (let ((*log-stream* out)
+                   (*log-level* :debug))
+               (check "minted: a raise inside verification answers NIL"
+                      (jwt-verify (%es256-token header payload) keys)
+                      nil)
+               (check "minted: and is logged at DEBUG, naming what raised"
+                      (let ((text (get-output-stream-string out)))
+                        (and (search "[DEBUG]" text)
+                             (search "a fault inside the verifier" text)
+                             t))
+                      t)))
+        (setf (symbol-function 'ecdsa-verify-p256) real)))))
+
 (defun test-jwt ()
   (format t "~%JWT~%")
 
@@ -4163,8 +5866,8 @@
     (check "jwt split"
            (length (web-skeleton::jwt-split token)) 3)
     ;; Malformed tokens (≠ 2 dots) return NIL with early-bail — a
-    ;; pathological 8 KiB token with many dots no longer allocates
-    ;; O(dots) substrings before rejection.
+    ;; pathological 8 KiB token with many dots does not allocate O(dots)
+    ;; substrings before rejection.
     (check "jwt split: no dots returns nil"
            (web-skeleton::jwt-split "nodotshere") nil)
     (check "jwt split: one dot returns nil"
@@ -4229,9 +5932,9 @@
       (check "jwt verify: A.3 token verifies with the clock window widened"
              (jwt-claim (jwt-verify token keys) "iss")
              "joe")
-      ;; First end-to-end proof that the JSON-OBJECT survives out of
-      ;; JWT-VERIFY into JWT-CLAIM — the claims used to be a bare alist,
-      ;; and the type change had no test that crossed this boundary.
+      ;; End-to-end proof that the JSON-OBJECT survives out of JWT-VERIFY
+      ;; into JWT-CLAIM: the one check of the claims' type that crosses
+      ;; this boundary.
       (check "jwt verify: claims come back as a json-object"
              (json-object-p (jwt-verify token keys))
              t)
@@ -4242,36 +5945,34 @@
              (jwt-verify (concatenate 'string token "==") keys)
              nil))
 
-    ;; jwt-verify rejects expired token
+    ;; The A.3 token, outside the widened window, is refused for its 2011
+    ;; exp. A tampered token and another alg are refused for their own
+    ;; reasons in TEST-JWT-REFUSALS-FOR-THEIR-OWN-REASONS: tried on this
+    ;; token, the exp check refuses them first, whatever else is missing.
     (check "jwt expired token"
            (jwt-verify token keys)
-           nil)
-
-    ;; jwt-verify rejects tampered token
-    (let ((bad-token (format nil "~a.~a.~a"
-                             header-b64
-                             ;; tamper: change one base64 character
-                             (concatenate 'string "X" (subseq payload-b64 1))
-                             sig-b64)))
-      (check "jwt tampered token"
-             (jwt-verify bad-token keys)
-             nil))
-
-    ;; jwt-verify rejects wrong algorithm
-    (let ((bad-alg-token (format nil "~a.~a.~a"
-                                 (base64url-encode
-                                  (sb-ext:string-to-octets
-                                   "{\"alg\":\"RS256\"}" :external-format :utf-8))
-                                 payload-b64 sig-b64)))
-      (check "jwt wrong algorithm"
-             (jwt-verify bad-alg-token keys)
-             nil)))
+           nil))
 
   ;; JWKS parsing
   (let* ((jwks-json "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"test-key\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"},{\"kty\":\"RSA\",\"kid\":\"rsa-key\",\"n\":\"abc\",\"e\":\"def\"}]}")
          (keys (parse-jwks jwks-json)))
     (check "jwks parses EC keys only" (length keys) 1)
     (check "jwks kid" (jwt-key-kid (first keys)) "test-key"))
+
+  ;; A kty or crv that is not a string names no key type this reader
+  ;; understands, and RFC 7517 §5 has those keys ignored: skipped beside the
+  ;; good one, as an RSA key is, rather than a bare type error out of
+  ;; STRING= on a number or a list.
+  (let ((good "{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}"))
+    (dolist (odd '("{\"kty\":5,\"crv\":\"P-256\"}"
+                   "{\"kty\":\"EC\",\"crv\":[1]}"
+                   "{\"kty\":{},\"crv\":\"P-256\"}"))
+      (check (format nil "jwks: ~a is skipped" odd)
+             (handler-case
+                 (mapcar #'jwt-key-kid
+                         (parse-jwks (format nil "{\"keys\":[~a,~a]}" odd good)))
+               (error (e) (princ-to-string e)))
+             '("k"))))
 
   ;; Two kidless keys — RFC 7517 §4.5 says kid is OPTIONAL, so a
   ;; JWKS with multiple kidless keys is spec-legal. Dedup only on
@@ -4355,6 +6056,18 @@
     (check "hooks run LIFO and survive a raising hook"
            (coerce log 'list)
            '(:third :second :first))
+    ;; The run that fires the hooks consumes them. Kept, a second
+    ;; START-SERVER in the same image would run every earlier run's hooks
+    ;; again, and each store with a reaper would hold its place for good.
+    (check "the hooks are consumed by the run that fires them"
+           web-skeleton::*shutdown-hooks* nil)
+    (web-skeleton:register-cleanup (lambda () (vector-push-extend :later log)))
+    (setf (fill-pointer log) 0)
+    (let ((web-skeleton:*log-level* :error)
+          (web-skeleton:*log-stream* (make-broadcast-stream)))
+      (web-skeleton::run-shutdown-hooks))
+    (check "a later run fires only the hooks registered since"
+           (coerce log 'list) '(:later))
     ;; Registration is idempotent on the return value — it returns FN.
     (let ((fn (lambda () nil)))
       (check "register-cleanup returns the function"
@@ -4527,15 +6240,17 @@
       (check "append: queued counts only the tail"
              (web-skeleton::connection-write-queued conn) 6)
 
-      ;; --- Order is preserved across a third ---
+      ;; --- Order is preserved across a third, joined to the second, and
+      ;; a fourth too large to join ---
       (web-skeleton::connection-append-write conn (bytes "third"))
+      (web-skeleton::connection-append-write conn (bytes (make-string 300 :initial-element #\x)))
       (check "append: queue holds tail vectors oldest first"
              (mapcar #'str (web-skeleton::connection-write-queue conn))
-             '("world!" "third"))
+             (list "world!third" (make-string 300 :initial-element #\x)))
 
       ;; --- QUEUE-WRITE's guard counts the queue, not just the head ---
-      ;; Drain the head only; a queue remains. The old guard subtracted
-      ;; write-pos from write-end and would have seen zero here.
+      ;; Drain the head only; a queue remains. A guard that subtracted
+      ;; write-pos from write-end would see zero here.
       (setf (web-skeleton::connection-write-pos conn)
             (web-skeleton::connection-write-end conn))
       (check "queue-write: signals when only the append queue is pending"
@@ -4549,22 +6264,22 @@
       (check "promote: first promotion takes the oldest"
              (progn (web-skeleton::connection-promote-write conn)
                     (str (web-skeleton::connection-write-buf conn)))
-             "world!")
+             "world!third")
       (check "promote: promotion resets the head offsets"
              (list (web-skeleton::connection-write-pos conn)
                    (web-skeleton::connection-write-end conn))
-             '(0 6))
+             '(0 11))
       (check "promote: second promotion takes the next"
-             (progn (setf (web-skeleton::connection-write-pos conn) 6)
+             (progn (setf (web-skeleton::connection-write-pos conn) 11)
                     (web-skeleton::connection-promote-write conn)
-                    (str (web-skeleton::connection-write-buf conn)))
-             "third")
+                    (length (web-skeleton::connection-write-buf conn)))
+             300)
       (check "promote: queued returns to zero when the tail empties"
              (web-skeleton::connection-write-queued conn) 0)
       (check "promote: tail pointer is released with the last cons"
              (web-skeleton::connection-write-queue-tail conn) nil)
       (check "promote: empty queue reports nothing to promote"
-             (progn (setf (web-skeleton::connection-write-pos conn) 5)
+             (progn (setf (web-skeleton::connection-write-pos conn) 300)
                     (web-skeleton::connection-promote-write conn))
              nil))
 
@@ -4712,7 +6427,7 @@
    is writable and not readable, so EPOLLOUT wakes the loop and EPOLLIN
    does not — which is what makes the two masks distinguishable without any
    data timing. Asserting delivery instead would pass against a mask that
-   never changed, and exactly that test was written twice before this one.
+   never changed.
 
    The second half is the security-relevant one. A connection whose
    transport has a handshake is not usable when the TCP connect lands, and
@@ -4872,10 +6587,15 @@
                                           (declare (ignore s h b)) nil))))
              ;; -1 is not an epoll fd, so EPOLL-ADD raises after the
              ;; transport is in place. ATTEMPT because the raise is the
-             ;; point and must not end the run.
-             (attempt
-              (web-skeleton::initiate-http-fetch-to-address
-               inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet))
+             ;; point and must not end the run, and the raise is asserted,
+             ;; so the release below is shown to follow the failure this
+             ;; arranges rather than some other way through the setup.
+             (check "fetch setup: the wiring failed, as arranged"
+                    (stringp
+                     (attempt
+                      (web-skeleton::initiate-http-fetch-to-address
+                       inbound -1 fetch-req "right.test" port "/" #(127 0 0 1) :inet)))
+                    t)
              (check "fetch setup: the transport was installed" installed 1)
              (check "fetch setup: and released when the wiring failed"
                     released 1)))
@@ -4892,10 +6612,12 @@
    paused and had nothing else to run had removed its own way back.
 
    Asserted against epoll rather than against a flag. Clearing
-   FETCH-PAUSED without re-arming EPOLLIN would look identical from the
-   struct and would leave the connection waiting for an event nobody is
-   going to send — which is exactly the mistake the re-arm test was
-   rewritten to catch."
+   FETCH-PAUSED without re-arming would look identical from the struct and
+   would leave the connection waiting for an event nobody is going to
+   send. And with nothing sent to the outbound: the resume has to wake it
+   through writability, because the chunks a pause leaves are already in
+   user space, and a readability re-arm would wait on bytes that may never
+   come."
   (format t "~%Automatic inbound-to-outbound resume~%")
   (multiple-value-bind (in-server in-client) (%loopback-pair)
     (multiple-value-bind (out-server out-client) (%loopback-pair)
@@ -4925,19 +6647,28 @@
                ;; event the edge hangs on.
                (web-skeleton::connection-queue-write
                 inbound (sb-ext:string-to-octets "xyz" :external-format :ascii))
-               (check "resume edge: the inbound drained"
+               (check "resume edge: the write returns without raising"
                       (attempt (web-skeleton::handle-client-write inbound epfd))
                       nil)
+               ;; What the name says, asserted: a write that did nothing
+               ;; also returns NIL.
+               (check "resume edge: the inbound drained"
+                      (web-skeleton::connection-write-pending inbound) 0)
+               (check "resume edge: and the bytes reached its peer"
+                      (let ((got (read-until-bounded
+                                  (sb-bsd-sockets:socket-make-stream
+                                   in-client :input t :element-type '(unsigned-byte 8))
+                                  :seconds 2
+                                  :until (lambda (buf fill) (declare (ignore buf)) (>= fill 3)))))
+                        (sb-ext:octets-to-string (subseq got 0 (fill-pointer got))
+                                                 :external-format :ascii))
+                      "xyz")
                (check "resume edge: the outbound is no longer paused"
                       (web-skeleton::connection-fetch-paused outbound) nil)
                (check "resume edge: the back-link is cleared with it"
                       (web-skeleton::connection-paused-outbound-fd inbound) -1)
-               ;; The assertion that matters: EPOLLIN is actually back.
-               (sb-bsd-sockets:socket-send out-client
-                                           (sb-ext:string-to-octets
-                                            "hi" :external-format :ascii)
-                                           nil)
-               (sleep 0.05)
+               ;; The assertion that matters: the outbound is woken, with
+               ;; nothing new sent to it.
                (check "resume edge: and epoll reports the outbound again"
                       (plusp (web-skeleton::epoll-wait epfd evbuf 4 100)) t)
                (check "resume edge: it is the outbound fd"
@@ -5068,11 +6799,11 @@
 
    The drain discipline is the part worth having. Edge-triggered epoll
    reports a transition, so readability must be drained in one pass —
-   stated in CONNECTION-READ-AVAILABLE's docstring since it was written,
-   and until now not assertable without a real socket and a real partial
-   read. A scripted byte source makes it deterministic, which matters
-   because the whole SSL_pending argument rests on this loop behaving
-   exactly this way."
+   stated in CONNECTION-READ-AVAILABLE's docstring, and not assertable
+   against a real socket without arranging a real partial read. A
+   scripted byte source makes it deterministic, which matters because the
+   whole SSL_pending argument rests on this loop behaving exactly this
+   way."
   (format t "~%Connection transport seam~%")
   ;; ---- reads ----
   (let* ((calls (list 0))
@@ -5159,7 +6890,7 @@
 
 (defun test-write-queue-drain ()
   (format t "~%Write queue drain~%")
-  (let ((path "/tmp/web-skeleton-write-queue.bin"))
+  (let ((path (scratch-path "ws-write-queue" ".bin")))
     (flet ((bytes (s) (sb-ext:string-to-octets s :external-format :ascii))
            (str (v) (sb-ext:octets-to-string v :external-format :ascii))
            (slurp ()
@@ -5205,10 +6936,11 @@
 ;;; the buffer is 64 KiB, `sleep` does not drain it, so a payload past
 ;;; that size is guaranteed to leave a remainder.
 ;;;
-;;; The elapsed-time check is the point of the whole item. The old ws-send
-;;; sat in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT* expired,
-;;; holding the worker and every other connection on it. Against this
-;;; fixture — a peer that never reads at all — that is a full ten seconds.
+;;; The elapsed-time check is the point of the test. A ws-send that
+;;; waited in POLL-WRITABLE until the peer read or *WRITE-STALL-TIMEOUT*
+;;; expired would hold the worker and every other connection on it —
+;;; against this fixture, a peer that never reads at all, a full ten
+;;; seconds.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-send-queues ()
@@ -5242,8 +6974,8 @@
                     (plusp (web-skeleton::connection-write-pending conn)) t)
              (check "ws-send: returns without waiting for the peer"
                     (< elapsed 1) t))
-           ;; Append, not substitute. The old ws-send never touched the
-           ;; connection's buffer at all; the new one must add to it.
+           ;; Append, not substitute: a second send must add to what the
+           ;; connection already holds.
            (let ((before (web-skeleton::connection-write-pending conn)))
              ;; Caught for the same reason as the first send: a blocking
              ;; ws-send raises here, and an unhandled raise ends the run
@@ -5289,23 +7021,23 @@
 (defun test-ws-send-refuses-a-foreign-connection ()
   "WS-SEND refuses a connection this worker does not own.
 
-   The small frame is the point of the first assertion. A cross-worker
-   WS-SEND used to be caught by the arming — an fd absent from this
-   worker's epoll gives ENOENT — and arming only happens when the flush
-   leaves a remainder. So the refusal covered the backed-up peer and
-   missed the ordinary one: a frame that fit was appended to an
-   unsynchronised queue, sent from the wrong thread, and reported success.
-   That is the case the README and DEPLOYMENT.md both described as
-   refused, and it is the common one.
+   The small frame is the point of the first assertion. Left to the
+   arming — an fd absent from this worker's epoll gives ENOENT — a
+   cross-worker WS-SEND would be caught only when the flush leaves a
+   remainder. The refusal would cover the backed-up peer and miss the
+   ordinary one: a frame that fit would be appended to an unsynchronised
+   queue, sent from the wrong thread, and reported as success. That is
+   the case the README and DEPLOYMENT.md both describe as refused, and it
+   is the common one.
 
    The big frame against a shrunk SO_SNDBUF is what makes the placement
    assertion mean anything, and it is the fixture rather than the
    assertion that does the work. PENDING = 0 after a refusal is supposed
    to say the guard ran before CONNECTION-APPEND-WRITE. Over a socket
    that takes everything it is offered, PENDING is 0 however late the
-   guard sits — including at the very end of the function, which is
-   exactly where the old incidental refusal lived and so the regression
-   worth guarding against. Backed up, an appended frame cannot flush
+   guard sits — including at the very end of the function, where the
+   arming's incidental refusal sits, and so the regression worth guarding
+   against. Backed up, an appended frame cannot flush
    away, so 0 means the append never happened and nothing else.
 
    Two socket pairs rather than one, because the foreign connection has
@@ -5339,12 +7071,12 @@
                                       :initial-element 88))))
                (web-skeleton::set-nonblocking ffd)
                (web-skeleton::set-nonblocking ofd)
-               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
-               ;; Both sides shrunk so neither can swallow the big frame whole.
+               ;; Both sides' send buffers shrunk, so neither can swallow the
+               ;; big frame whole.
                (web-skeleton::set-socket-option-int
-                ffd web-skeleton::+sol-socket+ 7 2048)
+                ffd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (web-skeleton::set-socket-option-int
-                ofd web-skeleton::+sol-socket+ 7 2048)
+                ofd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
                (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                       (web-skeleton::*epoll-fd* epfd)
                       (conn (web-skeleton::make-connection
@@ -5403,16 +7135,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; The write-stall deadline
 ;;;
-;;; *write-stall-timeout* used to bound a spin inside ws-send. It now bounds
-;;; how long a connection may sit on a backlog that is not moving. The
-;;; idle sweep cannot answer that question: *ws-idle-timeout* defaults to
-;;; a day, and a peer that has stopped reading may still be sending, which
-;;; keeps LAST-ACTIVE fresh. So the negative control here holds LAST-ACTIVE
-;;; current — that is precisely the case the idle timeout would miss.
+;;; *write-stall-timeout* bounds how long a connection may sit on a backlog
+;;; that is not moving. The idle sweep cannot answer that question:
+;;; *ws-idle-timeout* defaults to a day, and a peer that has stopped
+;;; reading may still be sending, which keeps LAST-ACTIVE fresh. So the
+;;; negative control here holds LAST-ACTIVE current — that is precisely the
+;;; case the idle timeout would miss.
 ;;;
 ;;; The sweep asks whether there is a backlog and whether it has moved,
-;;; not what state the connection is in. It used to name :WEBSOCKET, which
-;;; left every other state — including the long-lived ones most likely to
+;;; not what state the connection is in. A sweep naming :WEBSOCKET would
+;;; leave every other state — including the long-lived ones most likely to
 ;;; build a backlog — with no stall bound at all, so a second state is
 ;;; swept here to hold the generalization in place.
 ;;; ---------------------------------------------------------------------------
@@ -5450,8 +7182,8 @@
                (ignore-errors (web-skeleton::%close epfd))))))
 
     ;; Control: same backlog, progress just made. Must survive — and would
-    ;; also survive the old code, which is why the stalled case below is
-    ;; what carries the check.
+    ;; survive a sweep with no stall bound too, which is why the stalled
+    ;; case below is what carries the check.
     (destructuring-bind (count log) (sweep-one)
       (check "ws stall: a moving backlog is left alone" count 1)
       (check "ws stall: control logs nothing about stalling"
@@ -5473,6 +7205,196 @@
     (destructuring-bind (count log) (sweep-one :state :write-response)
       (declare (ignore log))
       (check "stall: a moving non-websocket backlog is left alone" count 1))))
+
+;;; ---------------------------------------------------------------------------
+;;; An unfinished WebSocket message's deadline
+;;;
+;;; *WS-MESSAGE-TIMEOUT* bounds how long a message may take to arrive. The
+;;; clock it reads is started by WEBSOCKET-ON-READ when a pass ends with a
+;;; message unfinished, and stopped when a data message completes; the
+;;; sweep closes a message past it with 1008.
+;;; ---------------------------------------------------------------------------
+
+(defun test-utf-8-well-formed-p ()
+  "UTF-8-WELL-FORMED-P, the check on a text message and a close reason,
+   answers as RFC 3629 does: the edges of each range, overlong forms,
+   surrogates, code points past U+10FFFF, leads that begin nothing, and
+   sequences cut short. Then against SBCL's decoder, which a text frame
+   was checked with before: every one- and two-byte sequence, and twenty
+   thousand built of pieces. A piece is a code point SBCL encodes, near a
+   range's edge as often as not, or one of the hard cases or a few random
+   bytes, so a sequence is often well formed but for the one piece that
+   decides it."
+  (format t "~%UTF-8: well-formed, read in place~%")
+  (flet ((ok (&rest bytes)
+           (web-skeleton::utf-8-well-formed-p
+            (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+    (dolist (case '(("empty" () t)
+                    ("ASCII" (#x41 #x7F) t)
+                    ("U+0080, the first two-byte" (#xC2 #x80) t)
+                    ("U+07FF, the last two-byte" (#xDF #xBF) t)
+                    ("U+0800, the first three-byte" (#xE0 #xA0 #x80) t)
+                    ("U+D7FF, below the surrogates" (#xED #x9F #xBF) t)
+                    ("U+E000, above them" (#xEE #x80 #x80) t)
+                    ("U+FFFF" (#xEF #xBF #xBF) t)
+                    ("U+10000, the first four-byte" (#xF0 #x90 #x80 #x80) t)
+                    ("U+10FFFF, the last" (#xF4 #x8F #xBF #xBF) t)
+                    ("overlong NUL" (#xC0 #x80) nil)
+                    ("overlong C1" (#xC1 #xBF) nil)
+                    ("overlong three-byte" (#xE0 #x9F #xBF) nil)
+                    ("overlong four-byte" (#xF0 #x8F #xBF #xBF) nil)
+                    ("surrogate U+D800" (#xED #xA0 #x80) nil)
+                    ("surrogate U+DFFF" (#xED #xBF #xBF) nil)
+                    ("past U+10FFFF" (#xF4 #x90 #x80 #x80) nil)
+                    ("lead F5" (#xF5 #x80 #x80 #x80) nil)
+                    ("lead FF" (#xFF) nil)
+                    ("a lone continuation" (#x80) nil)
+                    ("two-byte cut short" (#xC2) nil)
+                    ("three-byte cut short" (#xE2 #x82) nil)
+                    ("four-byte cut short" (#xF0 #x9F #x98) nil)
+                    ("a lead where a continuation belongs" (#xE2 #x41 #x80) nil)))
+      (destructuring-bind (name bytes expected) case
+        (check (format nil "utf-8: ~a" name) (apply #'ok bytes) expected))))
+  (let ((disagreements nil)
+        (state (sb-ext:seed-random-state 6455)))
+    (flet ((try (v)
+             (let ((ours (web-skeleton::utf-8-well-formed-p v))
+                   ;; SBCL's verdict: decoded without an error, and encoded
+                   ;; back to the same bytes. The decoded string has to be
+                   ;; used: a compiler may delete a call to OCTETS-TO-STRING
+                   ;; whose value goes nowhere, and the decoding error with it,
+                   ;; which would make every sequence look well formed.
+                   (sbcl (handler-case
+                             (equalp (sb-ext:string-to-octets
+                                      (sb-ext:octets-to-string v :external-format :utf-8)
+                                      :external-format :utf-8)
+                                     v)
+                           (error () nil))))
+               (unless (eq ours sbcl)
+                 (push (coerce v 'list) disagreements)))))
+      (dotimes (a 256)
+        (try (coerce (list a) '(simple-array (unsigned-byte 8) (*))))
+        (dotimes (b 256)
+          (try (coerce (list a b) '(simple-array (unsigned-byte 8) (*))))))
+      (let ((edges '(#x7F #x80 #x7FF #x800 #xD7FF #xE000 #xFFFF #x10000 #x10FFFF))
+            (hard '((#xC0 #x80) (#xC1 #xBF) (#xE0 #x9F #xBF) (#xF0 #x8F #xBF #xBF)
+                    (#xED #xA0 #x80) (#xED #xBF #xBF) (#xF4 #x90 #x80 #x80)
+                    (#xF5 #x80 #x80 #x80) (#xFF) (#x80) (#xC2) (#xE2 #x82)
+                    (#xF0 #x9F #x98))))
+        (flet ((piece ()
+                 (case (random 4 state)
+                   ;; A code point, SBCL's encoding of it.
+                   ((0 1)
+                    (let ((cp (if (zerop (random 2 state))
+                                  (nth (random (length edges) state) edges)
+                                  (loop for c = (random #x110000 state)
+                                        unless (<= #xD800 c #xDFFF) return c))))
+                      (coerce (sb-ext:string-to-octets (string (code-char cp))
+                                                       :external-format :utf-8)
+                              'list)))
+                   (2 (nth (random (length hard) state) hard))
+                   (t (loop repeat (1+ (random 4 state))
+                            collect (random 256 state))))))
+          (dotimes (n 20000)
+            (try (coerce (loop repeat (1+ (random 5 state)) append (piece))
+                         '(simple-array (unsigned-byte 8) (*))))))))
+    (check "utf-8: agrees with SBCL's decoder on every case tried"
+           (subseq (reverse disagreements) 0 (min 5 (length disagreements)))
+           nil)))
+
+(defun test-ws-message-clock ()
+  "WS-MESSAGE-AT through WEBSOCKET-ON-READ, a read at a time: a first
+   fragment starts it, a ping between fragments leaves it where it is, the
+   final fragment stops it; half a frame starts it, and the frame's other
+   half stops it; a message that completes in a read ending with half the
+   next one leaves it running for the next. A ping in two halves on a
+   socket with nothing else unfinished starts it and stops it, though no
+   data message completes: left running, the sweep would close a quiet
+   socket that only answers pings."
+  (format t "~%WebSocket: an unfinished message's clock~%")
+  (let ((conn (web-skeleton::make-connection :fd -1 :state :websocket :last-active 0)))
+    (setf (web-skeleton::connection-read-buf conn)
+          (make-array 4096 :element-type '(unsigned-byte 8))
+          (web-skeleton::connection-read-pos conn) 0)
+    (flet ((feed (&rest pieces)
+             ;; Each piece lands behind what the last pass left, and one
+             ;; pass runs over all of it.
+             (dolist (bytes pieces)
+               (let ((at (web-skeleton::connection-read-pos conn)))
+                 (replace (web-skeleton::connection-read-buf conn) bytes :start1 at)
+                 (setf (web-skeleton::connection-read-pos conn) (+ at (length bytes)))))
+             (web-skeleton::websocket-on-read conn nil)
+             (web-skeleton::connection-ws-message-at conn))
+           (text (s) (sb-ext:string-to-octets s :external-format :utf-8))
+           (set-clock (v) (setf (web-skeleton::connection-ws-message-at conn) v)))
+      (check "clock: a whole message leaves it stopped"
+             (feed (make-masked-frame t 1 (text "hello"))) 0)
+      (let ((ping (make-masked-frame t 9 (text "p"))))
+        (check "clock: half a ping starts it"
+               (plusp (feed (subseq ping 0 3))) t)
+        (check "clock: and the ping's other half stops it, nothing being unfinished"
+               (feed (subseq ping 3)) 0))
+      (check "clock: a first fragment starts it"
+             (plusp (feed (make-masked-frame nil 1 (text "hel")))) t)
+      (set-clock 12345)
+      (check "clock: a ping between fragments leaves it where it was"
+             (feed (make-masked-frame t 9 (text "p"))) 12345)
+      (check "clock: and so does a continuation short of the last"
+             (feed (make-masked-frame nil 0 (text "l"))) 12345)
+      (check "clock: the final fragment stops it"
+             (feed (make-masked-frame t 0 (text "lo"))) 0)
+      (let ((frame (make-masked-frame t 2 (make-array 300 :element-type '(unsigned-byte 8)
+                                                          :initial-element 7))))
+        (check "clock: half a frame starts it"
+               (plusp (feed (subseq frame 0 150))) t)
+        (set-clock 12345)
+        (check "clock: and the other half stops it"
+               (feed (subseq frame 150)) 0)
+        (check "clock: a message done in a read that ends with half the next leaves it running"
+               (plusp (feed (make-masked-frame t 1 (text "a")) (subseq frame 0 40)))
+               t)))))
+
+(defun test-ws-message-timeout-sweep ()
+  "The sweep closes a WebSocket whose unfinished message is past
+   *WS-MESSAGE-TIMEOUT* with 1008, and lets go of the fragments it held at
+   once. A message within its time is left alone, and 0 turns the bound
+   off."
+  (format t "~%WebSocket: an unfinished message's deadline~%")
+  (flet ((sweep-one (&key (age 0) (timeout 30))
+           ;; A WebSocket holding an unfinished fragmented message begun AGE
+           ;; seconds ago. Answers its state, the close code queued for it
+           ;; if any, and the fragment bytes it still holds.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (connfd (web-skeleton::epoll-create))
+                 (now (get-universal-time)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                         (web-skeleton:*log-stream* (make-broadcast-stream))
+                         (web-skeleton:*ws-message-timeout* timeout)
+                         (conn (web-skeleton::make-connection
+                                :fd connfd :state :websocket :last-active now)))
+                    (setf (web-skeleton::connection-ws-frag-buf conn)
+                          (make-array 1000 :element-type '(unsigned-byte 8))
+                          (web-skeleton::connection-ws-frag-total conn) 1000
+                          (web-skeleton::connection-ws-message-at conn) (- now age))
+                    (web-skeleton::epoll-add epfd connfd (logior web-skeleton::+epollin+
+                                                                 web-skeleton::+epollet+))
+                    (web-skeleton::register-connection conn)
+                    (let ((web-skeleton::*epoll-fd* epfd))
+                      (web-skeleton::sweep-idle-connections epfd now))
+                    (let ((frame (web-skeleton::connection-write-buf conn)))
+                      (list (web-skeleton::connection-state conn)
+                            (and frame (>= (length frame) 4) (= (aref frame 0) #x88)
+                                 (logior (ash (aref frame 2) 8) (aref frame 3)))
+                            (web-skeleton::connection-ws-frag-total conn))))
+               (ignore-errors (web-skeleton::%close connfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+    (check "deadline: a message past it is closed 1008, its fragments let go"
+           (sweep-one :age 31) '(:closing 1008 0))
+    (check "deadline: one within it is left alone"
+           (sweep-one :age 5) '(:websocket nil 1000))
+    (check "deadline: 0 turns it off"
+           (sweep-one :age 100000 :timeout 0) '(:websocket nil 1000))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked encoder
@@ -5670,6 +7592,28 @@
         (check "on-data: a byte-at-a-time upstream delivers each chunk once"
                (nreverse seen) '("alpha" "beta" "gamma")))
 
+      ;; --- :HALT ends the walk at that chunk; the next call resumes after it ---
+      ;; The whole body is in the buffer, so a walk that carried on past
+      ;; the verdict would hand over gamma and report the body complete.
+      (let ((seen nil))
+        (multiple-value-bind (complete resume)
+            (web-skeleton::chunked-body-complete-p
+             framed 0 n 0
+             (lambda (buf s e)
+               (push (str (subseq buf s e)) seen)
+               (when (equal (first seen) "beta") :halt)))
+          (check "on-data halt: the walk stops at the halting chunk"
+                 (list complete (reverse seen))
+                 (list nil '("alpha" "beta")))
+          (multiple-value-bind (complete2 resume2)
+              (web-skeleton::chunked-body-complete-p
+               framed 0 n resume
+               (lambda (buf s e) (push (str (subseq buf s e)) seen) nil))
+            (declare (ignore resume2))
+            (check "on-data halt: a later call resumes after it, and finishes"
+                   (list complete2 (reverse seen))
+                   (list t '("alpha" "beta" "gamma"))))))
+
       ;; --- A partial chunk is never handed over ---
       ;; The walk returns before ON-DATA when the data or its trailing
       ;; CRLF has not landed, so an app is never given bytes whose
@@ -5685,14 +7629,16 @@
 ;;; :on-body backpressure
 ;;;
 ;;; Over a real socket and a real epoll fd, because the whole mechanism
-;;; is an epoll interest change: :PAUSE drops EPOLLIN so the upstream's
-;;; send window fills, and FETCH-RESUME puts it back. Nothing about that
-;;; is observable from a struct.
+;;; is an epoll interest change: :PAUSE drops every event so the upstream's
+;;; send window fills, and FETCH-RESUME wakes the fetch again. Nothing
+;;; about that is observable from a struct.
 ;;;
-;;; The property that makes the simple re-arm correct is that a pause
-;;; stops the *upstream*, not the current pass — everything already read
-;;; is still handed over, so no undelivered bytes are left in user space
-;;; where an EPOLL_CTL_MOD would not re-fire.
+;;; A pause halts the walk at its chunk, so what the read brought after it
+;;; is left in user space, where no readability edge will report it. The
+;;; resume therefore wakes through writability and walks the buffer before
+;;; it reads, and the checks below are arranged so that only that wake-up
+;;; can deliver the chunks: nothing new reaches the socket until the last
+;;; round.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-fetch-on-body-pause ()
@@ -5736,13 +7682,12 @@
                                       (logior web-skeleton::+epollin+
                                               web-skeleton::+epollet+))
              (sb-bsd-sockets:socket-send client body nil)
-             ;; Give the bytes a moment to cross loopback, then let the
-             ;; read path drain them.
-             (sleep 0.1)
+             ;; Every byte across loopback, then the read path drains them.
+             (%await-arrival out-fd :bytes (length body))
              (web-skeleton::handle-outbound-read conn epfd)
 
-             (check "pause: the callback saw every chunk already read"
-                    (nreverse seen) '("aa" "bb" "cc"))
+             (check "pause: the walk stopped at the chunk it paused on"
+                    (reverse seen) '("aa"))
              (check "pause: the connection is marked paused"
                     (web-skeleton::connection-fetch-paused conn) t)
              ;; The response is unterminated, so the fetch has not
@@ -5751,49 +7696,59 @@
              (check "pause: the fetch has not completed"
                     (hash-table-count web-skeleton::*connections*) 1)
 
-             ;; Resume clears the flag and re-arms. The re-arm is what
-             ;; makes the pause recoverable rather than a one-way door.
-             (web-skeleton::fetch-resume conn)
-             (check "resume: the paused flag is cleared"
-                    (web-skeleton::connection-fetch-paused conn) nil)
-             (check "resume: a second resume is a no-op, not an error"
-                    (progn (web-skeleton::fetch-resume conn)
-                           (web-skeleton::connection-fetch-paused conn))
-                    nil)
-
-             ;; The re-arm has to be asserted against epoll, not against a
-             ;; read. HANDLE-OUTBOUND-READ calls the socket directly, so
-             ;; it delivers bytes whatever the interest mask says — the
-             ;; mask only decides whether the event loop is ever woken to
-             ;; call it. Reverting the re-arm and re-running showed
-             ;; exactly that: a delivery check passed with the pause
-             ;; never lifted.
+             ;; Asserted against epoll, not against a read.
+             ;; HANDLE-OUTBOUND-READ delivers whatever the interest mask
+             ;; says, so only the event shows whether the loop would ever
+             ;; be woken to call it.
              (let ((evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
                                       :element-type '(unsigned-byte 8))))
-               ;; Fresh bytes with the interest re-armed: the loop wakes.
-               (sb-bsd-sockets:socket-send
-                client
-                (web-skeleton::encode-chunk
-                 (sb-ext:string-to-octets "dd" :external-format :ascii))
-                nil)
-               (sleep 0.1)
-               (check "resume: epoll reports the fd once the interest is back"
-                      (plusp (web-skeleton::epoll-wait epfd evbuf 4 50)) t)
-               ;; And it really is our fd, not a stray wake-up.
-               (check "resume: and it is the outbound fd"
-                      (web-skeleton::epoll-event-fd evbuf 0) out-fd)
-               ;; Paused again, the same bytes produce no wake-up at all.
-               (web-skeleton::handle-outbound-read conn epfd)
-               (check "pause: a paused fd is not reported, with data waiting"
-                      (progn
-                        (sb-bsd-sockets:socket-send
-                         client
-                         (web-skeleton::encode-chunk
-                          (sb-ext:string-to-octets "ee" :external-format :ascii))
-                         nil)
-                        (sleep 0.1)
-                        (web-skeleton::epoll-wait epfd evbuf 4 50))
-                      0)))
+               (flet ((resume-and-dispatch ()
+                        ;; One resume, then the one event it must produce,
+                        ;; handed to the dispatcher the loop would use.
+                        (web-skeleton::fetch-resume conn)
+                        (let ((n (web-skeleton::epoll-wait epfd evbuf 4 50)))
+                          (when (plusp n)
+                            (web-skeleton::handle-outbound-event
+                             conn epfd (web-skeleton::epoll-event-flags evbuf 0)))
+                          (and (plusp n)
+                               (web-skeleton::epoll-event-fd evbuf 0)))))
+                 ;; Nothing new is sent before these two rounds, so the
+                 ;; chunks can only come from the buffer the pause left.
+                 (check "resume: woken at once, with no new bytes"
+                        (resume-and-dispatch) out-fd)
+                 (check "resume: the next buffered chunk, and only it"
+                        (reverse seen) '("aa" "bb"))
+                 (check "resume: paused again by its own verdict"
+                        (web-skeleton::connection-fetch-paused conn) t)
+                 (resume-and-dispatch)
+                 (check "resume: the last buffered chunk"
+                        (reverse seen) '("aa" "bb" "cc"))
+                 ;; Paused, bytes in the kernel produce no wake-up at all.
+                 ;; Waited for until they are in, so the nothing below is
+                 ;; asserted with data waiting.
+                 (let ((dd (web-skeleton::encode-chunk
+                            (sb-ext:string-to-octets "dd" :external-format :ascii))))
+                   (sb-bsd-sockets:socket-send client dd nil)
+                   (%await-arrival out-fd :bytes (length dd)))
+                 (check "pause: a paused fd is not reported, with data waiting"
+                        (web-skeleton::epoll-wait epfd evbuf 4 50) 0)
+                 ;; With the buffer walked dry, the resume goes on to read.
+                 (check "resume: and then reads what arrived meanwhile"
+                        (progn (resume-and-dispatch) (reverse seen))
+                        '("aa" "bb" "cc" "dd"))))
+             (check "resume: a second resume is a no-op, not an error"
+                    (progn (web-skeleton::fetch-resume conn)
+                           (web-skeleton::fetch-resume conn)
+                           :ok)
+                    :ok)
+             ;; A fetch that ends while paused is not paused any more, and
+             ;; resuming it is the no-op the contract promises rather than
+             ;; an epoll_ctl on a descriptor that is gone.
+             (web-skeleton::close-outbound conn epfd)
+             (check "resume: on a closed fetch, a no-op"
+                    (handler-case (progn (web-skeleton::fetch-resume conn) :ok)
+                      (error (e) (princ-to-string e)))
+                    :ok))
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
@@ -5827,9 +7782,7 @@
                               (make-test-request :method method :path "/d.txt"
                                                  :headers headers))))
                       (sb-ext:octets-to-string
-                       (if (consp r)
-                           (apply #'concatenate '(vector (unsigned-byte 8)) r)
-                           r)
+                       (%response-octets r)
                        :external-format :latin-1)))
                   (body (text)
                     (let ((i (search (format nil "~c~c~c~c" #\Return #\Newline
@@ -5868,10 +7821,11 @@
                               (setf i (1+ h)))))
                     1)
 
-             ;; The assertions the retired offset used to be load-bearing
-             ;; for. The body of a whole GET is the file and nothing else,
-             ;; and a range is the matching slice of it — both true no
-             ;; matter how long the header block happens to be.
+             ;; What a body offset into the pre-built response would be
+             ;; load-bearing for. The body of a whole GET is the file and
+             ;; nothing else, and a range is the matching slice of it —
+             ;; both true no matter how long the header block happens to
+             ;; be.
              (check "static date: the GET body is exactly the file"
                     (body (wire :GET))
                     "0123456789abcdefghijklmnopqrstuvwxyz")
@@ -6079,7 +8033,36 @@
                   :chunked)
                  :external-format :latin-1)))
       (check "sse: the protocol's content type is not overridable"
-             (and (search "content-type: text/event-stream" head) t) t))))
+             (and (search "content-type: text/event-stream" head) t) t)
+      (check "sse: and the caller's is not sent beside it"
+             (search "text/plain" head) nil))))
+
+(defun test-stream-headers-repeat ()
+  "A name a streamed response's :HEADERS repeats goes out each time: two
+   cookies are two Set-Cookie fields, and a stream that kept only the last
+   would set one of them without a word.
+
+   A function of its own rather than more of TEST-SSE, which is already as
+   large as SBCL 2.2.9's compiler takes in a 1 GiB heap."
+  (format t "~%Streamed responses keep a repeated header~%")
+  (flet ((head-of (sresp)
+             (sb-ext:octets-to-string
+              (web-skeleton::format-streaming-head
+               (web-skeleton::stream-response-response sresp) :chunked)
+              :external-format :latin-1))
+           (count-of (needle text)
+             (loop with start = 0
+                   for i = (search needle text :start2 start)
+                   while i count t do (setf start (1+ i)))))
+      (let ((headers '(("Set-Cookie" . "a=1") ("set-cookie" . "b=2"))))
+        (check "stream: a repeated name goes out each time"
+               (count-of "set-cookie: " (head-of (web-skeleton:make-stream-response
+                                                  :headers headers)))
+               2)
+        (check "sse: and on an SSE response too"
+               (count-of "set-cookie: " (head-of (web-skeleton:make-sse-response
+                                                  :headers headers)))
+               2))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Stream lifecycle
@@ -6316,7 +8299,7 @@
     ;; Over a real pair rather than /dev/null, because the only site that
     ;; can tell a framed keepalive from a raw one is the wire. "Nothing
     ;; left queued", "counts as production" and "survives without arming"
-    ;; are all true either way — they were, for a whole item.
+    ;; are all true either way.
     (multiple-value-bind (server client) (%loopback-pair)
       (let ((epfd (web-skeleton::epoll-create)))
         (unwind-protect
@@ -6512,10 +8495,10 @@
 ;;;
 ;;; DEPLOYMENT.md's own example calls ws-send from inside ws-handler. A
 ;;; handler that does that *and* returns a frame is the natural next step,
-;;; and it is the case the read branch had to convert for: the returned
-;;; frame used to go through CONNECTION-QUEUE-WRITE, which either
-;;; overwrites what ws-send queued or — now that its guard counts the
-;;; queue — signals, taking the connection down through the handler-case.
+;;; and the read branch appends the returned frame rather than handing it
+;;; to CONNECTION-QUEUE-WRITE, which would either overwrite what ws-send
+;;; queued or — its guard counting the queue — signal, taking the
+;;; connection down through the handler-case.
 ;;;
 ;;; Needs a genuinely bidirectional fd, so this builds a connected
 ;;; loopback pair rather than a pipe.
@@ -6536,6 +8519,50 @@
         (let ((server (sb-bsd-sockets:socket-accept listener)))
           (sb-bsd-sockets:socket-close listener)
           (values server client))))))
+
+(defun %bytes-buffered (fd)
+  "How many bytes FD's receive buffer holds, by FIONREAD, or 0 when the
+   ioctl fails, as it can on a socket a reset has ended."
+  (sb-alien:with-alien ((n sb-alien:int 0))
+    (if (zerop (sb-alien:alien-funcall
+                (sb-alien:extern-alien
+                 "ioctl" (function sb-alien:int sb-alien:int sb-alien:unsigned-long
+                                   (* sb-alien:int)))
+                fd +fionread+ (sb-alien:addr n)))
+        n
+        0)))
+
+(defun %peer-ended-p (fd)
+  "T when FD's peer has ended its side of the stream, by a FIN or a reset:
+   asked once, without waiting, of a level-triggered watch on an epoll set
+   of its own."
+  (let ((epfd (web-skeleton::epoll-create))
+        (evbuf (make-array web-skeleton::+epoll-event-size+
+                           :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (progn
+           (web-skeleton::epoll-add epfd fd +epollrdhup+)
+           (plusp (web-skeleton::epoll-wait epfd evbuf 1 0)))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
+(defun %await-arrival (fd &key (bytes 1) fin (seconds 2))
+  "T once FD's receive buffer holds BYTES bytes and, with FIN, its peer's
+   end of stream behind them; NIL if SECONDS pass first.
+
+   For a test that sends and then calls a read path directly, where a fixed
+   sleep would guess how long loopback takes, and a loaded runner can take
+   longer. Neither question consumes anything: FIONREAD only counts, and the
+   end of stream is asked of an epoll set of the helper's own, so the
+   edge-triggered one the test drives the connection through is untouched."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second))))
+    (loop
+      (when (and (>= (%bytes-buffered fd) bytes)
+                 (or (not fin) (%peer-ended-p fd)))
+        (return t))
+      (when (> (get-internal-real-time) deadline)
+        (return nil))
+      (sleep 0.005))))
 
 (defun test-ws-handler-push-and-return ()
   (format t "~%ws handler push and return~%")
@@ -6566,11 +8593,11 @@
                              (web-skeleton::ws-send c pushed)
                              returned)))
              (web-skeleton::set-nonblocking server-fd)
-             ;; SO_SNDBUF is 7 on Linux. The kernel doubles the value and
-             ;; enforces its own floor, so this asks for "as small as you
-             ;; will give me" rather than an exact size.
+             ;; The send buffer. The kernel doubles the value and enforces
+             ;; its own floor, so this asks for "as small as you will give
+             ;; me" rather than an exact size.
              (web-skeleton::set-socket-option-int
-              server-fd web-skeleton::+sol-socket+ 7 2048)
+              server-fd web-skeleton::+sol-socket+ +so-sndbuf+ 2048)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd server-fd
                                       (logior web-skeleton::+epollin+
@@ -6604,15 +8631,163 @@
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
+(defun test-a-stale-event-skips-the-fd-s-next-connection ()
+  "An event taken in a batch for a connection that has since closed is
+   not applied to the connection that took its fd later in the batch.
+
+   Built directly, since arranging a close and a reuse inside one live
+   epoll_wait batch is a race. OLD is the connection the hang-up was
+   reported for, closed since; NEW holds the same fd on the table. The
+   control is the same hang-up with NEW as its owner, which does close
+   NEW, so the first check is the owner comparison and not an event that
+   does nothing."
+  (format t "~%Event loop: a stale event and a reused fd~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (web-skeleton::*connections* (make-hash-table :test #'eql)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (old (web-skeleton::make-connection
+                        :fd -1 :state :closing :last-active 0))
+                  (new (web-skeleton::make-connection
+                        :fd fd :socket server :state :read-http
+                        :last-active (get-universal-time))))
+             (web-skeleton::register-connection new)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (web-skeleton::dispatch-connection-event
+              fd web-skeleton::+epollhup+ old epfd nil nil)
+             (check "stale event: the fd's next connection stays open"
+                    (list (eq (web-skeleton::lookup-connection fd) new)
+                          (web-skeleton::connection-fd new))
+                    (list t fd))
+             (web-skeleton::dispatch-connection-event
+              fd web-skeleton::+epollhup+ new epfd nil nil)
+             (check "stale event: the hang-up closes the connection it was for"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd new))
+                    (list nil -1)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
+(defun test-a-client-reset-is-a-disconnect ()
+  "A client that resets its connection is a client leaving, on the write
+   path as on the read path: its stream hears :DISCONNECTED and nothing is
+   logged as an ERROR — whether the failed write was the event loop's own,
+   or a relay's :ON-BODY writing into it.
+
+   Any client can reset at will, so an ERROR per reset is a log nobody can
+   act on, and blaming it on the upstream sends an operator to look at the
+   wrong end. The relay half is driven at the seam: a stub transport hands
+   HANDLE-OUTBOUND-EVENT one chunk, and :ON-BODY's STREAM-SEND into the
+   reset client is what fails."
+  (format t "~%A client reset, on the write path and mid-relay~%")
+  (flet ((reset-stream (on-close)
+           ;; A streaming connection whose client has reset: the next write
+           ;; on it fails with the connection's own descriptor.
+           (multiple-value-bind (server client) (%loopback-pair)
+             (let ((conn (web-skeleton::make-connection
+                          :fd (web-skeleton::socket-fd server) :socket server
+                          :state :streaming :stream-framing :chunked
+                          :stream-on-close on-close
+                          :last-active (get-universal-time))))
+               (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
+               (%reset-socket client)
+               (%await-arrival (web-skeleton::socket-fd server) :bytes 0 :fin t)
+               conn)))
+         (log-of (thunk)
+           (let ((web-skeleton:*log-stream* (make-string-output-stream)))
+             (funcall thunk)
+             (get-output-stream-string web-skeleton:*log-stream*))))
+    ;; --- The event loop's own write ---
+    (let* ((reason :never)
+           (epfd (web-skeleton::epoll-create))
+           (web-skeleton::*connections* (make-hash-table :test #'eql))
+           (conn (reset-stream (lambda (c r) (declare (ignore c)) (setf reason r)))))
+      (unwind-protect
+           (progn
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
+                                      (logior web-skeleton::+epollout+
+                                              web-skeleton::+epollet+))
+             (web-skeleton::connection-append-write
+              conn (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :initial-element 65))
+             (let ((log (log-of (lambda ()
+                                  (web-skeleton::handle-client-write conn epfd)))))
+               (check "client reset: the stream heard :disconnected" reason :disconnected)
+               (check "client reset: and nothing was logged as an ERROR"
+                      (search "[ERROR]" log) nil)))
+        (ignore-errors (web-skeleton::%close epfd))))
+    ;; --- A relay's :ON-BODY writing into it ---
+    (let* ((reason :never)
+           (status :never)
+           (epfd (web-skeleton::epoll-create))
+           (web-skeleton::*connections* (make-hash-table :test #'eql))
+           (target (reset-stream (lambda (c r) (declare (ignore c)) (setf reason r))))
+           (bytes (sb-ext:string-to-octets
+                   (concatenate 'string
+                                "HTTP/1.1 200 OK" *crlf*
+                                "Transfer-Encoding: chunked" *crlf* *crlf*
+                                "5" *crlf* "hello" *crlf*)
+                   :external-format :ascii))
+           (pos 0)
+           (socket (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+           (out (web-skeleton::make-connection
+                 :fd (web-skeleton::socket-fd socket) :socket socket
+                 :state :out-read :outbound-p t
+                 :fetch-sink :detached
+                 :inbound-fd (web-skeleton::connection-fd target)
+                 :fetch-method :GET
+                 :last-active (get-universal-time)
+                 :fetch-on-body (lambda (c chunk)
+                                  (declare (ignore c))
+                                  (web-skeleton:stream-send target chunk)
+                                  nil)
+                 :fetch-callback (lambda (s h b)
+                                   (declare (ignore h b))
+                                   (setf status s)
+                                   nil)
+                 ;; The bytes once, then nothing more for now.
+                 :read-fn (lambda (buf start max)
+                            (if (>= pos (length bytes))
+                                :again
+                                (let ((n (min max (- (length bytes) pos))))
+                                  (replace buf bytes :start1 start
+                                                     :start2 pos :end2 (+ pos n))
+                                  (incf pos n)
+                                  n))))))
+      (unwind-protect
+           (progn
+             (setf (web-skeleton::connection-fetch-outstanding target) t)
+             (web-skeleton::register-connection target)
+             (web-skeleton::register-connection out)
+             (let ((log (log-of
+                         (lambda ()
+                           (web-skeleton::handle-outbound-event
+                            out epfd web-skeleton::+epollin+)))))
+               (check "relay into a reset client: the stream heard :disconnected"
+                      reason :disconnected)
+               (check "relay into a reset client: the fetch ended on the abort sentinel"
+                      status nil)
+               (check "relay into a reset client: both connections are gone"
+                      (hash-table-count web-skeleton::*connections*) 0)
+               (check "relay into a reset client: nothing was logged as an ERROR"
+                      (search "[ERROR]" log) nil)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; The ping sweep flushes inline
 ;;;
 ;;; A two-byte ping onto an empty queue fits in any socket with room, so
-;;; the sweep should hand it over on the spot and arm nothing. Under the
-;;; old shape the frame sat queued until EPOLLOUT came back — one
-;;; epoll_ctl per WebSocket connection per interval, in a burst, to
-;;; deliver two bytes that had already fit. PENDING = 0 on return is the
-;;; observable form of "no arming was needed".
+;;; the sweep should hand it over on the spot and arm nothing. Queued for
+;;; EPOLLOUT instead, it would cost one epoll_ctl per WebSocket connection
+;;; per interval, in a burst, to deliver two bytes that had already fit.
+;;; PENDING = 0 on return is the observable form of "no arming was
+;;; needed".
 ;;; ---------------------------------------------------------------------------
 
 (defun test-ws-ping-flush ()
@@ -6751,6 +8926,50 @@
 ;;; Chunked completion detection (async outbound read path)
 ;;; ---------------------------------------------------------------------------
 
+(defun test-chunked-request-with-a-bad-chunk-size-e2e ()
+  "A chunked request whose chunk-size is not hex is answered 400 at once.
+
+   The completion walk took the boundary for 'not complete yet', so the
+   request was never dispatched or refused: no bytes came back, and the
+   idle sweep closed the connection ten seconds later. The control is the
+   same request with a valid chunk-size, answered the ordinary way."
+  (format t "~%chunked request: a chunk-size that is not hex~%")
+  (with-test-server (:handler (lambda (req)
+                                (declare (ignore req))
+                                (make-text-response 200 "ok")))
+    (flet ((answer (size)
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                             :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (progn
+                      (write-sequence
+                       (sb-ext:string-to-octets
+                        (concatenate 'string
+                                     (crlf "POST /x HTTP/1.1" "Host: x"
+                                           "Transfer-Encoding: chunked")
+                                     (format nil "~a~c~chello~c~c0~c~c~c~c" size
+                                             #\Return #\Newline #\Return #\Newline
+                                             #\Return #\Newline #\Return #\Newline))
+                        :external-format :ascii)
+                       stream)
+                      (force-output stream)
+                      (let ((text (sb-ext:octets-to-string
+                                   (read-until-bounded
+                                    stream :seconds 3
+                                    :until (lambda (buf fill)
+                                             (declare (ignore buf))
+                                             (>= fill 12)))
+                                   :external-format :latin-1)))
+                        (subseq text 0 (min 12 (length text)))))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (check "a chunk-size of ZZ is answered 400, not left to the idle sweep"
+             (answer "ZZ") "HTTP/1.1 400")
+      (check "control: a chunk-size of 5 is answered 200"
+             (answer "5") "HTTP/1.1 200"))))
+
 (defun test-chunked-body-complete-p ()
   (format t "~%Chunked completion~%")
   (flet ((complete-p (s)
@@ -6783,6 +9002,109 @@
     (check "incomplete: empty buffer"
            (complete-p "")
            nil)
+    ;; A chunk boundary whose first byte has arrived and is not a hex digit
+    ;; is decided, not incomplete: no later byte makes it a chunk-size. It
+    ;; raises, as an over-long size does, rather than waiting for a body
+    ;; that cannot come.
+    (flet ((raises-p (s)
+             (handler-case (progn (complete-p s) nil)
+               (web-skeleton::chunked-framing-error () t))))
+      (check "decided: a first chunk-size that is not hex raises"
+             (raises-p (format nil "ZZ~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: a later chunk-size that is not hex raises"
+             (raises-p (format nil "5~a~ahello~a~aZ" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: whitespace before a chunk-size raises"
+             (raises-p (format nil " 5~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "control: a boundary with nothing past it yet only waits"
+             (raises-p (format nil "5~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             nil)
+      ;; The walk accepts what DECODE-CHUNKED-BODY accepts and nothing
+      ;; more, because a consumer of its ON-DATA has no decoder behind it.
+      ;; Each of these is a framing the decoder refuses; each raises here
+      ;; as soon as the byte that decides it has arrived.
+      (check "decided: chunk data followed by something other than CRLF raises"
+             (raises-p (format nil "5~a~ahelloXX0~a~a~a~a" #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: a CR after the data with a stray byte behind it raises"
+             (raises-p (format nil "5~a~ahello~aX" #\Return #\Newline #\Return))
+             t)
+      (check "control: a CR after the data with nothing behind it only waits"
+             (raises-p (format nil "5~a~ahello~a" #\Return #\Newline #\Return))
+             nil)
+      (check "decided: a size line ended by a bare LF raises"
+             (raises-p (format nil "5~ahello~a~a0~a~a~a~a" #\Newline
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: junk after the chunk-size raises"
+             (raises-p (format nil "5g~a~ahello~a~a0~a~a~a~a"
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      (check "decided: junk after the whitespace that follows a size raises"
+             (raises-p (format nil "5 x~a~ahello~a~a" #\Return #\Newline
+                               #\Return #\Newline))
+             t)
+      (check "decided: a bare CR inside a chunk-extension raises"
+             (raises-p (format nil "5;a~ab~a~ahello~a~a0~a~a~a~a" #\Return
+                               #\Return #\Newline #\Return #\Newline
+                               #\Return #\Newline #\Return #\Newline))
+             t)
+      ;; The line cap, the same one READER-READ-CRLF-LINE applies, so a
+      ;; size line that never ends is refused at the cap rather than
+      ;; waited on until the read buffer fills.
+      (let ((web-skeleton::*max-header-line-length* 8))
+        (check "decided: a size line past *max-header-line-length* raises"
+               (raises-p "5;aaaaaaaaaa")
+               t)
+        (check "control: a size line at the cap is accepted"
+               (complete-p (format nil "0;aaaaaa~a~a~a~a" #\Return #\Newline
+                                   #\Return #\Newline))
+               t)
+        (check "control: a size line one byte past the cap raises"
+               (raises-p (format nil "0;aaaaaaa~a~a~a~a" #\Return #\Newline
+                                 #\Return #\Newline))
+               t))
+      ;; An extension's bytes are skipped, not interpreted, and RFC 7230
+      ;; admits obs-text in a quoted value.
+      (check "complete: an extension byte above 0x7F is skipped"
+             (complete-p (format nil "5;q=\"~a\"~a~ahello~a~a0~a~a~a~a"
+                                 (code-char #xE9)
+                                 #\Return #\Newline #\Return #\Newline
+                                 #\Return #\Newline #\Return #\Newline))
+             t))
+    ;; And the refusal comes before the handover: a chunk whose CRLF is
+    ;; wrong is not given to ON-DATA first and refused afterwards.
+    (let ((seen nil)
+          (buf (sb-ext:string-to-octets
+                (format nil "5~a~ahelloXX0~a~a~a~a" #\Return #\Newline
+                        #\Return #\Newline #\Return #\Newline)
+                :external-format :latin-1)))
+      (handler-case
+          (web-skeleton::chunked-body-complete-p
+           buf 0 (length buf) 0
+           (lambda (b s e) (push (subseq b s e) seen) nil))
+        (web-skeleton::chunked-framing-error () nil))
+      (check "on-data: a chunk with a wrong CRLF is never handed over"
+             seen nil))
+    ;; The streaming path's size parser agrees: BWS may follow the digits,
+    ;; nothing precedes them.
+    (check "size line: leading whitespace refused on the streaming path too"
+           (handler-case (progn (web-skeleton::parse-chunked-size-line " 5") :parsed)
+             (error () :refused))
+           :refused)
+    (check "size line: trailing whitespace before an extension is accepted"
+           (web-skeleton::parse-chunked-size-line "5 ;ext=1")
+           5)
     ;; Chunk-extensions on the size line are skipped, per RFC 7230 §4.1.1.
     (check "complete: chunk-extension tolerated"
            (complete-p (format nil "5;foo=bar~a~ahello~a~a0~a~a~a~a"
@@ -6892,6 +9214,62 @@
 ;;; DNS cache (opt-in)
 ;;; ---------------------------------------------------------------------------
 
+(defun test-dns-keeps-every-address ()
+  "A name's addresses after the first are kept, to fall back on: by
+   PARSE-GETENT-OUTPUT as its third value, every accepted STREAM address
+   in the order getent printed it, each once; and by the DNS cache, which
+   hands them back still filtered. getent can print an address on more
+   than one line, and the filter is asked about it once, the refused one
+   as well as the accepted."
+  (format t "~%DNS: every address a name resolves to is kept~%")
+  (let* ((out (format nil "::1             STREAM localhost~%~
+                           ::1             DGRAM~%~
+                           10.0.0.9        STREAM~%~
+                           127.0.0.1       STREAM~%~
+                           127.0.0.1       DGRAM~%~
+                           127.0.0.1       STREAM~%~
+                           10.0.0.9        STREAM~%~
+                           127.0.0.2       STREA"))
+         (buf (sb-ext:string-to-octets out :external-format :ascii))
+         (asked '())
+         (web-skeleton:*fetch-address-filter*
+           (lambda (ip family host)
+             (declare (ignore family host))
+             (push (coerce ip 'list) asked)
+             ;; 10.0.0.9 is refused, as a policy might.
+             (not (equalp ip #(10 0 0 9))))))
+    (multiple-value-bind (first refused all)
+        (web-skeleton::parse-getent-output buf (length buf) "localhost")
+      (check "getent: the first accepted address, as before"
+             (list (coerce (car first) 'list) (cdr first))
+             '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6))
+      (check "getent: every accepted STREAM address, in order, each once"
+             (mapcar (lambda (a) (list (coerce (car a) 'list) (cdr a))) all)
+             '(((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6) ((127 0 0 1) :inet)))
+      (check "getent: the refused one counted once, though printed twice, and a line not yet ended not read"
+             refused 1)
+      (check "getent: the filter asked about each address once, however often printed"
+             (reverse asked)
+             '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) (10 0 0 9) (127 0 0 1)))))
+  (let ((web-skeleton::*dns-cache* (make-hash-table :test #'equal))
+        (web-skeleton::*dns-cache-ttl* 60)
+        (fallbacks (list (cons (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (*)))
+                               :inet)
+                         (cons (coerce #(10 0 0 9) '(simple-array (unsigned-byte 8) (*)))
+                               :inet))))
+    (web-skeleton::dns-cache-store "dual.test" (coerce #(127 0 0 2) '(simple-array (unsigned-byte 8) (*)))
+                                   :inet fallbacks)
+    (check "cache: the fallbacks come back with the address"
+           (length (nth-value 2 (web-skeleton::dns-cache-lookup "dual.test"))) 2)
+    (let ((web-skeleton:*fetch-address-filter*
+            (lambda (ip family host)
+              (declare (ignore family host))
+              (not (equalp ip #(10 0 0 9))))))
+      (check "cache: a fallback the filter now refuses is left out"
+             (mapcar (lambda (a) (coerce (car a) 'list))
+                     (nth-value 2 (web-skeleton::dns-cache-lookup "dual.test")))
+             '((127 0 0 1))))))
+
 (defun test-dns-cache ()
   (format t "~%DNS cache~%")
   (let ((v4 (make-array 4 :element-type '(unsigned-byte 8)
@@ -6980,9 +9358,9 @@
 ;;; INITIATE-HTTP-FETCH-TO-ADDRESS parks the target only for an :INBOUND
 ;;; fetch; INITIATE-DNS-LOOKUP has to make the same decision, because a
 ;;; hostname reaches the TCP phase through it and an IP literal does not.
-;;; It used to park unconditionally, so every FETCH-INTO to a name — the
-;;; shape DEPLOYMENT.md's relay example uses — moved the application's own
-;;; :STREAMING or :WEBSOCKET connection to :AWAITING and nothing ever moved
+;;; Parking unconditionally would move the application's own :STREAMING or
+;;; :WEBSOCKET connection to :AWAITING on every FETCH-INTO to a name — the
+;;; shape DEPLOYMENT.md's relay example uses — and nothing would ever move
 ;;; it back.
 ;;;
 ;;; Asserted against the real function rather than a stub, because the stub
@@ -7086,25 +9464,95 @@
 ;;; ---------------------------------------------------------------------------
 ;;; A name that will not resolve, and the fetch it still has to end
 ;;;
-;;; DELIVER-DNS-ERROR held a copy of DELIVER-FETCH-ERROR's body that knew
-;;; only about a parked inbound. Delegating is the fix; this asserts what
-;;; the delegation buys, on the sink the copy had never heard of.
+;;; DELIVER-DNS-ERROR delegates to DELIVER-FETCH-ERROR rather than keeping
+;;; a copy of its body, which would know only about a parked inbound. This
+;;; asserts what the delegation buys, on the detached sink.
 ;;; ---------------------------------------------------------------------------
+
+(defun test-dns-child-closed-only-once-dead ()
+  "A getent child is closed once it has exited, and never before.
+
+   A lookup ends when its answer arrives, and the child that wrote the
+   answer may not have exited yet. SB-EXT:PROCESS-CLOSE on a child that is
+   still running takes it, on an SBCL before 2.4.11, off the list SBCL
+   collects exits from, and the zombie it becomes stays for the life of
+   the server. So the close waits for the exit, on the worker's tick,
+   while the pipe — a descriptor — goes at once.
+
+   Deterministic because PROCESS-KILL is stubbed: a real SIGKILL races the
+   close that follows it, so a close made too early would be caught only
+   most of the time. With the kill held back the child is running at the
+   end of the lookup on every run, which is the case that matters, and
+   every PROCESS-CLOSE is recorded with whether its child was alive at
+   the time. Broken state: one close, made while it was."
+  (format t "~%DNS child: closed once it has exited, never before~%")
+  (let ((closes nil)
+        (kills 0))
+    (unwind-protect
+         (progn
+           (sb-int:encapsulate 'sb-ext:process-kill 'held-alive
+                               (lambda (f process signal &rest more)
+                                 (declare (ignore f process signal more))
+                                 (incf kills)
+                                 t))
+           (sb-int:encapsulate 'sb-ext:process-close 'watched
+                               (lambda (f process)
+                                 (push (sb-ext:process-alive-p process) closes)
+                                 (funcall f process)))
+           (let* ((process (sb-ext:run-program "sleep" '("30")
+                                               :search t :wait nil
+                                               :output :stream))
+                  (pipe (sb-ext:process-output process))
+                  (web-skeleton::*dns-children* (make-hash-table :test #'eq))
+                  (conn (web-skeleton::make-connection
+                         :fd (sb-sys:fd-stream-fd pipe)
+                         :state :out-dns :outbound-p t
+                         :dns-process process)))
+             (web-skeleton::maybe-reap-dns-process conn)
+             (check "dns child: the end of the lookup sends it SIGKILL" kills 1)
+             (check "dns child: its pipe is closed at once" (open-stream-p pipe) nil)
+             (check "dns child: and the connection lets go of both"
+                    (list (web-skeleton::connection-fd conn)
+                          (web-skeleton::connection-dns-process conn))
+                    '(-1 nil))
+             (check "dns child: a child still running is not closed" closes nil)
+             (check "dns child: it is parked for the tick instead"
+                    (hash-table-count web-skeleton::*dns-children*) 1)
+             (web-skeleton::reap-dns-children)
+             (check "dns child: a tick while it still runs leaves it parked"
+                    (list closes (hash-table-count web-skeleton::*dns-children*))
+                    '(nil 1))
+             ;; Now let it die, for real.
+             (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
+             (sb-ext:process-kill process 9)
+             (let ((deadline (+ (get-internal-real-time)
+                                (* 3 internal-time-units-per-second))))
+               (loop while (and (sb-ext:process-alive-p process)
+                                (< (get-internal-real-time) deadline))
+                     do (sleep 0.02)))
+             (web-skeleton::reap-dns-children)
+             (check "dns child: once it has exited, the tick closes it, dead"
+                    closes '(nil))
+             (check "dns child: and forgets it"
+                    (hash-table-count web-skeleton::*dns-children*) 0)))
+      (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
+      (sb-int:unencapsulate 'sb-ext:process-close 'watched))))
 
 (defun test-dns-error-ends-a-detached-fetch ()
   "A detached fetch to a name that will not resolve releases its target.
 
    Three observations, and the first is a control that has to keep
-   passing. The old body called CLOSE-OUTBOUND, which fires an unclaimed
-   callback with the cleanup sentinel — so the application's callback ran
-   either way, and a detector that only counted it would have been green
-   against the defect. That is this branch's *confounded* mode: the right
-   outcome reached by a path that proves nothing.
+   passing. CLOSE-OUTBOUND fires an unclaimed callback with the cleanup
+   sentinel, so the application's callback runs whether or not the error
+   reaches the target, and a detector that only counted it would be green
+   against a body that never reached it. That is the *confounded* mode:
+   the right outcome reached by a path that proves nothing.
 
-   What the old body could not do was reach the target. FETCH-OUTSTANDING
-   stayed set for the rest of that connection's life, refusing every later
-   FETCH-INTO on it, and the failure disposition the caller chose was never
-   applied. Those two are the claim.
+   Reaching the target is what the other two observe. Unreached,
+   FETCH-OUTSTANDING would stay set for the rest of that connection's
+   life, refusing every later FETCH-INTO on it, and the failure
+   disposition the caller chose would never be applied. Those two are the
+   claim.
 
    No network and no getent: DELIVER-DNS-ERROR is called directly, which
    is what both of its failure sites do once they have decided the lookup
@@ -7145,27 +9593,64 @@
       (ignore-errors (web-skeleton::%close targetfd))
       (ignore-errors (web-skeleton::%close epfd)))))
 
+(defun test-dns-ready-hands-on-every-address ()
+  "HANDLE-DNS-READY, at the end of getent's output, calls DNS-THEN with the
+   first address and the rest to fall back on, in getent's order."
+  (format t "~%DNS: the lookup hands on every address~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (targetfd (web-skeleton::epoll-create))
+         (proc (sb-ext:run-program "/bin/true" nil :output :stream :wait t))
+         (got nil))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (out (sb-ext:string-to-octets
+                      (format nil "::1             STREAM localhost~%~
+                                   127.0.0.1       STREAM~%~
+                                   127.0.0.1       DGRAM~%")
+                      :external-format :ascii))
+                (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                (dns-conn (web-skeleton::make-connection
+                           :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
+                           :state :out-dns :outbound-p t :fetch-sink :detached
+                           :inbound-fd targetfd :dns-host "localhost"
+                           :dns-then (lambda (ip family &optional fallbacks)
+                                       (setf got (list (coerce ip 'list) family
+                                                       (mapcar (lambda (a)
+                                                                 (list (coerce (car a) 'list)
+                                                                       (cdr a)))
+                                                               fallbacks))))
+                           :last-active (get-universal-time))))
+           (replace buf out)
+           (setf (web-skeleton::connection-read-buf dns-conn) buf
+                 (web-skeleton::connection-read-pos dns-conn) (length out))
+           (web-skeleton::register-connection dns-conn)
+           (web-skeleton::handle-dns-ready dns-conn epfd)
+           (check "dns ready: the first address, and the rest to fall back on"
+                  got
+                  '((0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) :inet6 (((127 0 0 1) :inet)))))
+      (ignore-errors (sb-ext:process-close proc))
+      (ignore-errors (web-skeleton::%close targetfd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 (defun test-dns-chain-success-survives-a-failed-teardown ()
   "A resolution that succeeded is not undone by a failure to clean up
    after it.
 
-   The other side of the delegation the test above covers. HANDLE-DNS-
-   READY's HANDLER-CASE used to span two steps that run *after* DNS-THEN
-   has already returned — clearing the callback and closing the resolved
-   pipe. A raise there was harmless while DELIVER-DNS-ERROR knew only
-   about a parked inbound: the inbound's AWAITING-FD had already moved,
-   so the lookup matched nothing and the failure went nowhere. Delegating
-   to DELIVER-FETCH-ERROR is what made it consequential — the same raise
-   now reaches DELIVER-DETACHED with :ABORTED and applies the target's
-   failure disposition, closing a WebSocket whose fetch is alive and
-   running on the outbound DNS-THEN just opened.
+   The other side of the delegation the test above covers. A HANDLER-CASE
+   in HANDLE-DNS-READY spanning the two steps that run *after* DNS-THEN
+   has returned — clearing the callback and closing the resolved pipe —
+   would turn a raise there into a failed lookup. Because
+   DELIVER-DNS-ERROR delegates to DELIVER-FETCH-ERROR, that raise would
+   reach DELIVER-DETACHED with :ABORTED and apply the target's failure
+   disposition, closing a WebSocket whose fetch is alive and running on
+   the outbound DNS-THEN just opened.
 
    CLOSE-OUTBOUND raises once and then works, which is the shape that
    makes this a detector rather than a vacuous pass. A stub that always
    raised would raise a second time inside DELIVER-FETCH-ERROR — before
    it reaches DELIVER-DETACHED — so the target would come out untouched
-   against the old code too, and the assertions would agree for the wrong
-   reason.
+   even with the HANDLER-CASE spanning those steps, and the assertions
+   would agree for the wrong reason.
 
    DNS-THEN only sets a flag. Its contract here is that it returned
    normally; what it built is the next test's subject, not this one's."
@@ -7198,8 +9683,8 @@
                                       :fetch-sink :detached
                                       :inbound-fd targetfd
                                       :dns-host "localhost"
-                                      :dns-then (lambda (ip family)
-                                                  (declare (ignore ip family))
+                                      :dns-then (lambda (ip family &optional fallbacks)
+                                                  (declare (ignore ip family fallbacks))
                                                   (setf chained t))
                                       :fetch-callback
                                       (lambda (s h b)
@@ -7213,9 +9698,10 @@
                       (web-skeleton::register-connection target)
                       (web-skeleton::register-connection dns-conn)
                       ;; Raises on the first call only. The second — the one
-                      ;; DELIVER-FETCH-ERROR makes on the old path — has to
-                      ;; succeed, or the disposition is never reached and the
-                      ;; two sides of the revert look alike.
+                      ;; DELIVER-FETCH-ERROR makes when the first raise is
+                      ;; taken for a failed lookup — has to succeed, or the
+                      ;; disposition is never reached and the two sides of
+                      ;; the revert look alike.
                       (setf (symbol-function 'web-skeleton::close-outbound)
                             (lambda (c e)
                               (incf calls)
@@ -7225,7 +9711,8 @@
                       (web-skeleton::handle-dns-ready dns-conn epfd)
                       (list chained
                             (web-skeleton::connection-state target)
-                            (web-skeleton::connection-fetch-outstanding target)))
+                            (web-skeleton::connection-fetch-outstanding target)
+                            calls))
                  (setf (symbol-function 'web-skeleton::close-outbound) real)
                  (ignore-errors (sb-ext:process-close proc))
                  (ignore-errors (web-skeleton::%close targetfd))
@@ -7235,2372 +9722,207 @@
       (let ((clean (run nil)))
         (check "dns teardown control: the chain ran" (first clean) t)
         (check "dns teardown control: the target is untouched"
-               (rest clean) '(:websocket t)))
+               (subseq clean 1 3) '(:websocket t))
+        ;; Counted, or a HANDLE-DNS-READY that never called CLOSE-OUTBOUND
+        ;; would raise nothing and pass every check here.
+        (check "dns teardown control: the pipe is closed, once"
+               (fourth clean) 1))
       ;; The claim.
       (let ((failed (run t)))
         (check "dns teardown: the chain still ran" (first failed) t)
         (check "dns teardown: a failed close does not close the target"
                (second failed) :websocket)
         (check "dns teardown: nor clear the marker on a live fetch"
-               (third failed) t)))))
+               (third failed) t)
+        ;; Once: the raise is logged, not taken for a failed lookup, whose
+        ;; delivery would close the pipe a second time.
+        (check "dns teardown: the failed close is not taken for a failed lookup"
+               (fourth failed) 1)))))
 
-;;; ---------------------------------------------------------------------------
-;;; Transfer-Encoding: the rules, and the codes they answer with
-;;; ---------------------------------------------------------------------------
+(defun test-dns-dial-failure-is-not-a-lookup-failure ()
+  "A name that resolved, to an address that could not then be dialed, is
+   not logged as a lookup that failed.
 
-(defun test-transfer-encoding-rules ()
-  (format t "~%Transfer-Encoding rules~%")
-  (labels ((raw (version headers)
-             (with-output-to-string (s)
-               (format s "POST / HTTP/~a~a" version *crlf*)
-               (dolist (h headers) (format s "~a~a" h *crlf*))
-               (format s "~a" *crlf*)))
-           (bytes (version headers)
-             (sb-ext:string-to-octets (raw version headers)
-                                      :external-format :ascii))
-           (te (value)
-             ;; A Transfer-Encoding header line carrying VALUE verbatim,
-             ;; so a case can put a bare CR inside it.
-             (concatenate 'string "Transfer-Encoding: " value))
-           (cr (before after)
-             ;; BEFORE and AFTER joined by a bare CR — a byte no header
-             ;; value may contain, and one this scan has to notice before
-             ;; PARSE-HEADERS-BYTES gets to at dispatch.
-             (concatenate 'string before (string #\Return) after))
-           (coding-of (headers &optional (version "1.1"))
-             ;; Called the way CONNECTION-ON-READ calls it: bounded by the
-             ;; CRLFCRLF and started past the request line.
-             (let* ((b (bytes version headers))
-                    (header-end (web-skeleton::scan-crlf-crlf b 0 (length b)))
-                    (hdr-start (+ (web-skeleton::scan-crlf b 0 header-end) 2)))
-               (attempt (web-skeleton::scan-transfer-encoding
-                         b header-end hdr-start))))
-           (on-read (headers &optional (version "1.1"))
-             ;; The status the rules answer with, taken where the client
-             ;; would get it: the condition CONNECTION-ON-READ raises, which
-             ;; is what HANDLE-CLIENT-READ hands to MAKE-ERROR-RESPONSE. A
-             ;; read-fn answering :AGAIN keeps the whole request in the
-             ;; buffer and off any socket.
-             (let ((b (bytes version headers))
-                   (conn (web-skeleton::make-connection
-                          :fd -1
-                          :read-fn (lambda (buffer start max-bytes)
-                                     (declare (ignore buffer start max-bytes))
-                                     :again))))
-               (setf (web-skeleton::connection-read-buf conn) b
-                     (web-skeleton::connection-read-pos conn) (length b))
-               (handler-case (web-skeleton::connection-on-read conn)
-                 (web-skeleton:http-parse-error (e)
-                   (web-skeleton::http-parse-error-status e))))))
+   DNS-THEN signals CONNECT-FAILED-AT-ONCE here, as INITIATE-HTTP-FETCH-
+   TO-ADDRESS does when the kernel refuses the name's last address at
+   once. The fetch fails as any failed fetch does, its target's
+   disposition applied. What is under test is the line that says why:
+   told \"DNS lookup failed\", an operator goes and debugs a resolver that
+   worked.
 
-    ;; ---- classification ----
+   The control is a lookup that did fail, read through the same capture,
+   so a capture that caught nothing, or a label that never changes, fails
+   it."
+  (format t "~%DNS: an address that cannot be dialed is not a failed lookup~%")
+  (flet ((run (output dns-then)
+           ;; (values ENDED-WITH TARGET-STATE) for HANDLE-DNS-READY on a
+           ;; detached fetch whose getent wrote OUTPUT: what the fetch error
+           ;; line said ended the fetch, and what became of its target.
+           (let ((epfd (web-skeleton::epoll-create))
+                 (targetfd (web-skeleton::epoll-create))
+                 (proc (sb-ext:run-program "/bin/true" nil :output :stream :wait t)))
+             (unwind-protect
+                  (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                         (web-skeleton:*log-level* :warn)
+                         (web-skeleton:*log-stream* (make-string-output-stream))
+                         (bytes (sb-ext:string-to-octets output :external-format :ascii))
+                         (buf (make-array 256 :element-type '(unsigned-byte 8)))
+                         (target (web-skeleton::make-connection
+                                  :fd targetfd :state :websocket
+                                  :fetch-outstanding t
+                                  :fetch-failure-disposition :close
+                                  :last-active (get-universal-time)))
+                         (dns-conn (web-skeleton::make-connection
+                                    :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
+                                    :state :out-dns :outbound-p t :fetch-sink :detached
+                                    :inbound-fd targetfd :dns-host "undialable.example"
+                                    :dns-then dns-then
+                                    :fetch-callback (lambda (s h b)
+                                                      (declare (ignore s h b))
+                                                      nil)
+                                    :last-active (get-universal-time))))
+                    (replace buf bytes)
+                    (setf (web-skeleton::connection-read-buf dns-conn) buf
+                          (web-skeleton::connection-read-pos dns-conn) (length bytes))
+                    (web-skeleton::register-connection target)
+                    (web-skeleton::register-connection dns-conn)
+                    (web-skeleton::handle-dns-ready dns-conn epfd)
+                    (let* ((log (get-output-stream-string web-skeleton:*log-stream*))
+                           (at (search "fetch error fd " log))
+                           (from (and at (search ": " log :start2 at))))
+                      (values (and from
+                                   (subseq log (+ from 2)
+                                           (position #\Newline log :start from)))
+                              (web-skeleton::connection-state target))))
+               (ignore-errors (sb-ext:process-close proc))
+               (ignore-errors (web-skeleton::%close targetfd))
+               (ignore-errors (web-skeleton::%close epfd))))))
+    ;; The control: getent named no address.
+    (multiple-value-bind (ended state)
+        (run "" (lambda (ip family &optional fallbacks)
+                  (declare (ignore ip family fallbacks))
+                  (error "dns-then: called for a name with no address")))
+      (check "dns control: a lookup that found nothing is logged as one"
+             ended "DNS lookup failed")
+      (check "dns control: and the fetch failed" state :closing))
+    ;; The claim: getent named one, and the kernel would not dial it.
+    (multiple-value-bind (ended state)
+        (run (format nil "255.255.255.255 STREAM undialable.example~%")
+             (lambda (ip family &optional fallbacks)
+               (declare (ignore family fallbacks))
+               (error 'web-skeleton::connect-failed-at-once
+                      :address ip :why "ENETUNREACH (101)")))
+      (check "dns dial: the fetch ends with the dial that failed, not the lookup"
+             ended "connect to 255.255.255.255: ENETUNREACH (101)")
+      (check "dns dial: and it failed as any fetch does" state :closing))))
 
-    ;; The zero-count arm. A scanner that matched a header name as a
-    ;; substring — "x-transfer-encoding", or the word inside a value —
-    ;; would answer a coding here.
-    (check "TE: absent is NIL"
-           (coding-of '("Host: x" "X-Transfer-Encoding: chunked")) nil)
+(defun test-a-then-that-closes-its-target-mid-teardown ()
+  "A teardown whose callback closed the connection itself leaves what the
+   callback opened afterwards alone.
 
-    ;; END is the CRLFCRLF position, so the last header line's CR sits *at*
-    ;; END and a value scan bounded by END cannot see its terminator. These
-    ;; two differ only in whether Transfer-Encoding is the final header; a
-    ;; scan that got the bound wrong passes the second and fails the first.
-    (check "TE: last header still reads its value"
-           (coding-of '("Host: x" "Transfer-Encoding: chunked")) :chunked)
-    (check "TE: non-final header reads the same"
-           (coding-of '("Transfer-Encoding: chunked" "Host: x")) :chunked)
+   A WebSocket is closed with a detached fetch still running into it. The
+   fetch's :THEN hears the abort sentinel and answers it with WS-CLOSE, as
+   the :KEEP relay contract asks; at a full backlog that closes the
+   target at once, from inside its own teardown, and the inner teardown
+   closes the outbound from inside CLOSE-OUTBOUND's. The :THEN then opens
+   two descriptors on the two numbers just freed and registers them, as
+   the kernel's lowest-free rule would have it. Both outer calls go on
+   with the numbers they read on entry: an EPOLL_CTL_DEL with either would
+   take a registration that is no longer theirs, and that descriptor would
+   hear nothing again.
 
-    (check "TE: field name and value both case fold"
-           (coding-of '("Host: x" "TRANSFER-ENCODING: CHUNKED")) :chunked)
-
-    (check "TE: surrounding OWS trimmed"
-           (coding-of '("Host: x" "Transfer-Encoding:   chunked  ")) :chunked)
-
-    ;; RFC 7230 §7's list rule permits empty elements. Counting them would
-    ;; push chunked out of final position and refuse a legal message for a
-    ;; reason that is not true of it.
-    (check "TE: empty list elements are legal"
-           (coding-of '("Host: x" "Transfer-Encoding: chunked,,")) :chunked)
-
-    (check "TE: gzip alone is unsupported"
-           (coding-of '("Host: x" "Transfer-Encoding: gzip")) :unsupported)
-
-    ;; Legal, and chunked *is* final — the refusal is about the inner
-    ;; coding, not the framing, which is why it is not :INVALID.
-    (check "TE: gzip, chunked is unsupported"
-           (coding-of '("Host: x" "Transfer-Encoding: gzip, chunked"))
-           :unsupported)
-
-    ;; RFC 7230 §3.3.1: chunked is applied once, and applied last.
-    (check "TE: chunked in a non-final position is invalid"
-           (coding-of '("Host: x" "Transfer-Encoding: chunked, gzip")) :invalid)
-    (check "TE: chunked repeated in one value is invalid"
-           (coding-of '("Host: x" "Transfer-Encoding: chunked, chunked"))
-           :invalid)
-
-    ;; The combination rule for repeated headers is defined, and computing
-    ;; it is the reconciliation step the first rule refuses.
-    (check "TE: two Transfer-Encoding headers are invalid"
-           (coding-of '("Host: x" "Transfer-Encoding: gzip"
-                        "Transfer-Encoding: chunked"))
-           :invalid)
-
-    (check "TE: a value naming no coding is invalid"
-           (coding-of '("Host: x" "Transfer-Encoding:")) :invalid)
-
-    ;; A bare CR ends the value scan early, so this reader sees a different
-    ;; value than PARSE-HEADERS-BYTES will. Each of these four moves a
-    ;; different way against its CR-free twin — less refusing, more
-    ;; refusing, and twice not at all — which is why the arm rests on the
-    ;; disagreement and not on a direction. SCAN-TRANSFER-ENCODING carries
-    ;; the measured table.
-    ;;
-    ;; The no-space case is the one that distinguishes this arm. The spaced
-    ;; case is here because it is what a natural probe writes, and the fold
-    ;; arm catches it for an unrelated reason — tested alone, it makes a
-    ;; missing bare-CR arm look present.
-    (check "TE: bare CR before a comma is invalid"
-           (coding-of (list "Host: x" (te (cr "chunked" ",gzip")))) :invalid)
-    (check "TE: bare CR with the natural spacing is invalid"
-           (coding-of (list "Host: x" (te (cr "chunked" ", gzip")))) :invalid)
-    (check "TE: bare CR inside a token is invalid"
-           (coding-of (list "Host: x" (te (cr "chu" "nked")))) :invalid)
-    (check "TE: bare CR at the end of the value is invalid"
-           (coding-of (list "Host: x" (te (cr "gzip" "")))) :invalid)
-
-    ;; PARSE-HEADERS-BYTES rejects obsolete line folding too, but at
-    ;; dispatch — after this scan has already decided how the body is
-    ;; framed. Broken state: the fold is not noticed here, this reader
-    ;; answers :CHUNKED for a value the parser reads as `chunked , gzip`,
-    ;; and the two disagree about the framing of a body.
-    (check "TE: obs-folded value is invalid"
-           (coding-of (list "Host: x" "Transfer-Encoding: chunked"
-                            (concatenate 'string (string #\Tab) ", gzip")))
-           :invalid)
-
-    ;; ---- the codes ----
-
-    ;; RFC 7230 §3.3.3 says TE overrides CL. Answering 400 is the refusal
-    ;; to apply that rule at all.
-    (check "TE + Content-Length is 400"
-           (on-read '("Host: x" "Transfer-Encoding: chunked"
-                      "Content-Length: 5"))
-           400)
-
-    ;; Only *presence* is the violation, so the value is never consulted.
-    ;; Broken state: SCAN-CONTENT-LENGTH's own rejections reach the client,
-    ;; and the rule above holds only for Content-Lengths that happen to
-    ;; parse — 400 for the value here, 413 below, both naming a condition
-    ;; that is not why the request is refused.
-    (check "TE + unparseable Content-Length is still the pair, 400"
-           (on-read '("Host: x" "Transfer-Encoding: chunked"
-                      "Content-Length: abc"))
-           400)
-    (check "TE + oversized Content-Length is 400, not 413"
-           (on-read '("Host: x" "Transfer-Encoding: chunked"
-                      "Content-Length: 99999999999"))
-           400)
-
-    (check "TE on HTTP/1.0 is 400"
-           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.0") 400)
-
-    ;; The gate is stated as "for 1.1", not "against 1.0". The two
-    ;; implementations agree on every 1.0 request and part here: under
-    ;; "against 1.0" this byte is not 48, the gate does not fire, and the
-    ;; coding answers 501. PARSE-REQUEST-BYTES would answer 505 for the
-    ;; version — but at dispatch, and the framing is decided before that.
-    (check "TE on an unvalidated version is 400"
-           (on-read '("Host: x" "Transfer-Encoding: chunked") "1.9") 400)
-
-    ;; The other half of that answer, and the premise the gate's comment
-    ;; rests on: the same request without the header is the parser's 505,
-    ;; raised at dispatch. The gate answers 400 rather than 505 because it
-    ;; declines to hold a second copy of the supported-version set — this
-    ;; says the set really does live somewhere else, so the asymmetry is a
-    ;; division of labour and not an oversight.
-    ;;
-    ;; A pinned premise, not a detector, and the only one of these that no
-    ;; revert can reach — `typo'd version is 505` above exercises the same
-    ;; branch of the same function for the same reason. It earns its place
-    ;; by sitting beside the 400 it explains, and nowhere else. Anything
-    ;; that breaks it fails there first.
-    (check "no TE: an unsupported version is the parser's 505"
-           (let ((b (bytes "1.9" '("Host: x"))))
-             (handler-case (progn (web-skeleton::parse-request-bytes
-                                   b 0 (length b))
-                                  :no-error)
-               (web-skeleton:http-parse-error (e)
-                 (web-skeleton::http-parse-error-status e))))
-           505)
-
-    ;; Transfer-Encoding is a 1.1 field, so the gate covers every coding.
-    ;; Broken state: the gate sits inside the chunked arm, and a 1.0
-    ;; request naming gzip answers 501 — the coding, when the version is
-    ;; the reason it is refused.
-    (check "TE: gzip on HTTP/1.0 is 400, not 501"
-           (on-read '("Host: x" "Transfer-Encoding: gzip") "1.0") 400)
-
-    (check "TE with chunked non-final is 400"
-           (on-read '("Host: x" "Transfer-Encoding: chunked, gzip")) 400)
-
-    (check "TE repeated as two headers is 400"
-           (on-read '("Host: x" "Transfer-Encoding: gzip"
-                      "Transfer-Encoding: chunked"))
-           400)
-
-    (check "TE bare CR is 400"
-           (on-read (list "Host: x" (te (cr "chunked" ",gzip")))) 400)
-
-    (check "TE obs-folded is 400"
-           (on-read (list "Host: x" "Transfer-Encoding: chunked"
-                          (concatenate 'string (string #\Tab) ", gzip")))
-           400)
-
-    ;; §3.3.1's own code for a coding the server does not understand.
-    (check "TE: gzip is 501"
-           (on-read '("Host: x" "Transfer-Encoding: gzip")) 501)
-    (check "TE: gzip, chunked is 501"
-           (on-read '("Host: x" "Transfer-Encoding: gzip, chunked")) 501)
-    ;; Chunked is accepted now, so what this pins is the rules running
-    ;; ahead of the body arm: the request is well formed, no body byte has
-    ;; arrived, and the answer is to keep reading rather than to refuse or
-    ;; to dispatch a POST with its body still on the wire.
-    ;; TEST-CHUNKED-REQUEST-BODY covers where it ends.
-    (check "TE: chunked alone is accepted and waits for its body"
-           (on-read '("Host: x" "Transfer-Encoding: chunked")) :continue)
-
-    ;; The zero-behavior-change claim, asserted rather than assumed.
-    (check "no TE: request still dispatches"
-           (on-read '("Host: x")) :dispatch)
-    (check "no TE: a Content-Length body still reads"
-           (on-read '("Host: x" "Content-Length: 5")) :continue)))
-
-;;; ---------------------------------------------------------------------------
-;;; Chunked request bodies: where the request ends, and what ends it
-;;; ---------------------------------------------------------------------------
-
-(defun test-chunked-request-body ()
-  (format t "~%Chunked request bodies~%")
-  (labels ((req (body &key (headers '("Host: x" "Transfer-Encoding: chunked"))
-                           (version "1.1"))
-             (sb-ext:string-to-octets
-              (with-output-to-string (s)
-                (format s "POST /u HTTP/~a~a" version *crlf*)
-                (dolist (h headers) (format s "~a~a" h *crlf*))
-                (format s "~a~a" *crlf* body))
-              :external-format :ascii))
-           (drive (bytes)
-             ;; Returns (values VERDICT CONN). A read-fn answering :AGAIN
-             ;; keeps everything in the buffer and off any socket, so the
-             ;; verdict is the state machine's and nothing else.
-             (let ((conn (web-skeleton::make-connection
-                          :fd -1
-                          :read-fn (lambda (buffer start max-bytes)
-                                     (declare (ignore buffer start max-bytes))
-                                     :again))))
-               (setf (web-skeleton::connection-read-buf conn) bytes
-                     (web-skeleton::connection-read-pos conn) (length bytes))
-               (values (handler-case (web-skeleton::connection-on-read conn)
-                         (web-skeleton:http-parse-error (e)
-                           (web-skeleton::http-parse-error-status e))
-                         ;; Anything else becomes its own text rather than
-                         ;; ending the run. CONNECTION-ON-READ can raise a
-                         ;; plain error — the walk does, on a size line it
-                         ;; can already tell is invalid — and a raise that
-                         ;; escapes here takes every later assertion in the
-                         ;; file with it. A failed CHECK carrying the
-                         ;; condition says the same thing and stays
-                         ;; countable.
-                         (error (e) (princ-to-string e)))
-                       conn)))
-           (verdict (body &rest args)
-             (values (apply #'drive (list (apply #'req body args)))))
-           (body-of (body)
-             ;; Drive to :DISPATCH, then parse — the decoded body is what
-             ;; a handler would receive.
-             (multiple-value-bind (v conn) (drive (req body))
-               (declare (ignore v))
-               (handler-case
-                   (let ((r (web-skeleton::connection-parse-request conn)))
-                     (sb-ext:octets-to-string (web-skeleton:http-request-body r)
-                                              :external-format :ascii))
-                 (web-skeleton:http-parse-error (e)
-                   (web-skeleton::http-parse-error-status e))))))
-
-    ;; ---- where a chunked request ends ----
-
-    ;; Headers only: the framing says a body is coming and none of it has
-    ;; arrived. Broken state: the Content-Length arm answers "no body" for
-    ;; this request and dispatches a POST with its body still on the wire.
-    (check "chunked: no body bytes yet keeps reading"
-           (verdict "") :continue)
-
-    ;; The whole thing in one read.
-    (check "chunked: a complete body dispatches"
-           (verdict (format nil "3~a123~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
-           :dispatch)
-
-    ;; THE two-byte rule. `...0 CRLF` is the zero-size chunk header and
-    ;; nothing else; the CRLF that terminates an empty trailer section has
-    ;; not arrived. Broken state: complete is answered here, REQUEST-END
-    ;; lands two bytes early, and those two bytes are shifted to offset 0
-    ;; and read as the beginning of the next request.
-    (check "chunked: the terminator alone is not the end of the request"
-           (verdict (format nil "3~a123~a0~a" *crlf* *crlf* *crlf*))
-           :continue)
-    (check "chunked: the empty trailer's CRLF is what ends it"
-           (verdict (format nil "3~a123~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
-           :dispatch)
-
-    ;; An empty body is still a body, and still needs its terminator.
-    (check "chunked: zero chunks, terminated, dispatches"
-           (verdict (format nil "0~a~a" *crlf* *crlf*)) :dispatch)
-
-    ;; The boundary itself, not a delivery-shaped proxy for it: with a
-    ;; second request pipelined behind, REQUEST-END has to land exactly on
-    ;; its first byte. Computed from the pieces rather than written as a
-    ;; number — a hand-counted offset is a second implementation of the
-    ;; arithmetic this slot exists to delete, and the first draft of this
-    ;; assertion got it wrong by five bytes.
-    (let* ((first-req (req (format nil "3~a123~a0~a~a"
-                                   *crlf* *crlf* *crlf* *crlf*)))
-           (both (concatenate '(vector (unsigned-byte 8))
-                              first-req
-                              (sb-ext:string-to-octets
-                               "GET /b HTTP/1.1" :external-format :ascii))))
-      (multiple-value-bind (v conn) (drive both)
-        (declare (ignore v))
-        (check "chunked: the boundary lands on the next request's first byte"
-               (web-skeleton::connection-request-end conn)
-               (length first-req))))
-
-    ;; ---- trailers ----
-
-    ;; The decision: refuse. Nothing surfaces trailers to an app, so
-    ;; accepting silently discards data the client believed it sent, and
-    ;; consuming needs a second header parser whose disagreement with the
-    ;; first is the shape these rules exist to prevent.
-    (check "chunked: a trailer field is refused"
-           (verdict (format nil "0~aX-T: 1~a~a" *crlf* *crlf* *crlf*)) 400)
-
-    ;; The headline acceptance criterion, asserted at the boundary rather
-    ;; than at delivery: a trailer section carrying a complete HTTP request
-    ;; must not become a second request. Refusing means the boundary for
-    ;; this request is never computed at all.
-    (check "chunked: a trailer holding a whole request is refused"
-           (verdict (format nil "0~aGET /admin HTTP/1.1~aHost: x~a~a"
-                            *crlf* *crlf* *crlf* *crlf*))
-           400)
-
-    ;; A bare CR where the terminator belongs.
-    (check "chunked: a bare CR after the terminator is refused"
-           (verdict (format nil "0~a~a!" *crlf* (string #\Return))) 400)
-
-    ;; ---- the body a handler receives ----
-
-    (check "chunked: the decoded body reaches the request"
-           (body-of (format nil "3~aabc~a2~ade~a0~a~a"
-                            *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
-           "abcde")
-
-    (check "chunked: an empty chunked body decodes to nothing"
-           (body-of (format nil "0~a~a" *crlf* *crlf*)) "")
-    ;; `5g` — the issue names this one. The walk accepts it as framing:
-    ;; it reads one hex digit, stops at a byte that is not one, finds the
-    ;; line's LF and skips five bytes, exactly as a well-formed header
-    ;; would have it do. The decoder is what refuses, on the byte between
-    ;; the size and the CRLF, and that is the split working rather than
-    ;; failing — the walk defers what it cannot decide on sight.
-    (check "chunked: a junk byte after the chunk-size is 400"
-           (body-of (format nil "5g~ahello~a0~a~a"
-                            *crlf* *crlf* *crlf* *crlf*))
-           400)
-
-    ;; The framing walk is deliberately lax — it answers "do we have it
-    ;; all yet", and a too-strict predicate would hang instead of refusing.
-    ;; DECODE-CHUNKED-BODY is the validator, and its error has to become
-    ;; the client's 400 rather than the 500 an unhandled error becomes.
-    ;; Broken state: the decode error escapes CONNECTION-PARSE-REQUEST and
-    ;; HANDLE-CLIENT-READ's generic arm answers 500 — the server blamed
-    ;; for a malformed request.
-    (check "chunked: a size line the decoder rejects is 400, not 500"
-           (body-of (format nil "3~aabcXX0~a~a" *crlf* *crlf* *crlf*)) 400)
-
-
-
-    ;; ---- the size cap, which has no declared length to read ----
-
-    ;; *MAX-BODY-SIZE* is enforced before allocating on the Content-Length
-    ;; path, against a number the client supplied. A chunked request
-    ;; supplies none, so the check has to become incremental, and this is
-    ;; the only place a *body*-size refusal can come from at all.
-    (let ((web-skeleton::*max-body-size* 4))
-      (check "chunked: a body over the cap is 413"
-             (verdict (format nil "5~ahello~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
-             413)
-      ;; The boundary, so the comparison is > and not >=.
-      (check "chunked: a body exactly at the cap is served"
-             (verdict (format nil "4~ahell~a0~a~a" *crlf* *crlf* *crlf* *crlf*))
-             :dispatch)
-      ;; Spread across chunks: no single chunk crosses the cap, the
-      ;; running total does. Broken state: the check reads one chunk's
-      ;; size instead of accumulating, and three 2-byte chunks pass a
-      ;; 4-byte cap.
-      (check "chunked: the cap is a running total, not a per-chunk test"
-             (verdict (format nil "2~aab~a2~acd~a2~aef~a0~a~a"
-                              *crlf* *crlf* *crlf* *crlf*
-                              *crlf* *crlf* *crlf* *crlf*))
-             413))
-
-    ;; Refused on the *declared* size, the moment the header arrives.
-    ;; Broken state: the walk skips past the promised bytes, finds itself
-    ;; beyond the buffer, answers "keep reading", and the client is
-    ;; eventually told the read buffer filled — when what it actually did
-    ;; was declare a chunk larger than any body this server accepts. The
-    ;; buffer's answer is true and useless; a client cannot act on it.
-    (check "chunked: an oversized chunk header is refused on arrival"
-           (verdict (format nil "ffffffff~a" *crlf*)) 413)
-    ;; Sixteen digits is the walk's own limit, and the product is past
-    ;; MOST-POSITIVE-FIXNUM — the projected total is a local, so it may be
-    ;; a bignum without the accumulator slot ever leaving FIXNUM.
-    (check "chunked: a sixteen-digit chunk size is refused too"
-           (verdict (format nil "ffffffffffffffff~a" *crlf*)) 413)
-    ;; One digit further and the size is not large, it is unrepresentable
-    ;; — the walk's own digit cap trips before any value exists to
-    ;; project. Broken state: that arm answers "keep reading", the
-    ;; projection sees nothing, and the request waits for bytes that
-    ;; cannot come until the read buffer fills and answers about itself.
-    ;; 400 rather than 413 because the fault is the framing, not a size.
-    (check "chunked: a size line past the digit limit is 400, not a stall"
-           (verdict (format nil "fffffffffffffffff~a" *crlf*)) 400)
-    ;; ---- the buffer-full arm ----
-
-    ;; A chunked body larger than the read cap has to answer 413, and this
-    ;; is the assertion for the third reader of "is the body complete".
-    ;; The :FULL arm used to be Content-Length arithmetic, which a chunked
-    ;; request satisfies unconditionally — BODY-EXPECTED is 0 — so it would
-    ;; call a half-arrived body complete, fall through, and then :READ-BODY
-    ;; would answer :CONTINUE while the buffer sat at its cap with nothing
-    ;; able to read further. The connection would be held until the idle
-    ;; sweeper took it. Broken state: :CONTINUE here instead of 413.
-    ;;
-    ;; Two calls because the arm is only reachable from :READ-BODY: the
-    ;; first establishes the framing, the second arrives with the buffer
-    ;; already at its cap.
-    (let* ((web-skeleton::*max-body-size* 256)
-           (conn (web-skeleton::make-connection
-                  :fd -1
-                  :read-fn (lambda (buffer start max-bytes)
-                             (declare (ignore buffer start max-bytes))
-                             :again)))
-           (head (req ""))
-           (cap (web-skeleton::connection-read-cap conn)))
-      ;; First pass: headers only, framing established, waiting on a body.
-      (setf (web-skeleton::connection-read-buf conn) head
-            (web-skeleton::connection-read-pos conn) (length head))
-      (check "chunked: buffer-full setup reaches :read-body"
-             (attempt (web-skeleton::connection-on-read conn)) :continue)
-      ;; Second pass: a buffer at its cap holding framing that is
-      ;; *incomplete* rather than invalid, so this reaches the :FULL arm
-      ;; and not one of the refusals above it. `1;` opens a chunk-size
-      ;; line with an extension and the rest of the buffer never
-      ;; terminates it, so the walk finds no LF and answers keep reading
-      ;; with nothing pending — the body cap sees 0 and declines, which is
-      ;; the only way to isolate the buffer's 413 from the body's.
-      ;;
-      ;; The filler must not look like a chunk-size line. An earlier draft
-      ;; used a size header and left the rest as `a` bytes, which are hex
-      ;; digits: the walk read tens of thousands of them, tripped its
-      ;; sixteen-digit cap, and answered 400 — a correct answer to a
-      ;; different question, and this assertion failed for the right
-      ;; reason with the wrong subject.
-      (let ((big (make-array cap :element-type '(unsigned-byte 8)
-                                 :initial-element 97)))   ; #\a
-        (replace big head)
-        (replace big (sb-ext:string-to-octets "1;" :external-format :ascii)
-                 :start1 (length head))
-        (setf (web-skeleton::connection-read-buf conn) big
-              (web-skeleton::connection-read-pos conn) cap)
-        (check "chunked: a body past the read cap is 413, not a stall"
-               (handler-case (web-skeleton::connection-on-read conn)
-                 (web-skeleton:http-parse-error (e)
-                   (web-skeleton::http-parse-error-status e)))
-               413)))
-
-    ;; ---- Expect: 100-continue ----
-
-    ;; Routed through :SENDING-100-CONTINUE rather than around it, so the
-    ;; interim leaves by the same path a Content-Length body's does.
-    ;; Broken state: the chunked arm answers :CONTINUE, the client waits
-    ;; its timeout and sends anyway, and every chunked upload from a
-    ;; well-behaved client pays a second or more it should not.
-    (multiple-value-bind (v conn)
-        (drive (req "" :headers '("Host: x" "Transfer-Encoding: chunked"
-                                  "Expect: 100-continue")))
-      (check "chunked + 100-continue: the interim is flushed"
-             v :flush-queued)
-      (check "chunked + 100-continue: it is the interim that was queued"
-             (let ((b (web-skeleton::connection-write-buf conn)))
-               (and b (search "100 Continue"
-                              (sb-ext:octets-to-string
-                               b :external-format :ascii))
-                    t))
-             t)
-      (check "chunked + 100-continue: and the state is the interim's"
-             (web-skeleton::connection-state conn) :sending-100-continue))
-
-    ;; The client did not wait. Sending an interim it has stopped
-    ;; listening for is latency on what is, for chunked, the common
-    ;; shape — a sender that ignored the expectation has usually sent the
-    ;; whole body. Broken state: the interim arm is tested before the
-    ;; already-complete one, and every such upload takes an extra
-    ;; round trip.
-    (multiple-value-bind (v conn)
-        (drive (req (format nil "3~aabc~a0~a~a" *crlf* *crlf* *crlf* *crlf*)
-                    :headers '("Host: x" "Transfer-Encoding: chunked"
-                               "Expect: 100-continue")))
-      (check "chunked + 100-continue: a body already here dispatches"
-             v :dispatch)
-      (check "chunked + 100-continue: and no interim was queued"
-             (null (web-skeleton::connection-write-buf conn)) t))
-    ;; ---- interaction with the rules already in place ----
-
-    ;; The chunked arm falls through to the body cond rather than
-    ;; returning early, so the Expect gate still runs ahead of it.
-    ;; Broken state: chunked returns from the classification block and a
-    ;; chunked POST with an unknown expectation is accepted where a
-    ;; Content-Length one is refused.
-    (check "chunked: an unknown Expect still 417s"
-           (verdict "" :headers '("Host: x" "Transfer-Encoding: chunked"
-                                  "Expect: x-foo"))
-           :flush-queued)))
-
-
-;;; ---------------------------------------------------------------------------
-;;; A request that can never be finished does not keep its slot
-;;; ---------------------------------------------------------------------------
-
-(defun test-unfinishable-request-closes ()
-  (format t "~%Unfinishable request + peer FIN~%")
-  (labels ((drive (raw eof-verdict)
-             ;; RAW arrives in one read, then the peer's end-of-stream.
-             ;; CONNECTION-READ-AVAILABLE reports :OK-EOF for bytes and
-             ;; FIN together and :EOF for FIN alone, and both mean the
-             ;; same thing to a request still waiting on bytes.
-             (let* ((bytes (sb-ext:string-to-octets raw
-                                                    :external-format :ascii))
-                    (sent (list nil))
-                    (conn (web-skeleton::make-connection
-                           :fd -1
-                           :read-fn
-                           (lambda (buffer start max-bytes)
-                             (cond
-                               ((car sent) eof-verdict)
-                               (t (setf (car sent) t)
-                                  (let ((n (min (length bytes) max-bytes)))
-                                    (replace buffer bytes :start1 start
-                                                          :end2 n)
-                                    n)))))))
-               (handler-case (web-skeleton::connection-on-read conn)
-                 (web-skeleton:http-parse-error (e)
-                   (web-skeleton::http-parse-error-status e))
-                 (error (e) (princ-to-string e))))))
-
-    ;; Headers that never terminate. Nothing more is coming, so waiting
-    ;; for a CRLFCRLF that cannot arrive holds a connection slot for
-    ;; *IDLE-TIMEOUT* with no peer on the other end — free for whoever
-    ;; sent it and walked away.
-    (check "unfinishable: half a request line with FIN closes"
-           (drive "GET /par" :eof) :close)
-
-    ;; A Content-Length body short of its declared length.
-    (check "unfinishable: a body short of its Content-Length closes"
-           (drive (format nil "POST /u HTTP/1.1~aHost: x~aContent-Length: 10~a~aabc"
-                          *crlf* *crlf* *crlf* *crlf*)
-                  :eof)
-           :close)
-
-    ;; And chunked, which is the framing that has no declared length to
-    ;; be short of — the terminator is missing and no byte can supply it.
-    ;; Broken state: the check reads BODY-EXPECTED, which is 0 here, and
-    ;; a half-arrived chunked upload is held rather than closed.
-    (check "unfinishable: a chunked body without its terminator closes"
-           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aab"
-                          *crlf* *crlf* *crlf* *crlf* *crlf*)
-                  :eof)
-           :close)
-
-    ;; The other half of the rule, and the one that must not move: a
-    ;; *complete* request arriving with its own FIN is answered, not
-    ;; closed. This is what TEST-HARNESS-PIPELINED-WITH-FIN-E2E covers
-    ;; end to end; asserted here too because it is the failure this
-    ;; change could plausibly cause and a unit check names it directly.
-    (check "unfinishable: a complete request with FIN still dispatches"
-           (drive (format nil "GET / HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*)
-                  :eof)
-           :dispatch)
-    (check "unfinishable: a complete chunked request with FIN dispatches"
-           (drive (format nil "POST /u HTTP/1.1~aHost: x~aTransfer-Encoding: chunked~a~a3~aabc~a0~a~a"
-                          *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*)
-                  :eof)
-           :dispatch)))
+   Epoll descriptors stand in for the connections and the :THEN's own, as
+   in the awaiting sweep's test. The :THEN's are put on the freed numbers
+   with dup2 rather than left to the kernel, which would hand out a lower
+   number instead if a finalizer freed one meanwhile; one is freed below
+   them just before the teardown, so that case is the one run. The second
+   check is what makes the rest mean something: the :THEN's WS-CLOSE
+   closed both connections there and then, so the numbers were free to
+   take."
+  (format t "~%A :then that closes its target mid-teardown~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (below (web-skeleton::epoll-create))
+         (target-fd (web-skeleton::epoll-create))
+         (out-fd (web-skeleton::epoll-create))
+         (events (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+         (fresh nil)
+         (closed-at-once nil)
+         (heard 0))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (web-skeleton::*epoll-fd* epfd)
+                (web-skeleton::*max-write-backlog* 0)
+                (web-skeleton:*log-stream* (make-broadcast-stream))
+                (target (web-skeleton::make-connection
+                         :fd target-fd :state :websocket :last-active 0
+                         :fetch-outstanding t))
+                (out (web-skeleton::make-connection
+                      :fd out-fd :last-active 0 :outbound-p t
+                      :fetch-sink :detached :inbound-fd target-fd
+                      :fetch-callback
+                      (lambda (s h b)
+                        (declare (ignore s h b))
+                        (incf heard)
+                        (web-skeleton::ws-close target)
+                        (setf closed-at-once
+                              (list (web-skeleton::connection-fd target)
+                                    (web-skeleton::lookup-connection target-fd)
+                                    (web-skeleton::lookup-connection out-fd)))
+                        (dolist (number (list target-fd out-fd))
+                          ;; Where the kernel's choice is the number
+                          ;; already, there is nothing to move.
+                          (let ((fd (web-skeleton::epoll-create)))
+                            (unless (= fd number)
+                              (unwind-protect
+                                   (unless (= (sb-alien:alien-funcall
+                                               (sb-alien:extern-alien
+                                                "dup2" (function sb-alien:int sb-alien:int
+                                                                 sb-alien:int))
+                                               fd number)
+                                              number)
+                                     (error "dup2 onto fd ~d failed" number))
+                                (web-skeleton::%close fd)))
+                            (push number fresh)
+                            (web-skeleton::epoll-add epfd number events)))
+                        nil))))
+           (dolist (conn (list target out))
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd (web-skeleton::connection-fd conn)
+                                      events))
+           (web-skeleton::%close below)
+           (setf below nil)
+           (web-skeleton::close-connection target epfd)
+           (check "re-entered teardown: the :then heard the sentinel once"
+                  heard 1)
+           (check "re-entered teardown: its ws-close closed both there and then"
+                  closed-at-once '(-1 nil nil))
+           (flet ((registered-p (fd)
+                    (handler-case (progn (web-skeleton::epoll-modify epfd fd events)
+                                         t)
+                      (error () nil))))
+             (check "re-entered teardown: the target's number keeps its new registration"
+                    (registered-p target-fd) t)
+             (check "re-entered teardown: the outbound's number keeps its new registration"
+                    (registered-p out-fd) t))
+           (check "re-entered teardown: both connections are gone"
+                  (list (web-skeleton::connection-fd target)
+                        (web-skeleton::connection-fd out)
+                        (hash-table-count web-skeleton::*connections*))
+                  '(-1 -1 0)))
+      ;; The connections' own numbers are closed by the teardown, and
+      ;; taken by FRESH when the :THEN has run.
+      (dolist (fd fresh)
+        (ignore-errors (web-skeleton::%close fd)))
+      (unless fresh
+        (ignore-errors (web-skeleton::%close target-fd))
+        (ignore-errors (web-skeleton::%close out-fd)))
+      (when below
+        (ignore-errors (web-skeleton::%close below)))
+      (ignore-errors (web-skeleton::%close epfd)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
-
-;;; ---------------------------------------------------------------------------
-;;; cpu-count
-;;;
-;;; Driven with synthetic file contents rather than the live filesystem,
-;;; because a host that exposes cgroup CPU files cannot be relied on. CI does
-;;; not, so without this every branch except the final fall-through would go
-;;; unexercised — and the fall-through is the one path that was already
-;;; working.
-;;; ---------------------------------------------------------------------------
-
-(defun %detached-pause-pass (label target-state)
-  "Drive RESUME-PAUSED-OUTBOUND's edge against a target in TARGET-STATE.
-
-   LABEL prefixes every assertion, so a failure names which target state
-   broke rather than only that one did."
-  (multiple-value-bind (out-server out-client) (%loopback-pair)
-    (multiple-value-bind (tgt-server tgt-client) (%loopback-pair)
-      (let ((epfd (web-skeleton::epoll-create)))
-        (unwind-protect
-             (let* ((out-fd (web-skeleton::socket-fd out-server))
-                    (tgt-fd (web-skeleton::socket-fd tgt-server))
-                    (web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (web-skeleton::*epoll-fd* epfd)
-                    ;; The outbound, paused exactly as HANDLE-OUTBOUND-READ
-                    ;; leaves one: subscribed to no events at all, so
-                    ;; nothing but a resume can ever wake it.
-                    (out (web-skeleton::make-connection
-                          :fd out-fd :socket out-server :state :out-read
-                          :outbound-p t
-                          :fetch-sink :detached
-                          :fetch-paused t
-                          :fetch-paused-at (get-universal-time)
-                          :fetch-deadline (+ (get-universal-time) 30)
-                          :inbound-fd tgt-fd
-                          :last-active (get-universal-time)))
-                    ;; The target: a streaming connection with the
-                    ;; back-link the pause left on it.
-                    (tgt (web-skeleton::make-connection
-                          :fd tgt-fd :socket tgt-server :state target-state
-                          :stream-framing (when (eq target-state :streaming)
-                                            :chunked)
-                          :paused-outbound-fd out-fd
-                          :last-active (get-universal-time))))
-               (web-skeleton::set-nonblocking out-fd)
-               (web-skeleton::set-nonblocking tgt-fd)
-               (web-skeleton::register-connection out)
-               (web-skeleton::register-connection tgt)
-               (web-skeleton::epoll-add epfd out-fd web-skeleton::+epollet+)
-               (web-skeleton::epoll-add epfd tgt-fd
-                                        (logior web-skeleton::+epollout+
-                                                web-skeleton::+epollet+))
-               (check (format nil "~a: the outbound starts paused" label)
-                      (web-skeleton::connection-fetch-paused out) t)
-               ;; A backlog on the target, and then the drain that ends it.
-               (web-skeleton::connection-append-write
-                tgt (sb-ext:string-to-octets "queued" :external-format :ascii))
-               (check (format nil "~a: the target has a backlog to drain" label)
-                      (plusp (web-skeleton::connection-write-pending tgt)) t)
-               (web-skeleton::handle-client-write tgt epfd)
-               (check (format nil "~a: the target drained" label)
-                      (web-skeleton::connection-write-pending tgt) 0)
-               ;; The property.
-               (check (format nil "~a: draining the target resumed the fetch" label)
-                      (web-skeleton::connection-fetch-paused out) nil)
-               (check (format nil "~a: and the back-link was cleared with it" label)
-                      (web-skeleton::connection-paused-outbound-fd tgt) -1)
-               ;; The deadline moved by the time spent paused, so a relay
-               ;; is not killed for applying the backpressure it was told
-               ;; to apply.
-               (check (format nil "~a: the deadline is not still the original" label)
-                      (>= (web-skeleton::connection-fetch-deadline out)
-                          (+ (web-skeleton::connection-fetch-started-at out)
-                             30))
-                      t))
-          (ignore-errors (web-skeleton::%close epfd))
-          (ignore-errors (sb-bsd-sockets:socket-close out-server))
-          (ignore-errors (sb-bsd-sockets:socket-close out-client))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-server))
-          (ignore-errors (sb-bsd-sockets:socket-close tgt-client)))))))
-
-(defun test-detached-pause-auto-resumes ()
-  "A paused detached fetch is resumed by its target's backlog draining.
-
-   Sibling to TEST-AUTOMATIC-RESUME-EDGE rather than a replacement for it.
-   That one has covered the mechanism since the resume edge landed, and
-   with a :STREAMING target — what it could not cover is that anything
-   reached it. RESUME-PAUSED-OUTBOUND runs from HANDLE-CLIENT-WRITE's :DONE
-   arm when a connection's backlog empties, and until the detached seam the
-   only connection a fetch could pause against was an :AWAITING inbound,
-   which has nothing queued by construction and so never receives EPOLLOUT.
-   A tested mechanism with no reachable caller, which is the same shape as
-   the relay example this branch deleted.
-
-   So what is new here is the sink, not the edge: a paused outbound whose
-   FETCH-SINK is :DETACHED, resumed by its target draining, with the
-   deadline advanced by the interval spent paused.
-
-   Driven here rather than end to end, and that is a deliberate retreat.
-   The e2e version has to make a real client stop reading until the
-   target's socket refuses a write, and loopback will not cooperate:
-   measured, 768 KiB went through with the target's pending bytes never
-   leaving 0, and 5 MiB made the test slow without making it reliable. A
-   test that cannot provoke the state it names is worse than one that
-   drives the edge directly — it passes for the wrong reason, which is the
-   failure this branch exists to delete.
-
-   So the edge is driven: a target holding a backlog and a paused outbound
-   behind it, flushed until :DONE, with the outbound's interest checked
-   before and after.
-
-   The precondition this pins down, which no document has ever carried:
-   auto-resume needs the target to have *actually backed up*. STREAM-SEND
-   flushes inline, and a flush that completes arms nothing and so never
-   reaches HANDLE-CLIENT-WRITE — so a pause taken while the target's queue
-   was empty has no wake-up coming and still needs an explicit
-   FETCH-RESUME.
-
-   Run against both target states. RESUME-PAUSED-OUTBOUND sits in
-   HANDLE-CLIENT-WRITE's :DONE arm ahead of the state dispatch, and its own
-   comment says why: every state that can be relayed into reaches that
-   point, and a resume working for only one of them would be the kind of
-   gap nobody finds until a different response shape turns up. Only
-   :STREAMING was ever asserted against it.
-
-   The :WEBSOCKET pass is a regression guard and not a detector for this
-   branch — it passes on both sides, because the edge itself was always
-   state-agnostic. What the branch changes is whether it is reachable:
-   arming the remainder WS-SEND leaves behind is what lets
-   HANDLE-CLIENT-WRITE run for a websocket target at all. This asserts the
-   half of that chain the arming detector cannot see."
-  (format t "~%Detached fetch: pause resumes when the target drains~%")
-  (%detached-pause-pass "detached pause" :streaming)
-  (%detached-pause-pass "detached pause (ws)" :websocket))
-
-;;; ---------------------------------------------------------------------------
-;;; The write path a closed stream is handed to, and the event that runs it
-;;;
-;;; STREAM-CLOSE moves the connection to :WRITE-RESPONSE, which
-;;; HANDLE-CLIENT-WRITE and nothing else transitions out of. It used to
-;;; hand off through STREAM-FLUSH, which arms only when the flush did not
-;;; complete — so the ordinary close, a five-byte terminator onto a socket
-;;; with room, armed nothing and left the connection parked.
-;;;
-;;; TEST-STREAM-LIFECYCLE builds this exact state and asserts both halves
-;;; of its precondition — :WRITE-RESPONSE, and nothing left queued — and
-;;; then never asks whether anything would move it. That is the shape of
-;;; the gap, and the reason it survived a green suite.
-;;; ---------------------------------------------------------------------------
-
-(defun %stream-close-pass (back-up)
-  "Close a stream and report the flush state, the interest armed, and where
-   the connection was left.
-
-   Returns (values PENDING MASKS CLOSED-STATE POST-STATE) — bytes still
-   queued afterwards, every mask armed while STREAM-CLOSE ran in order, the
-   state it left, and the state after one turn of the event loop.
-
-   That last turn is driven through epoll rather than by calling
-   HANDLE-CLIENT-WRITE, which is the difference between asserting the
-   consequence and assuming it: the direct call runs whether or not
-   anything armed the fd.
-
-   BACK-UP shrinks SO_SNDBUF and pre-queues more than the socket will take,
-   which is the branch STREAM-FLUSH used to be the only arming for. Without
-   it the terminator goes out whole, the flush completes, and that is both
-   the ordinary case and the one that armed nothing."
-  (multiple-value-bind (server client) (%loopback-pair)
-    (let ((epfd (web-skeleton::epoll-create))
-          (masks nil)
-          (real (symbol-function 'web-skeleton::epoll-modify)))
-      (unwind-protect
-           (let* ((fd (web-skeleton::socket-fd server))
-                  (web-skeleton::*connections* (make-hash-table :test #'eql))
-                  (web-skeleton::*epoll-fd* epfd)
-                  (conn (web-skeleton::make-connection
-                         :fd fd :socket server :state :streaming
-                         :stream-framing :chunked
-                         :last-active (get-universal-time))))
-             (web-skeleton::set-nonblocking fd)
-             (when back-up
-               ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
-               (web-skeleton::set-socket-option-int
-                fd web-skeleton::+sol-socket+ 7 2048)
-               (web-skeleton::connection-append-write
-                conn (make-array (* 512 1024)
-                                 :element-type '(unsigned-byte 8)
-                                 :initial-element 80)))
-             (web-skeleton::register-connection conn)
-             (web-skeleton::epoll-add epfd fd
-                                      (logior web-skeleton::+epollin+
-                                              web-skeleton::+epollet+))
-             ;; Recording starts here, so what is counted is STREAM-CLOSE's
-             ;; own arming and not the setup's.
-             (setf (symbol-function 'web-skeleton::epoll-modify)
-                   (lambda (efd f mask)
-                     (push mask masks)
-                     (funcall real efd f mask)))
-             (web-skeleton:stream-close conn)
-             (setf (symbol-function 'web-skeleton::epoll-modify) real)
-             (let ((pending (web-skeleton::connection-write-pending conn))
-                   (closed-state (web-skeleton::connection-state conn))
-                   (evbuf (make-array (* 4 web-skeleton::+epoll-event-size+)
-                                      :element-type '(unsigned-byte 8))))
-               ;; One turn of the event loop, driven the way the loop drives
-               ;; it: ask epoll what is ready, and dispatch only that.
-               ;; Calling HANDLE-CLIENT-WRITE directly would prove nothing —
-               ;; it would run whether or not anything armed it, which is
-               ;; the whole defect. Fifty milliseconds, not a deadline: a
-               ;; writable socket with an armed interest is reported on the
-               ;; first call, and an unarmed one is never reported at all,
-               ;; so neither answer is waited for.
-               (let ((answered :not-run))
-                 (when (plusp (web-skeleton::epoll-wait epfd evbuf 4 50))
-                   (setf answered
-                         (web-skeleton::handle-client-write conn epfd)))
-                 (values pending
-                         (reverse masks)
-                         closed-state
-                         (web-skeleton::connection-state conn)
-                         answered))))
-        (setf (symbol-function 'web-skeleton::epoll-modify) real)
-        (ignore-errors (web-skeleton::%close epfd))
-        (ignore-errors (sb-bsd-sockets:socket-close server))
-        (ignore-errors (sb-bsd-sockets:socket-close client))))))
-
-(defun test-stream-close-arms-the-write-path ()
-  "A closed stream gets an event to finish on, whether or not it needed one
-   to flush.
-
-   The defect case is the ordinary one. With the terminator away and the
-   queue empty there is nothing left to write, which is precisely why
-   STREAM-FLUSH declined to arm — and precisely when the connection still
-   has a transition owed to it: :WRITE-RESPONSE is where a keep-alive
-   connection resets to :READ-HTTP and where a close-delimited one closes,
-   and only HANDLE-CLIENT-WRITE performs it. Bounded by the idle sweep, so
-   the symptom is liveness rather than loss: a FIN that waits
-   *IDLE-TIMEOUT*, and a keep-alive socket that never answers again.
-
-   The backed-up case is the control, and it is what makes the first
-   assertion about STREAM-CLOSE rather than about streams in general. It
-   was armed before this change and still is — by STREAM-FLUSH then, by
-   STREAM-CLOSE now — so it passes on both sides. Only the case where the
-   flush succeeded moves.
-
-   The defect case also asserts what the arming buys: one turn of the loop
-   and the connection is back at :READ-HTTP, reusable. That turn is driven
-   through EPOLL-WAIT and dispatched only if the fd is reported, which is
-   the difference between asserting the consequence and assuming it —
-   calling HANDLE-CLIENT-WRITE directly would run whether or not anything
-   armed the fd. Under the defect the loop is asked, told nothing is ready,
-   and the connection stays :WRITE-RESPONSE. Fifty milliseconds bounds it
-   and neither answer waits for the bound: an armed writable socket is
-   reported on the first call, an unarmed one never.
-
-   The control does not assert that half. Its socket is full, so no
-   EPOLLOUT arrives whether or not the interest is set, and the loop turn
-   is uninformative there rather than wrong.
-
-   The first case asserts the whole mask list rather than membership,
-   which pins three things at once: that arming happened, that it happened
-   exactly once, and that it is EPOLLOUT alone. The last is the decision
-   worth pinning — STREAM-FLUSH's mask keeps EPOLLIN for a reason its own
-   docstring gives, that a stream has to notice its peer going away, and
-   this connection is no longer a stream. The control asserts membership
-   only, because its mask is the thing that changed."
-  (format t "~%Stream close: the write path gets an event to run on~%")
-  (multiple-value-bind (pending masks state post answered)
-      (%stream-close-pass nil)
-    (check "stream close: the terminator flushed completely" pending 0)
-    (check "stream close: the ordinary write path is in charge"
-           state :write-response)
-    (check "stream close: EPOLLOUT was armed even so"
-           masks
-           (list (logior web-skeleton::+epollout+ web-skeleton::+epollet+)))
-    (check "stream close: and one turn of the loop reuses the connection"
-           post :read-http)
-    ;; The loop is told to answer, not merely reset. HANDLE-CLIENT-WRITE's
-    ;; :KEEP-ALIVE is what sends the event loop back into the read path
-    ;; without waiting for another EPOLLIN, and it is the step between a
-    ;; connection that is reusable and a client that is actually answered.
-    ;; Discarding it left that half of the claim untested.
-    (check "stream close: and the loop is told to read the next request"
-           answered :keep-alive))
-  (multiple-value-bind (pending masks state post answered)
-      (%stream-close-pass t)
-    (declare (ignore state post answered))
-    (check "stream close: the backed-up control did not flush"
-           (plusp pending) t)
-    (check "stream close: and the control is armed on both sides"
-           (and (find-if (lambda (m)
-                           (plusp (logand m web-skeleton::+epollout+)))
-                         masks)
-                t)
-           t)))
-
-(defun test-stream-close-refuses-a-foreign-connection ()
-  "STREAM-CLOSE refuses a connection this worker does not own.
-
-   The witness is the ON-CLOSE counter, not the write queue, and that is
-   the whole design of this test. Copying WS-SEND's fixture would be the
-   natural instinct and would pin nothing: a five-byte terminator flushes
-   completely on any socket with room, so WRITE-PENDING is 0 wherever the
-   guard sits. That is the vacuous shape the WS-SEND fixture had to be
-   rebuilt to escape, and it would be rebuilt here for the same reason.
-
-   What cannot be undone is the notification. NOTIFY-STREAM-CLOSED nulls
-   the slot before calling so the callback fires exactly once — so a
-   cross-worker close tells the application :DONE, and the owning
-   worker's own teardown notification afterwards is a no-op. The app's
-   first and last word about that stream is a false one. A counter that
-   stays at 0 is the assertion that no such word was said.
-
-   CONNECTION-STATE is the second witness and it pins the placement
-   directly. Moved to just before the arm — the natural wrong spot, since
-   that mirrors where the only previous check lived — the raise still
-   carries the right message and PENDING is still 0, but the counter is 1
-   and the state has moved to :WRITE-RESPONSE. Both go red there and
-   neither depends on socket-buffer behaviour.
-
-   Real sockets on both sides, not epoll descriptors. The control has to
-   reach CONNECTION-ON-WRITE and put the terminator on a wire, and an
-   epoll fd raises from send(2) — which would fail the control for a
-   fixture reason and, worse, would give the *foreign* connection a
-   second way to raise once the guard is reverted, confounding the
-   detector with an ENOTSOCK it was never about.
-
-   Exactly one of the last two assertions is a control. \"a connection
-   this worker owns still closes\" is: registering is the only change and
-   it passes on both sides. \"and that one did tell the app\" is not, and
-   should not be read as one — against main's source the *foreign* close
-   is accepted and fires the callback too, so the counter reaches 2 and
-   this fails as a cascade from the defect rather than independently of
-   it. Four of this test's five assertions fail there and there is one
-   defect behind them; only \"still closes\" survives. The sibling
-   FETCH-INTO ownership test carries the same note for the same reason,
-   which is how this one came to be checked.
-
-   Three is the number under the *mutation* — the guard relocated to just
-   before the arm — where assertion 1 also survives because a five-byte
-   terminator flushes whatever the guard's position. Two measurements,
-   two counts, and this paragraph is about the matrix."
-  (format t "~%stream-close: a connection this worker does not own~%")
-  (multiple-value-bind (fserver fclient) (%loopback-pair)
-    (multiple-value-bind (oserver oclient) (%loopback-pair)
-      (let ((epfd (web-skeleton::epoll-create)))
-        (unwind-protect
-             (let* ((fires 0)
-                    (ffd (web-skeleton::socket-fd fserver))
-                    (ofd (web-skeleton::socket-fd oserver))
-                    (web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (web-skeleton::*epoll-fd* epfd)
-                    (on-close (lambda (c reason)
-                                (declare (ignore c reason))
-                                (incf fires)))
-                    (foreign (web-skeleton::make-connection
-                              :fd ffd :socket fserver :state :streaming
-                              :stream-framing :chunked
-                              :stream-on-close on-close
-                              :last-active (get-universal-time)))
-                    (owned (web-skeleton::make-connection
-                            :fd ofd :socket oserver :state :streaming
-                            :stream-framing :chunked
-                            :stream-on-close on-close
-                            :last-active (get-universal-time))))
-               (web-skeleton::set-nonblocking ffd)
-               (web-skeleton::set-nonblocking ofd)
-               ;; On neither the table nor the epoll set.
-               (check "stream close: a connection this worker does not own is refused"
-                      (handler-case (progn (web-skeleton:stream-close foreign) nil)
-                        (error (e)
-                          (not (null (search "not on this worker's connection table"
-                                             (princ-to-string e))))))
-                      t)
-               (check "stream close: the refusal told the app nothing"
-                      fires 0)
-               (check "stream close: nor moved the connection out of :streaming"
-                      (web-skeleton::connection-state foreign) :streaming)
-               ;; The control. Registered and armed, so the terminator has a
-               ;; write path to be handed to.
-               (web-skeleton::register-connection owned)
-               (web-skeleton::epoll-add epfd ofd
-                                        (logior web-skeleton::+epollin+
-                                                web-skeleton::+epollet+))
-               (check "stream close: a connection this worker owns still closes"
-                      (handler-case (progn (web-skeleton:stream-close owned) :closed)
-                        (error (e) (format nil "signalled: ~a" e)))
-                      :closed)
-               (check "stream close: and that one did tell the app"
-                      fires 1))
-          (ignore-errors (web-skeleton::%close epfd))
-          (ignore-errors (sb-bsd-sockets:socket-close fserver))
-          (ignore-errors (sb-bsd-sockets:socket-close fclient))
-          (ignore-errors (sb-bsd-sockets:socket-close oserver))
-          (ignore-errors (sb-bsd-sockets:socket-close oclient)))))))
-
-;;; ---------------------------------------------------------------------------
-;;; The remainder a fetch callback leaves behind
-;;;
-;;; WS-SEND's second caller is a fetch callback on a :WEBSOCKET target, and
-;;; it runs on the outbound connection's read path. HANDLE-CLIENT-READ —
-;;; the site that did all of a WebSocket's arming — does not run for the
-;;; target there at all, so a remainder was left with nothing subscribed to
-;;; writability, waiting for an event no longer coming.
-;;;
-;;; Driven at the seam: DELIVER-DETACHED with a callback that sends, which
-;;; is what FETCH-INTO's :THEN reduces to. End to end it would reach the
-;;; same two lines through an upgrade handshake and a real upstream
-;;; response, either of which could be what broke instead.
-;;; ---------------------------------------------------------------------------
-
-(defun test-ws-send-arms-from-a-fetch-callback ()
-  "A frame sent from a fetch callback leaves its remainder armed.
-
-   The target is a real socket with a shrunk send buffer and a peer that
-   never reads — TEST-WS-HANDLER-PUSH-AND-RETURN's arrangement, and the
-   only one that produces a remainder at all. With room to spare WS-SEND
-   flushes completely and there is nothing left to arm for, so the two
-   paths are indistinguishable.
-
-   EPOLL-MODIFY is recorded rather than epoll being polled. A socket whose
-   send buffer is full is not writable, so EPOLL-WAIT reports nothing
-   whether or not EPOLLOUT was armed: the observation that looks the most
-   direct is the one that cannot tell the two cases apart.
-
-   Three checks, and the first two are the precondition. Without a
-   remainder there is no claim to make, and a frame that fits would leave
-   the third vacuous rather than failing — so the flush is asserted to have
-   been incomplete before anything is asserted about arming."
-  (format t "~%ws-send: arming from a fetch callback~%")
-  (multiple-value-bind (server client) (%loopback-pair)
-    (let ((epfd (web-skeleton::epoll-create))
-          (calls nil)
-          (real (symbol-function 'web-skeleton::epoll-modify)))
-      (unwind-protect
-           (let* ((tgt-fd (web-skeleton::socket-fd server))
-                  (web-skeleton::*connections* (make-hash-table :test #'eql))
-                  (web-skeleton::*epoll-fd* epfd)
-                  (target (web-skeleton::make-connection
-                           :fd tgt-fd :socket server :state :websocket
-                           :fetch-outstanding t
-                           :last-active (get-universal-time)))
-                  (frame (web-skeleton::build-ws-frame
-                          web-skeleton::+ws-op-binary+
-                          (make-array (* 512 1024)
-                                      :element-type '(unsigned-byte 8)
-                                      :initial-element 80)))
-                  (flushed :unset))
-             (web-skeleton::set-nonblocking tgt-fd)
-             ;; SO_SNDBUF is 7 on Linux, as in TEST-WS-HANDLER-PUSH-AND-RETURN.
-             (web-skeleton::set-socket-option-int
-              tgt-fd web-skeleton::+sol-socket+ 7 2048)
-             (web-skeleton::register-connection target)
-             (web-skeleton::epoll-add epfd tgt-fd
-                                      (logior web-skeleton::+epollin+
-                                              web-skeleton::+epollet+))
-             (setf (symbol-function 'web-skeleton::epoll-modify)
-                   (lambda (efd fd mask)
-                     (push (cons fd mask) calls)
-                     (funcall real efd fd mask)))
-             ;; What FETCH-INTO's :THEN reduces to, on the path where the
-             ;; outbound is what epoll woke and the target is not.
-             (web-skeleton::deliver-detached
-              tgt-fd epfd
-              (lambda (s h b)
-                (declare (ignore s h b))
-                (setf flushed (web-skeleton::ws-send target frame))
-                nil)
-              :delivered)
-             (setf (symbol-function 'web-skeleton::epoll-modify) real)
-             (check "callback ws-send: the frame did not all fit" flushed nil)
-             (check "callback ws-send: a remainder is queued"
-                    (plusp (web-skeleton::connection-write-pending target)) t)
-             (check "callback ws-send: EPOLLOUT is armed on the target"
-                    (and (find-if
-                          (lambda (c)
-                            (and (= (car c) tgt-fd)
-                                 (plusp (logand (cdr c)
-                                                web-skeleton::+epollout+))))
-                          calls)
-                         t)
-                    t))
-        (setf (symbol-function 'web-skeleton::epoll-modify) real)
-        (ignore-errors (web-skeleton::%close epfd))
-        (ignore-errors (sb-bsd-sockets:socket-close server))
-        (ignore-errors (sb-bsd-sockets:socket-close client))))))
-
-;;; ---------------------------------------------------------------------------
-;;; The third caller: a handler that sends to somebody else
-;;;
-;;; HANDLE-CLIENT-READ arms (CONNECTION-FD CONN) — the connection it was
-;;; woken for. A ws-handler that sends to any *other* connection is
-;;; therefore in exactly the position the fetch callback was in, and that
-;;; is not a hypothetical shape: it is the one DEPLOYMENT.md documents
-;;; under fan-out, "calling ws-send in a loop" over a subscriber list.
-;;;
-;;; The fix covers it by construction and the branch said nothing about it,
-;;; which by this suite's own criterion is a claim without a detector.
-;;; ---------------------------------------------------------------------------
-
-(defun %ws-fanout-pass ()
-  "Run the documented fan-out shape and report what got armed.
-
-   A real masked frame arrives on A; A's handler sends a 512 KiB frame to
-   B, whose send buffer is shrunk so a remainder is guaranteed. Returns
-   (values SENT PENDING-B TOUCHED-A ARMED-B) — WS-SEND's answer, the bytes
-   left on B, whether epoll was touched for A at all, and whether EPOLLOUT
-   was armed for B.
-
-   Asymmetric on purpose. A's handler returns NIL, so A has nothing pending
-   and HANDLE-CLIENT-READ arms it EPOLLIN — the question for A is only
-   whether the read path ran and reached its arming at all, which is what
-   separates a B that was missed from a run where nothing armed anything at
-   all.
-
-   Driven through the real HANDLE-CLIENT-READ rather than by calling the
-   handler, because the arming under test is the one HANDLE-CLIENT-READ
-   performs after a handler returns. Calling the handler directly would
-   remove the very code whose scope is the question."
-  (multiple-value-bind (a-server a-client) (%loopback-pair)
-    (multiple-value-bind (b-server b-client) (%loopback-pair)
-      (let ((epfd (web-skeleton::epoll-create))
-            (calls nil)
-            (real (symbol-function 'web-skeleton::epoll-modify)))
-        (unwind-protect
-             (let* ((a-fd (web-skeleton::socket-fd a-server))
-                    (b-fd (web-skeleton::socket-fd b-server))
-                    (web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (web-skeleton::*epoll-fd* epfd)
-                    (conn-a (web-skeleton::make-connection
-                             :fd a-fd :socket a-server :state :websocket
-                             :last-active (get-universal-time)))
-                    (conn-b (web-skeleton::make-connection
-                             :fd b-fd :socket b-server :state :websocket
-                             :last-active (get-universal-time)))
-                    (big (web-skeleton::build-ws-frame
-                          web-skeleton::+ws-op-binary+
-                          (make-array (* 512 1024)
-                                      :element-type '(unsigned-byte 8)
-                                      :initial-element 80)))
-                    (sent :unset))
-               (web-skeleton::set-nonblocking a-fd)
-               (web-skeleton::set-nonblocking b-fd)
-               ;; Only B is shrunk. A has to stay able to take its own
-               ;; handler's return value, or the two fds would both hold
-               ;; remainders and the assertion could not tell them apart.
-               (web-skeleton::set-socket-option-int
-                b-fd web-skeleton::+sol-socket+ 7 2048)
-               (web-skeleton::register-connection conn-a)
-               (web-skeleton::register-connection conn-b)
-               (web-skeleton::epoll-add epfd a-fd
-                                        (logior web-skeleton::+epollin+
-                                                web-skeleton::+epollet+))
-               (web-skeleton::epoll-add epfd b-fd
-                                        (logior web-skeleton::+epollin+
-                                                web-skeleton::+epollet+))
-               (let ((stream (sb-bsd-sockets:socket-make-stream
-                              a-client :input t :output t
-                              :element-type '(unsigned-byte 8))))
-                 (write-sequence (make-test-ws-frame "ping-a") stream)
-                 (force-output stream))
-               (sleep 0.1)
-               ;; Recording starts after the setup so what is counted is the
-               ;; read path's own arming and not EPOLL-ADD's.
-               (setf (symbol-function 'web-skeleton::epoll-modify)
-                     (lambda (efd fd mask)
-                       (push (cons fd mask) calls)
-                       (funcall real efd fd mask)))
-               (web-skeleton::handle-client-read
-                conn-a epfd nil
-                (lambda (c f)
-                  (declare (ignore c f))
-                  (setf sent (web-skeleton:ws-send conn-b big))
-                  nil))
-               (setf (symbol-function 'web-skeleton::epoll-modify) real)
-               (values sent
-                       (web-skeleton::connection-write-pending conn-b)
-                       (and (find a-fd calls :key #'car) t)
-                       (and (find-if (lambda (c)
-                                       (and (= (car c) b-fd)
-                                            (plusp (logand
-                                                    (cdr c)
-                                                    web-skeleton::+epollout+))))
-                                     calls)
-                            t)))
-          (setf (symbol-function 'web-skeleton::epoll-modify) real)
-          (ignore-errors (web-skeleton::%close epfd))
-          (ignore-errors (sb-bsd-sockets:socket-close a-server))
-          (ignore-errors (sb-bsd-sockets:socket-close a-client))
-          (ignore-errors (sb-bsd-sockets:socket-close b-server))
-          (ignore-errors (sb-bsd-sockets:socket-close b-client)))))))
-
-
-(defun test-ws-send-arms-a-fan-out-target ()
-  "A handler that sends to somebody else arms that somebody else.
-
-   HANDLE-CLIENT-READ arms the connection it was woken for, and only that
-   one. So a ws-handler pushing to a subscriber list is in exactly the
-   position the fetch callback was in — nothing downstream arms the target
-   — and DEPLOYMENT.md documents that shape under fan-out rather than
-   treating it as exotic. The same one-line fix covers both; only one of
-   them was claimed.
-
-   Four assertions, and the first two are the precondition. A frame that
-   fits leaves nothing to strand, so WS-SEND returning NIL and B holding a
-   backlog is what makes the fourth check about the claim rather than about
-   the fixture.
-
-   The third is the control, and what it guards against is the fourth going
-   vacuous later rather than anything failing now. Under the defect A is
-   still armed — HANDLE-CLIENT-READ names A's own fd and always did — so a
-   failure list reading A touched, B not states the defect precisely.
-
-   The case it really exists for is fixture drift. Simplify this test by
-   calling the handler directly instead of driving HANDLE-CLIENT-READ — the
-   obvious tidy-up, and someone will try it — and the fourth check still
-   passes, because WS-SEND now arms B itself. The seam stops being crossed
-   and nothing says so. That is the *pre-arranged* mode, reachable only
-   because the fix landed, and this check is the thing that catches it:
-   measured, that drift fails check three alone and leaves the other three
-   green.
-
-   EPOLLIN is what A gets, not EPOLLOUT: its handler returned NIL, so A has
-   nothing pending. Hence the asymmetry between the third check and the
-   fourth — for A the question is whether epoll was touched at all, for B
-   it is whether the right interest was set."
-  (format t "~%ws-send: arming a fan-out target~%")
-  (multiple-value-bind (sent pending-b touched-a armed-b) (%ws-fanout-pass)
-    (check "fan-out ws-send: the frame did not all fit" sent nil)
-    (check "fan-out ws-send: a remainder is queued on the target"
-           (plusp pending-b) t)
-    (check "fan-out ws-send: the read path armed its own connection"
-           touched-a t)
-    (check "fan-out ws-send: and EPOLLOUT is armed on the fan-out target"
-           armed-b t)))
-
-;;; ---------------------------------------------------------------------------
-;;; The close code for a frame that is too large
-;;; ---------------------------------------------------------------------------
-
-(defun test-ws-oversized-frame-close-code ()
-  "An oversized data frame closes 1009; an oversized control frame closes 1002.
-
-   RFC 6455 7.4.1 has 1009 (Message Too Big) for the data case, and the
-   oversized fragmented *message* — the same complaint one layer up —
-   already closed 1009 in two places. The single frame raised out of
-   TRY-PARSE-WS-FRAME as a generic error, took WEBSOCKET-ON-READ's
-   catch-all, and closed 1002. One file, two answers to one question.
-
-   The control frame is the other half, and it wants the other code.
-   *MAX-WS-PAYLOAD-SIZE* is a limit this endpoint chose, so exceeding it
-   is 1009 — 'too big for me'. §5.5 caps every control frame at 125 bytes
-   for everyone, so exceeding *that* is malformed rather than inconvenient
-   and earns 1002. Introducing WS-FRAME-TOO-LARGE above the §5.5 check
-   meant a ping declaring more than 64 KiB took the size check first and
-   was told its message was too big for us, when what was wrong with it is
-   that no endpoint may send it.
-
-   Driven through WEBSOCKET-ON-READ rather than by asserting the condition
-   type, because the code on the wire is the claim and the condition is
-   only how it gets there. The neighbouring 1002 test is a control that
-   still passes: an unknown opcode is a protocol error and keeps its code.
-
-   *MAX-WS-PAYLOAD-SIZE* is lowered rather than a real 1 MiB frame built.
-   What the parser compares is the declared length against the bound, and a
-   small bound reaches that comparison with eight bytes instead of a
-   megabyte. The ping needs 200 — over §5.5's 125 *and* over the lowered
-   bound, since a frame that trips only one of them cannot tell which
-   check ran first."
-  (format t "~%ws: the close code for a frame that is too large~%")
-  (flet ((close-code-for (frame)
-           (let ((conn (web-skeleton::make-connection
-                        :fd -1 :state :websocket :last-active 0)))
-             (setf (web-skeleton::connection-read-buf conn) frame
-                   (web-skeleton::connection-read-pos conn) (length frame))
-             (multiple-value-bind (action response)
-                 (web-skeleton::websocket-on-read
-                  conn (lambda (c f) (declare (ignore c f)) nil))
-               (values action
-                       (and response
-                            (>= (length response) 4)
-                            (logior (ash (aref response 2) 8)
-                                    (aref response 3))))))))
-    (let ((web-skeleton::*max-ws-payload-size* 4))
-      (multiple-value-bind (action code)
-          (close-code-for (make-masked-frame t 1 #(104 101 108 108 111 32 119 111)))
-        (check "oversized frame: the connection closes" action :close)
-        (check "oversized frame: with 1009, not 1002" code 1009))
-      ;; Opcode 9 is ping. 200 bytes is over both bounds, so the code that
-      ;; comes back names which check the parser reached first.
-      (multiple-value-bind (action code)
-          (close-code-for
-           (make-masked-frame t 9 (make-array 200 :element-type '(unsigned-byte 8)
-                                                  :initial-element 65)))
-        (check "oversized control frame: the connection closes" action :close)
-        (check "oversized control frame: with 1002, not 1009" code 1002)))))
-
-;;; ---------------------------------------------------------------------------
-;;; The verdict the discard loop used to spin on
-;;; ---------------------------------------------------------------------------
-
-(defun test-discard-available-want-write ()
-  "CONNECTION-DISCARD-AVAILABLE hands back :WANT-WRITE instead of looping.
-
-   CONNECTION-READ-INTO has four non-integer verdicts and this loop handled
-   two, so :WANT-WRITE fell into the integer default, set a flag and went
-   round again — a hot spin inside the event loop with no exit. Its own
-   docstring says the cond is deliberately the same shape as
-   CONNECTION-READ-AVAILABLE's so the two can be read side by side, and it
-   was not.
-
-   Unreachable today: the only caller is the :STREAMING inbound path and
-   there is no inbound TLS. That is how long a spin like this stays
-   invisible, and it is the argument for the assertion rather than against
-   it.
-
-   The stub is bounded on purpose. An unbounded one would hang the run
-   under the defect rather than fail it, which is the *too violent* mode —
-   a detector whose failure is indistinguishable from a machine problem.
-   Bounded, the defect exhausts the budget, falls through to :EOF and
-   answers :OK-EOF, so both assertions fail and the run continues.
-
-   The call count is the second assertion for the same reason: a fix that
-   answered :WANT-WRITE after looping ten times would satisfy the first
-   check and still be the bug."
-  (format t "~%Discard loop: the verdict it used to spin on~%")
-  (let ((calls 0)
-        (real (symbol-function 'web-skeleton::connection-read-into)))
-    (unwind-protect
-         (progn
-           (setf (symbol-function 'web-skeleton::connection-read-into)
-                 (lambda (conn buffer start max-bytes)
-                   (declare (ignore conn buffer start max-bytes))
-                   (incf calls)
-                   (if (< calls 20) :want-write :eof)))
-           (let ((conn (web-skeleton::make-connection
-                        :fd -1 :state :streaming :last-active 0))
-                 (sink (make-array 64 :element-type '(unsigned-byte 8))))
-             (check "discard: :want-write is answered, not swallowed"
-                    (web-skeleton::connection-discard-available conn sink)
-                    :want-write)
-             (check "discard: and it answered on the first read"
-                    calls 1)))
-      (setf (symbol-function 'web-skeleton::connection-read-into) real))))
-
-;;; ---------------------------------------------------------------------------
-;;; The third boot invariant
-;;; ---------------------------------------------------------------------------
-
-(defun test-fetch-timeout-validated-at-boot ()
-  "START-SERVER refuses a non-positive *FETCH-TIMEOUT* before it binds.
-
-   It already refuses a non-positive *WRITE-STALL-TIMEOUT* and an
-   under-sized *MAX-WRITE-BACKLOG*, with the same reasoning: a
-   misconfiguration should not wait for the shape that reveals it.
-   *FETCH-TIMEOUT* is the floor under every way a fetch can fail to return
-   — the DNS phase, the connect, the read, and the :AWAITING sweep that
-   answers a parked caller 504 — and at zero the sweep never fires.
-
-   The :HOST is deliberately invalid. If the validation is reverted,
-   START-SERVER continues to MAKE-TCP-LISTENER, which refuses a three-byte
-   vector by name — so the revert fails this assertion instead of starting
-   a real server inside the suite. A detector that leaves a listener
-   running when it fails is worse than none.
-
-   Asserted on the message rather than on the fact of a raise, because both
-   paths raise and only one of them is this invariant."
-  (format t "~%start-server: the third boot invariant~%")
-  (let ((web-skeleton:*fetch-timeout* 0))
-    (check "boot: a zero *fetch-timeout* is refused by name"
-           (let ((msg (attempt (web-skeleton:start-server
-                                :host #(1 2 3) :port 0 :workers 1))))
-             (and (stringp msg) (search "*fetch-timeout*" msg) t))
-           t)))
-
-(defun test-on-tick-runs-with-the-workers-bindings ()
-  "ON-TICK runs on each worker's own thread with that worker's epoll fd
-   and connection table bound.
-
-   The bindings are the entire primitive. Fanning a message out to the
-   connections a worker owns has to happen from that worker, and WS-SEND's
-   ownership guard is (WHEN *EPOLL-FD* ...) — so a hook running anywhere
-   else would not merely fail, it would skip the guard and append to an
-   unlocked queue while reporting success. Asserting the hook was called
-   proves almost nothing; asserting the bindings are live inside it is what
-   makes the call worth making.
-
-   Two workers, so `every worker ticks` is measured rather than inferred
-   from where the call sits in RUN-EVENT-LOOP."
-  (format t "~%on-tick: runs on every worker with its bindings live~%")
-  ;; Counted, not flagged. A boolean initialised to T and only cleared on
-  ;; failure passes when the hook never runs at all, which is the one
-  ;; outcome this test exists to catch.
-  (let ((ticks 0) (ids nil) (epoll-live 0) (table-live 0)
-        (lock (sb-thread:make-mutex :name "on-tick-bindings")))
-    (with-test-server (:workers 2
-                       :on-tick (lambda (id)
-                                  (sb-thread:with-mutex (lock)
-                                    (incf ticks)
-                                    (pushnew id ids)
-                                    (when web-skeleton::*epoll-fd*
-                                      (incf epoll-live))
-                                    (when web-skeleton::*connections*
-                                      (incf table-live)))))
-      ;; Control. Passes whether or not ON-TICK exists, so a failure here
-      ;; says the fixture broke rather than the feature.
-      (check "control: the server is up and answering"
-             (multiple-value-bind (status) (test-http-request :get "/__nonce")
-               (eql status 200))
-             t)
-      (sleep 0.6)
-      (sb-thread:with-mutex (lock)
-        (check "on-tick ran" (> ticks 0) t)
-        (check "*epoll-fd* was bound on every tick"
-               (and (> ticks 0) (= epoll-live ticks)) t)
-        (check "*connections* was bound on every tick"
-               (and (> ticks 0) (= table-live ticks)) t)
-        (check "both workers ticked"
-               (and (member 0 ids) (member 1 ids) t)
-               t)))))
-
-(defun test-on-tick-survives-a-raising-hook ()
-  "A raising hook is caught and the loop keeps turning.
-
-   A per-pass hook runs thousands of times a second under load, so any
-   raise it can produce it will produce. Letting one out would take down a
-   worker and every connection on it.
-
-   Asserted on the tick COUNT rather than on the server still answering,
-   because RUN-WORKER restarts a crashed worker with backoff — so a server
-   that answers proves nothing here. Eight-odd ticks in 0.4s at the
-   harness's 0.05s wake interval means the same loop kept running; a crash
-   and restart cycle would show one or two. The counter also makes a revert
-   visible: with no ON-TICK support it stays 0 rather than passing because
-   nothing ever ran."
-  (format t "~%on-tick: a raising hook does not take the worker down~%")
-  (let ((entered 0)
-        (lock (sb-thread:make-mutex :name "on-tick-raise"))
-        ;; Global SETF, not a binding: the worker is a thread START-SERVER
-        ;; spawns and reads the global value, so a LET here would capture
-        ;; nothing and the count below would pass on an empty string.
-        (log (make-string-output-stream))
-        (saved-stream web-skeleton::*log-stream*))
-    (setf web-skeleton::*log-stream* log)
-    (unwind-protect
-         (with-test-server (:on-tick (lambda (id)
-                                       (declare (ignore id))
-                                       (sb-thread:with-mutex (lock) (incf entered))
-                                       (error "deliberate: on-tick raised")))
-           (sleep 0.4)
-           (let ((n (sb-thread:with-mutex (lock) entered)))
-             (check "the hook ran and raised" (> n 0) t)
-             (check "the loop kept turning rather than crashing and backing off"
-                    (> n 3) t))
-           (check "the server still answers after all that"
-                  (multiple-value-bind (status) (test-http-request :get "/__nonce")
-                    (eql status 200))
-                  t))
-      (setf web-skeleton::*log-stream* saved-stream))
-    ;; Several raises and one report. A hook that raises on every pass would
-    ;; otherwise write a line on every pass, holding the one lock every worker
-    ;; takes to log — and the suite passed with that limit removed, because
-    ;; nothing counted the lines.
-    (let* ((text (get-output-stream-string log))
-           (reports (loop with start = 0
-                          for i = (search ":on-tick raised" text :start2 start)
-                          while i count t do (setf start (1+ i)))))
-      (check "a hook raising on every pass is reported once, not every pass"
-             reports 1))))
-
-(defun test-on-tick-validated-at-boot ()
-  "START-SERVER refuses a non-function :ON-TICK before it binds.
-
-   Same argument as the three boot invariants above it: a misconfiguration
-   should not wait for the shape that reveals it. This one is worse than
-   most if it waits — a value that cannot be funcalled raises on the first
-   pass of every worker's loop and on every pass after, which is exactly
-   the flood the rate limit in RUN-EVENT-LOOP exists to survive, reached
-   through a typo instead of a bug.
-
-   :HOST is deliberately invalid, so a revert fails this assertion at
-   MAKE-TCP-LISTENER instead of starting a real server inside the suite."
-  (format t "~%start-server: the fourth boot invariant~%")
-  (check "boot: a non-function :on-tick is refused by name"
-         (let ((msg (attempt (web-skeleton:start-server
-                              :host #(1 2 3) :port 0 :workers 1
-                              :on-tick 42))))
-           (and (stringp msg) (search ":on-tick" msg) t))
-         t)
-  (check "control: the same call without :on-tick fails elsewhere"
-         (let ((msg (attempt (web-skeleton:start-server
-                              :host #(1 2 3) :port 0 :workers 1))))
-           (and (stringp msg) (not (search ":on-tick" msg)) t))
-         t)
-  ;; A symbol naming a function is accepted, as :HANDLER accepts one, so a
-  ;; hook redefined at the REPL reaches a running server. Accepted here means
-  ;; the call gets past the check and fails on the bad host instead.
-  (check "boot: a symbol naming a function is accepted"
-         (let ((msg (attempt (web-skeleton:start-server
-                              :host #(1 2 3) :port 0 :workers 1
-                              :on-tick 'identity))))
-           (and (stringp msg) (not (search ":on-tick" msg)) t))
-         t)
-  ;; And the two a symbol could still get wrong. Without these, accepting
-  ;; every symbol would pass the assertion above.
-  (check "boot: a symbol naming no function is still refused"
-         (let ((msg (attempt (web-skeleton:start-server
-                              :host #(1 2 3) :port 0 :workers 1
-                              :on-tick 'no-function-is-named-this))))
-           (and (stringp msg) (search ":on-tick" msg) t))
-         t)
-  (check "boot: a symbol naming a macro is refused, since it cannot be funcalled"
-         (let ((msg (attempt (web-skeleton:start-server
-                              :host #(1 2 3) :port 0 :workers 1
-                              :on-tick 'when))))
-           (and (stringp msg) (search ":on-tick" msg) t))
-         t))
-
-(defun %ws-conn (fd state)
-  "Register a bare connection in the current *CONNECTIONS* with STATE."
-  (let ((c (web-skeleton::make-connection :fd fd :last-active 0)))
-    (setf (web-skeleton::connection-state c) state)
-    (web-skeleton::register-connection c)
-    c))
-
-(defun test-map-worker-websockets-visits-only-websockets ()
-  "The walk visits :WEBSOCKET and nothing else.
-
-   The states it must skip are not hypothetical: a connection mid-upgrade,
-   one already closing, and one writing a plain HTTP response all live in the
-   same table, and handing any of them to an application that is about to
-   call WS-SEND would produce a frame on a socket that is not speaking that
-   protocol yet, or at all."
-  (format t "~%map-worker-websockets: only websockets, only this worker~%")
-  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
-    (%ws-conn 101 :websocket)
-    (%ws-conn 102 :websocket)
-    (%ws-conn 103 :read-http)
-    (%ws-conn 104 :closing)
-    (%ws-conn 105 :write-response)
-    ;; Control: every state really is in the table, so a walk finding two is
-    ;; selecting rather than failing to see the other three.
-    (check "control: all five states are registered"
-           (hash-table-count web-skeleton::*connections*) 5)
-    (let ((seen nil))
-      (let ((n (web-skeleton:map-worker-websockets
-                (lambda (c) (push (web-skeleton::connection-fd c) seen)))))
-        (check "visits exactly the websockets" (sort seen #'<) (list 101 102))
-        (check "and returns how many it called" n 2)))))
-
-(defun test-map-worker-websockets-skips-what-a-callback-closed ()
-  "A connection an earlier callback closed is skipped, not handed over dead.
-
-   This is what lets a broadcast call WS-SEND without asking first. One slow
-   peer's send can close its connection, and on a table collected up front
-   the entry behind it would otherwise still be walked — WS-SEND would then
-   refuse it for not being in the table, turning one dead peer into a raise
-   that stops the fan-out to everyone after it."
-  (format t "~%map-worker-websockets: the liveness re-check~%")
-  (let ((web-skeleton::*connections* (make-hash-table :test #'eql)))
-    (let* ((a (%ws-conn 201 :websocket))
-           (b (%ws-conn 202 :websocket))
-           (calls 0))
-      (let ((n (web-skeleton:map-worker-websockets
-                (lambda (c)
-                  (incf calls)
-                  ;; Whichever one we were handed, close the other.
-                  (web-skeleton::unregister-connection (if (eq c a) b a))))))
-        (check "the closed one is not visited" calls 1)
-        (check "the count reflects only what was called" n 1)))))
-
-(defun test-map-worker-websockets-refuses-off-a-worker ()
-  "Off a worker there is no table, and zero would be a lie.
-
-   Returning zero would be indistinguishable from a server with no clients,
-   which is the shape a background thread would see every time — the same
-   silence that makes writing from off a worker dangerous in the first
-   place, since the ownership guards are (WHEN *EPOLL-FD* ...) and skip."
-  (format t "~%map-worker-websockets: refuses off a worker~%")
-  (let ((web-skeleton::*connections* nil))
-    (check "refuses by name rather than answering zero"
-           (let ((msg (attempt (web-skeleton:map-worker-websockets #'identity))))
-             (and (stringp msg) (search "connection table" msg) t))
-           t)))
-
-(defun test-map-worker-websockets-delivers-from-on-tick ()
-  "A frame sent to every WebSocket from inside :ON-TICK reaches the client.
-
-   The fan-out the demo is built on, end to end on a live server: a real
-   handshake, a hook that walks the worker's WebSockets and sends each a
-   frame, and that frame read back off the client's own socket. This replaces
-   a test that showed only that the walk could run inside the hook — over an
-   empty table — and left delivery resting on two halves proven apart,
-   because the suite had no handshake helper then. %WS-CLIENT-UPGRADE is one.
-
-   The hook sends once, when the test arms it, after the client has read its
-   101. An upgrade the client has seen is one the worker has recorded: the
-   state changes in the pass that writes the response, before any hook runs.
-   The walk counts what it visits, and that count is the control — a frame
-   from a hook whose walk found nothing did not come from the walk."
-  (format t "~%map-worker-websockets: a frame from on-tick reaches the client~%")
-  (let ((armed nil) (visited 0) (errs 0)
-        (lock (sb-thread:make-mutex :name "fan-out")))
-    (with-test-server
-        (:handler (lambda (req) (declare (ignore req)) :upgrade)
-         :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil)
-         :on-tick (lambda (id)
-                    (declare (ignore id))
-                    (when (sb-thread:with-mutex (lock) (shiftf armed nil))
-                      (handler-case
-                          (web-skeleton:map-worker-websockets
-                           (lambda (c)
-                             (sb-thread:with-mutex (lock) (incf visited))
-                             (web-skeleton:ws-send
-                              c (web-skeleton:build-ws-text "from the tick"))))
-                        (error () (sb-thread:with-mutex (lock) (incf errs)))))))
-      (let* ((sock (connect-to-test-server))
-             (stream (sb-bsd-sockets:socket-make-stream
-                      sock :input t :output t :element-type '(unsigned-byte 8))))
-        (unwind-protect
-             (progn
-               (check "control: the upgrade was accepted"
-                      (not (null (search "101" (%ws-client-upgrade stream))))
-                      t)
-               (sb-thread:with-mutex (lock) (setf armed t))
-               ;; A server frame is unmasked: a first byte, a length under 126
-               ;; for a payload this short, and the payload.
-               (let ((frame (read-until-bounded
-                             stream :seconds 3
-                             :until (lambda (buf fill)
-                                      (and (>= fill 2)
-                                           (>= fill (+ 2 (logand (aref buf 1)
-                                                                 #x7f))))))))
-                 (sb-thread:with-mutex (lock)
-                   (check "control: the walk visited the one WebSocket" visited 1)
-                   (check "and nothing in it signalled" errs 0))
-                 (check "the frame the hook sent is the frame the client read"
-                        (and (>= (length frame) 2)
-                             (= (aref frame 0) #x81)
-                             (string= (sb-ext:octets-to-string
-                                       (subseq frame 2) :external-format :utf-8)
-                                      "from the tick"))
-                        t)))
-          (ignore-errors (sb-bsd-sockets:socket-close sock)))))))
-
-(defun test-connection-census-is-exported-with-a-split-contract ()
-  "CONNECTION-CENSUS is reachable without :: and reports per worker.
-
-   Two workers, and a connection held open for the duration, so the sums are
-   over something rather than over nothing — a census of an empty server
-   agrees with almost any mistake.
-
-   Polled rather than slept: the census publishes on the maintenance gate at
-   1 Hz, and each worker publishes its own slot on its own tick, so there is
-   no single interval that is both long enough and not wasteful.
-
-   :STATES and :PER-WORKER are asserted to exist and to be consistent with
-   the sums, never on their exact contents, which is what the docstring
-   calls diagnostic. A test pinning the state keywords would be a test of
-   the state machine wearing a census costume."
-  (format t "~%connection-census: exported, per worker, split contract~%")
-  (with-test-server (:workers 2)
-    (let ((held (connect-to-test-server)))
-      (unwind-protect
-           (let ((census nil)
-                 (deadline (+ (get-universal-time) 6)))
-             (loop until (or (let ((pw (getf census :per-worker)))
-                               (and pw (= (length pw) 2) (every #'identity pw)))
-                             (> (get-universal-time) deadline))
-                   do (setf census (web-skeleton:connection-census))
-                      (sleep 0.05))
-             (check "every worker published a slot"
-                    (let ((pw (getf census :per-worker)))
-                      (and (= (length pw) 2) (every #'identity pw) t))
-                    t)
-             (check ":workers is the configured count"
-                    (getf census :workers) 2)
-             (check "the held connection is counted"
-                    (>= (getf census :total 0) 1) t)
-             (check "the sums are computed from the per-worker entries"
-                    (= (getf census :total)
-                       (reduce #'+ (getf census :per-worker)
-                               :key (lambda (slot) (getf slot :total 0))))
-                    t)
-             (check ":states accounts for as many connections as :total"
-                    (= (getf census :total)
-                       (loop for (state n) on (getf census :states) by #'cddr
-                             do (progn state)
-                             sum n))
-                    t))
-        (ignore-errors (close held))))))
-
-(defun test-a-log-line-is-one-line ()
-  "One LOG-MSG call emits exactly one line, whatever it was handed.
-
-   ~S on a nested structure pretty-prints by default, wrapping at
-   *PRINT-RIGHT-MARGIN* and turning one call into a dozen lines. That is
-   not cosmetic on this logger: it holds *LOG-LOCK* — the one lock every
-   worker contends for — across the format and the FORCE-OUTPUT, and it
-   makes a line unfindable, because a grep matching the message returns the
-   first fragment and silently hides the rest.
-
-   Found by tripping on it: a census logged at :DEBUG came out eleven lines
-   wide, and reading one back needed grep -A6 and a guess at the number.
-
-   Also asserts the bound. A value large enough to fill a disk from inside
-   the mutex should truncate instead."
-  (format t "~%log: one call, one line~%")
-  (let ((deep (loop for i from 0 below 40
-                    collect (list :k i :v (list :a i :b (list :c i))))))
-    (let ((out (with-output-to-string (capture)
-                 (let ((web-skeleton:*log-stream* capture)
-                       (web-skeleton:*log-level* :debug))
-                   (web-skeleton::log-debug "structure ~s" deep)))))
-      ;; Control: it logged at all, and logged the thing it was given.
-      (check "control: the message reached the stream"
-             (and (search "structure" out) (search ":K" out) t) t)
-      (check "one call is one line" (count #\Newline out) 1))
-    (let ((out (with-output-to-string (capture)
-                 (let ((web-skeleton:*log-stream* capture)
-                       (web-skeleton:*log-level* :debug))
-                   (web-skeleton::log-debug "wide ~s"
-                                            (loop for i from 0 below 5000
-                                                  collect i))))))
-      (check "a runaway structure is truncated, not printed whole"
-             (< (length out) 2000) t))))
-
-(defun test-counters-count-responses-by-class ()
-  "Every response is counted once in total and once in its class.
-
-   The class split is the point. A total alone cannot tell a server answering
-   a thousand requests from one refusing a thousand, and the refusals are the
-   half an application cannot see for itself."
-  (format t "~%counters: responses by class~%")
-  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-    (mapc #'web-skeleton::note-response (list 100 200 201 301 400 404 500))
-    (web-skeleton::note-accepted)
-    (web-skeleton::note-refused)
-    (web-skeleton::note-ws-frame)
-    (let ((snap (web-skeleton::counters-snapshot)))
-      (check "counted in total"  (getf snap :responses) 7)
-      (check "1xx informational" (getf snap :informational) 1)
-      (check "2xx successful"    (getf snap :successful) 2)
-      (check "3xx redirected"    (getf snap :redirected) 1)
-      (check "4xx client-error"  (getf snap :client-error) 2)
-      (check "5xx server-error"  (getf snap :server-error) 1)
-      (check "accepts taken"     (getf snap :accepted) 1)
-      (check "accepts refused"   (getf snap :refused) 1)
-      (check "ws frames queued"  (getf snap :ws-frames) 1)))
-  (check "off a worker: nothing to snapshot, and no raise getting there"
-         (let ((web-skeleton::*counters* nil))
-           (web-skeleton::note-response 200)
-           (web-skeleton::note-accepted)
-           (web-skeleton::counters-snapshot))
-         nil))
-
-(defun test-counters-see-a-response-no-handler-produced ()
-  "A request refused by the parser is counted, and the handler never runs.
-
-   This is the argument for counting in the framework rather than in the
-   application. Transfer-Encoding alongside Content-Length is refused before
-   dispatch, so the caller gets a 400 no handler produced — and an
-   application counting its own calls would report that request as never
-   having happened at all.
-
-   Polled rather than slept: the census publishes on the maintenance gate at
-   1 Hz, which is slower than this test would care to guess at."
-  (format t "~%counters: the refusals an application cannot see~%")
-  (let ((calls 0))
-    (with-test-server (:workers 1
-                       :handler (lambda (req)
-                                  (declare (ignore req))
-                                  (incf calls)
-                                  (web-skeleton:make-text-response 200 "ok")))
-      (test-http-request :get "/")
-      (let ((calls-before calls))
-        (let* ((sock (connect-to-test-server))
-               (stream (sb-bsd-sockets:socket-make-stream
-                        sock :input t :output t
-                        :element-type '(unsigned-byte 8))))
-          (unwind-protect
-               (progn
-                 (write-sequence
-                  (sb-ext:string-to-octets
-                   (crlf "POST /x HTTP/1.1" "Host: h"
-                         "Content-Length: 5" "Transfer-Encoding: chunked")
-                   :external-format :utf-8)
-                  stream)
-                 (force-output stream)
-                 (sleep 0.3))
-            (ignore-errors (close stream))
-            (ignore-errors (sb-bsd-sockets:socket-close sock))))
-        (check "the handler never ran for the refused request"
-               calls calls-before))
-      ;; Waits for both responses rather than the first. A census published
-      ;; between the two requests would otherwise end the poll on a count of
-      ;; one and fail the total for a reason that has nothing to do with it.
-      (let ((k nil) (deadline (+ (get-universal-time) 6)))
-        (loop until (or (and k (>= (getf k :responses 0) 2))
-                        (> (get-universal-time) deadline))
-              do (setf k (getf (web-skeleton:connection-census) :counters))
-                 (sleep 0.05))
-        (check "control: the handled request was counted successful"
-               (>= (getf k :successful 0) 1) t)
-        (check "the refusal was counted as a client error"
-               (>= (getf k :client-error 0) 1) t)
-        (check "and both are in the total"
-               (>= (getf k :responses 0) 2) t)
-        ;; Two connections were taken, the refused one included: the parser
-        ;; refused its request, not the accept. The class counts above are
-        ;; asserted on responses and would all pass with the accept count
-        ;; never incremented, which is the gap this closes.
-        (check "every connection taken is counted as an accept"
-               (>= (getf k :accepted 0) 2) t)))))
-
-(defun %ws-client-upgrade (stream)
-  "Send an RFC 6455 handshake for /ws on STREAM and read the response head,
-   to its blank line and no further, so a frame the server sends next is left
-   on the stream for the caller. Returns the head as a string, for the caller
-   to find its 101 in."
-  (write-sequence (sb-ext:string-to-octets
-                   (crlf "GET /ws HTTP/1.1" "Host: localhost"
-                         "Upgrade: websocket" "Connection: Upgrade"
-                         "Sec-WebSocket-Version: 13"
-                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")
-                   :external-format :ascii)
-                  stream)
-  (force-output stream)
-  (sb-ext:octets-to-string
-   (read-until-bounded stream
-                       :seconds 3
-                       :until (lambda (buf fill)
-                                (and (>= fill 4)
-                                     (= (aref buf (- fill 4)) 13)
-                                     (= (aref buf (- fill 3)) 10)
-                                     (= (aref buf (- fill 2)) 13)
-                                     (= (aref buf (- fill 1)) 10))))
-   :external-format :latin-1))
-
-(defun %reset-socket (socket)
-  "Close SOCKET with a reset rather than a FIN.
-
-   SO_LINGER on with a zero timeout makes close(2) drop anything unsent and
-   send RST, which is how a client looks when it crashes or its network drops
-   it. Signals if the option does not take: a close that quietly sent a FIN
-   instead would pass any test built on this, whether the server handled a
-   reset or not. SOL_SOCKET is 1 and SO_LINGER is 13 on Linux, the one
-   platform the framework runs on."
-  (let ((fd (sb-bsd-sockets:socket-file-descriptor socket)))
-    (sb-alien:with-alien ((linger (array sb-alien:int 2)))
-      (setf (sb-alien:deref linger 0) 1
-            (sb-alien:deref linger 1) 0)
-      (unless (zerop (sb-alien:alien-funcall
-                      (sb-alien:extern-alien
-                       "setsockopt"
-                       (function sb-alien:int sb-alien:int sb-alien:int
-                                 sb-alien:int sb-alien:system-area-pointer
-                                 sb-alien:unsigned))
-                      fd 1 13 (sb-alien:alien-sap linger) 8))
-        (error "setsockopt SO_LINGER failed on fd ~d" fd)))
-    (sb-bsd-sockets:socket-close socket)))
-
-(defun %ws-client-frame (opcode payload &key (fin t))
-  "A client-to-server frame: masked, as RFC 6455 requires of a client.
-   PAYLOAD is under 126 bytes, which is all these tests send."
-  (let* ((bytes (if (stringp payload)
-                    (sb-ext:string-to-octets payload :external-format :utf-8)
-                    payload))
-         (len (length bytes))
-         (mask #(55 11 202 99))
-         (out (make-array (+ 6 len) :element-type '(unsigned-byte 8))))
-    (assert (< len 126))
-    (setf (aref out 0) (logior (if fin #x80 0) opcode)
-          (aref out 1) (logior #x80 len))
-    (dotimes (i 4) (setf (aref out (+ 2 i)) (aref mask i)))
-    (dotimes (i len)
-      (setf (aref out (+ 6 i)) (logxor (aref bytes i) (aref mask (mod i 4)))))
-    out))
-
-(defun test-counters-count-every-way-a-frame-is-handed-over ()
-  "A frame is counted however the application hands it over, and a frame the
-   framework sends on its own is not.
-
-   Three call sites and one exclusion, each asserted as a delta so a revert of
-   any one site reddens its own line: WS-SEND, a ws-handler's reply to a
-   single frame, and its reply to a fragmented message, which completes on a
-   different path. The first version of the counter counted only WS-SEND, and
-   the suite passed with it deleted outright, because the only test called
-   NOTE-WS-FRAME directly.
-
-   The last delta sends a ping beside a reply. The framework answers the ping
-   with a pong of its own, which is not the application's traffic and must not
-   move the count — but a check that the count did not move passes on a census
-   that never published. So the reply rides along as the control: the delta is
-   exactly one, which is the reply counted and the pong not."
-  (format t "~%counters: every way a frame is handed over~%")
-  (with-test-server
-      (:workers 1
-       :handler (lambda (req)
-                  (declare (ignore req))
-                  :upgrade)
-       :ws-handler (lambda (conn frame)
-                     (let ((text (sb-ext:octets-to-string
-                                  (web-skeleton:ws-frame-payload frame)
-                                  :external-format :utf-8)))
-                       (cond ((string= text "send")
-                              (web-skeleton::ws-send
-                               conn (web-skeleton:build-ws-text "sent"))
-                              nil)
-                             ((string= text "reply")
-                              (web-skeleton:build-ws-text "replied"))
-                             (t nil)))))
-    (let* ((sock (connect-to-test-server))
-           (stream (sb-bsd-sockets:socket-make-stream
-                    sock :input t :output t :element-type '(unsigned-byte 8))))
-      (unwind-protect
-           (flet ((put (bytes) (write-sequence bytes stream) (force-output stream))
-                  (frames ()
-                    (getf (getf (web-skeleton:connection-census) :counters)
-                          :ws-frames 0)))
-             (flet ((frames-after (previous)
-                      ;; Polled: the census publishes at 1 Hz, and a site
-                      ;; that was reverted never moves, so the wait ends on
-                      ;; the deadline and the delta reads zero.
-                      (let ((deadline (+ (get-universal-time) 4))
-                            (n (frames)))
-                        (loop until (or (> n previous)
-                                        (> (get-universal-time) deadline))
-                              do (sleep 0.05) (setf n (frames)))
-                        n)))
-               ;; The control for all of it: without an upgrade there are
-               ;; no frames, and every delta below would read as a revert.
-               (check "control: the upgrade was accepted"
-                      (not (null (search "101" (%ws-client-upgrade stream))))
-                      t)
-               (let ((deadline (+ (get-universal-time) 4)))
-                 (loop until (or (web-skeleton:connection-census)
-                                 (> (get-universal-time) deadline))
-                       do (sleep 0.05)))
-               (let* ((b0 (frames))
-                      (n1 (progn (put (%ws-client-frame 1 "send"))
-                                 (frames-after b0)))
-                      (n2 (progn (put (%ws-client-frame 1 "reply"))
-                                 (frames-after n1)))
-                      (n3 (progn (put (%ws-client-frame 1 "rep" :fin nil))
-                                 (put (%ws-client-frame 0 "ly"))
-                                 (frames-after n2)))
-                      (n4 (progn (put (%ws-client-frame 9 "are you there"))
-                                 (put (%ws-client-frame 1 "reply"))
-                                 (frames-after n3))))
-                 (check "a frame handed over with ws-send is counted"
-                        (- n1 b0) 1)
-                 (check "a ws-handler's reply to a frame is counted"
-                        (- n2 n1) 1)
-                 (check "and its reply to a fragmented message"
-                        (- n3 n2) 1)
-                 (check "the pong the framework sends is not, the reply is"
-                        (- n4 n3) 1))))
-        (ignore-errors (close stream))
-        (ignore-errors (sb-bsd-sockets:socket-close sock))))))
-
-(defun test-counters-a-client-reset-is-not-a-server-error ()
-  "A client that resets its connection is closed, not answered with a 500 that
-   is then counted against the server.
-
-   A read of a reset socket fails with ECONNRESET, and HANDLE-CLIENT-READ
-   answered anything that escaped its dispatch with a 500 built through
-   FORMAT-RESPONSE. The 500 was always addressed to nobody. Counting it made a
-   client's disconnect a :SERVER-ERROR, in the block the census calls safe to
-   alert on, and clients reset all the time.
-
-   Three resets, from the three places a client can be when it goes: idle
-   before sending a byte, part way through a request, and upgraded to a
-   WebSocket.
-
-   Two controls. The log shows the server read each reset as ECONNRESET, not
-   as an end of stream; without that, a close that sent a FIN would pass here
-   on code that still counts resets. And a handler that raises still gets its
-   500, counted, so the fix reaches the client's own descriptor and not every
-   error."
-  (format t "~%counters: a client's reset is not a server error~%")
-  (let ((log (make-string-output-stream))
-        (so-far "")
-        (saved-stream web-skeleton:*log-stream*)
-        (saved-level web-skeleton:*log-level*))
-    ;; Global SETF, as the restart test does: the worker thread reads the
-    ;; global values, so a binding here would capture nothing.
-    (setf web-skeleton:*log-stream* log
-          web-skeleton:*log-level* :debug)
-    (unwind-protect
-         (with-test-server
-             (:handler (lambda (req)
-                         (let ((path (web-skeleton:http-request-path req)))
-                           (cond ((string= path "/ws") :upgrade)
-                                 ((string= path "/boom")
-                                  (error "the handler failed on purpose"))
-                                 (t (make-text-response 200 "ok")))))
-              :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil))
-           (flet ((resets-read ()
-                    ;; Drained under the lock the worker holds while writing,
-                    ;; and kept, because draining a string stream empties it.
-                    (setf so-far
-                          (concatenate 'string so-far
-                                       (sb-thread:with-mutex
-                                           (web-skeleton::*log-lock*)
-                                         (get-output-stream-string log))))
-                    (loop with start = 0
-                          for at = (search "ECONNRESET" so-far :start2 start)
-                          while at
-                          count t
-                          do (setf start (1+ at)))))
-             (let* ((idle (connect-to-test-server))
-                    (partial (connect-to-test-server))
-                    (ws (connect-to-test-server))
-                    (partial-stream (sb-bsd-sockets:socket-make-stream
-                                     partial :output t
-                                     :element-type '(unsigned-byte 8)))
-                    (ws-stream (sb-bsd-sockets:socket-make-stream
-                                ws :input t :output t
-                                :element-type '(unsigned-byte 8))))
-               ;; A request line and one header, and no blank line to end them.
-               (write-sequence (sb-ext:string-to-octets
-                                (format nil "GET / HTTP/1.1~c~cHost: localhost~c~c"
-                                        #\Return #\Linefeed #\Return #\Linefeed)
-                                :external-format :ascii)
-                               partial-stream)
-               (force-output partial-stream)
-               (check "control: the WebSocket was upgraded before it reset"
-                      (not (null (search "101" (%ws-client-upgrade ws-stream))))
-                      t)
-               ;; Long enough for the worker to accept the other two and take
-               ;; the partial request into its buffer before anything resets.
-               (sleep 0.3)
-               (mapc #'%reset-socket (list idle partial ws)))
-             (let ((deadline (+ (get-universal-time) 6)))
-               (loop until (or (>= (resets-read) 3)
-                               (> (get-universal-time) deadline))
-                     do (sleep 0.05)))
-             (check "control: the server read all three resets as ECONNRESET"
-                    (>= (resets-read) 3) t)
-             (check "control: a handler that raises still answers 500"
-                    (test-http-request :get "/boom") 500)
-             ;; Polled until that 500 is published and every connection has
-             ;; gone, so the count read is one taken after all four were seen.
-             (let ((census nil) (deadline (+ (get-universal-time) 6)))
-               (loop until (or (and census
-                                    (>= (getf (getf census :counters)
-                                              :server-error 0)
-                                        1)
-                                    (zerop (getf census :total 1)))
-                               (> (get-universal-time) deadline))
-                     do (sleep 0.05)
-                        (setf census (web-skeleton:connection-census)))
-               (let ((errors (getf (getf census :counters) :server-error 0)))
-                 (check "control: that 500 is counted" (>= errors 1) t)
-                 (check "and the three resets added nothing to it" errors 1)))))
-      (setf web-skeleton:*log-stream* saved-stream
-            web-skeleton:*log-level* saved-level))))
-
-(defun test-counters-count-a-response-the-serializer-never-built ()
-  "A cached file is a response, and it was not being counted.
-
-   FORMAT-RESPONSE is where a per-request response is built, so counting
-   there caught everything that passes through it. Static files do not pass
-   through it: their bytes are serialized once at startup and sent from the
-   cache thereafter. Static files are also most of what a page load asks
-   for, so the census reported one response for a page that made a dozen —
-   wrong by an order of magnitude, in the one number a reader would check.
-
-   The first assertion is a control. A per-request response counted before
-   this fix and counts after it, so a run where the cached paths also count
-   is telling us about the cache rather than about the harness."
-  (format t "~%counters: a cached file is a response~%")
-  (let* ((content (sb-ext:string-to-octets
-                   "0123456789abcdefghijklmnopqrstuvwxyz"
-                   :external-format :ascii))   ; 36 bytes
-         (entry (web-skeleton::build-static-response
-                 "text/plain; charset=utf-8" content 0))
-         (saved web-skeleton::*static-cache*))
-    (unwind-protect
-         (progn
-           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal))
-           (setf (gethash "/data.txt" web-skeleton::*static-cache*) entry)
-           (flet ((counted (thunk)
-                    ;; A fresh set per case, so each number below is that
-                    ;; case's own and not a running total someone has to
-                    ;; subtract in their head to read.
-                    (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-                      (funcall thunk)
-                      (web-skeleton::counters-snapshot)))
-                  (get* (&rest headers)
-                    (serve-static (make-test-request :method :GET
-                                                     :path "/data.txt"
-                                                     :headers headers))))
-             (let ((snap (counted
-                          (lambda ()
-                            (web-skeleton::format-response
-                             (web-skeleton::make-http-response :status 200))))))
-               (check "control: a per-request response counts"
-                      (list (getf snap :responses) (getf snap :successful))
-                      '(1 1)))
-             (let ((snap (counted (lambda () (get*)))))
-               (check "a cached 200 is one response"
-                      (list (getf snap :responses) (getf snap :successful))
-                      '(1 1)))
-             (let ((snap (counted
-                          (lambda ()
-                            (serve-static (make-test-request :method :HEAD
-                                                             :path "/data.txt"))))))
-               (check "a cached HEAD is one response"
-                      (list (getf snap :responses) (getf snap :successful))
-                      '(1 1)))
-             ;; 304 and 416 are the two a reader is most likely to want and
-             ;; least likely to generate on purpose: a browser revalidating,
-             ;; and a client asking for bytes that are not there.
-             (let ((snap (counted
-                          (lambda ()
-                            (get* (cons "if-none-match"
-                                        (web-skeleton::static-entry-etag entry)))))))
-               (check "a cached 304 is one response, counted 3xx"
-                      (list (getf snap :responses) (getf snap :redirected))
-                      '(1 1)))
-             (let ((snap (counted (lambda () (get* (cons "range" "bytes=10-19"))))))
-               (check "a 206 is one response, counted 2xx"
-                      (list (getf snap :responses) (getf snap :successful))
-                      '(1 1)))
-             (let ((snap (counted (lambda () (get* (cons "range" "bytes=900-999"))))))
-               (check "a 416 is one response, counted 4xx"
-                      (list (getf snap :responses) (getf snap :client-error))
-                      '(1 1)))))
-      (setf web-skeleton::*static-cache* saved)))
-  ;; A response the serializer refuses is not counted — and neither the
-  ;; original nor the 500 that replaces it is counted twice. The count used
-  ;; to be taken before the serialize that can reject the headers, so a 302
-  ;; whose Location carried a CRLF counted a phantom redirect the client never
-  ;; saw, on top of the 500 it did. The three assertions pin it: the
-  ;; serializer refuses, the refused response counts nothing, and the same
-  ;; 302 without the CRLF still counts once — so the fix cannot be reverted
-  ;; (the refused one would count) or over-applied (the good one would not).
-  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-    (flet ((crlf-302 ()
-             (let ((r (web-skeleton::make-http-response :status 302)))
-               (web-skeleton::set-response-header
-                r "location" (format nil "/a~c~c/b" #\Return #\Linefeed))
-               r)))
-      (check "the serializer refuses a CRLF smuggled into a header value"
-             (handler-case (progn (web-skeleton::format-response (crlf-302))
-                                  :built)
-               (error () :refused))
-             :refused)
-      (let ((snap (web-skeleton::counters-snapshot)))
-        (check "a response the serializer refused is counted nowhere"
-               (list (getf snap :responses)
-                     (getf snap :redirected)
-                     (getf snap :server-error))
-               '(0 0 0)))))
-  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-    (web-skeleton::format-response
-     (web-skeleton::make-http-response :status 302))
-    (let ((snap (web-skeleton::counters-snapshot)))
-      (check "control: the same 302, serialized, counts once as a redirect"
-             (list (getf snap :responses) (getf snap :redirected))
-             '(1 1))))
-  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-    (flet ((crlf-head ()
-             (let ((r (web-skeleton::make-http-response :status 200)))
-               (web-skeleton::set-response-header
-                r "x-note" (format nil "a~cb" #\Return))
-               r)))
-      (ignore-errors
-       (web-skeleton::format-streaming-head (crlf-head) :chunked))
-      (check "a streamed head the serializer refused is not counted"
-             (getf (web-skeleton::counters-snapshot) :responses)
-             0)))
-  ;; The streamed head is the fourth path that never reaches FORMAT-RESPONSE.
-  ;; One response, counted once, at the head — the chunks after it are not
-  ;; responses and STREAM-SEND does not count them.
-  (let ((web-skeleton::*counters* (web-skeleton::make-counters)))
-    (web-skeleton::format-streaming-head
-     (web-skeleton::make-http-response :status 200) :chunked)
-    (let ((snap (web-skeleton::counters-snapshot)))
-      (check "a streamed response is counted once, at its head"
-             (list (getf snap :responses) (getf snap :successful))
-             '(1 1)))))
-
-(defun test-getent-parse-separates-policy-from-resolution ()
-  "A name whose addresses policy refused is distinguishable from one that
-   did not resolve.
-
-   Both still return NIL, and both still answer the client 502: which of the
-   two happened is not the client's business, and the docstring has said so
-   for longer than this second value has existed. An operator is a different
-   audience. Told `DNS lookup failed` when getent answered perfectly well and
-   their own filter said no, they go and debug a resolver — which is what
-   happened, and is why this exists.
-
-   The two controls are the point of the test. Without them a second value
-   that always returned zero, or always returned one, would pass whichever
-   single case was asserted."
-  (format t "~%dns: a refusal is not a resolution failure~%")
-  (let ((line (sb-ext:string-to-octets
-               (format nil "127.0.0.1 STREAM localhost~%")
-               :external-format :ascii))
-        (web-skeleton:*log-stream* (make-broadcast-stream)))
-    (let ((web-skeleton:*fetch-address-filter* nil))
-      (multiple-value-bind (parsed refused)
-          (web-skeleton::parse-getent-output line (length line) "localhost")
-        (check "control: with no filter the address is chosen"
-               (and (consp parsed) (equalp (car parsed) #(127 0 0 1)) t) t)
-        (check "control: and nothing was refused" refused 0)))
-    (let ((web-skeleton:*fetch-address-filter*
-            (lambda (ip family host)
-              (declare (ignore ip family host))
-              nil)))
-      (multiple-value-bind (parsed refused)
-          (web-skeleton::parse-getent-output line (length line) "localhost")
-        (check "a refused address still yields no answer" parsed nil)
-        (check "but the caller can see policy refused one" refused 1)))
-    (let ((nothing (sb-ext:string-to-octets (format nil "~%")
-                                            :external-format :ascii)))
-      (multiple-value-bind (parsed refused)
-          (web-skeleton::parse-getent-output nothing (length nothing) "nowhere")
-        (check "control: nothing to refuse when nothing resolved"
-               (list parsed refused) (list nil 0))))))
-
-(defun test-parse-error-carries-its-status-to-a-caller ()
-  "An application that catches HTTP-PARSE-ERROR can ask what it carries.
-
-   The condition was exported and its readers were not, which gives a caller
-   something it can catch and cannot interrogate. A handler wanting to log
-   that a request was refused with 505 rather than 400 had to re-derive the
-   status by reading the printed message, which is a parser of a parser.
-
-   Reached through the WEB-SKELETON package rather than WEB-SKELETON:: on
-   purpose: the whole assertion is that these are public."
-  (format t "~%http-parse-error: status and message reach a caller~%")
-  (flet ((bad (version)
-           (format nil "GET /x HTTP/~a~c~cHost: h~c~c~c~c"
-                   version #\Return #\Newline #\Return #\Newline
-                   #\Return #\Newline)))
-    (check "the status is readable"
-           (handler-case (web-skeleton:parse-request (bad "9.9"))
-             (web-skeleton:http-parse-error (e)
-               (web-skeleton:http-parse-error-status e)))
-           505)
-    (check "the message is readable without parsing the printed form"
-           (handler-case (web-skeleton:parse-request (bad "9.9"))
-             (web-skeleton:http-parse-error (e)
-               (and (stringp (web-skeleton:http-parse-error-message e))
-                    (search "version" (web-skeleton:http-parse-error-message e))
-                    t)))
-           t)
-    ;; Control: a well-formed request does not signal, so the two assertions
-    ;; above are reading a condition that was raised rather than one the test
-    ;; manufactured.
-    (check "control: a well-formed request parses"
-           (handler-case (progn (web-skeleton:parse-request (bad "1.1")) :parsed)
-             (web-skeleton:http-parse-error () :refused))
-           :parsed)))
-
-(defun test-cpu-count-parsers ()
-  (format t "~%cpu-count: quota and topology parsing~%")
-
-  ;; cgroup v2. The unlimited form's first field is the literal string
-  ;; `max`, not a number: parsed as an integer it raises, and a parser that
-  ;; guessed would answer with whatever it made of the word. It must decline
-  ;; so the chain moves on.
-  (check "cpu.max: unlimited declines"
-         (web-skeleton::parse-cpu-max "max 100000") nil)
-  (check "cpu.max: one full CPU"
-         (web-skeleton::parse-cpu-max "100000 100000") 1)
-  (check "cpu.max: four CPUs"
-         (web-skeleton::parse-cpu-max "400000 100000") 4)
-  ;; The shape this whole change exists for. FLOOR gives 0 here, and
-  ;; START-SERVER refuses a non-positive :WORKERS — so rounding down turns
-  ;; the fix into a server that will not boot in the deployment it serves.
-  (check "cpu.max: half a CPU still gets one worker"
-         (web-skeleton::parse-cpu-max "50000 100000") 1)
-  (check "cpu.max: 2.5 CPUs rounds up"
-         (web-skeleton::parse-cpu-max "250000 100000") 3)
-  (check "cpu.max: trailing newline tolerated"
-         (web-skeleton::parse-cpu-max (format nil "200000 100000~c" #\Newline)) 2)
-  (check "cpu.max: garbage declines"
-         (web-skeleton::parse-cpu-max "not a quota") nil)
-  (check "cpu.max: single field declines"
-         (web-skeleton::parse-cpu-max "100000") nil)
-  (check "cpu.max: zero period declines"
-         (web-skeleton::parse-cpu-max "100000 0") nil)
-  (check "cpu.max: NIL line declines"
-         (web-skeleton::parse-cpu-max nil) nil)
-
-  ;; cgroup v1. Unlimited is a quota of -1 rather than a word.
-  (check "cfs: unlimited declines"
-         (web-skeleton::parse-cfs-quota "-1" "100000") nil)
-  (check "cfs: two CPUs"
-         (web-skeleton::parse-cfs-quota "200000" "100000") 2)
-  (check "cfs: half a CPU still gets one worker"
-         (web-skeleton::parse-cfs-quota "50000" "100000") 1)
-  (check "cfs: a missing file declines"
-         (web-skeleton::parse-cfs-quota nil "100000") nil)
-
-  ;; Topology, the last answer in the chain and the only one CI reaches.
-  (check "cpu list: simple range"
-         (web-skeleton::parse-cpu-list "0-15") 16)
-  (check "cpu list: single cpu"
-         (web-skeleton::parse-cpu-list "0") 1)
-  (check "cpu list: multi-range with a bare cpu"
-         (web-skeleton::parse-cpu-list "0-3,8,12-13") 7)
-  (check "cpu list: garbage declines"
-         (web-skeleton::parse-cpu-list "nonsense") nil)
-  (check "cpu list: empty declines"
-         (web-skeleton::parse-cpu-list "") nil)
-
-  ;; Affinity is a syscall and cannot be synthesised, so its arithmetic is
-  ;; tested where it lives: the popcount over a filled cpu_set_t.
-  (check "affinity: bits counted across bytes"
-         (web-skeleton::count-set-bits #(#xFF #x0F #x00)) 12)
-  (check "affinity: an empty mask counts nothing"
-         (web-skeleton::count-set-bits #(0 0 0 0)) 0)
-
-  ;; And the live call, which on any Linux host must answer something
-  ;; positive. This is the one arm that runs against the real machine.
-  (let ((n (web-skeleton::affinity-cpu-count)))
-    (check "affinity: the live call answers a positive count"
-           (and (integerp n) (plusp n)) t))
-
-  ;; The least of the sources, not the first. These are the assertions that
-  ;; distinguish the two: no host either of us can test on will disagree
-  ;; with itself, so on every real machine MIN and first-answer-wins return
-  ;; the same number and are indistinguishable.
-  (check "min: a quota of eight against an affinity of two answers two"
-         (web-skeleton::fewest-cpus
-          (web-skeleton::parse-cpu-max "800000 100000") 2)
-         2)
-  (check "min: an affinity of sixteen against a quota of two answers two"
-         (web-skeleton::fewest-cpus
-          (web-skeleton::parse-cpu-max "200000 100000") 16)
-         2)
-  (check "min: a silent quota leaves affinity to answer"
-         (web-skeleton::fewest-cpus
-          (web-skeleton::parse-cpu-max "max 100000") 16)
-         16)
-  (check "min: every source silent declines"
-         (web-skeleton::fewest-cpus nil nil nil) nil)
-  (check "min: a non-positive source is ignored rather than winning"
-         (web-skeleton::fewest-cpus 0 -3 4) 4)
-
-  ;; The whole thing, on whatever this host is. Cannot assert a number —
-  ;; that is the point of the change — but it must always be usable, since
-  ;; START-SERVER refuses anything else.
-  (let ((n (web-skeleton::cpu-count)))
-    (check "cpu-count: answers a positive integer"
-           (and (integerp n) (plusp n)) t)))
 
 (defun test-server ()
   (setf *tests-passed* 0
@@ -9609,32 +9931,47 @@
   (format t "~%=== Server Tests ===~%")
   (test-http-parser)
   (test-http-parser-errors)
-  (test-transfer-encoding-rules)
-  (test-chunked-request-body)
-  (test-unfinishable-request-closes)
+  (test-host-field)
+  (test-upstream-field-values)
   (test-expect-100-continue)
   (test-http-date)
   (test-http-date-cache)
   (test-http-response)
+  (test-format-response-owns-framing)
+  (test-bodiless-statuses-on-the-wire)
+  (test-fetch-then-answers-like-a-handler)
   (test-cookie-builder)
   (test-fetch)
   (test-dns)
   (test-is-public-address)
   (test-fetch-address-filter)
   (test-dns-cache)
+  (test-dns-keeps-every-address)
+  (test-dns-ready-hands-on-every-address)
   (test-dns-lookup-sink)
+  (test-dns-child-closed-only-once-dead)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
+  (test-dns-dial-failure-is-not-a-lookup-failure)
+  (test-a-then-that-closes-its-target-mid-teardown)
+  (test-documented-settings-are-exported)
+  (test-errno-names)
+  (test-descriptor-limit)
+  (test-a-log-line-escapes-control-characters)
+  (test-static-load-measures-first-and-keeps-nothing-it-refuses)
   (test-format-peer-addr)
   (test-parse-error-status)
   (test-url-decode)
   (test-query-string)
   (test-match-path)
+  (test-match-path-literals-validated-at-boot)
   (test-streaming-fetch)
+  (test-streaming-fetch-reads-the-buffered-head)
   (test-line-reader-over-read-fn)
   (test-interim-responses)
   (test-decode-chunked-body)
   (test-chunked-body-complete-p)
+  (test-chunked-request-with-a-bad-chunk-size-e2e)
   (test-chunked-encoder)
   (test-chunk-walk-on-data)
   (test-fetch-on-body-pause)
@@ -9644,13 +9981,19 @@
   (test-stream-head-request)
   (test-stream-keepalive-and-idle)
   (test-sse)
+  (test-stream-headers-repeat)
   (test-websocket)
   (test-websocket-fragmentation)
   (test-static-helpers)
+  (test-static-serves-what-the-router-sees)
+  (test-static-names-with-pathname-syntax)
+  (test-static-responses-carry-the-connection-line)
   (test-static-etag)
   (test-static-range)
+  (test-static-range-copies-nothing)
   (test-static-date)
   (test-jwt)
+  (test-jwt-refusals-for-their-own-reasons)
   (test-shutdown-hooks)
   (test-read-available-eof)
   (test-awaiting-sweep-504)
@@ -9663,33 +10006,14 @@
   (test-write-queue-drain)
   (test-ws-send-queues)
   (test-ws-send-refuses-a-foreign-connection)
+  (test-websocket-read-buffer-gives-back-what-a-frame-grew)
   (test-ws-write-stall-sweep)
+  (test-utf-8-well-formed-p)
+  (test-ws-message-clock)
+  (test-ws-message-timeout-sweep)
   (test-ws-handler-push-and-return)
+  (test-a-stale-event-skips-the-fd-s-next-connection)
+  (test-a-client-reset-is-a-disconnect)
   (test-ws-ping-flush)
-  (test-detached-pause-auto-resumes)
-  (test-ws-send-arms-from-a-fetch-callback)
-  (test-ws-send-arms-a-fan-out-target)
-  (test-stream-close-arms-the-write-path)
-  (test-stream-close-refuses-a-foreign-connection)
-  (test-cpu-count-parsers)
-  (test-ws-oversized-frame-close-code)
-  (test-discard-available-want-write)
-  (test-fetch-timeout-validated-at-boot)
-  (test-on-tick-runs-with-the-workers-bindings)
-  (test-on-tick-survives-a-raising-hook)
-  (test-on-tick-validated-at-boot)
-  (test-map-worker-websockets-visits-only-websockets)
-  (test-map-worker-websockets-skips-what-a-callback-closed)
-  (test-map-worker-websockets-refuses-off-a-worker)
-  (test-map-worker-websockets-delivers-from-on-tick)
-  (test-connection-census-is-exported-with-a-split-contract)
-  (test-a-log-line-is-one-line)
-  (test-counters-count-responses-by-class)
-  (test-counters-see-a-response-no-handler-produced)
-  (test-counters-count-every-way-a-frame-is-handed-over)
-  (test-counters-count-a-response-the-serializer-never-built)
-  (test-counters-a-client-reset-is-not-a-server-error)
-  (test-getent-parse-separates-policy-from-resolution)
-  (test-parse-error-carries-its-status-to-a-caller)
   (report-suite "Server")
   (zerop *tests-failed*))

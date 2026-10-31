@@ -9,7 +9,7 @@
     <meta name="description" content="SBCL web server framework for Linux">
     <meta property="og:title" content="web-skeleton">
     <meta property="og:description" content="SBCL web server framework for Linux">
-    <meta property="og:image" content="/og-image.png">
+    __OG_IMAGE__
     <meta property="og:type" content="website">
     <link rel="stylesheet" href="/style.css">
     <link rel="icon" type="image/svg+xml" href="/favicon/favicon.svg">
@@ -26,8 +26,8 @@
     </header>
 
     <nav class="tabs" id="tabs" role="tablist">
-        <button class="tab" role="tab" data-panel="x-ray" aria-controls="x-ray" aria-selected="true">x-ray</button>
-        <button class="tab" role="tab" data-panel="x-periments" aria-controls="x-periments" aria-selected="false">x-periments</button>
+        <button class="tab" role="tab" data-panel="x-ray" aria-controls="x-ray" aria-selected="true" tabindex="0">x-ray</button>
+        <button class="tab" role="tab" data-panel="x-periments" aria-controls="x-periments" aria-selected="false" tabindex="-1">x-periments</button>
     </nav>
 
     <div id="x-ray" class="panel" role="tabpanel">
@@ -65,9 +65,10 @@
     <div id="x-periments" class="panel" role="tabpanel" hidden>
         <section>
             <h2>lab samples</h2>
-            <p class="sub">three ordinary GETs, shown whole - the request is
-            what the server parsed, the response is what your browser
-            received, and each clock is reported by the side that kept it</p>
+            <p class="sub">three ordinary GETs and a form post, shown whole -
+            the request is what the server parsed, the response is what your
+            browser received, and each clock is reported by the side that
+            kept it</p>
             <div id="lab"></div>
         </section>
 

@@ -59,10 +59,9 @@
    ;; default because most raise sites are exactly that. It is not the
    ;; right answer for a request we understood perfectly and refused on
    ;; its merits — a 12 MiB body, an HTTP/2 preface, a method we do not
-   ;; implement. Those told the client "you wrote this wrong" when the
-   ;; truth was "this is too big", "wrong protocol", "not supported",
-   ;; and 413 / 414 / 431 already sat in *STATUS-REASONS* unreachable
-   ;; because every path through here answered 400.
+   ;; implement. A 400 would tell the client "you wrote this wrong" when
+   ;; the truth is "this is too big", "wrong protocol", "not supported",
+   ;; which is what 413 / 414 / 431 / 505 / 501 say.
    (status  :initarg :status  :reader http-parse-error-status
             :initform 400))
   (:report (lambda (condition stream)
@@ -118,11 +117,9 @@
 
    Used for Transfer-Encoding: chunked, Connection: close/keep-alive,
    and Upgrade: websocket detection — a general HTTP token-list
-   primitive, callable from any header-parsing site. It was
-   CONNECTION-HEADER-HAS-TOKEN-P while it only served the Connection
-   header, and the docstring spent two lines apologising for the name
-   afterwards; eight call sites across four files now read as what they
-   are rather than as something borrowed."
+   primitive, callable from any header-parsing site. Named for what it
+   is rather than for the Connection header, so its call sites across
+   four files read as what they are rather than as something borrowed."
   (let ((len (length header-value))
         (token-len (length token)))
     (loop with pos = 0
@@ -224,12 +221,39 @@
     (error "build-cookie: name contains '=' — browsers would split ~
             the cookie at it")))
 
+(defun check-cookie-prefix (who name secure path domain)
+  "Refuse a cookie whose name carries a prefix its attributes break.
+
+     __Secure-   needs Secure
+     __Host-     needs Secure, Path=/ and no Domain
+
+   A browser refuses such a Set-Cookie outright (RFC 6265bis §4.1.3), so
+   the cookie is never stored — or, for a deletion, never deleted — and
+   nothing anywhere says so. The prefixes are matched without regard to
+   case, as browsers match them. Same footing as :SAME-SITE :NONE without
+   :SECURE in BUILD-COOKIE: a refusal here beats a cookie that silently
+   does not exist."
+  (flet ((prefixed-p (prefix)
+           (and (>= (length name) (length prefix))
+                (string-equal prefix name :end2 (length prefix)))))
+    (cond
+      ((prefixed-p "__Host-")
+       (unless (and secure (equal path "/") (null domain))
+         (error "~a: a __Host- cookie needs :secure t, :path \"/\" and no ~
+                 :domain — browsers refuse it otherwise" who)))
+      ((prefixed-p "__Secure-")
+       (unless secure
+         (error "~a: a __Secure- cookie needs :secure t — browsers refuse ~
+                 it otherwise" who))))))
+
 (defun build-cookie (name value &key (path "/") (http-only t) (secure t)
                                      (same-site :lax) max-age domain)
   "Build a Set-Cookie header value string.
    :SAME-SITE accepts :LAX (default), :STRICT, :NONE, or NIL (omit).
    :NONE requires :SECURE T — browsers reject the combination otherwise,
    and catching it here is friendlier than a silent client-side failure.
+   A __Secure- or __Host- name is held to its prefix's rules the same way;
+   see CHECK-COOKIE-PREFIX.
    :MAX-AGE is an integer (seconds) or NIL (session cookie, drops on
    browser close).
    :PATH defaults to '/'; :DOMAIN is omitted by default.
@@ -241,9 +265,19 @@
   (validate-cookie-field "value" value)
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
+  (check-cookie-prefix "build-cookie" name secure path domain)
   (unless (or (null same-site)
               (member same-site '(:lax :strict :none)))
     (error "build-cookie: :same-site must be :lax, :strict, :none, or NIL"))
+  ;; The one attribute FORMAT writes rather than WRITE-STRING, and ~D
+  ;; prints anything that is not an integer as ~A would: a string of
+  ;; "3600; Domain=…" lands on the wire as two attributes, the injection
+  ;; VALIDATE-COOKIE-FIELD closes for every other field. Named by type,
+  ;; not echoed, since a value worth refusing is not one to put in a log.
+  (unless (or (null max-age) (integerp max-age))
+    (error "build-cookie: :max-age must be an integer number of seconds ~
+            or NIL, got a ~a"
+           (type-of max-age)))
   (when (and (eq same-site :none) (not secure))
     (error "build-cookie: :same-site :none requires :secure t"))
   (with-output-to-string (out)
@@ -270,17 +304,25 @@
                       (:none   "None"))
                     out))))
 
-(defun delete-cookie (name &key (path "/") domain)
+(defun delete-cookie (name &key (path "/") domain (secure t))
   "Build a Set-Cookie header value that removes the cookie NAME.
    Empty value + Max-Age=0 so the browser drops it on receipt.
    :PATH and :DOMAIN must match how the cookie was originally set —
    browsers match cookies to Set-Cookie by (name, domain, path);
-   HttpOnly / Secure / SameSite do not participate in matching."
+   HttpOnly / Secure / SameSite do not participate in matching.
+
+   Secure is sent all the same, by default, as BUILD-COOKIE sends it, for
+   the deletion to be accepted at all. A browser refuses any Set-Cookie for
+   a __Secure- or __Host- name that lacks Secure, a deletion included, so
+   without it the logout of a cookie built with the recommended defaults
+   is dropped and the cookie stays. Pass the :SECURE the cookie was built
+   with; CHECK-COOKIE-PREFIX refuses the combinations a browser would."
   (validate-cookie-field "name" name)
   (when (zerop (length name))
     (error "delete-cookie: empty cookie name"))
   (when path (validate-cookie-field "path" path))
   (when domain (validate-cookie-field "domain" domain))
+  (check-cookie-prefix "delete-cookie" name secure path domain)
   (with-output-to-string (out)
     (write-string name out)
     (write-char #\= out)
@@ -290,7 +332,9 @@
     (when domain
       (write-string "; Domain=" out)
       (write-string domain out))
-    (write-string "; Max-Age=0" out)))
+    (write-string "; Max-Age=0" out)
+    (when secure
+      (write-string "; Secure" out))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; URL percent-decoding (RFC 3986)
@@ -342,7 +386,10 @@
 (defun parse-query-string (query)
   "Parse a query string like \"a=1&b=2\" into an alist.
    Decodes per application/x-www-form-urlencoded (+ as space, %XX).
-   Keys with no = get empty string values."
+   Keys with no = get empty string values. An empty segment, as in
+   \"a=1&\" or \"a=1&&b=2\", is no pair at all, as the WHATWG URL
+   standard's form parser skips it; \"=\" is a pair, an empty name with
+   an empty value."
   (when (and query (> (length query) 0))
     (let ((pairs nil)
           (len (length query))
@@ -351,11 +398,12 @@
         (let* ((amp (or (position #\& query :start start) len))
                (segment-start start)
                (eq-pos (position #\= query :start segment-start :end amp)))
-          (push (if eq-pos
-                    (cons (form-decode (subseq query segment-start eq-pos))
-                          (form-decode (subseq query (1+ eq-pos) amp)))
-                    (cons (form-decode (subseq query segment-start amp)) ""))
-                pairs)
+          (when (> amp segment-start)
+            (push (if eq-pos
+                      (cons (form-decode (subseq query segment-start eq-pos))
+                            (form-decode (subseq query (1+ eq-pos) amp)))
+                      (cons (form-decode (subseq query segment-start amp)) ""))
+                  pairs))
           (if (>= amp len)
               (return (nreverse pairs))
               (setf start (1+ amp))))))))
@@ -383,11 +431,98 @@
             (setf start (1+ slash))
             (return (nreverse segments)))))))
 
+(defun path-either-spelling-byte-p (byte)
+  "T for a byte a path may carry either as itself or as a %XX escape,
+   naming the same path both ways.
+
+   These are [ ] : @ and the RFC 3986 sub-delims ! $ & ' ( ) * + , ; =. A
+   browser writes them as themselves in a path it builds, but a page that
+   builds its URLs with encodeURIComponent escapes them — Next.js does, for
+   its asset paths from 14.2 on — and the browser sends what the page
+   wrote. None of them can spell a letter, a digit, '.' or '/', so neither
+   spelling reaches a different file or route than the other."
+  (and (member byte '(#x21 #x24 #x26 #x27 #x28 #x29 #x2A #x2B #x2C
+                      #x3A #x3B #x3D #x40 #x5B #x5D))
+       t))
+
+(defun canonical-path (path)
+  "PATH with each %XX escape's hex digits in uppercase, each escape of a
+   byte PATH-EITHER-SPELLING-BYTE-P accepts replaced by the byte itself,
+   and nothing else changed. This is the form in which MATCH-PATH, under
+   :EXACT, and SERVE-STATIC compare a path, so the two read every request
+   the same way.
+
+   Uppercase because RFC 3986 §2.1 makes the case of an escape's hex
+   digits no part of the URI, and §6.2.2.1 normalizes it to uppercase: a
+   proxy that writes %c3%a9, as Apache httpd's re-encoding does, names the
+   path a browser writes as %C3%A9. Every other escape, and every byte
+   written as itself, is left as it arrived. So /a%5B1%5D, /a%5b1%5d and
+   /a[1] are one path, while /%61dmin stays apart from /admin and %2F
+   stays inside its segment. An application checking the raw path against
+   a literal compares CANONICAL-PATH of it, which is the router's
+   reading."
+  (if (not (find #\% path))
+      path
+      ;; ASCII hex only: DIGIT-CHAR-P would take other scripts' digits.
+      (flet ((hex (c)
+               (cond ((char<= #\0 c #\9) (- (char-code c) 48))
+                     ((char<= #\A c #\F) (- (char-code c) 55))
+                     ((char<= #\a c #\f) (- (char-code c) 87)))))
+        (with-output-to-string (out)
+          (let ((len (length path))
+                (i 0))
+            (loop while (< i len)
+                  do (let* ((c (char path i))
+                            (hi (and (char= c #\%) (< (+ i 2) len)
+                                     (hex (char path (1+ i)))))
+                            (lo (and hi (hex (char path (+ i 2)))))
+                            (byte (and lo (logior (ash hi 4) lo))))
+                       (cond ((null byte)
+                              (write-char c out)
+                              (incf i))
+                             ((path-either-spelling-byte-p byte)
+                              (write-char (code-char byte) out)
+                              (incf i 3))
+                             (t
+                              (write-char #\% out)
+                              (write-char (char-upcase (char path (1+ i))) out)
+                              (write-char (char-upcase (char path (+ i 2))) out)
+                              (incf i 3))))))))))
+
+(defparameter *match-path-literals* :exact
+  "How MATCH-PATH compares a pattern's literal segments with a path's.
+
+     :EXACT    the default. A literal matches the segment as it arrived,
+               read through CANONICAL-PATH, so /%61dmin does not match
+               /admin while /a%5B1%5D does match /a[1].
+     :DECODED  the segment is percent-decoded first, so /%61dmin does
+               match /admin — RFC 3986 §6.2.2.2 counts the two as one
+               URI.
+
+   A choice for the project, made once. :EXACT keeps a route matching
+   the spelling HTTP-REQUEST-PATH shows the application, up to the
+   punctuation CANONICAL-PATH reads either way, so a check on the raw
+   path that goes through CANONICAL-PATH and the router read the same
+   bytes the same way. Under :DECODED, make access decisions on the
+   matched route and never on the raw path: a prefix test for \"/admin\"
+   passes /%61dmin, which the router then sends to the admin route.
+
+   Captured :param values are percent-decoded under both. Under :EXACT a
+   literal outside unreserved ASCII and that punctuation is written in the
+   pattern the way it arrives, percent-encoded: /caf%C3%A9, not /café.
+   START-SERVER refuses any other value.")
+
 (defun match-path (pattern path)
   "Match PATH against PATTERN with :param segment captures.
-   Literal segments must match exactly; segments starting with : capture.
+   Literal segments must match; segments starting with : capture.
    Empty segments are not captured (e.g. /users/ does not match /users/:id).
-   Captured values are percent-decoded.
+   Captured values are percent-decoded. Literals are compared as
+   *MATCH-PATH-LITERALS* says: with the segment as it arrived (:EXACT,
+   the default), both sides read through CANONICAL-PATH, or with the
+   segment percent-decoded (:DECODED). Under :EXACT a literal comparison
+   decodes only that punctuation, so a segment whose escapes are not
+   UTF-8 fails a literal instead of raising; a capture decodes under
+   both, and raises for one.
 
    Return contract is a deliberate tri-state:
      NIL      — PATH does not match PATTERN
@@ -404,6 +539,9 @@
        (when (and b (listp b)) (cdr (assoc \"id\" b))))"
   (let ((pat-segs  (split-path-segments pattern))
         (path-segs (split-path-segments path))
+        (decode-literals (ecase *match-path-literals*
+                           (:exact nil)
+                           (:decoded t)))
         (bindings nil))
     (when (= (length pat-segs) (length path-segs))
       (when (loop for pat in pat-segs
@@ -414,7 +552,10 @@
                                (push (cons (subseq pat 1) (url-decode seg))
                                      bindings)
                                t)
-                             (string= pat (url-decode seg))))
+                             (if decode-literals
+                                 (string= pat (url-decode seg))
+                                 (string= (canonical-path pat)
+                                          (canonical-path seg)))))
         (if bindings (nreverse bindings) t)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -443,11 +584,40 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun bytes-to-string (buf start end)
-  "Convert BUF[START..END) to a UTF-8 string. Single allocation."
+  "Convert BUF[START..END) to a UTF-8 string. Single allocation.
+
+   Strict: bytes that are not UTF-8 raise HTTP-PARSE-ERROR. That is the
+   request side's answer, for every piece of a request head this decodes.
+   An upstream's field values take BYTES-TO-STRING-OR-LATIN-1 instead."
   (handler-case
       (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8)
     (sb-int:character-decoding-error ()
       (http-parse-error "invalid UTF-8 in request"))))
+
+(defun bytes-to-string-or-latin-1 (buf start end)
+  "Convert BUF[START..END) to a string: as UTF-8 when the bytes are valid
+   UTF-8, and otherwise as ISO-8859-1, one character per byte.
+
+   For field values in an upstream's response. RFC 9110 §5.5 allows
+   obs-text (%x80-FF) in a field value and tells a recipient to treat it
+   as opaque, and servers still send Latin-1: a Content-Disposition
+   filename with é as the single byte E9. Refusing that would fail the
+   whole response over one header the application may never read. The
+   request side stays strict, because there a refused byte costs a client
+   its own malformed request, where here it would cost the application an
+   upstream it does not control. The checks that protect framing — tchar
+   names, no CTLs in values — hold on both sides either way.
+
+   Nothing is lost. A value read as Latin-1 gives its bytes back through
+   (sb-ext:string-to-octets value :external-format :latin-1), and a value
+   that is valid UTF-8 reads exactly as BYTES-TO-STRING reads it. The two
+   spellings of é, C3 A9 and E9, both read as é, which is what each
+   means in the charset it can be."
+  (handler-case
+      (sb-ext:octets-to-string buf :start start :end end :external-format :utf-8)
+    (sb-int:character-decoding-error ()
+      (sb-ext:octets-to-string buf :start start :end end
+                                   :external-format :latin-1))))
 
 (defun bytes-to-lowercase-string (buf start end)
   "Convert BUF[START..END) to a lowercase ASCII string. Single allocation."
@@ -534,18 +704,29 @@
 ;;; Byte-level header parser (single-pass)
 ;;; ---------------------------------------------------------------------------
 
-(defun parse-headers-bytes (buf start end)
+(defun parse-headers-bytes (buf start end &key (invalid-utf-8 :refuse))
   "Parse headers from BUF[START..END) into an alist of (lowercase-name . value).
    Single-pass, handles obsolete line folding (RFC 7230 §3.2.4).
    Stops at the first empty line (CRLFCRLF boundary). Enforces
    *MAX-TOTAL-HEADER-BYTES* as a running-total guard — per-line and
    per-count caps alone permit worst-case 800 KiB of header-string
    allocation per request; the running total makes the actual bound
-   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB)."
+   match *MAX-TOTAL-HEADER-BYTES* (default 64 KiB).
+
+   INVALID-UTF-8 is what a field value that is not valid UTF-8 becomes.
+   :REFUSE, the default and the request side's answer, raises
+   HTTP-PARSE-ERROR. :LATIN-1 reads it one character per byte, which is
+   the response side's answer — see BYTES-TO-STRING-OR-LATIN-1. Either
+   way names are held to tchar and values refuse CTLs: those checks are
+   about framing, not charset, and one parser keeps them the same in both
+   directions."
   (let ((headers nil)
         (count 0)
         (total 0)
-        (pos start))
+        (pos start)
+        (decode-value (ecase invalid-utf-8
+                        (:refuse #'bytes-to-string)
+                        (:latin-1 #'bytes-to-string-or-latin-1))))
     (loop
       (let ((crlf (scan-crlf buf pos end)))
         (unless crlf (return))          ; no more complete lines
@@ -572,11 +753,11 @@
                   (when (= colon pos)
                     (http-parse-error "empty header name"))
                   ;; RFC 7230 §3.2.6: header name must be a token,
-                  ;; i.e. each byte must be a tchar. The earlier
-                  ;; loose check (<=0x20 or =0x7F) rejected CTLs and
-                  ;; SP but let through separators like ':', '(',
-                  ;; ',', '/', etc. — any of which hidden in a name
-                  ;; is a smuggling primitive if it reaches assoc.
+                  ;; i.e. each byte must be a tchar. A looser check
+                  ;; (<=0x20 or =0x7F) would reject CTLs and SP but
+                  ;; let through separators like ':', '(', ',', '/',
+                  ;; etc. — any of which hidden in a name is a
+                  ;; smuggling primitive if it reaches assoc.
                   (loop for i from pos below colon
                         for b = (aref buf i)
                         unless (tchar-byte-p b)
@@ -593,9 +774,9 @@
                       ;; shape the request-target and method checks
                       ;; already close in parse-request-bytes, and
                       ;; symmetric with serialize-http-message's
-                      ;; value reject on egress. The asymmetry was
-                      ;; the bug — inbound accepted bytes the
-                      ;; outbound side would refuse to emit.
+                      ;; value reject on egress: without it, inbound
+                      ;; would accept bytes the outbound side
+                      ;; refuses to emit.
                       (loop for i from vs below ve
                             for b = (aref buf i)
                             when (or (and (< b #x20) (/= b 9))
@@ -611,7 +792,7 @@
                         (http-reject 431 "too many headers (~d, max ~d)"
                                           count *max-header-count*))
                       (push (cons name (if (= vs ve) ""
-                                           (bytes-to-string buf vs ve)))
+                                           (funcall decode-value buf vs ve)))
                             headers)))))))
         (setf pos (+ crlf 2))))
     (nreverse headers)))
@@ -653,10 +834,19 @@
         ;; error text, which log-warn then splits across two lines —
         ;; a log-injection primitive identical in shape to the
         ;; request-target vector.
+        ;;
+        ;; The rest of what a token excludes is refused here too (RFC 9110
+        ;; §9.1: method = token), as malformed rather than as a method we
+        ;; do not implement. Otherwise a byte at or above 0x80 would reach
+        ;; the 501 below, whose message decodes the method, and the status
+        ;; would turn on whether the bytes happen to be UTF-8: 501 for
+        ;; G<C3 89>T, 400 for G<FF>T.
         (loop for i from start below sp1
               for b = (aref buf i)
               when (or (< b #x20) (= b #x7F))
-              do (http-parse-error "control character in request method"))
+                do (http-parse-error "control character in request method")
+              unless (tchar-byte-p b)
+                do (http-parse-error "request method is not a token"))
         ;; Method and version are both resolved before either is judged,
         ;; because the order of the two rejections is itself a decision.
         ;; RFC 7230 §2.6: a server SHOULD answer 505 when it cannot
@@ -668,8 +858,7 @@
         ;; both checks, and in practice that set has one member: the
         ;; HTTP/2 prior-knowledge preface, "PRI * HTTP/2.0". Its method
         ;; is PRI, so a method-first parser answers 501 and never looks
-        ;; at the version — which is how this read 501 while three
-        ;; comments and a table row claimed 505.
+        ;; at the version, where the answer it deserves is 505.
         (let ((method (match-method-bytes buf start sp1))
               ;; Version — match "HTTP/1.0" or "HTTP/1.1" byte-by-byte
               (version
@@ -979,11 +1168,9 @@
    Defaults to the current time when called with no argument.
 
    The no-argument call is cached per worker for the current second,
-   because it is on every dynamic response and it is most of what building
-   one costs: measured at 1.26 us against FORMAT-RESPONSE's 1.76 us total,
-   so roughly seventy percent of serializing a small response went on
-   rebuilding a string that changes once a second. The cached read is
-   0.02 us. DECODE-UNIVERSAL-TIME and a seven-directive FORMAT are simply
+   because it is on every dynamic response and formatting it is most of
+   what serializing a small one costs, for a string that changes once a
+   second. DECODE-UNIVERSAL-TIME and a seven-directive FORMAT are simply
    not cheap, and neither is needed twice in the same second.
 
    An explicit UNIVERSAL-TIME bypasses the cache entirely — that call is
@@ -1028,10 +1215,11 @@
 
    The vector is shared by every response sent in that second and is
    never mutated: a new one is built when the second turns, rather than
-   the old one being patched in place. Patching would be cheaper and
-   wrong — the queue can still be draining a vector into a slow peer
-   while the next request is served, and a Date rewritten underneath a
-   half-sent response is a torn header with nothing to catch it."
+   the previous second's being patched in place. Patching would be
+   cheaper and wrong — the queue can still be draining a vector into a
+   slow peer while the next request is served, and a Date rewritten
+   underneath a half-sent response is a torn header with nothing to
+   catch it."
   (let ((now (get-universal-time))
         (cache *http-date-line-cache*))
     (flet ((build ()
@@ -1045,6 +1233,87 @@
              (setf (car cache) now
                    (cdr cache) bytes)
              bytes))))))
+
+(defun status-without-body-p (status)
+  "True for a status whose response ends at its blank line whatever its
+   headers say: 1xx, 204 and 304 (RFC 9112 §6.3). A reader takes any byte
+   after that head as the start of the next response."
+  (or (<= 100 status 199) (= status 204) (= status 304)))
+
+(defun response-framing-headers (status body-bytes headers head-only-p)
+  "HEADERS with the Content-Length FORMAT-RESPONSE will send, after
+   refusing any framing the caller set that the bytes would contradict.
+
+   Framing is the serializer's, as it is for FORMAT-STREAMING-HEAD and
+   BUILD-OUTBOUND-REQUEST. The body goes out whole, so the only framing
+   this response can have is the length of BODY-BYTES, and two opinions
+   about where a body ends are the disagreement this codebase treats as
+   its threat model: the proxy, cache or client reading next takes the
+   wrong one, and on a keep-alive connection that is a desync. The
+   likeliest way in needs no exotic header, only an upstream's
+   Transfer-Encoding or Content-Length copied along with the rest of its
+   header alist by a relay whose :THEN received the body already decoded.
+
+     Transfer-Encoding   refused, always.
+     Content-Length      accepted when it says what the bytes say;
+                         refused when it contradicts them, or appears
+                         twice. Without a body it is accepted for HEAD,
+                         where it describes the body a GET would carry.
+     1xx and 204         no body, and no Content-Length (RFC 9110 §8.6).
+     304                 no body. A caller's Content-Length is kept: there
+                         it describes the representation, not this
+                         response (RFC 9110 §8.6).
+
+   A body on a status that cannot carry one is refused rather than
+   dropped. Bytes the caller meant to send and the framework quietly
+   discarded are a disagreement too, one nobody would see. Every refusal
+   is an error, and the error is the ordinary 500."
+  (when (assoc "transfer-encoding" headers :test #'string-equal)
+    (error "format-response: the caller set Transfer-Encoding. The body ~
+            goes out whole, framed by Content-Length, and framing is the ~
+            framework's; a relay copying an upstream's headers has to ~
+            leave the upstream's framing behind"))
+  (let ((declared (remove-if-not (lambda (h)
+                                   (string-equal (car h) "content-length"))
+                                 headers))
+        (body-length (if body-bytes (length body-bytes) 0)))
+    (when (rest declared)
+      (error "format-response: the caller set Content-Length ~d times"
+             (length declared)))
+    (let ((declared-length
+            (when declared
+              ;; 1*DIGIT, as the ingress parser requires of a request; a
+              ;; sign or a space inside would pass PARSE-INTEGER and fail
+              ;; a strict reader downstream. ASCII digits, since
+              ;; DIGIT-CHAR-P and PARSE-INTEGER both take any Unicode digit.
+              (let ((value (string-trim '(#\Space #\Tab) (cdr (first declared)))))
+                (if (and (plusp (length value))
+                         (every (lambda (c) (char<= #\0 c #\9)) value))
+                    (parse-integer value)
+                    (error "format-response: the caller's Content-Length ~s ~
+                            is not a length" (cdr (first declared))))))))
+      (cond
+        ((status-without-body-p status)
+         (when (plusp body-length)
+           (error "format-response: status ~d cannot carry a body, and ~d ~
+                   byte~:p were given. The response ends at its blank ~
+                   line, so they would be read as the start of the next one"
+                  status body-length))
+         (when (and declared (/= status 304))
+           (error "format-response: status ~d must not carry ~
+                   Content-Length" status))
+         headers)
+        (declared
+         (unless (or (= declared-length body-length)
+                     (and head-only-p (null body-bytes)))
+           (error "format-response: the caller's Content-Length is ~d but ~
+                   the body is ~d byte~:p" declared-length body-length))
+         headers)
+        ;; The length goes on even when it is zero: a response with no
+        ;; framing at all is read to the end of the connection, and a
+        ;; keep-alive client would wait for an end that never comes.
+        (t (cons (cons "content-length" (write-to-string body-length))
+                 headers))))))
 
 (defun format-response (response &key connection-hint head-only-p)
   "Serialize an HTTP-RESPONSE into a byte vector ready to write to a socket.
@@ -1085,7 +1354,11 @@
    back out — two large allocations for the cold HEAD path.
    Passing :HEAD-ONLY-P T encodes the body once for length, then
    skips emission. The byte-vector path (static files) still goes
-   through STRIP-BODY-FOR-HEAD post-serialize."
+   through STRIP-BODY-FOR-HEAD post-serialize.
+
+   Framing is decided by RESPONSE-FRAMING-HEADERS, which refuses a
+   caller's Transfer-Encoding, a Content-Length the body contradicts,
+   and a body on a status that cannot carry one."
   (let ((status (http-response-status response)))
     ;; Validate status up front so an out-of-range value short-
     ;; circuits before the body encode + header build below.
@@ -1103,24 +1376,9 @@
                          (string (sb-ext:string-to-octets
                                   body :external-format :utf-8))
                          ((simple-array (unsigned-byte 8) (*)) body)))
-           (headers (http-response-headers response))
-           (headers (cond
-                     ;; Body present — add CL if not already set
-                     ((and body-bytes
-                           (not (assoc "content-length" headers
-                                       :test #'string-equal)))
-                      (cons (cons "content-length"
-                                  (write-to-string (length body-bytes)))
-                            headers))
-                     ;; No body, status requires CL:0 to prevent
-                     ;; keep-alive clients from waiting forever
-                     ((and (null body-bytes)
-                           (not (or (<= 100 status 199)
-                                    (= status 204) (= status 304)))
-                           (not (assoc "content-length" headers
-                                       :test #'string-equal)))
-                      (cons (cons "content-length" "0") headers))
-                     (t headers)))
+           (headers (response-framing-headers
+                     status body-bytes (http-response-headers response)
+                     head-only-p))
            ;; Stamp the Connection header from the hint without touching
            ;; the caller's struct. App-set Connection header wins — if
            ;; the handler already put one in the alist, the hint is
@@ -1204,7 +1462,18 @@
     resp))
 
 (defun make-error-response (status &optional message)
-  "Build a plain-text error response."
-  (let ((body (or message
-                  (format nil "~d ~a" status (status-reason status)))))
-    (make-text-response status body)))
+  "Build a plain-text error response: MESSAGE, or the status and its
+   reason, as the body.
+
+   A status that cannot carry a body — 1xx, 204, 304 — gets a bare
+   response instead, with no body and no Content-Type. FORMAT-RESPONSE
+   refuses a body there, and a Content-Type on a 304 is worse than
+   useless: a cache that revalidates with it replaces the stored
+   response's type with text/plain. A MESSAGE given for one of those
+   statuses is a body all the same, and is refused when the response is
+   sent."
+  (if (and (null message) (status-without-body-p status))
+      (make-http-response :status status)
+      (make-text-response status (or message
+                                     (format nil "~d ~a" status
+                                             (status-reason status))))))

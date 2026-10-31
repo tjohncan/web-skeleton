@@ -59,11 +59,11 @@
    methods, spaces and CRLFs and reach the header parser, which is where
    the interesting surface is.
 
-   Measured rather than assumed: across 400 cases (half random, half
-   from here) the verdicts land as ~204 request-line, ~121 version, ~37
-   fully accepted, ~17 header, ~10 method, ~10 path. If a change to this
-   generator pushes nearly everything into request-line, the property
-   above is still passing but has stopped testing the parser."
+   Its cases spread across every verdict: most stop at the request line
+   or the version, and the rest reach the header, method and path checks
+   or are accepted whole. If a change to this generator pushes nearly
+   everything into request-line, the property above is still passing but
+   has stopped testing the parser."
   (let ((parts (list (nth (random 8) '("GET" "POST" "PUT" "DELETE"
                                        "HEAD" "OPTIONS" "PATCH" "PRI"))
                      " "
@@ -415,6 +415,673 @@
                       complete resume (- (length framed) term-len)))))))
     bad))
 
+(defparameter *size-line-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (concatenate 'string "aZ=\"x5;g" (list #\Space #\Tab #\Return #\Newline
+                                              (code-char 0) (code-char #xE9))))
+  "Bytes a generated chunk-size line is salted with: the separators the
+   grammar names, the line terminators taken apart, a NUL, a byte above
+   0x7F, and letters that are and are not hex digits.")
+
+(defun gen-size-line ()
+  "Bytes that may or may not be a chunk-size line, always followed by a
+   CRLF so every reader finds an end. Built from the grammar's own parts
+   — hex digits, whitespace, an extension — and then salted, so most
+   cases sit one byte away from valid rather than nowhere near it."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0)))
+    (flet ((emit (b) (vector-push-extend b out))
+           (salt () (aref *size-line-bytes* (random (length *size-line-bytes*)))))
+      (when (zerop (random 8)) (emit (salt)))
+      (dotimes (i (if (zerop (random 20)) 17 (random 5)))
+        (declare (ignorable i))
+        (emit (char-code (char "0123456789abcdefABCDEF" (random 22)))))
+      (dotimes (i (random 3))
+        (declare (ignorable i))
+        (emit (if (zerop (random 2)) 32 9)))
+      (when (zerop (random 2))
+        (emit 59)
+        (dotimes (i (random 7))
+          (declare (ignorable i))
+          (emit (salt))))
+      (when (zerop (random 6))
+        (let ((at (random (1+ (fill-pointer out)))))
+          (emit 0)
+          (replace out out :start1 (1+ at) :start2 at :end2 (1- (fill-pointer out)))
+          (setf (aref out at) (salt))))
+      (emit 13)
+      (emit 10))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun prop-chunk-size-line-parity (seed)
+  "Every chunked reader reads a size line the same way.
+
+   PARSE-CHUNK-SIZE-BYTES reads the line for the walk and the buffered
+   decoder; READER-READ-CRLF-LINE and PARSE-CHUNKED-SIZE-LINE read it for
+   the blocking stream. Both are written to one grammar, and a line one
+   accepts and the other refuses — or reads as a different size — is two
+   readers framing the same bytes two ways. The line cap is part of the
+   grammar, so each case runs under a small *MAX-HEADER-LINE-LENGTH* of
+   its own and the cap is reached as often as not."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((line (gen-size-line))
+             (web-skeleton::*max-header-line-length* (+ 4 (random 12)))
+             (buffered (handler-case
+                           (let ((size (web-skeleton::parse-chunk-size-bytes
+                                        line 0 (length line))))
+                             (or size :incomplete))
+                         (web-skeleton::chunked-framing-error () :refused)))
+             (streamed (handler-case
+                           (let ((text (web-skeleton::reader-read-crlf-line
+                                        (web-skeleton::make-stream-reader
+                                         (make-mock-stream line)))))
+                             (if text
+                                 (web-skeleton::parse-chunked-size-line text)
+                                 :eof))
+                         (error () :refused))))
+        (unless (eql buffered streamed)
+          (unless bad
+            (setf bad :disagreement)
+            (fuzz-report nil seed line)
+            (format t "    cap ~d: buffered ~s, streamed ~s~%"
+                    web-skeleton::*max-header-line-length* buffered streamed)))))
+    bad))
+
+(defparameter *framing-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (concatenate 'string "01fgX;" (list #\Space #\Tab #\Return #\Newline
+                                            (code-char 0))))
+  "What a mutation writes into chunked framing: the bytes the framing is
+   made of, and a few that are wrong in every position.")
+
+(defun mutate-framing (bytes)
+  "BYTES with one byte replaced, inserted or removed at a random place,
+   the new byte drawn from *FRAMING-BYTES*."
+  (mutate-bytes bytes *framing-bytes*))
+
+(defun mutate-bytes (bytes alphabet)
+  "BYTES with one byte replaced, inserted or removed at a random place,
+   the new byte drawn from ALPHABET."
+  (let* ((n (length bytes))
+         (at (random (1+ n)))
+         (b (aref alphabet (random (length alphabet)))))
+    (coerce
+     (ecase (if (zerop n) 1 (random 3))
+       (0 (let ((v (copy-seq bytes)))
+            (setf (aref v (min at (1- n))) b)
+            v))
+       (1 (concatenate '(vector (unsigned-byte 8))
+                       (subseq bytes 0 at) (vector b) (subseq bytes at)))
+       (2 (concatenate '(vector (unsigned-byte 8))
+                       (subseq bytes 0 (min at (1- n)))
+                       (subseq bytes (1+ (min at (1- n)))))))
+     '(simple-array (unsigned-byte 8) (*)))))
+
+(defun walk-verdict (buf start end resume collect)
+  "Run CHUNKED-BODY-COMPLETE-P over BUF[START..END) from RESUME, handing
+   each chunk to COLLECT. Returns (values VERDICT NEXT): :COMPLETE,
+   :INCOMPLETE or :REFUSED, and where a later call resumes."
+  (handler-case
+      (multiple-value-bind (complete next)
+          (web-skeleton::chunked-body-complete-p
+           buf start end resume
+           (lambda (b s e) (funcall collect (subseq b s e)) nil))
+        (values (if complete :complete :incomplete) next))
+    (web-skeleton::chunked-framing-error () (values :refused nil))))
+
+(defun prop-chunk-walk-matches-decoder (seed)
+  "CHUNKED-BODY-COMPLETE-P accepts exactly what DECODE-CHUNKED-BODY
+   accepts, and ON-DATA hands over exactly what the decoder decodes.
+
+   A consumer of ON-DATA — a relay forwarding a response as it arrives —
+   is given each chunk once the walk has proved it, and the decoder never
+   runs after that. So the walk is the only reader such a body meets, and
+   a framing it waves through that the decoder refuses is a body a relay
+   forwards and a buffered fetch answers 502.
+
+   Valid bodies from the encoder are mutated by a byte, most of the time,
+   so the corpus lives at the boundary of the grammar. Three claims:
+
+     the whole buffer      walk complete exactly when the decoder succeeds,
+                           and then ON-DATA's bytes are the decoded body; a
+                           walk that refuses or waits faces a decoder that
+                           refuses, waiting being truncation to a decoder
+                           handed the whole body
+     every split point     the walk run on a prefix and then on the whole
+                           buffer from where it stopped hands over the same
+                           bytes and reaches the same verdict as one pass
+     refusal is final      a prefix the walk refuses is a body it refuses"
+  (let ((bad nil))
+    (flet ((report (kind framed fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed framed)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+               (framed (if (zerop (random 4))
+                           valid
+                           (let ((m (mutate-framing valid)))
+                             (if (zerop (random 3)) (mutate-framing m) m))))
+               (n (length framed))
+               (decoded (handler-case
+                            (web-skeleton::decode-chunked-body framed 0 n)
+                          (web-skeleton::chunked-framing-error () :refused)))
+               (one-shot (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0)))
+          (flet ((into (acc) (lambda (v) (loop for b across v
+                                               do (vector-push-extend b acc)))))
+            (let ((verdict (walk-verdict framed 0 n 0 (into one-shot))))
+              (cond
+                ((eq verdict :complete)
+                 (unless (and (not (eq decoded :refused))
+                              (equalp (coerce one-shot '(vector (unsigned-byte 8)))
+                                      (coerce decoded '(vector (unsigned-byte 8)))))
+                   (report :whole framed "    walk complete, ~s handed over; decoder ~s~%"
+                           one-shot decoded)))
+                ((not (eq decoded :refused))
+                 (report :whole framed "    walk ~s; decoder accepted ~s~%"
+                         verdict decoded)))
+              (loop for k from 0 to n
+                    until bad
+                    do (let ((split (make-array 0 :element-type '(unsigned-byte 8)
+                                                  :adjustable t :fill-pointer 0)))
+                         (multiple-value-bind (first next)
+                             (walk-verdict framed 0 k 0 (into split))
+                           (cond
+                             ((eq first :refused)
+                              (unless (eq verdict :refused)
+                                (report :final framed
+                                        "    prefix ~d refused, whole buffer ~s~%"
+                                        k verdict)))
+                             (t
+                              (let ((second (walk-verdict framed 0 n next
+                                                          (into split))))
+                                (unless (and (eq second verdict)
+                                             (equalp (coerce split '(vector (unsigned-byte 8)))
+                                                     (coerce one-shot '(vector (unsigned-byte 8)))))
+                                  (report :split framed
+                                          "    split at ~d: ~s ~s, one pass ~s ~s~%"
+                                          k second split verdict one-shot)))))))))))))
+    bad))
+
+(defun feed-in-pieces (framed cuts)
+  "Feed FRAMED to CHUNKED-BODY-FEED as a receiving connection would: in
+   the pieces CUTS marks, appended to a buffer from which every call's
+   walked bytes are dropped. Returns (values VERDICT BYTES CALLS): the
+   walk's :COMPLETE, :INCOMPLETE or :REFUSED once the input or the body
+   ends, the data handed over, concatenated, and how many calls it took."
+  (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (got (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0))
+        (owed 0)
+        (calls 0)
+        (at 0))
+    (dolist (cut (append cuts (list (length framed))))
+      (loop for i from at below cut do (vector-push-extend (aref framed i) buf))
+      (setf at cut)
+      (incf calls)
+      (handler-case
+          (multiple-value-bind (complete next new-owed)
+              (web-skeleton::chunked-body-feed
+               buf 0 (fill-pointer buf) owed
+               (lambda (b from to rest)
+                 (declare (ignore rest))
+                 (loop for i from from below to
+                       do (vector-push-extend (aref b i) got))
+                 nil))
+            (when complete
+              (return-from feed-in-pieces (values :complete got calls)))
+            ;; Drop what the call walked, as the read path does.
+            (replace buf buf :start2 next)
+            (setf (fill-pointer buf) (- (fill-pointer buf) next)
+                  owed new-owed))
+        (web-skeleton::chunked-framing-error ()
+          (return-from feed-in-pieces (values :refused got calls)))))
+    (values :incomplete got calls)))
+
+(defun prop-chunk-feed-matches-decoder (seed)
+  "CHUNKED-BODY-FEED, which hands a received body over before its chunks
+   have all landed, accepts exactly what DECODE-CHUNKED-BODY accepts and
+   hands over exactly what it decodes — whatever pieces the body arrives
+   in, and with each call's walked bytes dropped before the next.
+
+   The feed is the reader a received request body meets and no decoder
+   runs after it, so its verdict is where the request ends. The corpus is
+   PROP-CHUNK-WALK-MATCHES-DECODER's — encoder output mutated by a byte or
+   two — cut into random pieces, one byte at a time on some cases so a
+   size line or a CRLF is split at every place it can be. The single-piece
+   feed is checked against the decoder; every other cutting against the
+   single piece."
+  (let ((bad nil))
+    (flet ((report (kind framed fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed framed)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+               (framed (if (zerop (random 4))
+                           valid
+                           (let ((m (mutate-framing valid)))
+                             (if (zerop (random 3)) (mutate-framing m) m))))
+               (n (length framed))
+               (decoded (handler-case
+                            (web-skeleton::decode-chunked-body framed 0 n)
+                          (web-skeleton::chunked-framing-error () :refused))))
+          (multiple-value-bind (verdict got) (feed-in-pieces framed nil)
+            (cond
+              ((eq verdict :complete)
+               (unless (and (not (eq decoded :refused)) (equalp got decoded))
+                 (report :whole framed "    feed complete, ~s; decoder ~s~%"
+                         got decoded)))
+              ((not (eq decoded :refused))
+               (report :whole framed "    feed ~s; decoder accepted ~s~%"
+                       verdict decoded)))
+            (let ((cuts (if (zerop (random 4))
+                            (loop for k from 1 below n collect k)
+                            (sort (remove-duplicates
+                                   (loop repeat (random 6)
+                                         collect (random (max 1 n))))
+                                  #'<))))
+              (multiple-value-bind (verdict2 got2) (feed-in-pieces framed cuts)
+                (unless (and (eq verdict2 verdict) (equalp got2 got))
+                  (report :pieces framed
+                          "    cut at ~s: ~s ~s, one piece ~s ~s~%"
+                          cuts verdict2 got2 verdict got))))))))
+    bad))
+
+(defun received-chunked-body (framed cuts halve)
+  "FRAMED received as a request's chunked body through the read path:
+   HANDLE-CLIENT-READ over a read-fn, the head first and then the body in
+   the pieces CUTS marks, by a plan whose feed takes every run whole or,
+   when HALVE, half of each run of two bytes or more, pausing there and
+   resumed until it stops. Returns (values VERDICT BYTES MOST): :COMPLETE
+   once ON-END has run, :REFUSED once ON-ABORT has heard :MALFORMED, any
+   other reason it heard, or :INCOMPLETE; the bytes the feed took, in
+   order; and the most feed calls one read or one resume made."
+  (let ((kernel (%kernel))
+        (taken (make-array 0 :element-type '(unsigned-byte 8)
+                             :adjustable t :fill-pointer 0))
+        (calls 0)
+        (most 0)
+        (paused nil)
+        (ended nil)
+        (aborted nil)
+        (at 0)
+        ;; A mutated case, one in four, is mostly refused, and each refusal
+        ;; logs its 400 at WARN, saying nothing the verdict does not.
+        (web-skeleton:*log-level* :error))
+    (with-read-fn-connection (conn kernel)
+      (let ((web-skeleton::*body-handler*
+              (lambda (req)
+                (declare (ignore req))
+                (web-skeleton::%make-body-plan
+                 :kind :receive :max-size most-positive-fixnum
+                 :feed (lambda (c buf from to)
+                         (declare (ignore c))
+                         (incf calls)
+                         (let ((upto (if (and halve (>= (- to from) 2))
+                                         (+ from (floor (- to from) 2))
+                                         to)))
+                           (loop for i from from below upto
+                                 do (vector-push-extend (aref buf i) taken))
+                           (if (< upto to)
+                               (progn (setf paused t) (values :pause upto))
+                               (values nil to))))
+                 :on-end (lambda (c)
+                           (declare (ignore c))
+                           (setf ended t)
+                           (make-text-response 200 "ok"))
+                 :on-abort (lambda (c reason)
+                             (declare (ignore c))
+                             (setf aborted reason))))))
+        (flet ((counted (thunk)
+                 (setf calls 0)
+                 (funcall thunk)
+                 (setf most (max most calls))))
+          (%supply kernel (format nil "POST /u HTTP/1.1~aHost: x~a~
+                                       Transfer-Encoding: chunked~a~a"
+                                  *crlf* *crlf* *crlf* *crlf*))
+          (dolist (cut (append cuts (list (length framed))))
+            (%supply kernel (subseq framed at cut))
+            (setf at cut)
+            (counted (lambda () (web-skeleton::handle-client-read conn 999 nil nil)))
+            (loop repeat 100
+                  while (and paused (not ended) (not aborted))
+                  do (setf paused nil)
+                     (counted (lambda ()
+                                (body-resume conn)
+                                (%resume-and-read conn))))
+            (when (or ended aborted)
+              (return))))))
+    (values (cond (ended :complete)
+                  ((eq aborted :malformed) :refused)
+                  (aborted aborted)
+                  (t :incomplete))
+            (coerce taken '(simple-array (unsigned-byte 8) (*)))
+            most)))
+
+(defun prop-received-chunked-body-one-run-per-read (seed)
+  "A chunked request body received through the read path reaches its
+   plan's feed as one run a read, whatever its chunking, and a pause
+   anywhere in a run loses and repeats nothing.
+
+   Each case is received whole, in one piece, and then cut into random
+   pieces twice: by a feed that takes every run, and by one that takes
+   half of every run and pauses there, so that the next resume begins
+   with the run's untaken rest, its framing already gone. No read or
+   resume may call the feed twice. The cut receptions must end as the
+   whole one does and take what it takes; for a refused body, a prefix of
+   what the walk proves before the fault, since the read that shows a
+   fault hands nothing over and an earlier read may already have. The
+   whole one is held to the decoder: a body it completes is the body the
+   decoder reads. The corpus is PROP-CHUNK-FEED-MATCHES-DECODER's, cut one
+   byte at a time on some cases, so a read holds many chunks or splits a
+   size line or a CRLF anywhere."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let* ((valid (encode-chunk-stream (gen-chunk-payloads)))
+             (framed (if (zerop (random 4)) (mutate-framing valid) valid))
+             (n (length framed))
+             (cuts (if (zerop (random 4))
+                       (loop for k from 1 below n collect k)
+                       (sort (remove-duplicates
+                              (loop repeat (random 6) collect (random (max 1 n))))
+                             #'<)))
+             (decoded (handler-case (web-skeleton::decode-chunked-body framed 0 n)
+                        (web-skeleton::chunked-framing-error () :refused)))
+             (walked (nth-value 1 (feed-in-pieces framed nil))))
+        (flet ((report (kind fmt &rest args)
+                 (unless bad
+                   (setf bad kind)
+                   (fuzz-report nil seed framed)
+                   (apply #'format t fmt args)))
+               (prefix-p (short long)
+                 (and (<= (length short) (length long))
+                      (equalp short (subseq long 0 (length short))))))
+          (multiple-value-bind (verdict got most) (received-chunked-body framed nil nil)
+            (when (and (eq framed valid) (not (eq verdict :complete)))
+              (report :valid "    a valid body was ~s~%" verdict))
+            (when (and (eq verdict :complete) (not (equalp got decoded)))
+              (report :whole "    received ~s; decoder ~s~%" got decoded))
+            (when (> most 1)
+              (report :runs "    in one piece: ~d feed calls in one read~%" most))
+            (dolist (halve '(nil t))
+              (multiple-value-bind (verdict2 got2 most2)
+                  (received-chunked-body framed cuts halve)
+                (unless (and (eq verdict2 verdict)
+                             (if (eq verdict :refused)
+                                 (prefix-p got2 walked)
+                                 (equalp got2 got)))
+                  (report :pieces "    cut at ~s~:[~;, halving~]: ~s ~s; ~
+                                   in one piece ~s ~s~%"
+                          cuts halve verdict2 got2 verdict got))
+                (when (> most2 1)
+                  (report :runs "    cut at ~s~:[~;, halving~]: ~d feed calls ~
+                                 in one read~%"
+                          cuts halve most2))))))))
+    bad))
+
+;;; ---------------------------------------------------------------------------
+;;; multipart/form-data
+;;; ---------------------------------------------------------------------------
+
+(defparameter *boundary-alphabet*
+  "abcXYZ019'()+_,-./:=? "
+  "Characters a generated boundary is drawn from: all of RFC 2046's
+   punctuation, a few letters and digits, and the space it allows inside.")
+
+(defun gen-boundary ()
+  "A boundary RFC 2046 allows. Short ones half the time, since a boundary
+   of a character or two is the one a part's content collides with by
+   chance, and the collisions are the parser's hard cases."
+  (let* ((n (if (zerop (random 2)) (1+ (random 3)) (+ 4 (random 67))))
+         (s (make-string n)))
+    (dotimes (i n)
+      (setf (char s i) (char *boundary-alphabet* (random (length *boundary-alphabet*)))))
+    (when (char= (char s (1- n)) #\Space)
+      (setf (char s (1- n)) #\z))
+    s))
+
+(defun ascii-octets (string)
+  (sb-ext:string-to-octets string :external-format :utf-8))
+
+(defun octets-contain-p (bytes needle &key (start 0))
+  (and (search needle bytes :start2 start) t))
+
+(defun gen-part-content (boundary)
+  "Content for a part that a valid body can carry: built from the pieces a
+   delimiter is made of — CRLF, dashes, prefixes of the boundary — and
+   random bytes, then refused and drawn again if it holds a line that
+   begins with the boundary, which RFC 2046 forbids content to."
+  (let* ((dash-boundary (ascii-octets (format nil "--~a" boundary)))
+         (delimiter (concatenate '(vector (unsigned-byte 8)) #(13 10) dash-boundary)))
+    (loop repeat 20
+          do (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                                      :adjustable t :fill-pointer 0)))
+               (dotimes (i (random 12))
+                 (declare (ignorable i))
+                 (let ((piece (ecase (random 6)
+                                (0 #(13 10))
+                                (1 #(45 45))
+                                (2 (subseq delimiter 0 (random (length delimiter))))
+                                (3 (subseq dash-boundary 0 (random (length dash-boundary))))
+                                (4 (vector (random 256)))
+                                (5 (gen-bytes (random 40))))))
+                   (loop for b across piece do (vector-push-extend b out))))
+               (let ((v (coerce out '(simple-array (unsigned-byte 8) (*)))))
+                 (unless (or (octets-contain-p v delimiter)
+                             (and (>= (length v) (length dash-boundary))
+                                  (equalp (subseq v 0 (length dash-boundary)) dash-boundary)))
+                   (return-from gen-part-content v)))))
+    (ascii-octets "plain")))
+
+(defparameter *form-names*
+  '("title" "file" "a b" "C:\\path\\x.txt" "café" "" "x;y" "photos[]" "tab	here")
+  "Names and filenames a generated part may carry: the backslash a Windows
+   path has, a space, a ;, a tab and an empty name, all of which a quoted
+   value holds as sent.")
+
+(defun gen-param-value (value)
+  "VALUE as a Content-Disposition parameter value: quoted, or bare when it
+   is a token and the coin says so."
+  (if (and (plusp (length value))
+           (every #'web-skeleton::%token-char-p value)
+           (zerop (random 2)))
+      value
+      (format nil "\"~a\"" value)))
+
+(defun gen-multipart-form ()
+  "A valid multipart/form-data body and what it says. Returns
+   (values BOUNDARY PARTS BODY): PARTS a list of (NAME FILENAME
+   CONTENT-TYPE CONTENT), in order.
+
+   Every way the format lets the same parts be written turns up: a
+   preamble, transport padding after a boundary, header names in any case,
+   whitespace around a parameter's =, a bare or a quoted value, an extra
+   header, a Content-Transfer-Encoding that leaves the content alone, an
+   empty part written without a line of its own, and an epilogue."
+  (let* ((boundary (gen-boundary))
+         (crlf (format nil "~c~c" #\Return #\Newline))
+         (parts (loop repeat (random 5)
+                      collect (list (nth (random (length *form-names*)) *form-names*)
+                                    (and (zerop (random 2))
+                                         (nth (random (length *form-names*)) *form-names*))
+                                    (and (zerop (random 3))
+                                         (nth (random 3) '("text/plain" "image/png"
+                                                           "application/octet-stream; x=\"y\"")))
+                                    (if (zerop (random 4))
+                                        (make-array 0 :element-type '(unsigned-byte 8))
+                                        (gen-part-content boundary)))))
+         (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (flet ((emit (thing)
+             (loop for b across (if (stringp thing) (ascii-octets thing) thing)
+                   do (vector-push-extend b out)))
+           (padding () (subseq "  	 " 0 (if (zerop (random 3)) (random 4) 0))))
+      (when (zerop (random 4))
+        ;; A preamble, held to what content is held to, and the CRLF
+        ;; before the first boundary.
+        (emit (gen-part-content boundary))
+        (emit crlf))
+      (emit (format nil "--~a" boundary))
+      (dolist (part parts)
+        (destructuring-bind (name filename content-type content) part
+          (emit (format nil "~a~a" (padding) crlf))
+          (emit (format nil "~a: form-data;~a~a~a=~a~a~a"
+                        (nth (random 3) '("Content-Disposition" "content-disposition"
+                                          "CONTENT-DISPOSITION"))
+                        (if (zerop (random 3)) "" " ")
+                        "name"
+                        (if (zerop (random 5)) " " "")
+                        (gen-param-value name)
+                        (if filename (format nil "; filename=~a" (gen-param-value filename)) "")
+                        crlf))
+          (when content-type
+            (emit (format nil "Content-Type: ~a~a" content-type crlf)))
+          (when (zerop (random 6))
+            (emit (format nil "Content-Transfer-Encoding: ~a~a"
+                          (nth (random 3) '("binary" "8bit" "7BIT")) crlf)))
+          (when (zerop (random 6))
+            (emit (format nil "X-Extra: ignored~a" crlf)))
+          (if (and (zerop (length content)) (zerop (random 2)))
+              ;; No line of content: the blank line is the delimiter's CRLF.
+              (emit crlf)
+              (progn (emit crlf) (emit content) (emit crlf)))
+          (emit (format nil "--~a" boundary))))
+      (emit "--")
+      (emit (padding))
+      (case (random 3)
+        (0)
+        (1 (emit crlf))
+        (2 (emit crlf) (emit (gen-bytes (random 30))))))
+    (values boundary
+            (mapcar (lambda (p) (list (first p) (second p) (third p)
+                                      (coerce (fourth p) 'list)))
+                    parts)
+            (coerce out '(simple-array (unsigned-byte 8) (*))))))
+
+(defun multipart-in-pieces (body boundary cuts)
+  "Parse BODY through MULTIPART-STEP in the pieces CUTS marks, as a body
+   received a read at a time is parsed: each piece appended to what the
+   last step left, and what a step read dropped. Returns (:PARTS list) of
+   (NAME FILENAME CONTENT-TYPE CONTENT), or (:REFUSED status)."
+  (handler-case
+      (let ((parser (web-skeleton::make-multipart-parser
+                     (ascii-octets boundary) :max-parts 1000))
+            (buf (make-array 0 :element-type '(unsigned-byte 8)))
+            (at 0)
+            (parts '())
+            (content nil))
+        (dolist (cut (append cuts (list (length body))))
+          (setf buf (concatenate '(simple-array (unsigned-byte 8) (*))
+                                 buf (subseq body at cut))
+                at cut)
+          (let ((pos 0))
+            (loop
+              (multiple-value-bind (event next source from to)
+                  (web-skeleton::multipart-step parser buf pos (length buf))
+                (setf pos next)
+                (ecase event
+                  (:more (return))
+                  (:part (setf content '()))
+                  (:data (loop for i from from below to do (push (aref source i) content)))
+                  (:part-end
+                   (let ((part (web-skeleton::multipart-parser-part parser)))
+                     (push (list (form-part-name part) (form-part-filename part)
+                                 (form-part-content-type part) (reverse content))
+                           parts))))))
+            (setf buf (subseq buf pos))))
+        (if (web-skeleton::multipart-parser-done-p parser)
+            (list :parts (nreverse parts))
+            (list :refused 400)))
+    (http-parse-error (e) (list :refused (http-parse-error-status e)))
+    (error (e) (list :escaped (type-of e)))))
+
+(defun multipart-whole (body boundary)
+  "PARSE-MULTIPART's reading of BODY, in MULTIPART-IN-PIECES' terms."
+  (handler-case
+      (list :parts
+            (mapcar (lambda (p) (list (form-part-name p) (form-part-filename p)
+                                      (form-part-content-type p)
+                                      (coerce (form-part-body p) 'list)))
+                    (parse-multipart
+                     (web-skeleton::make-http-request
+                      :method :post :path "/"
+                      :headers (list (cons "content-type"
+                                           (format nil "multipart/form-data; boundary=\"~a\""
+                                                   boundary)))
+                      :body body))))
+    (http-parse-error (e) (list :refused (http-parse-error-status e)))))
+
+(defparameter *multipart-mutation-bytes*
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+       (format nil "~c~c-:;=\" a~c" #\Return #\Newline (code-char 0)))
+  "What a mutation writes into a multipart body: the bytes its framing is
+   made of, and a NUL.")
+
+(defun prop-multipart-reads-alike-in-any-pieces (seed)
+  "MULTIPART-STEP reads a multipart/form-data body the same however it
+   arrives, and reads a valid one as what was sent.
+
+     what was sent    a generated body parses to exactly its parts —
+                      names, filenames, types and content, in order
+     any pieces       the body cut anywhere, or a byte at a time, parses
+                      as the whole body does
+     a broken body    with a byte or two changed, inserted or removed, the
+                      body is refused or read alike whole and in pieces,
+                      and nothing but HTTP-PARSE-ERROR escapes
+
+   A received form is parsed a read at a time, so where the reads fall
+   is the client's choice. A body that reads one way in one piece and
+   another way in two is a body whose fields depend on the network."
+  (let ((bad nil))
+    (flet ((report (kind body fmt &rest args)
+             (unless bad
+               (setf bad kind)
+               (fuzz-report nil seed body)
+               (apply #'format t fmt args))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (multiple-value-bind (boundary expected body) (gen-multipart-form)
+          (let* ((broken (if (zerop (random 3))
+                             (let ((m (mutate-bytes body *multipart-mutation-bytes*)))
+                               (if (zerop (random 3)) (mutate-bytes m *multipart-mutation-bytes*) m))
+                             body))
+                 (n (length broken))
+                 (whole (handler-case (multipart-whole broken boundary)
+                          (error (e) (list :escaped (type-of e))))))
+            (when (eq broken body)
+              (unless (equal whole (list :parts expected))
+                (report :sent body "    boundary ~s: read ~s, sent ~s~%"
+                        boundary whole expected)))
+            (when (eq (first whole) :escaped)
+              (report :escaped broken "    boundary ~s: ~s escaped~%" boundary whole))
+            (let ((cutting (case (random 8)
+                             (0 (loop for k from 1 below n collect k))
+                             (1 (and (< n 600) :every))
+                             (t (sort (remove-duplicates
+                                       (loop repeat (random 6) collect (random (max 1 n))))
+                                      #'<)))))
+              (if (eq cutting :every)
+                  (loop for k from 0 to n
+                        for got = (multipart-in-pieces broken boundary (list k))
+                        unless (equal got whole)
+                          do (report :split broken "    boundary ~s, split at ~d: ~s; whole ~s~%"
+                                     boundary k got whole)
+                             (return))
+                  (let ((got (multipart-in-pieces broken boundary cutting)))
+                    (unless (equal got whole)
+                      (report :pieces broken "    boundary ~s, cut at ~s: ~s; whole ~s~%"
+                              boundary cutting got whole)))))))))
+    bad))
+
 (defun drive-request-incrementally (bytes step)
   "Feed BYTES to a fresh connection STEP bytes per wake-up.
    Returns (values CALLS VERDICT CONN) — how many CONNECTION-ON-READ calls
@@ -706,12 +1373,10 @@
 ;;; buffered and streaming paths are both drivable from a byte vector, so
 ;;; the same fixture goes through both and the results must match.
 ;;;
-;;; The HTTPS path needs no arm of its own any more. It used to have a
-;;; second reader of these bytes in tls.lisp, first untestable and then
-;;; testable through an injected byte source; that reader is deleted and
-;;; the TLS transport now calls STREAM-RESPONSE-LINES with a byte source
-;;; of its own. There is nothing left to disagree with, which is a
-;;; stronger result than an arm that agreed.
+;;; The HTTPS path needs no arm of its own: the TLS transport calls
+;;; STREAM-RESPONSE-LINES with a byte source of its own, so there is no
+;;; second reader of these bytes to disagree with — a stronger result
+;;; than an arm that agreed.
 ;;; ---------------------------------------------------------------------------
 
 (defun parity-fixture (interims body)
@@ -728,20 +1393,16 @@
   "Drive STREAM-RESPONSE-LINES over RAW through a READ-FN byte source.
    Returns (STATUS LINES).
 
-   This drove TLS-STREAM-RESPONSE until that function was deleted, and it
-   is the arm that made the deletion checkable — the READ-FN seam was
-   reachable only from here. What it compares changed and what it
-   covers did not: the TLS transport now uses this very reader, so the
-   third implementation is gone rather than merely agreed with, and the
-   distinction still worth exercising is the byte source. READ-SEQUENCE
-   fills a whole buffer; a READ-FN hands over buffer-sized bites, so a
-   record boundary can fall anywhere and the cross-read state (PREV-CR,
-   the chunk phase flags) is exercised rather than bypassed.
+   The TLS transport uses this very reader, so what is worth exercising
+   here is the byte source. READ-SEQUENCE fills a whole buffer; a READ-FN
+   hands over buffer-sized bites, so a record boundary can fall anywhere
+   and the cross-read state (PREV-CR, the chunk phase flags) is exercised
+   rather than bypassed.
 
-   It also no longer resolves a symbol at run time or answers :SKIPPED,
-   which matters more than the line count: when TLS-STREAM-RESPONSE was
-   deleted, the FIND-SYMBOL miss turned these five assertions into SKIPs
-   and the suite stayed green while losing them."
+   It calls the reader directly rather than resolving a symbol at run
+   time, so it never answers :SKIPPED: a FIND-SYMBOL miss would turn
+   these assertions into SKIPs, and the suite would stay green while
+   losing them."
   (let ((pos 0)
         (lines nil))
     ;; A divergence in the reader shows up as a raise as often as a
@@ -797,12 +1458,9 @@
                      (length interims))
              (nreverse streamed-lines)
              (list "{\"a\":1}" "{\"b\":2}"))
-      ;; The same reader over the other byte source. This arm used to be
-      ;; tls.lisp's independent implementation of this read, which the
-      ;; header of this suite once recorded as an unclosable gap; the
-      ;; gap is closed by there no longer being a second implementation.
-      ;; What it still buys is fill granularity — buffer-sized bites put
-      ;; a record boundary anywhere, where a stream hands over the lot.
+      ;; The same reader over the other byte source. What it buys is
+      ;; fill granularity — buffer-sized bites put a record boundary
+      ;; anywhere, where a stream hands over the lot.
       (check (format nil "parity: ~d interim block(s), read-fn source agrees"
                      (length interims))
              (read-fn-stream-lines raw)
@@ -855,6 +1513,16 @@
                             #'prop-chunked-encoder-roundtrip)
                       (cons "chunked corpus through the request path"
                             #'prop-chunked-inbound-parity)
+                      (cons "chunk-size lines read alike"
+                            #'prop-chunk-size-line-parity)
+                      (cons "chunk walk accepts what the decoder accepts"
+                            #'prop-chunk-walk-matches-decoder)
+                      (cons "chunk feed, in any pieces, matches the decoder"
+                            #'prop-chunk-feed-matches-decoder)
+                      (cons "a received chunked body: one run a read, paused anywhere"
+                            #'prop-received-chunked-body-one-run-per-read)
+                      (cons "multipart reads alike in any pieces"
+                            #'prop-multipart-reads-alike-in-any-pieces)
                       (cons "byte ranges stay in bounds" #'prop-byte-range-in-bounds)
                       (cons "base64 round-trips" #'prop-base64-roundtrip)
                       (cons "base64 accepts only canonical" #'prop-base64-canonical-only)))

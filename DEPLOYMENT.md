@@ -87,6 +87,37 @@ Register both your project and web-skeleton with ASDF, then load and start:
                 :ws-handler #'handle-ws-message))
 ```
 
+### Routes in front of static files
+
+A handler that guards a path, such as a login check on `/admin`, and falls
+back to `serve-static` relies on the router and the static server reading a
+request's path the same way. They do:
+
+- `http-request-path` is the path as it arrived, escapes and all.
+- `match-path` compares a pattern's literal segments with that spelling
+  under the default `*match-path-literals*` of `:exact` (with its decoding
+  under `:decoded`), and decodes captures. Under `:exact` both sides are
+  read through `canonical-path`, which puts each escape's hex digits in
+  uppercase and decodes one thing: an escape of
+  `[ ] : @ ! $ & ' ( ) * + , ; =`. Those may be written either way,
+  because a page that builds its URLs with `encodeURIComponent` escapes
+  them, as Next.js does for its asset paths. The case of the hex is no
+  part of the URI (RFC 3986 §2.1), and a proxy may re-encode a path in
+  lowercase, as Apache httpd does, so `/caf%c3%a9` and `/caf%C3%A9` are
+  one path.
+- `serve-static` serves a file at the spellings of its path a browser
+  sends. A byte is escaped where a browser escapes it (space, `"`, `#`,
+  `%`, `<`, `>`, `?`, `` ` ``, `{`, `}`, controls and non-ASCII), with
+  hex in either case, the punctuation above is either escaped or not, and
+  every other byte is written as itself. `/%61dmin.html`, `/admin%2Ehtml`
+  and `/admin%2Freport.txt` name no file, in either case of hex.
+
+So every spelling that reaches a file is one the router reads the same way,
+and a guard's literal covers all of them. An application that checks the
+raw path itself should compare `(canonical-path path)`, the router's
+reading. A guard must also cover the file's aliases. `serve-static` answers
+`/x` for `x.html`, and both `/dir` and `/dir/` for `dir/index.html`.
+
 ### Configuration
 
 Tune parameters before calling `start-server`:
@@ -125,9 +156,9 @@ tighten it for known-small line protocols or raise it for unusual schemas.
 
 | file | what it settles |
 |---|---|
-| `Dockerfile` | Debian rather than Alpine, because resolution shells out to glibc's `getent ahosts`; compiles at build time so a compile error fails the build rather than the container; healthchecks on `/healthz`, which fails when any worker stops passing its loop — whichever worker takes the probe, since it reads every worker's last pass — where a TCP connect, or a probe that lands on one worker of four, would not |
-| `compose.yml` | publishes on `127.0.0.1` only, so the proxy is the only way in |
-| `nginx.conf.sample` | the `Upgrade`/`Connection` pair via a `map`, buffering off, a read timeout longer than the server's own ping interval, `limit_req`, which bounds HTTP requests but not the frames on an upgraded WebSocket — one request, however many frames follow — so the bulletin budgets posts per socket in the application; and `limit_conn` on the WebSocket location alone, because a budget per socket does not bound a client that opens many — the budget limits a socket, and bounding a client takes both proxy limits: `limit_conn` for the sockets one address holds at once, `limit_req` for how fast it opens new ones |
+| `Dockerfile` | Debian rather than Alpine, because resolution shells out to glibc's `getent ahosts`; runs as a user of its own rather than root; compiles at build time, as that user, so a compile error fails the build rather than the container and a start finds what the build compiled; healthchecks on `/healthz`, which fails when any worker stops passing its loop — whichever worker takes the probe, since it reads every worker's last pass — where a TCP connect, or a probe that lands on one worker of four, would not |
+| `compose.yml` | publishes on `127.0.0.1` only, so the proxy is the only way in; keeps no capability, and sets no-new-privileges |
+| `nginx.conf.sample` | listens on IPv6 as well as IPv4; HSTS beside the CSP header, and a note that a location with an `add_header` of its own loses both; the `Upgrade`/`Connection` pair via a `map`, buffering off, a read timeout longer than the server's own ping interval, `limit_req`, which bounds HTTP requests but not the frames on an upgraded WebSocket — one request, however many frames follow — so the bulletin budgets posts per socket in the application; and `limit_conn` on the WebSocket location alone, because a budget per socket does not bound a client that opens many — the budget limits a socket, and bounding a client takes both proxy limits: `limit_conn` for the sockets one address holds at once, `limit_req` for how fast it opens new ones |
 | `run.lisp` | the container entry point: binds `0.0.0.0` rather than loopback, because a socket bound to a container's own loopback is reachable from nothing outside it |
 
 They deploy the demo and name no other project. Adapt rather than adopt: the
@@ -156,6 +187,27 @@ Caddy, HAProxy and Traefik stream it to the upstream unless told otherwise
 Behind a proxy that streams, the client trickling a body
 is this server's to hold after all,
 which is the one job above that comes back here.
+What holds it is `*idle-timeout*`, and it holds it bluntly:
+it is the whole budget for one request to arrive, head and body together,
+and the bytes arriving do not extend it.
+That is what stops a client that drips a request from keeping its slot,
+and it also cuts off an honest upload that is merely slow —
+at 20 KiB/s, ten seconds is about 200 KiB —
+with a close and no response.
+Behind a streaming proxy, have the proxy buffer bodies,
+or accept the bodies you expect from a body handler
+(see "Request bodies, decided at the head"):
+an accepted body is timed by `*body-stall-timeout*` on its progress,
+so an upload that keeps arriving is not cut off for its size,
+and one that stops is still closed.
+
+A proxy that opens connections in bursts meets the accept queue.
+Each worker listens with `*listen-backlog*` (128) completed connections
+held for it, so the server holds that times its worker count,
+and a burst past that is dropped at the SYN, which the client retries
+after a second or more and nothing on this side logs.
+Linux clamps the backlog to `net.core.somaxconn`;
+raising `*listen-backlog*` past it needs that sysctl raised as well.
 
 ### Status codes the framework itself sends
 
@@ -164,16 +216,23 @@ specific status, not a blanket 400:
 
 | Code | Sent when |
 |------|-----------|
-| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, missing or duplicated `Host`. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and chunked framing either the completion walk or the decoder rejects — the walk decides a chunk-size line it can already tell is invalid, the decoder decides everything else |
-| `413 Payload Too Large` | Body over `*max-body-size*`, `Content-Length` over ten digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
-| `414 URI Too Long` | Request line over `*max-request-line-length*` |
+| `400 Bad Request` | Syntax it could not parse — malformed request line, bad header, invalid UTF-8, a `Host` missing at HTTP/1.1, repeated at any version, or not `host[:port]` as RFC 9110 §7.2 has it. Also every refusable `Transfer-Encoding` shape that is not simply unimplemented: TE with `Content-Length`, `chunked` in a non-final position or repeated, a repeated TE header, an obs-folded TE value, TE on HTTP/1.0, a non-empty trailer section, and malformed chunked framing — a size line outside the grammar, chunk data not followed by its CRLF — which the completion walk refuses as soon as the bytes that show it have arrived, the decoder and the walk accepting exactly the same framing |
+| `413 Payload Too Large` | Body over its cap — `*max-body-size*`, or the one a body handler chose for the request — `Content-Length` over fifteen digits, or the read buffer filled without a complete request. A chunked body reaches the first of those incrementally, as its decoded total grows, and also on a single chunk header declaring more than the cap; the message says which of the two limits fired, because for small chunks the buffer fills first |
+| `400`, `413`, `415` from a form | `parse-multipart` or `receive-multipart` reading a request the application asked it to: `415 Unsupported Media Type` for a `Content-Type` that is not `multipart/form-data` — from a body handler, before any of the body is read — `400` for a body that is not one as the parser reads it, `413` past one of its limits. See "Forms and file uploads" |
+| `414 URI Too Long` | Request line over `*max-request-line-length*` — refused as soon as that many bytes have arrived without it ending, not when it finally does |
 | `417 Expectation Failed` | An `Expect` the framework does not implement |
-| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them |
+| `431 Request Header Fields Too Large` | One header over `*max-header-line-length*`, headers over `*max-total-header-bytes*`, or more than `*max-header-count*` of them. A head still unterminated at the size the header budgets allow is refused then, rather than buffered toward the larger cap that leaves room for a body |
 | `501 Not Implemented` | A method not in the accepted set, or a transfer coding that is legal and unimplemented — `gzip`, or `gzip, chunked` (RFC 7230 §3.3.1). A bare final `chunked` is accepted |
-| `503 Service Unavailable` | The worker is at `*max-connections*` — carries `Retry-After: 2` |
-| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed |
+| `503 Service Unavailable` | The worker is at `*max-connections*`, or the process is nearly out of descriptors (see "Descriptors" under "Environment") — carries `Retry-After: 2` |
+| `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed. For a request answered with a streamed fetch, the wait starts once its body has gone; see "Sending a request body as it is produced" |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
-| `500 Internal Server Error` | Your handler raised |
+| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
+
+**A `Host` that passes is still the client's.** The 400 holds it to the
+grammar, and the grammar allows characters that matter in a page: a
+reg-name may carry the sub-delims, `'`, `&`, `(` and `)` among them. Escape
+it before writing it into HTML, and check it against the names you serve
+before building a redirect, a link or an origin from it.
 
 **The 503 says overloaded, where silence would say crashed.** A worker at
 `*max-connections*` answers before it closes, so a client can tell a full
@@ -202,8 +261,12 @@ consequences worth knowing before you build an alert on it:
   at the client will undercount.
 - **It is not in your access path**, so it will not appear in handler
   metrics or anything else counted after dispatch. If you want to see
-  refusals, watch the `connection limit reached` warning, which is
-  logged once per refusal.
+  refusals, watch the `connection limit reached` warning. It is logged on
+  a worker's first refusal and then at most once a minute with a count,
+  because a refusal comes when a worker is out of room, and a line per
+  refusal would have every worker queueing on the log lock in a flood.
+  For exact numbers read `:refused` in `connection-census`, which counts
+  every one.
 
 The refusal carries no `Date`. It is one frozen vector sent whole, and
 building a header per refusal would put that work on the path that exists
@@ -241,6 +304,47 @@ Check Origin in your handler before returning `:upgrade`:
            (make-error-response 404)))))
 ```
 
+Comparing the whole Origin is right for a site that knows its public
+origin. One that does not, served under whatever name its proxy is given,
+can compare the Origin's host and port with the `Host` the request arrived
+with instead: `%ws-origin-allowed-p` in `demo/handler.lisp` does, and says
+why it leaves the scheme out and what the proxy has to pass through.
+
+### Subprotocols, and the rest of the 101
+
+A client that opens `new WebSocket(url, ["graphql-transport-ws"])` offers
+subprotocols in `Sec-WebSocket-Protocol`, and fails the connection unless
+the 101 names one of them (RFC 6455 §4.1). GraphQL subscriptions, STOMP and
+MQTT over WebSocket all negotiate this way. Return `ws-upgrade` in place of
+`:upgrade` to answer with one:
+
+```lisp
+((string= (http-request-path request) "/graphql")
+ (let ((protocol (ws-choose-protocol request '("graphql-transport-ws"
+                                               "graphql-ws"))))
+   (if protocol
+       (ws-upgrade :protocol protocol
+                   :headers (list (cons "set-cookie" (session-cookie request))))
+       (make-error-response 400 "no subprotocol in common"))))
+```
+
+- **`ws-choose-protocol`** answers the first of the names you list, in your
+  order of preference, that the client offered, or `nil`.
+  `ws-offered-protocols` lists what it offered, in its order. Names are
+  compared exactly, as browsers compare the one the 101 returns.
+- **`ws-upgrade :protocol`** must be one the client offered. Any other is
+  a 500 that names it, since the client would fail the connection with
+  nothing said to the server.
+- **`ws-upgrade :headers`** adds fields to the 101: a cookie, a correlation
+  id. The fields the handshake owns are refused (`Upgrade`, `Connection`,
+  `Sec-WebSocket-Accept`, `Sec-WebSocket-Protocol`, `Content-Length`,
+  `Transfer-Encoding`), and so is `Sec-WebSocket-Extensions`, which would
+  agree to an extension, such as `permessage-deflate`, that the frame reader
+  does not implement.
+- **The handshake's checks still decide.** A request that is not a valid
+  upgrade is answered 400 whatever the handler returned, and the Origin
+  check above belongs before either.
+
 ### JWT issuer and audience
 
 `jwt-verify` checks the signature, and checks `exp` / `nbf` **when those claims
@@ -258,6 +362,21 @@ If your JWKS key set is shared across services, always verify these:
     ;; token is valid and intended for this service
     ...))
 ```
+
+### What a signature check costs
+
+`jwt-verify` checks the signature on the worker handling the request, after
+the cheap checks: `alg`, a known `kid`, and `exp`. Every one of those is in an
+attacker's hands. The `kid` is in your public JWKS, and the attacker writes the
+claims. So each forged token costs one full ECDSA verification, and sending
+forged tokens is a way to spend your workers' CPU.
+
+Without `web-skeleton-tls`, the verification is pure Lisp and takes on the
+order of a millisecond of one worker's time. With it loaded,
+`ecdsa-verify-p256` is OpenSSL's `EVP_PKEY_verify`, which takes a fraction of
+that. Rate limit JWT-guarded routes at the proxy either way. An application
+that verifies a token on every request should load `web-skeleton-tls` even if
+it never fetches over HTTPS.
 
 ### Keying on the token string
 
@@ -371,7 +490,7 @@ from where the previous read stopped, so each chunk is walked once across
 the transfer instead of the body being rescanned on every read.
 
 That is the **response** side — decoding a chunked body an upstream sent
-to us. The **request** side now reads the same framing with the same walk,
+to us. The **request** side reads the same framing with the same walk,
 and that sharing is deliberate: one decoder, two directions, so the
 acceptance sets cannot drift apart. A disagreement about where a body ends
 is only visible when both sides read the same input.
@@ -401,7 +520,8 @@ pair. Only a bare final `chunked` is accepted. `gzip, chunked` is 501,
 legal and unimplemented; `chunked, gzip`, a repeated Transfer-Encoding
 header, an obs-folded value, and `Transfer-Encoding` on HTTP/1.0 are 400.
 
-**`*max-body-size*` for a chunked request.** The Content-Length path checks
+**The body cap for a chunked request.** The cap is `*max-body-size*`, or
+the one a body handler chose. The Content-Length path checks
 the declared length once, before allocating. A chunked request declares
 nothing, so the same limit is applied as the decoded total grows, and also
 to any single chunk header that declares more than the cap on its own —
@@ -414,7 +534,7 @@ different limits: `chunked body too large` is the body cap, `request too
 large (buffer full)` is the read buffer. Neither is redundant. The wire
 carries framing the decoded body does not — a 1-byte chunk costs six wire
 bytes — so a body made of very small chunks fills the buffer well before
-its decoded total reaches `*max-body-size*`, and a body made of large ones
+its decoded total reaches the cap, and a body made of large ones
 does the opposite. If you alert on 413s, the reason string is the part
 that tells you which knob to turn.
 
@@ -435,7 +555,10 @@ answers it and two callers read it. On a socket left in blocking mode with
 `SO_RCVTIMEO` installed, a read cannot return would-block unless the receive
 timeout expired, so `ssl-blocking-read-eof-or-raise` turns it into the loud
 timeout this document promises — that is what bounds the HTTPS read path for
-close-delimited responses and for `http-fetch-stream` over HTTPS. On a
+close-delimited responses and for `http-fetch-stream` over HTTPS. OpenSSL
+reports that expiry as `SSL_ERROR_WANT_READ` rather than as `EAGAIN` under
+`SSL_ERROR_SYSCALL`, so on this socket both read as the timeout, and the
+blocking write side reads `WANT_WRITE` the same way. On a
 non-blocking socket `SO_RCVTIMEO` does nothing at all, so `EAGAIN` means only
 what it says and the event loop waits for readability; there the bound comes
 from the parked inbound's timer rather than from the socket.
@@ -460,8 +583,9 @@ rather than going on the wire. Both are ways for a request's declared
 framing to disagree with the bytes that follow (RFC 7230 §3.3.3), and
 either one aimed at an upstream is a request-smuggling primitive:
 
-- `Transfer-Encoding` — the framework never chunk-encodes, so the claim
-  is false whatever the body is, and it does not suppress the computed
+- `Transfer-Encoding` — the framework chunk-encodes only a streamed body
+  with no declared length, and writes that header itself, so a caller's
+  claim is false for any other body. It does not suppress the computed
   `Content-Length`, so the request would have carried both framing
   headers at once.
 - `Content-Length` — a caller-supplied one *does* suppress the computed
@@ -471,7 +595,10 @@ either one aimed at an upstream is a request-smuggling primitive:
   rest of a header alist.
 
 For a deliberate `Content-Length: 0` on a bodiless POST, pass `:body ""`
-— an empty body is still a body, and the header is computed from it.
+— an empty body is still a body, and the header is computed from it. A
+streamed body's length is declared with `:content-length` instead, and the
+bytes are held to it: `fetch-send` signals past it, and `fetch-finish`
+short of it.
 
 ### Fetch callback contract
 
@@ -481,6 +608,10 @@ fires **exactly once per fetch** with one of two argument shapes:
 - **`(status headers body)`** on the happy path — `status` is an integer HTTP status,
   `headers` is an alist of lowercase-name string pairs,
   `body` is a byte vector (or `NIL` for empty bodies).
+  A header value is decoded as UTF-8 when it is valid UTF-8, and as
+  Latin-1, one character per byte, when it is not, so a legacy server's
+  Latin-1 filename arrives as text rather than failing the fetch. A
+  request header that is not UTF-8 is still refused with `400`.
   The closure's return value becomes the response
   delivered to the original inbound client.
 - **`(NIL NIL NIL)`** as a cleanup sentinel on every abnormal teardown path:
@@ -561,13 +692,16 @@ rejecting loopback, link-local, RFC 1918 private, RFC 6598 CGNAT,
 RFC 4193 unique local, multicast, documentation prefixes, reserved ranges,
 6to4 relay anycast (`192.88.99.0/24`), and cloud metadata IPs. It unwraps
 IPv4-mapped IPv6, NAT64, and 6to4, so an attacker cannot launder
-`127.0.0.1` as `::ffff:127.0.0.1`.
+`127.0.0.1` as `::ffff:127.0.0.1`. On IPv6 it states what public is rather
+than what it is not: only global unicast, `2000::/3`, can be public at all,
+so a special-purpose block assigned later out of reserved space is refused
+before anyone has written a clause for it. Its docstring lists every range.
 
 The 6to4 relay prefix is refused *because* RFC 7526 deprecated it. The
-relays are gone, so the prefix is still globally routed but no longer
-goes anywhere in particular — whoever announces it today receives the
-traffic. "Deprecated" reads like a reason to stop worrying about a range;
-here it is the reason to refuse it.
+relays are gone, so the prefix is still globally routed but goes nowhere
+in particular — whoever announces it receives the traffic. "Deprecated"
+reads like a reason to stop worrying about a range; here it is the reason
+to refuse it.
 
 **Why the framework has to do this and an app cannot.**
 The framework resolves hostnames itself. An app that resolves a name,
@@ -607,13 +741,30 @@ Non-numeric hostnames in `http-fetch` / `defer-to-fetch` URLs
 are resolved asynchronously: the framework spawns `getent ahosts <host>`
 via `sb-ext:run-program`, registers the subprocess's stdout pipe
 with the worker's epoll, and parks the inbound connection in an `:out-dns` state
-until the address lands. The first TCP-compatible line (`<address> STREAM`) wins.
-IPv4 and IPv6 are both supported, with `AI_ADDRCONFIG` filtering
-so addresses for unreachable families never appear.
-Numeric literals (including bracketed IPv6 forms like `http://[::1]:8080/`)
-skip the subprocess entirely via the numeric fast path.
+until the address lands. Every TCP-compatible line (`<address> STREAM`)
+that `*fetch-address-filter*` accepts is kept, in the order `getent`
+printed them, which is the system's preference (RFC 6724). The first is
+dialed, and a connect that fails gives way to the next:
+- **Refused or unreachable** — the next address is dialed at once.
+- **Unanswered** — a connect that has not completed in
+  `*connect-fallback-delay*` seconds (2, RFC 8305's longest attempt delay)
+  gives way to the next while there is one. The last address has what is
+  left of `*fetch-timeout*`, which runs from the first attempt throughout.
+- **The request goes with it.** A streamed body's pieces sent while the
+  first attempt was connecting are sent on the next.
 
-`http-fetch-stream` and the HTTPS paths use the same `getent` subprocess
+So a name whose first address the upstream does not answer on still
+reaches it: `localhost` resolving to `::1` first while the service binds
+`127.0.0.1` alone, or a name whose IPv6 route goes nowhere.
+`AI_ADDRCONFIG` drops a family only when this host has none of its
+addresses, so such a name sorts IPv6 first on any host with IPv6. The
+unanswered case costs `*connect-fallback-delay*` before the next address
+answers, since attempts are made one at a time rather than raced.
+Numeric literals (including bracketed IPv6 forms like `http://[::1]:8080/`)
+skip the subprocess entirely via the numeric fast path, and have no other
+address to fall back on.
+
+`http-fetch-stream`, over either scheme, uses the same `getent` subprocess
 synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
 The only difference from the async path is that the subprocess
@@ -720,9 +871,12 @@ every connection on the box being simultaneously backed up to reach it.
 Lower it for many connections and a generous `ulimit`; raise it for few
 connections and bursty output.
 
-`ws-send` is the first surface to use it. The HTTP response path still
-sends one vector and waits for it, so a plain request/response connection
-never builds a queue.
+The bound holds what a producer sends, the case it exists for: `ws-send`,
+`stream-send` (a streaming response or SSE, and a relay into either), and
+`fetch-send` on a streamed request body. A complete response, a handler's
+or a static file's, is queued as one act outside it: held to the bound, a
+finished file larger than the bound would have its body refused after its
+head had gone out promising one.
 
 ### Reading a response incrementally
 
@@ -748,8 +902,24 @@ buffered, so a large response can be processed without being held:
 
 `status` is tested rather than ignored, and `EQL` rather than `=` because
 the cleanup sentinel passes `NIL`. Answering `200` with a count from a
-fetch that never completed is the failure this section was rewritten to
-stop describing.
+fetch that never completed is the failure that test exists to stop.
+
+**A relay holds one chunk at a time.** Each chunk is freed once `:on-body`
+has it, so a stream of any length passes through a buffer the size of the
+response head plus its largest chunk. `*max-outbound-response-size*` bounds
+that buffer, not the stream. A single chunk larger than the cap still fails
+the fetch with a `502`.
+
+**Copying an upstream's headers onto your response takes a filter.**
+`:then` receives the body decoded and whole, while `headers` still
+describes it the way the upstream sent it: `Transfer-Encoding: chunked`,
+or a `Content-Length` for bytes that are no longer there. `format-response`
+refuses a caller's `Transfer-Encoding`, and a `Content-Length` the body
+contradicts, so a relay that copies everything is answered `500`. Leave out
+the framing headers (`transfer-encoding`, `content-length`) and the
+hop-by-hop ones (`connection`, `keep-alive`, `te`, `trailer`, `upgrade`,
+`proxy-connection`, and any header the upstream's `Connection` names), and
+copy the rest.
 
 **To forward the bytes onward, use `fetch-into`.** A handler-returned
 continuation feeds the handler that returned it and nothing else. A
@@ -782,9 +952,16 @@ continuation feeds the handler that returned it and nothing else. A
 
 It returns `T`, or signals — a wrong state, a second argument that is not
 a continuation, no event loop, or a fetch already outstanding on that
-connection. A signalling call has done nothing and the callback does not
-fire, so `:then` can never run before `fetch-into` returns. `:then`'s
-return value is discarded here; there is no parked request to answer.
+connection. It signals as well for a fetch that cannot be started: a URL
+that does not parse, `https://` without web-skeleton-tls, an IP literal
+`*fetch-address-filter*` refuses, or an address the kernel will not dial
+when the dial is made inside the call, for an IP literal or a name the DNS
+cache answers. A name that has to be looked up is dialed after
+`fetch-into` has returned, and a refusal of its address reaches `:then`
+instead, as the abort sentinel. A signalling call has done nothing and
+the callback does not fire, so `:then` can never run before `fetch-into`
+returns. `:then`'s return value is discarded here; there is no parked
+request to answer.
 
 **When the fetch ends, the framework decides what becomes of your
 connection.** What it decides depends on the connection's kind and on how
@@ -796,13 +973,32 @@ the fetch ended, and the two kinds are not treated alike:
 | `:streaming` | delivered | `stream-close`, terminator written |
 | `:streaming` | failed | closed without a terminator, so the peer's decoder sees truncation rather than being told a failed body was complete |
 | `:websocket` | delivered | nothing; you own your framing |
-| `:websocket` | failed | a `1011` close frame, then the connection goes — the one row you can override, with `:failure-disposition :keep` |
-| either | stopped | nothing; you asked for the ending, so what follows is yours |
+| `:websocket` | failed | a `1011` close frame, then the connection goes — a row you can override, with `:failure-disposition :keep` |
+| receiving a body | delivered | nothing; your `:then` resumes or refuses the body |
+| receiving a body | failed | closed, the body's `:on-abort` hearing `:upstream-failed` — overridable with `:keep` too, leaving `:then` to refuse it (see "Receiving a body as it arrives") |
+| any | stopped | nothing; you asked for the ending, so what follows is yours |
 
 It decides rather than leaving it to you because a handler written for the
 happy path will not have a failure path, and a `:then` that only closes on
 success leaves a failed stream open until `*stream-idle-timeout*` — or a
 failed WebSocket until `*ws-idle-timeout*`, which defaults to a day.
+
+Under `forward-body`, which passes `:keep`, every row leaves the body to
+`forward-body` itself: it refuses a body still arriving with `:then`'s
+answer whichever way the fetch ended, a stop included (see "Sending a
+request body as it is produced").
+
+**A fetch lasts no longer than what it was started for.** A body's fetch
+ends with the body, once `:on-end` has answered, unless `:on-end` answers
+with that fetch. A stream's fetch ends once the stream has closed and its
+response has gone, and any fetch ends with its connection. One still
+running then is closed, its `:then` hearing the abort sentinel, and
+nothing in the table is applied: what it was for has gone, and the
+connection may be on to its next request, or to the stream a body was
+answered with. A `:then` that answers that sentinel with another
+`fetch-into` on the connection is refused. A fetch whose result matters is
+one to wait for: a body pauses on it, or `:on-end` answers with it, and a
+relay closes its stream from `:then`.
 
 "Failed" above is the framework's `:aborted` outcome, which is the word the
 source uses and the one you will see in a log line. It is spelled out here
@@ -830,7 +1026,7 @@ connection alone when the fetch fails:
 ;; the default, unchanged
 (fetch-into conn continuation :failure-disposition :close)
 
-;; :websocket targets only
+;; :websocket targets and bodies being received; never :streaming
 (fetch-into conn continuation :failure-disposition :keep)
 ```
 
@@ -884,6 +1080,14 @@ to take the bytes from `:on-body` when they arrive there and from
 path, so there is no second implementation to differ from. It is the
 framing that decides, not the transport.
 
+**As strict as the buffered path.** A relayed body is never decoded after
+the fact — its chunks were handed on as they arrived — so the walk that
+hands them over is the only reader the body meets, and it refuses every
+framing `decode-chunked-body` refuses, before the chunk concerned reaches
+`:on-body`. A malformed upstream body fails the relay where a buffered
+fetch of it would answer 502: `:then` gets the abort sentinel and the
+target its failure disposition.
+
 **Chunk-granular, not line-granular, and deliberately.** Line splitting
 already exists once, on the blocking path, with CR/LF/CRLF handling and
 partial-line state carried across reads. A second implementation here
@@ -894,9 +1098,12 @@ you are given if you want lines.
 **Backpressure is a return value, and resuming it is yours to do.**
 Return `:pause` from `:on-body` to stop reading the upstream — its send
 window fills and the pressure propagates back without anything being
-dropped or buffered. Call `fetch-resume` on the connection `:on-body` was
-handed to start reading again; it is idempotent, so a producer that calls
-it on every pass rather than tracking state is not punished for it.
+dropped or buffered. The pause takes effect at that chunk: no later chunk
+is handed over, however many the last read brought, until the fetch
+resumes, and then those are handed over first. Call `fetch-resume` on the
+connection `:on-body` was handed to start again; it is idempotent, and a
+no-op once the fetch has ended, so a producer that calls it on every pass
+rather than tracking state is not punished for it.
 
 **A relay's pause ends by itself, and the condition is narrower than it
 sounds.** Reading resumes when the connection being relayed into drains
@@ -906,29 +1113,40 @@ inline, and a flush that completes never reaches the event loop's write
 path, so a pause taken while the target's queue was empty has no drain
 coming, and only an explicit `fetch-resume` restarts it.
 
-The shape that avoids the question is to ask before pausing. `stream-full-p`
-is exported for exactly this — it runs the same test `connection-append-write`
-runs internally — so a producer can give the verdict only when there is a drain
-that will end it:
+So pause on what the send said. `stream-send` answers `T` when the chunk
+went straight to the kernel and `NIL` when part of it is still queued, and
+`NIL` is exactly the case with a drain coming:
 
 ```lisp
 :on-body (lambda (out chunk)
            (declare (ignore out))
-           (stream-send client chunk)
-           ;; :pause only when the target has actually backed up. Pausing
-           ;; on an empty queue has no drain coming and strands the fetch
-           ;; until *fetch-timeout*, on an upstream that was healthy.
-           (when (stream-full-p client) :pause))
+           ;; NIL: part of this chunk is queued, the client is behind, and
+           ;; its queue draining is what resumes the fetch.
+           (unless (stream-send client chunk) :pause))
 ```
 
-The same shape works for a `:websocket` target through
-`connection-write-pending`, which is exported for the same reason. What you
-must not do is return `:pause` unconditionally and rely on something to lift
-it: nothing will, unless the queue was non-empty when you said it.
+Because the pause stops at that chunk, the client's queue never holds more
+than one chunk's remainder, and `stream-send` never meets
+`*max-write-backlog*` — unless a single chunk is larger than the backlog
+by itself, which it refuses. Size `*max-write-backlog*` above the largest
+chunk the upstream sends. `stream-full-p` is not this test: it reports a
+queue already at the bound, and a send can be refused before the queue gets
+there.
+
+The same shape works for a `:websocket` target, since `ws-send` answers the
+same way: `(unless (ws-send client (build-ws-frame +ws-op-binary+ chunk))
+:pause)`. What you must not do is return `:pause` unconditionally and rely
+on something to lift it: nothing will, unless the queue was non-empty when
+you said it.
 
 The deadline runs on unpaused time: `fetch-resume` pushes it out by the
 interval spent paused, so a relay is not killed for applying the
-backpressure it was told to apply.
+backpressure it was told to apply. While the client is still draining, the
+pause is bounded by the client's `*write-stall-timeout*` rather than by the
+deadline: a slow link draining a full queue can take longer than
+`*fetch-timeout*`, and that time is the client's. A queue that stops
+moving closes the client, which ends the fetch with it. A pause over an
+empty queue has nothing coming to end it, and the deadline still applies.
 
 **Outside a relay, resuming is yours to do, and forgetting is fatal to
 that request.** `:pause` is what stops `:on-body` firing, so the callback
@@ -962,21 +1180,11 @@ application's own to do, and it is in a position to: a stop can only
 originate inside a callback of the fetch being stopped, so the code that
 returns `:stop` can set its own flag on the way.
 
-**It ends the fetch, not the pass.** Like `:pause`, the chunks already
-read are still handed to `:on-body` first, and a pass can carry many.
-Unlike `:pause`, it is remembered once given — a later chunk returning
-NIL does not retract it — and it is not advisory about the next read, so
-a response that completed in the same pass does not override it. What
-`:then` is told never depends on where the upstream's bytes happened to
-be split.
-
-One consequence of that is worth seeing before you meet it. If you stop on
-chunk three of five and the upstream's terminator happens to land in the
-same read, your `:then` receives the abort sentinel while `:on-body` has
-already handed you every byte of the response. That is correct — you asked
-to stop, and the answer to "did this fetch deliver" is no — but it does
-mean a NIL status is not proof you are missing anything. If you care, count
-what you consumed; the sentinel is about the fetch, not about your data.
+**It takes effect at that chunk.** As with `:pause`, no later chunk is
+handed over, however many the last read brought, and a response whose
+terminator had already arrived does not override it. What `:then` is told
+never depends on where the upstream's bytes happened to be split: a pass in
+which `:on-body` returned `:stop` ends the fetch as stopped.
 
 **Closing the target is the other way to end one, and it costs the
 connection.** `close-connection` walks for detached outbounds and reaps
@@ -1000,7 +1208,7 @@ would be worse — a request that hangs to `*fetch-timeout*` and then dies —
 and reporting success would be the truncation the verdict exists to
 prevent. But `502` says the gateway failed, and what happened is that your
 application cancelled. **"Stop the upstream and let me answer the client
-myself" is not expressible today.** If that is what you want, do not stop
+myself" is not expressible.** If that is what you want, do not stop
 the fetch: let it finish and answer from `:then`, which is the one place a
 handler-returned fetch's response comes from.
 
@@ -1011,22 +1219,17 @@ caller carries on; it is a blocking call, so there is a stack to leave. A
 detached fetch has no call to exit from, and `:stop` is what it has
 instead.
 
-**One shape where `:pause` does nothing at all.** A response that arrives
-complete in a single read is delivered before the pause is consulted, so
-the flag is set and never read. Whether that happens is not something an
-app controls — it depends on how the upstream's bytes land — so treat
-`:pause` as advisory about the *next* read rather than as a guarantee that
-one is outstanding.
-
 A value rather than a condition, for the same reason
 `connection-append-write` refuses by return: applying backpressure is
 ordinary control flow and should not unwind through the middle of a read
 loop.
 
-`fetch-resume`'s re-arm works for a reason worth knowing. Elsewhere the
-docs warn that an `EPOLL_CTL_MOD` will not re-fire for data already
-sitting in user space; the bytes a paused fetch has not read are still in
-the kernel, so the edge does fire.
+`fetch-resume` does not wait for more bytes to arrive. A pause can leave
+chunks already read in user space, where no readability edge will report
+them — the warning elsewhere in these docs about `EPOLL_CTL_MOD` not
+re-firing for buffered data is about exactly this. So the resume wakes the
+fetch through writability, which its socket has at once, hands those
+chunks over first, and then reads.
 
 `*fetch-timeout*` stays a **total** on this path, not an inactivity
 bound. It is the only end-to-end network deadline the framework has, and
@@ -1083,10 +1286,15 @@ next response's status line landing where a downstream reader expects a
 chunk-size is a request-smuggling primitive, and it would be one we built
 ourselves.
 
-`:on-close` fires exactly once however the stream ends, with a reason —
-`:done`, `:disconnected`, `:idle`, `:stalled`, `:shutdown`, or `:closed`.
-Register teardown there rather than after `stream-close`, because most of
-those reasons never reach the app's own code path.
+`:on-close` fires exactly once however the stream ends, with a reason:
+`:done` when the app closed it, `:disconnected` when the peer went away,
+`:idle` or `:stalled` when a deadline took it, `:upstream-failed` when a
+`fetch-into` relaying into it failed or its close could not be written,
+`:error` when `:on-open` raised after the head went out or the worker
+carrying the stream crashed, `:shutdown` on server drain, and `:closed`
+for a close that names no reason of its own. Register teardown there
+rather than after `stream-close`, because most of those reasons never
+reach the app's own code path.
 
 Three deadlines apply, and they answer different questions:
 
@@ -1265,11 +1473,11 @@ loop that wants to know which subscribers are falling behind can see it
 without tracking anything itself.
 
 `handle-client-read` arms the connection it was woken for — the one whose
-handler is running. A frame pushed to *another* connection had nothing
-downstream to arm it, so a lagging subscriber did not cost its own
-connection: it got a truncated message, with every `ws-send` reporting
-success, and then a `*write-stall-timeout*` close. `ws-send` now arms the
-connection it wrote to whenever it leaves a remainder.
+handler is running. A frame pushed to *another* connection has nothing
+downstream to arm it, so `ws-send` arms the connection it wrote to
+whenever it leaves a remainder. Without that, a lagging subscriber would
+get a truncated message, with every `ws-send` reporting success, and then
+a `*write-stall-timeout*` close.
 
 A `ws-send` to a connection belonging to a *different worker*
 raises, and the raise is caught by the handler-case around the handler that
@@ -1337,8 +1545,8 @@ resident for the life of the process, so without a cap a directory
 holding one large video buys a resident set to match — discovered on the
 box at deploy time rather than at the call. Range support makes that
 likelier rather than less: serving large media is what Range is *for*, so
-the invitation to keep large media next to the CSS now comes with a
-number attached.
+the invitation to keep large media next to the CSS comes with a number
+attached.
 
 There is no serve-from-disk path — every served file lives in this cache.
 If the cap fires, either raise it deliberately:
@@ -1470,6 +1678,14 @@ each wrapped in `handler-case` — a raising hook cannot block the rest
 or prevent `start-server` from returning to its caller.
 SIGTERM from Docker exercises the same path as Ctrl-C at the REPL.
 
+A hook fires once. The run that fires the hooks consumes them, so a second
+`start-server` in the same image (a restart at the REPL, an app that
+restarts its server in-process) runs only the hooks registered since the
+last one ended. Something started once at load time and stopped by a hook
+is therefore stopped for good after the first run: start it again, and
+register its hook again, before the next `start-server`, as the `start`
+function above does on every call.
+
 ### Concurrent store
 
 `make-store` returns a thread-safe hash-table-backed store for app-level state
@@ -1491,6 +1707,14 @@ The reaper thread is spawned during `make-store` and its stop function
 is registered in the shutdown hook machinery — no app-side teardown.
 Supplying `:expiry-fn` without `:reap-interval` (or vice versa) signals
 an error at `make-store` time rather than silently skipping the reaper.
+
+The reaper sleeps between sweeps and costs nothing while it waits. It
+stops when the `start-server` run it was made before or during ends, since
+that run consumes the hook. A store made once at load time, as above, and
+used across several runs in one image (a server restarted at the REPL)
+reaps during the first only; make it in the function that starts the
+server when that matters. `stop-store-reaper` stops one sooner, for a
+store the application retires, and lets the store be collected.
 
 Two locking hazards to know about:
 
@@ -1560,6 +1784,15 @@ since browsers match Set-Cookie to stored cookies on those two fields:
 (add-response-header resp "set-cookie" (delete-cookie "session"))
 ```
 
+`delete-cookie` sends `Secure` by default, as `build-cookie` does, and takes
+the same `:secure`. It does not take part in matching, but a browser refuses
+any Set-Cookie for a `__Secure-` or `__Host-` name that lacks it, deletions
+included — so without it, logging out of a `__Host-sid` session would leave
+the cookie where it was. Both functions refuse a prefixed name whose
+attributes break its prefix (`__Secure-` needs `Secure`; `__Host-` needs
+`Secure`, `Path=/` and no `Domain`), for the reason they refuse
+`SameSite=None` without `Secure`: the browser would refuse it silently.
+
 ### JSON objects are a distinct type
 
 `json-parse` returns a `json-object` struct for a JSON object, and a plain list
@@ -1623,6 +1856,466 @@ If a handler needs multiple parameters, parse once and reuse:
     ...))
 ```
 
+### Request bodies, decided at the head
+
+A handler is called with a whole request, and for most requests that is
+the right shape. It comes too late for two things: a cap that should
+differ by route, and a refusal that should happen before the body is read.
+`:body-handler` is asked at the head:
+
+```lisp
+(defun decide-body (request)
+  (let ((path (http-request-path request)))
+    (cond ((string= path "/api/import")
+           (buffer-body :max-size (* 16 1024 1024)))
+          ((string= path "/upload")
+           (if (signed-in-p request)
+               (buffer-body :max-size (* 64 1024 1024))
+               (make-error-response 401)))
+          (t nil))))
+
+(start-server :handler #'handle-request
+              :body-handler #'decide-body)
+```
+
+- **When it is asked.** Once the head of a request with a body — a
+  `Content-Length` above zero, or chunked — has arrived, on the worker, with
+  the request parsed and its body `nil`. A request without a body never
+  reaches it. The framing checks come first, `Transfer-Encoding` with
+  `Content-Length` and an unknown `Expect` among them, so it is never shown
+  a request the framework is about to refuse.
+- **`nil`** reads the body as it would be read without a body handler:
+  under `*max-body-size*`, timed by `*idle-timeout*`.
+- **`(buffer-body :max-size n)`** reads it whole under `n`, which may be
+  above or below `*max-body-size*`, and then `:handler` gets the whole
+  request as usual. Buffering means holding: up to `n` bytes per connection
+  doing this at once, so a large `n` is memory a request may really use.
+- **`(receive-body :on-data … :on-end … :on-abort … :max-size n)`** hands
+  the body to the application as it arrives instead of holding it, and its
+  `:on-end` answers the request; see "Receiving a body as it arrives".
+- **An `http-response`** is sent before the body is read, and the
+  connection closes after it, whatever the response's own `Connection`
+  header says: the body was never read, so there is no telling where a next
+  request would begin. A client that sent `Expect: 100-continue` gets the
+  answer instead of a `100 Continue` and never sends the body. One that
+  sends it anyway has it read and thrown away until it stops or
+  `*linger-timeout*` runs out, so the answer is followed by a FIN rather
+  than a reset.
+- **`100 Continue`** goes out only once the body is accepted.
+- **Accepted bodies are timed on progress.** A body a body handler accepted
+  with `buffer-body` or `receive-body` is closed when `*body-stall-timeout*`
+  passes without a byte of it, rather than by `*idle-timeout*`'s budget for
+  the whole request, so an upload takes as long as it keeps arriving. A body
+  the handler answered `nil` for stays on `*idle-timeout*`.
+- **Per request.** The next request on a keep-alive connection starts from
+  the defaults again — its own head, its own question.
+- **Failure.** A body handler that raises, or answers anything other than
+  these shapes, fails the request with a 500, as a handler would.
+
+### Receiving a body as it arrives
+
+A buffered body is held whole before anyone sees it, which makes its size
+a memory question. `receive-body` hands it over a read at a time instead,
+and answers the request from `:on-end`:
+
+```lisp
+(defun save-upload (path)
+  (let ((out nil))
+    (receive-body
+     :max-size (* 4 1024 1024 1024)            ; 4 GiB
+     :on-data (lambda (conn bytes)
+                (declare (ignore conn))
+                (unless out
+                  (setf out (open path :direction :output
+                                       :element-type '(unsigned-byte 8))))
+                (write-sequence bytes out)
+                nil)
+     :on-end (lambda (conn)
+               (declare (ignore conn))
+               (when out (close out))
+               (make-text-response 201 "stored"))
+     :on-abort (lambda (conn reason)
+                 (declare (ignore conn reason))
+                 (when out (close out :abort t))))))
+```
+
+- **`:on-data (conn bytes)`** gets the next run of the body, decoded, in a
+  fresh vector it may keep. The runs are the size reads happen to be, not
+  the client's chunks. Its value is ignored unless it is an
+  `http-response`, which refuses the rest of the body: the response is sent
+  and the connection closes after it.
+- **`:on-end (conn)`** runs once the body is complete and returns the
+  answer, in any shape `:handler` may answer with but `:upgrade` — a fetch
+  included, so a body can be stored and then announced to an upstream
+  before the client hears back.
+- **`:on-abort (conn reason)`** runs once if the body ends any other way,
+  and never once `:on-end` has returned: `:disconnected`, `:stalled`
+  (`*body-stall-timeout*`), `:too-large` (answered 413), `:malformed`
+  (chunked framing, answered 400), `:refused` (`:on-data` answered),
+  `:error` (`:on-data` or `:on-end` raised; answered 500), `:shutdown`, or
+  `:closed` for any other close. It is the one place to release what
+  `:on-data` has been building.
+- **`:max-size`** caps the decoded body, `*max-body-size*` by default, or
+  `nil` for no cap. A `Content-Length` over it is refused before any of the
+  body is read; a chunked body is refused the moment its total, or a chunk
+  header, would pass it, with none of that chunk handed over. A declared
+  length of up to fifteen digits is parsed, so a large upload's length
+  reaches the cap rather than being refused at the head.
+- **One window of buffer.** The read buffer holds the head and 64 KiB of
+  body, whatever the body's size and whatever its chunk sizes — a chunk is
+  handed over as it lands, not once it has all arrived. The first run can
+  be larger: whatever arrived with the head before the body handler was
+  asked.
+- **Provisional until `:on-end`.** A body cut short, or found malformed
+  partway, has had some of its bytes handed over by the time `:on-abort`
+  says so — a chunk's bytes reach `:on-data` before the CRLF that ends the
+  chunk has been seen. Clean up in `:on-abort`.
+- **The callbacks hold the worker.** Writing what `:on-data` is handed
+  somewhere synchronous, as above, is backpressure for free: nothing more is
+  read until it returns, the kernel's receive window fills, and the client
+  slows. It is also every other connection on that worker waiting, so
+  `:on-data` should do what a handler should and nothing slower.
+- **Fair to the rest of the worker.** A client that sends faster than the
+  worker hands its body over is read a mebibyte at a time, sixteen windows,
+  and then waits its turn behind the other events on the loop.
+- **The handler never sees a received body.** The request is the one the
+  body handler was given; close over it if `:on-data` or `:on-end` need it.
+- **An asynchronous sink pauses.** When what `:on-data` is handed goes
+  somewhere that answers later — an upstream, a part at a time — it starts
+  that work and returns `:pause`. Nothing more is handed over, the
+  connection is subscribed to no events, and the client's bytes wait in
+  the kernel until `(body-resume conn)`; a pause taken on the body's last
+  bytes holds `:on-end` back until then. `(body-refuse conn response)` ends
+  the body from outside `:on-data` instead. Both are calls on the worker
+  that owns the connection, and both are no-ops once the body has ended or
+  the client has gone, so a late callback need not check first.
+- **The fetch is `fetch-into` on the receiving connection.** The body
+  bounds it — a client that leaves takes the fetch down, and so does the
+  body's end — and its result goes to `:then`, which resumes or refuses:
+
+  ```lisp
+  :on-data (lambda (conn bytes)
+             (fetch-into conn
+                         (http-fetch :put (part-url) :body bytes
+                                     :then (lambda (status headers body)
+                                             (declare (ignore headers body))
+                                             (if (eql status 200)
+                                                 (body-resume conn)
+                                                 (body-refuse conn (make-error-response 502)))))
+                         :failure-disposition :keep)
+             :pause)
+  ```
+
+  A body paused on a fetch it started is bounded by that fetch's
+  deadline, not by `*body-stall-timeout*`; a pause waiting on anything
+  else is ended as a stall once that long has passed. A real part is
+  usually larger than one read — collect `:on-data`'s runs to the size
+  the upstream wants, and pause when one is full. `:on-end` may answer
+  with a fetch too, for the last part or the call that completes the
+  upload.
+
+### Forms and file uploads
+
+A form with a file input is sent as `multipart/form-data`: a run of
+parts, each a few header fields and its content, divided by a boundary the
+browser chose and named in the `Content-Type`. There are two ways to read
+one, and they are one parser.
+
+**Read whole, from the handler.** The body is buffered under its request's
+cap, and `parse-multipart` returns the parts:
+
+```lisp
+(defun handle-request (request)
+  (let* ((parts (parse-multipart request))
+         (title (form-part-text (find-form-part parts "title")))
+         (photo (find-form-part parts "photo")))
+    (store-photo (form-part-body photo))
+    (make-text-response 201 title)))
+```
+
+- **A part** is a `form-part`. `form-part-name` is the field's name.
+  `form-part-filename` is `nil` for a text field, and `""` for a file
+  input with no file chosen. `form-part-content-type` is the part's type as
+  sent, or `nil`. `form-part-headers` holds every field of the part's head,
+  and `form-part-body` its content.
+- **`form-part-text`** decodes a part as UTF-8, which is what a browser
+  sends from a page served as UTF-8, and raises 400 for bytes that are not.
+  `find-form-part` finds the first part of a name, and `find-form-parts`
+  all of them, for a file input that takes several files.
+- **It raises `http-parse-error`.** The status is 415 for a `Content-Type`
+  that is not `multipart/form-data`, 400 for a body that is not one, and
+  413 past a limit. Let it go and the framework answers with that status.
+  Catch it to answer otherwise.
+- **The cost is the body twice.** The body is held under the request's cap
+  — `*max-body-size*`, or `buffer-body`'s from a body handler — and the
+  parts are copied out of it. `:max-parts` (1000) and `:max-part-head-size`
+  (16 KiB) bound the rest.
+
+**Read as it arrives, from a body handler.** `receive-multipart` parses the
+body a read at a time: the fields you collect are held and handed to
+`:on-end`, and the files you stream go to `:on-part-data` and are never
+held.
+
+```lisp
+(defun decide-body (request)
+  (when (string= (http-request-path request) "/upload")
+    (let ((out nil))
+      (receive-multipart
+       request
+       :max-size (* 4 1024 1024 1024)                       ; the whole body
+       :on-part (lambda (conn part)
+                  (declare (ignore conn))
+                  (cond ((null (form-part-filename part)) nil) ; a field: collect it
+                        ((string= (form-part-name part) "file")
+                         (setf out (open (fresh-upload-path) :direction :output
+                                                             :element-type '(unsigned-byte 8)))
+                         :stream)
+                        (t (make-error-response 400))))        ; nothing else is wanted
+       :on-part-data (lambda (conn part bytes)
+                       (declare (ignore conn part))
+                       (write-sequence bytes out)
+                       nil)
+       :on-part-end (lambda (conn part)
+                      (declare (ignore conn))
+                      (when (form-part-filename part)
+                        (close out)
+                        (setf out nil))
+                      nil)
+       :on-end (lambda (conn parts)
+                 (declare (ignore conn))
+                 (make-text-response
+                  201 (form-part-text (find-form-part parts "title"))))
+       :on-abort (lambda (conn reason)
+                   (declare (ignore conn reason))
+                   (when out (close out :abort t)))))))
+```
+
+- **`:on-part (conn part)`** is called when a part's head has arrived, with
+  no body yet. It answers `nil` to collect the part, `:stream` to have its
+  content handed to `:on-part-data`, or a response to refuse the body,
+  which is sent with the connection closed after it. Anything else is an
+  error, so a misspelt `:stream` does not quietly collect a file. Without
+  `:on-part`, every part is collected.
+- **`:on-part-data (conn part bytes)`** gets the next run of a streamed
+  part, in a fresh vector. It answers as `receive-body`'s `:on-data` does:
+  `:pause`, a response, or anything else to go on.
+- **`:on-part-end (conn part)`** is called for every part, a collected one
+  with its body set. A field sent before the file — a CSRF token, the id of
+  the record the file belongs to — can refuse the body here, before any of
+  the file is read. It answers as `:on-part-data` does.
+- **`:on-end (conn parts)`** gets the collected parts in the order they
+  were sent, and answers the request in any shape `:handler` may.
+- **`:on-abort (conn reason)`** is `receive-body`'s, heard once. `:malformed`
+  (400) covers a body that is not `multipart/form-data` as the parser reads
+  it, and `:too-large` (413) covers every limit.
+- **Its limits.** `:max-size` caps the whole body, as `receive-body`'s
+  does. `:max-parts` (1000) and `:max-part-head-size` (16 KiB) are
+  `parse-multipart`'s. `:max-collected-size` caps what is held for
+  `:on-end`, the heads and content of the collected parts, at
+  `*max-body-size*` by default. That last one keeps the memory a received
+  form costs known, whatever `:max-size` allows. A part's head is also held
+  to sixteen fields.
+- **Refused at the head.** `receive-multipart` reads the `Content-Type`
+  when the body handler calls it, and raises there for a request that is
+  not a form. The request is answered 415 before any of its body is read,
+  and a client that sent `Expect: 100-continue` is never told to send it.
+- **A pause holds where it falls.** `:pause` from `:on-part-data` or
+  `:on-part-end` stops the parse at that event, even partway through a
+  read: no more of the body is parsed and no callback runs until
+  `body-resume`. A pause on the last part's end holds `:on-end` back. This
+  is how a file goes on to object storage a piece at a time:
+
+  ```lisp
+  :on-part-data (lambda (conn part bytes)
+                  (declare (ignore part))
+                  (collect bytes)                     ; into the next piece
+                  (when (piece-full-p)
+                    (fetch-into conn
+                                (http-fetch :put (next-piece-url) :body (take-piece)
+                                            :then (lambda (status headers body)
+                                                    (declare (ignore headers body))
+                                                    (if (eql status 200)
+                                                        (body-resume conn)
+                                                        (body-refuse conn (make-error-response 502))))))
+                    :pause))
+  ```
+
+  `:on-part-end` sends the file's last piece the same way, and `:on-end`
+  can answer with the fetch that completes the upload. A `:then` that finds
+  another full piece already collected can send it at once with another
+  `fetch-into` before it resumes. The fetch's own marker is released before
+  `:then` runs. A file can also go upstream as one request, its runs sent as
+  they arrive: see "Sending a request body as it is produced".
+
+**What is accepted, and what is refused.** One parser serves both
+functions. Where the format leaves room for two readings, it refuses the
+body rather than choosing one, because a filter in front of the
+application that chose the other reading would see different fields.
+
+- A line that begins with the boundary is a delimiter, or the body is
+  refused. It is never content. RFC 2046 matches the boundary against the
+  start of a line, so `--BOUNDARYxyz` is a malformed delimiter, not data.
+- Every line the format defines ends in CRLF.
+- A part has exactly one `Content-Disposition`, of type `form-data`, with
+  one name and at most one filename. It has at most one `Content-Type`.
+  The extended `filename*` is refused: RFC 7578 §4.2 forbids it, and beside
+  a `filename` it would be two names for one file.
+- A `Content-Transfer-Encoding` other than `7bit`, `8bit` or `binary` is
+  refused. None of those three changes the bytes, and RFC 7578 §4.7 says
+  no deployed sender uses another.
+- What the format says to ignore is ignored: a preamble before the first
+  boundary, transport padding after one, an epilogue after the last. A
+  part's other header fields are kept in its headers and otherwise
+  ignored.
+- A form with no fields is the close delimiter alone, which is what
+  browsers send for one, and it reads as no parts.
+
+**Names and filenames are returned as the browser sent them.** A quoted
+value is the characters between its quotes, and a backslash is an ordinary
+character, as in a Windows path. Browsers write a quote as `%22`, CR as
+`%0D` and LF as `%0A`, but leave `%` itself alone, so those escapes cannot
+be undone reliably and are not undone.
+
+**A filename is a label, not a path.** Browsers send a file's base name.
+For a folder upload (`<input type=file webkitdirectory>`) they send the
+path below the chosen folder, `photos/2026/a.jpg`. Either way the text is
+the client's. Name the stored file yourself. Where the client's path
+matters, check every segment of it before any of it names something on
+disk: no empty segment, no `.` or `..`, no backslash, no NUL, nothing that
+reads as a drive.
+
+### Sending a request body as it is produced
+
+A fetch's body is given whole by default: a string or bytes, measured and
+framed with `Content-Length`. `:body :stream` makes it the application's to
+send as it has it, so an upload can go on to an upstream as it arrives and
+never be held whole:
+
+```lisp
+(defun decide-body (request)
+  (when (string= (http-request-path request) "/upload")
+    (forward-body
+     (http-fetch :put (object-url request)
+                 :body :stream
+                 :content-length (let ((n (get-header request "content-length")))
+                                   (and n (parse-integer n)))
+                 :then (lambda (status headers body)
+                         (declare (ignore headers body))
+                         (if (and status (<= 200 status 299))
+                             (make-text-response 201 "stored")
+                             (make-error-response 502))))
+     :max-size (* 5 1024 1024 1024))))             ; 5 GiB
+```
+
+- **`forward-body`** is a body plan, for a body handler to return. The
+  request's body goes upstream as the fetch's body, a run at a time as it
+  arrives, and the client is answered with what `:then` returns. The fetch
+  starts with the body's first bytes, and a body with none starts it at
+  its end, with an empty body. `:max-size` and `:on-abort` are
+  `receive-body`'s.
+- **The client is held to the upstream's pace.** When the upstream falls
+  behind, the body pauses, and it resumes once the upload has drained. What
+  is held between the two is one read of the body at most, plus what the
+  sockets hold, whatever the upload's size.
+- **An upstream that answers first has answered the client.** One that
+  refuses an upload at its head, a 413 or a 401, answers before the body
+  has all gone, and so does one that fails partway. `:then` hears that
+  answer, and as soon as it returns the rest of the body is refused with
+  what it returned if that is an `http-response`, or 502 if not, whether
+  or not the client is still sending. A connection that fails reaches
+  `:then` as the abort sentinel, and so does one that cannot be made at
+  all, to an address the kernel will not dial: `:then`'s answer to it is
+  the client's, or 502. A `:then` that raises is a 500. The body's
+  `:on-abort` hears `:refused` when it is refused in any of these ways.
+- **The answer is read as the body goes out.** `:on-body` gets an early
+  answer's chunks as they arrive, as it gets any fetch's. A `:pause` from
+  it holds the answer and not the request: the body goes on going out, and
+  the answer is read again from `fetch-resume`. A `:stop` ends the fetch,
+  and the rest of the body has nowhere to go: `:then` hears the abort
+  sentinel, as for a failure, its answer refuses the body, and `:on-abort`
+  hears `:refused`.
+- **Framing.** A fetch that declares `:content-length` sends exactly that
+  many bytes, framed by `Content-Length`; without it the body is sent
+  chunked. Some upstreams take only the first. S3's PutObject is one, and so
+  is a presigned URL to it, so forward the length the client declared, as
+  above. A client that sent its body chunked declared no length, and for
+  an upstream that needs one the route is the one in "Forms and file
+  uploads": a piece at a time, each piece its own request.
+
+**By hand.** `forward-body` is `receive-body` and the three calls a streamed
+fetch has, with a `:then` that refuses the body when the upstream has
+answered before it ended. In outline:
+
+```lisp
+(let* ((conn nil)
+       (put (http-fetch :put (object-url) :body :stream
+                        :then (lambda (status headers body)
+                                (let ((answer (stored-or-502 status headers body)))
+                                  ;; Refused if the body is still arriving;
+                                  ;; a no-op once it has ended.
+                                  (when conn (body-refuse conn answer))
+                                  answer)))))
+  (receive-body
+   :on-data (lambda (c bytes)
+              (setf conn c)
+              (if (and (not (fetch-started-p put))
+                       (not (ignore-errors
+                             (fetch-into c put :failure-disposition :keep))))
+                  (make-error-response 502)          ; the fetch could not start
+                  (let ((sent (fetch-send put bytes)))
+                    (cond ((eq sent t) nil)          ; with the kernel: go on
+                          ((null sent) :pause)       ; resumed when it drains
+                          (t (make-error-response 502)))))) ; the fetch is over
+   :on-end (lambda (c)
+             (declare (ignore c))
+             put)))                                  ; answered by the upstream
+```
+
+- **`(fetch-send fetch bytes)`** sends the next piece of the body, a chunk
+  of its own unless a length was declared. It answers `t` when everything
+  sent so far is with the kernel and `nil` when some of it is waiting. `nil`
+  is backpressure, as `stream-send`'s is. A body being received pauses on
+  it and is resumed when the upload drains, with nothing more asked of the
+  application. Any other producer, an `:on-tick` for one, stops and asks
+  again later with an empty send, which sends nothing and answers `t` once
+  the upstream has caught up; sending on regardless signals at
+  `*max-write-backlog*`. `:ended` means the fetch is over, answered or
+  failed or stopped, and the bytes went nowhere. The bytes are copied, so
+  the vector may be reused at once.
+- **`(fetch-finish fetch)`** ends the body: the chunked terminator, or a
+  check that the declared length has all been sent, which signals if not.
+- **Answering with the fetch.** An `:on-end`, or a fetch's `:then`, that
+  answers with a streamed fetch already started for its request answers
+  the request with what that fetch's `:then` returns: once the upstream has
+  answered, or at once if it already has. A fetch whose body is not
+  finished is finished then.
+- **Started once.** `fetch-into` starts a streamed fetch, or it starts as an
+  answer, like any fetch. What is sent before it starts is held for it,
+  under the same backlog bound. Starting it a second time signals, since
+  the fetch is the application's handle on that one exchange, and
+  `fetch-started-p` says whether it has started.
+- **On the worker.** `fetch-send` and `fetch-finish` are called on the
+  worker that carries the fetch, from a body's callbacks, a fetch's `:then`
+  or an `:on-tick`, and signal anywhere else. An `:on-tick` runs on every
+  worker, so one that feeds a fetch keeps the `*worker-id*` the fetch was
+  started on and feeds it there alone.
+- **Timing.** While the body is going out, `*fetch-timeout*` bounds it
+  standing still, not the upload. Each piece sent, and each piece the
+  upstream takes, moves the deadline out, so an upload takes as long as it
+  keeps moving. If the upstream stops reading, the fetch ends once that
+  long has passed, and the client is answered at once with `:then`'s
+  answer to the abort sentinel, or 502. If the client stops sending,
+  `*body-stall-timeout*` measures the same quiet: the fetch ends the same
+  way if its deadline comes first or with the stall, as at the defaults,
+  and if the stall comes first the connection is closed unanswered and
+  `:on-abort` hears `:stalled`. By hand, a `:then` that does not refuse
+  the body leaves the client to be answered from the next `fetch-send`,
+  which answers `:ended`. Once the body has all been written to the socket,
+  the answer is waited for under `*fetch-timeout*` as any fetch's is, and a
+  request answered with the fetch is answered 504 if it does not come. That
+  wait includes the time the upstream takes to read what the kernel was
+  still holding for it, which over a slow link can be seconds.
+
 ### Form body decoding
 
 `parse-query-string` and `get-query-param` decode `+` as space
@@ -1638,6 +2331,8 @@ For POST bodies with this content type, parse directly:
 
 Note: `url-decode` itself treats `+` as literal (pure RFC 3986 path decoding).
 The form-aware decoding is in `parse-query-string` and `form-decode`.
+A form with a file input sends `multipart/form-data` instead; see
+"Forms and file uploads".
 
 ### Testing your handlers
 
@@ -1666,7 +2361,7 @@ binds `*test-port*` for the body, and tears it down on scope exit
 (signal shutdown, bounded join, fallback to `terminate-thread`).
 Shutdown hooks registered inside the body are isolated to that server's teardown —
 they do not leak into the caller's state.
-Besides `:handler` it takes `:ws-handler` and `:host`, as `start-server` does;
+Besides `:handler` it takes `:ws-handler`, `:body-handler` and `:host`, as `start-server` does;
 `:workers`, which defaults to one, so a test can reason about a single connection table;
 and `:on-tick`, passed to `start-server` unchanged, for a test of work that runs on a worker's own loop.
 
@@ -1723,3 +2418,107 @@ End-to-end tests are slower than unit-style tests
 Use unit-style tests for handler logic,
 end-to-end for the request/response path itself
 and for anything that depends on the event loop or graceful shutdown machinery.
+
+## Environment
+
+What web-skeleton needs from the machine it runs on.
+
+### SBCL
+
+2.2.9 is the oldest SBCL the suite runs on, and the one Debian 12 and
+Ubuntu 24.04 package.
+
+**SBCL 2.2.4 through 2.2.9 can miscompile a closure's store, and the heap
+pays for it later.** A store into an object made by the enclosing
+function, a list say, loses the garbage collector's store barrier when
+the value stored is the closure's own argument (SBCL bug lp#1982608,
+fixed in 2.2.10). That holds in straight-line code. In a closure that
+runs later the argument can be younger than the object, and a collection
+then moves the argument and leaves the object pointing where it was. The
+damage shows at a time and place unrelated to the store: a memory fault
+in code that did nothing wrong, or a crash inside the collector.
+
+The shape is a callback that stores what it is handed into a box made
+around it, for another callback to read later:
+
+```lisp
+(let ((box (list nil)))
+  (http-fetch :get url
+              :then (lambda (status headers body)
+                      (declare (ignore status headers))
+                      (setf (car box) body)            ; BODY, into BOX
+                      (make-text-response 200 "fetched"))))
+```
+
+A variable the callbacks share keeps its barrier, and is the way to hand
+a value from one callback to another on 2.2.9:
+
+```lisp
+(let ((fetched nil))
+  (http-fetch :get url
+              :then (lambda (status headers body)
+                      (declare (ignore status headers))
+                      (setf fetched body)
+                      (make-text-response 200 "fetched"))))
+```
+
+A fixnum, a character or NIL is not a pointer and loses nothing either
+way. web-skeleton's own code, its TLS system and the demo have no store
+of the first shape. Code built on them with 2.2.9 should keep to the
+second, or be built with 2.2.10 or later.
+
+### getent
+
+Hostnames are resolved by running `getent ahosts` with
+`sb-ext:run-program`, so a lookup never blocks a worker, and the getent
+on PATH must be glibc's, which every glibc distribution ships. Its
+`ahosts` output is what the parser reads, and the name is passed after
+`--`, which glibc's getent honours. Alpine's does not: it comes from the
+musl-utils package (musl itself ships none) and looks the `--` up as a
+name, so no hostname resolves there, which is why the demo's image is
+Debian. Other getents are untested.
+
+### libssl
+
+Outbound TLS is the optional `web-skeleton-tls` system, which loads
+libssl, and it needs a CA bundle to verify against: see
+"TLS trust anchors" above.
+
+### Descriptors
+
+Every connection is a descriptor, and so is each fetch's socket and DNS
+pipe. The soft descriptor limit is commonly 1024, systemd's default for
+a service and many a container's, which would run out at about a
+thousand connections, long before `*max-connections*`, while the hard
+limit is usually hundreds of thousands. So `start-server` raises the
+soft limit to what the settings need, workers × `*max-connections*`
+with room on top, as far as the hard limit allows, and logs it: 46,080
+for four workers at the defaults. With `*max-connections*` at 0 it
+raises it to the hard limit.
+
+It raises no further than that because a high limit has a cost where
+the kernel lacks `close_range(2)`, before Linux 5.9 (RHEL 8, Ubuntu
+20.04's original kernel) or under a seccomp profile older than the call.
+There, every child process SBCL starts closes descriptors one at a time
+up to the limit before it runs, and its worker waits: about 12 ms at
+46,080, and 130 ms at 524,288. getent is one such child for every fetch
+to a hostname. On such a host `start-server` says so in a WARN at start,
+whether it raised the limit or the process was started with a high one,
+as some container runtimes start it at 1,048,576; it names the limit the
+settings need, which can be set where the process starts, and
+`*dns-cache-ttl*` starts fewer children. Nothing in the process waits
+with `select(2)`, the other reason soft limits are kept low.
+
+Whatever the limit, a server close to it answers new connections `503`,
+as it does at `*max-connections*`. Once the descriptors in use reach
+seven-eighths of the limit, a new connection is refused, and the eighth
+kept back is for the connections already open, whose fetches and
+lookups need descriptors too. The census counts these refusals under
+`:refused`, and the log says which limit was met.
+
+A hard limit too low for the connections you mean to hold is raised
+where the process is started: `LimitNOFILE=` in a systemd unit,
+`ulimits: nofile:` in a compose file, or `ulimit -Hn` in the shell that
+starts it. A proxy in front holds a descriptor for each side of every
+connection it carries, so it needs a limit of its own, as nginx's
+`worker_rlimit_nofile` and `worker_connections` set.

@@ -11,9 +11,16 @@
   "SHA-256 processes 512-bit (64-byte) blocks.")
 
 (defun hmac-sha256 (key message)
-  "Compute HMAC-SHA256 of MESSAGE using KEY. Both are byte vectors.
-   Returns a 32-byte MAC."
-  (let ((block-key (make-array +hmac-sha256-block-size+
+  "Compute HMAC-SHA256 of MESSAGE using KEY. Both are (unsigned-byte 8)
+   vectors, taken through OCTETS-ARGUMENT: a string key or message is
+   refused rather than given an encoding. Returns a 32-byte MAC.
+
+   Both are checked here, before either is used. A key longer than a block
+   is reduced with SHA256 before anything copies it, so the key would
+   otherwise meet the contract only on that one branch."
+  (let ((key (octets-argument key 'hmac-sha256))
+        (message (octets-argument message 'hmac-sha256))
+        (block-key (make-array +hmac-sha256-block-size+
                                 :element-type '(unsigned-byte 8)
                                 :initial-element 0)))
     ;; If key is longer than block size, hash it first

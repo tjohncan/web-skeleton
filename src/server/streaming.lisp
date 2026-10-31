@@ -14,15 +14,15 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Chunked transfer encoding — the producing side
 ;;;
-;;; Encode to the intersection of what the three readers require, not to
-;;; what any one of them forgives. DECODE-CHUNKED-BODY demands strict CRLF
-;;; after both the size line and the data ("Lax trailing CRLF is a smuggling
-;;; primitive"); PARSE-CHUNKED-SIZE-LINE tolerates BWS around the hex and
-;;; strips chunk-extensions; CHUNKED-BODY-COMPLETE-P is lax on purpose and
-;;; validates nothing. Their tolerances exist to survive other people's
-;;; output. They are not a licence for ours, so what goes on the wire is
-;;; bare lowercase hex, CRLF, data, CRLF — no extensions, no whitespace,
-;;; nothing any strict downstream re-parser could read differently.
+;;; Encode to what every reader requires, not to what the readers forgive.
+;;; The three readers demand strict CRLF after both the size line and the
+;;; data ("Lax trailing CRLF is a smuggling primitive"), and they tolerate
+;;; whitespace after the hex and skip chunk-extensions — PARSE-CHUNK-SIZE-
+;;; BYTES and PARSE-CHUNKED-SIZE-LINE have the grammar. Those tolerances
+;;; exist to survive other people's output. They are not a licence for
+;;; ours, so what goes on the wire is bare lowercase hex, CRLF, data,
+;;; CRLF — no extensions, no whitespace, nothing any strict downstream
+;;; re-parser could read differently.
 ;;; ---------------------------------------------------------------------------
 
 (defun chunked-terminator ()
@@ -96,9 +96,13 @@
 ;;; The terminator's lifecycle, decided here because this is the function
 ;;; that decides there is no Content-Length:
 ;;;
-;;;   The framework emits CHUNKED-TERMINATOR on stream teardown, on every
-;;;   path out — normal end, handler error, connection reaped. The app
-;;;   never writes it and is given no way to.
+;;;   The framework emits CHUNKED-TERMINATOR when a stream ends normally,
+;;;   through STREAM-CLOSE, and on no other path. The app never writes it
+;;;   and is given no way to. A terminator is a claim that the body is
+;;;   complete, so every other way out — application code raising, the
+;;;   connection reaped, a relayed upstream failing, the server draining —
+;;;   closes the connection without one, and the peer reads the truncation
+;;;   that actually happened.
 ;;;
 ;;;   A stream whose terminator was not written may not return its
 ;;;   connection to :READ-HTTP. If the terminator cannot be emitted at all
@@ -128,10 +132,10 @@
                 the only framing left is the one the end of the
                 connection provides.
 
-   Close-delimited framing is the shape whose *reading* side was broken
-   until :OK-EOF landed — a peer's FIN arriving in the same read as the
-   last data was swallowed, and the response hung. Named here because
-   this is the function that decides to start producing them."
+   Close-delimited framing is the shape whose *reading* side depends on
+   :OK-EOF — a peer's FIN arriving in the same read as the last data is
+   the end of the response, and a reader that drops it hangs. Named here
+   because this is the function that decides to start producing them."
   (if (string= (http-request-version request) "1.1")
       :chunked
       :close))
@@ -154,8 +158,8 @@
    a third behavioral flag on it. Almost everything FORMAT-RESPONSE does
    with a body is Content-Length work — computing it, defaulting it to
    zero for bodiless statuses, preserving it across HEAD — and a stream
-   wants none of it. The flag would have switched off most of the
-   function it was added to.
+   wants none of it. The flag would switch off most of the function it
+   was added to.
 
    Refuses rather than reconciling. A caller-supplied Content-Length or
    Transfer-Encoding means the caller thinks it owns framing, and two
@@ -166,7 +170,7 @@
         (headers (http-response-headers response)))
     (unless (<= 100 status 599)
       (error "HTTP status ~d out of range (must be 100-599)" status))
-    (when (or (<= 100 status 199) (= status 204) (= status 304))
+    (when (status-without-body-p status)
       (error "streaming response: status ~d cannot carry a body" status))
     (when (assoc "content-length" headers :test #'string-equal)
       (error "streaming response: caller set Content-Length; a stream ~
@@ -311,14 +315,22 @@
                                :UPSTREAM-FAILED when a FETCH-INTO
                                relaying into it failed, or its close
                                could not be written,
-                               :SHUTDOWN on server drain. Release
-                               whatever the app registered here.
+                               :ERROR when ON-OPEN raised after the
+                               head went out, or the worker carrying
+                               the stream crashed,
+                               :SHUTDOWN on server drain,
+                               :CLOSED for a close that names no
+                               reason of its own (CLOSE-CONNECTION's
+                               default). Release whatever the app
+                               registered here.
    KEEPALIVE (bytes or NIL)  — sent when the stream goes quiet. See
                                *STREAM-KEEPALIVE-INTERVAL* for why the
                                framework cannot invent these.
 
-   HEADERS is an alist. Content-Length and Transfer-Encoding are refused
-   — the framework owns framing for a stream."
+   HEADERS is an alist, sent as given, so a name may repeat, as
+   Set-Cookie has to for two cookies. Content-Length and
+   Transfer-Encoding are refused — the framework owns framing for a
+   stream."
   ;; An empty keepalive fires on schedule and sends nothing, forever:
   ;; FRAME-STREAM-BYTES returns NIL for an empty payload on both paths,
   ;; correctly, and the sweep skips it. The only symptom would be streams
@@ -329,8 +341,11 @@
     (error "make-stream-response: :keepalive is empty — that sends nothing ~
             on every interval forever. Pass NIL to decline a keepalive."))
   (let ((resp (make-http-response :status status)))
-    (loop for (name . value) in headers
-          do (set-response-header resp name value))
+    ;; As given, so a name may repeat: Set-Cookie must, one field a cookie,
+    ;; and Link often does. WS-UPGRADE's :HEADERS go out the same way.
+    (setf (http-response-headers resp)
+          (loop for (name . value) in headers
+                collect (cons (string-downcase name) value)))
     (%make-stream-response :response resp
                            :on-open on-open
                            :on-close on-close
@@ -363,14 +378,13 @@
    remainder, because STREAM-FLUSH then arms and epoll_ctl answers ENOENT
    — the common case, where the bytes fit, returns T and says nothing.
 
-   That is the shape WS-SEND had before it was guarded, and it is stated here
-   rather than fixed because fixing it is a contract change: today a
-   cross-worker STREAM-SEND mostly succeeds, and applications may be
-   relying on it accidentally. STREAM-CLOSE could be guarded without one,
-   since it already raised on that path every time. The rule for all four
-   is in README.md under Limitations; this paragraph exists so that a
-   reader who has seen the other three enforce it does not infer that
-   this one does."
+   It is stated here rather than guarded because guarding it is a
+   contract change: a cross-worker STREAM-SEND mostly succeeds, and
+   applications may be relying on it accidentally. STREAM-CLOSE's guard
+   changes no contract, since unguarded that call raises every time
+   anyway. The rule for all four is in README.md under Limitations;
+   this paragraph exists so that a reader who has seen the other three
+   enforce it does not infer that this one does."
   (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
   (unless (eq (connection-state conn) :streaming)
     (error "stream-send: fd ~d is in state ~a, not :streaming"
@@ -395,12 +409,12 @@
 
    The one place a stream's framing is applied, because there is more
    than one writer and they land in the same body. The keepalive sweep
-   is the other, and it appended raw bytes until it was found doing so —
-   on a chunked stream that put a comment line where the peer's decoder
-   expects a chunk-size, which kills the stream the keepalive exists to
-   keep alive. Two writers deciding framing separately is the same
-   hazard as two readers deciding acceptance separately, and this
-   codebase already names that one."
+   is the other, and raw bytes from it would put a comment line on a
+   chunked stream where the peer's decoder expects a chunk-size, which
+   kills the stream the keepalive exists to keep alive. Two writers
+   deciding framing separately is the same hazard as two readers
+   deciding acceptance separately, and this codebase already names that
+   one."
   (ecase (connection-stream-framing conn)
     (:chunked (encode-chunk bytes))
     ;; Copied, not passed through. The queue holds vectors by reference
@@ -409,10 +423,10 @@
     ;; goes out instead of what was sent. Reusing one buffer is the
     ;; obvious way to write a producer, and without this the rule for
     ;; whether that is allowed would depend on the client's HTTP version
-    ;; — chunked copies here because ENCODE-CHUNK builds a new vector,
-    ;; close framing did not. An app cannot see which framing it got, so
-    ;; it would be correct against every browser and corrupt against one
-    ;; old client.
+    ;; — chunked framing copies because ENCODE-CHUNK builds a new vector,
+    ;; and close framing would not without this. An app cannot see which
+    ;; framing it got, so it would be correct against every browser and
+    ;; corrupt against one HTTP/1.0 client.
     (:close (when (plusp (length bytes)) (copy-seq bytes)))))
 
 (defun stream-flush (conn)
@@ -423,7 +437,7 @@
    The arming is conditional and self-limiting: it happens only when a
    send does not fully flush, which means the socket is genuinely backed
    up. A peer keeping up costs no epoll_ctl at all, the same property
-   the ping sweep gained when its write moved inline.
+   the ping sweep has by writing inline.
 
    EPOLLIN stays in the mask because a stream still has to notice its
    peer going away — that is the only read event a :STREAMING connection
@@ -447,7 +461,8 @@
     (when fn
       (setf (connection-stream-on-close conn) nil)
       (handler-case (funcall fn conn reason)
-        (error (e)
+        ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+        (serious-condition (e)
           (log-warn "stream on-close signalled on fd ~d (~a): ~a"
                     (connection-fd conn) reason e))))))
 
@@ -470,25 +485,26 @@
    would have armed one — see the comment below.
 
    Signals if the state is not :STREAMING, and signals if that arming
-   fails. The second is unconditional, where the arming it replaced was
-   skipped whenever the flush finished — so a failure to arm is reported
-   every time rather than only when the terminator did not fit.
+   fails. The second is unconditional: an arming skipped whenever the
+   flush finished would report a failure to arm only when the terminator
+   did not fit, where this reports it every time.
 
    Signals, before either of those has a chance to matter, if CONN is not
    on this worker's connection table — the same check WS-SEND and
    FETCH-INTO make, before anything is touched.
 
-   The arm was the only thing that noticed a cross-worker close, and it
-   arms last: by then the terminator has been appended to another
-   worker's unlocked queue and put on the wire with send(2) from the
-   wrong thread, the state has moved to :WRITE-RESPONSE, and ON-CLOSE
-   has fired :DONE. That last one is why this is a guard rather than a
-   documented limitation. NOTIFY-STREAM-CLOSED nulls the slot before
-   calling so the callback fires exactly once, so the owning worker's own
-   teardown notification is afterwards a no-op — the application's first
-   and last word about that stream is :DONE, it is false, and nothing can
-   correct it. A corrupted queue is at least a thing the framework knows
-   about; telling an app its stream ended normally when it did not is not."
+   Without the check, the arm would be the only thing to notice a
+   cross-worker close, and it arms last: by then the terminator has been
+   appended to another worker's unlocked queue and put on the wire with
+   send(2) from the wrong thread, the state has moved to :WRITE-RESPONSE,
+   and ON-CLOSE has fired :DONE. That last one is why this is a guard
+   rather than a documented limitation. NOTIFY-STREAM-CLOSED nulls the
+   slot before calling so the callback fires exactly once, so the owning
+   worker's own teardown notification is afterwards a no-op — the
+   application's first and last word about that stream would be :DONE,
+   false, with nothing able to correct it. A corrupted queue is at least
+   a thing the framework knows about; telling an app its stream ended
+   normally when it did not is not."
   (unless (eq (connection-state conn) :streaming)
     (error "stream-close: fd ~d is in state ~a, not :streaming"
            (connection-fd conn) (connection-state conn)))
@@ -537,16 +553,16 @@
   ;; it is where a keep-alive connection resets to :READ-HTTP and where a
   ;; close-delimited one closes — so the event has to be armed whether or
   ;; not the flush completed, and STREAM-FLUSH arms only when it did not.
-  ;; The ordinary close is the one that completes. Measured on the wire:
-  ;; the client receives a complete, correctly terminated response, and the
+  ;; The ordinary close is the one that completes. Left unarmed, the
+  ;; client receives a complete, correctly terminated response, and the
   ;; connection is then unusable — its next request met by
   ;; HANDLE-CLIENT-READ's permissive arm and answered with nothing until
   ;; the idle sweep.
   ;;
-  ;; START-STREAM already does this for the one caller it owns: its
+  ;; START-STREAM does the same for the one caller it owns: its
   ;; ON-OPEN-closed branch arms EPOLLOUT unconditionally, saying the
-  ;; ordinary write path takes it from here. Every *later* caller had no
-  ;; counterpart — a fetch :THEN, a timer, a second event.
+  ;; ordinary write path takes it from here. This covers every later
+  ;; caller — a fetch :THEN, a timer, a second event.
   ;;
   ;; EPOLLOUT alone, and not by calling STREAM-FLUSH, because that
   ;; function's mask is argued for a connection that is still streaming:
@@ -604,8 +620,8 @@
   ;; Named rather than left to FIND's type error. An integer id is the
   ;; most natural thing an app passes — sequence numbers are what
   ;; Last-Event-ID replay is for — and "The value 42 is not of type
-  ;; SEQUENCE" names neither the argument nor the fix. RETRY already had
-  ;; a check of its own; three of the four fields did not.
+  ;; SEQUENCE" names neither the argument nor the fix. RETRY has a check
+  ;; of its own; this is the other three fields'.
   (unless (stringp value)
     (error "sse: ~a must be a string, got ~s. Field values go on the wire ~
             as text; convert first (WRITE-TO-STRING for a number)."
@@ -699,7 +715,11 @@
    emission is the terminator."
   (make-stream-response
    :status 200
-   :headers (append headers
+   :headers (append (remove-if (lambda (name)
+                                 (member name '("content-type" "cache-control"
+                                                "x-accel-buffering")
+                                         :test #'string-equal))
+                               headers :key #'car)
                     (list (cons "content-type" "text/event-stream")
                           (cons "cache-control" "no-cache")
                           (cons "x-accel-buffering" "no")))
@@ -724,9 +744,11 @@
   (stream-send conn (sse-comment-bytes text)))
 
 (defun stream-full-p (conn)
-  "True when CONN's queue is at *MAX-WRITE-BACKLOG* and STREAM-SEND
-   would signal. A producer that can pause should ask before generating
-   an expensive payload — but this is a hint about bytes already queued,
-   not a promise about the next send, which only STREAM-SEND's own
-   return can give. See CONNECTION-WRITE-FULL-P."
+  "True when CONN's queue is at *MAX-WRITE-BACKLOG*. A producer that can
+   pause should ask before generating an expensive payload — but this is a
+   hint about bytes already queued, not a promise about the next send,
+   which only STREAM-SEND's own return can give: a send is refused as soon
+   as it would cross the bound, which is before the queue reaches it. A
+   relay pauses on STREAM-SEND answering NIL instead (DEPLOYMENT.md has the
+   recipe). See CONNECTION-WRITE-FULL-P."
   (connection-write-full-p conn))

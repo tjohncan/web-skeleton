@@ -17,6 +17,40 @@
 (declaim (special *max-outbound-response-size*))
 
 ;;; ---------------------------------------------------------------------------
+;;; Body plan
+;;;
+;;; What a body handler decided for a request's body. Defined here rather
+;;; than beside the constructors in body.lisp because the read path follows
+;;; it, and the read path is this file.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (body-plan (:constructor %make-body-plan))
+  "What a body handler decided for a request's body. Built by BUFFER-BODY,
+   RECEIVE-BODY or RECEIVE-MULTIPART, never by hand, so every plan has been
+   through its constructor's checks.
+
+     KIND      :BUFFER, read whole and handed to :HANDLER; or :RECEIVE,
+               handed to FEED as it arrives
+     MAX-SIZE  the cap on the body's decoded bytes
+     FEED      a :RECEIVE plan's reader, called (CONN BUF FROM TO) with the
+               next run of the body where it lies, BUF[FROM, TO) of the read
+               buffer: one run a read, decoded, whatever the framing. It
+               returns (values VERDICT UPTO). VERDICT is NIL,
+               :PAUSE or an HTTP-RESPONSE, as RECEIVE-BODY's ON-DATA answers.
+               With :PAUSE, UPTO is how far into the run the reader got: the
+               bytes from there stay buffered and begin its next run, after
+               BODY-RESUME. Any other verdict has taken the whole run.
+               RECEIVE-BODY's copies the run for ON-DATA; RECEIVE-MULTIPART's
+               parses it in place, and a pause can fall inside it.
+     ON-END, ON-ABORT
+               a :RECEIVE plan's callbacks; see RECEIVE-BODY"
+  (kind :buffer :type keyword)
+  (max-size 0 :type (integer 0))
+  (feed nil)
+  (on-end nil)
+  (on-abort nil))
+
+;;; ---------------------------------------------------------------------------
 ;;; Connection struct
 ;;; ---------------------------------------------------------------------------
 
@@ -40,11 +74,10 @@
   ;; This worker's count of accepted connections at the time this one was
   ;; accepted. Together with the worker id it names a connection for as long
   ;; as the server runs, a crashed worker's restart included, which FD alone
-  ;; cannot do: an fd is unique only
-  ;; among the connections open right now, and the kernel hands the lowest
-  ;; free one to the next accept. A closed connection's fd belongs to a
-  ;; stranger within milliseconds, so anything that labels a peer by fd
-  ;; labels two different peers the same.
+  ;; cannot do: an fd is unique only among the connections open right now,
+  ;; and the kernel hands the lowest free one to the next accept. A closed
+  ;; connection's fd belongs to a stranger within milliseconds, so anything
+  ;; that labels a peer by fd labels two different peers the same.
   ;;
   ;; 0 for a connection this worker did not accept — an outbound fetch is a
   ;; connection too, and it is nobody's peer.
@@ -96,6 +129,9 @@
   ;;                            the one state where readable does not mean
   ;;                            read and writable does not mean write
   ;;   :out-write             — outbound: sending HTTP request
+  ;;   :out-send              — outbound: sending a request body the
+  ;;                            application streams, and reading whatever
+  ;;                            the upstream answers meanwhile
   ;;   :out-read              — outbound: reading HTTP response
   (state     :read-http :type keyword)
   ;; Read buffer — accumulates incoming bytes, grows as needed
@@ -109,7 +145,8 @@
   ;; Vectors queued behind write-buf, oldest first. write-buf is the head
   ;; of the queue and these follow it; CONNECTION-ON-WRITE promotes the
   ;; next one each time the head drains. Held by reference and never
-  ;; written into — see CONNECTION-APPEND-WRITE for why that matters.
+  ;; written into — see CONNECTION-APPEND-WRITE for why that matters —
+  ;; though small ones are joined into a fresh vector: see %QUEUE-TAIL.
   (write-queue      nil :type list)
   (write-queue-tail nil :type list)          ; last cons of write-queue, for O(1) append
   (write-queued     0   :type fixnum)        ; unsent bytes in write-queue, head excluded
@@ -162,6 +199,22 @@
   ;; TEST-HARNESS-PIPELINED-AFTER-BODY-E2E fails, which is the sharper of
   ;; the two: the next request is read out of the tail of its predecessor.
   (body-expected 0 :type fixnum)             ; Content-Length value
+  ;; How far the search for the CRLFCRLF ending the request head has got:
+  ;; READ-BUF holds no CRLFCRLF in [0, HEADER-SCAN-POS). The next search
+  ;; starts three bytes before it, since a terminator can straddle the
+  ;; place one read ended and the next began, so each byte of a head is
+  ;; searched about once. Searching from 0 on every read would make a head
+  ;; that arrives in small pieces quadratic: the whole buffer again on
+  ;; every wake-up, up to CONNECTION-READ-CAP.
+  ;;
+  ;; Its one writer is conditional — the :READ-HTTP arm records how far it
+  ;; got only when it found nothing — so the two resets have to clear it,
+  ;; and that is a necessity rather than the choice REQUEST-END's frame
+  ;; rule describes. Both move the next request's bytes to offset 0, and a
+  ;; position left over from the request before would start the search
+  ;; past a terminator that is now nearer the front: the next request
+  ;; waits for an end it has already sent.
+  (header-scan-pos 0 :type fixnum)
   (header-end    0 :type fixnum)             ; byte offset where body starts
   ;; Byte offset one past the whole request on the wire — headers, the
   ;; CRLFCRLF, and every byte the body's framing occupies. Read by the
@@ -183,6 +236,57 @@
   ;; shifts the next request to offset 0 and fails unmissably, where one
   ;; left over from the request before fails at a plausible offset, quietly.
   (request-end   0 :type fixnum)
+  ;; This request's cap on its body, as a body handler chose it, or NIL
+  ;; for *MAX-BODY-SIZE*. Read through CONNECTION-MAX-BODY by both body
+  ;; caps and by CONNECTION-READ-CAP, so a decision moves the read
+  ;; buffer's ceiling with the body's.
+  ;;
+  ;; Its writer, APPLY-BODY-PLAN, is conditional, so the two resets clear
+  ;; it — a necessity rather than the choice REQUEST-END's frame rule
+  ;; describes. Left over, the next request's head and body would be read
+  ;; under the cap one request chose for itself.
+  (body-limit nil :type (or null (integer 0)))
+  ;; When the body of a request a body handler accepted last had bytes
+  ;; arrive, or 0 for a body timed as a whole. A non-zero value moves the
+  ;; connection from *IDLE-TIMEOUT*, which bounds a request's arrival from
+  ;; its start, to *BODY-STALL-TIMEOUT*, which bounds the quiet between
+  ;; its bytes. Conditional writer again, so both resets clear it.
+  (body-progress-at 0 :type integer)
+  ;; T when the request asked for 100 Continue and is HTTP/1.1 — the
+  ;; condition for sending the interim. Recorded when the head is read
+  ;; because CONNECTION-BEGIN-BODY can run later, after a body handler has
+  ;; decided, when the head is no longer being looked at. Both body arms
+  ;; of CONNECTION-ON-READ write it before anything reads it, so neither
+  ;; reset has to.
+  (expect-continue nil :type boolean)
+  ;; The :RECEIVE plan whose FEED this request's body is being handed
+  ;; to, or NIL. Taken off the connection — set back to NIL — at the moment
+  ;; the body ends, however it ends: by ON-END on completion, or by
+  ;; NOTIFY-BODY-ABORTED otherwise, which is how the plan's callbacks fire
+  ;; exactly once between them. Being NIL is also what every reset relies
+  ;; on: a body that ended left nothing to clear.
+  (body-receiver nil :type (or null body-plan))
+  ;; Bytes of a received body its plan's FEED has taken so far, decoded.
+  ;; With BODY-HELD, the total the cap is held to, and on a Content-Length
+  ;; body what tells the read path how much of it is still to come.
+  ;;
+  ;; This, BODY-OWED and BODY-HELD are zeroed by APPLY-BODY-PLAN when a
+  ;; :RECEIVE plan is installed and read only while one is, so no reset
+  ;; clears them: a value left from an earlier body is never looked at.
+  (body-received 0 :type unsigned-byte)
+  ;; CHUNKED-BODY-FEED's OWED between reads: the bytes of the current chunk
+  ;; still to come, its data and its CRLF, or 0 at a chunk boundary.
+  (body-owed 0 :type unsigned-byte)
+  ;; Bytes of a chunked body that a pause left untaken. Decoded already,
+  ;; they sit at the start of the body's place in the read buffer, where
+  ;; the run they belonged to was gathered, and begin the next run handed
+  ;; over; the walk over the framing resumes after them.
+  (body-held 0 :type unsigned-byte)
+  ;; T while a received body's FEED has asked for a pause: nothing is
+  ;; handed over, the connection is subscribed to no events, and the
+  ;; client's bytes wait in the kernel until BODY-RESUME. Cleared there,
+  ;; and by APPLY-BODY-PLAN for the next body, so it is never read stale.
+  (body-paused nil :type boolean)
   ;; Activity tracking (for idle timeout and ping/pong)
   (last-active   0 :type integer)             ; updated on real activity only
   (missed-pongs  0 :type fixnum)
@@ -213,16 +317,28 @@
   ;; resets, where it would write the same 0 the setter already writes.
   ;; That changes no failure mode and hides the setter from every test.
   (chunk-scan-pos  0  :type fixnum)
+  ;; Where an outbound response's head search resumes: the first byte of
+  ;; the head still arriving, after the interims already stepped over, and
+  ;; how many interims those were. HEADER-SCAN-POS is the search's resume
+  ;; point inside that head, as it is for a request. See
+  ;; OUTBOUND-RESPONSE-HEAD.
+  (out-head-start  0  :type fixnum)
+  (out-interims    0  :type fixnum)
   ;; (CONN BYTES) per chunk as an outbound response arrives, or NIL to
   ;; buffer the whole body. Set from the continuation by INITIATE-FETCH.
   (fetch-on-body   nil :type (or null function))
-  ;; T while ON-BODY has asked for backpressure: EPOLLIN is dropped and
-  ;; the upstream's send window fills. FETCH-RESUME re-arms.
+  ;; T while ON-BODY has asked for backpressure: no chunk is handed over,
+  ;; no event is acted on, and the upstream's send window fills.
+  ;; FETCH-RESUME ends it.
   (fetch-paused    nil :type boolean)
   ;; When the current pause began, or 0. Read by FETCH-RESUME to push the
   ;; deadline out by the interval spent paused, so the total is on unpaused
   ;; time rather than wall clock.
   (fetch-paused-at 0 :type integer)
+  ;; T when the read buffer may hold chunks a pause left there, read but not
+  ;; yet handed over. HANDLE-OUTBOUND-READ walks them before reading more:
+  ;; no readability edge will report bytes already in user space.
+  (fetch-rewalk    nil :type boolean)
   ;; On an *inbound* connection: the fd of an outbound that paused while
   ;; relaying into it, or -1. The back-link exists because the pause is
   ;; recorded on the outbound and the event that should end it — this
@@ -232,7 +348,7 @@
   ;; the ordinary path.
   (paused-outbound-fd -1 :type fixnum)
   ;; On an *outbound* connection: where its result goes.
-  ;;   :INBOUND   the historical path — an inbound is parked in :AWAITING
+  ;;   :INBOUND   a handler's fetch — an inbound is parked in :AWAITING
   ;;              and the callback's return value becomes its response.
   ;;   :DETACHED  the caller already owns a connection it is writing to, so
   ;;              nothing is parked and the callback's return is discarded.
@@ -253,6 +369,22 @@
   ;; whole seam exists to remove.
   (fetch-started-at 0 :type integer)
   (fetch-deadline   0 :type integer)
+  ;; On an outbound still connecting: the addresses its name resolved to
+  ;; after the one being dialed, (IP . FAMILY) in order, which a connect
+  ;; that fails, or takes past CONNECT-DEADLINE, falls back to. See
+  ;; FALL-BACK-TO-NEXT-ADDRESS. CONNECT-DEADLINE is 0 when there are none.
+  (fallback-addresses nil :type list)
+  (connect-deadline 0 :type integer)
+  ;; On an outbound or :OUT-DNS connection: the HTTP-FETCH-CONTINUATION it
+  ;; carries, so that the fetch's life — a streamed body's state, whether it
+  ;; has ended — is answered from the struct the application holds.
+  (fetch-continuation nil)
+  ;; T on a *target* connection while its application has been told to wait
+  ;; for a streamed fetch's request body to drain: FETCH-SEND answered NIL.
+  ;; The drain resumes the body it is receiving if that body is paused, so
+  ;; an upload forwarded upstream is held back by the upstream's pace and
+  ;; let go by it, as a relay's pause is let go by its client's.
+  (send-waiting nil :type boolean)
   ;; T on a *target* connection while a detached fetch it started is still
   ;; outstanding. Read by FETCH-INTO to refuse a second, and by the
   ;; delivery step to tell "this callback chained another fetch" from "this
@@ -293,13 +425,24 @@
   (stream-keepalive nil :type (or null (simple-array (unsigned-byte 8) (*))))
   ;; Keep-alive
   (close-after-p  nil :type boolean)          ; T = close after response sent
+  ;; T when that close should linger: the response answered a request
+  ;; whose bytes may still be arriving, so the close half-closes and
+  ;; drains rather than resetting. See BEGIN-LINGERING-CLOSE.
+  (linger         nil :type boolean)
   ;; WebSocket fragment reassembly
   (ws-frag-opcode  0  :type fixnum)           ; opcode from the first fragment
-  (ws-frag-buf   nil :type list)              ; accumulated payload chunks, or NIL
-  (ws-frag-total  0  :type fixnum)            ; running total bytes in frag-buf
+  ;; The fragments so far, one after another in [0, WS-FRAG-TOTAL), or NIL
+  ;; while no fragmented message is arriving. See WS-FRAG-APPEND.
+  (ws-frag-buf   nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (ws-frag-total  0  :type fixnum)            ; bytes of frag-buf in use
+  ;; Universal time the WebSocket message still arriving began: its first
+  ;; fragment, or the first bytes of a frame not yet whole. 0 while no
+  ;; message is unfinished. *WS-MESSAGE-TIMEOUT* is measured from it.
+  (ws-message-at  0  :type integer)
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
-  (dns-then    nil :type (or null function))  ; (IP FAMILY) -> kick off TCP phase
+  (dns-then    nil :type (or null function))  ; (IP FAMILY &optional FALLBACKS)
+                                              ; -> kick off the TCP phase
   (dns-host    nil :type (or null string)))   ; hostname being resolved — carried
                                               ; so the address filter and the log
                                               ; lines can name it when the getent
@@ -315,11 +458,11 @@
    bracketed per RFC 3986 §3.2.2 so the port cannot be read as another
    hex group; the v4 form needs no brackets.
 
-   The address itself is FORMAT-IP's job. This used to walk the sixteen
-   bytes itself, which meant two implementations of one hex format — and
-   a log line that disagreed with a filter decision about what an address
-   even looked like would be a miserable thing to debug. Brackets and a
-   port are the whole difference, so that is all this adds."
+   The address itself is FORMAT-IP's job. Walking the sixteen bytes here
+   would make two implementations of one hex format — and a log line that
+   disagreed with a filter decision about what an address even looked
+   like would be a miserable thing to debug. Brackets and a port are the
+   whole difference, so that is all this adds."
   (let ((addr (format-ip host)))
     (if (= (length host) 16)
         (format nil "[~a]:~d" addr port)
@@ -376,23 +519,81 @@
             (connection-socket conn) nil
             (connection-state conn) :closing))))
 
+(defvar *dns-children* nil
+  "getent children this worker has finished with and not yet seen exit,
+   as a table of process to T. Bound per worker by RUN-WORKER beside
+   *DNS-CACHE*, and emptied by REAP-DNS-CHILDREN on the maintenance tick.
+   NIL off a worker, where RELEASE-DNS-PROCESS waits instead of parking.
+
+   It exists because a lookup ends when its answer arrives, and the
+   process that gave the answer has not necessarily exited by then.
+   SB-EXT:PROCESS-CLOSE on a child that is still running takes it, on an
+   SBCL before 2.4.11, off the list SBCL waits on, so when the child does
+   exit nothing collects it — one in every few hostname fetches would
+   leave a zombie for the life of the server. A child is therefore closed
+   only once it has been seen dead, which holds on any SBCL.")
+
+(defun settle-dns-process (process)
+  "Close PROCESS if it has exited; otherwise leave it for REAP-DNS-CHILDREN.
+
+   Off a worker there is no tick to come back on, so it waits for the exit
+   instead. The callers have sent SIGKILL before getting here, so the wait
+   is for the kernel to finish a death it has already been told about."
+  (cond
+    ((not (ignore-errors (sb-ext:process-alive-p process)))
+     (ignore-errors (sb-ext:process-close process)))
+    (*dns-children*
+     (setf (gethash process *dns-children*) t))
+    (t
+     (ignore-errors (sb-ext:process-wait process))
+     (ignore-errors (sb-ext:process-close process)))))
+
+(defun release-dns-process (process)
+  "End a getent child whose lookup is over: kill it if it is still
+   running, close its pipe now, and close the process itself once it has
+   exited — see *DNS-CHILDREN* for why those last two are apart.
+
+   The pipe goes at once because it is a descriptor, and a descriptor
+   held until a child is collected is one more reason a connection slot
+   is not free. Closing the stream is what PROCESS-CLOSE would have done
+   for it; the PROCESS-CLOSE that follows later finds it closed."
+  (ignore-errors
+   (when (sb-ext:process-alive-p process)
+     (sb-ext:process-kill process 9)))
+  (ignore-errors (close (sb-ext:process-output process)))
+  (settle-dns-process process))
+
+(defun reap-dns-children ()
+  "Close every parked getent child that has since exited. Called from
+   the maintenance tick, and once more as a worker exits. Asking whether
+   a child is alive is what collects it, on any SBCL, so this is also the
+   wait itself. A child still running stays parked for the next call; it
+   was sent SIGKILL before it was parked."
+  (when *dns-children*
+    (let ((dead nil))
+      (maphash (lambda (process v)
+                 (declare (ignore v))
+                 (unless (ignore-errors (sb-ext:process-alive-p process))
+                   (push process dead)))
+               *dns-children*)
+      (dolist (process dead)
+        (ignore-errors (sb-ext:process-close process))
+        (remhash process *dns-children*)))))
+
 (defun maybe-reap-dns-process (conn)
   "If CONN has an attached getent process (a :out-dns outbound during
-   the DNS phase), kill it (if still running) and reap the zombie.
-   Safe to call on any connection — no-op when there is no process.
-   Idempotent: nulls the process slot so repeat calls are harmless.
-   Called from every teardown path (CLOSE-OUTBOUND in fetch.lisp,
-   CLOSE-CONNECTION in main.lisp) so a half-finished DNS lookup never
-   leaks a zombie process. Lives here alongside CONNECTION-CLOSE for
+   the DNS phase), release it through RELEASE-DNS-PROCESS. Safe to call
+   on any connection — no-op when there is no process. Idempotent: nulls
+   the process slot so repeat calls are harmless. Called from every
+   teardown path (CLOSE-OUTBOUND in fetch.lisp, CLOSE-CONNECTION in
+   main.lisp) so neither a finished lookup nor a half-finished one
+   leaves a child behind. Lives here alongside CONNECTION-CLOSE for
    load-order symmetry with both callers."
   (let ((process (connection-dns-process conn)))
     (when process
-      (ignore-errors
-       (when (sb-ext:process-alive-p process)
-         (sb-ext:process-kill process 9)))
-      (ignore-errors (sb-ext:process-close process))
-      ;; process-close already closed the pipe fd — mark it so
-      ;; connection-close's (when (>= fd 0) (%close fd)) skips
+      (release-dns-process process)
+      ;; The pipe was this connection's descriptor and it is closed now —
+      ;; mark it so connection-close's (when (>= fd 0) (%close fd)) skips
       ;; the double-close.
       (setf (connection-fd conn) -1)
       (setf (connection-dns-process conn) nil))))
@@ -401,12 +602,117 @@
 ;;; Read buffer helpers
 ;;; ---------------------------------------------------------------------------
 
+(defun request-head-budget ()
+  "The longest request head PARSE-REQUEST-BYTES can accept, terminator
+   included: the request line and the header bytes, each within its own
+   budget, and every CRLF the two budgets leave out.
+
+   A head that has not ended within this many bytes never will in a form
+   the parser accepts, which is what lets CONNECTION-ON-READ refuse it
+   then rather than buffering it toward CONNECTION-READ-CAP, the larger
+   bound that also makes room for a body."
+  (+ *max-total-header-bytes*
+     *max-request-line-length*
+     (* 2 *max-header-count*)  ; CRLF ending each header
+     4))                       ; request-line and blank-line CRLFs
+
+(defun refuse-unterminated-head (buf end)
+  "Refuse the request head in BUF[0..END), which has passed
+   REQUEST-HEAD-BUDGET without its blank line, with the status its first
+   fault has earned. Raises, always.
+
+     414   no CRLF within *MAX-REQUEST-LINE-LENGTH*: the request line is
+           what never ended
+     ...   whatever PARSE-REQUEST-BYTES raises over the lines that did
+           end — 431 for a header budget, 501, 505, 400 — as the
+           Content-Length arm's early refusal does
+     431   otherwise: the bytes past the last complete line are a header
+           that has not ended within the budget either"
+  (unless (scan-crlf buf 0 (min end (+ *max-request-line-length* 2)))
+    (http-reject 414 "request line too long (no end within ~d bytes)"
+                 *max-request-line-length*))
+  (parse-request-bytes buf 0 end)
+  (http-reject 431 "request head too large (no end within ~d bytes)"
+               (request-head-budget)))
+
+(defvar *body-handler* nil
+  "The application's body handler on this worker, or NIL: START-SERVER's
+   :BODY-HANDLER, bound by RUN-WORKER beside the worker's other slots.
+
+   A binding rather than an argument threaded from the event loop down
+   to the read path, so that no path into CONNECTION-ON-READ can arrive
+   without it. A pipelined request read after a keep-alive reset is
+   asked about its body exactly as the first one was, because there is
+   nothing a call site could forget to pass.")
+
+(defun connection-max-body (conn)
+  "The cap on CONN's request body: what a body handler chose for this
+   request, or *MAX-BODY-SIZE*."
+  (or (connection-body-limit conn) *max-body-size*))
+
+(defconstant +receive-window+ 65536
+  "Bytes of a received body the read buffer holds at once, past the head.
+   What one read can bring, and so the most a plan's FEED is handed in one
+   call after the first — that one carries whatever arrived with the head
+   before the body handler was asked. The body itself can be any size: each
+   window is handed over and dropped before the next is read.")
+
+(defconstant +receive-rounds+ 16
+  "Windows of a received body read and handed over in one wake-up before
+   the connection yields, a mebibyte at the window's size. A client that
+   sends faster than the worker can hand its body over would otherwise be
+   read for as long as it kept sending, every other connection on the
+   worker waiting behind it. Yielding arms writability, which is at once
+   true, so the read resumes on the next pass of the loop, after the
+   events already waiting.")
+
+(defun claim-body-receiver (conn)
+  "Take CONN's receiving plan off the connection and return it, or NIL if
+   there is none. Whoever claims it is the only one who can fire its
+   callbacks, which is how ON-END and ON-ABORT come to fire at most once
+   between them — the discipline CLAIM-FETCH-CALLBACK keeps for a fetch."
+  (let ((plan (connection-body-receiver conn)))
+    (when plan
+      (setf (connection-body-receiver conn) nil))
+    plan))
+
+(defun abort-received-body (plan conn reason)
+  "Fire PLAN's ON-ABORT with REASON, once PLAN has been claimed. A raise
+   inside it is logged rather than propagated: the callback is the
+   application's cleanup, and a failed cleanup must not stop the
+   framework's own."
+  (let ((fn (body-plan-on-abort plan)))
+    (when fn
+      (handler-case (funcall fn conn reason)
+        ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
+        (serious-condition (e)
+          (log-warn "body on-abort signalled on fd ~d (~a): ~a"
+                    (connection-fd conn) reason e))))))
+
+(defun receiving-body-p (conn)
+  "True while CONN's request body is being received into a plan's FEED:
+   the body has been accepted and has not yet ended."
+  (and (member (connection-state conn) '(:read-body :sending-100-continue))
+       (connection-body-receiver conn)
+       t))
+
+(defun notify-body-aborted (conn reason)
+  "If CONN is receiving a body, end that with REASON: claim the plan and
+   fire its ON-ABORT. A no-op otherwise, and after the first call, so every
+   path that can end a body may call it, and the framework's own refusals
+   call it where they are raised, with the reason only they know."
+  (let ((plan (claim-body-receiver conn)))
+    (when plan
+      (abort-received-body plan conn reason))))
+
 (defun connection-read-cap (conn)
   "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
      :out-dns           → 8 KiB
      outbound response  → *max-outbound-response-size* (8 MiB default)
-     inbound request    → every inbound budget summed (~1.07 MiB default)
+     received body      → the head and +RECEIVE-WINDOW+
+     inbound request    → every inbound budget summed (~1.07 MiB default),
+                          the body's share being CONNECTION-MAX-BODY
 
    Keeping the inbound and outbound caps separate means a 1 MiB+ HTTPS
    response (which a real upstream will routinely send) doesn't get
@@ -428,25 +734,46 @@
      8192)
     ((connection-outbound-p conn)
      *max-outbound-response-size*)
+    ;; A body being received is handed over a window at a time, so the
+    ;; buffer holds the head and one window and never the body.
+    ((connection-body-receiver conn)
+     (+ (connection-header-end conn) 4 +receive-window+))
     ;; The inbound cap is the sum of the budgets that actually apply, not
-    ;; *max-body-size* alone. Aliasing them made one knob quietly move
-    ;; two: a JSON API tightening the body cap to 32 KiB also capped
-    ;; total request bytes at 32 KiB, so a request with large-but-legal
-    ;; headers — a fat cookie jar, a long Authorization, a proxy's
-    ;; X-Forwarded-* chain — died on the buffer with a 400 that blamed
-    ;; the body.
+    ;; *max-body-size* alone. Aliasing them would make one knob quietly
+    ;; move two: a JSON API tightening the body cap to 32 KiB would also
+    ;; cap total request bytes at 32 KiB, so a request with
+    ;; large-but-legal headers — a fat cookie jar, a long Authorization,
+    ;; a proxy's X-Forwarded-* chain — would die on the buffer with a 400
+    ;; that blamed the body.
     ;;
     ;; Summed exactly rather than padded with slack, the same way the
-    ;; :websocket arm spells out its 14-byte masked header. The last two
-    ;; terms are why this is not simply the sum of two variables:
-    ;; *max-total-header-bytes* counts header line bytes only, so the
-    ;; request line and every CRLF fall outside it.
+    ;; :websocket arm spells out its 14-byte masked header. The head's share
+    ;; is REQUEST-HEAD-BUDGET, which counts the CRLFs the header budgets
+    ;; leave out, and is why this is not simply the sum of two variables.
     (t
-     (+ *max-body-size*
-        *max-total-header-bytes*
-        *max-request-line-length*
-        (* 2 *max-header-count*)  ; CRLF ending each header
-        4))))                     ; request-line and blank-line CRLFs
+     (+ (connection-max-body conn) (request-head-budget)))))
+
+(defun connection-shrink-read-buf (conn)
+  "Swap CONN's read buffer for a fresh 4 KiB one when it has grown past
+   that and holds less, carrying over the bytes it holds.
+
+   A buffer grows to fit what arrives and nothing shrinks it, so a
+   connection that once received something large holds that much for as
+   long as it lives. 10k idle keep-alives with 1 MiB buffers would sit on
+   ~10 GiB, and the long-lived connection is the WebSocket: a day by
+   default under *WS-IDLE-TIMEOUT*, so 10k sockets that have each sent one
+   maximal message hold ~640 MiB against ~40 MiB at 4 KiB. Called where a
+   connection settles: the keep-alive reset, the upgrade to a WebSocket,
+   and a WebSocket read that has consumed what it could. A uniform stream
+   of large requests or frames shrinks and regrows each time — fine for
+   bursty traffic, the common case, and measurable when it is not."
+  (let ((buf (connection-read-buf conn))
+        (held (connection-read-pos conn)))
+    (when (and (> (length buf) 4096) (< held 4096))
+      (let ((fresh (make-array 4096 :element-type '(unsigned-byte 8))))
+        (when (> held 0)
+          (replace fresh buf :end2 held))
+        (setf (connection-read-buf conn) fresh)))))
 
 (defun connection-read-into (conn buffer start max-bytes)
   "Read from CONN's transport into BUFFER[START..START+MAX-BYTES).
@@ -468,9 +795,11 @@
    That structural closure holds only while this is the sole path in. A
    direct SSL_read anywhere else re-opens exactly the hang it removes, and
    it would do so intermittently, on records that happen to be larger than
-   one buffer. It also covers WANT_READ alone: WANT_WRITE from a read is a
-   direction inversion the state machine cannot express yet, and belongs
-   to a later round rather than to this seam."
+   one buffer. It covers WANT_READ alone. WANT_WRITE from a read is a
+   different request — the same read again once the socket is writable —
+   and this seam passes it through as :WANT-WRITE for CONNECTION-READ-
+   AVAILABLE to report and the outbound read path to answer by inverting
+   the interest."
   (let ((fn (connection-read-fn conn)))
     (if fn
         (funcall fn buffer start max-bytes)
@@ -508,8 +837,7 @@
                 does. See CONNECTION-READ-INTO.
 
    :OK-EOF is separate from :OK because the difference is the whole
-   framing on two paths, and collapsing them cost this framework two
-   bugs.
+   framing on two paths, and collapsing them breaks both.
 
    Both arise when a peer's last bytes and its end-of-stream arrive in the
    same wake-up, which is the ordinary shape on loopback and a coin-toss
@@ -519,8 +847,8 @@
      A close-delimited outbound response — no Content-Length, no
      Transfer-Encoding — is framed by the close and nothing else.
      OUTBOUND-RESPONSE-COMPLETE-P says so in as many words and returns NIL
-     forever, deferring to the caller's EOF branch. That branch was
-     unreachable, so the fetch sat until *FETCH-TIMEOUT*.
+     forever, deferring to the caller's EOF branch. With the EOF dropped
+     that branch never runs, and the fetch sits until *FETCH-TIMEOUT*.
 
      A `getent` pipe carries the same hazard, on a race rather than
      reliably. getent writes its output in one go and the EOF appears when
@@ -529,22 +857,22 @@
      :OK, the exit arrives as a later event, and HANDLE-DNS-READY's \"no
      usable address\" branch fires on a clean :EOF. When it has — a cached
      answer, a loaded box, any scheduling that lets it finish first — the
-     two coalesce and that branch was skipped. The name it strands is one
-     whose every address *FETCH-ADDRESS-FILTER* refused, so the failure
-     lands on the SSRF-defense path and only sometimes.
+     two coalesce, and with the EOF dropped that branch is skipped. The
+     name it strands is one whose every address *FETCH-ADDRESS-FILTER*
+     refused, so the failure lands on the SSRF-defense path and only
+     sometimes.
 
    Neither is rescued by epoll. A TCP peer calling close(2) does not set
    EPOLLHUP — that flag means both directions are down, and a FIN alone
-   does not qualify; measured, not assumed. The pipe does set it, and the
-   :OUT-DNS branch of HANDLE-OUTBOUND-EVENT dispatches without looking at
-   flags. So the one fd type that gets the signal is the one that ignores
-   it.
+   does not qualify. The pipe does set it, and the :OUT-DNS branch of
+   HANDLE-OUTBOUND-EVENT dispatches without looking at flags. So the one
+   fd type that gets the signal is the one that ignores it.
 
    Subscribing to EPOLLRDHUP (0x2000) is the obvious alternative and is
    the wrong shape: it would mean re-registering every fd's event mask, it
    does nothing for the pipe, and it asks the kernel to tell us something
    we already know. The EOF is in hand at the moment this function
-   returns. The defect is that the return value had nowhere to put it."
+   returns, so the return value carries it."
   (let ((any-read nil)
         (max-size (connection-read-cap conn)))
     (loop
@@ -572,7 +900,7 @@
             ;; re-issues the *read*. Split into two verdicts for the same
             ;; reason :OK-EOF is split from :EOF: the caller has bytes to
             ;; process in one case and not the other, and collapsing that
-            ;; distinction has cost this framework two bugs already.
+            ;; distinction loses the bytes or the wait.
             ((eq result :want-write)
              (return (if any-read :ok-want-write :want-write)))
             (t (incf (connection-read-pos conn) result)
@@ -585,7 +913,7 @@
    below answers them in the same order so the two can be read side by
    side. The caller needs to tell 'the peer said something' from 'the
    peer is gone', and those two arrive in one wake-up often enough that
-   collapsing them cost this framework two bugs already.
+   collapsing them would lose one of them in ordinary traffic.
 
    One arm more than its sibling, and deliberately. Both end with a
    default that assumes a byte count; the sibling's ADDs that count to
@@ -611,11 +939,12 @@
           ((eq result :again) (return (if any-read :ok :again)))
           ;; The same arm CONNECTION-READ-AVAILABLE carries, for the reason
           ;; the docstring above gives: the two are meant to be readable
-          ;; side by side, and they were not. Without it :WANT-WRITE fell
-          ;; into the integer default and this loop spun inside the event
-          ;; loop with no exit. Unreachable today — the only caller is the
-          ;; :STREAMING inbound path and there is no inbound TLS — which is
-          ;; exactly how long a spin like this stays invisible.
+          ;; side by side. Without it :WANT-WRITE would fall into the
+          ;; integer default and this loop would spin inside the event loop
+          ;; with no exit. Unreachable from the callers there are — both
+          ;; inbound, :STREAMING and :LINGERING, and there is no inbound
+          ;; TLS — which is exactly how long a spin like this stays
+          ;; invisible.
           ((eq result :want-write)
            (return (if any-read :ok-want-write :want-write)))
           ;; Defensive, and not redundant with the arm above: a fifth
@@ -664,23 +993,22 @@
                  ;; Parse decimal digits
                  (let ((value 0) (found nil) (digits 0))
                    (loop while (and (< pos end) (<= 48 (aref buf pos) 57))
-                         ;; 10 decimal digits caps at 9_999_999_999 ≈ 9.3 GB
-                         ;; which is still four orders of magnitude past
-                         ;; any sensible *MAX-BODY-SIZE* default. The prior
-                         ;; 15-digit cap permitted values up to 10^15 ~ 900 TB,
-                         ;; which the real *MAX-BODY-SIZE* check always
-                         ;; rejected anyway — so the per-digit loop was
-                         ;; cosmetic, and an attacker sending
-                         ;; 'Content-Length: 999999999999999' forced a
-                         ;; bignum accumulator for free. Tightening to 10
-                         ;; makes the per-digit cap do real work.
+                         ;; Fifteen decimal digits, so under 10^15 bytes:
+                         ;; past any body worth sending, and a fixnum, so
+                         ;; the accumulator never grows into a bignum on
+                         ;; a run of digits. The cap is about the number
+                         ;; being representable, not about the body's
+                         ;; size — that is the body cap's, checked once the
+                         ;; value has parsed, against the request's own
+                         ;; cap. A body a body handler receives is never
+                         ;; held, so a cap of many gigabytes is a real one,
+                         ;; and a declared length has to be able to say so.
                          do (incf digits)
-                            (when (> digits 10)
-                              ;; An 11-digit length is >= 10 GB, which is
-                              ;; over any *max-body-size* worth setting —
-                              ;; 413 rather than 400, same as the body
-                              ;; check that would have caught it if we
-                              ;; had let the number finish parsing.
+                            (when (> digits 15)
+                              ;; Sixteen digits is 10^15 bytes or more,
+                              ;; past any cap — 413 rather than 400, the
+                              ;; answer the body check would have given had
+                              ;; the number been let finish.
                               (http-reject 413 "Content-Length too large"))
                             (setf value (+ (* value 10) (- (aref buf pos) 48))
                                   found t)
@@ -849,8 +1177,8 @@
          (cond
            ;; A bare CR makes this reader see a different value than
            ;; PARSE-HEADERS-BYTES will see, and this is the reader that
-           ;; decides how the body is framed. Measured, the disagreement
-           ;; runs both ways depending on where the CR sits — the same value
+           ;; decides how the body is framed. The disagreement runs both
+           ;; ways depending on where the CR sits — the same value
            ;; can be refused less or refused more — so the direction is
            ;; incidental and the disagreement itself is the fault. Same
            ;; argument the fold arm rests on, which is why the two sit
@@ -861,6 +1189,11 @@
            ;; line terminator has its LF there.
            ((and (< line-end end)
                  (/= (aref buf (1+ line-end)) 10))
+            :invalid)
+           ;; A bare LF is the same fault the other way round: this scan
+           ;; would read `chunked<LF>X` as one value and classify it, where
+           ;; PARSE-HEADERS-BYTES refuses the LF at dispatch.
+           ((position 10 buf :start value-start :end line-end)
             :invalid)
            ;; The value continues on a folded line this scan would not see.
            ((and (< (+ line-end 2) end)
@@ -894,23 +1227,35 @@
    Queued before reading the body when the client asks for it.")
 
 (defun scan-expect-disposition (buf end &optional (start 0))
-  "Classify the Expect header in BUF[START..END). Returns
-     :100-CONTINUE — an Expect: 100-continue header (case-insensitive)
-                     with a valid token terminator. Near-miss values
-                     like 100-continued are classified as :UNKNOWN.
-     :UNKNOWN      — an Expect header whose value is not 100-continue.
-                     RFC 7231 §5.1.1 lets the server respond with 417
-                     (MAY); the state machine uses this classification
-                     to do so unconditionally.
-     :NONE         — no Expect header present.
-   Start-of-line match only — suffixed names like X-Expect do not
-   match. First Expect header wins (early return)."
+  "Classify the expectations in BUF[START..END). Returns
+     :100-CONTINUE — at least one Expect header, and every member of
+                     every one is 100-continue (case-insensitive). A
+                     member may carry ;parameters. Near-miss values like
+                     100-continued are not 100-continue.
+     :UNKNOWN      — an Expect header with any other member. RFC 9110
+                     §10.1.1 lets a server answer 417 (MAY); the state
+                     machine does so unconditionally.
+     :INVALID      — an Expect value holding a bare CR or a bare LF,
+                     which PARSE-HEADERS-BYTES refuses at dispatch. The
+                     state machine answers it 400 at once, the parser's
+                     answer, rather than a 417, or a 100 Continue for a
+                     request about to be refused.
+     :NONE         — no Expect header, or Expect headers naming nothing:
+                     `Expect: ,` is an empty list, which RFC 9110 §5.6.1.2
+                     has a recipient ignore, so it carries no expectation.
+
+   Every header and every member counts, because the policy is about which
+   expectations a request carries. Reading the first token of the first
+   header would make `Expect: 100-continue, foo` and an `Expect: foo`
+   after an `Expect: 100-continue` pass where the same set in another
+   order is refused. Repeated headers are combined, as RFC 9110 §5.3
+   combines field lines; empty list elements are the list grammar, not
+   members. Start-of-line match only — suffixed names like X-Expect do
+   not match."
   (let ((name (load-time-value
                (sb-ext:string-to-octets "expect:"
                                          :external-format :ascii)))
-        (token (load-time-value
-                (sb-ext:string-to-octets "100-continue"
-                                          :external-format :ascii))))
+        (members 0))
     (loop for i from start below end
           do (when (and (>= i 2)
                         (= (aref buf (- i 2)) 13)
@@ -922,44 +1267,31 @@
                               always (or (= b n)
                                          (and (<= 97 n 122)
                                               (= b (- n 32))))))
-               ;; Found an Expect header. Classify it.
-               (let ((pos (+ i (length name))))
-                 ;; Skip OWS after the colon.
-                 (loop while (and (< pos end)
-                                  (or (= (aref buf pos) 32)
-                                      (= (aref buf pos) 9)))
-                       do (incf pos))
-                 ;; Case-insensitive match against "100-continue".
-                 (when (and (<= (+ pos (length token)) end)
-                            (loop for k below (length token)
-                                  for b = (aref buf (+ pos k))
-                                  for n = (aref token k)
-                                  always (or (= b n)
-                                             (and (<= 97 n 122)
-                                                  (= b (- n 32))))))
-                   ;; Require a token terminator so 100-continued (etc.)
-                   ;; does not match. Accepted terminators:
-                   ;;   CR (13)  — end of header line
-                   ;;   SP (32)  — whitespace continuation
-                   ;;   TAB (9)  — whitespace continuation
-                   ;;   ';' (59) — header parameter start
-                   ;;              (Expect: 100-continue;q=1.0 — rare
-                   ;;               but permitted by RFC 7231)
-                   ;;   ',' (44) — list separator. RFC 7231 §5.1.1
-                   ;;              defines Expect as 1#expectation
-                   ;;              (the RFC 7230 §7 list rule), so
-                   ;;              Expect: 100-continue, foo is a
-                   ;;              well-formed shape and the comma
-                   ;;              terminates the 100-continue token.
-                   (let ((after (+ pos (length token))))
-                     (when (or (>= after end)
-                               (let ((b (aref buf after)))
-                                 (or (= b 13) (= b 32) (= b 9)
-                                     (= b 59) (= b 44))))
-                       (return-from scan-expect-disposition :100-continue))))
-                 ;; Header present but value not 100-continue.
-                 (return-from scan-expect-disposition :unknown))))
-    :none))
+               ;; The value runs to the line's CR; walk its members. A CR
+               ;; that is not the line's end, or an LF before it, would
+               ;; have this reader and PARSE-HEADERS-BYTES see different
+               ;; values: the TRANSFER-ENCODING scan's rule, and its reason.
+               (let* ((line-end (or (position 13 buf :start i :end end) end))
+                      (pos (+ i (length name))))
+                 (when (or (and (< line-end end)
+                                (/= (aref buf (1+ line-end)) 10))
+                           (position 10 buf :start pos :end line-end))
+                   (return-from scan-expect-disposition :invalid))
+                 (loop
+                   (let ((comma (or (position 44 buf :start pos :end line-end)
+                                    line-end)))
+                     (multiple-value-bind (ms me) (trim-ows-bounds buf pos comma)
+                       (when (> me ms)
+                         (incf members)
+                         ;; The member's name ends at a parameter's ';'.
+                         (multiple-value-bind (ts te)
+                             (trim-ows-bounds
+                              buf ms (or (position 59 buf :start ms :end me) me))
+                           (unless (ascii-token-equal-p buf ts te "100-continue")
+                             (return-from scan-expect-disposition :unknown)))))
+                     (when (>= comma line-end) (return))
+                     (setf pos (1+ comma)))))))
+    (if (zerop members) :none :100-continue)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Is this request's body finished?
@@ -969,13 +1301,13 @@
 ;;; arm, deciding whether a buffer at its cap holds a complete request or
 ;;; is a 413, and in the :READ-BODY arm, deciding whether to dispatch.
 ;;;
-;;; Not hypothetical. The :FULL arm used to be Content-Length arithmetic,
-;;; and (>= (- read-pos body-start) body-expected) is satisfied
+;;; Not hypothetical. Content-Length arithmetic in the :FULL arm,
+;;; (>= (- read-pos body-start) body-expected), is satisfied
 ;;; unconditionally by a chunked request, whose BODY-EXPECTED is 0 until
-;;; the decode runs. A chunked body that filled the buffer read as
+;;; the decode runs. A chunked body that filled the buffer would read as
 ;;; *complete* there while :READ-BODY answered :CONTINUE, and nothing
-;;; could read further — the connection sat until the idle sweeper took
-;;; it, instead of answering 413.
+;;; could read further — the connection would sit until the idle sweeper
+;;; took it, instead of answering 413.
 ;;; ---------------------------------------------------------------------------
 
 (defun connection-body-complete-p (conn)
@@ -994,7 +1326,7 @@
    header parser whose disagreement with the first is the exact shape
    these rules exist to prevent. Refusing also means the boundary for a
    trailer-bearing request is never computed at all, which is the strongest
-   possible answer to the smuggle this issue is named for."
+   possible answer to a smuggle hidden in a trailer."
   (let ((body-start (+ (connection-header-end conn) 4))
         (end (connection-read-pos conn)))
     (ecase (connection-body-framing conn)
@@ -1003,15 +1335,15 @@
       (:chunked
        (multiple-value-bind (complete resume after-size-line
                              data-bytes pending-size)
-           ;; The walk signals CHUNKED-FRAMING-ERROR on a chunk-size line
-           ;; it can already tell is invalid, which for a *request* is 400:
-           ;; the client's framing is malformed, not the server. Caught by
+           ;; The walk signals CHUNKED-FRAMING-ERROR on framing it can
+           ;; already tell is invalid, which for a *request* is 400: the
+           ;; client's framing is malformed, not the server. Caught by
            ;; condition rather than by ERROR, because ERROR would also
            ;; catch a defect in the walk and answer 400 for it — telling a
            ;; client their bytes were at fault when the bug was ours, in
            ;; the middle of the one file whose job is deciding exactly
            ;; that. Same conversion CONNECTION-PARSE-REQUEST does for
-           ;; DECODE-CHUNKED-BODY, at the other end of the same split.
+           ;; DECODE-CHUNKED-BODY.
            (handler-case
                (chunked-body-complete-p (connection-read-buf conn)
                                         body-start end
@@ -1020,7 +1352,8 @@
                (http-reject 400 "malformed chunked framing: ~a" e)))
          (setf (connection-chunk-scan-pos conn) resume)
          (incf (connection-body-decoded conn) data-bytes)
-         ;; *MAX-BODY-SIZE* enforced incrementally, because a chunked
+         ;; The body cap (CONNECTION-MAX-BODY: *MAX-BODY-SIZE*, or what a
+         ;; body handler chose) enforced incrementally, because a chunked
          ;; request declares nothing for the Content-Length path's
          ;; before-allocating check to read. PENDING-SIZE is included so a
          ;; chunk header claiming more than the cap is refused the moment
@@ -1034,10 +1367,11 @@
          ;; this one names the body, CONNECTION-ON-READ's :FULL arm names
          ;; the buffer — because a client told the wrong reason cannot act
          ;; on it.
-         (let ((projected (+ (connection-body-decoded conn) pending-size)))
-           (when (> projected *max-body-size*)
+         (let ((projected (+ (connection-body-decoded conn) pending-size))
+               (limit (connection-max-body conn)))
+           (when (> projected limit)
              (http-reject 413 "chunked body too large (~d bytes, max ~d)"
-                          projected *max-body-size*)))
+                          projected limit)))
          (when complete
            (multiple-value-bind (status offset)
                (chunked-trailer-status (connection-read-buf conn)
@@ -1071,36 +1405,430 @@
 ;;;                    417 (unknown Expect → close after flush).
 ;;;                    Caller must flip the fd to EPOLLOUT.
 ;;;   :WEBSOCKET     — WebSocket frame(s) available to process
+;;;   :DECIDE-BODY   — the head of a request with a body is here, and
+;;;                    *BODY-HANDLER* is to decide what becomes of the
+;;;                    body before any of it is read. Second value: the
+;;;                    peer's FIN has arrived. The caller calls the
+;;;                    handler, then CONNECTION-BEGIN-BODY for the verdict
+;;;                    this function would otherwise have given.
+;;;   :RECEIVED      — a body being received is complete: its plan's
+;;;                    ON-END is to answer the request
+;;;   :REFUSED       — a body being received was refused by its plan's FEED;
+;;;                    second value: the response to send
+;;;   :PAUSED        — a body being received was paused by its plan's FEED;
+;;;                    the caller unsubscribes it until BODY-RESUME
+;;;   :ENDED         — a body being received was ended, and answered, from
+;;;                    inside its plan's FEED; the caller has nothing to do
+;;;   :YIELD         — a body being received has more in the kernel than
+;;;                    one wake-up hands over; the caller arms
+;;;                    writability so the read resumes next pass
 ;;;   :CLOSE         — connection should be closed
 ;;; ---------------------------------------------------------------------------
+
+(defun connection-unfinished (conn peer-finished)
+  "The verdict every 'not yet' site answers with, once it has found CONN's
+   request unfinished. PEER-FINISHED is true when the peer's FIN arrived
+   in the read that brought the request this far.
+
+   :CONTINUE means more bytes will finish this request. When the peer's
+   FIN arrived in the same read no more bytes can, so the request is
+   unfinishable rather than merely incomplete, and the answer is :CLOSE:
+   the slot is not held until *IDLE-TIMEOUT* for a peer that has gone.
+   That is distinct from CONNECTION-ON-READ's :EOF arm, which fires when
+   nothing is buffered at all; this is the case where bytes arrived and
+   were not enough.
+
+   Framing-independent on purpose: a Content-Length body short of its
+   declared length and a chunked body without its terminator are
+   unfinishable for the same reason, and the second has no declared
+   length to compare against. The question is only whether the state
+   machine still wants bytes.
+
+   The Expect: 100-continue arms sit *above* this in CONNECTION-BEGIN-
+   BODY, so a request whose peer FINs after the headers has an interim
+   queued before the FIN is noticed — one wasted write to a peer that is
+   gone. Deliberate: gating the interim on the FIN would risk withholding
+   it from a live client to save a write to a dead one, and a client
+   waiting the full 1-3s for an interim that never comes is the failure
+   interims exist to avoid.
+
+   And a buffer at CONNECTION-READ-CAP holding a request that is not
+   finished will never hold a finished one, so it is refused here with
+   the :FULL arm's 413. The :FULL arm sees only a buffer that was already
+   full when the read began; the read that fills it reports :OK, because
+   it read something, and stops with the rest of the request still in the
+   kernel. An edge-triggered descriptor reports no new edge for bytes
+   already there, so a client that had sent everything would get no
+   answer until the idle sweep closed it. The refusal must come only from
+   a site that has found the request unfinished, because the same full
+   buffer can hold a request that is complete. A peer that has gone is
+   answered first: there is no one to send a 413 to."
+  (let ((buf (connection-read-buf conn)))
+    (cond
+      (peer-finished :close)
+      ((and (>= (connection-read-pos conn) (length buf))
+            (>= (length buf) (connection-read-cap conn)))
+       (http-reject 413 "request too large (buffer full)"))
+      (t :continue))))
+
+(defun connection-drop-read-bytes (conn from to)
+  "Remove BUF[FROM, TO) from CONN's read buffer, moving what follows down
+   to FROM. A received body's bytes are dropped once its plan's FEED has
+   taken them, so the buffer holds what is still to be handed over and
+   nothing else.
+
+   A buffer grown before the body was received — a read can fill it to the
+   default cap while the head waits for the body handler — is replaced by
+   one the size of CONNECTION-READ-CAP once what it holds fits, so the
+   window really is what a received body costs."
+  (let* ((buf (connection-read-buf conn))
+         (end (connection-read-pos conn))
+         (held (- end (- to from))))
+    (replace buf buf :start1 from :start2 to :end2 end)
+    (setf (connection-read-pos conn) held)
+    (let ((cap (connection-read-cap conn)))
+      (when (and (> (length buf) cap) (<= held cap))
+        (let ((fresh (make-array cap :element-type '(unsigned-byte 8))))
+          (replace fresh buf :end2 held)
+          (setf (connection-read-buf conn) fresh))))))
+
+(defun connection-deliver-body (conn)
+  "Hand what has arrived of CONN's received body to its plan's FEED, and
+   drop what the feed took from the read buffer. Returns:
+
+     :RECEIVED   the body is complete, and REQUEST-END says where it
+                 ended, for the keep-alive reset
+     :REFUSED    the feed answered; the second value is its response, and
+                 nothing more of the body was handed over
+     :PAUSED     the feed asked for a pause; nothing more was handed over,
+                 and what is still in the buffer — the rest of the run the
+                 pause fell in, and whatever followed it — waits there for
+                 BODY-RESUME. A pause that comes with the body's last
+                 bytes holds ON-END back too: an application pausing has
+                 said it is not ready, and the end of the body is
+                 something it must be ready for
+     :ENDED      the body was ended from inside the feed: an application
+                 callback called BODY-REFUSE rather than returning its
+                 response. That answered the request, so nothing is left
+                 to do, and nothing more of the body is handed over
+     NIL         keep reading
+
+   Raises what the body has earned instead — 413 past its cap, 400 for
+   malformed framing or a trailer section — having first ended the body
+   with that reason through NOTIFY-BODY-ABORTED. The reason is known here
+   and nowhere else: the catch that answers the raise sees only a status.
+
+   The feed is handed one run a read, whatever the framing. A chunked
+   body's data is gathered first: the walk moves each chunk's bytes down
+   over the framing before them, which it has passed, so the read's data
+   lies contiguous from the body's start, as a Content-Length body's does.
+   Handed over a chunk at a time instead, a client choosing one-byte
+   chunks would cost a call into the application, and through
+   FORWARD-BODY a write upstream, for every byte.
+
+   The run is held to the cap before any of it is handed over: every
+   chunk in it, as declared, must keep the total within the cap, and a
+   size line declaring more is refused on arrival with none of that read's
+   run delivered."
+  (let* ((plan (connection-body-receiver conn))
+         (buf (connection-read-buf conn))
+         (body-start (+ (connection-header-end conn) 4))
+         (end (connection-read-pos conn))
+         (limit (body-plan-max-size plan))
+         (answer nil)
+         (over nil)
+         (ended nil))
+    (flet ((hand-over (from to)
+             ;; (values HALT UPTO): BUF[FROM, TO) to the feed, which took it
+             ;; to UPTO. The run is counted before the feed sees it and what
+             ;; a pause left untaken is counted back out, so the total is
+             ;; always the bytes taken.
+             (incf (connection-body-received conn) (- to from))
+             (multiple-value-bind (verdict upto)
+                 (funcall (body-plan-feed plan) conn buf from to)
+               (cond
+                 ((not (eq (connection-body-receiver conn) plan))
+                  (setf ended t)
+                  (values :halt to))
+                 ((typep verdict 'http-response)
+                  (setf answer verdict)
+                  (values :halt to))
+                 ((eq verdict :pause)
+                  (unless (and (integerp upto) (<= from upto to))
+                    (error "body feed paused at ~s, outside its run [~d, ~d)"
+                           upto from to))
+                  (decf (connection-body-received conn) (- to upto))
+                  (setf (connection-body-paused conn) t)
+                  (values :halt upto))
+                 (t (values nil to)))))
+           (refuse (reason status format-string &rest args)
+             (notify-body-aborted conn reason)
+             (apply #'http-reject status format-string args)))
+      (ecase (connection-body-framing conn)
+        (:length
+         (let ((take (min (- (connection-body-expected conn)
+                             (connection-body-received conn))
+                          (- end body-start))))
+           (when (plusp take)
+             (let ((upto (nth-value 1 (hand-over body-start (+ body-start take)))))
+               (when ended
+                 (return-from connection-deliver-body :ended))
+               (connection-drop-read-bytes conn body-start upto)))
+           (cond
+             (answer (values :refused answer))
+             ((connection-body-paused conn) :paused)
+             ((= (connection-body-received conn) (connection-body-expected conn))
+              ;; What is left after the body is the next request's.
+              (setf (connection-request-end conn) body-start)
+              :received)
+             (t nil))))
+        (:chunked
+         ;; RUN-END is where the run being gathered ends. It starts past
+         ;; what a pause left untaken, which is gathered already, and the
+         ;; walk over the framing resumes there.
+         (let ((run-end (+ body-start (connection-body-held conn))))
+           (multiple-value-bind (complete next owed data-bytes pending
+                                 after-size-line)
+               (handler-case
+                   (chunked-body-feed
+                    buf run-end end (connection-body-owed conn)
+                    (lambda (b from to rest)
+                      (declare (ignore b))
+                      ;; The run so far, this chunk's bytes and the rest of
+                      ;; the chunk, as declared, against the cap — before
+                      ;; the feed sees any of them.
+                      (let ((projected (+ (connection-body-received conn)
+                                          (- run-end body-start)
+                                          (- to from) rest)))
+                        (if (> projected limit)
+                            (progn (setf over projected) :halt)
+                            ;; Down over the framing the walk has passed.
+                            ;; RUN-END never passes FROM, so nothing the walk
+                            ;; has still to read is written over.
+                            (progn
+                              (replace buf buf :start1 run-end :start2 from :end2 to)
+                              (incf run-end (- to from))
+                              nil)))))
+                 (chunked-framing-error (e)
+                   (refuse :malformed 400 "malformed chunked framing: ~a" e)))
+             (declare (ignore data-bytes))
+             (when over
+               (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
+                       over limit))
+             (let ((projected (+ (connection-body-received conn)
+                                 (- run-end body-start) pending)))
+               (when (> projected limit)
+                 (refuse :too-large 413 "chunked body too large (~d bytes, max ~d)"
+                         projected limit)))
+             (setf (connection-body-owed conn) owed)
+             (let ((upto (if (> run-end body-start)
+                             (nth-value 1 (hand-over body-start run-end))
+                             run-end)))
+               (when ended
+                 (return-from connection-deliver-body :ended))
+               ;; Short of RUN-END only after a pause.
+               (setf (connection-body-held conn) (- run-end upto))
+               (cond
+                 (answer
+                  (connection-drop-read-bytes conn body-start next)
+                  (values :refused answer))
+                 ;; A pause: keep the run's untaken bytes where they are and
+                 ;; what the walk has not reached, and drop between them the
+                 ;; framing the walk passed after the run; then drop the part
+                 ;; of the run the feed took. BODY-RESUME's read hands the
+                 ;; untaken bytes over first, and walks on from NEXT.
+                 ((connection-body-paused conn)
+                  (connection-drop-read-bytes conn run-end next)
+                  (connection-drop-read-bytes conn body-start upto)
+                  :paused)
+                 (complete
+                  (multiple-value-bind (status offset)
+                      (chunked-trailer-status buf after-size-line end)
+                    (ecase status
+                      ;; The empty trailer's CRLF has not arrived: keep the
+                      ;; zero-size line, which the next call reads again.
+                      (:incomplete
+                       (connection-drop-read-bytes conn body-start next)
+                       nil)
+                      (:present
+                       (refuse :malformed 400 "trailer section not accepted"))
+                      (:malformed
+                       (refuse :malformed 400
+                               "malformed chunked framing after terminator"))
+                      (:empty
+                       (connection-drop-read-bytes conn body-start offset)
+                       (setf (connection-request-end conn) body-start)
+                       :received))))
+                 (t
+                  (connection-drop-read-bytes conn body-start next)
+                  nil))))))))))
+
+(defun connection-receive (conn peer-finished)
+  "Hand CONN's received body over as it arrives, reading again for as long
+   as each read filled the window and the body is still owed, up to
+   +RECEIVE-ROUNDS+ windows in one wake-up. Returns CONNECTION-DELIVER-
+   BODY's :RECEIVED, :REFUSED (with its response), :PAUSED or :ENDED, or:
+
+     :CONTINUE  the kernel has nothing more yet
+     :CLOSE     the peer's FIN has arrived and the body is not complete
+     :YIELD     the rounds are spent with the window still filling; the
+                caller arms writability so the read resumes next pass
+
+   The read has to be repeated here because the drain that filled the
+   window stopped with bytes still in the kernel, and an edge-triggered
+   descriptor reports no new edge for those."
+  (loop with rounds = 0
+        do (let ((full (>= (connection-read-pos conn)
+                           (length (connection-read-buf conn)))))
+             (multiple-value-bind (verdict response)
+                 (connection-deliver-body conn)
+               (when verdict
+                 (return (values verdict response))))
+             (cond
+               (peer-finished (return :close))
+               ((not full) (return :continue))
+               ((>= (incf rounds) +receive-rounds+) (return :yield))
+               (t
+                (let ((result (connection-read-available conn)))
+                  (setf peer-finished (and (member result '(:eof :ok-eof)) t))
+                  (when (member result '(:ok :ok-eof :ok-want-write))
+                    (setf (connection-body-progress-at conn)
+                          (get-universal-time)))))))))
+
+(defun connection-begin-body (conn peer-finished)
+  "Start reading the body of CONN's request, whose head has arrived and
+   whose framing CONNECTION-ON-READ has recorded. Returns the verdict
+   CONNECTION-ON-READ gives — :DISPATCH, :FLUSH-QUEUED (a 100 Continue is
+   queued), :CONTINUE or :CLOSE — or raises the refusal the body has
+   earned. PEER-FINISHED is CONNECTION-UNFINISHED's.
+
+   Split out of CONNECTION-ON-READ because the body's cap may not be
+   known when the head is read: a body handler decides it, between the
+   head and this, and nothing here may run before it does — not the size
+   checks, which need the cap, not the walk over a chunked body, which
+   enforces it, and not the 100 Continue, which invites a body the handler
+   may refuse. Without a body handler this runs at once, in the same call
+   that read the head.
+
+   A body being received is handed over from here as it is for every read
+   after: what arrived with the head goes to its plan's FEED at once. The
+   read cap does not bound it, the window does, so the only size check is
+   the cap's own."
+  (let* ((body-start (+ (connection-header-end conn) 4))
+         (buf (connection-read-buf conn)))
+    (when (connection-body-receiver conn)
+      (let ((limit (connection-max-body conn)))
+        (when (and (eq (connection-body-framing conn) :length)
+                   (> (connection-body-expected conn) limit))
+          (notify-body-aborted conn :too-large)
+          (http-reject 413 "body too large (~d bytes, max ~d)"
+                       (connection-body-expected conn) limit)))
+      (return-from connection-begin-body
+        (cond
+          ((and (connection-expect-continue conn)
+                (= (connection-read-pos conn) body-start))
+           (connection-queue-write conn *http-100-continue-bytes*)
+           (setf (connection-state conn) :sending-100-continue)
+           :flush-queued)
+          (t
+           (setf (connection-state conn) :read-body)
+           (connection-receive conn peer-finished)))))
+    (ecase (connection-body-framing conn)
+      (:length
+       (let ((content-length (connection-body-expected conn))
+             (limit (connection-max-body conn)))
+         ;; Reject oversized bodies before reading them.
+         (when (> content-length limit)
+           (http-reject 413 "body too large (~d bytes, max ~d)"
+                        content-length limit))
+         ;; The buffer is not grown here to the length the client declared.
+         ;; A declaration is one header line, and honouring it up front would
+         ;; let a head of a few dozen bytes make the server allocate up to the
+         ;; body cap before any body arrived — that much per connection, for
+         ;; whoever opens connections and sends nothing more.
+         ;; CONNECTION-READ-AVAILABLE grows the buffer as bytes arrive, so the
+         ;; memory follows what was sent.
+         ;;
+         ;; It grows only to CONNECTION-READ-CAP, so a request whose head and
+         ;; body together pass the cap is refused here, before its body is
+         ;; waited for. The cap is the sum of the request-line, header and
+         ;; body budgets, so a head within its own budgets always leaves room
+         ;; for a body within its cap: only a head over them gets here, and
+         ;; parsing it raises what it has earned — 414 or 431 for the budget,
+         ;; or whatever else is wrong with it first. Waiting would fill the
+         ;; buffer to the cap with the rest of the body still in the kernel,
+         ;; and an edge-triggered descriptor reports no new edge for bytes
+         ;; already there, so a client that had sent everything would get no
+         ;; answer until the idle sweep closed it. The 413 is for a head the
+         ;; parser accepts, which the arithmetic says cannot happen; it keeps
+         ;; the refusal from resting on that.
+         (let ((cap (connection-read-cap conn)))
+           (when (> (+ body-start content-length) cap)
+             (parse-request-bytes buf 0 body-start)
+             (http-reject 413 "request too large (~d bytes, max ~d)"
+                          (+ body-start content-length) cap)))
+         (cond
+           ;; Already have the full body — dispatch even if Expect:
+           ;; 100-continue is set. The client chose not to wait, and sending
+           ;; 100 now is pointless.
+           ((>= (- (connection-read-pos conn) body-start) content-length)
+            (setf (connection-state conn) :read-body)
+            :dispatch)
+           ;; Body still incoming and client asked for 100 Continue. RFC 7231
+           ;; §5.1.1 scopes 1xx to HTTP/1.1; a 1.0 client with Expect gets its
+           ;; body read without the interim.
+           ((connection-expect-continue conn)
+            (connection-queue-write conn *http-100-continue-bytes*)
+            (setf (connection-state conn) :sending-100-continue)
+            :flush-queued)
+           ;; Plain body wait.
+           (t
+            (setf (connection-state conn) :read-body)
+            (connection-unfinished conn peer-finished)))))
+      (:chunked
+       (cond
+         ;; The whole body can already be buffered — a small upload arrives
+         ;; in one read — so ask before waiting for an event that would
+         ;; never come.
+         ;;
+         ;; This case matters more here than on the Content-Length path. A
+         ;; client that sent Expect: 100-continue and then sent its body
+         ;; anyway did not wait, and a chunked sender that did not wait has
+         ;; usually sent the whole thing — so answering with an interim it
+         ;; is no longer listening for is pure latency on the common shape,
+         ;; not a rare one.
+         ((connection-body-complete-p conn)
+          (setf (connection-state conn) :read-body)
+          :dispatch)
+         ;; The interim, under the same rule the Content-Length arm states:
+         ;; HTTP/1.1, and the client asked.
+         ((connection-expect-continue conn)
+          (connection-queue-write conn *http-100-continue-bytes*)
+          (setf (connection-state conn) :sending-100-continue)
+          :flush-queued)
+         (t
+          (setf (connection-state conn) :read-body)
+          (connection-unfinished conn peer-finished)))))))
 
 (defun connection-on-read (conn)
   "Handle readable event. Reads available data and advances protocol state."
   (let* ((read-result (connection-read-available conn))
-         ;; The verdict every "not yet" site answers with. :CONTINUE means
-         ;; more bytes will finish this request; when the peer's FIN arrived
-         ;; in the same read no more bytes can, so the request is
-         ;; unfinishable rather than merely incomplete and the slot is not
-         ;; held until *IDLE-TIMEOUT* for a peer that has gone. Distinct
-         ;; from the :EOF arm below, which fires when nothing is buffered at
-         ;; all; this is the case where bytes arrived and were not enough.
-         ;;
-         ;; Framing-independent on purpose: a Content-Length body short of
-         ;; its declared length and a chunked body without its terminator
-         ;; are unfinishable for the same reason, and the second has no
-         ;; declared length to compare against. The question is only whether
-         ;; the state machine still wants bytes.
-         ;;
-         ;; The Expect: 100-continue arms sit *above* this in both body
-         ;; conds, so a request whose peer FINs after the headers has an
-         ;; interim queued before the FIN is noticed — one wasted write to a
-         ;; peer that is gone. Deliberate: gating the interim on this value
-         ;; would risk withholding it from a live client to save a write to
-         ;; a dead one, and a client waiting the full 1-3s for an interim
-         ;; that never comes is the failure interims exist to avoid.
-         (unfinished (if (member read-result '(:eof :ok-eof))
-                         :close
-                         :continue)))
+         (peer-finished (and (member read-result '(:eof :ok-eof)) t))
+         ;; The verdict every "not yet" site answers with; see
+         ;; CONNECTION-UNFINISHED.
+         (unfinished
+           (lambda () (connection-unfinished conn peer-finished)))
+         ;; The verdict once the head of a request with a body has been read
+         ;; and its framing recorded. With a body handler, the head goes to
+         ;; it first: the caller asks, then calls CONNECTION-BEGIN-BODY. The
+         ;; state is :READ-BODY either way, so an error answered meanwhile is
+         ;; answered as one raised while reading the request.
+         (body-head
+           (lambda ()
+             (if *body-handler*
+                 (progn (setf (connection-state conn) :read-body)
+                        (values :decide-body peer-finished))
+                 (connection-begin-body conn peer-finished)))))
     ;; :OK and :OK-EOF both fall through to the state machine below, and
     ;; deliberately: bytes are bytes, and a fire-and-close client whose
     ;; request arrived with its FIN still deserves an answer. The :EOF arm
@@ -1120,8 +1848,8 @@
          ((eq (connection-state conn) :websocket)
           (return-from connection-on-read :websocket))
          ;; :read-body with a complete body means the buffer cap fired
-         ;; after we already had everything we need (content-length
-         ;; near *MAX-BODY-SIZE*, or pipelined bytes queued past the
+         ;; after we already had everything we need (a request that
+         ;; fills the cap exactly, or pipelined bytes queued past the
          ;; body). Fall through to the state-machine dispatch check.
          ;;
          ;; Through CONNECTION-BODY-COMPLETE-P rather than by recomputing
@@ -1131,12 +1859,24 @@
          ;; complete while :READ-BODY kept waiting for a terminator no
          ;; further read could deliver.
          ((and (eq (connection-state conn) :read-body)
-               (connection-body-complete-p conn))
+               ;; A body being received is handed over from the buffer by
+               ;; the state machine below, which is what makes room in it;
+               ;; the walk that asks whether a buffered body is complete is
+               ;; not its reader.
+               (or (connection-body-receiver conn)
+                   (connection-body-complete-p conn)))
           nil)
          (t
           ;; The buffer is at CONNECTION-READ-CAP with no complete
           ;; request in it. Whatever the client is sending, there is
           ;; more of it than we will hold — 413, not 400.
+          ;;
+          ;; Reached in :READ-BODY, by a body short of its end at the cap:
+          ;; a chunked body whose framing outgrows it. Not in :READ-HTTP
+          ;; while the cap is REQUEST-HEAD-BUDGET plus the body's share,
+          ;; because a head still unended at its budget is refused on the
+          ;; read that crosses it, before the buffer can fill. The arm
+          ;; covers both, so the bound holds if that arithmetic changes.
           (http-reject 413 "request too large (buffer full)"))))
       (:again (when (zerop (connection-read-pos conn))
                 (return-from connection-on-read :continue))))
@@ -1150,14 +1890,23 @@
     (ecase (connection-state conn)
       (:read-http
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
-                                          0 (connection-read-pos conn))))
+                                          (max 0 (- (connection-header-scan-pos
+                                                     conn)
+                                                    3))
+                                          (connection-read-pos conn))))
          (if header-end
              (let* ((buf (connection-read-buf conn))
                     ;; Scanners match on CRLF-anchored header patterns,
                     ;; so starting at byte 0 lets a \r\n injected in the
                     ;; request-target create a fake header boundary before
                     ;; parse-request-bytes validates CTL bytes.
-                    (req-line-end (scan-crlf buf 0 header-end)))
+                    ;;
+                    ;; Searched through the terminator's first CRLF: a
+                    ;; head with no header fields, `GET / HTTP/1.0` and
+                    ;; CRLFCRLF, ends its request line there. Its fields
+                    ;; then run from HEADER-END + 2 to HEADER-END, which
+                    ;; every scanner below reads as none.
+                    (req-line-end (scan-crlf buf 0 (+ header-end 2))))
                (unless req-line-end
                  (http-parse-error "no CRLF in request line"))
                ;; Verify the request line ends with HTTP/1.x before
@@ -1274,6 +2023,10 @@
                         (expect (scan-expect-disposition
                                  buf header-end hdr-start)))
                  (cond
+                   ;; An Expect value this scan and the parser would read
+                   ;; differently: refused with the parser's 400.
+                   ((eq expect :invalid)
+                    (http-parse-error "malformed Expect value"))
                    ;; Unknown Expect → 417 regardless of body. RFC 7231
                    ;; §5.1.1 MAY; framework always 417s so a GET probe
                    ;; can't bypass the check a matching POST receives.
@@ -1301,8 +2054,11 @@
                        (format-response (make-error-response 417)
                                         :connection-hint :close
                                         :head-only-p head-p)))
+                    ;; Lingering: a client with a body may be sending it
+                    ;; anyway, and an unread byte at close is a reset.
                     (setf (connection-state conn) :write-response
-                          (connection-close-after-p conn) t)
+                          (connection-close-after-p conn) t
+                          (connection-linger conn) t)
                     :flush-queued)
                    ;; Chunked body. Ahead of the Content-Length arm rather
                    ;; than inside it, because a chunked request declares no
@@ -1320,110 +2076,38 @@
                     ;; when the framing walk reaches the terminator.
                     (setf (connection-header-end conn) header-end
                           (connection-body-framing conn) :chunked
-                          (connection-chunk-scan-pos conn) 0)
-                    (cond
-                      ;; The whole body can already be buffered — a small
-                      ;; upload arrives in one read — so ask before
-                      ;; waiting for an event that would never come.
-                      ;;
-                      ;; This case matters more here than on the
-                      ;; Content-Length path. A client that sent
-                      ;; Expect: 100-continue and then sent its body
-                      ;; anyway did not wait, and a chunked sender that
-                      ;; did not wait has usually sent the whole thing —
-                      ;; so answering with an interim it is no longer
-                      ;; listening for is pure latency on the common
-                      ;; shape, not a rare one.
-                      ((connection-body-complete-p conn)
-                       (setf (connection-state conn) :read-body)
-                       :dispatch)
-                      ;; RFC 7231 §5.1.1 scopes 1xx to HTTP/1.1. The
-                      ;; version test cannot fire here — a chunked request
-                      ;; is already refused unless it is 1.1, three arms
-                      ;; up — and it is stated anyway, for the reason
-                      ;; REQUEST-END is stated by every completing path
-                      ;; rather than inherited from the reset: a site's
-                      ;; correctness should not ride on a check somewhere
-                      ;; else. The Content-Length arm at this same
-                      ;; decision point carries the identical guard, so
-                      ;; with it the two arms read as one rule and without
-                      ;; it they read as two.
-                      ((and (= minor-version-byte 49)
-                            (eq expect :100-continue))
-                       (connection-queue-write
-                        conn *http-100-continue-bytes*)
-                       (setf (connection-state conn) :sending-100-continue)
-                       :flush-queued)
-                      (t
-                       (setf (connection-state conn) :read-body)
-                       unfinished)))
+                          (connection-chunk-scan-pos conn) 0
+                          ;; RFC 7231 §5.1.1 scopes 1xx to HTTP/1.1. The
+                          ;; version test cannot fail here — a chunked
+                          ;; request is already refused unless it is 1.1,
+                          ;; three arms up — and it is stated anyway, for
+                          ;; the reason REQUEST-END is stated by every
+                          ;; completing path rather than inherited from the
+                          ;; reset: a site's correctness should not ride on
+                          ;; a check somewhere else. The Content-Length arm
+                          ;; below states the identical rule, so the two
+                          ;; arms read as one rule and not as two.
+                          (connection-expect-continue conn)
+                          (and (= minor-version-byte 49)
+                               (eq expect :100-continue)))
+                    (funcall body-head))
                    ;; Body present — read it, dispatching when complete.
                    ((and content-length (> content-length 0))
-                    ;; Reject oversized bodies before allocating.
-                    (when (> content-length *max-body-size*)
-                      (http-reject 413 "body too large (~d bytes, max ~d)"
-                                   content-length *max-body-size*))
-                    ;; Grow read buffer if needed.
-                    (let ((total-needed (+ body-start content-length)))
-                      (when (> total-needed (length (connection-read-buf conn)))
-                        (let ((new-buf (make-array total-needed
-                                                   :element-type '(unsigned-byte 8)
-                                                   :initial-element 0)))
-                          (replace new-buf (connection-read-buf conn)
-                                   :end2 (connection-read-pos conn))
-                          (setf (connection-read-buf conn) new-buf))
-                        ;; Re-drain: buffer grew past connection-read-available's
-                        ;; original cap, kernel may still have data (edge-triggered).
-                        ;; :EOF and :OK-EOF (peer FIN'd, with or without
-                        ;; bytes on the way past) and :FULL (buffer at cap)
-                        ;; are terminal only if the body is still
-                        ;; incomplete. :OK-EOF belongs here for the same
-                        ;; reason :EOF does — a body that arrives with its
-                        ;; own FIN and is still short of Content-Length is
-                        ;; never going to be completed, and waiting for a
-                        ;; wake-up that cannot come just holds the slot
-                        ;; until the idle sweeper takes it.
-                        ;; When CONTENT-LENGTH is at or near *MAX-BODY-SIZE*,
-                        ;; the pre-grown buffer exceeds the drain cap and
-                        ;; :FULL fires at pos = body-start+CL — which IS
-                        ;; the complete body. Close only on truly incomplete
-                        ;; bodies so that CL-at-cap requests still dispatch.
-                        (case (connection-read-available conn)
-                          ((:eof :ok-eof :full)
-                           (when (< (- (connection-read-pos conn) body-start)
-                                    content-length)
-                             (return-from connection-on-read :close))))))
-                    (let ((body-available (- (connection-read-pos conn) body-start)))
-                      (setf (connection-body-expected conn) content-length
-                            (connection-header-end conn) header-end
-                            ;; The wire end of a Content-Length request is
-                            ;; its declared end. Stated rather than derived,
-                            ;; because the chunked arm cannot state it here
-                            ;; at all — it is not known until the framing
-                            ;; walk reaches the terminator.
-                            (connection-request-end conn)
-                            (+ body-start content-length))
-                      (cond
-                        ;; Already have the full body — dispatch even if
-                        ;; Expect: 100-continue is set. The client chose
-                        ;; not to wait, and sending 100 now is pointless.
-                        ((>= body-available content-length)
-                         (setf (connection-state conn) :read-body)
-                         :dispatch)
-                        ;; Body still incoming and client asked for
-                        ;; 100 Continue. RFC 7231 §5.1.1 scopes 1xx to
-                        ;; HTTP/1.1; a 1.0 client with Expect gets its
-                        ;; body read without the interim.
-                        ((and (= minor-version-byte 49)
-                              (eq expect :100-continue))
-                         (connection-queue-write
-                          conn *http-100-continue-bytes*)
-                         (setf (connection-state conn) :sending-100-continue)
-                         :flush-queued)
-                        ;; Plain body wait.
-                        (t
-                         (setf (connection-state conn) :read-body)
-                         unfinished))))
+                    (setf (connection-body-expected conn) content-length
+                          (connection-header-end conn) header-end
+                          ;; The wire end of a Content-Length request is its
+                          ;; declared end. Stated rather than derived,
+                          ;; because the chunked arm cannot state it here at
+                          ;; all — it is not known until the framing walk
+                          ;; reaches the terminator.
+                          (connection-request-end conn)
+                          (+ body-start content-length)
+                          ;; A 1.0 client with Expect gets its body read
+                          ;; without the interim.
+                          (connection-expect-continue conn)
+                          (and (= minor-version-byte 49)
+                               (eq expect :100-continue)))
+                    (funcall body-head))
                    ;; No body — request is complete.
                    (t
                     ;; BODY-EXPECTED is deliberately not set here: it is
@@ -1436,27 +2120,154 @@
                     (setf (connection-header-end conn) header-end
                           (connection-request-end conn) (+ header-end 4))
                     :dispatch)))))))
-             ;; No CRLFCRLF yet — keep reading
-             unfinished)))
+             ;; No CRLFCRLF yet — keep reading, and resume the search near
+             ;; here next time rather than from the start. Unless the head
+             ;; has reached its budget: then it is decided, not incomplete,
+             ;; since a terminator still to come would make it longer than
+             ;; any head the parser accepts. Waiting for the read cap
+             ;; instead would hold fourteen times the head budget per
+             ;; connection and answer with an idle close, or a 413 naming
+             ;; the body. Checked against the count, never by rescanning,
+             ;; so a head that arrives a byte at a time costs no more.
+             (progn
+               (when (>= (connection-read-pos conn) (request-head-budget))
+                 (refuse-unterminated-head (connection-read-buf conn)
+                                           (connection-read-pos conn)))
+               (setf (connection-header-scan-pos conn) (connection-read-pos conn))
+               (funcall unfinished)))))
       (:read-body
-       (if (connection-body-complete-p conn)
-           :dispatch
-           unfinished))
+       ;; A body a body handler accepted is timed on its progress, so every
+       ;; read that brought some of it moves the clock. Bytes, not events:
+       ;; a wake-up that read nothing is not progress.
+       (when (and (plusp (connection-body-progress-at conn))
+                  (member read-result '(:ok :ok-eof :ok-want-write)))
+         (setf (connection-body-progress-at conn) (get-universal-time)))
+       (cond
+         ;; Paused: what this read brought waits in the buffer, within the
+         ;; window, for BODY-RESUME. Only a stale event can get here — a
+         ;; paused body is subscribed to none.
+         ((and (connection-body-receiver conn) (connection-body-paused conn))
+          :continue)
+         ((connection-body-receiver conn)
+          (connection-receive conn peer-finished))
+         ((connection-body-complete-p conn) :dispatch)
+         (t (funcall unfinished))))
+      ;; The second value says the peer's FIN has arrived. Frames already
+      ;; buffered are still the peer's to have answered, so this does not
+      ;; close; HANDLE-CLIENT-READ does, once they are processed, because
+      ;; nothing can follow a FIN and a frame left unfinished never will
+      ;; be. Without it, a socket at end of stream stays readable, and
+      ;; every wake-up finds the same partial frame again.
       (:websocket
-       :websocket))))
+       (values :websocket peer-finished)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Parse the buffered request
 ;;; ---------------------------------------------------------------------------
 
+(defun %reg-name-char-p (c)
+  "True for a character a reg-name holds as itself: RFC 3986's unreserved
+   characters and sub-delims, all of them ASCII."
+  (or (char<= #\a c #\z) (char<= #\A c #\Z) (char<= #\0 c #\9)
+      (find c "-._~!$&'()*+,;=")))
+
+(defun %reg-name-p (s start end)
+  "True when S[START, END) is an RFC 3986 reg-name: characters
+   %REG-NAME-CHAR-P accepts and %XX escapes of two hex digits, any number
+   of them or none."
+  (loop with i = start
+        while (< i end)
+        do (let ((c (char s i)))
+             (cond ((%reg-name-char-p c) (incf i))
+                   ((and (char= c #\%)
+                         (<= (+ i 3) end)
+                         (hex-digit-value (char-code (char s (+ i 1))))
+                         (hex-digit-value (char-code (char s (+ i 2)))))
+                    (incf i 3))
+                   (t (return nil))))
+        finally (return t)))
+
+(defun %ip-future-p (s)
+  "True when S is RFC 3986's IPvFuture: v, hex digits, a dot, and then
+   unreserved characters, sub-delims and colons."
+  (let ((dot (position #\. s)))
+    (and dot
+         (> dot 1)
+         (< (1+ dot) (length s))
+         (char-equal (char s 0) #\v)
+         (loop for i from 1 below dot
+               always (hex-digit-value (char-code (char s i))))
+         (loop for i from (1+ dot) below (length s)
+               always (or (%reg-name-char-p (char s i))
+                          (char= (char s i) #\:))))))
+
+(defun host-field-valid-p (value)
+  "True when VALUE, a Host field's value, is what RFC 9110 §7.2 allows: a
+   host, then optionally a colon and a port of digits.
+
+   The host is RFC 3986's: an IPv6 address or an IPvFuture in brackets,
+   checked by PARSE-IPV6-LITERAL and %IP-FUTURE-P, or a reg-name, which
+   covers an IPv4 address as well. A reg-name may be empty, and so may the
+   port: an empty Host is what a client sends for a target with no
+   authority. An IPv6 address outside brackets is not a host, nor is one
+   with a zone identifier inside them."
+  (let* ((len (length value))
+         (host-end
+           (if (and (plusp len) (char= (char value 0) #\[))
+               (let ((close (position #\] value)))
+                 (and close
+                      (let ((inside (subseq value 1 close)))
+                        (or (parse-ipv6-literal inside)
+                            (%ip-future-p inside)))
+                      (1+ close)))
+               (let ((end (or (position #\: value) len)))
+                 (and (%reg-name-p value 0 end) end)))))
+    (and host-end
+         (or (= host-end len)
+             (and (char= (char value host-end) #\:)
+                  (loop for i from (1+ host-end) below len
+                        always (char<= #\0 (char value i) #\9)))))))
+
+(defun connection-parse-head (conn)
+  "Parse the head of CONN's request from the read buffer — request line
+   and headers, without the body — and set the connection's request field
+   to it. Returns the request, whose body is NIL, or signals.
+
+   Separate from CONNECTION-PARSE-REQUEST because a body handler is asked
+   about the body before any of it is read, so its request is parsed once
+   the head is in and handed over bodiless. Every check a request's head
+   is held to happens here, so a body handler is never shown a head the
+   framework would go on to refuse."
+  (let* ((body-start (+ (connection-header-end conn) 4))
+         (request (parse-request-bytes (connection-read-buf conn)
+                                       0 body-start)))
+    ;; RFC 9112 §3.2: a 400 for an HTTP/1.1 request with no Host, and for
+    ;; any request with more than one Host field line or a Host that is
+    ;; not host[:port]. Any request, HTTP/1.0 too: a handler reads Host the
+    ;; same way on both, and two of them are the split by which a proxy in
+    ;; front routes a request by one name and the handler sees another.
+    (let ((hosts (get-headers request "host")))
+      (when (and (null hosts) (string= (http-request-version request) "1.1"))
+        (http-parse-error "missing Host header in HTTP/1.1 request"))
+      (when (rest hosts)
+        (http-parse-error "duplicate Host header"))
+      (when (and hosts (not (host-field-valid-p (first hosts))))
+        (http-parse-error "malformed Host header")))
+    (setf (connection-request conn) request)
+    request))
+
 (defun connection-parse-request (conn)
-  "Parse the complete HTTP request from the read buffer.
-   Sets the connection's request field. Returns the request or signals error."
+  "Parse the complete HTTP request from the read buffer, body included.
+   Sets the connection's request field. Returns the request or signals
+   error.
+
+   The head is the one CONNECTION-PARSE-HEAD already parsed when a body
+   handler was asked about this request, and is parsed here otherwise."
   (let* ((header-end (connection-header-end conn))
          (body-start (+ header-end 4))
          (content-length (connection-body-expected conn))
-         (request (parse-request-bytes (connection-read-buf conn)
-                                       0 body-start)))
+         (request (or (connection-request conn)
+                      (connection-parse-head conn))))
     (ecase (connection-body-framing conn)
       (:length
        (when (> content-length 0)
@@ -1464,14 +2275,13 @@
                (subseq (connection-read-buf conn) body-start
                        (+ body-start content-length)))))
       (:chunked
-       ;; The framing walk that got us here is deliberately lax — it
-       ;; answers "do we have it all yet", and a too-strict predicate
-       ;; would hang rather than refuse. DECODE-CHUNKED-BODY is the
-       ;; validator, so a body the walk waved through can still be
-       ;; rejected here, and its CHUNKED-FRAMING-ERROR becomes the
-       ;; client's 400: the request is malformed, not the server. Any
-       ;; other condition out of the decoder is a defect in the decoder
-       ;; and is deliberately left to become a 500.
+       ;; The framing walk that got us here accepts exactly what
+       ;; DECODE-CHUNKED-BODY accepts, so for a body it completed the
+       ;; decode cannot refuse. The conversion stays all the same: should
+       ;; the two ever disagree, the decoder's CHUNKED-FRAMING-ERROR is
+       ;; still a malformed request and the client's 400, not the
+       ;; server's 500. Any other condition out of the decoder is a
+       ;; defect in the decoder and is deliberately left to become a 500.
        (let ((decoded (handler-case
                           (decode-chunked-body (connection-read-buf conn)
                                                body-start
@@ -1482,14 +2292,6 @@
                ;; BODY-EXPECTED becomes the decoded length, so it means the
                ;; same thing on both paths once the body exists.
                (connection-body-expected conn) (length decoded)))))
-    ;; RFC 7230 §5.4: HTTP/1.1 requests MUST have exactly one Host header
-    (when (string= (http-request-version request) "1.1")
-      (let ((host-count (length (get-headers request "host"))))
-        (when (zerop host-count)
-          (http-parse-error "missing Host header in HTTP/1.1 request"))
-        (when (> host-count 1)
-          (http-parse-error "duplicate Host header"))))
-    (setf (connection-request conn) request)
     request))
 
 ;;; ---------------------------------------------------------------------------
@@ -1534,7 +2336,8 @@
    Per connection, so the worst case is this times *MAX-CONNECTIONS*
    times worker count — the same arithmetic as the read buffers, and
    it needs every connection to be simultaneously backed up to get
-   there. Lower it if the deployment has many connections and a
+   there. What a backlog holds stays near what this counts, however
+   small its writes: %QUEUE-TAIL joins them. Lower it if the deployment has many connections and a
    generous ulimit; raise it for few connections and bursty output.")
 
 (defvar *epoll-fd* nil
@@ -1554,14 +2357,12 @@
    much queued, and queued too long. They share a prefix because they are
    two limits on one thing.
 
-   This was *WS-SEND-TIMEOUT*, which bounded a blocking spin inside
-   WS-SEND back when the thing at risk was the worker. WS-SEND queues and
-   returns now, so what can go wrong is that one connection's queue never
-   drains — and once SSE and chunked streams queue through the same path,
-   a name saying 'ws' pointed operators at the wrong knob for every
-   surface but the one it was named after. Renamed rather than widened
-   quietly: an operator tuning a stalled SSE stream would never have
-   looked at a WebSocket setting.
+   WS-SEND queues and returns, so what can go wrong is not a worker held
+   but one connection's queue that never drains. SSE and chunked streams
+   queue through the same path, so the name says write, not ws: a name
+   saying 'ws' would point operators at the wrong knob for every surface
+   but one, and an operator tuning a stalled SSE stream would never look
+   at a WebSocket setting.
 
    Measured from the last forward progress on the backlog, never from the
    connection's last activity — HANDLE-CLIENT-WRITE bumps LAST-ACTIVE on
@@ -1570,14 +2371,13 @@
 
    An inactivity bound, not a total. It restarts on any byte the peer
    accepts, so a peer that trickles is never closed: its memory is capped
-   by *MAX-WRITE-BACKLOG*, its time is not. Deliberate — the total bound
-   it replaced was a total on the worker, which is the more expensive
-   thing to hold.
+   by *MAX-WRITE-BACKLOG*, its time is not. Deliberate: a trickling peer
+   holds one connection's capped memory, never the worker, which does not
+   wait on a queue.
 
-   No setting disables it. Zero used to mean a worker pinned forever; it
-   would now mean a connection holding a full backlog forever, against
-   idle timeouts that are long by design on exactly the states most
-   likely to build one.")
+   No setting disables it. Zero would mean a connection holding a full
+   backlog forever, against idle timeouts that are long by design on
+   exactly the states most likely to build one.")
 
 (defun connection-write-pending (conn)
   "Unsent bytes on CONN: what is left of the head, plus the queue behind it."
@@ -1609,16 +2409,44 @@
   "Drop all write state. Used where a connection is recycled for its
    next request — keep-alive reset, ws-upgrade completion, 100-continue.
 
-   The queue has to go with the head. Those sites used to zero the three
-   buffer slots inline, which was the whole of the write state; leaving
-   a queued vector behind now would flush it into the *next* response on
-   the same socket, arriving as a prefix nobody sent."
+   The queue has to go with the head. Zeroing only the three buffer
+   slots would leave a queued vector behind, to be flushed into the
+   *next* response on the same socket, arriving as a prefix nobody sent."
   (setf (connection-write-buf conn) nil
         (connection-write-pos conn) 0
         (connection-write-end conn) 0
         (connection-write-queue conn) nil
         (connection-write-queue-tail conn) nil
         (connection-write-queued conn) 0))
+
+(defstruct (write-span (:constructor make-write-span (bytes start end)))
+  "BYTES[START, END) as one piece of a response, for the write queue to send
+   without a copy.
+
+   A 206's body is a slice of a static file that every request for it
+   shares. As a SUBSEQ it would cost a copy of the range per request, held
+   by the connection until its peer has read all of it: a whole-file range,
+   what a browser asks for first on <video>, per slow reader. As a span the
+   slice is the file's own bytes, and only WRITE-POS and WRITE-END, which
+   live on the connection, move through them."
+  (bytes nil :type (simple-array (unsigned-byte 8) (*)))
+  (start 0 :type fixnum)
+  (end 0 :type fixnum))
+
+(defun segment-bounds (segment)
+  "(values BYTES START END) for a write-queue SEGMENT: a byte vector, which
+   is the whole of itself, or a WRITE-SPAN."
+  (if (write-span-p segment)
+      (values (write-span-bytes segment)
+              (write-span-start segment)
+              (write-span-end segment))
+      (values segment 0 (length segment))))
+
+(defun segment-length (segment)
+  "How many bytes SEGMENT puts on the wire."
+  (multiple-value-bind (bytes start end) (segment-bounds segment)
+    (declare (ignore bytes))
+    (- end start)))
 
 (defun connection-append-write (conn bytes)
   "Queue BYTES behind whatever CONN has pending. Returns T if accepted,
@@ -1662,16 +2490,43 @@
        t)
       (t (%queue-tail conn bytes) t))))
 
-(defun %queue-tail (conn bytes)
-  "Put BYTES on the tail of CONN's write queue. No bound check — whether
-   a bound applies is the caller's question, and the two callers answer
-   it differently."
-  (let ((cell (list bytes)))
-    (if (connection-write-queue-tail conn)
-        (setf (cdr (connection-write-queue-tail conn)) cell)
-        (setf (connection-write-queue conn) cell))
-    (setf (connection-write-queue-tail conn) cell))
-  (incf (connection-write-queued conn) (length bytes))
+(defconstant +queue-merge-limit+ 256
+  "Bytes up to which %QUEUE-TAIL joins a byte vector to the one queued
+   before it.")
+
+(defun %queue-tail (conn segment)
+  "Put SEGMENT, a byte vector or a WRITE-SPAN, on the tail of CONN's write
+   queue. No bound check — whether a bound applies is the caller's
+   question, and the two callers answer it differently.
+
+   A byte vector that would make, with the byte vector at the tail, no
+   more than +QUEUE-MERGE-LIMIT+ bytes is joined to it instead: the tail
+   cell takes a fresh vector holding both, and neither is written into.
+   *MAX-WRITE-BACKLOG* counts bytes, while each queued segment costs a
+   cell and a vector header besides. Kept one apiece, segments of a few
+   bytes would cost many times what is counted, and a peer can have them
+   made: every ping it sends is answered with a pong, two bytes long when
+   the ping is empty. Joined, any two neighbouring byte vectors hold more
+   than the limit between them, so what the queue holds stays within a
+   fraction of what it counts, at a copy of no more than the limit for
+   each segment joined.
+
+   Only the tail cell is replaced, never the head, which the writer may
+   be partway through, and the tail is always a cell not yet promoted:
+   CONNECTION-PROMOTE-WRITE releases it with the last one."
+  (let ((tail (connection-write-queue-tail conn)))
+    (if (and tail
+             (typep segment '(simple-array (unsigned-byte 8) (*)))
+             (typep (car tail) '(simple-array (unsigned-byte 8) (*)))
+             (<= (+ (length (car tail)) (length segment)) +queue-merge-limit+))
+        (setf (car tail) (concatenate '(simple-array (unsigned-byte 8) (*))
+                                      (car tail) segment))
+        (let ((cell (list segment)))
+          (if tail
+              (setf (cdr tail) cell)
+              (setf (connection-write-queue conn) cell))
+          (setf (connection-write-queue-tail conn) cell))))
+  (incf (connection-write-queued conn) (segment-length segment))
   t)
 
 (defun connection-queue-segments (conn segments)
@@ -1703,15 +2558,16 @@
   t)
 
 (defun connection-promote-write (conn)
-  "Make the next queued vector the head. Returns NIL if the queue is empty."
+  "Make the next queued segment the head. Returns NIL if the queue is empty."
   (let ((next (pop (connection-write-queue conn))))
     (when next
       (unless (connection-write-queue conn)
         (setf (connection-write-queue-tail conn) nil))
-      (decf (connection-write-queued conn) (length next))
-      (setf (connection-write-buf conn) next
-            (connection-write-pos conn) 0
-            (connection-write-end conn) (length next))
+      (decf (connection-write-queued conn) (segment-length next))
+      (multiple-value-bind (bytes start end) (segment-bounds next)
+        (setf (connection-write-buf conn) bytes
+              (connection-write-pos conn) start
+              (connection-write-end conn) end))
       t)))
 
 (defun connection-queue-write (conn bytes)
@@ -1723,8 +2579,8 @@
    Every one of the current call sites is reached from a read state,
    a freshly-created outbound connection, or an inbound parked in
    :awaiting with its buffer already drained, so the invariant holds
-   by construction — but by construction is a property of today's
-   nineteen callers, not of the function. DRAIN-CONNECTIONS and
+   by construction — but by construction is a property of the callers,
+   not of the function. DRAIN-CONNECTIONS and
    PING-WS-CONNECTIONS both test (< write-pos write-end) before
    calling, which is the same invariant enforced two levels out; the
    next caller to skip that test would otherwise ship the peer a
@@ -1739,12 +2595,14 @@
     (when (plusp pending)
       (error "connection-queue-write would clobber ~d un-flushed byte~:p on fd ~d"
              pending (connection-fd conn))))
-  (setf (connection-write-buf conn) bytes
-        (connection-write-pos conn) 0
-        (connection-write-end conn) (length bytes)
-        ;; Guard above proves nothing was pending, so this is always the
-        ;; start of an episode.
-        (connection-write-progress-at conn) (get-universal-time)))
+  ;; BYTES may be a WRITE-SPAN, when it is the first segment of a response.
+  (multiple-value-bind (vector start end) (segment-bounds bytes)
+    (setf (connection-write-buf conn) vector
+          (connection-write-pos conn) start
+          (connection-write-end conn) end
+          ;; Guard above proves nothing was pending, so this is always the
+          ;; start of an episode.
+          (connection-write-progress-at conn) (get-universal-time))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write
@@ -1759,10 +2617,10 @@
    Edge-triggered epoll requires draining writability in one pass.
 
    Reads the head's slots each turn instead of hoisting them out of the
-   loop. The hoist was correct while a connection could hold one vector
-   and only one, but the head now moves underneath: it advances to the
-   next queued vector as each drains, and an append can land while this
-   loop is running. A stale END would stop the pass at the old vector's
+   loop. A hoist would be correct if a connection held one vector and
+   only one, but the head moves underneath: it advances to the next
+   queued vector as each drains, and an append can land while this loop
+   is running. A stale END would stop the pass at the drained vector's
    length and wait for an EPOLLOUT that — the socket having never
    reported unwritable — is not coming."
   (let ((wrote nil))

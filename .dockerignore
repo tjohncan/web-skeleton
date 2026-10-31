@@ -7,13 +7,26 @@
 .git
 .github
 
-# Editor state.
+# Editor and tool state.
 .idea
 .vscode
+.claude
 
-# Local compile output. The image compiles its own; a stale host .fasl must
-# not shadow a fresh build.
+# Editor backups and swap files. An `nginx.conf~` is a copy of a file the
+# last section keeps out, under a name it does not match.
+**/*~
+**/*.swp
+**/*.swo
+
+# Local build output. The image compiles its own; a stale host .fasl must
+# not shadow a fresh build. build.lisp writes an executable at the root, an
+# SBCL core like any *.core, tens of megabytes the container never runs.
 **/*.fasl
+**/*.core
+/web-skeleton
+
+# The test suite: the demo system does not load it.
+tests
 
 # Secrets and real proxy configs carrying live hostnames. The sample ships as
 # `nginx.conf.sample`, which ends in .sample and so is not matched by *.conf.

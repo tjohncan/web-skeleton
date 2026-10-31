@@ -6,9 +6,15 @@
   :depends-on ("web-skeleton" "web-skeleton-test-harness")
   :components ((:file "tests/package")
                (:file "tests/run" :depends-on ("tests/package"))
-               (:file "tests/test-algorithms" :depends-on ("tests/run"))
+               (:file "tests/ecdsa-corpus" :depends-on ("tests/package"))
+               (:file "tests/test-algorithms" :depends-on ("tests/run"
+                                                            "tests/ecdsa-corpus"))
                (:file "tests/test-json" :depends-on ("tests/run"))
                (:file "tests/test-server" :depends-on ("tests/run"))
+               ;; The second half of the server tests, which use helpers
+               ;; the first half defines.
+               (:file "tests/test-connections" :depends-on ("tests/run"
+                                                            "tests/test-server"))
                (:file "tests/test-store" :depends-on ("tests/run"))
                (:file "tests/test-harness" :depends-on ("tests/run"))
                ;; The TLS suite reuses the harness fixtures: the chunked

@@ -43,11 +43,12 @@
    and closes its own. A cached stream that fails is not fatal: the
    call falls back to opening its own, matching WITH-WORKER-URANDOM's
    open, which also degrades to per-call rather than refusing to start
-   a worker. Without that, one bad read would poison the binding for
-   the worker's whole life — the stream stays bound, so every later
-   call fails too, and RANDOM-TOKEN feeds session IDs and CSRF tokens.
-   Per-call opens were the behaviour before the cache existed, so
-   falling back to them is a return to something known to work."
+   a worker. RANDOM-TOKEN feeds session IDs and CSRF tokens, so a
+   failure here cannot be allowed to stick. The failed stream is closed
+   and unbound in the worker's binding, so later calls open their own
+   from the start rather than failing on it first. A per-call open is
+   what a call off a worker always does, so the fallback is a path
+   every such call already takes."
   (let ((buf (make-array n :element-type '(unsigned-byte 8))))
     (flet ((read-fresh ()
              (with-open-file (s "/dev/urandom"
@@ -58,6 +59,11 @@
       (if *urandom-stream*
           (unless (ignore-errors
                    (= (read-sequence buf *urandom-stream*) n))
+            ;; A stream that failed once is let go: closed and unbound in
+            ;; this worker's binding, so every later call opens its own
+            ;; rather than failing on it first.
+            (ignore-errors (close *urandom-stream*))
+            (setf *urandom-stream* nil)
             (read-fresh))
           (read-fresh)))
     buf))

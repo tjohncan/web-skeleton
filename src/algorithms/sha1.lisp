@@ -18,8 +18,12 @@
 ;;;   Rounds 60-79: Parity(b,c,d) = b XOR c XOR d                  K = CA62C1D6
 ;;; ---------------------------------------------------------------------------
 
+(declaim (inline sha1-f sha1-k))
+
 (defun sha1-f (round b c d)
   "SHA-1 logical function for the given ROUND index."
+  (declare (type (integer 0 79) round)
+           (type (unsigned-byte 32) b c d))
   (cond
     ((< round 20) (logior (logand b c)
                           (logand (logxor b #xFFFFFFFF) d)))
@@ -29,6 +33,7 @@
 
 (defun sha1-k (round)
   "SHA-1 constant for the given ROUND index."
+  (declare (type (integer 0 79) round))
   (cond
     ((< round 20) #x5A827999)
     ((< round 40) #x6ED9EBA1)
@@ -77,17 +82,24 @@
    it — not a freshly copied 64-byte block — and W is a caller-owned
    80-word scratch schedule reused across every block of one digest.
    Both exist to keep the hot loop allocation-free: a per-block SUBSEQ
-   plus a per-block schedule cost ~350 bytes of garbage for every 64
-   bytes of input, which was essentially all of the pure-Lisp digest's
-   garbage (measured: 7.5 bytes consed per input byte, down to 1.0 — and
-   that 1.0 is the one padded copy). Throughput moves ~10%; the real win
-   is the GC pressure a busy server no longer pays. Every W slot is
-   written before it is read (0-15 from the block, 16-79 derived from
-   those), so reuse needs no clearing. SHA1-LISP allocates W per call, so
-   concurrent digests never share one."
+   plus a per-block schedule would cost ~350 bytes of garbage for every
+   64 bytes of input, essentially all of the pure-Lisp digest's garbage,
+   where with the reuse the one allocation left is the padded copy. What
+   the reuse saves is GC pressure on a busy server more than time. Every
+   W slot is written before it is read (0-15 from the block, 16-79
+   derived from those), so reuse needs no clearing. SHA1-LISP allocates W
+   per call, so concurrent digests never share one.
+
+   Every word is declared (UNSIGNED-BYTE 32), so the masked sums and
+   rotations are machine arithmetic. Optimized for speed at the default
+   safety, so the declarations are checked where values enter and an
+   index is still bounds-checked: the FIPS and RFC vectors, and the corpus
+   checked against OpenSSL, are what hold the arithmetic to the standard."
   (declare (type (simple-array (unsigned-byte 8) (*)) data)
            (type (simple-array (unsigned-byte 32) (*)) w)
-           (type fixnum start))
+           (type fixnum start)
+           (type (unsigned-byte 32) h0 h1 h2 h3 h4)
+           (optimize speed))
   ;; First 16 words: read from the block as big-endian 32-bit integers
   (loop for i of-type fixnum from 0 below 16
         for offset of-type fixnum = (+ start (* i 4))
@@ -107,6 +119,7 @@
                   1)))
   ;; Initialize working variables
   (let ((a h0) (b h1) (c h2) (d h3) (e h4))
+    (declare (type (unsigned-byte 32) a b c d e))
     ;; 80 rounds
     (loop for i of-type fixnum from 0 below 80
           do (let ((temp (u32+ (u32-rotate-left a 5)
@@ -127,8 +140,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun sha1-lisp (data)
-  "Pure-Lisp SHA-1 (FIPS 180-4). Takes a byte vector, returns a 20-byte
-   digest vector. Always reachable under this name regardless of whether
+  "Pure-Lisp SHA-1 (FIPS 180-4). Takes an (unsigned-byte 8) vector through
+   OCTETS-ARGUMENT, as SHA1-LIBSSL does, and returns a 20-byte digest
+   vector. Always reachable under this name regardless of whether
    web-skeleton-tls has been loaded — the TLS system swaps the public
    SHA1 symbol to a libssl-backed version at load time via SETF
    SYMBOL-FUNCTION, but this function stays accessible directly so the
@@ -138,7 +152,7 @@
    DO NOT declaim SHA1 inline: the libssl swap works through the
    function cell, and an inlined caller would bypass the cell and keep
    calling whichever implementation was visible at compile time."
-  (let ((padded (sha1-pad data))
+  (let ((padded (sha1-pad (octets-argument data 'sha1)))
         ;; One scratch schedule for the whole digest — see
         ;; SHA1-PROCESS-BLOCK. Allocated per call, so concurrent
         ;; digests stay independent.
@@ -169,7 +183,9 @@
         digest))))
 
 (defun sha1 (data)
-  "Compute SHA-1 digest of DATA (byte vector). Returns a 20-byte vector.
+  "Compute SHA-1 digest of DATA, an (unsigned-byte 8) vector; a string is
+   refused, with the call that makes one into bytes (see OCTETS-ARGUMENT).
+   Returns a 20-byte vector.
    Delegates to SHA1-LISP by default; web-skeleton-tls replaces this
    function with a libssl-backed version at load time. SHA1-HEX and any
    other caller picks up the swap transparently by routing through the

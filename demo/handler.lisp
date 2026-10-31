@@ -24,10 +24,10 @@
    competing with the real one, which is the same argument that keeps a
    metrics format out of the framework. So the application mints it, and
    demo/deploy lets WS_INSTANCE override it with whatever the deployment
-   already calls this box.
+   already calls this host.
 
    Fresh on every start when it is random, which is what makes it useful
-   across a restart: the codes differ, so two runs of the same box are two
+   across a restart: the codes differ, so two runs on the same host are two
    names. That is also why a start time is not in the handle below — it would
    be answering a question this already answers.")
 
@@ -44,16 +44,45 @@
    It is fixed for the life of the process, and the page it lands on is a
    cached file.")
 
+(defvar *public-url* nil
+  "The demo's own public URL, absolute, or NIL when the deployment has not
+   said what it is.
+
+   Open Graph consumers want an absolute og:image, and some ignore a relative
+   one, but the server cannot know the name it is reached by: behind a proxy,
+   the Host a request carries is the proxy's business, and a guess baked into
+   a cached page would be wrong for everyone it was wrong for once. So the
+   tag is written only when the deployment supplies the URL, and left out
+   otherwise.")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Self-address for the /demo-fetch example
 ;;; ---------------------------------------------------------------------------
 
 (defvar *demo-host* "127.0.0.1"
-  "Host the /demo-fetch endpoint uses to self-fetch over HTTP.")
+  "Host the /demo-fetch endpoint dials to reach this server, as it goes in a
+   URL. START-DEMO sets it from the address it binds; see %SELF-FETCH-HOST.")
 
 (defvar *demo-port* 8081
   "Port the demo server is listening on. START-DEMO sets this so the
    /demo-fetch endpoint can build a self-referential URL.")
+
+(defun %self-fetch-host (host)
+  "The host part of a URL that reaches a server bound to HOST, an IPv4 or
+   IPv6 address vector: loopback of the same family for a wildcard, and the
+   bound address itself otherwise, bracketed when it is IPv6.
+
+   A server bound to one address answers on that address alone, so a fixed
+   127.0.0.1 reaches it only when that is the address: bound to ::1, to ::
+   or to one interface's address, the self-fetch would find nothing
+   listening and answer 502."
+  (let ((v6 (= (length host) 16)))
+    (cond ((and v6 (every #'zerop host)) "[::1]")
+          (v6 (format nil "[~{~(~x~)~^:~}]"
+                      (loop for i from 0 below 16 by 2
+                            collect (+ (ash (aref host i) 8) (aref host (1+ i))))))
+          ((every #'zerop host) "127.0.0.1")
+          (t (format nil "~{~d~^.~}" (coerce host 'list))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Origin check for the /ws upgrade
@@ -97,7 +126,7 @@
    proxy_set_header Host $host — the sample's comment on that line says what
    happens without it.
 
-   demo/test-origin.lisp holds the cases, as a table of what the route owes
+   demo/test-demo.lisp holds the cases, as a table of what the route owes
    each pair of headers."
   (let ((origin (get-header request "origin")))
     (or (null origin)
@@ -204,7 +233,13 @@
    Probed at HOST because that is the address a second server has to share
    for the kernel to pool the two, and a server bound to one address does not
    answer on loopback. A wildcard is probed on loopback, which every wildcard
-   listener answers on."
+   listener answers on.
+
+   The connect is bounded, at two seconds. Loopback answers at once, but an
+   interface whose firewall drops SYNs would hold a blocking connect for the
+   kernel's own timeout, minutes, before START-DEMO bound anything. A connect
+   still going at the bound is taken for nothing there: a listener on this
+   host answers well inside it."
   (let* ((v6 (= (length host) 16))
          (target (cond ((notevery #'zerop host) host)
                        (v6 #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))
@@ -215,8 +250,18 @@
                                         'sb-bsd-sockets:inet-socket)
                                     :type :stream :protocol :tcp)))
           (unwind-protect
-               (progn (sb-bsd-sockets:socket-connect probe target port)
-                      t)
+               (progn
+                 (setf (sb-bsd-sockets:non-blocking-mode probe) t)
+                 ;; In progress is the usual answer off loopback, and the
+                 ;; connect goes on while the wait below watches it.
+                 (handler-case (sb-bsd-sockets:socket-connect probe target port)
+                   (sb-bsd-sockets:operation-in-progress () nil))
+                 ;; Writable is a connect that has finished, made or refused;
+                 ;; only a made one has a peer to name.
+                 (and (sb-sys:wait-until-fd-usable
+                       (sb-bsd-sockets:socket-file-descriptor probe) :output 2)
+                      (handler-case (progn (sb-bsd-sockets:socket-peername probe) t)
+                        (error () nil))))
             (ignore-errors (sb-bsd-sockets:socket-close probe))))
       (error () nil))))
 
@@ -295,10 +340,7 @@
    and refusing the shape costs one comparison."
   (cond
     ((null *backlink-url*) "")
-    ((not (or (and (> (length *backlink-url*) 8)
-                   (string= "https://" *backlink-url* :end2 8))
-              (and (> (length *backlink-url*) 7)
-                   (string= "http://" *backlink-url* :end2 7))))
+    ((not (%http-url-p *backlink-url*))
      (log-warn "backlink ignored: ~s is not an http or https URL"
                *backlink-url*)
      "")
@@ -306,6 +348,25 @@
      (format nil "<a class=\"backlink\" href=\"~a\">&#8627; ~a</a>"
              (%escape-html-attr *backlink-url*)
              (%escape-html-attr (%backlink-display *backlink-url*))))))
+
+(defun %http-url-p (url)
+  "T if URL begins with http:// or https:// and has something after it."
+  (or (and (> (length url) 8) (string= "https://" url :end2 8))
+      (and (> (length url) 7) (string= "http://" url :end2 7))))
+
+(defun %og-image-html ()
+  "The og:image tag, with the image's absolute URL under *PUBLIC-URL*, or
+   the empty string when no public URL was given or it is not an http or
+   https one. Empty for the reason %BACKLINK-HTML gives: the placeholder is
+   replaced either way."
+  (cond
+    ((null *public-url*) "")
+    ((not (%http-url-p *public-url*))
+     (log-warn "public URL ignored: ~s is not an http or https URL" *public-url*)
+     "")
+    (t
+     (format nil "<meta property=\"og:image\" content=\"~a/og-image.png\">"
+             (%escape-html-attr (string-right-trim "/" *public-url*))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The bench — refusals, run against the real parser
@@ -462,7 +523,8 @@
 ;;; digest, and a JWT taken apart. Useful on their own, which is the point —
 ;;; a demo page gets opened a second time if one of its tabs does a job. All
 ;;; three already live in src/algorithms, so the demo reaches for the
-;;; framework rather than carrying a copy of anything.
+;;; framework rather than carrying a copy of anything. A fourth sample posts
+;;; a form, below.
 ;;;
 ;;; Every answer carries the same envelope: which worker ran it, how long the
 ;;; server spent inside it, and the request as the server parsed it.
@@ -495,17 +557,16 @@
   "Microseconds of wall time: for timing a handler, refilling a post budget,
    and stamping a bulletin line.
 
-   Not GET-INTERNAL-REAL-TIME: on SBCL 2.6 it does not advance between
-   adjacent calls, and two hundred FORMATs between two reads still measured
-   zero. Every lab request reported itself as instantaneous, which reads as
-   a broken field rather than as a fast server.
+   Not GET-INTERNAL-REAL-TIME: its clock ticks too coarsely to time a
+   handler, so every lab request would report itself as instantaneous,
+   which reads as a broken field rather than as a fast server.
 
-   This was CLOCK_MONOTONIC, which is the right clock and was the wrong
-   call. SB-UNIX:CLOCK-GETTIME is external on some SBCLs and internal on
-   others, so the demo compiled on the machine it was written on and failed
-   to READ on a Debian image — not a worse number, a build that stopped
-   before it started. Reaching into another package's internals to measure
-   microseconds on a demo page was not a trade worth making.
+   Not CLOCK_MONOTONIC through SB-UNIX:CLOCK-GETTIME either, though it is
+   the right clock. That symbol is external on some SBCLs and internal on
+   others, so code naming it fails to READ where it is internal — not a
+   worse number, a build that stops before it starts. Reaching into
+   another package's internals to measure microseconds on a demo page is
+   not a trade worth making.
 
    GET-TIME-OF-DAY is external, has been for over a decade, and has the
    resolution. What it costs is that it is wall time, so an interval
@@ -513,10 +574,10 @@
 
    So every subtraction of two of these clamps at zero: the lab's handler
    timer, and the post budget's refill. A backward step then reads as no
-   time having passed, never as negative time. Unclamped, the budget turned
-   a one-hour backward step into minus three thousand six hundred posts,
-   and a connection that had posted before the step stayed locked out for
-   the hour it took to earn them back.
+   time having passed, never as negative time. Unclamped, the budget would
+   turn a one-hour backward step into minus three thousand six hundred
+   posts, and a connection that had posted before the step would stay
+   locked out for the hour it takes to earn them back.
 
    The bulletin's stamps are not clamped, and say so where they are taken:
    a stamp is the time the server believed it was, and a clock that stepped
@@ -700,12 +761,12 @@
       (if err
           (%lab-json request started nil :error err :status 400)
           (handler-case
-              ;; The framework's splitter, not one of the demo's own. This
-              ;; used to carry its own, which accepted a token with base64
-              ;; padding that JWT-SPLIT refuses — two readers of one token
-              ;; disagreeing about whether it was one, on a page whose
-              ;; subject is that disagreement. RFC 7515 omits the padding, so
-              ;; JWT-SPLIT is the one that is right.
+              ;; The framework's splitter, not one of the demo's own. A
+              ;; splitter of its own is a second reader of the token: one
+              ;; that accepted base64 padding JWT-SPLIT refuses would have
+              ;; the two disagreeing about whether a token is one, on a page
+              ;; whose subject is that disagreement. RFC 7515 omits the
+              ;; padding, so JWT-SPLIT is the one that is right.
               (let ((parts (jwt-split token)))
                 (unless parts
                   (error "not a JWS compact serialization: it needs exactly ~
@@ -731,6 +792,95 @@
             (error (e)
               (%lab-json request started nil
                          :error (format nil "~a" e) :status 400)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The lab's form — a body read as it arrives
+;;;
+;;; The one lab sample with a body. A form with a file input is sent as
+;;; multipart/form-data, and the demo's body handler reads it a part at a
+;;; time with RECEIVE-MULTIPART: text fields are collected, and a file is
+;;; counted as it passes and never held. Nothing is stored. The answer is
+;;; what the parser made of the body — each part's name, a file's filename
+;;; and type as the browser sent them, its size and its first bytes — in the
+;;; envelope every lab answer has.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *lab-upload-max* (* 4 1024 1024)
+  "Largest form body the lab reads, in bytes. Nothing is kept, so a larger
+   one costs bandwidth and the worker's attention and nothing else. A body
+   over it is answered 413 by the framework, before any of it is read when
+   it declares its length.")
+
+(defparameter *lab-upload-preview* 16
+  "How many of a file's first bytes the answer shows, as hex: enough to
+   tell most formats by their magic number.")
+
+(defstruct lab-file
+  "A file of the lab's form as it passes: its part, how many of its bytes
+   have arrived, and the first few of them."
+  part
+  (bytes 0)
+  (head (make-array *lab-upload-preview* :element-type '(unsigned-byte 8)
+                                         :fill-pointer 0)))
+
+(defun %lab-field-json (part)
+  "A collected text field: its name, and its value as text."
+  (let ((text (handler-case (form-part-text part)
+                (http-parse-error () nil))))
+    (make-json-object
+     (list (cons "name" (form-part-name part))
+           (cons "value" (cond ((null text) "(not UTF-8)")
+                               ((> (length text) *lab-input-max*)
+                                (format nil "~a..." (subseq text 0 *lab-input-max*)))
+                               (t text)))))))
+
+(defun %lab-file-json (file)
+  "A file of the lab's form: what the browser said about it, and what
+   arrived."
+  (let ((part (lab-file-part file)))
+    (make-json-object
+     (list (cons "name" (form-part-name part))
+           (cons "filename" (form-part-filename part))
+           (cons "content_type" (or (form-part-content-type part) :null))
+           (cons "bytes" (lab-file-bytes file))
+           (cons "first_bytes" (bytes-to-hex (subseq (lab-file-head file) 0)))))))
+
+(defun %lab-upload-plan (request)
+  "The body plan for the lab's form, posted to /lab/upload."
+  (let ((started (%now-us))
+        (files '()))
+    (receive-multipart
+     request
+     :max-size *lab-upload-max*
+     :max-parts 64
+     :max-collected-size (* 64 1024)
+     ;; A field is collected. A file is streamed: counted, its first bytes
+     ;; kept, and the rest let go as it arrives.
+     :on-part (lambda (conn part)
+                (declare (ignore conn))
+                (when (form-part-filename part)
+                  (push (make-lab-file :part part) files)
+                  :stream))
+     :on-part-data (lambda (conn part bytes)
+                     (declare (ignore conn part))
+                     (let ((file (first files)))
+                       (incf (lab-file-bytes file) (length bytes))
+                       (loop for b across bytes
+                             while (vector-push b (lab-file-head file))))
+                     nil)
+     :on-end (lambda (conn parts)
+               (declare (ignore conn))
+               (%lab-json request started
+                          (list (cons "fields" (mapcar #'%lab-field-json parts))
+                                (cons "files" (mapcar #'%lab-file-json
+                                                      (reverse files)))))))))
+
+(defun decide-body (request)
+  "The demo's body handler. The lab's form is read as it arrives, and every
+   other request's body is left to the usual buffered read."
+  (when (and (eq (http-request-method request) :POST)
+             (string= (http-request-path request) "/lab/upload"))
+    (%lab-upload-plan request)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Vitals — what the server can say about itself
@@ -787,23 +937,28 @@
    that have not.
 
    This is what makes the container healthcheck mean something. The census
-   used to be the healthcheck, and a probe lands on one of four workers: a
-   wedged worker failed about one probe in four, and a check that wants three
-   failures in a row almost never saw it. Here any live worker answers for
-   all of them, because the ticks it reads are every worker's own, so one
-   stuck loop fails every probe, whichever worker takes it."
+   would make a poor one, because a probe lands on one of four workers: a
+   wedged worker would fail about one probe in four, and a check that wants
+   three failures in a row would almost never see it. Here any live worker
+   answers for all of them, because the ticks it reads are every worker's
+   own, so one stuck loop fails every probe, whichever worker takes it.
+
+   Before START-DEMO there are no workers to read, and the answer is 503,
+   not started."
   (declare (ignore request))
-  (let* ((now (get-universal-time))
-         (stale (loop for at across *last-tick*
-                      for i from 0
-                      when (> (- now at) *healthz-stale-after*)
-                        collect i)))
-    (if stale
-        (make-text-response
-         503 (format nil "wedged worker~p: ~{~d~^, ~}~%" (length stale) stale))
-        (make-text-response
-         200 (format nil "ok: ~d workers passing their loops~%"
-                     (length *last-tick*))))))
+  (if (null *last-tick*)
+      (make-text-response 503 (format nil "not started~%"))
+      (let* ((now (get-universal-time))
+             (stale (loop for at across *last-tick*
+                          for i from 0
+                          when (> (- now at) *healthz-stale-after*)
+                            collect i)))
+        (if stale
+            (make-text-response
+             503 (format nil "wedged worker~p: ~{~d~^, ~}~%" (length stale) stale))
+            (make-text-response
+             200 (format nil "ok: ~d workers passing their loops~%"
+                         (length *last-tick*)))))))
 
 (defun handle-census (request)
   "Server-derived vitals as JSON, for the sternum and limbs panels."
@@ -962,7 +1117,7 @@
 (defun %bulletin-payload (entry)
   "Wire form: sequence, TAB, UTC stamp, TAB, sender handle, TAB, the line.
 
-   Three tabs now, and the line itself still cannot contain one —
+   Three tabs, and the line itself cannot contain one —
    %SANITIZE-LINE strips every byte below 32, TAB among them. So a client
    splits on the first three and whatever is left is the text, however many
    tabs somebody tried to type into it.
@@ -999,20 +1154,28 @@
       ;; only once the ring holding it exists, STORE-GET waits on the update
       ;; that built it, and a trim never takes the line just added: a worker
       ;; slow enough to lose lines to the trim loses older ones, and still
-      ;; finds this. So there is no branch for an empty NEW. Were one ever
-      ;; reached, the REDUCE below would signal rather than skip a line.
+      ;; finds this. Should a change ever break that, an empty NEW leaves
+      ;; *FANNED* where it is, the :INITIAL-VALUE below, for the next pass to
+      ;; look again, where a REDUCE with nothing to reduce would raise on
+      ;; every pass and stop this worker's fan-out for good.
       (let* ((new (bulletin-since (aref *fanned* worker-id)))
              (payloads (mapcar #'%bulletin-payload new)))
         (map-worker-websockets
          (lambda (conn)
            ;; One peer at *MAX-WRITE-BACKLOG* must not cost everyone
            ;; behind it the batch. MAP-WORKER-WEBSOCKETS deliberately
-           ;; does not decide this; an application that broadcasts does.
+           ;; does not decide this; an application that broadcasts does,
+           ;; and this one closes that peer. Its view of the bulletin
+           ;; would otherwise skip the lines it missed with nothing to say
+           ;; so. 1013 asks it to try again later; a page that reconnects
+           ;; sees what is posted from then on, as any new one does.
            (handler-case
                (dolist (p payloads) (ws-send conn p))
-             (error () nil))))
+             (error ()
+               (ignore-errors (ws-close conn 1013))))))
         (setf (aref *fanned* worker-id)
-              (reduce #'max new :key #'first))))))
+              (reduce #'max new :key #'first
+                                :initial-value (aref *fanned* worker-id)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; WebSocket handler
@@ -1036,10 +1199,9 @@
    owns it, so each table has one reader and one writer, and the lock SBCL
    puts on a weak table — it synchronizes them for the collector's sake — is
    never contended. Weak on the key because nothing tells an application a
-   WebSocket closed: an entry
-   for a connection that has gone is dropped when the connection is
-   collected, so the table needs neither a registry nor a close notification
-   to stay the size of the live population.")
+   WebSocket closed: an entry for a connection that has gone is dropped when
+   the connection is collected, so the table needs neither a registry nor a
+   close notification to stay the size of the live population.")
 
 (defun %post-allowed-p (conn)
   "Spend one post from CONN's budget, or refuse. A token bucket: *POST-BURST*
@@ -1173,10 +1335,19 @@
 
    A post is one row. The log renders with white-space: pre-wrap, so a newline
    in the text would draw a second row that its sender could dress up as
-   somebody else's line.
+   somebody else's line. A newline is not the only character that breaks a
+   line: NEL (U+0085), the LINE and PARAGRAPH SEPARATORs (U+2028, U+2029)
+   are mandatory breaks in Unicode's line breaking (UAX #14), so they go
+   with the controls, C0, DEL and C1, that NEL is one of.
 
    Space is 32, so the test below never catches it and needs no exception."
-  (let ((clean (remove-if (lambda (c) (< (char-code c) 32)) text)))
+  (let ((clean (remove-if (lambda (c)
+                            (let ((code (char-code c)))
+                              (or (< code 32)
+                                  (<= #x7F code #x9F)
+                                  (= code #x2028)
+                                  (= code #x2029))))
+                          text)))
     (if (> (length clean) *bulletin-line-max*)
         (subseq clean 0 *bulletin-line-max*)
         clean)))
@@ -1187,7 +1358,7 @@
 
 (defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
                         (instance (bytes-to-hex (random-bytes 2)))
-                        backlink)
+                        backlink public-url)
   "Start the demo server.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
@@ -1206,26 +1377,30 @@
    BACKLINK is an absolute URL to whatever this demo hangs off, or NIL. A
    page served from somebody's collection of things should offer a way back
    to the collection; a page served from nowhere in particular should not
-   invent one."
+   invent one.
+
+   PUBLIC-URL is the demo's own absolute URL, or NIL. Given, the page carries
+   an og:image under it; see *PUBLIC-URL*.
+
+   The pages are read from demo/static/ beside the demo's system definition,
+   wherever the process was started, and a directory with no index.html is
+   refused rather than served as an empty site.
+
+   *WORKER-WAKE-INTERVAL* is the image's, and this sets it to 0.05 for as
+   long as the demo serves, putting it back when START-SERVER returns. A
+   server started beside the demo in one image runs at that cadence too
+   while the demo does."
   (when (%port-already-served-p host port)
     (error "start-demo: something is already answering on port ~d.~%~
             SO_REUSEPORT means a second server binds it rather than failing, ~
             and both would serve — the kernel splitting connections between ~
             them, each with its own bulletin, so the room divides in two with ~
             no error anywhere. Stop the other one first." port))
-  (setf *demo-port* port)
-  ;; The fan-out can only be as prompt as the workers wake: a worker with no
-  ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
-  ;; returns. The default second is fine for a server and far too slow for a
-  ;; bulletin — at 0.05 a posted line lands in about 50ms, and the cost is
-  ;; twenty syscall returns per worker per second doing a sequence compare.
-  ;;
-  ;; Set here rather than left alone because the page displays it: the cadence
-  ;; is what sharing nothing costs, and the number belongs on screen rather
-  ;; than in an apology.
-  (setf *worker-wake-interval* 0.05)
+  (setf *demo-host* (%self-fetch-host host)
+        *demo-port* port)
   (setf *instance* instance
-        *backlink-url* backlink)
+        *backlink-url* backlink
+        *public-url* public-url)
   (setf *started-at* (get-universal-time)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0)
@@ -1243,18 +1418,43 @@
   ;; and still off any worker so they stay out of the census. See
   ;; %BENCH-RESPONSE.
   (setf *bench-responses* (%build-bench-responses))
-  ;; Backquoted rather than quoted now: the backlink is not known until
-  ;; this call, and the cache is built once from what it says here.
-  (load-static-files "demo/static/"
-                     :substitutions
-                     `(("robots.txt" ("are smart" . "robots are cool and smart"))
-                       ("index.html" ("__BACKLINK__" . ,(%backlink-html)))))
-  (start-server :host host
-                :port port
-                :workers workers
-                :handler #'handle-request
-                :ws-handler #'handle-ws-message
-                :on-tick #'bulletin-tick))
+  ;; Beside the system definition, not relative to wherever the process
+  ;; started: started elsewhere, a relative path finds no directory, and
+  ;; LOAD-STATIC-FILES warns and goes on with an empty cache, so every page
+  ;; is a 404.
+  (let ((static (asdf:system-relative-pathname "web-skeleton-demo" "demo/static/")))
+    (unless (probe-file (merge-pathnames "index.html" static))
+      (error "start-demo: ~a holds no index.html, so the demo has no page to ~
+              serve." static))
+    ;; Backquoted rather than quoted: the backlink is not known until
+    ;; this call, and the cache is built once from what it says here.
+    (load-static-files static
+                       :substitutions
+                       `(("robots.txt" ("are smart" . "robots are cool and smart"))
+                         ("index.html" ("__BACKLINK__" . ,(%backlink-html))
+                                       ("__OG_IMAGE__" . ,(%og-image-html))))))
+  ;; The fan-out can only be as prompt as the workers wake: a worker with no
+  ;; traffic is asleep in epoll_wait, and :ON-TICK does not run until it
+  ;; returns. The default second is fine for a server and far too slow for a
+  ;; bulletin — at 0.05 a posted line lands in about 50ms, and the cost is
+  ;; twenty syscall returns per worker per second doing a sequence compare.
+  ;;
+  ;; Set here rather than left alone because the page displays it: the cadence
+  ;; is what sharing nothing costs, and the number belongs on screen rather
+  ;; than in an apology. Put back when the server returns, since the setting
+  ;; is the whole image's.
+  (let ((wake *worker-wake-interval*))
+    (unwind-protect
+         (progn
+           (setf *worker-wake-interval* 0.05)
+           (start-server :host host
+                         :port port
+                         :workers workers
+                         :handler #'handle-request
+                         :body-handler #'decide-body
+                         :ws-handler #'handle-ws-message
+                         :on-tick #'bulletin-tick))
+      (setf *worker-wake-interval* wake))))
 
 (defun main ()
   (start-demo))

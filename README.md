@@ -15,13 +15,12 @@ It is the network and protocol layer; applications must bring their own flesh.
 
 ## Requirements
 
-- SBCL (Steel Bank Common Lisp). 2.4.11 or later for a long-running server
-  that fetches by hostname: before it, every lookup whose `getent` child
-  outlives its answer leaves a zombie
+- SBCL (Steel Bank Common Lisp), 2.2.9 or later — the oldest the suite is
+  run on. 2.2.9 has a compiler bug that code built with it should steer
+  clear of: see DEPLOYMENT.md, "Environment".
 - Linux
-- `getent` on PATH — ships with glibc and musl, present on every
-  mainstream distro (used via `sb-ext:run-program`
-  for non-blocking hostname resolution).
+- `getent` on PATH, glibc's, for hostname resolution; Alpine's will not
+  do (DEPLOYMENT.md, "Environment", says why)
 
 SBCL built-ins used:
  `sb-bsd-sockets` (TCP),
@@ -100,6 +99,7 @@ sbcl
 (web-skeleton-tests:test-algorithms)        ; SHA-1, SHA-256, Base64, ECDSA, HMAC, hex
 (web-skeleton-tests:test-json)              ; JSON parser and serializer
 (web-skeleton-tests:test-server)            ; HTTP, URL, query, routing, JWT
+(web-skeleton-tests:test-connections)       ; request bodies, connection life, the runtime
 (web-skeleton-tests:test-store)             ; concurrent store and reaper
 (web-skeleton-tests:test-properties)        ; generated-input properties, cross-path parity
 (web-skeleton-tests:test-harness)           ; live-server test harness round-trips
@@ -128,11 +128,12 @@ src/
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
   json.lisp        JSON parser and serializer (RFC 8259)
   random.lisp      Crypto random bytes and tokens (/dev/urandom)
-  address.lisp     IP address classification (SSRF allowlisting)
+  address.lisp     IP address classification (SSRF allowlisting), IP literal parsers
   store.lisp       Concurrent keyed store with optional reaper
   tls.lisp         libssl FFI, TLS connections, HTTPS fetch (optional)
   algorithms/
     word32.lisp      32-bit unsigned word ops (shared by SHA-1, SHA-256)
+    octets.lisp      Byte-vector input contract shared by the digests, HMAC and ECDSA
     hex.lisp         Hex encoding utilities
     sha1.lisp        SHA-1 digest (FIPS 180-4)
     sha256.lisp      SHA-256 digest (FIPS 180-4)
@@ -143,26 +144,30 @@ src/
     connection.lisp    Connection state machine, read/write buffers
     http.lisp          HTTP request parser, response builder, URL/query/routing
     chunked.lisp       Chunked transfer coding decoders, shared by both directions
+    body.lisp          Request bodies decided at the head: per-request caps, receiving as they arrive
+    multipart.lisp     multipart/form-data: forms and file uploads, buffered or as they arrive
     websocket.lisp     WebSocket handshake and incremental frame protocol
     jwt.lisp           JWT validation (ES256) and JWKS parsing
     static.lisp        In-memory static file cache and serving
-    fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch)
+    fetch.lisp         Outbound HTTP client (non-blocking fetch, streaming fetch, streamed request bodies)
     dns.lisp           Async DNS via getent ahosts subprocess
     streaming.lisp     Streamed responses, chunked or close-delimited, produced over time
     main.lisp          epoll event loop, handler dispatch, server entry point
 demo/
   package.lisp     Demo package declaration
   handler.lisp     Bulletin fan-out, census endpoint, request lab, refusal bench
-  test-origin.lisp The /ws Origin check's cases, as a table CI runs
+  test-demo.lisp   The demo's checks CI runs: the /ws Origin table and a few helpers
   static/          Demo static assets (HTML, CSS, JS, favicon, images)
   deploy/          Dockerfile, compose, nginx sample, container entry point
 tests/
   package.lisp           Test package declaration
   run.lisp               Test utilities and combined runner
   harness.lisp           Ephemeral-port live server and request/frame builders
+  ecdsa-corpus.lisp      P-256 verify cases with OpenSSL's verdicts, for the ECDSA tests
   test-algorithms.lisp   SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
+  test-connections.lisp  Request bodies, a connection's life, the runtime
   test-store.lisp        Concurrent store and reaper tests
   test-properties.lisp   Generated-input properties; buffered/streaming parity
   test-harness.lisp      Test harness self-tests (live-server round-trips)
@@ -248,7 +253,56 @@ tests/
   chunked bodies alike. Prevents 1-3s invisible latency with curl, Go,
   Python, and Java HTTP clients on large POSTs. The interim is skipped when
   the body has already arrived: a client that did not wait is not listening
-  for it, and sending it would only add a round trip
+  for it, and sending it would only add a round trip. With a body handler
+  it goes out only once the body handler has accepted the body
+- **Request bodies decided at the head** — `start-server`'s `:body-handler`
+  is asked about a request's body once the head has arrived and before any
+  of the body is read. `nil` reads it as usual. `(buffer-body :max-size n)`
+  reads it under a cap of that request's own, above or below
+  `*max-body-size*`, before `:handler` gets the whole request as usual.
+  `(receive-body :on-data … :on-end … :on-abort …)` hands the body to the
+  application as it arrives, a read at a time, and lets `:on-end` answer the
+  request: the body is never held whole, so an upload of any size costs the
+  head and one 64 KiB window of buffer, chunked or not, whatever its chunk
+  sizes. `:on-abort` hears, exactly once, why a body that did not complete
+  ended. `:on-data` can answer `:pause`, and the body waits in the kernel
+  until `body-resume` — for a sink that answers later, such as a part
+  forwarded upstream by a `fetch-into` on the receiving connection, whose
+  `:then` resumes, or ends the body with `body-refuse`. An
+  `http-response` is the answer, sent before the body: an upload
+  that fails a login check is refused before its first byte is read, and a
+  client that sent `Expect: 100-continue` is never told to send it. A body
+  the body handler accepted is timed on its progress, by
+  `*body-stall-timeout*`, rather than as a whole, so a large upload takes as
+  long as it keeps arriving. The `:handler` contract does not change
+- **Forms and file uploads** — `multipart/form-data`, read whole by
+  `parse-multipart` from `:handler`, or as it arrives by a body handler's
+  `receive-multipart`: text fields collected and handed to its `:on-end`,
+  files streamed to `:on-part-data` a run at a time and never held, so an
+  upload's size is the cap's business and the memory a form costs is
+  bounded by `:max-collected-size`. A part can be refused at its head, and a
+  field sent before a file — a token — can refuse the body before the file
+  is read. A pause from any part's callbacks holds the body where it falls,
+  which is how a file is forwarded to an upstream a piece at a time with
+  `fetch-into`. One parser serves both, and it is strict where the format
+  leaves room for two readings: a line beginning with the boundary is a
+  delimiter or a 400, never content; CRLF only; one `Content-Disposition`
+  per part with one name; no `filename*`; no `Content-Transfer-Encoding`
+  that changes the bytes. Names and filenames are returned as sent
+- **Request bodies sent as they are produced** — `(http-fetch … :body
+  :stream)` makes a fetch's body the application's to send a piece at a
+  time with `fetch-send` and end with `fetch-finish`: chunked, or framed by
+  a `:content-length` declared up front for an upstream that needs one.
+  `fetch-send` answers `nil` when the upstream falls behind, and a received
+  body that pauses on that answer is resumed when the upload drains, so a
+  client is held to its upstream's pace and nothing is held whole.
+  `forward-body` is the upload proxy in one form: a body plan that sends
+  the request's body upstream as it arrives and answers the client with
+  what `:then` makes of the upstream's answer. One that answers before the
+  body has all gone, a 413 or a 401, has answered the client, and the rest
+  of the body is refused. A multipart file goes the same way from
+  `:on-part-data`, and all of it works the same over `http://` and
+  `https://`
 - **URL and query utilities** — percent-decoding (`url-decode`), query string
   parsing (`parse-query-string`, `get-query-param`)
 - **Cookies** — `get-cookie` reads a named cookie from the request
@@ -256,7 +310,10 @@ tests/
   `HttpOnly`, `Secure`, `SameSite`, `Max-Age`, `Path`, `Domain`.
   Safe defaults (HttpOnly, Secure, SameSite=Lax); structural-character validation
 - **Path matching** — `match-path` matches URL paths against patterns
-  with `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL
+  with `:param` captures (e.g. `/users/:id`), returns bindings alist or NIL.
+  Literal segments match the path as it arrived unless
+  `*match-path-literals*` says `:decoded`, so by default a route and
+  `http-request-path` read the same bytes
 - **JSON** — full parser and serializer (RFC 8259).
   Objects become `json-object` structs (read with `json-get`, which also
   accepts a bare alist); arrays become lists. `{}`, `[]`, and `null` are
@@ -279,13 +336,20 @@ tests/
   `random-token` returns a base64url-encoded token (default 32 bytes / ~256 bits).
   For session IDs, CSRF tokens, nonces, PKCE verifiers
 - **ECDSA P-256** — signature verification per FIPS 186-4.
-  Pure Lisp bignum arithmetic, verification only (no signing, no key generation)
+  Pure Lisp bignum arithmetic, verification only (no signing, no key generation).
+  Jacobian coordinates and Shamir's trick. DEPLOYMENT.md says what a
+  verification costs a worker, and why a JWT-guarded app loads
+  `web-skeleton-tls` for it
 - **JWT validation** — ES256 token verification, JWKS key set parsing,
   claim extraction, expiration checking.
-- **WebSocket handshake** — validates upgrade request, computes accept key
+- **WebSocket handshake** — validates upgrade request, computes accept key.
+  A handler that returns `ws-upgrade` instead of `:upgrade` shapes the 101:
+  a subprotocol chosen from those the client offered (`ws-choose-protocol`),
+  and headers of its own
 - **WebSocket frame protocol** — incremental frame parser and builder per RFC 6455,
   handles text, binary, ping/pong, close, and fragmented messages
-  (automatic reassembly with size limits)
+  (automatic reassembly, bounded in size and in the time a message may
+  take to arrive)
 - **Incremental relay** — `fetch-into` starts an outbound request against a
   connection the app already owns, so a streaming response or a WebSocket can
   forward an upstream as it arrives instead of buffering it or holding a worker.
@@ -295,7 +359,8 @@ tests/
   keep the connection — the outbound closes, the target is left untouched, and
   `:then` gets the abort sentinel. A *failed* fetch closes the connection by
   default; `:failure-disposition :keep` leaves a WebSocket to the app that
-  has its own error frame to send. `:then` fires once at the end, its
+  has its own error frame to send, and a body being received — a target
+  too, for an upload forwarded as it arrives — to the app that refuses it. `:then` fires once at the end, its
   return value discarded — there is no parked request for it to answer. Chunked
   framing only, both schemes
 - **Streaming responses** — a handler returns `make-stream-response` instead of
@@ -310,11 +375,18 @@ tests/
   dispatch an event it never wrote
 - **WebSocket server push** — `ws-send` queues a frame and flushes what the
   socket takes immediately, so a handler can stream without returning and
-  without a slow peer holding the worker
+  without a slow peer holding the worker. `ws-close` ends a WebSocket from
+  the server's side, with a close frame when the peer has room for one
 - **Static file serving** — `load-static-files` reads a directory tree into memory
   at startup; `serve-static` looks up the request path and returns a pre-built response.
+  A file is served at the spellings of its path a browser sends, with an
+  escape's hex digits in either case, which the router reads as one, and
+  at no other, so a route in front of it sees what it serves
+  (DEPLOYMENT.md, "Routes in front of static files").
   MIME detection (including `application/wasm`, without which browsers refuse
-  `WebAssembly.instantiateStreaming`), extensionless HTML aliases (`/login.html` → `/login`),
+  `WebAssembly.instantiateStreaming`, and `text/javascript` for `.mjs`, without
+  which they refuse a module script), with `*extra-mime-types*` for a type the
+  table does not know, extensionless HTML aliases (`/login.html` → `/login`),
   directory-index aliases (`/docs/index.html` → `/docs`),
   directory traversal protection, ETag-based revalidation
   (`If-None-Match` → `304 Not Modified` using a SHA-256 strong entity tag
@@ -335,7 +407,8 @@ tests/
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
   Optional background reaper sweeps entries on an app-supplied predicate
-  and registers its stop via the cleanup hook machinery — no app-side teardown needed
+  and registers its stop via the cleanup hook machinery — no app-side teardown needed;
+  `stop-store-reaper` retires one early
 - **HTTP client** — non-blocking outbound HTTP via `http-fetch`. Integrates with
   the event loop — outbound connections use the same epoll, zero blocking.
   Handler returns a fetch descriptor; the framework parks the inbound connection,
@@ -347,7 +420,11 @@ tests/
   subprocess whose stdout pipe is registered with the worker's epoll;
   the parked inbound resumes when the address lands.
   Numeric IPv4 and IPv6 literals (including `http://[::1]:8080/`) skip DNS entirely
-  via a fast path. Both families supported.
+  via a fast path. Both families supported. A name's addresses are dialed in
+  the system's order of preference, the next taken when one refuses or does
+  not answer within two seconds, so `localhost` reaches a service bound to
+  `127.0.0.1` alone, and an IPv6 route that goes nowhere costs that budget
+  rather than the fetch
   Optional per-worker resolution cache (`*dns-cache-ttl*`, off by default) —
   a hit skips the subprocess entirely, and is re-gated on the address filter
 - **Outbound address policy (SSRF)** — `*fetch-address-filter*` is consulted for
@@ -420,20 +497,19 @@ read about here.
   the four refuse a connection another worker owns**: `ws-send`,
   `stream-close` and `fetch-into` each ask the connection table and raise
   before anything is queued. Before is the point: a check that ran later —
-  `ws-send` and `stream-close` once raised only when the write left a
-  remainder — would report the misuse after appending the bytes, and in
-  `stream-close`'s case after telling the application the stream had closed
-  normally.
+  such as the arm after a write that left a remainder, which fails for an fd
+  on another worker's epoll — would report the misuse after appending the
+  bytes, and in `stream-close`'s case after telling the application the
+  stream had closed normally.
 
   **`stream-send` is the exception and does not check.** A cross-worker
   `stream-send` appends to the unsynchronised queue and calls `send(2)` from
   the wrong thread; it is noticed only when the write leaves a remainder,
   because the arm that follows gets `ENOENT` — so the common case, where the
-  bytes fit, returns `T` and says nothing. That is exactly the shape `ws-send`
-  had before it was guarded. It is left alone because closing it is a contract
-  change rather than a fix: a cross-worker `stream-send` mostly succeeds today
-  and code may lean on that accidentally, where a cross-worker `stream-close`
-  already raised every time.
+  bytes fit, returns `T` and says nothing. It is left unguarded because
+  guarding it is a contract change: a cross-worker `stream-send` mostly
+  succeeds and code may lean on that accidentally, where an unguarded
+  cross-worker `stream-close` would raise every time anyway.
 
   A second boundary, and it applies to all four: the question they ask is
   "is this fd on **this worker's** table", and only a worker can ask it. A
@@ -445,7 +521,7 @@ read about here.
   reachable, but a change to three functions at once, and one they have to
   make together or not at all.
 
-  Fan-out *across* workers is still not provided, but it is now buildable:
+  Fan-out *across* workers is not provided, but it is buildable:
   `:on-tick` runs application code on each worker's own event loop with that
   worker's connection table and epoll fd bound, and `map-worker-websockets`
   walks the connections that loop owns. Together they are the one place a
@@ -482,24 +558,26 @@ read about here.
   supported — `web-skeleton-tls` gives `https://` fetches — so the
   feature list above can read as if the inbound case were covered too. It
   isn't.
-- **Chunked request bodies are accepted, but not streamed to a handler.**
-  `Transfer-Encoding: chunked` is decoded and the handler receives the
-  whole body exactly as it does for a `Content-Length` request — the
-  wire bytes accumulate, and the body is decoded once when the terminator
-  arrives. So `curl -T -` is served, and "chunked requests are supported"
-  does *not* mean a 4 GiB upload: the whole body is buffered before your
-  handler is called, and `*max-body-size*` is enforced incrementally as
-  the decoded total grows — plus on a chunk header that declares more than
-  the cap on its own, which is refused the moment it arrives rather than
-  after its bytes fail to turn up. Streaming a request body into a handler
-  would change the handler contract and is out.
+- **A body reaches `:handler` whole, or not at all.** `Transfer-Encoding:
+  chunked` is decoded and the handler receives the whole body exactly as it
+  does for a `Content-Length` request — the wire bytes accumulate, and the
+  body is decoded once when the terminator arrives. So `curl -T -` is
+  served, and "chunked requests are supported" does *not* mean a 4 GiB
+  upload *to the handler*: the whole body is buffered before it is called,
+  and the body's cap — `*max-body-size*`, or the one a body handler chose —
+  is enforced incrementally as the decoded total grows, plus on a chunk
+  header that declares more than the cap on its own, which is refused the
+  moment it arrives rather than after its bytes fail to turn up. A body
+  that should not be held belongs to a body handler's `receive-body`, which
+  hands it to the application as it arrives and answers the request from
+  its `:on-end`; the handler is never called for it.
 - **Two different 413s, and they say which.** The body cap above answers
   `chunked body too large`; the read buffer answers `request too large
   (buffer full)`. Both are reachable for a chunked request and neither is
   redundant: the wire carries framing the decoded body does not, and a
   1-byte chunk costs six wire bytes, so a body made of very small chunks
-  fills the buffer well before its decoded total reaches
-  `*max-body-size*`. Which one fires depends on the chunk sizes, not on
+  fills the buffer well before its decoded total reaches the body's
+  cap. Which one fires depends on the chunk sizes, not on
   the amount of data — so read the reason, not just the code.
 - **Trailers on a request are refused with 400.** A non-empty trailer
   section after the zero-size chunk gets a 400, not a silent discard.
@@ -515,11 +593,17 @@ read about here.
   legal, unimplemented. `chunked, gzip`, a repeated header, an obs-folded
   value, and `Transfer-Encoding` on an HTTP/1.0 request are 400.
 - **No response compression.** No gzip, no `Content-Encoding`
-  negotiation. Compressing static assets is the proxy's job today.
-- **No HTTP/2, no multipart.** A request whose version token is not
-  HTTP/1.0 or HTTP/1.1 gets 505. Form bodies are
-  `application/x-www-form-urlencoded` only — `multipart/form-data`, and
-  therefore file upload, is unimplemented.
+  negotiation. Compressing static assets is the proxy's job.
+- **No HTTP/2.** A request whose version token is not HTTP/1.0 or
+  HTTP/1.1 gets 505.
+- **`multipart/form-data`, and not the rest of MIME.** A
+  `Content-Transfer-Encoding` that changes the bytes and an RFC 2231
+  `filename*` are each refused with 400: reading either would mean reading
+  a body one way while a filter in front of the application may read it
+  another, and no browser sends one. A part whose own type is
+  `multipart/mixed` — how RFC 2388 sent several files under one name,
+  which RFC 7578 §4.3 retired — is not parsed into its files: it arrives as
+  one part, with that type and its content as sent.
 - **Static files are served from memory only.** `load-static-files` reads
   the tree into the heap at startup and pre-builds each response; there
   is no serve-from-disk path, so every file you serve is resident for the
@@ -542,7 +626,9 @@ read about here.
   event loop's write path, so a pause taken while the target's queue was
   empty has no drain coming and needs an explicit `fetch-resume`. An app
   that pauses with neither condition arranged strands that fetch until
-  `*fetch-timeout*`.
+  `*fetch-timeout*`. Pausing when `stream-send` or `ws-send` answers `NIL`
+  — part of the chunk still queued — is the shape that always has a drain
+  coming (DEPLOYMENT.md, "Backpressure is a return value").
 - **A failed detached fetch takes a `:streaming` target with it, and on
   that path there is no opt-out.** The connection closes without its
   chunked terminator, so the peer sees truncation rather than a failed
@@ -557,6 +643,13 @@ read about here.
   ending that produces no response there already gives. "Stop the upstream
   and let me answer the client myself" is not expressible; let the fetch
   finish and answer from `:then` instead.
+- **A streamed request body is chunked unless its length is declared.**
+  `:body :stream` without `:content-length` sends `Transfer-Encoding:
+  chunked`, which an upstream that needs a length up front refuses, S3's
+  PutObject among them. A client that sent its own body chunked declared no
+  length to forward, so its upload reaches such an upstream a piece at a
+  time, each piece a request of its own (DEPLOYMENT.md, "Forms and file
+  uploads").
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
@@ -567,9 +660,9 @@ read about here.
   every connection that worker is serving, not only the one that asked.
   `http-fetch` runs on the event loop for **both** schemes: the inbound
   parks, the outbound uses the same epoll, and one `*fetch-timeout*`
-  bounds the whole exchange. For `https://` that now includes the TLS
+  bounds the whole exchange. For `https://` that includes the TLS
   handshake and every encrypted read and write. What remains below is
-  either your code or a deliberate sleep.
+  your code, or the one API that blocks by design.
 
   - **`http-fetch-stream`, both schemes**, blocks and has **no total
     deadline of any kind**. `SO_RCVTIMEO` bounds each individual read, so
@@ -581,9 +674,6 @@ read about here.
     for as long as they run, with no bound. Inherent rather than a
     shortcoming — that is your code on the worker thread — but it is the
     same worker.
-  - **`accept-connection` sleeps 100 ms** after a failed `accept(2)`, to
-    keep `EMFILE` from spinning the log. Under fd exhaustion that is a
-    worker doing nothing else, 100 ms at a time.
 - **TLS renegotiation mid-transfer is handled but not exercised.** OpenSSL
   can answer a read with "I need to write first" and a write with "I need
   to read first" — a renegotiation or a post-handshake message. The state
@@ -608,18 +698,6 @@ read about here.
   a connection slot and its backlog, not unbounded growth. This is the
   deliberate trade for `ws-send` not holding the worker: a total deadline
   would bound the frame rather than the stall.
-- **A stream can only be written from the worker that owns it.**
-  `stream-send` touches an unsynchronized write queue, and the connection
-  belonging to exactly one event loop is what lets that queue exist
-  without a lock. So the framework holds connections open and writes
-  bytes; deciding *who* receives an event is the app's, and its registry
-  has to push from the owning worker. Delivering to a connection this
-  thread does not own is a designed-for next step and not a thing you can
-  do today. Fan-out is per worker, as the top of this list says: each
-  worker delivers to the connections it owns, from `:on-tick` with
-  `map-worker-websockets`. What the framework does not provide is the
-  subscriber registry, deliberately — a framework that owned it would own
-  per-process state and become the horizontal-scaling limit.
 
 ## Configuration
 
@@ -629,38 +707,48 @@ All configurable via `setf` before calling `start-server`.
 |--------------------------------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `*log-level*`                  | `:info`   | Minimum log level (`:debug`, `:info`, `:warn`, `:error`)                                                                                                                                                                                           |
 | `*log-stream*`                 | `nil`     | Stream for log output (`nil` uses `*standard-output*`)                                                                                                                                                                                             |
-| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes)                                                                                                                                                                                                                      |
-| `*max-header-count*`           | `100`     | Max number of headers per request                                                                                                                                                                                                                  |
-| `*max-header-line-length*`     | `8192`    | Max single header line (bytes)                                                                                                                                                                                                                     |
-| `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431      |
-| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB)                                                                                                                                                                                                              |
-| `*max-outbound-response-size*` | `8388608` | Max buffered outbound HTTPS response total (headers + body, bytes, default 8MB). Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected                                                                          |
-| `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound)                 |
-| `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value                                    |
-| `*json-max-depth*`             | `256`     | Max nesting depth for `json-parse`. Bounds the recursive descent so deeply nested input cannot overflow the stack                                                                                                                                   |
-| `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it |
-| `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path                                                                                                                                              |
-| `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame |
-| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing |
+| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes). Validated when the server starts                                                                                                                                                                                    |
+| `*max-header-count*`           | `100`     | Max number of headers per request. Validated when the server starts                                                                                                                                                                                |
+| `*max-header-line-length*`     | `8192`    | Max single header line (bytes). Validated when the server starts                                                                                                                                                                                   |
+| `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431. Validated when the server starts |
+| `*max-body-size*`              | `1048576` | Max request body (bytes, default 1MB). A body handler can choose another cap for a request, above or below this one, with `buffer-body` or `receive-body` — the latter's can be `nil`, since a received body is never held. `0` takes no body. Validated when the server starts |
+| `*max-outbound-response-size*` | `8388608` | Max bytes an outbound response holds in the read buffer, headers included, either scheme (default 8MB). A buffered `http-fetch` holds the whole response, so this caps its size. An `:on-body` relay of a chunked response frees each chunk once it is handed on, so here it caps the head plus one chunk and the stream itself can be any length. Separate from `*max-body-size*` so 1MB+ responses with normal headers don't get rejected. Validated when the server starts |
+| `*max-streaming-line-size*`    | `1048576` | Max single line in a streamed response (NDJSON, SSE, chunked text, bytes, default 1MB). Per-line cap on the `http-fetch-stream` paths, distinct from `*max-outbound-response-size*` (per-response) and `*max-body-size*` (inbound). Validated when the server starts |
+| `*max-interim-responses*`      | `8`       | Max 1xx interim blocks an upstream may send before its final response (RFC 7231 §6.2) — CDNs emit `103 Early Hints` unsolicited. The ninth fails the fetch with a 502. All three transports read this one value. `0` allows none. Validated when the server starts |
+| `*max-upstream-header-count*`  | `nil`     | Max header fields in an upstream's response head; `nil` takes `*max-header-count*`'s value. With the next two, what an upstream's head is held to, apart from what a client's is: raise them for an upstream that sends more than a client may, a CDN's long `Set-Cookie` or `Link` line say, without widening what every client may send. Past them the fetch fails with a 502. Validated when the server starts |
+| `*max-upstream-header-line-length*` | `nil` | Max length of one field line in an upstream's response head; `nil` takes `*max-header-line-length*`'s value |
+| `*max-upstream-total-header-bytes*` | `nil` | Max field-line bytes in an upstream's response head; `nil` takes `*max-total-header-bytes*`'s value |
+| `*json-max-depth*`             | `256`     | Max nesting depth for `json-parse`. Bounds the recursive descent so deeply nested input cannot overflow the stack. Validated when the server starts                                                                                                 |
+| `*json-max-string-length*`     | `1048576` | Max decoded length of one JSON string, default 1 MiB. Bounds the per-string accumulator so an attacker-controlled response body (up to `*max-outbound-response-size*`) cannot force an 8 MiB allocation per value. Raise it if you need to; don't disable it. Validated when the server starts |
+| `*max-ws-payload-size*`        | `65536`   | Max individual WebSocket frame payload (bytes, default 64KB). Per-frame memory bound on the read path. Validated when the server starts                                                                                                            |
+| `*max-ws-message-size*`        | `1048576` | Max reassembled WebSocket message (bytes, default 1MB). Applies to fragmented messages (opcode TEXT/BINARY + CONTINUATION frames). Separate from `*max-ws-payload-size*` so fragmentation can actually deliver messages larger than a single frame. Validated when the server starts |
+| `*max-connections*`            | `10000`   | Max connections **per worker**, not per server. The default worker count is the core count, so the real ceiling is `10000 × cores` — 160,000 on a 16-core box. Each connection's read buffer can grow to roughly 1.07 MiB (body cap plus the header budgets) before the keep-alive reset shrinks it back to 4 KiB, and a WebSocket's to its payload cap until the frame is consumed, so size this against memory rather than accepting the default because it looks like one number. At the limit a new accept is answered `503` with `Retry-After: 2` and closed. Counts every fd in the worker's table, not just client connections — an in-flight `http-fetch` outbound and a `getent` DNS pipe each occupy a slot, so a relay-heavy app reaches the limit with fewer clients than the number suggests. That is honest as an fd budget and worth knowing when sizing. `0` is no limit. Validated when the server starts. New accepts are refused the same way when the process is nearly out of descriptors, whatever this is: see "Descriptors" in DEPLOYMENT.md's Environment section |
+| `*listen-backlog*`             | `128`     | Each worker's accept queue: connections the kernel has completed and holds until the worker accepts them. Per worker, since each binds its own `SO_REUSEPORT` listener, so the server's is this × workers. Linux clamps it to `net.core.somaxconn`, so raise that too to raise this. Overflow shows only as clients' SYN retransmits, so a reverse proxy that opens bursts of connections at a server with few workers is the case for raising it. Validated when the server starts |
 | `*max-write-backlog*`          | `2097152` | Max unsent bytes one connection may hold (default 2MB) — the in-flight buffer plus anything queued behind it. Reached when a producer outruns the peer. Must clear `*max-ws-message-size*` by at least 10 bytes, the largest frame header, or a maximal legal WebSocket message cannot be sent even onto an empty queue; the default leaves a full MiB of room. Validated when the server starts, so a deployment that trims this below the message size is told at boot rather than at the first maximal message. A send that would exceed it is refused whole rather than truncated, and the caller decides what that means. Per connection, so the ceiling is this × `*max-connections*` × workers, and it takes every connection simultaneously backed up to get there |
 | `*max-write-backlog*` (query)  | —         | `stream-full-p` answers whether a connection is at the bound, for a producer deciding whether to generate more at all. A hint about bytes already queued, never a promise about the next send — only `stream-send`'s own return gives that |
-| `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this |
-| `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice |
-| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end |
-| `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed                                                                                                                                                                                                     |
-| `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings                                                                                                                                                                                                   |
-| `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead                                                                                                                                                                                                   |
+| `*stream-idle-timeout*`        | `300`     | Seconds a streaming response may go without the app producing anything before the connection is closed (`0` disables). Distinct from `*idle-timeout*` and `*ws-idle-timeout*`, which would be wrong in opposite directions — ten seconds reaps healthy streams, a day holds dead ones. Distinct again from `*write-stall-timeout*`: that asks whether bytes are leaving, this asks whether any are arriving to send. A keepalive counts as production, so a stream that emits them is never reaped by this. Validated when the server starts |
+| `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice. Validated when the server starts |
+| `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end. It is also the whole budget for one request to arrive, body included — partial reads do not extend it, which is what stops a client dripping a request — so an upload slower than that is cut off: accept the body from a body handler, which then times it by `*body-stall-timeout*` instead, or have the proxy buffer bodies (see DEPLOYMENT.md). Validated when the server starts |
+| `*body-stall-timeout*`         | `30`      | Seconds the body of a request a body handler accepted may go without a byte arriving before the connection is closed. Measured from the last bytes of it, not from the request's start, so an upload is bounded by its stalls and not by its size. The head is still `*idle-timeout*`'s, and so is a body no body handler accepted. Must be positive; validated when the server starts, since it is the only time bound on an accepted body. A client sending a byte per interval is never closed by it — the proxy is where a client that slow belongs |
+| `*linger-timeout*`             | `2`       | Seconds a connection closed after an early error response (a 413 for a body over the cap, a 431, any refusal of a request still arriving) keeps reading and discarding what its client is still sending, so the response is followed by a FIN. Closed at once, Linux sends a reset instead, which discards response bytes not yet sent and reads as a failure to a peer that treats resets as one. `0` closes at once. Validated when the server starts |
+| `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed. `0` disables. Validated when the server starts                                                                                                                                                     |
+| `*ws-message-timeout*`         | `30`      | Seconds a WebSocket message may take to arrive, from its first byte to its last. A fragmented message short of its final fragment, or a frame not all here, is closed 1008 once it passes. Not moved by fragments, so it bounds how long an unfinished message holds its buffer, which `*ws-idle-timeout*` does not. `0` disables. Validated when the server starts |
+| `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings. Must be positive; validated when the server starts                                                                                                                                               |
+| `*ws-max-missed-pongs*`        | `3`       | Missed pongs before a WebSocket is declared dead. A ping goes out each `*ws-ping-interval*` and the close comes at the round after the last one missed, so at the defaults a peer that vanishes without a word is closed 90 to 120 seconds after its last pong: it is a bound on how long a dead socket is held, not a 30-second detector. A peer that stops reading while the server is sending to it is closed sooner, by `*write-stall-timeout*`. A positive integer; validated when the server starts |
 | `*write-stall-timeout*`        | `10`      | Inactivity bound on a write backlog, not a total — the time half of the pair whose byte half is `*max-write-backlog*`. Seconds a connection may sit without the queue moving before it is closed; any byte accepted restarts it, so a peer reading one byte per interval is never closed — memory stays capped, time does not. Measured from the last forward progress, not the connection's last activity, so a peer that keeps sending while refusing to read cannot hold its own backlog open. Applies in every state, not just WebSocket. Must be positive; validated when the server starts. Bounds one connection, not the worker. See Limitations |
-| `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations |
+| `*fetch-timeout*`              | `30`      | A **total** on the parked `http-fetch` path, both schemes: the `:awaiting` reap covers DNS + connect + TLS handshake + request I/O together, and it is the inbound's deadline that makes it a total. A **detached** fetch — `fetch-into` — has no parked inbound and so no reap over the whole exchange: the DNS phase carries its own deadline and the TCP phase gets another, which bounds a detached fetch **to a name** at twice this value. An IP literal skips the DNS phase and is bounded at one. A **streamed** request body (`:body :stream`) is bounded by its progress while it goes out, every piece sent or taken moving the deadline, and its answer by this value from when the body has gone. Per-phase on `http-fetch-stream` and the blocking setup paths, where it bounds DNS, connect, and each individual socket read separately — so a trickling upstream never trips it. See Limitations. A positive whole number of seconds; validated when the server starts |
+| `*connect-fallback-delay*`     | `2`       | Seconds a connect to one of a name's addresses is given, while the name has more, before the next is dialed instead: RFC 8305's longest Connection Attempt Delay. A refused or unreachable address gives way at once; this is for one that does not answer, a black-holed IPv6 route say. The last address has what is left of `*fetch-timeout*`. Both paths, parked and blocking. A positive whole number of seconds; validated when the server starts |
 | `*fetch-address-filter*`       | `nil`     | Policy hook `(ip family host) -> boolean` consulted for every address an outbound fetch is about to dial, IP literals included. `nil` allows all. Set it (typically to `is-public-address-p`) when fetch URLs come from user input — SSRF defense   |
-| `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`                                |
-| `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough                                                                                                                                 |
-| `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks                                                                                                                                                                                             |
-| `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown                                                                                                                                                                                               |
-| `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes |
+| `*dns-cache-ttl*`              | `0`       | Seconds a hostname resolution is cached, per worker. `0` disables caching — every fetch re-runs `getent`. `getent` reports no TTL, so the value is the app's judgment. Hits are re-gated on `*fetch-address-filter*`. Whole seconds; validated when the server starts |
+| `*dns-cache-max-entries*`      | `256`     | Max hostnames cached per worker. On overflow, expired entries are swept and the table cleared if that isn't enough. Validated when the server starts                                                                                               |
+| `*jwt-clock-skew*`             | `60`      | Seconds of clock skew tolerance for JWT exp/nbf checks. Whole seconds; validated when the server starts                                                                                                                                            |
+| `*match-path-literals*`        | `:exact`  | How `match-path` compares a pattern's literal segments. `:exact` matches the path as it arrived, the spelling `http-request-path` shows, read through `canonical-path`: `/%61dmin` does not match `/admin`, and `/a%5B1%5D` does match `/a[1]`. `:decoded` percent-decodes the segment first (RFC 3986 §6.2.2.2), and then access decisions belong on the matched route, never on the raw path. Captures are decoded either way. Validated when the server starts |
+| `*extra-mime-types*`           | `nil`     | Extension and Content-Type pairs `load-static-files` consults before its own table, for a type the table does not know or one it should answer differently: `'(("glb" . "model/gltf-binary"))`. Extensions without the dot, matched in any case. Read as each file is loaded, so set it before `load-static-files`, which refuses an entry that is not two strings |
+| `*drain-timeout*`              | `5`       | Seconds to wait for connections to drain on shutdown. Whole seconds; validated when the server starts                                                                                                                                              |
+| `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes. Must be positive; validated when the server starts |
 
-The `host`, `port`, `workers`, `handler`, `ws-handler`, `on-listen`, and
-`on-tick` are passed as keyword arguments:
+The `host`, `port`, `workers`, `handler`, `ws-handler`, `body-handler`,
+`on-listen`, and `on-tick` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)
@@ -693,6 +781,9 @@ being chosen and being served.
 and dispatches the listener family accordingly.
 Use `:host #(0 0 0 0)` to listen on all IPv4 interfaces,
 or `:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)` to listen on all IPv6 interfaces.
+On Linux's default (`net.ipv6.bindv6only = 0`) the IPv6 wildcard serves
+IPv4 peers too, as v4-mapped addresses logged as `0:0:0:0:0:ffff:a.b.c.d`,
+so it is the one listener a dual-stack host needs.
 IPv6 loopback is `:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)`.
 The number of workers defaults to the number of CPU cores.
 Without a handler, the server returns 501 for all requests.
@@ -729,6 +820,12 @@ The callback can itself return another continuation for chained fetches —
 the framework detects the nested continuation and runs the chain.
 A regular `http-response` object terminates the chain.
 See `demo/handler.lisp`'s `/demo-fetch` endpoint for a runnable example.
+
+A fetch's body can also be sent as it is produced: `:body :stream` makes it
+the application's to send with `fetch-send` and end with `fetch-finish`,
+and `forward-body` is a body plan built from the two that sends a
+request's body upstream as it arrives. DEPLOYMENT.md's "Sending a request
+body as it is produced" has the contract.
 
 `http-fetch-stream` is a separate, **blocking** variant that
 reads the response body line by line via a per-line callback.

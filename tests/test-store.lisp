@@ -132,7 +132,7 @@
              (store-count s) 4)
       ;; Wait for the reaper to sweep at least once. Interval is
       ;; 0.2s; sleeping 0.5s gives ~2.5x margin against thread-start
-      ;; latency, scheduler jitter, and the reaper's 0.1s slice.
+      ;; latency and scheduler jitter.
       (sleep 0.5)
       (check "after reap: count is 2 (doomed entries gone)"
              (store-count s) 2)
@@ -145,6 +145,73 @@
       (let ((web-skeleton:*log-level* :error)
             (web-skeleton:*log-stream* (make-broadcast-stream)))
         (web-skeleton::run-shutdown-hooks)))))
+
+(defun test-store-reaper-stops-at-once ()
+  "STOP-STORE-REAPER wakes a reaper in the middle of its interval rather
+   than waiting it out, and takes the store's shutdown hook back out, so a
+   store an application retires is held by nothing of the framework's.
+
+   The interval is a minute: a stop that only flagged the reaper would
+   leave it asleep for that minute, and STOP-STORE-REAPER's join would give
+   up after its five seconds with the thread still alive."
+  (format t "~%Store reaper: stopped at once, and let go~%")
+  (let ((web-skeleton::*shutdown-hooks* nil))
+    (let* ((s (make-store :expiry-fn (lambda (k v) (declare (ignore k v)) nil)
+                          :reap-interval 60))
+           (thread (web-skeleton::store-reaper-thread s)))
+      (sleep 0.2)
+      (check "retire: the store's hook is registered"
+             (length web-skeleton::*shutdown-hooks*) 1)
+      (let ((start (get-internal-real-time)))
+        (stop-store-reaper s)
+        (check "retire: the stop returns at once, not at the interval"
+               (< (/ (- (get-internal-real-time) start)
+                     internal-time-units-per-second)
+                  1)
+               t))
+      (check "retire: the reaper thread has ended"
+             (sb-thread:thread-alive-p thread) nil)
+      (check "retire: and the hook is gone with it"
+             web-skeleton::*shutdown-hooks* nil)
+      (check "retire: a second stop is harmless"
+             (progn (stop-store-reaper s) :ok) :ok))))
+
+(defun test-store-reaper-survives-a-serious-condition ()
+  "An expiry predicate that runs out of stack, or out of the time it gave
+   itself, costs one sweep, not the reaper.
+
+   The reaper is a thread of its own with nothing above it, so a condition
+   its catch lets past ends it — and SBCL ends the process with it when the
+   debugger is disabled. Neither STORAGE-CONDITION nor SB-EXT:TIMEOUT is an
+   ERROR, so a catch on ERROR alone is that catch. The predicate runs out
+   of stack on its first call and out of time on its second, each ending
+   its sweep; the entries a later sweep would reap being gone is the
+   evidence that a later sweep happened."
+  (format t "~%Store reaper: a predicate out of stack, then out of time~%")
+  (let ((web-skeleton::*shutdown-hooks* nil)
+        (calls 0))
+    (call-with-escapes-ending-the-thread
+     (lambda ()
+       (let ((s (make-store
+                 :expiry-fn (lambda (k v)
+                              (declare (ignore k))
+                              (case (incf calls)
+                                (1 (%exhaust-the-stack 0))
+                                (2 (%run-out-of-time)))
+                              (eq v :doomed))
+                 :reap-interval 0.2)))
+         (store-set s "keep" :alive)
+         (store-set s "doomed" :doomed)
+         ;; The first two sweeps are the ones that fail; a third fits in
+         ;; the wait with room for the scheduler.
+         (sleep 1.2)
+         (check "reaper: the predicate did run out of stack, then time"
+                (>= calls 2) t)
+         (check "reaper: and a later sweep still reaped"
+                (store-count s) 1)
+         (let ((web-skeleton:*log-level* :error)
+               (web-skeleton:*log-stream* (make-broadcast-stream)))
+           (web-skeleton::run-shutdown-hooks)))))))
 
 (defun test-store-thread-safety ()
   (format t "~%Store thread safety~%")
@@ -184,6 +251,8 @@
   (test-store-map)
   (test-store-validation)
   (test-store-reaper)
+  (test-store-reaper-stops-at-once)
+  (test-store-reaper-survives-a-serious-condition)
   (test-store-thread-safety)
   (report-suite "Store")
   (zerop *tests-failed*))

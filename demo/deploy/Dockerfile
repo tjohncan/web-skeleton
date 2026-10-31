@@ -2,17 +2,18 @@
 #
 #   docker build -f demo/deploy/Dockerfile -t web-skeleton-demo .
 #
-# Debian rather than Alpine, deliberately. Hostname resolution shells out to
-# `getent ahosts`, which is glibc's. Busybox ships a getent whose output this
-# parser has never been tested against, and the failure would be a server that
-# starts cleanly and cannot resolve anything, with nothing in the log to say
-# why. One base image is one thing to get wrong.
+# Debian rather than Alpine, deliberately. Hostname resolution runs
+# `getent ahosts -- HOST`, written for glibc's getent. Alpine's comes from
+# musl-utils, which does not take `--` as the end of its options: it looks
+# `--` up as a hostname, finds none and stops there, so a server on Alpine
+# starts cleanly and then resolves no hostname at all, with nothing in the log
+# to say why. One base image is one thing to get wrong.
 #
-# bookworm's SBCL is 2.2.9, which is right for this demo and not for every
-# application. The demo never fetches by hostname, so it never spawns the
-# getent child SBCL leaks before 2.4.11: measured on 2.2.9, 200 fetches to a
-# name that resolves left 14 zombies, and 2.6 left none. An application that
-# does fetch by hostname wants a newer SBCL than this base image carries.
+# bookworm's SBCL is 2.2.9, the oldest the suite is run on, and it serves an
+# application that fetches by hostname as well as this demo, which does not.
+# Each such fetch spawns a getent child, and the framework closes one only
+# once it has exited: an SBCL before 2.4.11 never collects a child closed
+# while it was still running, and leaves it as a zombie.
 FROM debian:bookworm-slim
 
 # sbcl is the runtime. libssl3 and ca-certificates are optional and are what
@@ -23,6 +24,15 @@ RUN apt-get update \
       sbcl ca-certificates libssl3 curl \
  && rm -rf /var/lib/apt/lists/*
 
+# The server binds 8081 and needs no privilege, so it runs as a user of its
+# own rather than as root. The user owns its home and nothing else: /app
+# stays root's, readable and not writable. USER names it by number, so an
+# orchestrator that has to verify an image does not run as root (Kubernetes'
+# runAsNonRoot) can.
+RUN groupadd --gid 10001 demo \
+ && useradd --uid 10001 --gid demo --create-home --home-dir /home/demo \
+      --shell /usr/sbin/nologin demo
+
 WORKDIR /app
 COPY . /app
 
@@ -32,6 +42,13 @@ COPY . /app
 # libssl only at load time, so this step never needs libssl, and a container
 # without it still starts and says TLS is absent. CI compiles on its runner's
 # SBCL, so this is the one compile that runs on the SBCL the container does.
+#
+# It runs as the user the container runs as, with that user's HOME, because
+# ASDF keeps what it compiles under ~/.cache/common-lisp. Compiled by root,
+# the files would sit where the runtime never looks, and each new container
+# would compile the whole system again before it served anything.
+USER 10001:10001
+ENV HOME=/home/demo
 RUN sbcl --non-interactive \
       --eval '(require :asdf)' \
       --eval '(push #p"/app/" asdf:*central-registry*)' \
@@ -47,5 +64,8 @@ RUN sbcl --non-interactive \
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${WS_PORT:-8081}/healthz" > /dev/null || exit 1
 
+# WS_PORT's default. EXPOSE is only metadata, which `docker run -P` reads;
+# a container run with another WS_PORT publishes that port explicitly, as
+# compose.yml's ports: does.
 EXPOSE 8081
 CMD ["sbcl", "--non-interactive", "--load", "demo/deploy/run.lisp"]

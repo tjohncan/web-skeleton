@@ -19,6 +19,8 @@
         (test-ssl-ctx-init)
         (test-tls-client-ssl)
         (test-tls-end-to-end)
+        (test-tls-blocking-read-timeout-is-reported-as-one)
+        (test-https-stream-survives-collections)
         (test-tls-ssl-pending)
         (test-tls-connection-write)
         (test-tls-write-retry-after-gc)
@@ -27,8 +29,10 @@
         (test-ssl-eintr-retry)
         (test-https-fetch-async-e2e)
         (test-https-fetch-on-body-e2e)
+        (test-https-on-body-relays-past-the-cap)
         (test-https-close-without-close-notify-ends-the-body)
         (test-https-a-dirty-error-queue-does-not-fail-a-read)
+        (test-https-streamed-request-body)
         (test-https-does-not-hold-the-worker)
         (report-suite "TLS")
         (zerop *tests-failed*))))
@@ -80,7 +84,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    One command per line, no backslash continuations. A backslash before a
    newline inside a Common Lisp string escapes the newline and is consumed,
    so the shell never receives the continuation and each command silently
-   splits in two — which is how the first version of this failed.")
+   splits in two.")
 
 (defun %pick-free-port ()
   "Bind port 0, read the number, close, return it.
@@ -180,10 +184,16 @@ printf 'TAIL-MARKER\\n' >> body.txt
    which relay mode sends to the client as-is — the way to arrange a
    response bigger than one TLS record, and bigger than the read buffer.
 
-   Not -HTTP, which looked like the obvious way to serve a large file and
-   is not: measured, it truncates at around 10 KB against a reader that
-   consumes in 4 KiB steps driven by epoll, while delivering the whole file
-   to s_client. The cause is s_server's, not ours — a clean close_notify
+   Relay mode runs non-blocking, -nbio. Blocking, s_server can stop for
+   good after its first record on a loaded host, held in a read on the
+   socket waiting for a record from a client that sends none, and the rest
+   of the file is never relayed. Non-blocking, that read gives up at once
+   and the relay goes on.
+
+   Not -HTTP, which looks like the obvious way to serve a large file and
+   is not: it truncates at around 10 KB against a reader that consumes in
+   4 KiB steps driven by epoll, while delivering the whole file to
+   s_client. The cause is s_server's, not ours — a clean close_notify
    arrives mid-body — but a fixture that stops early for reasons belonging
    to the fixture cannot support an assertion about our drain loop."
   (let* ((port (%pick-free-port))
@@ -201,7 +211,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                        "-cert" (format nil "~a/~a.pem" dir leaf)
                        "-key"  (format nil "~a/~a.key" dir leaf)
                        "-quiet")
-                 (if relay-file (list "-naccept" "1") (list "-www")))
+                 (if relay-file (list "-naccept" "1" "-nbio") (list "-www")))
                 :wait nil :output nil :error nil
                 :directory dir :search t
                 :input (and relay-file (pathname relay-file)))))
@@ -244,7 +254,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    a name, so the test needs one. A LET suffices: TLS-CONNECT is blocking
    and reads this special on this thread."
   (format t "~%TLS end to end~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -338,13 +348,185 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
+(defun test-tls-blocking-read-timeout-is-reported-as-one ()
+  "HTTP-FETCH-STREAM over https:// to a peer that takes the request and
+   never answers gives up after *FETCH-TIMEOUT*, and says it timed out.
+
+   The report is the point as much as the bound. OpenSSL reports a
+   blocking socket's receive-timeout expiry as SSL_ERROR_WANT_READ, which
+   the shared classifier answers as a caller bug, so unless the blocking
+   wrapper calls it the timeout, an operator facing a slow upstream is
+   sent to read tls.lisp. The classifier checks assert the pairs they are
+   handed; this one provokes the real pair.
+
+   The peer is s_server in relay mode with a stdin that never speaks: it
+   completes the handshake, reads the request, and has nothing to relay."
+  (format t "~%TLS: a blocking read that times out says so~%")
+  (let ((dir (scratch-path "ws-tls")))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "tls timeout: fixture certificates generated" nil t)
+             (return-from test-tls-blocking-read-timeout-is-reported-as-one))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir)
+                    nil)
+           (let* ((port (%pick-free-port))
+                  (proc (sb-ext:run-program
+                         "openssl"
+                         (list "s_server" "-accept" (princ-to-string port)
+                               "-cert" (format nil "~a/right.pem" dir)
+                               "-key"  (format nil "~a/right.key" dir)
+                               "-quiet" "-naccept" "1")
+                         :wait nil :output nil :error nil
+                         :directory dir :search t :input :stream)))
+             (unwind-protect
+                  (progn
+                    (check "tls timeout: the silent peer is listening"
+                           (%wait-for-listener port) t)
+                    (let ((web-skeleton::*dns-resolve-blocking-fn*
+                            (lambda (host)
+                              (declare (ignore host))
+                              (values #(127 0 0 1) :inet)))
+                          (web-skeleton:*fetch-timeout* 1)
+                          (start (get-internal-real-time)))
+                      (let ((outcome
+                              (handler-case
+                                  (http-fetch-stream
+                                   :get (format nil "https://right.test:~d/" port)
+                                   :on-line #'identity)
+                                (error (e) (princ-to-string e))))
+                            (secs (/ (float (- (get-internal-real-time) start))
+                                     internal-time-units-per-second)))
+                        (check "tls timeout: the read was bounded by *fetch-timeout*"
+                               (< secs 4.0) t)
+                        (check "tls timeout: and reported as a timeout"
+                               (and (stringp outcome)
+                                    (search "SSL_read: timed out" outcome)
+                                    t)
+                               t))))
+               (ignore-errors (close (sb-ext:process-input proc)))
+               (ignore-errors (sb-ext:process-kill proc 15))
+               (ignore-errors (sb-ext:process-wait proc)))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
+(defun test-https-stream-survives-collections ()
+  "HTTP-FETCH-STREAM over https:// reads a slow body to its end while
+   another thread collects garbage throughout.
+
+   Each collection stops every other thread with a signal, and a blocking
+   read carrying SO_RCVTIMEO fails with EINTR when one lands in it, which
+   OpenSSL reports with the WANT_READ a receive timeout gets. Taken for
+   the timeout, the stream ends at the first collection to land in a
+   wait. The peer spaces its lines so that every read waits, and the
+   collector runs far more often than the lines arrive, so each wait is
+   interrupted many times over.
+
+   The handshake gets the same treatment. The peer is stopped before the
+   fetch connects and resumed a moment later, so SSL_connect waits on a
+   peer that cannot answer yet, and collections land in that wait too.
+
+   The peer is s_server in relay mode, fed from this process: a head
+   framed by the close, then the lines, then the end of its input, which
+   it answers with close_notify."
+  (format t "~%TLS: a blocking stream outlasts collections on another thread~%")
+  (let ((dir (scratch-path "ws-tls"))
+        (expected (loop for i below 6 collect (format nil "line ~d" i))))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "gc stream: fixture certificates generated" nil t)
+             (return-from test-https-stream-survives-collections))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir)
+                    nil)
+           (let* ((port (%pick-free-port))
+                  (proc (sb-ext:run-program
+                         "openssl"
+                         (list "s_server" "-accept" (princ-to-string port)
+                               "-cert" (format nil "~a/right.pem" dir)
+                               "-key"  (format nil "~a/right.key" dir)
+                               "-quiet" "-naccept" "1")
+                         :wait nil :output nil :error nil
+                         :directory dir :search t :input :stream))
+                  (stop nil)
+                  (threads nil))
+             (unwind-protect
+                  (progn
+                    (check "gc stream: the peer is listening"
+                           (%wait-for-listener port) t)
+                    ;; Stopped, the peer's kernel still completes the TCP
+                    ;; connect, and the ClientHello waits unanswered.
+                    (sb-ext:process-kill proc 19)
+                    (push (sb-thread:make-thread
+                           (lambda ()
+                             ;; The peer may be gone early when the fetch
+                             ;; fails, and a write into its closed input
+                             ;; must not end the run.
+                             (ignore-errors
+                              (sleep 0.4)
+                              (sb-ext:process-kill proc 18)
+                              (let ((in (sb-ext:process-input proc)))
+                                (format in "HTTP/1.1 200 OK~a~
+                                            Connection: close~a~a"
+                                        *crlf* *crlf* *crlf*)
+                                (finish-output in)
+                                (dolist (line expected)
+                                  (sleep 0.15)
+                                  (write-line line in)
+                                  (finish-output in))
+                                (close in))))
+                           :name "gc-stream-feeder")
+                          threads)
+                    (push (sb-thread:make-thread
+                           (lambda ()
+                             (loop until stop
+                                   do (sb-ext:gc)
+                                      (sleep 0.005)))
+                           :name "gc-stream-collector")
+                          threads)
+                    (let* ((lines nil)
+                           (outcome
+                             (let ((web-skeleton::*dns-resolve-blocking-fn*
+                                     (lambda (host)
+                                       (declare (ignore host))
+                                       (values #(127 0 0 1) :inet)))
+                                   (web-skeleton:*fetch-timeout* 10))
+                               (handler-case
+                                   (http-fetch-stream
+                                    :get (format nil "https://right.test:~d/" port)
+                                    :on-line (lambda (line) (push line lines)))
+                                 (error (e) (princ-to-string e))))))
+                      (check "gc stream: the stream ended with its status"
+                             outcome 200)
+                      (check "gc stream: and delivered every line"
+                             (reverse lines) expected)))
+               (setf stop t)
+               (ignore-errors (sb-ext:process-kill proc 18))
+               (dolist (thread threads)
+                 (ignore-errors (sb-thread:join-thread thread :timeout 5)))
+               (ignore-errors (close (sb-ext:process-input proc)))
+               (ignore-errors (sb-ext:process-kill proc 15))
+               (ignore-errors (sb-ext:process-wait proc)))))
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
 (defun test-tls-ssl-pending ()
   "A TLS response far larger than the read buffer arrives complete, through
    CONNECTION-READ-AVAILABLE over an SSL byte source, driven only by
    edge-triggered epoll.
 
-   This is the trap most likely to bite, and until now it was an argument
-   rather than a test. SSL_read returns at most one record
+   This is the trap most likely to bite, and it is a test here rather than
+   an argument. SSL_read returns at most one record
    per call and hands back already-decrypted bytes before it touches the
    socket. Consume part of a record and the remainder sits in OpenSSL's
    buffer with nothing left on the fd, so an edge-triggered epoll has no
@@ -364,7 +546,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    record and leave the rest pending. One record larger than one buffer is
    the condition; this arranges several."
   (format t "~%TLS SSL_pending discipline~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -390,6 +572,17 @@ printf 'TAIL-MARKER\\n' >> body.txt
                 (when port
                   (multiple-value-bind (ssl socket)
                       (%tls-connect-retrying "right.test" port)
+                    ;; The peer sends the whole response and exits before
+                    ;; the first read, so every record waits behind one
+                    ;; readability edge: the shape the trap needs, where a
+                    ;; drain that stops early gets no second event. Read
+                    ;; while the peer is still sending, each record can
+                    ;; bring an edge of its own, and the next one rescues a
+                    ;; drain that stopped. Ten seconds at most; a peer
+                    ;; still running then is read as it sends.
+                    (loop repeat 200
+                          while (eq (sb-ext:process-status *tls-peer-process*) :running)
+                          do (sleep 0.05))
                     (let ((epfd (web-skeleton::epoll-create)))
                       (unwind-protect
                            (let* ((fd (web-skeleton::socket-fd socket))
@@ -420,11 +613,19 @@ printf 'TAIL-MARKER\\n' >> body.txt
                              ;; Reads happen only when epoll says so. If a
                              ;; drain ever leaves bytes inside OpenSSL, epoll
                              ;; goes quiet and this loop ends short.
+                             ;;
+                             ;; Quiet is five seconds without an event. Bytes
+                             ;; stranded inside OpenSSL raise no event ever,
+                             ;; so the stall is caught at any length of wait;
+                             ;; the length is for a peer the wait above gave
+                             ;; up on, still sending on a loaded host, which
+                             ;; is the peer being slow and not the read
+                             ;; losing bytes.
                              (loop repeat 200
                                    while (not (member (first verdicts)
                                                       '(:eof :ok-eof)))
                                    do (if (plusp (web-skeleton::epoll-wait
-                                                  epfd evbuf 4 1000))
+                                                  epfd evbuf 4 5000))
                                           ;; A raising read becomes a verdict
                                           ;; rather than the end of the suite;
                                           ;; the assertions below then report
@@ -484,11 +685,6 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
-(defconstant +so-sndbuf+ 7
-  "SO_SNDBUF. Defined here rather than in epoll.lisp because nothing the
-   framework does needs it — only this test, which has to make a socket
-   small enough to block.")
-
 (defun test-tls-write-retry-after-gc ()
   "A blocked SSL_write, a full GC, and then the retry — the exact sequence
    the foreign staging buffer exists for.
@@ -504,17 +700,17 @@ printf 'TAIL-MARKER\\n' >> body.txt
    than a race. A stopped process cannot read, so its receive buffer fills
    and stays full; and unlike a peer that has finished or exited, it cannot
    close the connection underneath the retry. Racing a live peer instead
-   produced exactly that — SSL_write failing with SSL_ERROR_SYSCALL because
+   risks exactly that — SSL_write failing with SSL_ERROR_SYSCALL because
    the far end had gone away mid-test.
 
    Small vectors, not one large one: a full GC is free to relocate a 1 KiB
    vector and would leave a multi-megabyte one where it is.
 
-   Measured: with staging removed, the retry raises \"SSL_write failed:
-   error 1\" — SSL_ERROR_SSL, OpenSSL's bad-write-retry — three runs of
-   three. That is this ruling demonstrated rather than argued."
+   With staging removed, the retry raises \"SSL_write failed: error 1\" —
+   SSL_ERROR_SSL, OpenSSL's bad-write-retry. That is this ruling
+   demonstrated rather than argued."
   (format t "~%TLS write retry across a GC~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -591,7 +787,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    while its socket buffer fills, and a retry that never happens cannot
    demonstrate that the address held still across it. Review-verified."
   (format t "~%TLS connection write path~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10)))))
+  (let ((dir (scratch-path "ws-tls")))
     (unwind-protect
          (progn
            (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
@@ -704,12 +900,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
    fast request against a peer that merely happens to be slow would be a
    measurement of the machine.
 
-   Before this branch the relay held the worker for the whole exchange,
-   and /fast would not have been answered until the upstream finished.
-   With one worker there is no other thread to rescue it: whether the fast
+   A relay that held the worker for the whole exchange would leave /fast
+   unanswered until the upstream finished. With one worker there is no
+   other thread to rescue it: whether the fast
    request is served at all is the entire question."
   (format t "~%HTTPS relay does not hold the worker~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -822,27 +1018,20 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (when sock (ignore-errors (sb-bsd-sockets:socket-close sock))))))
 
 (defun test-ssl-eintr-retry ()
-  "EINTR is a retry, not a transport failure, on both classifiers — and
-   the loop that acts on it actually loops.
+  "EINTR is a retry, not a transport failure or a timeout, on every
+   blocking classifier — and the loop that acts on it actually loops.
 
    An interrupted call moved no bytes and left the connection intact, so
-   reporting it as a transport error fails a fetch that nothing is wrong
-   with. It reached the application as a 502 with the callback's cleanup
-   sentinel.
+   reporting it as an error fails a fetch that nothing is wrong with.
 
-   Reachable on the blocking fetch path specifically, and not by the
-   route a reader assumes. Those sockets are blocking by BLOCKING-CONNECT's
-   deliberate choice and carry SO_RCVTIMEO so *FETCH-TIMEOUT* bounds them,
-   and per signal(7) a blocking socket call carrying a receive timeout
-   fails with EINTR when interrupted regardless of SA_RESTART. The
-   framework then supplies the signal: a getent child per DNS lookup, on a
-   path that has just resolved a name.
-
-   Asserted directly rather than provoked, for the same reason the
-   ECONNRESET branch above is: arranging a real signal to land inside an
-   in-flight SSL_read is not something this fixture can do reliably, and a
-   test that only sometimes reaches its branch only sometimes catches a
-   regression in it. Stated rather than implied.
+   The pair that matters is the one OpenSSL produces: its socket BIO
+   counts EINTR as retryable, so an interrupted read or write arrives as
+   WANT_READ or WANT_WRITE with errno EINTR — the same codes a blocking
+   socket's timeout gets, told apart only by errno. SYSCALL with EINTR is
+   asserted too, since the classifiers answer it the same way.
+   TEST-HTTPS-STREAM-SURVIVES-COLLECTIONS provokes the real thing; these
+   pin each classifier's answer, including the ones that test cannot
+   steer a signal into.
 
    The count in the loop check is the assertion with teeth. A helper that
    called its thunk once and returned whatever it got would satisfy the
@@ -851,11 +1040,38 @@ printf 'TAIL-MARKER\\n' >> body.txt
   (let ((classify (tls-sym "SSL-READ-EOF-OR-RAISE"))
         (blocking (tls-sym "SSL-BLOCKING-READ-EOF-OR-RAISE"))
         (wclass   (tls-sym "SSL-WRITE-RETRY-OR-RAISE"))
+        (want     (tls-sym "BLOCKING-WANT-OR-RAISE"))
         (retrying (tls-sym "CALL-RETRYING-EINTR"))
         (syscall  (symbol-value (tls-sym "+SSL-ERROR-SYSCALL+")))
+        (want-read  (symbol-value (tls-sym "+SSL-ERROR-WANT-READ+")))
+        (want-write (symbol-value (tls-sym "+SSL-ERROR-WANT-WRITE+")))
         (eagain   (symbol-value (find-symbol "+EAGAIN+" :web-skeleton)))
         (eintr    (symbol-value (find-symbol "+EINTR+" :web-skeleton)))
         (econnreset 104))
+    (flet ((timed-out-p (answer)
+             (and (stringp answer) (search "timed out" answer) t)))
+      ;; The WANT codes with EINTR, on each blocking classifier, and their
+      ;; neighbours with EAGAIN, which must stay the timeout.
+      (check "eintr: a blocking read's WANT_READ with EINTR is a retry"
+             (attempt (funcall blocking nil -1 eintr want-read)) :retry)
+      (check "eintr: a blocking read's WANT_WRITE with EINTR is a retry"
+             (attempt (funcall blocking nil -1 eintr want-write)) :retry)
+      (check "eintr: a blocking read's WANT_READ with EAGAIN is the timeout"
+             (timed-out-p (attempt (funcall blocking nil -1 eagain want-read)))
+             t)
+      (check "eintr: a blocking write's WANT_WRITE with EINTR is a retry"
+             (attempt (funcall wclass nil -1 eintr want-write)) :retry)
+      (check "eintr: a blocking write's WANT_READ with EINTR is a retry"
+             (attempt (funcall wclass nil -1 eintr want-read)) :retry)
+      (check "eintr: a blocking write's WANT_WRITE with EAGAIN is the timeout"
+             (timed-out-p (attempt (funcall wclass nil -1 eagain want-write)))
+             t)
+      (check "eintr: a handshake step interrupted is a retry"
+             (attempt (funcall want "SSL_connect" eintr)) :retry)
+      (check "eintr: a handshake step that waited out the timeout says so"
+             (let ((answer (attempt (funcall want "SSL_connect" eagain))))
+               (and (timed-out-p answer) (search "SSL_connect" answer) t))
+             t))
     ;; Read side, and the blocking wrapper must pass it through rather
     ;; than convert it into the loud receive-timeout error — reporting a
     ;; blown 30-second deadline milliseconds into the budget is the
@@ -874,6 +1090,11 @@ printf 'TAIL-MARKER\\n' >> body.txt
            t)
     (check "eintr: SSL_write with ECONNRESET still raises"
            (stringp (attempt (funcall wclass nil -1 econnreset syscall))) t)
+    ;; The send timeout as OpenSSL reports it on a blocking socket: WANT_WRITE.
+    (check "SSL_write with WANT_WRITE is the send timeout"
+           (let ((text (attempt (funcall wclass nil -1 0 want-write))))
+             (and (stringp text) (search "timed out" text) t))
+           t)
     ;; And the loop.
     (let ((calls 0))
       (check "eintr: the retry loop runs until the answer is not :retry"
@@ -901,8 +1122,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
       ;; STRINGP before SEARCH, and that guard is load-bearing. With the
       ;; deadline removed the loop returns 7, and SEARCH against a fixnum
       ;; raises a type error *outside* ATTEMPT — ending the run with no
-      ;; failure list rather than reporting one. Measured: that is exactly
-      ;; what the first version of this check did.
+      ;; failure list rather than reporting one.
       (let ((answer (attempt (funcall retrying
                                       (lambda ()
                                         (incf calls)
@@ -916,13 +1136,12 @@ printf 'TAIL-MARKER\\n' >> body.txt
 (defun test-https-fetch-async-e2e ()
   "An https:// fetch through the event loop, end to end, on one worker.
 
-   This is what items 3 through 8 were for. Until now every one of them
-   was mechanism with tests and no production caller: the seam, the
-   handshake state, the byte source, the byte sink, the direction
-   inversion and the errno discipline had never all been wired at once,
-   let alone driven by a real request. Here a handler calls HTTP-FETCH on
-   an https:// URL, and the worker returns to the event loop between every
-   step of it.
+   The test that wires every piece of the TLS transport at once: the
+   seam, the handshake state, the byte source, the byte sink, the
+   direction inversion and the errno discipline each have tests of their
+   own, and only a real request drives them together. Here a handler
+   calls HTTP-FETCH on an https:// URL, and the worker returns to the
+   event loop between every step of it.
 
    DNS is overridden through *DNS-LOOKUP-FN*, the hook dns.lisp fills, and
    SETF globally rather than bound: the worker reading it lives in a
@@ -934,7 +1153,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
    address is not it. That refusal is the reason this test needs a
    resolver at all."
   (format t "~%HTTPS fetch through the event loop~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -999,17 +1218,16 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    Asserted against *CHUNKED-CORPUS*, which is also what the plain-TCP
    test asserts and what this upstream is built from. That shared
-   definition is the point: two literals could agree today and drift
-   apart later without either test noticing.
+   definition is the point: two literals can agree and later drift apart
+   without either test noticing.
 
-   Measured, this does *not* reach the :OK-EOF branch, and the docstring
-   said it did until the claim was checked. s_server's close_notify
+   This does *not* reach the :OK-EOF branch. s_server's close_notify
    arrives as its own wake-up, so the walk completes on :OK while the
-   stream is still open — confirmed by reintroducing the :OK-EOF defect,
-   which leaves this test green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is
-   where that branch is pinned. This one covers the boundaries."
+   stream is still open, and removing the :OK-EOF arm leaves this test
+   green. TEST-FETCH-OK-EOF-WALKS-THE-BYTES is where that branch is
+   pinned. This one covers the boundaries."
   (format t "~%HTTPS fetch :on-body chunk boundaries~%")
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -1081,6 +1299,94 @@ printf 'TAIL-MARKER\\n' >> body.txt
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
 
+(defun test-https-on-body-relays-past-the-cap ()
+  "An :ON-BODY fetch over TLS relays a chunked response five times
+   *MAX-OUTBOUND-RESPONSE-SIZE*, with the read buffer held to the cap.
+
+   The TLS half of TEST-HARNESS-FETCH-ON-BODY-RELAYS-PAST-THE-CAP-E2E,
+   and it covers the reason HANDLE-OUTBOUND-READ re-issues a drain the
+   cap cut short instead of waiting for readability. SSL_read hands back
+   one record at a time from what OpenSSL has already decrypted, so a
+   drain stopped by a full buffer can leave bytes there with nothing on
+   the socket to wake the connection again."
+  (format t "~%HTTPS: an :on-body relay carries more than the cap~%")
+  (let ((dir (scratch-path "ws-tls"))
+        (saved-dns web-skeleton::*dns-lookup-fn*)
+        (saved-cap web-skeleton:*max-outbound-response-size*)
+        (corpus (%relay-corpus 40 8192)))
+    (unwind-protect
+         (progn
+           (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                               :wait t :output nil :error nil)
+           (unless (probe-file (format nil "~a/right.pem" dir))
+             (check "https relay past the cap: fixture generated" nil t)
+             (return-from test-https-on-body-relays-past-the-cap))
+           (with-open-file (out (format nil "~a/chunked.txt" dir)
+                                :direction :output :if-exists :supersede
+                                :element-type '(unsigned-byte 8))
+             (write-sequence
+              (sb-ext:string-to-octets
+               (concatenate 'string
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" "")
+                            (apply #'%crlf-lines
+                                   (append (loop for c in corpus
+                                                 append (list (format nil "~x" (length c))
+                                                              c))
+                                           (list "0" ""))))
+               :external-format :ascii)
+              out))
+           (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                    (funcall (tls-sym "ENSURE-SSL-CTX"))
+                    (format nil "~a/ca.pem" dir) nil)
+           ;; SETF globally, not bound: the worker is another thread.
+           (setf web-skeleton::*dns-lookup-fn*
+                 (lambda (conn epoll-fd fetch-req host port path)
+                   (web-skeleton::initiate-http-fetch-to-address
+                    conn epoll-fd fetch-req host port path #(127 0 0 1) :inet))
+                 web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (%call-with-tls-peer
+            dir "right"
+            (lambda (port)
+              (let ((received (make-string-output-stream))
+                    (peak 0)
+                    (final :never))
+                (check "https relay past the cap: the peer is listening"
+                       (%wait-for-listener port) t)
+                (with-test-server
+                    (:handler
+                     (lambda (req)
+                       (declare (ignore req))
+                       (http-fetch
+                        :get (format nil "https://right.test:~d/" port)
+                        :on-body (lambda (out chunk)
+                                   (setf peak (max peak (length (web-skeleton::connection-read-buf
+                                                                 out))))
+                                   (write-string (sb-ext:octets-to-string
+                                                  chunk :external-format :latin-1)
+                                                 received)
+                                   nil)
+                        :then (lambda (status headers body)
+                                (declare (ignore headers))
+                                (setf final (list status body))
+                                (make-text-response 200 "relayed")))))
+                  (check "https relay past the cap: the client is answered 200"
+                         (attempt (nth-value 0 (test-http-request :get "/relay")))
+                         200))
+                (check "https relay past the cap: every chunk, in order"
+                       (string= (get-output-stream-string received)
+                                (apply #'concatenate 'string corpus))
+                       t)
+                (check "https relay past the cap: :then got 200 and no body"
+                       final (list 200 nil))
+                (check "https relay past the cap: the buffer stayed within the cap"
+                       (<= peak (* 64 1024)) t)))
+            :relay-file (format nil "~a/chunked.txt" dir)))
+      (setf web-skeleton::*dns-lookup-fn* saved-dns
+            web-skeleton:*max-outbound-response-size* saved-cap)
+      (ignore-errors
+       (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
+                                                      :output nil :error nil)))))
+
 (defun %call-with-https-fixture (label fn)
   "Generate the certificate fixture, trust its CA on the shared context, and
    send every fetch to loopback for the length of FN, which gets the
@@ -1089,7 +1395,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    The DNS hook is set globally rather than bound: the worker that reads it
    is a thread WITH-TEST-SERVER spawned, and a binding would not reach it."
-  (let ((dir (format nil "/tmp/ws-tls-~36r" (random (expt 36 10))))
+  (let ((dir (scratch-path "ws-tls"))
         (saved-dns web-skeleton::*dns-lookup-fn*))
     (unwind-protect
          (progn
@@ -1116,7 +1422,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
    stdin open. FN gets the port, or NIL if the peer never listened, and the
    process. The response goes to (PROCESS-INPUT PROCESS) when FN chooses,
    and what the client sent comes back on (PROCESS-OUTPUT PROCESS), where
-   s_server copies it.
+   s_server copies it. Both streams are Latin-1, a character a byte, so a
+   body of any bytes crosses them as it is.
 
    Held open because a relay whose input runs out ends with close_notify.
    With the input still open, s_server sends what it has been given and
@@ -1131,6 +1438,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                       "-key"  (format nil "~a/~a.key" dir leaf)
                       "-quiet" "-naccept" "1")
                 :wait nil :input :stream :output :stream :error nil
+                :external-format :latin-1
                 :directory dir :search t)))
     (unwind-protect
          (funcall fn (and (%wait-for-listener port) port) proc)
@@ -1214,9 +1522,10 @@ printf 'TAIL-MARKER\\n' >> body.txt
 
    OpenSSL keeps one error queue per thread, and SSL_get_error reads it
    first: with anything on it, a read that only needs more bytes comes back
-   SSL_ERROR_SSL. Nothing emptied it, so any earlier failure on the worker —
-   a certificate that did not verify, a token whose signature did not check
-   out — turned the next WANT_READ into a failed fetch.
+   SSL_ERROR_SSL. Left unemptied, any earlier failure on the worker — a
+   certificate that did not verify, a token whose signature did not check
+   out — would turn the next WANT_READ into a failed fetch, which is why
+   every SSL call is preceded by ERR_clear_error.
 
    Arranged directly. A held-open peer sends the head and first chunk of a
    chunked response and waits. :ON-BODY takes the chunk on the worker's own
@@ -1236,13 +1545,13 @@ printf 'TAIL-MARKER\\n' >> body.txt
    Between chunks, and not before the fetch. OpenSSL's handshake empties the
    queue itself on every step, so a queue dirtied in the handler is clean
    again before the first read, and a test arranged that way passes without
-   the fix.
+   the clear.
 
    Control: the queue was dirty in the way that matters. Asked about an SSL
    that has done nothing, SSL_get_error has only the queue to go on, and
    answers SSL_ERROR_SSL only for an error from outside the system library.
    A system error reads as SSL_ERROR_SYSCALL, which the classifier settles
-   from errno, and would leave this passing without the fix."
+   from errno, and would leave this passing without the clear."
   (format t "~%HTTPS: a dirty error queue does not fail the next read~%")
   (%call-with-https-fixture
    "https error queue"
@@ -1295,12 +1604,190 @@ printf 'TAIL-MARKER\\n' >> body.txt
                               (setf final status)
                               (make-text-response 200 "relayed")))))
                 (test-http-request :get "/relay")))
-            (check "control: the worker's queue now reads as SSL_ERROR_SSL (1)"
+            (check "control: the dirtied queue reads as SSL_ERROR_SSL (1)"
                    reads-as 1)
             (check "https error queue: the fetch on that worker completed"
                    final 200)
             (check "https error queue: with both halves of the body"
                    (reverse chunks) '("FIRST-HALF" "SECOND-HALF")))))))))
+
+(defun %read-relayed-request (peer &key head-only)
+  "Read the request a held TLS peer copies to its output: the head, then
+   the body as the head frames it, by Content-Length or chunked to its
+   terminator. Returns (values HEAD BODY), the head a string and the body
+   bytes; BODY is NIL when HEAD-ONLY, or when the output ended first.
+
+   Chunked is read as this framework writes it, a size line and its data
+   for each chunk, then a zero chunk with no trailer."
+  (let* ((out (sb-ext:process-output peer))
+         (lines (loop for line = (read-line out nil nil)
+                      do (unless line
+                           (return-from %read-relayed-request (values nil nil)))
+                      until (string= line (string #\Return))
+                      collect (string-right-trim '(#\Return) line)))
+         (head (format nil "~{~a~%~}" lines)))
+    (flet ((header (name)
+             (loop for line in lines
+                   for colon = (position #\: line)
+                   when (and colon (string-equal name line :end2 colon))
+                     return (string-trim " " (subseq line (1+ colon)))))
+           (read-bytes (n)
+             ;; N characters, each one byte, or NIL if the output ends.
+             (let ((s (make-string n)))
+               (when (= (read-sequence s out) n)
+                 (map '(simple-array (unsigned-byte 8) (*)) #'char-code s)))))
+      (values
+       head
+       (unless head-only
+         (let ((declared (header "content-length")))
+           (if declared
+               (read-bytes (parse-integer declared))
+               (let ((runs '()))
+                 (loop
+                   (let* ((size-line (read-line out nil nil))
+                          (size (and size-line
+                                     (parse-integer size-line :radix 16 :junk-allowed t))))
+                     (cond
+                       ((null size) (return nil))
+                       ((zerop size)
+                        (read-line out nil nil)
+                        (return (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                                       (nreverse runs))))
+                       (t
+                        (let ((run (read-bytes size)))
+                          (unless run (return nil))
+                          (push run runs)
+                          (read-line out nil nil))))))))))))))
+
+(defun test-https-streamed-request-body ()
+  "A request body forwarded upstream over TLS as it arrives, end to end:
+   FORWARD-BODY into an https:// fetch. A body declared by Content-Length
+   reaches the peer with that length, and one sent chunked reaches it
+   chunked, each whole and in order, and the client hears the peer's
+   answer. A peer that answers before the body has all gone answers the
+   client, and the rest of the body is refused.
+
+   :OUT-SEND reads while it writes, and under TLS either one can be waiting
+   on the other direction, a write on readability or a read on
+   writability, which a plain socket never asks for. The peer is s_server
+   in relay mode, held open: what the fetch sends comes out on its output,
+   which the test reads to the end of the body before giving the answer to
+   its input. The early peer answers at the head and then reads slowly, so
+   the body is still arriving when its answer does."
+  (format t "~%HTTPS: a request body forwarded upstream as it arrives~%")
+  (%call-with-https-fixture
+   "https upload"
+   (lambda (dir)
+     (let* ((body (%pseudo-random-bytes (* 1024 1024) 81))
+            (expected (format nil "got:~d:~a" (length body) (sha256-hex body)))
+            (lock (sb-thread:make-mutex :name "https-upload"))
+            (aborts nil)
+            (port-box (list nil)))
+       (labels ((answer (peer status text)
+                  (let ((input (sb-ext:process-input peer)))
+                    (format input "HTTP/1.1 ~d X~c~cContent-Length: ~d~c~c~
+                                   Connection: close~c~c~c~c~a"
+                            status #\Return #\Linefeed (length text) #\Return #\Linefeed
+                            #\Return #\Linefeed #\Return #\Linefeed text)
+                    (finish-output input)))
+                (aborts-for (path)
+                  (sb-thread:with-mutex (lock)
+                    (loop for (p . r) in aborts when (string= p path) collect r)))
+                (exchange (path peer reader-fn &key chunk-size (bytes body))
+                  ;; (values REPLY SEEN): the client's answer for BYTES sent
+                  ;; to PATH, and what READER-FN made of the relayed request.
+                  (let* ((reader (sb-thread:make-thread (lambda () (funcall reader-fn peer))
+                                                        :name "relayed request reader"))
+                         (reply (%exchange-or-why (%form-post-bytes path bytes
+                                                                 :chunk-size chunk-size
+                                                                 :headers '("Connection: close"))
+                                               :seconds 30)))
+                    (values reply
+                            (handler-case (sb-thread:join-thread reader :timeout 20)
+                              (error () nil))))))
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (let ((path (http-request-path req)))
+                  (forward-body
+                   (http-fetch :put (format nil "https://right.test:~d/up" (first port-box))
+                               :body :stream
+                               :content-length (and (string= path "/length")
+                                                    (parse-integer
+                                                     (get-header req "content-length")))
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers))
+                                       (if (eql status 200)
+                                           (make-text-response
+                                            200 (sb-ext:octets-to-string
+                                                 b :external-format :latin-1))
+                                           (make-error-response (or status 502)))))
+                   :max-size nil
+                   :on-abort (lambda (conn reason)
+                               (declare (ignore conn))
+                               (sb-thread:with-mutex (lock)
+                                 (push (cons path reason) aborts)))))))
+           ;; ---- forwarded whole, framed as it arrived ----
+           (loop for (path chunk-size framing)
+                   in '(("/length" nil "content-length: 1048576")
+                        ("/chunked" 65521 "transfer-encoding: chunked"))
+                 do (%call-with-held-tls-peer
+                     dir "right"
+                     (lambda (port peer)
+                       (check (format nil "https upload ~a: the peer is listening" path)
+                              (not (null port)) t)
+                       (when port
+                         (setf (first port-box) port)
+                         (multiple-value-bind (reply seen)
+                             (exchange path peer
+                                       (lambda (peer)
+                                         (multiple-value-bind (head got)
+                                             (%read-relayed-request peer)
+                                           (when got
+                                             (answer peer 200 (format nil "got:~d:~a" (length got)
+                                                                      (sha256-hex got))))
+                                           (list head got)))
+                                       :chunk-size chunk-size)
+                           (check (format nil "https upload ~a: framed as it arrived" path)
+                                  (and seen (search framing (first seen) :test #'char-equal) t)
+                                  t)
+                           (check (format nil "https upload ~a: the peer got it whole" path)
+                                  (and seen (equalp (second seen) body)) t)
+                           (check (format nil "https upload ~a: the client heard the peer" path)
+                                  (and (search "HTTP/1.1 200" reply) (search expected reply) t)
+                                  t))))))
+           ;; ---- a peer that answers first ----
+           ;; A body larger than the socket buffers on the way can take in
+           ;; while the answer is on its way back, so it is still arriving
+           ;; when the answer does.
+           (%call-with-held-tls-peer
+            dir "right"
+            (lambda (port peer)
+              (check "https upload early: the peer is listening" (not (null port)) t)
+              (when port
+                (setf (first port-box) port)
+                (let ((reply (exchange "/early" peer
+                                       (lambda (peer)
+                                         (%read-relayed-request peer :head-only t)
+                                         (answer peer 413 "refused")
+                                         ;; Read on slowly to the end, so
+                                         ;; the peer is never held writing
+                                         ;; its output.
+                                         (let ((buf (make-string 16384))
+                                               (out (sb-ext:process-output peer)))
+                                           (loop while (= (read-sequence buf out) (length buf))
+                                                 do (sleep 0.005))))
+                                       :bytes (%pseudo-random-bytes (* 16 1024 1024) 82))))
+                  (check "https upload early: the peer's answer reached the client"
+                         (and (search "HTTP/1.1 413" reply) t) t)
+                  (check "https upload early: and the rest of the body was refused"
+                         (loop repeat 100 until (aborts-for "/early") do (sleep 0.05)
+                               finally (return (aborts-for "/early")))
+                         '(:refused))))))
+           (check "https upload: nothing aborted the bodies forwarded whole"
+                  (list (aborts-for "/length") (aborts-for "/chunked"))
+                  '(nil nil))))))))
 
 (defun test-ssl-read-classification ()
   "Every branch of the SSL_read classifier, and the blocking wrapper's one
@@ -1338,8 +1825,8 @@ printf 'TAIL-MARKER\\n' >> body.txt
     ;; framing signal HTTP/1.0-style servers actually use.
     (check "classify: SYSCALL with errno 0 is end of stream"
            (attempt (funcall classify nil -1 0 syscall)) :eof)
-    ;; The re-derivation. This used to be "the receive timeout fired",
-    ;; which is true only on a blocking socket.
+    ;; Would-block, not "the receive timeout fired", which is true only
+    ;; on a blocking socket.
     (check "classify: SYSCALL with EAGAIN is would-block, not an error"
            (attempt (funcall classify nil -1 eagain syscall)) :again)
     ;; The one that must never be quiet.
@@ -1382,7 +1869,22 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                  (attempt (funcall classify nil -1 0 want-wr)))
                          t))
            t)
-    ;; The blocking wrapper differs in exactly one place.
+    ;; The blocking wrapper differs in what a would-block means. OpenSSL
+    ;; reports a blocking socket's receive-timeout expiry as WANT_READ (a
+    ;; renegotiating read's send expiry as WANT_WRITE); some paths report
+    ;; SYSCALL with EAGAIN. All of them are the timeout on that socket.
+    ;; TEST-TLS-BLOCKING-READ-TIMEOUT-IS-REPORTED-AS-ONE provokes the
+    ;; real one.
+    (check "blocking: WANT_READ is the receive timeout, and raises"
+           (attempt (and (search "timed out"
+                                 (attempt (funcall blocking nil -1 0 want-rd)))
+                         t))
+           t)
+    (check "blocking: WANT_WRITE too"
+           (attempt (and (search "timed out"
+                                 (attempt (funcall blocking nil -1 0 want-wr)))
+                         t))
+           t)
     (check "blocking: EAGAIN is the receive timeout, and raises"
            ;; Two ATTEMPTs, and both are needed. The inner one turns the
            ;; expected raise into its text so SEARCH has something to look
@@ -1453,7 +1955,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
 (defun test-ssl-ctx-init ()
   ;; Smoke the shared-context init path for real. Registration checks
   ;; alone can't catch an FFI-level mistake — a binding that names the
-  ;; wrong libssl entry point (the historical SSL_ctrl / SSL_CTX_ctrl
+  ;; wrong libssl entry point (SSL_ctrl for SSL_CTX_ctrl is the easy
   ;; mixup) or passes the wrong struct type loads cleanly and only
   ;; misbehaves when the call executes. ENSURE-SSL-CTX runs the whole
   ;; init sequence (OPENSSL_init_ssl, SSL_CTX_new, TLS 1.2 floor via

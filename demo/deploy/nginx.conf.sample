@@ -22,6 +22,23 @@
 # proxying to its own loopback port — not one nginx per application.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Descriptors
+#
+# Every proxied connection costs nginx two descriptors, the client's and the
+# upstream's, and a WebSocket holds both for as long as it is open. Its
+# ceiling is worker_connections, in the events block of nginx.conf (768 in
+# Debian's), and its descriptor limit worker_rlimit_nofile, in the main
+# context. Size both to the sockets you mean to hold, or nginx refuses
+# connections past them and logs "worker_connections are not enough".
+#
+# A client that opens connections and sends nothing is nginx's to bound:
+# client_header_timeout (60 s by default) closes them, and they never reach
+# the application. WebSockets do, one upstream connection each, and
+# limit_conn below caps them per address. The application answers 503 as it
+# nears its own descriptor limit (DEPLOYMENT.md, "Descriptors").
+# ---------------------------------------------------------------------------
+
 # The upgrade pair, hoisted because it has to live in the http block.
 # "Connection: upgrade" must be sent only for requests that asked to upgrade;
 # sending it on every request breaks keep-alive for ordinary ones.
@@ -53,10 +70,15 @@ limit_req_zone $binary_remote_addr zone=ws_demo:10m rate=10r/s;
 limit_conn_zone $binary_remote_addr zone=ws_demo_conns:10m;
 
 server {
+    # IPv4 and IPv6 each take a listen of their own: `listen 443` is IPv4
+    # alone. Without the [::] line, a visitor who reaches this name over IPv6
+    # is refused, or, on a box serving another site there, handed that site.
     listen 443 ssl;
+    listen [::]:443 ssl;
     # The standalone directive needs nginx 1.25.1 or later. Older builds —
     # Ubuntu 24.04 ships 1.24, Debian bookworm 1.22 — refuse to start on it;
-    # for those, drop this line and write `listen 443 ssl http2;` above.
+    # for those, drop this line and add http2 to both listens above:
+    # `listen 443 ssl http2;` and `listen [::]:443 ssl http2;`.
     http2 on;
     server_name demo.example.com;
 
@@ -71,6 +93,11 @@ server {
     # the count held open.
     limit_req_status 429;
 
+    # The two add_header lines below reach a location only while it has no
+    # add_header of its own. One add_header in a location drops all of the
+    # server block's there, silently, so a location that adds a header
+    # repeats these two beside it.
+    #
     # frame-ancestors is the one CSP directive a <meta> tag cannot carry —
     # browsers parse it there and then ignore it, with a console warning and
     # no protection. The page's other directives stay in the meta where they
@@ -78,9 +105,18 @@ server {
     # A deployer who skips this proxy gets no clickjacking defence.
     add_header Content-Security-Policy "frame-ancestors 'none'" always;
 
-    # Proxy settings at server level so both locations below inherit them;
-    # neither sets a proxy_set_header of its own, which is what would stop
-    # the inheritance.
+    # Once a browser has seen this header, it goes to https by itself rather
+    # than through the plain-HTTP redirect below, which anyone on the path
+    # can answer instead. max-age alone: includeSubDomains would hold every
+    # name under this one to HTTPS too, and preload asks browsers to ship the
+    # name built in — commitments a deployment makes for itself. A year is
+    # the usual age; while a deployment is being tried out, a short one is
+    # easier to take back.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # Proxy settings at server level so every location below inherits them;
+    # none sets a proxy_set_header of its own, which is what would stop the
+    # inheritance.
     proxy_http_version 1.1;
 
     # Host is load-bearing. The demo refuses a WebSocket upgrade whose Origin
@@ -114,6 +150,16 @@ server {
         proxy_pass http://127.0.0.1:8081;
     }
 
+    # The lab's form post is the one request here with a body of any size.
+    # nginx answers a body over a megabyte with its own 413 unless told
+    # otherwise. A little above the demo's own 4 MiB cap, a body just over
+    # that cap meets the framework's 413, which the page shows, and only a
+    # far larger one meets nginx's.
+    location = /lab/upload {
+        client_max_body_size 5m;
+        proxy_pass http://127.0.0.1:8081;
+    }
+
     # The socket cap lives on the WebSocket alone. Server-wide it would count
     # HTTP/2 streams too, and one page load opens about ten at once — so two
     # people behind one NAT would start getting 503s on stylesheets. Here it
@@ -131,6 +177,7 @@ server {
 
 server {
     listen 80;
+    listen [::]:80;
     server_name demo.example.com;
     return 301 https://$host$request_uri;
 }

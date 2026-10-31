@@ -71,26 +71,43 @@
     (sb-alien:* sb-alien:int))
 
 (defun errno-name (errno)
-  "Return a human-readable name for common errno values, or nil."
+  "Return a human-readable name for common errno values, or nil.
+
+   Linux's numbering, which x86-64 and arm64 share (asm-generic/errno.h),
+   the two architectures this file's structure layouts are checked for.
+   The set is the errnos this server's own calls can raise: the socket,
+   epoll and pipe calls, accept, and an outbound connect."
   (case errno
+    (1   "EPERM")
+    (2   "ENOENT")
     (4   "EINTR")
     (9   "EBADF")
     (11  "EAGAIN")
+    (12  "ENOMEM")
     (13  "EACCES")
+    (17  "EEXIST")
     (22  "EINVAL")
     ;; asm-generic/errno-base.h: ENFILE is 23 ("file table overflow",
     ;; system-wide) and EMFILE is 24 ("too many open files", per-process).
-    ;; These were transposed, which mattered because the two have
-    ;; different remedies: EMFILE says raise this process's RLIMIT_NOFILE,
-    ;; ENFILE says the box is out of file handles entirely. An operator
-    ;; reading "ENFILE (24)" out of an accept loop reaches for fs.file-max
-    ;; when the ulimit is what ran out.
+    ;; Easy to transpose, and the two have different remedies: EMFILE says
+    ;; raise this process's RLIMIT_NOFILE, ENFILE says the host is out of
+    ;; file handles entirely. An operator reading "ENFILE (24)" out of an
+    ;; accept loop reaches for fs.file-max when the ulimit is what ran out.
     (23  "ENFILE")
     (24  "EMFILE")
+    (28  "ENOSPC")
     (32  "EPIPE")
+    (98  "EADDRINUSE")
+    (99  "EADDRNOTAVAIL")
+    (101 "ENETUNREACH")
+    (103 "ECONNABORTED")
     (104 "ECONNRESET")
+    (105 "ENOBUFS")
     (107 "ENOTCONN")
+    (110 "ETIMEDOUT")
     (111 "ECONNREFUSED")
+    (113 "EHOSTUNREACH")
+    (115 "EINPROGRESS")
     (t   nil)))
 
 (defun errno-string (errno)
@@ -149,6 +166,14 @@
 (sb-alien:define-alien-routine ("close" %close) sb-alien:int
   (fd sb-alien:int))
 
+(sb-alien:define-alien-routine ("shutdown" %shutdown) sb-alien:int
+  (fd sb-alien:int)
+  (how sb-alien:int))
+
+(defconstant +shut-wr+ 1
+  "shutdown(2)'s HOW for the write side alone: the peer reads a FIN after
+   whatever was already written, and the read side stays open.")
+
 (sb-alien:define-alien-routine ("poll" %poll) sb-alien:int
   (fds (sb-alien:* t))
   (nfds sb-alien:unsigned-long)
@@ -167,6 +192,19 @@
   (optname sb-alien:int)
   (optval (sb-alien:* t))
   (optlen (sb-alien:* sb-alien:unsigned-int)))
+
+(sb-alien:define-alien-routine ("getrlimit" %getrlimit) sb-alien:int
+  (resource sb-alien:int)
+  (rlim (sb-alien:* t)))
+
+(sb-alien:define-alien-routine ("setrlimit" %setrlimit) sb-alien:int
+  (resource sb-alien:int)
+  (rlim (sb-alien:* t)))
+
+(defconstant +rlimit-nofile+ 7
+  "getrlimit(2)'s RESOURCE for the number of open descriptors, 7 on
+   x86-64 and arm64 alike. Its struct rlimit is two 64-bit counts, the
+   soft limit and then the hard one.")
 
 ;;; ===========================================================================
 ;;; Lisp wrappers — these are the public interface
@@ -329,6 +367,66 @@
         (when (< result 0)
           (error "setsockopt SO_SNDTIMEO failed: ~a" (errno-string (get-errno))))))))
 
+;;; ---------------------------------------------------------------------------
+;;; Descriptor limit
+;;; ---------------------------------------------------------------------------
+
+(defun descriptor-limits ()
+  "The process's RLIMIT_NOFILE, as (values SOFT HARD)."
+  (let ((buf (make-array 2 :element-type '(unsigned-byte 64) :initial-element 0)))
+    (sb-sys:with-pinned-objects (buf)
+      (when (< (%getrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
+        (error "getrlimit failed: ~a" (errno-string (get-errno)))))
+    (values (aref buf 0) (aref buf 1))))
+
+(defun raise-descriptor-limit (&optional wanted)
+  "Raise the soft descriptor limit to WANTED, or as near as the hard limit
+   allows, and to the hard limit itself when WANTED is NIL. Never lowers
+   it. Returns the soft limit in force afterwards, and the one before it
+   as a second value.
+
+   The soft limit is commonly 1024, systemd's default for a service and
+   many a container's, while the hard limit is far higher. Left at 1024,
+   a server runs out of descriptors long before *MAX-CONNECTIONS*. The
+   soft limit is kept low for two kinds of program, and the cost of each
+   is why this raises to what is wanted rather than to the hard limit:
+   - one that waits with select(2), which cannot take a descriptor past
+     1024. Nothing here does: the event loop waits with epoll, and SBCL's
+     own waits use poll(2).
+   - one that closes every descriptor up to the limit before it execs a
+     child. SBCL's RUN-PROGRAM does, where the kernel lacks close_range(2),
+     and the worker that starts getent waits while it does: about 130 ms
+     a child at a limit of 524288. See CLOSE-RANGE-AVAILABLE-P.
+   A process may raise its soft limit as far as the hard one without
+   privilege, and one the kernel refuses to raise is left as it was."
+  (multiple-value-bind (soft hard) (descriptor-limits)
+    (let ((target (max soft (if wanted (min wanted hard) hard))))
+      (if (= target soft)
+          (values soft soft)
+          (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                   :initial-contents (list target hard))))
+            (sb-sys:with-pinned-objects (buf)
+              (if (< (%setrlimit +rlimit-nofile+ (sb-sys:vector-sap buf)) 0)
+                  (values soft soft)
+                  (values target soft))))))))
+
+(sb-alien:define-alien-routine ("syscall" %syscall-3) sb-alien:long
+  (number sb-alien:long)
+  (a sb-alien:unsigned-long)
+  (b sb-alien:unsigned-long)
+  (c sb-alien:unsigned-long))
+
+(defconstant +sys-close-range+ 436
+  "close_range(2)'s syscall number, 436 on x86-64 and arm64 alike.")
+
+(defun close-range-available-p ()
+  "Whether the kernel has close_range(2), and a seccomp profile lets it
+   through. Asked with an empty range, from the largest descriptor number
+   to itself, which closes nothing. Linux has it from 5.9. Without it,
+   SBCL's RUN-PROGRAM closes descriptors one at a time up to the soft limit
+   in each child before it execs."
+  (zerop (%syscall-3 +sys-close-range+ #xFFFFFFFF #xFFFFFFFF 0)))
+
 (defun get-socket-option-int (fd level optname)
   "Get an integer-valued socket option."
   (let ((val-buf (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -490,10 +588,7 @@
    escapes its dispatch with a 500, and the right answer depends on whose
    descriptor failed. The client's own means the client is gone and there is
    nobody to answer; a handler's own I/O failing on some other descriptor is
-   a failed request, and it is owed its 500.
-
-   It reports exactly as the plain error it replaced did, so no log line
-   reads any differently."))
+   a failed request, and it is owed its 500."))
 
 (defun nb-read (fd buffer start max-bytes)
   "Non-blocking read into BUFFER starting at START, up to MAX-BYTES.

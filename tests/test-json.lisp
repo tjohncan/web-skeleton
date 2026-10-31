@@ -56,9 +56,9 @@
          '(("inner" . "deep")))
   (check "json-get reads a json-object"
          (json-get (json-parse "{\"a\":1}") "a") 1)
-  ;; json-get still accepts a bare alist so handler code written against
-  ;; the old representation keeps working.
-  (check "json-get still accepts a bare alist"
+  ;; json-get also accepts a bare alist, so code that holds an object as
+  ;; a plain alist reads it the same way.
+  (check "json-get also accepts a bare alist"
          (json-get '(("a" . 1)) "a") 1)
   (check "json-get on a non-object returns nil, does not raise"
          (json-get "not-an-object" "a") nil)
@@ -113,6 +113,13 @@
   (flet ((signals-error-p (thunk)
            (handler-case (progn (funcall thunk) nil)
              (error () t))))
+    ;; JSON's digits are ASCII. DIGIT-CHAR-P is true of every Unicode
+    ;; digit, so dispatching on it sent U+0663 to the number reader, which
+    ;; refused it as a number missing its digit.
+    (check "a non-ASCII digit is an unexpected character"
+           (handler-case (progn (json-parse (format nil "[1,~c]" (code-char #x663))) nil)
+             (error (e) (not (null (search "unexpected character" (princ-to-string e))))))
+           t)
     (check "leading zeros rejected"
            (signals-error-p (lambda () (json-parse "01"))) t)
     (check "negative leading zeros rejected"
@@ -174,11 +181,18 @@
   (check "ser false" (json-serialize :false) "false")
   (check "ser null" (json-serialize :null) "null")
   ;; NIL is the empty list, so it emits []. Explicit null is :NULL and an
-  ;; empty object is an empty JSON-OBJECT — the three used to collapse
-  ;; onto "null" and now each round-trips to itself.
+  ;; empty object is an empty JSON-OBJECT, so each of the three
+  ;; round-trips to itself.
   (check "ser nil is []" (json-serialize nil) "[]")
   (check "ser empty json-object is {}"
          (json-serialize (make-json-object nil)) "{}")
+  ;; Keys are strings, as JSON-PARSE makes them. Another key is refused by
+  ;; name, not with a type error from inside the string writer.
+  (check "ser a key that is not a string is refused by name"
+         (handler-case (progn (json-serialize (make-json-object '((:a . 1)))) nil)
+           (error (e) (not (null (search "object key must be a string"
+                                         (princ-to-string e))))))
+         t)
   (check "ser float" (json-serialize 3.14d0) "3.14")
   (check "ser float large" (json-serialize 1.0d7) "1.0e7")
   (check "ser float small" (json-serialize 1.0d-4) "1.0e-4")
@@ -217,7 +231,7 @@
             (lambda () (json-serialize '(("a" . 1) ("b" . 2) . 3)))) t))
 
   ;; Objects — MAKE-JSON-OBJECT is what emits {...}. A bare alist is an
-  ;; array of pairs now; see the A2 block below for why.
+  ;; array of pairs; see the arrays-of-pairs block below for why.
   (check "ser object"
          (json-serialize
           (make-json-object '(("name" . "ankle") ("size" . 4444))))
@@ -236,14 +250,15 @@
     (check "round-trip nested objects in an array"
            (json-serialize (json-parse doc)) doc))
 
-  ;; ---- A2: arrays of pairs must stay arrays ----
-  ;; The serializer used to decide "object vs array" by testing whether
-  ;; every element was a cons with a string car. An array whose elements
-  ;; are two-element arrays beginning with a string satisfies that test,
-  ;; so [["a",1],["b",2]] came back out as {"a":[1],"b":[2]} — well-formed,
-  ;; silently wrong, no error anywhere. That shape is not exotic: it is how
-  ;; Object.entries(), tabular payloads, and header lists serialize.
-  ;; Objects are a distinct type now, so no guessing happens.
+  ;; ---- arrays of pairs must stay arrays ----
+  ;; A serializer that decided "object vs array" by testing whether every
+  ;; element is a cons with a string car would be fooled: an array whose
+  ;; elements are two-element arrays beginning with a string satisfies
+  ;; that test, so [["a",1],["b",2]] would come back out as
+  ;; {"a":[1],"b":[2]} — well-formed, silently wrong, no error anywhere.
+  ;; That shape is not exotic: it is how Object.entries(), tabular
+  ;; payloads, and header lists serialize. Objects are a distinct type,
+  ;; so no guessing happens.
   (dolist (doc '("[[\"a\",1],[\"b\",2]]"
                  "[[\"a\",1]]"
                  "[[\"k\",\"v\"],[\"k2\",\"v2\"],[\"k3\",\"v3\"]]"
@@ -255,7 +270,7 @@
                  "null"
                  "[{\"a\":1},{\"a\":2}]"
                  "{\"outer\":{\"inner\":[[\"x\",1]]}}"))
-    (check (format nil "A2 round-trip ~a" doc)
+    (check (format nil "array of pairs round-trip ~a" doc)
            (json-serialize (json-parse doc)) doc))
 
   ;; A hand-built alist is an array of pairs, and a dotted pair is not a
@@ -316,6 +331,52 @@
                   t))
       (setf web-skeleton:*json-max-string-length* saved))))
 
+(defun test-json-first-repeated-key ()
+  "FIRST-REPEATED-KEY, which JSON-PARSE and multipart's parameters find a
+   repeated name with, answers the repeat a reader going in order meets
+   first, and agrees with that reader on keys drawn at random.
+
+   It sorts where a table of the keys seen would hash them, since a client
+   can aim names at one bucket of SBCL's string hash. What that buys is
+   time on such names, which needs names searched for against one SBCL's
+   hash to show; what is checked here is that the sort answers as the
+   table did."
+  (format t "~%JSON: the first repeated key~%")
+  (flet ((naive (entries)
+           ;; A reader going in order, remembering every key so far.
+           (loop for (entry . rest) on entries
+                 for seen = (list (car entry)) then (cons (car entry) seen)
+                 for next = (first rest)
+                 when (and next (member (car next) seen :test #'string=))
+                   return next)))
+    (check "repeat: none among distinct keys, a prefix of another included"
+           (web-skeleton::first-repeated-key '(("a" . 0) ("ab" . 1) ("b" . 2)))
+           nil)
+    (check "repeat: none in one key, or none"
+           (list (web-skeleton::first-repeated-key '(("a" . 0)))
+                 (web-skeleton::first-repeated-key '()))
+           '(nil nil))
+    (check "repeat: of two, the one met first"
+           (web-skeleton::first-repeated-key
+            '(("a" . 1) ("b" . 7) ("b" . 9) ("a" . 13)))
+           '("b" . 9))
+    (check "repeat: of a key three times, its second"
+           (web-skeleton::first-repeated-key '(("x" . 1) ("x" . 2) ("x" . 3)))
+           '("x" . 2))
+    (check "repeat: json-parse names that key, where it is"
+           (handler-case (progn (json-parse "{\"a\":1,\"b\":2,\"b\":3,\"a\":4}") nil)
+             (error (e) (princ-to-string e)))
+           "json: duplicate key \"b\" at 13")
+    (let ((*random-state* (sb-ext:seed-random-state 1031))
+          (disagreements 0))
+      (dotimes (trial 500)
+        (let ((entries (loop for i below (random 12)
+                             collect (cons (string (code-char (+ 97 (random 6)))) i))))
+          (unless (equal (web-skeleton::first-repeated-key entries) (naive entries))
+            (incf disagreements))))
+      (check "repeat: as a reader in order finds it, on 500 random key lists"
+             disagreements 0))))
+
 (defun test-json ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -324,5 +385,6 @@
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-serialize)
+  (test-json-first-repeated-key)
   (report-suite "JSON")
   (zerop *tests-failed*))

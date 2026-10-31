@@ -109,12 +109,18 @@
 ;;;     affected function directly rather than through TEST. A revert
 ;;;     that takes the harness down produces a hang, not a result.
 ;;;   - An inlined or block-compiled callee does not follow a redefinition
-;;;     at all: the caller holds the expansion, not the fdefn. Nothing here
-;;;     is declaimed INLINE today, and TEST-DISCARD-AVAILABLE-WANT-WRITE is
-;;;     the first test that depends on that staying true — it stubs
-;;;     CONNECTION-READ-INTO and asserts what its caller does with the
-;;;     answer. Declaim that function INLINE and the test passes against
-;;;     the original code while appearing to drive the stub.
+;;;     at all: the caller holds the expansion, not the fdefn. Check for a
+;;;     declaim before reverting a function by redefining it — grep for
+;;;     "declaim (inline". A handful of small helpers are inlined: SCAN-CRLF
+;;;     and TCHAR-BYTE-P in http.lisp, the byte packers and event
+;;;     accessors in epoll.lisp, HEX-DIGIT-VALUE, the modular arithmetic in
+;;;     ecdsa.lisp, and the SHA-256 and 32-bit word helpers. A revert of one
+;;;     of those in an image keeps the old code in every caller already
+;;;     compiled, and the test looks as though it has no teeth.
+;;;     TEST-DISCARD-AVAILABLE-WANT-WRITE depends on CONNECTION-READ-INTO
+;;;     staying out of that list — it stubs that function and asserts what
+;;;     its caller does with the answer. Declaim it INLINE and the test
+;;;     passes against the original code while appearing to drive the stub.
 ;;;
 ;;; The same rule holds outside testing: do not enter a multi-step state
 ;;; change without first confirming every intermediate step passes.
@@ -122,6 +128,42 @@
 
 (defvar *crlf* (coerce '(#\Return #\Newline) 'string)
   "CRLF string for constructing test request data.")
+
+;;; ---------------------------------------------------------------------------
+;;; Linux numbers the tests use
+;;;
+;;; Beside the SOL_SOCKET, SO_ and EPOLL numbers epoll.lisp defines for the
+;;; framework. These are here rather than there because nothing the
+;;; framework does needs them: only tests that shrink a buffer to make a
+;;; socket block, close one with a reset, or wait for bytes to arrive.
+;;; ---------------------------------------------------------------------------
+
+(defconstant +so-sndbuf+ 7 "SO_SNDBUF: a socket's send buffer size.")
+(defconstant +so-rcvbuf+ 8 "SO_RCVBUF: a socket's receive buffer size.")
+(defconstant +so-linger+ 13 "SO_LINGER: what close(2) does with unsent data.")
+(defconstant +fionread+ #x541B
+  "FIONREAD: the ioctl that answers how many bytes a receive buffer holds.")
+(defconstant +epollrdhup+ #x2000
+  "EPOLLRDHUP: the peer has ended its side of the stream, by a FIN or a
+   reset.")
+
+;;; ---------------------------------------------------------------------------
+;;; Scratch paths
+;;; ---------------------------------------------------------------------------
+
+(defvar *scratch-random* (make-random-state t)
+  "The random state scratch names are drawn from, seeded from the system
+   when the suite loads. The default *RANDOM-STATE* starts out the same in
+   every fresh image, so names drawn from it repeat from one run to the
+   next, and two runs on one host would pick the same ones.")
+
+(defun scratch-path (prefix &optional (suffix ""))
+  "A path under /tmp that no other run picks: PREFIX, this process's id and
+   a random number, then SUFFIX, \"/\" for a directory or a type such as
+   \".bin\" for a file. Under /tmp rather than beside the code, so a run
+   cut short leaves nothing in the source tree."
+  (format nil "/tmp/~a-~d-~36r~a" prefix (sb-unix:unix-getpid)
+          (random (expt 36 10) *scratch-random*) suffix))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Reaching into the optional TLS system
@@ -138,9 +180,8 @@
 ;;; absent. Such a guard cannot tell "TLS not loaded" from "that function
 ;;; was renamed or deleted", so the second case skips silently on a
 ;;; machine where TLS is loaded and the assertion was meant to run.
-;;; Deleting TLS-STREAM-RESPONSE did exactly that to five assertions in
-;;; test-properties: green suite, lost coverage, visible only as a
-;;; per-suite count dropping.
+;;; Deleting a function such a guard names does exactly that: a green
+;;; suite, lost coverage, visible only as a per-suite count dropping.
 ;;;
 ;;; So: ask TLS-LOADED-P whether the system is there, and inside that
 ;;; branch use TLS-SYM, which raises on a miss because by then a miss can
@@ -215,33 +256,110 @@
   `(handler-case (progn ,@body)
      (error (e) (princ-to-string e))))
 
+;;; ---------------------------------------------------------------------------
+;;; Serious conditions that are not errors, raised on purpose
+;;;
+;;; Unbounded recursion and an allocation larger than the heap both signal a
+;;; STORAGE-CONDITION, and the end of an SB-EXT:WITH-TIMEOUT signals an
+;;; SB-EXT:TIMEOUT. Each is a SERIOUS-CONDITION and not an ERROR: ATTEMPT
+;;; does not catch one, and neither does a HANDLER-CASE on ERROR anywhere in
+;;; the framework that is meant to. A test asserting that the framework
+;;; contains one has to survive the framework not doing so, or a revert does
+;;; not fail the test — it ends the process, since SBCL quits on a condition
+;;; nothing handles when the debugger is disabled, and the run ends with no
+;;; totals line.
+;;; ---------------------------------------------------------------------------
+
+(defun %exhaust-the-stack (n)
+  "Recurse until the control stack runs out. Not a tail call — the 1+ waits
+   on the result — so every level keeps its frame."
+  (1+ (%exhaust-the-stack (1+ n))))
+
+(defun %exhaust-the-heap ()
+  "Ask for one byte more than the whole dynamic space. No collection can
+   satisfy it, so SBCL signals at once rather than after a struggle."
+  (make-array (1+ (sb-ext:dynamic-space-size))
+              :element-type '(unsigned-byte 8)))
+
+(defun %run-out-of-time ()
+  "Wait inside SB-EXT:WITH-TIMEOUT for far longer than it allows. A real
+   timer and a real TIMEOUT, rather than a TIMEOUT made with ERROR, because
+   the timer interrupts the thread from outside and the condition arrives
+   the way an application's own WITH-TIMEOUT delivers it."
+  (sb-ext:with-timeout 0.01
+    (sleep 10)))
+
+(defun call-with-escapes-ending-the-thread (thunk)
+  "Call THUNK with a condition that escapes every handler on some thread
+   ending that thread, not the process.
+
+   The global value of *INVOKE-DEBUGGER-HOOK* is replaced rather than bound,
+   because the threads this is for are workers START-SERVER spawned, which
+   inherit no binding; SYMBOL-GLOBAL-VALUE so that a binding on this thread
+   cannot absorb the write. Each escape prints a NOTE naming its condition
+   and thread, so a revert reads as what it is rather than as a run of
+   connection errors.
+
+   The main thread cannot be ended this way, and an escape there is a
+   defect in the test rather than in the framework, so it goes to the hook
+   that was installed before."
+  (let ((saved (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*)))
+    (setf (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*)
+          (lambda (condition hook)
+            ;; Returning from the hook hands the condition on to the
+            ;; ordinary debugger, which is what NIL would have done.
+            (if (sb-thread:main-thread-p)
+                (when saved (funcall saved condition hook))
+                (progn
+                  (format t "  NOTE  ~a escaped every handler on ~a; ~
+                             ending the thread~%"
+                          (type-of condition)
+                          (sb-thread:thread-name sb-thread:*current-thread*))
+                  (sb-thread:abort-thread)))))
+    (unwind-protect (funcall thunk)
+      (setf (sb-ext:symbol-global-value 'sb-ext:*invoke-debugger-hook*) saved))))
+
 (defmacro check (name expr expected)
-  "Assert that EXPR produces EXPECTED. Logs pass/fail."
-  `(let ((result ,expr))
-     (if (equal result ,expected)
-         (progn
-           (format t "  PASS  ~a~%" ,name)
-           (incf *tests-passed*))
-         (progn
-           (format t "  FAIL  ~a~%    expected: ~s~%         got: ~s~%"
-                   ,name ,expected result)
-           (incf *tests-failed*)
-           (push ,name *failed-names*)))))
+  "Assert that EXPR produces EXPECTED. Logs pass/fail.
+
+   EXPR, EXPECTED and NAME are each evaluated once, in that order, into
+   variables of the macro's own, so a form that names a variable of the
+   test's, a RESULT say, reads the test's."
+  (let ((result (gensym "RESULT"))
+        (want (gensym "EXPECTED"))
+        (label (gensym "NAME")))
+    `(let* ((,result ,expr)
+            (,want ,expected)
+            (,label ,name))
+       (if (equal ,result ,want)
+           (progn
+             (format t "  PASS  ~a~%" ,label)
+             (incf *tests-passed*))
+           (progn
+             (format t "  FAIL  ~a~%    expected: ~s~%         got: ~s~%"
+                     ,label ,want ,result)
+             (incf *tests-failed*)
+             (push ,label *failed-names*))))))
 
 (defmacro check-error (name expr)
-  "Assert that EXPR signals an HTTP-PARSE-ERROR (or any error as fallback)."
-  `(if (handler-case (progn ,expr nil)
-         (http-parse-error () t)
-         (error (e)
-           (format t "  NOTE  ~a caught ~a (not http-parse-error)~%" ,name (type-of e))
-           t))
-       (progn
-         (format t "  PASS  ~a~%" ,name)
-         (incf *tests-passed*))
-       (progn
-         (format t "  FAIL  ~a (expected error, got none)~%" ,name)
-         (incf *tests-failed*)
-         (push ,name *failed-names*))))
+  "Assert that EXPR signals an HTTP-PARSE-ERROR (or any error as fallback).
+   NAME is evaluated once, after EXPR."
+  (let ((signalled (gensym "SIGNALLED"))
+        (label (gensym "NAME")))
+    `(let* ((,signalled (handler-case (progn ,expr nil)
+                          (http-parse-error () :parse-error)
+                          (error (e) (type-of e))))
+            (,label ,name))
+       (when (and ,signalled (not (eq ,signalled :parse-error)))
+         (format t "  NOTE  ~a caught ~a (not http-parse-error)~%" ,label ,signalled))
+       (if ,signalled
+           (progn
+             (format t "  PASS  ~a~%" ,label)
+             (incf *tests-passed*))
+           (progn
+             (format t "  FAIL  ~a (expected error, got none)~%" ,label)
+             (incf *tests-failed*)
+             (push ,label *failed-names*))))))
 
 (defun report-suite (suite-name &optional suffix)
   "Emit the per-suite summary line, preceded by the list of failing
@@ -273,7 +391,8 @@
         (total-failed 0))
     (setf *all-failed-names* nil
           *tests-skipped* 0)
-    (dolist (suite '(test-algorithms test-json test-server test-store test-properties
+    (dolist (suite '(test-algorithms test-json test-server test-connections
+                     test-store test-properties
                      test-harness test-tls))
       (unless (funcall suite)
         (setf all-passed nil))

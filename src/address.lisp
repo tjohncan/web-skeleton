@@ -39,20 +39,31 @@
 ;;; DEPLOYMENT.md "Fetch URL safety (SSRF)" carries the rest: what a
 ;;; refusal does to an in-flight fetch, and why an allowlist of upstream
 ;;; hosts is better still where the app can name them.
+;;;
+;;; The file ends with the IP literal parsers, PARSE-IPV4-LITERAL and
+;;; PARSE-IPV6-LITERAL, which read an address out of a URL, getent's
+;;; output or a request's Host: a section of their own, below.
 ;;; ===========================================================================
 
 (defun format-ip (bytes)
   "Format an address byte vector for logs. 4 bytes → dotted quad,
    16 bytes → colon-separated lowercase hex groups (no :: compression —
-   a log line wants unambiguous identity, not canonical form). Anything
-   else → \"<addr>\". Bracketless: a caller needing the RFC 3986
-   authority form adds its own brackets."
+   a log line wants unambiguous identity, not canonical form). A
+   v4-mapped address, ::ffff:0:0/96, keeps its IPv4 half as a dotted quad
+   in RFC 4291's x:x:x:x:x:x:d.d.d.d form, 0:0:0:0:0:ffff:192.0.2.1, since
+   it is an IPv4 peer an IPv6 wildcard listener accepted, and the log
+   should read as the address that peer has. Anything else → \"<addr>\".
+   Bracketless: a caller needing the RFC 3986 authority form adds its own
+   brackets."
   (case (length bytes)
     (4  (format nil "~{~d~^.~}" (coerce bytes 'list)))
-    (16 (format nil "~(~{~x~^:~}~)"
-                (loop for i from 0 below 16 by 2
-                      collect (logior (ash (aref bytes i) 8)
-                                      (aref bytes (1+ i))))))
+    (16 (if (and (every #'zerop (subseq bytes 0 10))
+                 (= (aref bytes 10) #xff) (= (aref bytes 11) #xff))
+            (format nil "0:0:0:0:0:ffff:~{~d~^.~}" (coerce (subseq bytes 12) 'list))
+            (format nil "~(~{~x~^:~}~)"
+                    (loop for i from 0 below 16 by 2
+                          collect (logior (ash (aref bytes i) 8)
+                                          (aref bytes (1+ i)))))))
     (t  "<addr>")))
 
 (defun ipv4-public-p (bytes)
@@ -120,9 +131,9 @@
       ;; semantically IPv4, and the framework's policy is to
       ;; reject every dangerous-looking address. Unwrap and
       ;; classify via the embedded v4 for consistency with the
-      ;; mapped branch. Also subsumes the old ::/120 check: ::
-      ;; unwraps to 0.0.0.0 (rejected), ::1 unwraps to 0.0.0.1
-      ;; (rejected — zero first octet).
+      ;; mapped branch. This also covers ::/120, which needs no
+      ;; check of its own: :: unwraps to 0.0.0.0 (rejected), ::1
+      ;; unwraps to 0.0.0.1 (rejected — zero first octet).
       ((loop for i from 0 below 12 always (zerop (aref bytes i)))
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 12 :end2 16)
@@ -134,6 +145,28 @@
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 12 :end2 16)
          (ipv4-public-p v4)))
+      ;; Everything outside 2000::/3. IANA allocates global unicast from
+      ;; 2000::/3 and nowhere else; the rest of the space is reserved,
+      ;; local, multicast, or a special-purpose block the registry marks
+      ;; not globally reachable. So the test outside it is what public
+      ;; *is*, not a list of what it is not. Beyond the unspecified address
+      ;; and loopback, which the IPv4-compatible unwrap above already sends
+      ;; to 0.0.0.0/8, it refuses at once:
+      ;; discard-only 100::/64 (RFC 6666), the dummy prefix 100:0:0:1::/64
+      ;; (RFC 9780), the local-use translation prefix 64:ff9b:1::/48 (RFC
+      ;; 8215) — whose v4 is not in bytes 12..15, so the NAT64 unwrap above
+      ;; rightly does not take it — the IPv4-translated ::ffff:0:0:0/96,
+      ;; SRv6 SIDs 5f00::/16 (RFC 9602), unique local fc00::/7 (AWS's
+      ;; fd00:ec2::254 among them), link-local fe80::/10 and the reserved
+      ;; fe00::/8 around it, and multicast ff00::/8.
+      ;;
+      ;; And whatever is assigned out of reserved space later, which is
+      ;; where 5f00::/16 came from. A list of exceptions to public misses
+      ;; the block nobody has added yet; a statement of what public is
+      ;; does not. If IANA ever opens unicast outside 2000::/3, this
+      ;; refuses it until the clause is widened — the direction for an
+      ;; SSRF filter to be wrong in.
+      ((/= (logand b0 #xe0) #x20) nil)
       ;; 2002::/16 — 6to4 encapsulation (RFC 3056). The IPv4 payload
       ;; lives in bytes 2..5; the rest of the address is an arbitrary
       ;; host identifier. 6to4 is deprecated (RFC 7526) and current
@@ -148,58 +181,46 @@
        (let ((v4 (make-array 4 :element-type '(unsigned-byte 8))))
          (replace v4 bytes :start2 2 :end2 6)
          (ipv4-public-p v4)))
-      ;; 2001:db8::/32 — documentation
+      ;; 2001::/23 — IETF Protocol Assignments, refused whole: the v6
+      ;; counterpart of 192.0.0.0/24, refused whole for the same reason.
+      ;; The registry marks the block not globally reachable unless a
+      ;; more specific allocation says otherwise, and the ones that do are
+      ;; protocol machinery rather than anywhere an application fetches
+      ;; from by URL: anycast service addresses, AMT relays, AS112-v6, the
+      ;; drone-ID prefix. The rest is benchmarking (2001:2::/48, the
+      ;; counterpart of 198.18.0.0/15), unassigned space, and three that
+      ;; need saying:
+      ;;
+      ;;   Teredo, 2001::/32 (RFC 4380), is the one with teeth. Bytes 4-7
+      ;;   are the Teredo server's IPv4 address and bytes 12-15 the
+      ;;   client's, obfuscated by complement — a wrapper around two IPv4
+      ;;   addresses in exactly the sense ::ffff: and 2002:: are, and the
+      ;;   policy for those is to refuse the private-shaped ones whether or
+      ;;   not the carrier is live. It cannot be unwrapped instead: the
+      ;;   client field is complemented and the server field is the relay
+      ;;   rather than the destination, so there is no single carried
+      ;;   address to hand IPV4-PUBLIC-P.
+      ;;
+      ;;   ORCHIDv2, 2001:20::/28 (RFC 7343), is an identifier space — a
+      ;;   hash of a key standing where an address would — not a locator,
+      ;;   though the registry marks it reachable.
+      ;;
+      ;;   2001:10::/28 was RFC 4843's ORCHID, expired and returned to the
+      ;;   pool, which is a reason to refuse it rather than to skip it, as
+      ;;   the 2002::/16 and 192.88.99.0/24 clauses give: a prefix returned
+      ;;   to the pool reaches whoever is handed it next.
+      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
+            (<= (aref bytes 2) #x01))
+       nil)
+      ;; 2001:db8::/32 — documentation (RFC 3849).
       ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
             (= (aref bytes 2) #x0d) (= (aref bytes 3) #xb8))
        nil)
-      ;; 2001::/32 — Teredo (RFC 4380). The one with teeth in this group:
-      ;; bytes 4-7 are the Teredo server's IPv4 address and bytes 12-15 are
-      ;; the client's, obfuscated by complement — so a Teredo address is a
-      ;; wrapper around two IPv4 addresses in exactly the sense ::ffff: and
-      ;; 2002:: are, and the stated policy for those is to refuse the
-      ;; private-shaped ones whether or not the carrier is live. Refused
-      ;; whole rather than unwrapped: the client field is complemented and
-      ;; the server field is the relay rather than the destination, so there
-      ;; is no single carried address to hand IPV4-PUBLIC-P.
-      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
-            (= (aref bytes 2) #x00) (= (aref bytes 3) #x00))
+      ;; 3fff::/20 — documentation (RFC 9637), the second block, sized for
+      ;; examples that need room for whole networks.
+      ((and (= (aref bytes 0) #x3f) (= (aref bytes 1) #xff)
+            (< (aref bytes 2) #x10))
        nil)
-      ;; 2001:2::/48 — benchmarking (RFC 5180), the v6 counterpart of
-      ;; 198.18.0.0/15.
-      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
-            (= (aref bytes 2) #x00) (= (aref bytes 3) #x02)
-            (= (aref bytes 4) #x00) (= (aref bytes 5) #x00))
-       nil)
-      ;; ORCHID, both allocations. 2001:20::/28 is ORCHIDv2 (RFC 7343) and
-      ;; is the live one — currently allocated and marked not globally
-      ;; reachable in the IANA IPv6 Special-Purpose Address Registry.
-      ;; 2001:10::/28 is RFC 4843's original, whose allocation expired and
-      ;; returned to the free pool when RFC 7343 obsoleted it.
-      ;;
-      ;; Both are refused, and the retired one is refused for the reason
-      ;; the 2002::/16 and 192.88.99.0/24 clauses give above: an expired
-      ;; allocation is a reason to refuse rather than to skip, because a
-      ;; prefix returned to the pool reaches whoever is handed it next.
-      ((and (= (aref bytes 0) #x20) (= (aref bytes 1) #x01)
-            (= (aref bytes 2) #x00)
-            (or (= (logand (aref bytes 3) #xf0) #x10)
-                (= (logand (aref bytes 3) #xf0) #x20)))
-       nil)
-      ;; 100::/64 — discard-only (RFC 6666). Traffic to it is dropped, so
-      ;; nothing is reachable there and a fetch aimed at it can only be a
-      ;; mistake or a probe.
-      ((and (= (aref bytes 0) #x01) (= (aref bytes 1) #x00)
-            (loop for i from 2 below 8 always (zerop (aref bytes i))))
-       nil)
-      ;; fc00::/7 — unique local (RFC 4193), covers AWS fd00:ec2::254
-      ((= (logand b0 #xfe) #xfc) nil)
-      ;; fe00::/8 — a conservative superset of link-local (fe80::/10),
-      ;; deprecated site-local (fec0::/10), and everything else in the
-      ;; IETF-reserved fe00::/8 range. None of it is publicly routable,
-      ;; so the /8 gate is both simpler and safer than narrow matches.
-      ((= b0 #xfe) nil)
-      ;; ff00::/8 — multicast
-      ((= b0 #xff) nil)
       (t t))))
 
 (defun is-public-address-p (bytes family)
@@ -208,31 +229,174 @@
    A wrong-length BYTES or unknown FAMILY returns NIL — callers get
    the conservative answer.
 
-   Rejects: loopback (127/8, ::1), link-local (169.254/16, fe00::/8 superset incl. fe80::/10),
-   RFC 1918 private (10/8, 172.16/12, 192.168/16), RFC 6598 CGNAT
-   (100.64/10), RFC 4193 unique local (fc00::/7), multicast (224/4,
-   ff00::/8), documentation prefixes (TEST-NET-1/2/3, 2001:db8::/32),
-   reserved / future, unspecified, benchmarking, and cloud metadata
-   IPs (169.254.169.254, fd00:ec2::254 via fc00::/7).
+   IPv4 rejects: unspecified (0/8), RFC 1918 private (10/8, 172.16/12,
+   192.168/16), RFC 6598 CGNAT (100.64/10), loopback (127/8), link-local
+   (169.254/16, which holds the cloud metadata address 169.254.169.254),
+   IETF protocol assignments (192.0.0.0/24), documentation (TEST-NET-1/2/3),
+   6to4 relay anycast (192.88.99.0/24), benchmarking (198.18/15),
+   multicast (224/4), and reserved and broadcast (240/4).
 
-   Also on the v6 side: 6to4 (2002::/16, unwrapped), Teredo (2001::/32,
-   refused whole — its two embedded IPv4 addresses are a relay and a
+   IPv6 is public only inside global unicast, 2000::/3 — the one range
+   IANA allocates unicast from. Everything outside it is refused, which
+   covers loopback and unspecified, discard-only 100::/64, the dummy
+   prefix 100:0:0:1::/64, the local-use translation prefix 64:ff9b:1::/48,
+   IPv4-translated ::ffff:0:0:0/96, SRv6 SIDs 5f00::/16, unique local
+   fc00::/7 (the AWS metadata address fd00:ec2::254 included),
+   link-local fe80::/10 within the reserved fe00::/8, multicast ff00::/8,
+   and every reserved range. Inside it, refused: IETF protocol
+   assignments 2001::/23 (Teredo, benchmarking, ORCHID and ORCHIDv2
+   among them — Teredo's two embedded IPv4 addresses are a relay and a
    complemented client, so there is no single carried address to unwrap),
-   IPv6 benchmarking (2001:2::/48), ORCHID and ORCHIDv2 (2001:10::/28 and
-   2001:20::/28), and discard-only (100::/64).
+   and documentation 2001:db8::/32 and 3fff::/20.
+
+   Three IPv4-in-IPv6 forms are unwrapped and classified by the IPv4
+   they carry rather than refused: IPv4-mapped ::ffff:0:0/96,
+   IPv4-compatible ::/96, and NAT64 64:ff9b::/96, ahead of the 2000::/3
+   test that would otherwise refuse them; 6to4 2002::/16 inside it. An
+   attacker cannot bypass the check by rewriting 127.0.0.1 as
+   ::ffff:127.0.0.1.
 
    The list is exhaustive on purpose. This filter's value is that its
    coverage can be read off rather than inferred, so a prefix added to the
    code and not to this list costs more than one left out of both.
 
-   IPv4-mapped IPv6 (::ffff:0:0/96) and NAT64 (64:ff9b::/96) are
-   unwrapped and classified via their embedded IPv4 — an attacker
-   cannot bypass the check by rewriting 127.0.0.1 as ::ffff:127.0.0.1.
-
-   This helper answers \"is this concrete address safe to dial?\"
-   It does not resolve hostnames. Apps that accept hostnames must
-   resolve first and call this on each resolved address."
+   This helper answers \"is this concrete address safe to dial?\" and
+   resolves nothing. For the addresses a fetch is about to dial, install it
+   through *FETCH-ADDRESS-FILTER*, which runs on the resolution the fetch
+   actually uses. Called directly, it is for an address the app already
+   holds: an allowlist entry, a literal it parsed. Checking what a name
+   resolves to here and then handing the fetch the name checks one
+   resolution and dials another, which an attacker's nameserver can answer
+   differently."
   (case family
     (:inet  (and (= (length bytes) 4)  (ipv4-public-p bytes)))
     (:inet6 (and (= (length bytes) 16) (ipv6-public-p bytes)))
     (otherwise nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; IP literal parsers
+;;;
+;;; Used by PARSE-URL (to recognize bracketed IPv6 literals), by
+;;; INITIATE-HTTP-FETCH (to skip DNS entirely when the host is already an
+;;; address), and by HOST-FIELD-VALID-P (to check a request's bracketed
+;;; Host). Returning NIL on any failure — callers fall through to the next
+;;; case, never error.
+;;; ---------------------------------------------------------------------------
+
+(defun parse-ipv4-literal (str)
+  "Parse STR as a strict dotted-quad IPv4 address. Returns a 4-byte
+   vector on success, NIL on any failure. Rejects leading zeros (except
+   the bare '0'), out-of-range octets, wrong segment count, non-digits."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv4-literal nil))
+  (let ((parts '())
+        (start 0)
+        (len (length str)))
+    (dotimes (i (1+ len))
+      (when (or (= i len) (char= (char str i) #\.))
+        (let ((piece (subseq str start i)))
+          (when (zerop (length piece))
+            (return-from parse-ipv4-literal nil))
+          (when (and (> (length piece) 1) (char= (char piece 0) #\0))
+            (return-from parse-ipv4-literal nil))
+          (unless (every (lambda (c) (char<= #\0 c #\9)) piece)
+            (return-from parse-ipv4-literal nil))
+          (let ((val (parse-integer piece)))
+            (unless (<= 0 val 255)
+              (return-from parse-ipv4-literal nil))
+            (push val parts)))
+        (setf start (1+ i))))
+    (when (= (length parts) 4)
+      (make-array 4 :element-type '(unsigned-byte 8)
+                    :initial-contents (nreverse parts)))))
+
+(defun %ipv6-groups-to-bytes (groups)
+  "Convert a list of eight 16-bit integers to a 16-byte vector (network
+   byte order — big-endian)."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8))))
+    (loop for g in groups
+          for i from 0 by 2
+          do (setf (aref out i)       (logand #xFF (ash g -8))
+                   (aref out (1+ i))  (logand #xFF g)))
+    out))
+
+(defun %parse-ipv6-group (s)
+  "Parse 1-4 hex digits as an integer 0-65535, or return NIL."
+  (and (<= 1 (length s) 4)
+       (every (lambda (c)
+                (or (char<= #\0 c #\9)
+                    (char<= #\a c #\f)
+                    (char<= #\A c #\F)))
+              s)
+       (parse-integer s :radix 16)))
+
+(defun %split-ipv6-groups (s)
+  "Split S on colons into a list of substrings. Empty S returns NIL."
+  (when (zerop (length s))
+    (return-from %split-ipv6-groups nil))
+  (let ((groups '())
+        (start 0))
+    (dotimes (i (1+ (length s)) (nreverse groups))
+      (when (or (= i (length s)) (char= (char s i) #\:))
+        (push (subseq s start i) groups)
+        (setf start (1+ i))))))
+
+(defun %ipv6-maybe-unfold-ipv4-tail (groups)
+  "If the last entry of GROUPS is a dotted-quad IPv4 literal, expand
+   it to two 16-bit hex-string groups and return the new list.
+   Otherwise return GROUPS unchanged. Supports the IPv4-mapped and
+   IPv4-compatible IPv6 address forms (RFC 4291 §2.5.5) — e.g.
+   '::ffff:127.0.0.1' — so PARSE-IPV6-LITERAL and IS-PUBLIC-ADDRESS-P
+   agree on URL-literal classification.
+
+   The last-contains-dot branch uses OR so a failed PARSE-IPV4-LITERAL
+   falls back to GROUPS unchanged (the downstream %PARSE-IPV6-GROUP
+   then rejects the dotted tail as non-hex). Returning NIL on a
+   failed unfold would mask the rejection and let PARSE-IPV6-LITERAL
+   silently accept malformed literals like '::1.2.3' as '::'."
+  (let ((last (car (last groups))))
+    (if (and last (find #\. last))
+        (or (let ((v4 (parse-ipv4-literal last)))
+              (when v4
+                (let ((hi (logior (ash (aref v4 0) 8) (aref v4 1)))
+                      (lo (logior (ash (aref v4 2) 8) (aref v4 3))))
+                  (append (butlast groups)
+                          (list (format nil "~x" hi)
+                                (format nil "~x" lo))))))
+            groups)
+        groups)))
+
+(defun parse-ipv6-literal (str)
+  "Parse STR as an IPv6 literal. Returns a 16-byte vector on success,
+   NIL on failure. Handles :: compression and the IPv4-mapped /
+   IPv4-compatible tail form (::ffff:1.2.3.4 — RFC 4291 §2.5.5).
+   Does not handle zone identifiers (fe80::1%eth0) — rare in URL
+   contexts and v1 rejects them cleanly."
+  (unless (and (stringp str) (> (length str) 0))
+    (return-from parse-ipv6-literal nil))
+  (let ((dcolon (search "::" str)))
+    (cond
+      ;; "::" compression present
+      (dcolon
+       (let* ((prefix (subseq str 0 dcolon))
+              (suffix (subseq str (+ dcolon 2)))
+              (pre (if (zerop (length prefix)) '() (%split-ipv6-groups prefix)))
+              (suf (if (zerop (length suffix)) '() (%split-ipv6-groups suffix)))
+              (suf (%ipv6-maybe-unfold-ipv4-tail suf))
+              (pre-vals (mapcar #'%parse-ipv6-group pre))
+              (suf-vals (mapcar #'%parse-ipv6-group suf))
+              (filled (+ (length pre-vals) (length suf-vals))))
+         (when (and (every #'identity pre-vals)
+                    (every #'identity suf-vals)
+                    (<= filled 7))
+           (%ipv6-groups-to-bytes
+            (append pre-vals
+                    (make-list (- 8 filled) :initial-element 0)
+                    suf-vals)))))
+      ;; No "::" — must be exactly 8 groups (or 6 groups + IPv4 tail)
+      (t
+       (let* ((groups (%ipv6-maybe-unfold-ipv4-tail
+                       (%split-ipv6-groups str)))
+              (vals (mapcar #'%parse-ipv6-group groups)))
+         (when (and (= (length vals) 8) (every #'identity vals))
+           (%ipv6-groups-to-bytes vals)))))))

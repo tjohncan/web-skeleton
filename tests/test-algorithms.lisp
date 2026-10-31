@@ -10,27 +10,30 @@
 
 (defun test-sha1 ()
   (format t "~%SHA-1~%")
+  ;; Through ATTEMPT, so a digest that raises fails its check rather than
+  ;; ending the run. With every word in the rounds typed, a fault there is
+  ;; likelier to raise a type error than to return a wrong digest.
+  (flet ((digest (text)
+           (attempt (sha1-hex (sb-ext:string-to-octets text)))))
+    ;; FIPS 180-4 one-block message
+    (check "abc"
+           (digest "abc")
+           "a9993e364706816aba3e25717850c26c9cd0d89d")
 
-  ;; FIPS 180-4 one-block message
-  (check "abc"
-         (sha1-hex (sb-ext:string-to-octets "abc"))
-         "a9993e364706816aba3e25717850c26c9cd0d89d")
+    ;; FIPS 180-4 two-block message
+    (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+           (digest "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+           "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
 
-  ;; FIPS 180-4 two-block message
-  (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-         (sha1-hex (sb-ext:string-to-octets
-                    "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
-         "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    ;; Empty string
+    (check "empty string"
+           (digest "")
+           "da39a3ee5e6b4b0d3255bfef95601890afd80709")
 
-  ;; Empty string
-  (check "empty string"
-         (sha1-hex (sb-ext:string-to-octets ""))
-         "da39a3ee5e6b4b0d3255bfef95601890afd80709")
-
-  ;; Single character
-  (check "single char 'a'"
-         (sha1-hex (sb-ext:string-to-octets "a"))
-         "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8"))
+    ;; Single character
+    (check "single char 'a'"
+           (digest "a")
+           "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Base64 test vectors (RFC 4648 §10)
@@ -75,34 +78,36 @@
 
 (defun test-base64-decode ()
   (format t "~%Base64 Decode~%")
+  ;; A decode that should succeed goes through ATTEMPT, so one that raises
+  ;; fails its check rather than ending the run.
 
   ;; RFC 4648 §10 round-trips
   (check "empty"
-         (sb-ext:octets-to-string (base64-decode "") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "") :external-format :utf-8))
          "")
 
   (check "f"
-         (sb-ext:octets-to-string (base64-decode "Zg==") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zg==") :external-format :utf-8))
          "f")
 
   (check "fo"
-         (sb-ext:octets-to-string (base64-decode "Zm8=") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm8=") :external-format :utf-8))
          "fo")
 
   (check "foo"
-         (sb-ext:octets-to-string (base64-decode "Zm9v") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9v") :external-format :utf-8))
          "foo")
 
   (check "foob"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYg==") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYg==") :external-format :utf-8))
          "foob")
 
   (check "fooba"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYmE=") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYmE=") :external-format :utf-8))
          "fooba")
 
   (check "foobar"
-         (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64-decode "Zm9vYmFy") :external-format :utf-8))
          "foobar")
 
   ;; Invalid: single character (6 bits, can't form a byte)
@@ -116,22 +121,22 @@
     ;; must be zero or one byte string has sixteen spellings: "QQ" and
     ;; "QR" differ only in bits the decoder never emits.
     (check "2-char group: canonical trailing bits accepted"
-           (bytes-to-hex (base64-decode "QQ")) "41")
+           (attempt (bytes-to-hex (base64-decode "QQ"))) "41")
     (check "2-char group: non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64-decode "QR"))) t)
     (check "3-char group: canonical trailing bits accepted"
-           (bytes-to-hex (base64-decode "QUE")) "4141")
+           (attempt (bytes-to-hex (base64-decode "QUE"))) "4141")
     (check "3-char group: non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64-decode "QUF"))) t)
     ;; Padded spellings of those same two groups. Padding and the bit
     ;; check are separate guards, so each verdict has to survive both.
     (check "padded 2-char group accepted"
-           (bytes-to-hex (base64-decode "QQ==")) "41")
+           (attempt (bytes-to-hex (base64-decode "QQ=="))) "41")
     (check "padded non-canonical 2-char group rejected"
            (signals-error-p (lambda () (base64-decode "QR=="))) t)
 
-    ;; Padding must complete the final group and then stop. The
-    ;; trailing-'=' scan used to swallow a stray pad, so "AAAA=" decoded
+    ;; Padding must complete the final group and then stop. A
+    ;; trailing-'=' scan that swallowed a stray pad would decode "AAAA="
     ;; as "AAAA" — a second spelling of three zero bytes.
     (check "stray pad after a complete group rejected"
            (signals-error-p (lambda () (base64-decode "AAAA="))) t)
@@ -151,6 +156,8 @@
 
 (defun test-base64url ()
   (format t "~%Base64url~%")
+  ;; A decode that should succeed goes through ATTEMPT, as in
+  ;; TEST-BASE64-DECODE.
 
   ;; URL-safe encode: no padding, - instead of +, _ instead of /
   (check "url encode no padding"
@@ -164,18 +171,18 @@
 
   ;; URL-safe decode: handles missing padding
   (check "url decode no padding"
-         (sb-ext:octets-to-string (base64url-decode "Zg") :external-format :utf-8)
+         (attempt (sb-ext:octets-to-string (base64url-decode "Zg") :external-format :utf-8))
          "f")
 
   (check "url decode with - and _"
-         (bytes-to-hex (base64url-decode "s3pPLMBiTxaQ9kYGzzhZRbK-xOo"))
+         (attempt (bytes-to-hex (base64url-decode "s3pPLMBiTxaQ9kYGzzhZRbK-xOo")))
          (sha1-hex (sb-ext:string-to-octets
                     "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
 
   ;; Round-trip: encode then decode
   (let ((data (sb-ext:string-to-octets "the quick brown ankle leaps over the lazy heel")))
     (check "url round-trip"
-           (bytes-to-hex (base64url-decode (base64url-encode data)))
+           (attempt (bytes-to-hex (base64url-decode (base64url-encode data))))
            (bytes-to-hex data)))
 
   ;; Invalid: single character rejected
@@ -197,18 +204,18 @@
       (check "signature segment is 86 chars (2-char final group)"
              (mod (length sig) 4) 2)
       (check "signature segment decodes to 64 bytes"
-             (length (base64url-decode sig)) 64)
+             (attempt (length (base64url-decode sig))) 64)
       ;; Canonical input has exactly one spelling, and it is the one the
       ;; encoder produces — so decode is injective over what it accepts.
       (check "signature segment round-trips to its own spelling"
-             (base64url-encode (base64url-decode sig)) sig)
+             (attempt (base64url-encode (base64url-decode sig))) sig)
       (check "non-canonical twin of a signature segment rejected"
              (signals-error-p (lambda () (base64url-decode twin))) t))
 
     ;; base64url omits padding, so unpadded input stays legal — the new
     ;; padding guard must not have quietly made it mandatory.
     (check "url unpadded 2-char group still accepted"
-           (bytes-to-hex (base64url-decode "QQ")) "41")
+           (attempt (bytes-to-hex (base64url-decode "QQ"))) "41")
     (check "url non-canonical trailing bits rejected"
            (signals-error-p (lambda () (base64url-decode "QR"))) t)))
 
@@ -218,27 +225,28 @@
 
 (defun test-sha256 ()
   (format t "~%SHA-256~%")
+  ;; Through ATTEMPT, for the reason TEST-SHA1 gives.
+  (flet ((digest (text)
+           (attempt (sha256-hex (sb-ext:string-to-octets text)))))
+    ;; FIPS 180-4 one-block message
+    (check "abc"
+           (digest "abc")
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
 
-  ;; FIPS 180-4 one-block message
-  (check "abc"
-         (sha256-hex (sb-ext:string-to-octets "abc"))
-         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    ;; FIPS 180-4 two-block message
+    (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+           (digest "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+           "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
 
-  ;; FIPS 180-4 two-block message
-  (check "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-         (sha256-hex (sb-ext:string-to-octets
-                      "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
-         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    ;; Empty string
+    (check "empty string"
+           (digest "")
+           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 
-  ;; Empty string
-  (check "empty string"
-         (sha256-hex (sb-ext:string-to-octets ""))
-         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-
-  ;; Single character
-  (check "single char 'a'"
-         (sha256-hex (sb-ext:string-to-octets "a"))
-         "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"))
+    ;; Single character
+    (check "single char 'a'"
+           (digest "a")
+           "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; ECDSA P-256 verification tests
@@ -298,10 +306,10 @@
 
   ;; DER encoding strips leading zeros per X.690 8.3.2.
   ;; der-encode-ecdsa-signature lives in the optional TLS system, so this
-  ;; asks TLS-LOADED-P whether to run and TLS-SYM for the function. It
-  ;; used to gate on (FBOUNDP 'WEB-SKELETON::DER-ENCODE-ECDSA-SIGNATURE),
-  ;; which cannot tell "no libssl" from "that name moved" and would have
-  ;; dropped this assertion silently on a rename. TLS-SYM raises instead.
+  ;; asks TLS-LOADED-P whether to run and TLS-SYM for the function. A
+  ;; gate on (FBOUNDP 'WEB-SKELETON::DER-ENCODE-ECDSA-SIGNATURE) could
+  ;; not tell "no libssl" from "that name moved", and would drop this
+  ;; assertion silently on a rename; TLS-SYM raises instead.
   (when (tls-loaded-p)
     (let* ((sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element #x42))
            (dummy (progn (setf (aref sig 0) #x00 (aref sig 1) #x4A) nil))
@@ -313,12 +321,25 @@
              (aref der 3)
              31)))
 
-  ;; Generator point self-test: n*G should be the point at infinity
+  ;; Generator point self-test: n*G is the point at infinity, Z = 0. With
+  ;; Q = G and U2 = 0 this is also Shamir's table building 2G.
   (check "n*G = infinity"
-         (web-skeleton::ec-mul web-skeleton::+p256-n+
-                               (cons web-skeleton::+p256-gx+
-                                     web-skeleton::+p256-gy+))
-         nil)
+         (nth-value 2 (web-skeleton::ec-mul-add web-skeleton::+p256-n+ 0
+                                                web-skeleton::+p256-gx+
+                                                web-skeleton::+p256-gy+))
+         0)
+  ;; (n-1)G is -G: the same x, the opposite y.
+  (check "(n-1)*G = -G"
+         (multiple-value-bind (x y z)
+             (web-skeleton::ec-mul-add (1- web-skeleton::+p256-n+) 0
+                                       web-skeleton::+p256-gx+
+                                       web-skeleton::+p256-gy+)
+           (let* ((p web-skeleton::+p256-p+)
+                  (zi (web-skeleton::mod-inv z p))
+                  (zi2 (mod (* zi zi) p)))
+             (list (mod (* x zi2) p) (mod (* y zi2 zi) p))))
+         (list web-skeleton::+p256-gx+
+               (- web-skeleton::+p256-p+ web-skeleton::+p256-gy+)))
 
   ;; Short pubkey coordinate rejected
   (let ((short-x (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -352,6 +373,50 @@
     (check "unreduced pubkey-x (>= p) rejected"
            (web-skeleton::ecdsa-verify-p256-lisp hash sig huge huge)
            nil)))
+
+(defun test-ecdsa-corpus ()
+  "ECDSA-VERIFY-P256-LISP answers every *ECDSA-P256-CORPUS* entry as
+   OpenSSL did, and with web-skeleton-tls loaded so does libssl.
+
+   The corpus is what the verifier's arithmetic is held to: random
+   signatures and their high-S twins, single-bit damage of every kind, r
+   and s at the edges of their range, and crafted signatures for what a
+   random one never reaches. Among those are a sum u1 G + u2 Q that
+   doubles or vanishes, and public keys for which G + Q is 2G or the
+   point at infinity — where an addition that skips its special cases
+   answers wrongly. See ecdsa-corpus.lisp for how each verdict was made.
+
+   The pure-Lisp verifier is called by name, so this holds whichever
+   implementation ECDSA-VERIFY-P256 is swapped to.
+
+   Against the Jacobian verifier, a JACOBIAN-ADD that answers
+   infinity for P + P fails the two Q = G entries, where Shamir's table
+   builds G + Q by doubling, and a verifier without its point-at-infinity
+   check fails the entry whose sum is infinity. The entry whose halves
+   are equal does not catch the first. Shamir's trick never adds the two
+   halves to each other, so that entry guards a verifier that computes
+   them apart, which this one does not."
+  (format t "~%ECDSA P-256 corpus~%")
+  (let ((libssl (when (tls-loaded-p) (tls-sym "ECDSA-VERIFY-P256-LIBSSL")))
+        (libssl-disagrees nil))
+    (dolist (e *ecdsa-p256-corpus*)
+      (destructuring-bind (name expected digest sig x y) e
+        (let ((digest (hex-decode digest))
+              (sig (hex-decode sig))
+              (x (hex-decode x))
+              (y (hex-decode y)))
+          (check (format nil "ecdsa corpus: ~a" name)
+                 (attempt (web-skeleton::ecdsa-verify-p256-lisp digest sig x y))
+                 expected)
+          (when (and libssl
+                     (not (eq (attempt (funcall libssl digest sig x y))
+                              expected)))
+            (push name libssl-disagrees)))))
+    (when libssl
+      (check (format nil "ecdsa corpus: libssl agrees on all ~d entries"
+                     (length *ecdsa-p256-corpus*))
+             (reverse libssl-disagrees)
+             nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; mod-inv raises on non-invertible input (pure-Lisp primitive)
@@ -414,6 +479,135 @@
            (sb-ext:string-to-octets
             "Test Using Larger Than Block-Size Key - Hash Key First")))
          "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"))
+
+;;; ---------------------------------------------------------------------------
+;;; The octet contract — what SHA1, SHA256, HMAC-SHA256 and
+;;; ECDSA-VERIFY-P256 accept, asked of whatever is in their function cells
+;;;
+;;; TEST-ALGORITHMS runs this, and TEST-PURE-LISP-CRYPTO runs it again with
+;;; the pure-Lisp implementations swapped back in, so on a libssl machine the
+;;; same assertions meet both sides of the swap. That is the property under
+;;; test: one exported name, one contract, whichever library is loaded.
+;;; ---------------------------------------------------------------------------
+
+(defun test-octet-contract ()
+  (format t "~%Digest, MAC and verifier inputs: octets, under one contract~%")
+  (labels ((outcome (thunk)
+             ;; :REFUSED for the contract's own refusal; otherwise the value,
+             ;; or the text of whatever else was raised.
+             (handler-case (funcall thunk)
+               (error (e)
+                 (let ((text (princ-to-string e)))
+                   (if (search "takes an (unsigned-byte 8) vector" text)
+                       :refused
+                       text)))))
+           (octets (s) (sb-ext:string-to-octets s :external-format :utf-8))
+           (adjustable (bytes)
+             ;; BYTES behind a fill pointer, with bytes past it that must not
+             ;; be read.
+             (let ((v (make-array (+ (length bytes) 7)
+                                  :element-type '(unsigned-byte 8)
+                                  :adjustable t :fill-pointer (length bytes)
+                                  :initial-element #xEE)))
+               (replace v bytes)
+               v))
+           (displaced (bytes)
+             (let ((backing (make-array (+ (length bytes) 4)
+                                        :element-type '(unsigned-byte 8)
+                                        :initial-element #xEE)))
+               (replace backing bytes :start1 2)
+               (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                          :displaced-to backing
+                                          :displaced-index-offset 2))))
+    ;; Strings. These two share their first quarter, which is all a libssl
+    ;; digest read of a character string; they hashed alike there.
+    (let ((a "secret=s3cr3t;amount=100;to=alice")
+          (b "secret=s3X;amount=999999;to=mallo"))
+      (check "octets: sha256 refuses a character string"
+             (outcome (lambda () (sha256 a))) :refused)
+      (check "octets: sha256-hex refuses the string sharing its prefix"
+             (outcome (lambda () (sha256-hex b))) :refused)
+      (check "octets: sha1 refuses a character string"
+             (outcome (lambda () (sha1 a))) :refused)
+      (check "octets: a base-string is refused too, whatever its storage"
+             (outcome (lambda () (sha256 (coerce "abc" 'base-string))))
+             :refused)
+      (check "octets: the refusal names the call that makes a string into bytes"
+             (handler-case (progn (sha256 a) nil)
+               (error (e)
+                 (not (null (search "string-to-octets" (princ-to-string e))))))
+             t))
+    ;; Bytes held in something other than an (unsigned-byte 8) vector.
+    (check "octets: a simple-vector of byte values is refused"
+           (outcome (lambda () (sha256 (vector 97 98 99)))) :refused)
+    (check "octets: an (unsigned-byte 16) vector is refused"
+           (outcome (lambda ()
+                      (sha256 (make-array 3 :element-type '(unsigned-byte 16)
+                                            :initial-contents '(97 98 99)))))
+           :refused)
+    ;; Octets held non-simply digest as their active elements do.
+    (let ((abc (octets "abc")))
+      (check "octets: an adjustable vector digests to its fill pointer"
+             (outcome (lambda () (sha256-hex (adjustable abc))))
+             (sha256-hex abc))
+      (check "octets: a displaced vector digests what it shows"
+             (outcome (lambda () (sha256-hex (displaced abc))))
+             (sha256-hex abc))
+      (check "octets: sha1 takes an adjustable vector the same way"
+             (outcome (lambda () (sha1-hex (adjustable abc))))
+             (sha1-hex abc)))
+    ;; HMAC: both arguments, and the long-key branch that reaches SHA256
+    ;; before anything copies the key.
+    (let ((secret (concatenate 'string "a-long-secret-key-"
+                               (make-string 60 :initial-element #\k)))
+          (msg (octets "what do ya want for nothing?")))
+      (check "octets: hmac-sha256 refuses a string key longer than a block"
+             (outcome (lambda () (hmac-sha256 secret msg))) :refused)
+      (check "octets: and a short one"
+             (outcome (lambda () (hmac-sha256 "Jefe" msg))) :refused)
+      (check "octets: and a string message"
+             (outcome (lambda () (hmac-sha256 (octets "Jefe")
+                                              "what do ya want for nothing?")))
+             :refused)
+      (check "octets: the refusal of a key does not carry the key"
+             (handler-case (progn (hmac-sha256 secret msg) nil)
+               (error (e) (search "a-long-secret" (princ-to-string e))))
+             nil)
+      ;; RFC 4231 case 2, with both arguments held non-simply.
+      (check "octets: hmac-sha256 takes adjustable and displaced octets"
+             (outcome (lambda ()
+                        (bytes-to-hex (hmac-sha256 (adjustable (octets "Jefe"))
+                                                   (displaced msg)))))
+             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"))
+    ;; The verifier, with RFC 7515 A.3.
+    (let* ((hash (sha256 (octets "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ")))
+           (x (base64url-decode "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"))
+           (y (base64url-decode "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"))
+           (sig (base64url-decode "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")))
+      (check "octets: ecdsa-verify-p256 refuses a string hash"
+             (outcome (lambda ()
+                        (ecdsa-verify-p256 (make-string 32 :initial-element #\a)
+                                           sig x y)))
+             :refused)
+      (check "octets: and verifies arguments held non-simply"
+             (outcome (lambda ()
+                        (ecdsa-verify-p256 (adjustable hash) (displaced sig)
+                                           (adjustable x) (displaced y))))
+             t))
+    ;; Parity at every padding boundary. Without libssl the cells hold the
+    ;; pure-Lisp functions and this compares each with itself.
+    (flet ((disagreements (public lisp)
+             (loop for n in '(0 1 55 56 57 63 64 65 119 120 128 1000)
+                   for bytes = (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                                 (dotimes (i n v)
+                                   (setf (aref v i) (mod (* (1+ i) 131) 256))))
+                   unless (equalp (outcome (lambda () (funcall public bytes)))
+                                  (funcall lisp bytes))
+                     collect n)))
+      (check "parity: sha256 agrees with sha256-lisp at every padding boundary"
+             (disagreements #'sha256 #'web-skeleton::sha256-lisp) nil)
+      (check "parity: sha1 agrees with sha1-lisp at every padding boundary"
+             (disagreements #'sha1 #'web-skeleton::sha1-lisp) nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; constant-time-equal tests
@@ -505,11 +699,11 @@
         (b (random-bytes 32)))
     (check "random-bytes: successive calls differ"
            (equalp a b) nil))
-  ;; The worker path. RANDOM-BYTES used to open, read and close
-  ;; /dev/urandom on every call, which a session-per-request app pays
-  ;; per request; a worker now holds one stream open for its lifetime.
-  ;; Outside a worker the binding is NIL and the per-call open remains,
-  ;; which is the state every check above runs in.
+  ;; The worker path. A worker holds one /dev/urandom stream open for its
+  ;; lifetime, where opening, reading and closing it on every call would
+  ;; cost a session-per-request app an open per request. Outside a worker
+  ;; the binding is NIL and RANDOM-BYTES opens per call, which is the
+  ;; state every check above runs in.
   (check "random-bytes: no cached stream outside a worker"
          web-skeleton::*urandom-stream* nil)
   (web-skeleton::with-worker-urandom
@@ -532,7 +726,7 @@
   ;; it must return those bytes — a RANDOM-BYTES that ignored the
   ;; binding would return four bytes from /dev/urandom instead, and
   ;; every check above would still pass.
-  (let ((path (merge-pathnames "tests/tmp-urandom.bin" (truename "."))))
+  (let ((path (scratch-path "ws-urandom" ".bin")))
     (unwind-protect
          (progn
            (with-open-file (s path :direction :output
@@ -554,17 +748,22 @@
                       (coerce (random-bytes 4) 'list) '(5 6 7 8))
                ;; Exhausted. The cached stream is an optimisation, not a
                ;; requirement, so a read that comes up short falls back
-               ;; to a per-call open rather than raising — otherwise one
-               ;; bad read poisons the binding for the worker's whole
-               ;; life, and RANDOM-TOKEN feeds session IDs and CSRF
-               ;; tokens. Matches how the open already degrades.
+               ;; to a per-call open rather than raising — RANDOM-TOKEN
+               ;; feeds session IDs and CSRF tokens. Matches how the open
+               ;; already degrades.
                (let ((bytes (random-bytes 8)))
                  (check "random-bytes: exhausted stream falls back"
                         (length bytes) 8)
                  ;; And the fallback really produced random bytes rather
                  ;; than the zeros a silently-unfilled buffer would hold.
                  (check "random-bytes: fallback bytes are not the empty buffer"
-                        (every #'zerop bytes) nil)))))
+                        (every #'zerop bytes) nil)
+                 ;; The failed stream is let go, so the calls after this one
+                 ;; open their own at once instead of failing on it first.
+                 (check "random-bytes: a stream that failed is unbound"
+                        web-skeleton::*urandom-stream* nil)
+                 (check "random-bytes: and closed"
+                        (open-stream-p s) nil)))))
       (ignore-errors (delete-file path))))
   ;; random-token: expected base64url length (unpadded)
   ;; 32 bytes -> ceil(32*4/3) = 43 chars
@@ -605,8 +804,10 @@
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)
+  (test-ecdsa-corpus)
   (test-mod-inv-raise)
   (test-hmac-sha256)
+  (test-octet-contract)
   (test-constant-time-equal)
   (test-hex)
   (test-random)
@@ -627,27 +828,27 @@
 ;;;
 ;;; Mechanism: temporarily swap SYMBOL-FUNCTION for the three public
 ;;; crypto names back to their *-LISP originals, run the existing
-;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-ECDSA functions
-;;; unchanged (so the FIPS / RFC vectors live in exactly one place),
-;;; then restore via UNWIND-PROTECT. Safe only in a serial test runner.
-;;; If libssl isn't loaded, the swap still works — it just replaces
-;;; the thin SHA1/SHA256/ECDSA-VERIFY-P256 wrappers with their direct
-;;; *-LISP targets, which is effectively a no-op.
+;;; TEST-SHA1 / TEST-SHA256 / TEST-HMAC-SHA256 / TEST-OCTET-CONTRACT /
+;;; TEST-ECDSA functions unchanged (so the FIPS / RFC vectors and the input
+;;; contract live in exactly one place), then restore via UNWIND-PROTECT.
+;;; Safe only in a serial test runner. If libssl isn't loaded, the swap
+;;; still works — it just replaces the thin SHA1/SHA256/ECDSA-VERIFY-P256
+;;; wrappers with their direct *-LISP targets, which is effectively a
+;;; no-op.
 ;;; ---------------------------------------------------------------------------
 
 (defun test-pure-lisp-crypto ()
   "Framework-dev entry point: re-run the existing crypto tests against
    the pure-Lisp implementations by temporarily swapping SYMBOL-FUNCTION
    for SHA1 / SHA256 / ECDSA-VERIFY-P256. HMAC-SHA256 is exercised for
-   free because it calls SHA256 through the function cell.
+   free because it calls SHA256 through the function cell, and
+   TEST-OCTET-CONTRACT puts the same input contract to the pure-Lisp side
+   that TEST-ALGORITHMS put to the libssl one.
 
    Run by TEST automatically whenever libssl is loaded, which is the only
    condition under which it has anything to say — without libssl the
    default function cells already are the pure-Lisp ones and the first
-   TEST-ALGORITHMS pass covered them. This docstring said the opposite for
-   long enough that three other places — RUN.LISP's header, TEST's own
-   comment, and the README — all describe the real behaviour and this one
-   did not."
+   TEST-ALGORITHMS pass covered them."
   (setf *tests-passed* 0
         *tests-failed* 0
         *failed-names* nil)
@@ -663,6 +864,7 @@
            (test-sha1)
            (test-sha256)
            (test-hmac-sha256)
+           (test-octet-contract)
            (test-ecdsa))
       (setf (symbol-function 'sha1)              saved-sha1
             (symbol-function 'sha256)            saved-sha256

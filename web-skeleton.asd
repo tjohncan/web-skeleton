@@ -11,26 +11,35 @@
                (:file "src/address" :depends-on ("src/package"))
                (:file "src/algorithms/hex"   :depends-on ("src/package"))
                (:file "src/algorithms/word32" :depends-on ("src/package"))
+               (:file "src/algorithms/octets" :depends-on ("src/package"))
                (:file "src/algorithms/sha1"  :depends-on ("src/package"
                                                            "src/algorithms/hex"
-                                                           "src/algorithms/word32"))
+                                                           "src/algorithms/word32"
+                                                           "src/algorithms/octets"))
                (:file "src/algorithms/sha256" :depends-on ("src/package"
                                                             "src/algorithms/hex"
-                                                            "src/algorithms/word32"))
+                                                            "src/algorithms/word32"
+                                                            "src/algorithms/octets"))
                (:file "src/algorithms/hmac"   :depends-on ("src/package"
-                                                           "src/algorithms/sha256"))
-               (:file "src/algorithms/ecdsa"  :depends-on ("src/package"))
+                                                           "src/algorithms/sha256"
+                                                           "src/algorithms/octets"))
+               (:file "src/algorithms/ecdsa"  :depends-on ("src/package"
+                                                           "src/algorithms/octets"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
                (:file "src/random" :depends-on ("src/package"
                                                  "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/counters" "src/package"
                                                        "src/algorithms/hex"))
+               ;; src/server/http for *MAX-HEADER-LINE-LENGTH*, which also
+               ;; caps a chunk-size line.
                (:file "src/server/chunked" :depends-on ("src/package"
-                                                          "src/algorithms/hex"))
+                                                          "src/algorithms/hex"
+                                                          "src/server/http"))
                (:file "src/server/connection" :depends-on ("src/package"
                                                             "src/log"
                                                             "src/epoll"
                                                             "src/address"
+                                                            "src/algorithms/hex"
                                                             "src/server/http"
                                                             "src/server/chunked"))
                (:file "src/server/websocket" :depends-on ("src/counters" "src/package"
@@ -42,7 +51,9 @@
                                                            "src/algorithms/base64"))
                (:file "src/server/static" :depends-on ("src/counters" "src/package"
                                                          "src/log"
-                                                         "src/server/http"))
+                                                         "src/server/http"
+                                                         ;; WRITE-SPAN, for a 206.
+                                                         "src/server/connection"))
                (:file "src/json" :depends-on ("src/package"))
                (:file "src/server/jwt"  :depends-on ("src/package"
                                                        "src/json"
@@ -54,6 +65,10 @@
                ;; meant to be paired with. Both fetch and dns call it, so
                ;; the dependency is declared rather than left to rely on
                ;; the order of this list.
+               ;; src/server/streaming for the chunk encoder a streamed
+               ;; request body is framed with, and src/server/body for the
+               ;; resume that lets a received body go once the upload it
+               ;; feeds has drained.
                (:file "src/server/fetch" :depends-on ("src/package"
                                                         "src/log"
                                                         "src/epoll"
@@ -61,7 +76,9 @@
                                                         "src/server/http"
                                                         "src/server/chunked"
                                                         "src/server/connection"
-                                                        "src/server/websocket"))
+                                                        "src/server/websocket"
+                                                        "src/server/streaming"
+                                                        "src/server/body"))
                (:file "src/server/dns" :depends-on ("src/package"
                                                       "src/log"
                                                       "src/epoll"
@@ -74,6 +91,15 @@
                                                            "src/epoll"
                                                            "src/server/http"
                                                            "src/server/connection"))
+               (:file "src/server/body" :depends-on ("src/package"
+                                                      "src/epoll"
+                                                      "src/server/http"
+                                                      "src/server/connection"))
+               (:file "src/server/multipart" :depends-on ("src/package"
+                                                           "src/json"
+                                                           "src/server/http"
+                                                           "src/server/connection"
+                                                           "src/server/body"))
                (:file "src/server/main"  :depends-on ("src/counters" "src/package"
                                                        "src/log"
                                                        "src/epoll"
@@ -90,7 +116,8 @@
                                                        "src/server/static"
                                                        "src/server/fetch"
                                                        "src/server/dns"
-                                                       "src/server/streaming"))
+                                                       "src/server/streaming"
+                                                       "src/server/body"))
                (:file "src/store" :depends-on ("src/package"
                                                 "src/log"
                                                 "src/server/main"))))

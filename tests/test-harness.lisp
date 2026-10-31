@@ -197,12 +197,165 @@
         (check "HEAD fetch: callback saw 200 status"
                body "status=200 body-nil=T")))))
 
+(defun test-harness-large-body-grows-the-buffer-e2e ()
+  "A body many times the size of a connection's first read buffer arrives
+   whole over a real socket.
+
+   The buffer starts at 4 KiB and is grown by CONNECTION-READ-AVAILABLE as
+   bytes arrive, never in advance to the length the client declared. This
+   is the path every large upload takes, through as many partial reads as
+   the kernel happens to deliver, and nothing else drives it end to end.
+   The digest is compared rather than the length alone, because a buffer
+   that grew in the wrong place would lose bytes at a doubling boundary
+   and could still report the right count."
+  (format t "~%Harness: a large body grows the read buffer~%")
+  (let* ((n (* 600 1024))
+         (body (let ((s (make-string n)))
+                 (dotimes (i n s)
+                   (setf (char s i) (code-char (+ 97 (mod (* i 7) 26)))))))
+         (want (format nil "~d ~a" n
+                       (sha256-hex (sb-ext:string-to-octets
+                                    body :external-format :ascii)))))
+    (with-test-server
+        (:handler (lambda (req)
+                    (let ((b (http-request-body req)))
+                      (make-text-response
+                       200 (format nil "~d ~a" (length b) (sha256-hex b))))))
+      (multiple-value-bind (status headers response-body)
+          (test-http-request :post "/upload" :body body)
+        (declare (ignore headers))
+        (check "large body: dispatches" status 200)
+        (check "large body: every byte arrived, in order" response-body want)))))
+
+(defun test-harness-split-head-then-pipelined-e2e ()
+  "A short request pipelined behind one whose head arrived in two pieces is
+   answered.
+
+   The first head's search records how far it got when the first piece
+   held no terminator. The keep-alive reset then moves the pipelined
+   request to offset 0, where its whole head sits before that position.
+   Broken state: the reset leaves the position as it was, the search for
+   the second head starts past its terminator, and the second request
+   waits for an end it has already sent — here until the read deadline.
+
+   The pause between the two writes is what makes the first head two
+   wake-ups rather than one; without it this is an ordinary pipelined
+   pair and passes whatever the reset does."
+  (format t "~%Harness: a split head, then a pipelined request~%")
+  (with-test-server (:handler (lambda (req)
+                                (make-text-response
+                                 200 (http-request-path req))))
+    (let* ((socket (connect-to-test-server))
+           (stream (sb-bsd-sockets:socket-make-stream
+                    socket :input t :output t :element-type '(unsigned-byte 8))))
+      (flet ((put (s)
+               (write-sequence (sb-ext:string-to-octets s :external-format :ascii)
+                               stream)
+               (force-output stream)))
+        (unwind-protect
+             (progn
+               (put (concatenate 'string
+                                 "GET /first HTTP/1.1" *crlf*
+                                 "Host: localhost" *crlf*
+                                 "X-Pad: " (make-string 100 :initial-element #\a)))
+               (sleep 0.2)
+               (put (concatenate 'string
+                                 *crlf* *crlf*
+                                 "GET /b HTTP/1.1" *crlf*
+                                 "Host: x" *crlf* *crlf*))
+               (let* ((buf (read-until-bounded
+                            stream :seconds 3
+                            :until (lambda (buf fill)
+                                     ;; Both bodies, the second one last.
+                                     (and (>= fill 2)
+                                          (= (aref buf (- fill 2)) 47)     ; /
+                                          (= (aref buf (- fill 1)) 98))))) ; b
+                      (text (sb-ext:octets-to-string buf :external-format :latin-1)))
+                 (check "split head: the first request is answered"
+                        (not (null (search "/first" text))) t)
+                 (check "split head: and the pipelined one behind it"
+                        (let ((tail (search "HTTP/1.1 200" text :from-end t)))
+                          (and tail (plusp tail) (search "/b" text :start2 tail) t))
+                        t)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+
+(defun test-harness-full-buffer-answered-promptly-e2e ()
+  "A request that fills the read buffer without finishing is answered as
+   the buffer fills, not when the idle sweep gets to it.
+
+   The client sends everything at once and then only reads. The read that
+   fills the buffer leaves the rest in the kernel, and nothing more will
+   arrive to raise another edge, so the answer has to come from that read.
+   Broken state: the read deadline below expires with nothing received,
+   because the server is waiting for an event that will not come and will
+   close the connection, unanswered, at *IDLE-TIMEOUT*.
+
+   The answer is the 413 and then a lingering close: a FIN after the
+   response, and the rest of the request read and discarded. Closed at
+   once instead, with the rest unread, Linux answers with a reset, which
+   a client on Linux survives — the 413 arrived first and stays readable
+   — but which discards anything unsent and reads as a failure to a peer
+   that treats it as one. The read ending in :EOF rather than :ERROR is
+   what tells the two apart.
+
+   Budgets are set with SETF, not LET: the worker reads the global values."
+  (format t "~%Harness: a full buffer is answered when it fills~%")
+  (let ((saved (list web-skeleton:*max-body-size*
+                     web-skeleton:*max-total-header-bytes*
+                     web-skeleton:*max-request-line-length*
+                     web-skeleton:*max-header-count*)))
+    (setf web-skeleton:*max-body-size* 8192
+          web-skeleton:*max-total-header-bytes* 1024
+          web-skeleton:*max-request-line-length* 1024
+          web-skeleton:*max-header-count* 10)
+    (unwind-protect
+         (with-test-server (:handler (lambda (req)
+                                       (declare (ignore req))
+                                       (make-text-response 200 "unreached")))
+           (let* ((socket (connect-to-test-server))
+                  (stream (sb-bsd-sockets:socket-make-stream
+                           socket :input t :output t
+                           :element-type '(unsigned-byte 8))))
+             (unwind-protect
+                  (progn
+                    ;; 12 KiB of one-byte chunks against a 10 KiB cap: the
+                    ;; decoded body is 2000 bytes, well inside the body cap,
+                    ;; so it is the buffer that fills.
+                    (write-sequence
+                     (sb-ext:string-to-octets
+                      (concatenate 'string
+                                   "POST /u HTTP/1.1" *crlf*
+                                   "Host: localhost" *crlf*
+                                   "Transfer-Encoding: chunked" *crlf*
+                                   *crlf*
+                                   (with-output-to-string (s)
+                                     (dotimes (i 2000)
+                                       (format s "1~aX~a" *crlf* *crlf*))))
+                      :external-format :ascii)
+                     stream)
+                    (force-output stream)
+                    (multiple-value-bind (buf reason)
+                        (read-until-bounded stream :seconds 4)
+                      (check "full buffer e2e: the connection ends promptly"
+                             (not (eq reason :deadline)) t)
+                      (check "full buffer e2e: the 413 arrives"
+                             (eql 0 (search "HTTP/1.1 413"
+                                            (sb-ext:octets-to-string
+                                             buf :external-format :latin-1)))
+                             t)
+                      (check "full buffer e2e: and ends with a FIN, not a reset"
+                             reason :eof)))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+      (setf web-skeleton:*max-body-size* (first saved)
+            web-skeleton:*max-total-header-bytes* (second saved)
+            web-skeleton:*max-request-line-length* (third saved)
+            web-skeleton:*max-header-count* (fourth saved)))))
+
 (defun test-harness-body-at-max-size-e2e ()
-  "A POST whose Content-Length equals *MAX-BODY-SIZE* dispatches
-   cleanly even though pre-growing the buffer to body-start+CL
-   takes it past CONNECTION-READ-AVAILABLE's cap: :FULL fires at
-   pos=body-start+CL, which IS the complete body, and the state
-   machine reaches :DISPATCH.
+  "A POST whose Content-Length equals *MAX-BODY-SIZE* dispatches: the cap
+   is a ceiling the body may reach, and the comparison is > rather than >=.
 
    SETF (not LET) on *MAX-BODY-SIZE*: the worker thread reads the
    top-level value — dynamic bindings do not cross thread creation —
@@ -280,6 +433,130 @@
              (drain-response stream)))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
+(defun test-harness-a-head-with-no-fields-e2e ()
+  "A request line and CRLFCRLF with nothing between, on the wire: answered
+   at HTTP/1.0, which requires no field, and refused 400 at HTTP/1.1,
+   which requires Host. OPTIONS / HTTP/1.0 alone is HAProxy's default
+   health probe, so a server that refuses this shape fails its checks."
+  (format t "~%Harness: a request head with no header fields~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response 200 (format nil "~a ~a"
+                                                  (http-request-method req)
+                                                  (http-request-path req)))))
+    (flet ((exchange (line)
+             (%exchange-or-why (%ascii (format nil "~a~a~a" line *crlf* *crlf*))))
+           (status-line (text)
+             (subseq text 0 (min 12 (length text)))))
+      (let ((answer (exchange "GET /probe HTTP/1.0")))
+        (check "no fields: GET at 1.0 is answered" (status-line answer) "HTTP/1.1 200")
+        (check "no fields: GET reaches the handler"
+               (not (null (search "GET /probe" answer))) t))
+      (let ((answer (exchange "OPTIONS / HTTP/1.0")))
+        (check "no fields: OPTIONS at 1.0 is answered" (status-line answer) "HTTP/1.1 200")
+        (check "no fields: OPTIONS reaches the handler"
+               (not (null (search "OPTIONS /" answer))) t))
+      (check "no fields: at 1.1 it is refused for its missing Host"
+             (status-line (exchange "GET / HTTP/1.1")) "HTTP/1.1 400"))))
+
+(defun test-harness-host-field-e2e ()
+  "Host on the wire, checked before any handler is called: a Host that is
+   host[:port] reaches the handler as it was sent, and one that is not, or
+   a second Host at HTTP/1.0, is answered 400 with the handler never
+   called."
+  (format t "~%Harness: the Host field, held to host[:port]~%")
+  (let ((lock (sb-thread:make-mutex :name "host-e2e"))
+        (seen nil))
+    (with-test-server
+        (:handler (lambda (req)
+                    (sb-thread:with-mutex (lock) (push (get-header req "host") seen))
+                    (make-text-response 200 "ok")))
+      (flet ((exchange (&rest lines)
+               (let ((answer (%exchange-or-why
+                              (%ascii (format nil "~{~a~a~}~a"
+                                              (loop for line in lines
+                                                    append (list line *crlf*))
+                                              *crlf*)))))
+                 (subseq answer 0 (min 12 (length answer))))))
+        (check "host: a name with a port reaches the handler"
+               (exchange "GET / HTTP/1.1" "Host: example.com:8080" "Connection: close")
+               "HTTP/1.1 200")
+        (check "host: and so does a bracketed IPv6 address with one"
+               (exchange "GET / HTTP/1.1" "Host: [::1]:8080" "Connection: close")
+               "HTTP/1.1 200")
+        (dolist (value '("x\"><b>" "evil.example/x?y" "u:p@x" "x:80:90" "a b"))
+          (check (format nil "host: ~s is answered 400" value)
+                 (exchange "GET / HTTP/1.1" (format nil "Host: ~a" value)
+                           "Connection: close")
+                 "HTTP/1.1 400"))
+        (check "host: two at HTTP/1.0 are answered 400"
+               (exchange "GET / HTTP/1.0" "Host: a.example" "Host: b.example")
+               "HTTP/1.1 400")
+        (check "host: the handler saw the valid ones, as sent, and no other"
+               (sb-thread:with-mutex (lock) (reverse seen))
+               '("example.com:8080" "[::1]:8080"))))))
+
+(defun test-harness-content-length-spellings-e2e ()
+  "Every spelling of a Content-Length field is read alike by both of its
+   readers, or refused with the connection closed.
+
+   SCAN-CONTENT-LENGTH takes the body's length from the raw head when its
+   CRLFCRLF arrives, and PARSE-HEADERS-BYTES reads the same field again at
+   dispatch. A spelling one of them reads and the other does not is what
+   request smuggling is made of, so each case carries five body bytes with
+   GET /second behind them in the same write.
+   - Read alike: the body is the five bytes, and /second is answered.
+   - Refused: one 400, and /second never answered.
+   - A name that is not Content-Length frames no body, so its five bytes
+     begin the next request, refused 501 and closed."
+  (format t "~%Harness: Content-Length spellings, read alike or refused~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response 200 (format nil "~a ~d"
+                                                  (http-request-path req)
+                                                  (length (or (http-request-body req) ""))))))
+    (flet ((shown (field)
+             ;; FIELD for a check's name, its CR, LF and TAB written out.
+             (with-output-to-string (s)
+               (loop for c across field
+                     do (case c
+                          (#\Return (write-string "<CR>" s))
+                          (#\Newline (write-string "<LF>" s))
+                          (#\Tab (write-string "<TAB>" s))
+                          (t (write-char c s))))))
+           (outcome (field)
+             ;; (statuses first-body-length second-answered-p)
+             (let* ((resp (%exchange-or-why
+                           (%ascii (format nil "POST /first HTTP/1.1~aHost: x~a~a~a~a~
+                                                helloGET /second HTTP/1.1~aHost: x~a~a"
+                                           *crlf* *crlf* field *crlf* *crlf*
+                                           *crlf* *crlf* *crlf*))))
+                    (statuses (loop for at = (search "HTTP/1.1 " resp)
+                                      then (search "HTTP/1.1 " resp :start2 (1+ at))
+                                    while at
+                                    collect (subseq resp (+ at 9) (min (length resp) (+ at 12))))))
+               (list statuses
+                     (cond ((search "/first 5" resp) 5)
+                           ((search "/first 0" resp) 0))
+                     (not (null (search "/second 0" resp)))))))
+      (dolist (field (list "Content-Length: 5" "Content-Length:5" "content-length: 5"
+                           "CONTENT-LENGTH: 5" "Content-Length: 05" "Content-Length: 5 "
+                           (format nil "Content-Length:~c5" #\Tab)
+                           (format nil "Content-Length: 5~c" #\Tab)
+                           (format nil "Content-Length: 5~aContent-Length: 5" *crlf*)))
+        (check (format nil "CL read alike: ~a" (shown field))
+               (outcome field) '(("200" "200") 5 t)))
+      (dolist (field (list "Content-Length : 5" (format nil "Content-Length~c: 5" #\Tab)
+                           "Content-Length: +5" "Content-Length: -5" "Content-Length: 0x5"
+                           "Content-Length: 5x" "Content-Length: 5,5" "Content-Length: 5, 5"
+                           "Content-Length: 5, 6" "Content-Length: 5 5" "Content-Length: "
+                           (format nil "X-Pad: y~a Content-Length: 5" *crlf*)))
+        (check (format nil "CL refused, nothing behind it read: ~a" (shown field))
+               (outcome field) '(("400") nil nil)))
+      (dolist (field '("X-Content-Length: 5" "Content-Lengthx: 5"))
+        (check (format nil "not a CL, no body: ~a" (shown field))
+               (outcome field) '(("200" "501") 0 nil))))))
+
 (defun test-harness-http10-keepalive-no-mutation-e2e ()
   "An HTTP/1.0 + Connection: keep-alive request must not stamp
    'Connection: keep-alive' onto the handler's returned struct.
@@ -294,14 +571,38 @@
         (:handler (lambda (req)
                     (declare (ignore req))
                     cached))
-      ;; Raw HTTP/1.0 + Connection: keep-alive.
-      (%raw-http-request
-       (sb-ext:string-to-octets
-        (concatenate 'string
-                     "GET / HTTP/1.0" *crlf*
-                     "Host: localhost" *crlf*
-                     "Connection: keep-alive" *crlf* *crlf*)
-        :external-format :ascii))
+      ;; One connection, kept alive, and no half-close: a FIN beside the
+      ;; request would have the server answer it Connection: close.
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (flet ((ask (request)
+                      ;; REQUEST sent; its answer, head and four-byte body, as
+                      ;; text, read no further than that.
+                      (write-sequence (%ascii request) stream)
+                      (force-output stream)
+                      (let ((buf (read-until-bounded
+                                  stream :seconds 5
+                                  :until (lambda (b fill)
+                                           (let ((hend (web-skeleton::scan-crlf-crlf b 0 fill)))
+                                             (and hend (>= fill (+ hend 4 4))))))))
+                        (string-downcase
+                         (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                  :external-format :latin-1)))))
+               (let ((first (ask (concatenate 'string
+                                              "GET / HTTP/1.0" *crlf*
+                                              "Host: localhost" *crlf*
+                                              "Connection: keep-alive" *crlf* *crlf*))))
+                 (check "http/1.0 keep-alive: the hint is on the wire"
+                        (not (null (search "connection: keep-alive" first))) t))
+               (let ((second (ask (concatenate 'string
+                                               "GET / HTTP/1.1" *crlf*
+                                               "Host: localhost" *crlf* *crlf*))))
+                 (check "http/1.0 keep-alive: the connection serves the next request"
+                        (not (null (search "http/1.1 200" second))) t)
+                 (check "http/1.0 keep-alive: which carries no stale hint"
+                        (search "connection: keep-alive" second) nil)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
       (check "http/1.0 keep-alive: struct body still set"
              (http-response-body cached) "body")
       (check "http/1.0 keep-alive: no connection header on struct"
@@ -372,8 +673,9 @@
 
 (defun test-harness-expect-417-on-unknown-e2e ()
   "An HTTP/1.1 request carrying an Expect token other than
-   100-continue must receive a 417 Expectation Failed (RFC 7231
-   §5.1.1 MUST), with the body never reaching the handler. Sends
+   100-continue receives a 417 Expectation Failed, with the body never
+   reaching the handler. RFC 9110 §10.1.1 lets a server answer 417
+   (MAY); the framework always does, so this pins its choice. Sends
    headers only (Content-Length: 4 declared, body bytes withheld):
    body-available=0 < CL=4 keeps the request out of the already-
    have-full-body fast path, so SCAN-EXPECT-DISPOSITION actually
@@ -467,7 +769,7 @@
    the 'HEAD ' method prefix inline and passes :head-only-p to
    format-response so Content-Length survives but body bytes
    are suppressed. Shape is vanishingly rare — HEAD with Expect
-   is meaningless in practice — but the test locks in the fix."
+   is meaningless in practice — but the test pins it."
   (format t "~%Harness: HEAD + Expect: unknown has no body on wire~%")
   (with-test-server
       (:handler (lambda (req)
@@ -547,10 +849,10 @@
                (write-sequence req1 stream)
                (force-output stream)
                ;; Drain the first response until EOF. A correct close
-               ;; makes EOF arrive promptly; a regression that held the
-               ;; socket open used to block here until with-test-server's
-               ;; teardown noticed. Bounded now, so the same regression
-               ;; fails these checks with whatever did arrive instead.
+               ;; makes EOF arrive promptly. The drain is bounded, so a
+               ;; regression that held the socket open fails these
+               ;; checks with whatever did arrive, rather than blocking
+               ;; here until with-test-server's teardown notices.
                (let ((text (drain-response stream)))
                  (check "handler close: response present"
                         (not (null (search "HTTP/1.1 200" text))) t)
@@ -565,7 +867,9 @@
                ;; held the socket open would accept the second
                ;; request and respond, flipping GOT-SECOND to T.
                ;; SB-EXT:WITH-TIMEOUT bounds the probe so a pathological
-               ;; regression doesn't hang the suite.
+               ;; regression doesn't hang the suite. The TIMEOUT it signals
+               ;; is not an ERROR, so it is named in the catch; a catch on
+               ;; ERROR alone would let it end the run instead.
                (let ((got-second nil))
                  (handler-case
                      (sb-ext:with-timeout 1
@@ -573,7 +877,7 @@
                        (force-output stream)
                        (let ((b (read-byte stream nil nil)))
                          (when b (setf got-second t))))
-                   (error () nil))
+                   ((or error sb-ext:timeout) () nil))
                  (check "handler close: second request on same socket fails"
                         got-second nil))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
@@ -640,7 +944,8 @@
                          (force-output stream)
                          (let ((b (read-byte stream nil nil)))
                            (when b (setf got-second t))))
-                     (error () nil))
+                     ;; TIMEOUT named beside ERROR, as in the test above.
+                     ((or error sb-ext:timeout) () nil))
                    (check "fetch close: second request on same socket fails"
                           got-second nil))))
           (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
@@ -740,7 +1045,10 @@
 
    Reads only to the request's CRLFCRLF, never to EOF. A fetch sends its
    request and then waits, so no end of stream is coming until this
-   answers: draining to EOF here deadlocks both sides."
+   answers: draining to EOF here deadlocks both sides.
+
+   RESPONSE goes out one byte per character, as Latin-1, so a test can
+   put any byte on the wire by writing the character with that code."
   (sb-thread:make-thread
    (lambda ()
      (handler-case
@@ -754,13 +1062,13 @@
                  do (vector-push-extend byte b)
                  until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
            (write-sequence
-            (sb-ext:string-to-octets response :external-format :ascii) st)
+            (sb-ext:string-to-octets response :external-format :latin-1) st)
            (force-output st)
            (sb-bsd-sockets:socket-close s))
        (error () nil)))
    :name name))
 
-(defun %crlf (&rest lines)
+(defun %crlf-lines (&rest lines)
   "LINES joined by CRLF, with a trailing CRLF. Hand-written wire bytes: the
    chunk boundaries a test asserts on have to be the test's choice, not
    whatever an encoder picked on the day."
@@ -772,12 +1080,13 @@
   "A fetch of a close-delimited upstream completes when the close arrives,
    not when *FETCH-TIMEOUT* expires.
 
-   CONNECTION-READ-AVAILABLE used to report \"read bytes, then EOF\" as
-   :OK, discarding the end of stream. For a response with no
-   Content-Length and no Transfer-Encoding that end of stream *is* the
-   framing — OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
-   deferring to the caller's EOF branch — so the branch never ran and the
-   fetch hung until the sweeper took it.
+   CONNECTION-READ-AVAILABLE reports \"read bytes, then EOF\" as :OK-EOF,
+   not :OK. For a response with no Content-Length and no
+   Transfer-Encoding that end of stream *is* the framing —
+   OUTBOUND-RESPONSE-COMPLETE-P returns NIL forever and says so,
+   deferring to the caller's EOF branch — so a read that discarded it
+   would never run the branch, and the fetch would hang until the
+   sweeper took it.
 
    A TCP peer's close does not set EPOLLHUP, so HANDLE-OUTBOUND-EVENT's
    error arm did not rescue it either. Nothing about this needs
@@ -802,7 +1111,7 @@
                    (%canned-upstream
                     listener
                     (concatenate 'string
-                                 (%crlf "HTTP/1.1 200 OK"
+                                 (%crlf-lines "HTTP/1.1 200 OK"
                                         "Content-Type: text/plain"
                                         "")
                                  "close-framed-body")
@@ -843,6 +1152,296 @@
         (handler-case (sb-thread:join-thread thread :timeout 5)
           (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
 
+(defun test-harness-fetch-latin-1-header-e2e ()
+  "An upstream header in Latin-1 reaches the fetch's :THEN, and so does
+   the response it came with.
+
+   The byte is E9: é in ISO-8859-1, and not UTF-8 on its own. It sits in
+   a Content-Disposition filename, which is where legacy servers send it.
+   Read strictly, that one header would fail the whole fetch — a 502 and
+   the cleanup sentinel — over a value the application may never read."
+  (format t "~%Harness: an upstream's Latin-1 header does not fail the fetch~%")
+  (let* ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (thread nil)
+         (disposition (format nil "attachment; filename=\"r~csum.pdf\""
+                              (code-char #xE9))))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread
+                   (%canned-upstream
+                    listener
+                    (concatenate 'string
+                                 (%crlf-lines "HTTP/1.1 200 OK"
+                                        (format nil "Content-Disposition: ~a"
+                                                disposition)
+                                        "Content-Length: 2"
+                                        "")
+                                 "ok")
+                    :name "latin-1-upstream"))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (defer-to-fetch :GET
+                      (format nil "http://127.0.0.1:~d/file" upstream-port)
+                      :then (lambda (status headers body)
+                              (let ((value (cdr (assoc "content-disposition"
+                                                       headers
+                                                       :test #'string-equal))))
+                                (make-text-response
+                                 200
+                                 (format nil "~a|~a|~a"
+                                         status
+                                         (equal value disposition)
+                                         (if body
+                                             (sb-ext:octets-to-string
+                                              body :external-format :utf-8)
+                                             "(none)"))))))))
+               (multiple-value-bind (status headers body)
+                   (handler-case (test-http-request :get "/proxy")
+                     (error (e) (values nil nil (princ-to-string e))))
+                 (declare (ignore headers))
+                 (check "latin-1 header: the client is answered 200" status 200)
+                 (check "latin-1 header: :THEN got the status, the value and the body"
+                        body "200|T|ok")))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-accept-failure-is-retried-e2e ()
+  "A connection queued behind a failed accept is answered without another
+   connection arriving.
+
+   The listener is edge-triggered: its event fires when a connection
+   arrives, not while one waits. Once the server is up, the next
+   SOCKET-ACCEPT is made to fail as EMFILE would, and one client
+   connects. The kernel has queued it, the accept that should take it
+   fails, and nothing else will ever raise an edge for it. Only the
+   maintenance tick's retry answers it, so it is answered within a few
+   seconds or, without the retry, not until the client gives up."
+  (format t "~%Harness: a backlog left by a failed accept is retried~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (declare (ignore req))
+                  (make-text-response 200 "ok")))
+    (let ((failed nil))
+      (sb-int:encapsulate 'sb-bsd-sockets:socket-accept 'fail-once
+                          (lambda (f &rest args)
+                            (if failed
+                                (apply f args)
+                                (progn (setf failed t)
+                                       (error "simulated EMFILE")))))
+      (unwind-protect
+           (let ((start (get-internal-real-time)))
+             (multiple-value-bind (status headers body)
+                 (attempt (test-http-request :get "/"))
+               (declare (ignore headers))
+               (check "accept retry: the queued client is answered"
+                      (list status body) (list 200 "ok"))
+               (check "accept retry: within a few seconds, by the tick"
+                      (< (/ (- (get-internal-real-time) start)
+                            internal-time-units-per-second)
+                         5)
+                      t))
+             (check "control: the accept did fail first" failed t))
+        (sb-int:unencapsulate 'sb-bsd-sockets:socket-accept 'fail-once)))))
+
+(defun test-harness-client-errors-log-once-a-minute-e2e ()
+  "A flood of requests a client gets wrong logs a line, not a flood.
+
+   Every log line holds *LOG-LOCK*, the one lock all workers share, across
+   a format and a flush, and a malformed request costs a client one write.
+   LOG-THROTTLED logs the first of a kind at once and then at most once a
+   minute per worker, with a count of the ones held back. The first half
+   drives it directly; the second sends twenty requests with an unknown
+   method to a real server and counts the lines its worker wrote, and the
+   third twenty plain GETs to a route that upgrades."
+  (format t "~%Harness: a flood of bad requests logs a line, not a flood~%")
+  (let ((out (make-string-output-stream)))
+    (let ((web-skeleton::*log-stream* out)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* (make-hash-table :test #'eq)))
+      (dotimes (i 5)
+        (web-skeleton::log-throttled :warn :test-kind "bad thing ~d" i))
+      (web-skeleton::log-throttled :warn :other-kind "other thing")
+      ;; A minute on, as far as the throttle can tell.
+      (decf (car (gethash :test-kind web-skeleton::*log-throttle*)) 61)
+      (web-skeleton::log-throttled :warn :test-kind "bad thing ~d" 5))
+    (let ((text (get-output-stream-string out)))
+      (check "throttle: the first of a kind logs"
+             (and (search "bad thing 0" text) t) t)
+      (check "throttle: the four after it do not"
+             (search "bad thing 1" text) nil)
+      (check "throttle: another kind logs on its own"
+             (and (search "other thing" text) t) t)
+      (check "throttle: a minute on, one line carries the count"
+             (and (search "bad thing 5 (and 4 more like it" text) t) t)))
+  (let ((out (make-string-output-stream)))
+    (let ((web-skeleton::*log-stream* out)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* nil))
+      (dotimes (i 3) (web-skeleton::log-throttled :warn :k "line ~d" i)))
+    (check "throttle: outside a worker every line logs"
+           (count #\Newline (get-output-stream-string out)) 3))
+  (let ((saved web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           ;; SETF, not bound: the worker that logs is another thread.
+           (setf web-skeleton::*log-stream* log)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (dotimes (i 20)
+               (push (attempt (values (test-http-request :bogus "/")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved))
+    (let ((text (get-output-stream-string log)))
+      (check "control: every request was refused with 501"
+             (every (lambda (s) (eql s 501)) statuses) t)
+      (check "twenty malformed requests log one parse-error line"
+             (loop with n = 0 and start = 0
+                   for at = (search "parse error fd" text :start2 start)
+                   while at do (incf n) (setf start (1+ at))
+                   finally (return n))
+             1)))
+  ;; A GET with no upgrade headers to a route that upgrades.
+  (let ((saved web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log)
+           (with-test-server
+               (:handler (lambda (req) (declare (ignore req)) :upgrade))
+             (dotimes (i 20)
+               (push (attempt (values (test-http-request :get "/ws")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved))
+    (let ((text (get-output-stream-string log)))
+      (check "control: every plain GET to the upgrade route was a 400"
+             (every (lambda (s) (eql s 400)) statuses) t)
+      (check "twenty of them log one bad-upgrade line"
+             (loop with n = 0 and start = 0
+                   for at = (search "bad upgrade" text :start2 start)
+                   while at do (incf n) (setf start (1+ at))
+                   finally (return n))
+             1))))
+
+(defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
+  "Accept once, read the request head, write PIECES (strings, one byte per
+   character) one at a time with PAUSE seconds between them, then hold the
+   connection open for HOLD seconds before closing. Returns the thread."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (loop for byte = (read-byte st nil nil)
+                 while byte
+                 do (vector-push-extend byte b)
+                 until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b)))
+           (dolist (piece pieces)
+             (write-sequence (sb-ext:string-to-octets piece :external-format :latin-1) st)
+             (force-output st)
+             (sleep pause))
+           (sleep hold)
+           (sb-bsd-sockets:socket-close s))
+       (error () nil)))
+   :name "piecemeal-upstream"))
+
+(defun %pieces (string size)
+  "STRING cut into consecutive pieces of SIZE characters."
+  (loop for i from 0 below (length string) by size
+        collect (subseq string i (min (length string) (+ i size)))))
+
+(defun %fetch-through (pieces &key (hold 6))
+  "Fetch from a %PIECEMEAL-UPSTREAM sending PIECES. Returns
+   (values STATUS SECONDS) as the client of the relay saw them."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host port) (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread (%piecemeal-upstream listener pieces :hold hold))
+             (with-test-server
+                 (:handler (lambda (req)
+                             (declare (ignore req))
+                             (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/h" port)
+                               :then (lambda (status headers body)
+                                       (declare (ignore headers body))
+                                       (make-text-response (or status 502) "relayed")))))
+               (let ((start (get-internal-real-time)))
+                 (values (attempt (values (test-http-request :get "/relay")))
+                         (/ (- (get-internal-real-time) start)
+                            internal-time-units-per-second))))))
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun test-harness-outbound-head-budget-and-search-e2e ()
+  "An upstream's response head is searched once and refused at the
+   streaming path's length.
+
+   Two halves. An upstream that sends a head longer than
+   RESPONSE-HEAD-BUDGET and then holds the connection open is answered 502
+   at once, where waiting for the buffer's 8 MiB cap or for the upstream
+   to close would keep the fetch alive. An upstream that dribbles a 20 KiB
+   head in 200 pieces is searched incrementally: the bytes SCAN-CRLF-CRLF
+   walks stay near the head's size, where a search from the top on every
+   read would walk the buffer once per piece, about 4 MiB."
+  (format t "~%Harness: an upstream head is budgeted and searched once~%")
+  ;; A head that never ends.
+  (let ((head (with-output-to-string (s)
+                (format s "HTTP/1.1 200 OK~c~c" #\Return #\Newline)
+                (dotimes (i 100)
+                  (format s "X-Pad-~3,'0d: ~a~c~c" i (make-string 1000 :initial-element #\p)
+                          #\Return #\Newline)))))
+    (multiple-value-bind (status seconds) (%fetch-through (%pieces head 4096))
+      (check "head budget: an unending head is answered 502" status 502)
+      (check "head budget: at once, not when the upstream gives up"
+             (< seconds 4) t)))
+  ;; A head that ends, sent in pieces.
+  (let* ((head (with-output-to-string (s)
+                 (format s "HTTP/1.1 200 OK~c~cContent-Length: 2~c~c" #\Return #\Newline
+                         #\Return #\Newline)
+                 (dotimes (i 50)
+                   (format s "X-Pad-~3,'0d: ~a~c~c" i (make-string 390 :initial-element #\p)
+                           #\Return #\Newline))
+                 (format s "~c~cok" #\Return #\Newline)))
+         (scanned 0))
+    (sb-int:encapsulate 'web-skeleton::scan-crlf-crlf 'count-scan
+                        (lambda (f buf start end)
+                          (incf scanned (max 0 (- end start)))
+                          (funcall f buf start end)))
+    (unwind-protect
+         (multiple-value-bind (status seconds)
+             (%fetch-through (%pieces head 100) :hold 0)
+           (declare (ignore seconds))
+           (check "head search: the dribbled head is read and relayed" status 200)
+           (check "head search: the bytes walked stay near the head's size"
+                  (< scanned (* 200 1024)) t))
+      (sb-int:unencapsulate 'web-skeleton::scan-crlf-crlf 'count-scan))))
+
 (defparameter *chunked-corpus* '("aa" "bbb" "cccc")
   "The chunk payloads the :ON-BODY framing tests assert on.
 
@@ -858,7 +1457,7 @@
    Framed here rather than run through the encoder: a test asserting on
    chunk boundaries has to choose them, not inherit whatever the encoder
    picked on the day."
-  (apply #'%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+  (apply #'%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
          (append (loop for payload in *chunked-corpus*
                        append (list (format nil "~x" (length payload)) payload))
                  (list "0" ""))))
@@ -923,12 +1522,12 @@
   "A chunked upstream whose entire response and FIN arrive in one read
    still delivers every chunk to :ON-BODY.
 
-   :OK-EOF means \"read some bytes, and then hit end of stream\". Sharing
-   an arm with :EOF — read *nothing*, already at end of stream — meant
-   the bytes it carried were never walked, so :ON-BODY never fired; and
-   COMPLETE-FETCH then nulled the buffered body on the strength of an
-   :ON-BODY callback merely being installed. The app got 200 with no body
-   at all. Not truncated, absent.
+   :OK-EOF means \"read some bytes, and then hit end of stream\". An arm
+   shared with :EOF — read *nothing*, already at end of stream — would
+   never walk the bytes it carried, so :ON-BODY would never fire, and
+   COMPLETE-FETCH would then null the buffered body on the strength of an
+   :ON-BODY callback merely being installed. The app would get 200 with
+   no body at all. Not truncated, absent.
 
    TEST-HARNESS-FETCH-ON-BODY-E2E cannot catch this and is not weaker for
    it: its upstream streams over time, so the FIN reliably arrives as its
@@ -937,7 +1536,7 @@
    The canned upstream writes and closes back to back, which makes the
    coalesced read the usual outcome and not a guaranteed one — the
    framework can still be scheduled between the write and the close, read
-   the bytes as :OK, and take the ordinary path. Measured: this catches a
+   the bytes as :OK, and take the ordinary path. So this catches a
    reintroduced defect on most runs and not all.
    TEST-FETCH-OK-EOF-WALKS-THE-BYTES pins the branch itself, every run.
    This test is the end-to-end shape around it, and the pair is the
@@ -1031,18 +1630,22 @@
            (check "ok-eof: every chunk reached :on-body, in order"
                   (reverse chunks) *chunked-corpus*)
            (check "ok-eof: the fetch ended exactly once" fires 1))
-      (ignore-errors (web-skeleton::%close epfd)))))
+      (ignore-errors (web-skeleton::%close epfd))
+      ;; The fetch's teardown closes the socket; this is for a run that
+      ;; never reached it. A closed socket takes a second close as a no-op.
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-harness-fetch-on-body-truncated-chunked-e2e ()
   "A chunked upstream that delivers chunks and then closes without the
    zero-size terminator fails the fetch, rather than reporting success.
 
-   The truncation guard on this framing is DECODE-CHUNKED-BODY's raise —
-   there is no Content-Length to compare against — and suppressing the
-   buffered body suppressed the guard along with it. Chunks went to
-   :ON-BODY, the upstream vanished mid-body, and :THEN fired 200 with a
-   NIL body: byte-for-byte the report a *whole* response produces. The
-   app cannot tell the two apart, which is the failure the Content-Length
+   There is no Content-Length to compare against, and under :ON-BODY the
+   delivered chunks have been freed, so the guard is COMPLETE-FETCH's own:
+   a chunked relay that reaches end of stream without the walk finding
+   its terminator is a 502. Without it, chunks would go to :ON-BODY, the
+   upstream would vanish mid-body, and :THEN would fire 200 with a NIL
+   body: byte-for-byte the report a *whole* response produces. The app
+   could not tell the two apart, which is the failure the Content-Length
    guard already refuses to have.
 
    The chunks arriving first is asserted rather than assumed. Without
@@ -1055,7 +1658,7 @@
     (multiple-value-bind (status body)
         (%chunked-upstream-fetch
          ;; Chunks, then the close. No "0" terminator.
-         (%crlf "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
+         (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: chunked" ""
                 "2" "aa" "3" "bbb")
          chunks final fires)
       (declare (ignore body))
@@ -1067,6 +1670,156 @@
     (check "truncated-chunked: :then fired the cleanup sentinel"
            (first (car final)) nil)
     (check "truncated-chunked: :then fires exactly once" (car fires) 1)))
+
+(defun %relay-corpus (chunks size)
+  "CHUNKS chunks of SIZE bytes each, chunk I filled with the letter I mod
+   26, as a list of strings. Distinct letters make a lost, repeated or
+   reordered chunk show in the relayed text, where a byte count would not."
+  (loop for i below chunks
+        collect (make-string size :initial-element
+                             (code-char (+ 97 (mod i 26))))))
+
+(defun test-harness-fetch-on-body-relays-past-the-cap-e2e ()
+  "An :ON-BODY fetch relays a chunked response many times the size of
+   *MAX-OUTBOUND-RESPONSE-SIZE*, with the read buffer held to the cap.
+
+   A relay hands each chunk on as its framing is proved, so the chunks
+   it has handed on are freed. Kept, they would hold the whole upstream
+   in memory, and the read would fail at the cap however steadily the
+   stream flowed: a feed relayed into a stream or a WebSocket, which is
+   what :ON-BODY is for, would die once it had carried the cap's worth.
+
+   The cap is lowered to 64 KiB for the run and the upstream sends five
+   times that, so the claim is about the cap and not about a size."
+  (format t "~%Harness: an :on-body relay carries more than the cap~%")
+  (let* ((saved-cap web-skeleton:*max-outbound-response-size*)
+         (corpus (%relay-corpus 40 8192))
+         (expected (apply #'concatenate 'string corpus))
+         (listener (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (thread nil)
+         (received (make-string-output-stream))
+         (peak (list 0))
+         (final (list :never)))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (multiple-value-bind (host upstream-port)
+               (sb-bsd-sockets:socket-name listener)
+             (declare (ignore host))
+             (setf thread
+                   (%canned-upstream
+                    listener
+                    (concatenate 'string
+                                 (%crlf-lines "HTTP/1.1 200 OK"
+                                        "Transfer-Encoding: chunked" "")
+                                 (apply #'%crlf-lines
+                                        (append
+                                         (loop for c in corpus
+                                               append (list (format nil "~x" (length c))
+                                                            c))
+                                         (list "0" ""))))
+                    :name "relay-upstream"))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (http-fetch
+                     :get (format nil "http://127.0.0.1:~d/feed" upstream-port)
+                     :on-body (lambda (out chunk)
+                                (setf (car peak)
+                                      (max (car peak)
+                                           (length (web-skeleton::connection-read-buf
+                                                    out))))
+                                (write-string (sb-ext:octets-to-string
+                                               chunk :external-format :latin-1)
+                                              received)
+                                nil)
+                     :then (lambda (status headers body)
+                             (declare (ignore headers))
+                             (setf (car final) (list status body))
+                             (make-text-response 200 "relayed")))))
+               (let ((status (handler-case (test-http-request :get "/relay")
+                               (error () nil))))
+                 (check "relay past the cap: the client is answered 200" status 200)))))
+      (setf web-skeleton:*max-outbound-response-size* saved-cap)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 5)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))
+    (let ((got (get-output-stream-string received)))
+      (check "relay past the cap: every chunk was relayed, in order"
+             (string= got expected) t)
+      (check "relay past the cap: five times the cap went through"
+             (length got) (* 5 64 1024)))
+    (check "relay past the cap: :then fired 200 with a NIL body"
+           (car final) (list 200 nil))
+    (check "relay past the cap: the read buffer stayed within the cap"
+           (<= (car peak) (* 64 1024)) t)))
+
+(defun test-harness-fetch-into-relays-past-the-cap-e2e ()
+  "FETCH-INTO relays a stream many times *MAX-OUTBOUND-RESPONSE-SIZE* into
+   a client's own stream, end to end.
+
+   The detached relay DEPLOYMENT.md documents, at a size the cap would end:
+   five times a 64 KiB cap, from the framework's own chunked stream through
+   FETCH-INTO into the client's. The relayed body is decoded and compared
+   whole, so a relay cut off at the cap fails here as a short body."
+  (format t "~%Harness: a fetch-into relay carries more than the cap~%")
+  (let* ((saved-cap web-skeleton:*max-outbound-response-size*)
+         (corpus (%relay-corpus 40 8192))
+         (port-box (list nil))
+         (then-status (list :never)))
+    (unwind-protect
+         (progn
+           (setf web-skeleton:*max-outbound-response-size* (* 64 1024))
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (if (search "/up" (http-request-path req))
+                      (make-stream-response
+                       :on-open (lambda (c)
+                                  (dolist (piece corpus)
+                                    (stream-send c (%ascii piece)))
+                                  (stream-close c)))
+                      (make-stream-response
+                       :on-open
+                       (lambda (client)
+                         (fetch-into
+                          client
+                          (http-fetch
+                           :get (format nil "http://127.0.0.1:~d/up"
+                                        (first port-box))
+                           :on-body (lambda (out chunk)
+                                      (declare (ignore out))
+                                      (stream-send client chunk)
+                                      nil)
+                           :then (lambda (status headers body)
+                                   (declare (ignore headers body))
+                                   (setf (car then-status) status)
+                                   (stream-close client)
+                                   nil))))))))
+             (setf (first port-box) *test-port*)
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (%send-raw-get stream "/relay" :extra
+                                     (format nil "Connection: close~c~c"
+                                             #\Return #\Newline))
+                      (let* ((buf (read-until-bounded stream))
+                             (raw (subseq buf 0 (fill-pointer buf))))
+                        (check "fetch-into past the cap: the whole body arrived, framed"
+                               (equal (%decode-streamed-body raw)
+                                      (apply #'concatenate 'string corpus))
+                               t)))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))
+             (check "fetch-into past the cap: :then saw the upstream's 200"
+                    (car then-status) 200)))
+      (setf web-skeleton:*max-outbound-response-size* saved-cap))))
 
 (defun test-harness-fetch-on-body-stop-parked-e2e ()
   "A :STOP from a handler-returned fetch answers the parked client 502.
@@ -1116,19 +1869,19 @@
   "A hostname whose every resolved address the policy refuses fails the
    fetch promptly, with a 502, rather than stranding until the sweeper.
 
-   Read this before trusting it: **this test passes without the fix**, and
-   is here as an end-to-end assertion of the DEPLOYMENT.md promise rather
-   than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is the check with
-   teeth.
+   Read this before trusting it: **this test passes without the :OK-EOF
+   arm**, and is here as an end-to-end assertion of the DEPLOYMENT.md
+   promise rather than as coverage for :OK-EOF. TEST-READ-AVAILABLE-EOF is
+   the check with teeth.
 
    The reason is the mechanism. getent writes its output in one go and the
    EOF appears when it exits, so whether one drain sees both depends on
    whether it has exited by the time we read — and usually it has not. The
-   bytes come back :OK, the exit arrives as a separate event, and the old
-   code handled it on a clean :EOF. Only when getent finishes first do the
-   two coalesce, and that is the ordering the bug needed. A race, not a
-   certainty, which is exactly why it survived a suite that covers the
-   parser it sits behind.
+   bytes come back :OK, the exit arrives as a separate event, and a branch
+   taking only :EOF handles it. Only when getent finishes first do the two
+   coalesce, and that is the ordering that needs the arm. A race, not a
+   certainty, so a missing arm can survive a suite that covers the parser
+   it sits behind.
 
    What the test does assert is the promise: a name whose every resolved
    address *FETCH-ADDRESS-FILTER* refuses fails the fetch promptly with a
@@ -1171,6 +1924,168 @@
                   sentinel-fires 1))
       (setf web-skeleton:*fetch-address-filter* saved))))
 
+(defun test-harness-address-filter-asked-once-e2e ()
+  "*FETCH-ADDRESS-FILTER* is asked about each address of a name once a
+   lookup, and once again on each fetch a cached resolution serves: the
+   count its docstring gives a filter with a side effect, an audit line or
+   a rate budget, to be charged.
+
+   getent's output usually arrives in one read and its exit in another,
+   and a lookup that parsed the output at each would ask twice; getent can
+   also print an address on two lines. The fetch is to localhost, so the
+   name's addresses are whatever this host's getent prints for it, one or
+   two, and the check is that none is asked about twice in one fetch, the
+   cache off and on.
+
+   The filter and *DNS-CACHE-TTL* are set globally, not bound: the worker
+   reads them on a thread START-SERVER spawned."
+  (format t "~%Harness: the address filter is asked once an address~%")
+  (let ((saved-filter web-skeleton:*fetch-address-filter*)
+        (saved-ttl web-skeleton:*dns-cache-ttl*)
+        (lock (sb-thread:make-mutex :name "filter-calls"))
+        (calls nil))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore family host))
+            (sb-thread:with-mutex (lock)
+              (push (web-skeleton::format-ip ip) calls))
+            t))
+    (unwind-protect
+         (dolist (ttl '(0 60))
+           (setf web-skeleton:*dns-cache-ttl* ttl)
+           (let ((port nil))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (if (string= (http-request-path req) "/up")
+                        (make-text-response 200 "up")
+                        (defer-to-fetch :get (format nil "http://localhost:~d/up" port)
+                          :then (lambda (status headers body)
+                                  (declare (ignore headers body))
+                                  (make-text-response (or status 502) "fetched"))))))
+               (setf port *test-port*)
+               (let ((fetches
+                       (loop repeat 3
+                             collect (progn
+                                       (sb-thread:with-mutex (lock) (setf calls nil))
+                                       (let ((status (test-http-request :get "/go")))
+                                         (list status
+                                               (sb-thread:with-mutex (lock)
+                                                 (reverse calls))))))))
+                 (check (format nil "filter, cache ~:[off~;on~]: three fetches answered"
+                                (plusp ttl))
+                        (mapcar #'first fetches) '(200 200 200))
+                 ;; Against the same lists with any repeat taken out, so a
+                 ;; failure prints what was asked.
+                 (let ((asked (mapcar #'second fetches)))
+                   (check (format nil "filter, cache ~:[off~;on~]: each address asked once a fetch"
+                                  (plusp ttl))
+                          (list (notany #'null asked) asked)
+                          (list t (mapcar (lambda (a)
+                                            (remove-duplicates a :test #'string=
+                                                                 :from-end t))
+                                          asked))))))))
+      (setf web-skeleton:*fetch-address-filter* saved-filter
+            web-skeleton:*dns-cache-ttl* saved-ttl))))
+
+(defun %proc-pids ()
+  "Every pid with a directory under /proc.
+
+   Listed with * and filtered for digits afterwards, because SBCL's
+   pathnames have no character classes: /proc/[0-9]*/ matches nothing at
+   all, and a zombie count built on it passes on every build ever made.
+   Symlinks are left unresolved so /proc/self is skipped as a name rather
+   than counted twice as a pid."
+  (loop for p in (directory "/proc/*/stat" :resolve-symlinks nil)
+        for dir = (pathname-directory p)
+        for name = (car (last dir))
+        when (and (= (length dir) 3)
+                  (stringp name)
+                  (plusp (length name))
+                  (every #'digit-char-p name))
+          collect (parse-integer name)))
+
+(defun %proc-stat-fields (line)
+  "(STATE PPID) from a /proc/PID/stat LINE. Read from after the last ')',
+   because the command name before it is in parentheses and may contain
+   anything, a ')' or a space included."
+  (let ((rp (position #\) line :from-end t)))
+    (when rp
+      (let ((fields (%split-ws (subseq line (1+ rp)))))
+        (list (first fields)
+              (ignore-errors (parse-integer (second fields))))))))
+
+(defun %zombie-children ()
+  "Pids of this process's children that have exited and not been
+   collected: state Z, and this process as the parent."
+  (let ((self (sb-unix:unix-getpid)))
+    (loop for pid in (%proc-pids)
+          for line = (ignore-errors
+                      (with-open-file (s (format nil "/proc/~d/stat" pid)
+                                         :if-does-not-exist nil)
+                        (and s (read-line s nil nil))))
+          for (state ppid) = (and line (%proc-stat-fields line))
+          when (and (equal state "Z") (eql ppid self))
+            collect pid)))
+
+(defun test-harness-hostname-fetches-leave-no-zombie-e2e ()
+  "Two hundred fetches by hostname leave no zombie behind.
+
+   Each one spawns a getent child, and its lookup ends when the answer
+   arrives, which may be before the child has exited. Closing the process
+   then makes a zombie on an SBCL before 2.4.11. The framework closes a
+   child only once it has seen it exit, collecting it on the worker's tick.
+
+   On 2.4.11 and later SBCL collects a closed child itself, so there this
+   passes whether or not the framework waits for the exit, and is a
+   control: two hundred real lookups through the whole path, and nothing
+   left behind. On an older SBCL it is a detector, and not a perfect one.
+   A zombie needs getent to be still running at the moment its lookup
+   ends, which is a race, so a build that closes early can come through a
+   lucky run clean. TEST-DNS-CHILD-CLOSED-ONLY-ONCE-DEAD holds the child
+   alive on purpose and is the check that never misses, on any SBCL.
+
+   Any answer is accepted from the fetch itself. What is under test is the
+   child, and a lookup that resolved and then failed to connect ended the
+   same way one that succeeded did."
+  (format t "~%Harness: hostname fetches leave no zombie~%")
+  ;; The counter's premises. Without the first, a listing that matches
+  ;; nothing reads as no zombies forever; without the second, a parse
+  ;; thrown by a command name does.
+  (check "hostname fetches: the /proc walk finds this process"
+         (not (null (member (sb-unix:unix-getpid) (%proc-pids))))
+         t)
+  (check "hostname fetches: a stat line reads past a name holding ') '"
+         (%proc-stat-fields "42 (odd) S name) Z 7 1 1 0")
+         '("Z" 7))
+  (let ((upstream-port nil)
+        (before (%zombie-children)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/upstream")
+               (make-text-response 200 "up")
+               (defer-to-fetch :GET (format nil "http://localhost:~d/upstream"
+                                            upstream-port)
+                 :then (lambda (status headers body)
+                         (declare (ignore headers body))
+                         (make-text-response (or status 502) "via name"))))))
+      (setf upstream-port *test-port*)
+      (let ((answered (loop repeat 200
+                            count (member (ignore-errors
+                                           (values (test-http-request :get "/via")))
+                                          '(200 502)))))
+        (check "hostname fetches: all two hundred were answered" answered 200))
+      ;; Collected on the worker's tick, so give it two.
+      (let ((deadline (+ (get-internal-real-time)
+                         (* 3 internal-time-units-per-second)))
+            (left nil))
+        (loop do (setf left (set-difference (%zombie-children) before))
+              while (and left (< (get-internal-real-time) deadline))
+              do (sleep 0.1))
+        (check "hostname fetches: no zombie children left behind"
+               (length left) 0)))))
+
 (defun test-harness-http11-server-close-stamps-connection-close-e2e ()
   "When an HTTP/1.1 client sends 'Connection: close', the server's
    response MUST carry 'Connection: close' (RFC 7230 §6.1: a sender
@@ -1200,27 +2115,43 @@
   "A client that sends split Connection: keep-alive / Connection:
    close pair (semantically equivalent to 'keep-alive, close' per
    RFC 7230 §6.1) must be read as 'close' — GET-HEADERS walks every
-   instance, not just the first one."
+   instance, not just the first one.
+
+   Sent with no half-close: a FIN beside the request would have the
+   server answer it Connection: close whatever its headers said."
   (format t "~%Harness: split Connection header close wins~%")
   (with-test-server
       (:handler (lambda (req)
                   (declare (ignore req))
                   (make-text-response 200 "body")))
-    (let* ((req (concatenate 'string
-                             "GET / HTTP/1.1" *crlf*
-                             "Host: localhost" *crlf*
-                             "Connection: keep-alive" *crlf*
-                             "Connection: close" *crlf* *crlf*))
-           (raw (%raw-http-request
-                 (sb-ext:string-to-octets req :external-format :ascii))))
-      (check "split Connection: response present"
-             (not (null (search "HTTP/1.1 200" raw))) t)
-      ;; If the server honored 'close', the socket was closed after
-      ;; this response — which is already the shape of this test
-      ;; (raw reads until EOF). The presence of a complete response
-      ;; confirms framing was correct.
-      (check "split Connection: body byte received"
-             (not (null (search "body" raw))) t))))
+    (multiple-value-bind (socket stream) (%raw-connect)
+      (unwind-protect
+           (progn
+             (write-sequence (%ascii (concatenate 'string
+                                                  "GET / HTTP/1.1" *crlf*
+                                                  "Host: localhost" *crlf*
+                                                  "Connection: keep-alive" *crlf*
+                                                  "Connection: close" *crlf* *crlf*))
+                             stream)
+             (force-output stream)
+             ;; To the end of the stream, which only the server's close
+             ;; brings: a connection kept open ends the read at its
+             ;; deadline instead.
+             (multiple-value-bind (buf reason) (read-until-bounded stream :seconds 5)
+               (let ((raw (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                   :external-format :latin-1)))
+                 (check "split Connection: response present"
+                        (not (null (search "HTTP/1.1 200" raw))) t)
+                 (check "split Connection: body byte received"
+                        (not (null (search "body" raw))) t)
+                 ;; The property, in both places it shows: what the server
+                 ;; says, and what it does.
+                 (check "split Connection: close answered on the wire"
+                        (not (null (search "connection: close" raw))) t)
+                 (check "split Connection: and the connection closed"
+                        reason :eof))))
+        (ignore-errors (close stream))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
 
 (defun test-harness-workers-zero-rejected ()
   "start-server with :workers 0 must raise rather than silently
@@ -1238,7 +2169,9 @@
                         (lambda ()
                           (handler-case
                               (progn
+                                ;; Port 0: see the backlog probe below.
                                 (start-server
+                                 :port 0
                                  :workers n
                                  :handler (lambda (r) (declare (ignore r))))
                                 nil)
@@ -1286,7 +2219,12 @@
                                (lambda ()
                                  (handler-case
                                      (progn
+                                       ;; Port 0, so a start that got past
+                                       ;; the check never binds the default
+                                       ;; port, which SO_REUSEPORT would
+                                       ;; share with whatever serves there.
                                        (start-server
+                                        :port 0
                                         :workers 1
                                         :handler (lambda (r) (declare (ignore r))))
                                        nil)
@@ -1341,7 +2279,12 @@
                                (lambda ()
                                  (handler-case
                                      (progn
+                                       ;; Port 0, so a start that got past
+                                       ;; the check never binds the default
+                                       ;; port, which SO_REUSEPORT would
+                                       ;; share with whatever serves there.
                                        (start-server
+                                        :port 0
                                         :workers 1
                                         :handler (lambda (r) (declare (ignore r))))
                                        nil)
@@ -1365,13 +2308,12 @@
                     (and m (not (null (search "*max-write-backlog*" m))) t))
                   t)
            ;; And exactly at the bound must start. Asserted by the absence
-           ;; of a message, since this probe's server is torn down by the
-           ;; thread timeout rather than returning.
+           ;; of any message, since this probe's server is torn down by the
+           ;; thread timeout rather than returning: a start that failed for
+           ;; another reason is no start either.
            (check "start-server: exactly ten bytes of headroom is accepted"
-                  (let ((m (try-backlog (+ *max-ws-message-size* 10))))
-                    (or (null m)
-                        (null (search "*max-write-backlog*" m))))
-                  t))
+                  (try-backlog (+ *max-ws-message-size* 10))
+                  nil))
       (setf *max-write-backlog* saved))))
 
 (defun %split-ws (line)
@@ -1413,18 +2355,18 @@
    unique per socket, cannot over-report, and leaves only the undercount
    for the caller to handle.
 
-   NIL rather than 0 because a read of this file has been seen to fail,
-   and 'no listeners there' and 'could not look' are different answers:
-   a caller that conflates them reports a spurious failure whenever the
-   machine is busy.
+   NIL rather than 0 when the read fails, because 'no listeners there'
+   and 'could not look' are different answers: a caller that conflates
+   them reports a spurious failure whenever the read does.
 
-   Two separate things happen to this file and they were conflated once,
-   so: the undercount above is seq_file resume, measured directly. The
-   failed read was not. That was EBADF on a descriptor nothing here
-   closed, and its cause turned out to live in CONNECTION-CLOSE -- a
-   finalizer closing a reissued fd number under its new owner. Fixed
-   there. The guard stays because a busy machine can still make the
-   count late, and because a caller should not have to know which."
+   The two are separate failures and easy to conflate. The undercount
+   above is seq_file resume. A read that fails
+   outright is not: EBADF on a descriptor nothing here closed means
+   something else closed it, which is the shape CONNECTION-CLOSE's
+   comment describes, a finalizer closing a reissued fd number under its
+   new owner. The guard is kept all the same: a busy machine can still
+   make the count late, and a caller should not have to know which
+   failure it met."
   (handler-case
       (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
         (when in
@@ -1491,6 +2433,190 @@
       (setf web-skeleton::*shutdown-hooks* saved-hooks
             *drain-timeout* saved-drain
             *worker-wake-interval* saved-poll))))
+
+(defun test-harness-a-worker-left-behind-stays-with-its-run ()
+  "A worker its run's join gave up on does not come back to serve beside
+   the next run on the same port.
+
+   Server A's handler is inside a slow request when shutdown is asked for,
+   so A's join gives up on that worker and START-SERVER returns, saying
+   so. Server B starts on the same port. When A's handler returns, its
+   worker finds *SHUTDOWN* cleared by B and, keyed on the flag alone, went
+   back to serving: listener open, old handler, and SO_REUSEPORT splitting
+   connections between it and B. Every request made after A's handler
+   returned is asserted to reach B, and the log to have named the worker
+   left running.
+
+   Started by hand rather than through WITH-TEST-SERVER, which owns one
+   server at a time and resolves its own port; this needs two servers on
+   one port, in sequence."
+  (format t "~%Harness: a worker left behind by its run stays with that run~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (port nil)
+        (a-up (sb-thread:make-semaphore :name "server-a"))
+        (b-up (sb-thread:make-semaphore :name "server-b"))
+        (threads nil))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 0
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (flet ((serve (port* marker semaphore &optional slow)
+             (sb-thread:make-thread
+              (lambda ()
+                (start-server
+                 :host #(127 0 0 1) :port port* :workers 1
+                 :on-listen (lambda (p)
+                              (setf port p)
+                              (sb-thread:signal-semaphore semaphore))
+                 :handler (lambda (req)
+                            (when (and slow (string= (http-request-path req)
+                                                     "/slow"))
+                              (sleep slow))
+                            (make-text-response 200 marker))))
+              :name (format nil "server-~a" marker)))
+           (body-from (p)
+             (let ((*test-port* p))
+               (nth-value 2 (handler-case (test-http-request :get "/")
+                              (error (e) (values nil nil (princ-to-string e))))))))
+      (unwind-protect
+           (let ((slow-start nil))
+             ;; A's join gives up after *DRAIN-TIMEOUT* + 3 seconds; its
+             ;; handler sleeps past that.
+             (push (serve 0 "A" a-up 4.5) threads)
+             (check "control: server A came up"
+                    (not (null (sb-thread:wait-on-semaphore a-up :timeout 10))) t)
+             (setf slow-start (get-internal-real-time))
+             (push (sb-thread:make-thread
+                    (lambda ()
+                      (let ((*test-port* port))
+                        (ignore-errors (test-http-request :get "/slow"))))
+                    :name "slow-client")
+                   threads)
+             (sleep 0.3)
+             (setf web-skeleton::*shutdown* t)
+             ;; Server A returns once its join has given up.
+             (let ((a (car (last threads))))
+               (handler-case (sb-thread:join-thread a :timeout 10)
+                 (error () nil)))
+             (push (serve port "B" b-up) threads)
+             (check "control: server B came up on the same port"
+                    (not (null (sb-thread:wait-on-semaphore b-up :timeout 10))) t)
+             ;; Past the end of A's slow handler, with room for its worker
+             ;; to come back to its loop.
+             (loop until (> (/ (- (get-internal-real-time) slow-start)
+                               internal-time-units-per-second)
+                            5.5)
+                   do (sleep 0.1))
+             (let ((bodies (loop repeat 20 collect (body-from port))))
+               (check "every request after A's handler returned reached B"
+                      (count "B" bodies :test #'equal) 20)))
+        (setf web-skeleton::*shutdown* t)
+        (dolist (th threads)
+          (handler-case (sb-thread:join-thread th :timeout 10)
+            (error () (ignore-errors (sb-thread:terminate-thread th)))))
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll
+              web-skeleton::*log-stream* saved-stream)))
+    (check "the log named the worker A left running"
+           (not (null (search "still running" (get-output-stream-string log))))
+           t)))
+
+(defun test-harness-drain-closes-a-keep-alive-response-it-let-finish ()
+  "A shutdown that finds a keep-alive response in flight lets it finish,
+   then closes the connection, and returns well inside *DRAIN-TIMEOUT*.
+
+   A drain that let such a response finish and left the connection's
+   keep-alive alone would have the last byte reset it to reading a next
+   request. The drain never closes a connection that is reading, so
+   shutdown would sit out the whole *DRAIN-TIMEOUT* for a response
+   delivered at once, and log a force-close.
+
+   The handler is still running when shutdown is asked for, so its
+   response is queued after the drain has begun: the shape a SIGTERM
+   during a request produces."
+  (format t "~%Harness: the drain closes a keep-alive response it let finish~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (port nil)
+        (up (sb-thread:make-semaphore :name "drain-server"))
+        (reply nil))
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 5
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (let ((server (sb-thread:make-thread
+                        (lambda ()
+                          (start-server
+                           :host #(127 0 0 1) :port 0 :workers 1
+                           :on-listen (lambda (p)
+                                        (setf port p)
+                                        (sb-thread:signal-semaphore up))
+                           :handler (lambda (req)
+                                      (declare (ignore req))
+                                      (sleep 1)
+                                      (make-text-response 200 "answered"))))
+                        :name "drain-server"))
+               (client nil))
+           (check "control: the server came up"
+                  (not (null (sb-thread:wait-on-semaphore up :timeout 10))) t)
+           ;; HTTP/1.1 and no Connection: close — a keep-alive request — and
+           ;; the socket held open after the response, as a client reusing
+           ;; it would.
+           (setf client
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (let* ((*test-port* port)
+                           (sock (connect-to-test-server))
+                           (stream (sb-bsd-sockets:socket-make-stream
+                                    sock :input t :output t
+                                    :element-type '(unsigned-byte 8))))
+                      (unwind-protect
+                           (progn
+                             (write-sequence (sb-ext:string-to-octets
+                                              (crlf "GET /slow HTTP/1.1" "Host: x")
+                                              :external-format :ascii)
+                                             stream)
+                             (force-output stream)
+                             (setf reply (sb-ext:octets-to-string
+                                          (read-until-bounded stream :seconds 8)
+                                          :external-format :latin-1)))
+                        (ignore-errors (close stream))
+                        (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+                  :name "drain-client"))
+           (sleep 0.4)
+           (let ((start (get-internal-real-time)))
+             (setf web-skeleton::*shutdown* t)
+             (handler-case (sb-thread:join-thread server :timeout 10)
+               (error () (ignore-errors (sb-thread:terminate-thread server))))
+             (let ((secs (/ (float (- (get-internal-real-time) start))
+                            internal-time-units-per-second)))
+               (check "the server stopped well inside *drain-timeout*"
+                      (< secs 3.0) t)))
+           (handler-case (sb-thread:join-thread client :timeout 10)
+             (error () (ignore-errors (sb-thread:terminate-thread client))))
+           (check "the response in flight was delivered whole"
+                  (and reply (search "HTTP/1.1 200" reply) (search "answered" reply) t)
+                  t))
+      (setf web-skeleton::*shutdown* t
+            web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll
+            web-skeleton::*log-stream* saved-stream))
+    (check "and nothing was force-closed"
+           (search "force-closing" (get-output-stream-string log))
+           nil)))
 
 (defun %port-answers-with-p (port marker)
   "T if a plain GET / on PORT comes back containing MARKER.
@@ -1563,6 +2689,544 @@
         (check "fetch-stream: every line arrived, in order"
                (nreverse lines) (list "alpha" "beta" "gamma"))))))
 
+(defun %scripted-upstream (listener script &key (read-request t) stop
+                                              (name "scripted-upstream"))
+  "Accept once and play SCRIPT on the connection, then close. Returns the
+   thread.
+
+   SCRIPT is a list of steps: a string is written and flushed at once, a
+   number is that many seconds of silence. READ-REQUEST NIL skips reading
+   the request head, for an upstream that never reads at all; otherwise
+   the head is read to its CRLFCRLF first, as %CANNED-UPSTREAM reads it
+   and for its reason.
+
+   STOP, a cons, ends a silence early once its car is true. A test whose
+   fetch has already given up has no use for the rest of the script, and
+   the suite should not wait it out."
+  (sb-thread:make-thread
+   (lambda ()
+     (handler-case
+         (let* ((s (sb-bsd-sockets:socket-accept listener))
+                (st (sb-bsd-sockets:socket-make-stream
+                     s :input t :output t :element-type '(unsigned-byte 8)))
+                (b (make-array 4096 :element-type '(unsigned-byte 8)
+                                    :fill-pointer 0 :adjustable t)))
+           (unwind-protect
+                (progn
+                  (when read-request
+                    (loop for byte = (read-byte st nil nil)
+                          while byte
+                          do (vector-push-extend byte b)
+                          until (web-skeleton::scan-crlf-crlf b 0 (fill-pointer b))))
+                  (dolist (step script)
+                    (if (stringp step)
+                        (progn
+                          (write-sequence (sb-ext:string-to-octets
+                                           step :external-format :ascii)
+                                          st)
+                          (force-output st))
+                        (let ((until (+ (get-internal-real-time)
+                                        (* step internal-time-units-per-second))))
+                          (loop until (or (and stop (car stop))
+                                          (>= (get-internal-real-time) until))
+                                do (sleep 0.05))))))
+             (ignore-errors (sb-bsd-sockets:socket-close s))))
+       (error () nil)))
+   :name name))
+
+(defun %call-with-scripted-upstream (script fn &key (read-request t))
+  "Call FN with the port of a listener playing SCRIPT, and tear both down,
+   cutting short whatever silence the script has left once FN returns."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (stop (list nil))
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (setf thread (%scripted-upstream listener script
+                                            :read-request read-request
+                                            :stop stop))
+           (funcall fn (nth-value 1 (sb-bsd-sockets:socket-name listener))))
+      (setf (car stop) t)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun %timed (seconds thunk)
+  "Run THUNK on its own thread for at most SECONDS. Returns (VALUES OUTCOME
+   ELAPSED): what THUNK returned, or the text of what it raised, or :HUNG;
+   and the seconds it took. The bound is the test's, so a blocking call
+   that never returns fails a check instead of the run."
+  (let* ((start (get-internal-real-time))
+         (outcome :hung)
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (setf outcome (handler-case (funcall thunk)
+                                    (error (e) (princ-to-string e)))))
+                  :name "timed-call")))
+    (handler-case (sb-thread:join-thread thread :timeout seconds :default nil)
+      (error () nil))
+    (when (sb-thread:thread-alive-p thread)
+      (ignore-errors (sb-thread:terminate-thread thread)))
+    (values outcome
+            (/ (float (- (get-internal-real-time) start))
+               internal-time-units-per-second))))
+
+(defun test-harness-fetch-stream-plain-read-timeout-e2e ()
+  "HTTP-FETCH-STREAM over http:// gives up on an upstream that accepts,
+   takes the request and says nothing, after *FETCH-TIMEOUT*.
+
+   SO_RCVTIMEO is what bounds the read, and it bounds read(2) only. The
+   upstream here closes after six seconds, so a read that waits on
+   anything else finishes then, with a different error, and the elapsed
+   time is what tells the two apart."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, a silent upstream~%")
+  (%call-with-scripted-upstream
+   '(6)
+   (lambda (port)
+     (multiple-value-bind (outcome secs)
+         (%timed 12 (lambda ()
+                      (let ((web-skeleton:*fetch-timeout* 1))
+                        (http-fetch-stream
+                         :get (format nil "http://127.0.0.1:~d/silent" port)
+                         :on-line #'identity))))
+       (check "silent upstream: the fetch raised a read timeout"
+              (and (stringp outcome) (search "read timed out" outcome) t) t)
+       (check "silent upstream: within the timeout, not at the upstream's close"
+              (< secs 4.0) t)))))
+
+(defun test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e ()
+  "HTTP-FETCH-STREAM over http:// hands each line to :ON-LINE as it
+   arrives, not when the response ends.
+
+   Five NDJSON lines a third of a second apart, the shape of a token
+   stream, in both framings a streaming upstream uses. The first line must
+   arrive while the last is still unsent; a reader that waits to fill an
+   8 KiB buffer gets all five at once, at the end."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, lines as they arrive~%")
+  (flet ((paced (framing)
+           (let ((lines (loop for i from 1 to 5
+                              collect (format nil "{\"token\":~d}~c" i #\Newline))))
+             (ecase framing
+               (:close
+                (cons (%crlf-lines "HTTP/1.1 200 OK"
+                             "Content-Type: application/x-ndjson" "")
+                      (loop for line in lines append (list line 0.3))))
+               (:chunked
+                (append
+                 (list (%crlf-lines "HTTP/1.1 200 OK"
+                              "Content-Type: application/x-ndjson"
+                              "Transfer-Encoding: chunked" ""))
+                 (loop for line in lines
+                       append (list (%crlf-lines (format nil "~x" (length line)) line)
+                                    0.3))
+                 (list (%crlf-lines "0" "")))))))
+         (arrivals (port)
+           ;; (SECONDS . LINE) for each line, in the order they came.
+           (let ((start (get-internal-real-time))
+                 (seen nil))
+             (values
+              (%timed 10 (lambda ()
+                           (http-fetch-stream
+                            :get (format nil "http://127.0.0.1:~d/tokens" port)
+                            :on-line (lambda (line)
+                                       (push (cons (/ (float (- (get-internal-real-time)
+                                                                start))
+                                                      internal-time-units-per-second)
+                                                   line)
+                                             seen)))))
+              (reverse seen)))))
+    (dolist (framing '(:close :chunked))
+      (%call-with-scripted-upstream
+       (paced framing)
+       (lambda (port)
+         (multiple-value-bind (status seen) (arrivals port)
+           (check (format nil "~(~a~): the upstream answered" framing) status 200)
+           (check (format nil "~(~a~): all five lines, in order" framing)
+                  (mapcar #'cdr seen)
+                  (loop for i from 1 to 5 collect (format nil "{\"token\":~d}" i)))
+           ;; The last line goes out at 1.2 s, the close at 1.5 s.
+           (check (format nil "~(~a~): the first line came before the last was sent"
+                          framing)
+                  (and seen (< (car (first seen)) 0.9) t)
+                  t)))))))
+
+(defun test-harness-fetch-bodiless-status-kept-alive-e2e ()
+  "A fetch whose upstream answers 304 or 204 and keeps the connection open
+   completes at the response's blank line.
+
+   Neither status has a body, whatever its headers say — a 304's
+   Content-Length describes the representation — so nothing more is coming
+   and the end of the connection is not either. The upstream holds the
+   connection for five seconds; a fetch that waited for a body or a close
+   finishes then, when it finishes at all, and the elapsed time is what
+   tells the two apart."
+  (format t "~%Harness: a 304 or 204 from an upstream that keeps the connection~%")
+  (dolist (case (list (list "304 with a Content-Length"
+                            (%crlf-lines "HTTP/1.1 304 Not Modified" "ETag: \"v1\""
+                                   "Content-Length: 1234" "")
+                            304)
+                      (list "204 with no framing at all"
+                            (%crlf-lines "HTTP/1.1 204 No Content" "")
+                            204)))
+    (destructuring-bind (name head status) case
+      (%call-with-scripted-upstream
+       (list head 5)
+       (lambda (port)
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (declare (ignore req))
+                (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                  :headers '(("connection" . "keep-alive")
+                             ("if-none-match" . "\"v1\""))
+                  :then (lambda (s h b)
+                          (declare (ignore h b))
+                          (make-text-response 200 (format nil "upstream ~a" s))))))
+           (let ((start (get-internal-real-time)))
+             (multiple-value-bind (code headers body)
+                 (handler-case (test-http-request :get "/relay")
+                   (error (e) (values nil nil (princ-to-string e))))
+               (declare (ignore headers))
+               (let ((secs (/ (float (- (get-internal-real-time) start))
+                              internal-time-units-per-second)))
+                 (check (format nil "~a: :then saw the upstream's status" name)
+                        (list code body)
+                        (list 200 (format nil "upstream ~d" status)))
+                 (check (format nil "~a: at the blank line, not the close" name)
+                        (< secs 2.5) t))))))))))
+
+(defun test-harness-fetch-non-chunked-coding-e2e ()
+  "A response whose Transfer-Encoding does not include chunked is framed
+   by the close, and HTTP-FETCH hands :THEN its bytes as they came, as
+   HTTP-FETCH-STREAM reads the same response.
+
+   RFC 9112 §6.3 frames such a response by the connection's close, and the
+   Transfer-Encoding overrides any Content-Length. There is no chunk size
+   to find: a reader that walks the body as chunks refuses it at its first
+   byte. Neither coding is decoded here, so the body arrives unchanged.
+
+   The buffered predicate is asked on its own as well, about a gzip body's
+   first bytes, which the ASCII scripts below cannot send."
+  (format t "~%Harness: a transfer coding other than chunked ends at the close~%")
+  (let ((buf (concatenate '(vector (unsigned-byte 8))
+                          (sb-ext:string-to-octets
+                           (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                                  "Connection: close" "")
+                           :external-format :ascii)
+                          #(#x1F #x8B #x08 #x00))))
+    (check "non-chunked coding: a gzip body waits for the close"
+           (attempt (web-skeleton::outbound-response-complete-p
+                     buf (length buf) :get))
+           nil))
+  (dolist (case (list (list "gzip"
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: gzip"
+                                   "Connection: close" "")
+                            "{\"a\":1}")
+                      ;; A length shorter than the body, so a reader that
+                      ;; honoured it instead of reading to the close would
+                      ;; answer "hel" and fail here, where an equal length
+                      ;; could not tell the two apart.
+                      (list "identity beside a Content-Length"
+                            (%crlf-lines "HTTP/1.1 200 OK" "Transfer-Encoding: identity"
+                                   "Content-Length: 3" "Connection: close" "")
+                            "hello")))
+    (destructuring-bind (name head body) case
+      (%call-with-scripted-upstream
+       (list head body)
+       (lambda (port)
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (declare (ignore req))
+                (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                  :then (lambda (s h b)
+                          (declare (ignore h))
+                          (make-text-response
+                           200 (format nil "~a ~a" s
+                                       (if b
+                                           (sb-ext:octets-to-string
+                                            b :external-format :latin-1)
+                                           "")))))))
+           (multiple-value-bind (code headers reply)
+               (handler-case (test-http-request :get "/relay")
+                 (error (e) (values nil nil (princ-to-string e))))
+             (declare (ignore headers))
+             (check (format nil "~a: http-fetch delivers the body read to the close"
+                            name)
+                    (list code reply)
+                    (list 200 (format nil "200 ~a" body)))))))
+      (%call-with-scripted-upstream
+       (list head body)
+       (lambda (port)
+         (let* ((lines nil)
+                (status (%timed 10 (lambda ()
+                                     (http-fetch-stream
+                                      :get (format nil "http://127.0.0.1:~d/x" port)
+                                      :on-line (lambda (line) (push line lines)))))))
+           (check (format nil "~a: http-fetch-stream reads it the same way" name)
+                  (list status (reverse lines))
+                  (list 200 (list body)))))))))
+
+(defun test-harness-upstream-header-limits-e2e ()
+  "An upstream's response head is held to the *MAX-UPSTREAM-* knobs, a
+   client's request head to the inbound ones, and both upstream readers
+   agree.
+
+   Each head is past an inbound default: a field line over 8 KiB, a
+   hundred and one fields, field lines over 64 KiB in all. At the
+   defaults HTTP-FETCH answers 502 and HTTP-FETCH-STREAM raises; with the
+   upstream knob raised, both read the response. Raised, it does not widen
+   what a client may send, and left NIL it follows the inbound knob, so a
+   deployment that raised that one for its upstreams keeps them.
+
+   SETF, not LET: the buffered fetch is read on the worker and the
+   streaming one on %TIMED's thread, and a binding crosses neither."
+  (format t "~%Harness: an upstream's head is held to its own limits~%")
+  (let* ((long-line (concatenate 'string "X-Long: " (make-string 9000 :initial-element #\a)))
+         (many-fields (loop for i from 1 to 101 collect (format nil "X-F~d: v" i)))
+         (big-lines (loop for i from 1 to 10
+                          collect (format nil "X-B~d: ~a" i
+                                          (make-string 7500 :initial-element #\b))))
+         (saved (list web-skeleton:*max-upstream-header-count*
+                      web-skeleton:*max-upstream-header-line-length*
+                      web-skeleton:*max-upstream-total-header-bytes*
+                      web-skeleton:*max-header-line-length*)))
+    (labels ((head (lines)
+               (apply #'%crlf-lines "HTTP/1.1 200 OK"
+                      (append lines (list "Connection: close" ""))))
+             (buffered (head)
+               ;; HTTP-FETCH's answer to the client: (code body).
+               (let ((result nil))
+                 (%call-with-scripted-upstream
+                  (list head "ok")
+                  (lambda (port)
+                    (with-test-server
+                        (:handler
+                         (lambda (req)
+                           (declare (ignore req))
+                           (defer-to-fetch :GET (format nil "http://127.0.0.1:~d/x" port)
+                             :then (lambda (s h b)
+                                     (declare (ignore s h))
+                                     (make-text-response
+                                      200 (if b
+                                              (sb-ext:octets-to-string
+                                               b :external-format :latin-1)
+                                              ""))))))
+                      (multiple-value-bind (code headers reply)
+                          (handler-case (test-http-request :get "/relay")
+                            (error (e) (values nil nil (princ-to-string e))))
+                        (declare (ignore headers))
+                        (setf result (list code (if (eql code 200) reply :refused)))))))
+                 result))
+             (streamed (head)
+               ;; HTTP-FETCH-STREAM's answer: (status lines), or :REFUSED
+               ;; when it raised.
+               (let ((result nil))
+                 (%call-with-scripted-upstream
+                  (list head "ok")
+                  (lambda (port)
+                    (let* ((lines nil)
+                           (status (%timed 10 (lambda ()
+                                                (http-fetch-stream
+                                                 :get (format nil "http://127.0.0.1:~d/x" port)
+                                                 :on-line (lambda (line) (push line lines)))))))
+                      (setf result (if (integerp status)
+                                       (list status (reverse lines))
+                                       :refused)))))
+                 result))
+             (reset ()
+               (setf web-skeleton:*max-upstream-header-count* nil
+                     web-skeleton:*max-upstream-header-line-length* nil
+                     web-skeleton:*max-upstream-total-header-bytes* nil
+                     web-skeleton:*max-header-line-length* (fourth saved))))
+      (unwind-protect
+           (progn
+             (dolist (case (list (list "a field line over 8 KiB" (list long-line)
+                                       '*max-upstream-header-line-length* 16384)
+                                 (list "101 fields" many-fields
+                                       '*max-upstream-header-count* 200)
+                                 (list "field lines over 64 KiB" big-lines
+                                       '*max-upstream-total-header-bytes* (* 128 1024))))
+               (destructuring-bind (name lines knob value) case
+                 (reset)
+                 (check (format nil "upstream head, ~a: refused at the defaults" name)
+                        (list (buffered (head lines)) (streamed (head lines)))
+                        '((502 :refused) :refused))
+                 (setf (symbol-value knob) value)
+                 (check (format nil "upstream head, ~a: read with ~(~a~) raised" name knob)
+                        (list (buffered (head lines)) (streamed (head lines)))
+                        '((200 "ok") (200 ("ok"))))))
+             ;; Raised for the upstream, the client's limit stays put.
+             (reset)
+             (setf web-skeleton:*max-upstream-header-line-length* 16384)
+             (with-test-server
+                 (:handler (lambda (req) (declare (ignore req))
+                             (make-text-response 200 "ok")))
+               (check "upstream head: a client's long line is still refused"
+                      (let ((answer (%exchange-or-why
+                                     (%ascii (concatenate 'string
+                                                          "GET / HTTP/1.1" *crlf*
+                                                          "Host: x" *crlf*
+                                                          long-line *crlf* *crlf*)))))
+                        (and (stringp answer) (search "HTTP/1.1 431" answer) t))
+                      t))
+             ;; Left NIL, the upstream limit is the inbound knob's.
+             (reset)
+             (setf web-skeleton:*max-header-line-length* 16384)
+             (check "upstream head: NIL follows the inbound knob"
+                    (buffered (head (list long-line)))
+                    '(200 "ok")))
+        (setf web-skeleton:*max-upstream-header-count* (first saved)
+              web-skeleton:*max-upstream-header-line-length* (second saved)
+              web-skeleton:*max-upstream-total-header-bytes* (third saved)
+              web-skeleton:*max-header-line-length* (fourth saved))))
+    ;; Checked at the start, on the calling thread, so a LET reaches it.
+    ;; The invalid :HOST, as in the other boot checks, keeps a reverted
+    ;; check from starting a server.
+    (dolist (name '(*max-upstream-header-count*
+                    *max-upstream-header-line-length*
+                    *max-upstream-total-header-bytes*))
+      (check (format nil "boot: ~(~a~) as a string is refused by name" name)
+             (progv (list name) (list "100")
+               (let ((msg (attempt (web-skeleton:start-server
+                                    :host #(1 2 3) :port 0 :workers 1))))
+                 (and (stringp msg)
+                      (search (string-downcase (symbol-name name)) msg)
+                      t)))
+             t))))
+
+(defun test-harness-serves-without-tls-e2e ()
+  "The framework starts and serves with web-skeleton-tls absent, the build
+   the demo's image and demo/deploy/run.lisp support.
+
+   The suite runs with TLS loaded, so its absence is made here: the two
+   hooks it registers unset, and SHA1, SHA256 and ECDSA-VERIFY-P256 back on
+   the pure-Lisp versions it swaps out. A live server then answers a plain
+   request; a WebSocket upgrade, whose accept key is SHA-1's; an ES256
+   token, whose hash and signature check are SHA-256's and the pure-Lisp
+   verifier's; and a static file, whose ETag is the SHA-256 of its bytes.
+   An https:// fetch is refused for want of TLS, with a 502, and :THEN
+   hears the cleanup sentinel.
+
+   SETF, not LET: the workers read the hooks, and a function cell is
+   global already."
+  (format t "~%Harness: the framework serves with web-skeleton-tls absent~%")
+  (let ((saved-setup web-skeleton::*tls-outbound-setup-fn*)
+        (saved-stream web-skeleton:*https-stream-fn*)
+        (saved-sha1 (symbol-function 'sha1))
+        (saved-sha256 (symbol-function 'sha256))
+        (saved-ecdsa (symbol-function 'web-skeleton::ecdsa-verify-p256))
+        (saved-cache web-skeleton::*static-cache*)
+        (then-status :never))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*tls-outbound-setup-fn* nil
+                 web-skeleton:*https-stream-fn* nil
+                 (symbol-function 'sha1) #'web-skeleton::sha1-lisp
+                 (symbol-function 'sha256) #'web-skeleton::sha256-lisp
+                 (symbol-function 'web-skeleton::ecdsa-verify-p256)
+                 #'web-skeleton::ecdsa-verify-p256-lisp)
+           (check "without TLS: the suite's own test reads it as absent"
+                  (tls-loaded-p) nil)
+           ;; Built with the pure-Lisp SHA-256 in the cell, as a load
+           ;; without TLS builds it.
+           (setf web-skeleton::*static-cache* (make-hash-table :test #'equal)
+                 (gethash "/hello.txt" web-skeleton::*static-cache*)
+                 (web-skeleton::build-static-response
+                  "text/plain; charset=utf-8"
+                  (sb-ext:string-to-octets "hello" :external-format :ascii) 0))
+           (let ((key (%es256-test-key))
+                 (token (%es256-token "{\"alg\":\"ES256\",\"kid\":\"test\"}"
+                                      "{\"sub\":\"no-tls\"}")))
+             (with-test-server
+                 (:handler
+                  (lambda (req)
+                    (let ((path (http-request-path req)))
+                      (cond
+                        ((string= path "/ws") :upgrade)
+                        ((string= path "/jwt")
+                         (let ((claims (jwt-verify (get-header req "x-token")
+                                                   (list key))))
+                           (make-text-response
+                            200 (if claims (jwt-claim claims "sub") "refused"))))
+                        ((string= path "/out")
+                         (defer-to-fetch :GET "https://example.test/"
+                           :then (lambda (s h b)
+                                   (declare (ignore h b))
+                                   (setf then-status s)
+                                   (make-text-response 200 "fetched"))))
+                        ((serve-static req))
+                        (t (make-text-response 200 "plain")))))
+                  :ws-handler (lambda (conn frame)
+                                (declare (ignore conn frame))
+                                nil))
+               (multiple-value-bind (status headers body) (test-http-request :get "/")
+                 (declare (ignore headers))
+                 (check "without TLS: a plain request is answered"
+                        (list status body) '(200 "plain")))
+               (multiple-value-bind (socket stream) (%raw-connect)
+                 (unwind-protect
+                      (let ((head (string-downcase (%ws-client-upgrade stream))))
+                        ;; RFC 6455 §1.3's sample key and its accept value.
+                        (check "without TLS: the upgrade's accept key is SHA-1's"
+                               (list (not (null (search "http/1.1 101" head)))
+                                     (not (null (search "s3pplmbitxaq9kygzzhzrbk+xoo=" head))))
+                               '(t t)))
+                   (ignore-errors (close stream))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket))))
+               (multiple-value-bind (status headers body)
+                   (test-http-request :get "/jwt" :headers (list (cons "x-token" token)))
+                 (declare (ignore headers))
+                 (check "without TLS: an ES256 token verifies"
+                        (list status body) '(200 "no-tls")))
+               (multiple-value-bind (status headers body) (test-http-request :get "/hello.txt")
+                 (check "without TLS: a static file is served with its SHA-256 ETag"
+                        (list status body (cdr (assoc "etag" headers :test #'string-equal)))
+                        '(200 "hello"
+                          "\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"")))
+               (multiple-value-bind (status headers body) (test-http-request :get "/out")
+                 (declare (ignore headers body))
+                 (check "without TLS: an https:// fetch is refused 502"
+                        (list status then-status) '(502 nil))))))
+      (setf web-skeleton::*tls-outbound-setup-fn* saved-setup
+            web-skeleton:*https-stream-fn* saved-stream
+            (symbol-function 'sha1) saved-sha1
+            (symbol-function 'sha256) saved-sha256
+            (symbol-function 'web-skeleton::ecdsa-verify-p256) saved-ecdsa
+            web-skeleton::*static-cache* saved-cache))))
+
+(defun test-harness-fetch-stream-plain-write-timeout-e2e ()
+  "HTTP-FETCH-STREAM over http:// gives up on an upstream that never reads
+   the request, after *FETCH-TIMEOUT*.
+
+   The body is larger than both ends' socket buffers together, so the
+   write blocks once they fill. SO_SNDTIMEO bounds write(2) only; the
+   upstream closes after six seconds, and the elapsed time tells a write
+   that timed out from one that waited for the close."
+  (format t "~%Harness: http-fetch-stream over plain HTTP, an upstream that never reads~%")
+  (%call-with-scripted-upstream
+   '(6)
+   (lambda (port)
+     (let ((body (make-array (* 24 1024 1024) :element-type '(unsigned-byte 8)
+                                              :initial-element 97)))
+       (multiple-value-bind (outcome secs)
+           (%timed 12 (lambda ()
+                        (let ((web-skeleton:*fetch-timeout* 1))
+                          (http-fetch-stream
+                           :post (format nil "http://127.0.0.1:~d/sink" port)
+                           :body body
+                           :on-line #'identity))))
+         (check "non-reading upstream: the fetch raised a write timeout"
+                (and (stringp outcome) (search "write timed out" outcome) t) t)
+         (check "non-reading upstream: within the timeout, not at the close"
+                (< secs 4.0) t))))
+   :read-request nil))
+
 (defun test-harness-port-zero-reported ()
   "START-SERVER with :PORT 0 binds an ephemeral port and reports it
    through :ON-LISTEN, and the port it reports is the one that serves.
@@ -1605,14 +3269,14 @@
           ;; still NIL at the end, fails as NIL-against-3 rather than
           ;; being counted as zero listeners.
           ;;
-          ;; The budget is slack for a loaded CI box and nothing more:
-          ;; measured, all three listeners are present on the first read,
+          ;; The budget is slack for a loaded CI runner and nothing more:
+          ;; all three listeners are normally present on the first read,
           ;; because MAKE-THREAD plus a bind is microseconds. Only a
           ;; failing run spends the whole budget, and a failing check
           ;; should not also be the suite's longest sleep.
-          ;; Highest count seen, not the last one. Measured: a read of
-          ;; /proc/net/tcp intermittently returns 2, and once 1, while
-          ;; three healthy workers are demonstrably on the port, because a
+          ;; Highest count seen, not the last one. A read of
+          ;; /proc/net/tcp can return fewer listeners than there are,
+          ;; while three healthy workers are on the port, because a
           ;; seq_file resume can land late and skip records. Overcounting
           ;; is ruled out by %LISTEN-SOCKET-COUNT counting distinct socket
           ;; inodes — the same resume can land early and re-emit a row, so
@@ -1746,9 +3410,9 @@
 (defun test-harness-sse-keepalive-framed-e2e ()
   "A keepalive on a chunked stream has to be framed as a chunk.
 
-   Every check written for the keepalive before this one looked at the
-   response struct or the connection's queue — 'installed by default',
-   'nothing left queued', 'counts as production' — and all of those are
+   The other keepalive checks look at the response struct or the
+   connection's queue — 'installed by default', 'nothing left queued',
+   'counts as production' — and all of those are
    true of raw bytes and framed bytes alike. The only site that can tell
    them apart is the wire, so this reads the bytes back and puts them
    through the framework's own chunked decoder.
@@ -1781,43 +3445,45 @@
                       ;; deadline is the mechanism. Four seconds at a
                       ;; one-second interval collects the event plus
                       ;; several keepalives.
-                      (let ((buf (read-until-bounded stream :seconds 4)))
-                        (let* ((raw (subseq buf 0 (fill-pointer buf)))
-                               (hend (or (web-skeleton::scan-crlf-crlf
-                                          raw 0 (length raw))
-                                         (error "no header boundary in ~d bytes"
-                                                (length raw))))
-                               (body (subseq raw (+ hend 4)))
-                               ;; The stream is still open, so it has no
-                               ;; terminator. Append one and the decoder
-                               ;; can pass judgement on everything sent
-                               ;; so far.
-                               (terminated
-                                 (concatenate '(vector (unsigned-byte 8))
-                                              body
-                                              (web-skeleton::chunked-terminator))))
-                          (check "sse keepalive: the stream so far is valid chunked"
-                                 (handler-case
-                                     (progn (web-skeleton::decode-chunked-body
-                                             terminated 0 (length terminated))
-                                            :decoded)
-                                   (error (e) (princ-to-string e)))
-                                 :decoded)
-                          (check "sse keepalive: and a comment line reached the client"
-                                 (let ((decoded
-                                         (handler-case
-                                             (sb-ext:octets-to-string
-                                              (web-skeleton::decode-chunked-body
+                      (let* ((buf (read-until-bounded stream :seconds 4))
+                             (raw (subseq buf 0 (fill-pointer buf)))
+                             (hend (web-skeleton::scan-crlf-crlf raw 0 (length raw))))
+                        ;; A check rather than a raise, so a head that never
+                        ;; came fails here and the run goes on.
+                        (check "sse keepalive: the head arrived"
+                               (not (null hend)) t)
+                        (when hend
+                          (let* ((body (subseq raw (+ hend 4)))
+                                 ;; The stream is still open, so it has no
+                                 ;; terminator. Append one and the decoder
+                                 ;; can pass judgement on everything sent
+                                 ;; so far.
+                                 (terminated
+                                   (concatenate '(vector (unsigned-byte 8))
+                                                body
+                                                (web-skeleton::chunked-terminator))))
+                            (check "sse keepalive: the stream so far is valid chunked"
+                                   (handler-case
+                                       (progn (web-skeleton::decode-chunked-body
                                                terminated 0 (length terminated))
-                                              :external-format :utf-8)
-                                           (error () ""))))
-                                   (and (search "data: start" decoded)
-                                        (search ":" decoded :start2
-                                                (+ 11 (or (search "data: start"
-                                                                  decoded)
-                                                          0)))
-                                        t))
-                                 t))))
+                                              :decoded)
+                                     (error (e) (princ-to-string e)))
+                                   :decoded)
+                            (check "sse keepalive: and a comment line reached the client"
+                                   (let ((decoded
+                                           (handler-case
+                                               (sb-ext:octets-to-string
+                                                (web-skeleton::decode-chunked-body
+                                                 terminated 0 (length terminated))
+                                                :external-format :utf-8)
+                                             (error () ""))))
+                                     (and (search "data: start" decoded)
+                                          (search ":" decoded :start2
+                                                  (+ 11 (or (search "data: start"
+                                                                    decoded)
+                                                            0)))
+                                          t))
+                                   t)))))
                  (ignore-errors (close stream))
                  (ignore-errors (sb-bsd-sockets:socket-close socket))))))
       (setf *stream-keepalive-interval* saved))))
@@ -1831,8 +3497,8 @@
    rather than being accumulated, and delivering them twice would double
    the memory the callback exists to avoid.
 
-   The upstream is item 5's streaming surface, so this also checks that
-   what the encoder produces is what the walk hands back."
+   The upstream is the framework's own streaming surface, so this also
+   checks that what the encoder produces is what the walk hands back."
   (format t "~%Harness: fetch :on-body incremental delivery~%")
   (let ((collected nil)
         (final :never)
@@ -1974,15 +3640,20 @@
                  (declare (ignore got))
                  (check "stream/worker: the stream delivered its first chunk"
                         reason :satisfied))
-               (check "stream/worker: the stream is still open"
-                      (null live-conn) nil)
                ;; The worker must still be able to serve someone else.
                (multiple-value-bind (status headers body)
                    (test-http-request :get "/fast")
                  (declare (ignore headers))
                  (check "stream/worker: a concurrent request is answered"
                         status 200)
-                 (check "stream/worker: and answered correctly" body "fast")))
+                 (check "stream/worker: and answered correctly" body "fast"))
+               ;; Asked after a request the one worker served, so a stream it
+               ;; closed after the first chunk would be closed by now: ON-CLOSE
+               ;; has not fired, and the connection is still streaming.
+               (check "stream/worker: the stream is still open"
+                      (list closed-reason
+                            (and live-conn (web-skeleton::connection-state live-conn)))
+                      '(:never :streaming)))
           (ignore-errors (close stream))
           (ignore-errors (sb-bsd-sockets:socket-close socket))))
       ;; The streaming client is gone now. The server should notice and
@@ -2172,7 +3843,11 @@
               do (sleep 0.05))))
     (let ((pairs (sb-thread:with-mutex (lock) (copy-list seen))))
       (check "three workers, three different ids"
-             (sort (mapcar #'cdr pairs) #'<) '(0 1 2))
+             (let ((ids (mapcar #'cdr pairs)))
+               ;; Sorted only when every id is a number, so a worker whose
+               ;; id is NIL fails this check rather than raising out of SORT.
+               (if (every #'realp ids) (sort ids #'<) ids))
+             '(0 1 2))
       (check "the id :ON-TICK is handed is the one bound on its thread"
              (and pairs (every (lambda (p) (eql (car p) (cdr p))) pairs))
              t))))
@@ -2199,22 +3874,21 @@
    which runs with this worker's table bound, is the only place an
    application can look at one.
 
-   Keyed on the connection object, and that is load-bearing. The first
-   version recorded (fd . serial) pairs deduplicated by EQUAL, so a server
-   handing every connection the same serial collapsed them to one pair per fd
-   — and the control counting observations went red with the property it was
-   meant to be independent of. A mutation that turns the control red cannot
-   be read: it says the observation broke, not that the property did. Here
-   the count of connections seen does not depend on the serials at all.
+   Keyed on the connection object, and that is load-bearing. Pairs of
+   (fd . serial) deduplicated by EQUAL would collapse a server handing every
+   connection the same serial to one pair per fd, and turn the control
+   counting observations red with the property it is meant to be
+   independent of. A mutation that turns the control red cannot be read: it
+   says the observation broke, not that the property did. Here the count of
+   connections seen does not depend on the serials at all.
 
    The fd is captured when the connection is seen rather than read back
    later, because CONNECTION-CLOSE sets it to -1. The serial it leaves alone.
 
-   There is no assertion that the serials increase. There was one, and it
-   compared a sorted list with a sorted copy of itself, which is true of any
-   list whatever. Distinct serials, and a highest serial no lower than the
-   number of connections, are the claims a repeating or constant counter
-   actually fails."
+   There is no assertion that the serials increase: comparing a sorted list
+   with a sorted copy of itself is true of any list whatever. Distinct
+   serials, and a highest serial no lower than the number of connections,
+   are the claims a repeating or constant counter actually fails."
   (format t "~%server: a connection number that is not an fd~%")
   (let ((seen nil)
         (lock (sb-thread:make-mutex))
@@ -2395,8 +4069,7 @@
    — two GETs — cannot tell a boundary that forgets the body from one that
    does not.
 
-   What each assertion catches, measured against three sabotaged
-   boundaries rather than reasoned about:
+   What each assertion catches, against three sabotaged boundaries:
 
      never set, so 0    the whole request stays buffered and is re-parsed
                         forever. The server never closes, and `server
@@ -2474,8 +4147,8 @@
                    ;; then GET, the keep-alive reset is its only writer.
                    ;; Left stale, CONNECTION-PARSE-REQUEST attaches five
                    ;; bytes of whatever follows /b's headers to a request
-                   ;; the client sent no body with. The handler has always
-                   ;; printed this value; only the assertion was missing.
+                   ;; the client sent no body with. The handler prints this
+                   ;; value, and this is the assertion that reads it.
                    (check "pipelined body: /b carried no body of its own"
                           (not (null (search "path=/b body=-" text))) t)))))
         (ignore-errors (sb-bsd-sockets:socket-close socket))))))
@@ -2493,15 +4166,14 @@
    Sized so it cannot: the first body is one 200-byte chunk, leaving the
    cursor near 270, while the second request's body begins near 84. With
    the clear neutered the second walk starts well past its own body, finds
-   no framing there, and the connection never answers — measured:
-   this test's `server closed the connection` and `second request
+   no framing there, and the connection never answers, which fails this
+   test's `server closed the connection` and `second request
    dispatched`.
 
-   That was measured after removing a second clear, not before. The
-   connection resets used to zero the cursor as well, and with both in
-   place neutering either one was silent: each masked the other, and this
-   test detected neither. Two mechanisms, one guarantee, no way to tell
-   them apart.
+   That holds because the cursor has one clear. With a second — the
+   connection resets zeroing it as well — neutering either one would be
+   silent: each would mask the other, and this test would detect neither.
+   Two mechanisms, one guarantee, no way to tell them apart.
 
    The second request is chunked too, rather than a plain GET, because a
    GET would never consult the cursor at all."
@@ -2683,8 +4355,8 @@
 (defun test-harness-chunked-trailer-smuggle-e2e ()
   "A trailer section carrying a complete HTTP request, end to end.
 
-   The headline acceptance criterion of the issue, and a delivery-shaped
-   assertion cannot see it: if the smuggle succeeded the client would get
+   The point of refusing trailers, and a delivery-shaped assertion cannot
+   see it: if the smuggle succeeded the client would get
    *two* responses, so what this asserts is that it gets one, and that the
    one it gets is the 400 the trailer earned rather than a 200 for /a
    followed by a 200 for the request hidden in its trailer.
@@ -2736,7 +4408,7 @@
                                                     :start2 (1+ first-status)))))
                    (check "trailer smuggle: refused with 400"
                           (not (null (search "HTTP/1.1 400" text))) t)
-                   ;; The assertion the issue exists for: not two responses.
+                   ;; The assertion that matters most: not two responses.
                    (check "trailer smuggle: exactly one response"
                           (null second-status) t)
                    (check "trailer smuggle: /admin was never served"
@@ -3005,7 +4677,7 @@
                           (multiple-value-bind (ended clean)
                               (read-to-eof-bounded stream buf :seconds 5)
                             ;; Bounded even though REFUSE-CONNECTION closes
-                            ;; unconditionally today: this test's subject
+                            ;; unconditionally: this test's subject
                             ;; is whether it closes, and the day that
                             ;; SOCKET-CLOSE moves inside a conditional, the
                             ;; test written to catch it should fail rather
@@ -3091,6 +4763,106 @@
                  (ignore-errors (sb-bsd-sockets:socket-close holder))))))
       (setf web-skeleton::*max-connections* saved))))
 
+(defun test-harness-refusals-are-reported-not-logged-each ()
+  "A flood of refusals at *MAX-CONNECTIONS* is logged once, and counted
+   in full by the census.
+
+   Each refusal logged its own WARN, and every log line holds the one lock
+   all workers share across a format and a flush: a flood arrives exactly
+   when a worker is out of room, and a line per refusal had every worker
+   queueing on logging. The first refusal is logged at once and the rest
+   are reported at most once a minute, so in a test well inside that
+   minute fifty refusals are one line. The census is what counts them."
+  (format t "~%Harness: refusals are reported, not logged one by one~%")
+  (let ((saved web-skeleton::*max-connections*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream)))
+    (setf web-skeleton::*max-connections* 1
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "")))
+           (let ((holder (claim-connection-slot)))
+             (unwind-protect
+                  (progn
+                    (check "control: the one slot is taken" (not (null holder)) t)
+                    (when holder
+                      (let ((refused (loop repeat 50
+                                           count (eql (values (request-expecting-refusal))
+                                                      503))))
+                        (check "control: fifty connections were refused" refused 50))
+                      (let ((k nil) (deadline (+ (get-universal-time) 6)))
+                        (loop until (or (and k (>= (getf k :refused 0) 50))
+                                        (> (get-universal-time) deadline))
+                              do (setf k (getf (web-skeleton:connection-census)
+                                               :counters))
+                                 (sleep 0.05))
+                        (check "the census counts every refusal"
+                               (>= (getf k :refused 0) 50) t))))
+               (when holder
+                 (ignore-errors (sb-bsd-sockets:socket-close holder))))))
+      (setf web-skeleton::*max-connections* saved
+            web-skeleton::*log-stream* saved-stream))
+    (let* ((text (get-output-stream-string log))
+           (lines (loop with start = 0
+                        for i = (search "connection limit reached" text :start2 start)
+                        while i count t do (setf start (1+ i)))))
+      (check "and the log says so once, not fifty times" lines 1))))
+
+(defun test-harness-descriptor-limit-e2e ()
+  "A server close to its descriptor limit answers 503, as at
+   *MAX-CONNECTIONS*, rather than running out and leaving clients the
+   kernel has connected unanswered.
+
+   START-SERVER records the soft limit it raised. Set to 1, every
+   descriptor an accept can return is past it, and is refused; set back,
+   the next is served."
+  (format t "~%Harness: a server near its descriptor limit answers 503~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (before (multiple-value-list (web-skeleton::descriptor-limits))))
+    (setf web-skeleton::*log-stream* log)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (make-text-response 200 "")))
+           (let ((recorded web-skeleton::*descriptor-limit*))
+             (check "start-server records the soft limit it left in force"
+                    recorded (nth-value 0 (web-skeleton::descriptor-limits)))
+             ;; One worker's need, not the hard limit: where close_range(2)
+             ;; is missing, every child would close descriptors up to it.
+             (check "and raised it to what its one worker needs, no further"
+                    recorded
+                    (max (first before)
+                         (min (second before) (web-skeleton::descriptors-wanted 1))))
+             (unwind-protect
+                  (progn
+                    (setf web-skeleton::*descriptor-limit* 1)
+                    (multiple-value-bind (status headers body)
+                        (request-expecting-refusal)
+                      (check "near the limit, a new connection gets 503" status 503)
+                      (check "with Retry-After"
+                             (cdr (assoc "retry-after" headers :test #'string-equal))
+                             "2")
+                      (check "and the refusal's body"
+                             (and body (search "connection limit" body) t) t))
+                    (request-expecting-refusal))
+               (setf web-skeleton::*descriptor-limit* recorded))
+             (check "control: at the real limit the next one is served"
+                    (nth-value 0 (test-http-request :get "/"))
+                    200)))
+      (setf web-skeleton::*log-stream* saved-stream))
+    (let* ((text (get-output-stream-string log))
+           (lines (loop with start = 0
+                        for i = (search "descriptors nearly out" text :start2 start)
+                        while i count t do (setf start (1+ i)))))
+      (check "the log names the limit met, once for two refusals" lines 1)
+      (check "and not the connection limit"
+             (and (search "connection limit reached" text) t) nil))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -3110,32 +4882,32 @@
              (web-skeleton::decode-chunked-body raw (+ hend 4) (length raw))
              :external-format :ascii)
           (error (e) (princ-to-string e))))))
+
 (defun test-harness-fetch-into-relay-e2e ()
-  "The relay DEPLOYMENT.md described, now that it dials — and through the
-   real resolver.
+  "The relay DEPLOYMENT.md describes, end to end — and through the real
+   resolver.
 
    A streaming response whose :ON-OPEN starts a fetch, forwards each chunk
    into its own body as the framing proves it, and closes when the upstream
-   is done. Before FETCH-INTO this built a continuation inside :ON-OPEN and
-   dropped it: the client got a 200 with chunked framing that never
-   terminated, held for *STREAM-IDLE-TIMEOUT*, then a truncated body with
-   no error anywhere.
+   is done. A continuation built inside :ON-OPEN and dropped would leave
+   the client a 200 with chunked framing that never terminated, held for
+   *STREAM-IDLE-TIMEOUT*, then a truncated body with no error anywhere.
 
-   Asserted on the decoded body rather than on bytes arriving, because the
-   defect's signature was a body that never terminated — a check that only
-   looked for content would have passed against it.
+   Asserted on the decoded body rather than on bytes arriving, because
+   that failure's signature is a body that never terminates — a check that
+   only looked for content would pass against it.
 
    The upstream is dialled by **name**, which is what makes this the only
    e2e in the suite to reach INITIATE-DNS-LOOKUP on its success path. Every
    other FETCH-INTO here dials an IP literal and takes INITIATE-HTTP-FETCH's
-   PARSE-IPV4-LITERAL fast path straight past it — which is how three
-   defects lived in that function behind a green suite.
+   PARSE-IPV4-LITERAL fast path straight past it, so a defect in that
+   function would live behind a green suite.
 
    Both ends are moved together rather than one end being assumed. The
    listener binds whatever RESOLVE-HOST-BLOCKING answers for the same name
    the fetch will dial, and CONNECT-TO-TEST-SERVER dispatches the client
    socket on that vector's length exactly as MAKE-TCP-LISTENER dispatches
-   the bind. So the family is whatever this machine's resolver prefers, and
+   the bind. So the family is whatever the host's resolver prefers, and
    agreement is by construction rather than by assumption: a host whose
    /etc/hosts orders `::1 localhost` first binds and dials v6, one that
    orders IPv4 first binds and dials v4, and neither can reach a listener
@@ -3204,15 +4976,121 @@
       (check "fetch-into relay: no outbound left behind"
              (census-await :outbound 0) 0))))
 
+(defun test-harness-fetch-into-relays-to-a-slow-client-e2e ()
+  "A relay into a client slower than its upstream delivers the whole body,
+   pausing the way DEPLOYMENT.md says to: when STREAM-SEND answers NIL.
+
+   The upstream sends a hundred chunks of 8 KiB at once, and the client
+   says nothing for a second before it reads. The target's send buffer and
+   the client's receive buffer are both shrunk to a few KiB, and
+   *MAX-WRITE-BACKLOG* to 64 KiB, so the relay is far ahead of the client
+   almost at once. The pause has to take effect at the chunk it was given
+   for. A pass carries many chunks, and each one handed over after the
+   verdict would land in the queue the pause is protecting, until
+   STREAM-SEND refused one and the fetch failed with the stream left
+   unterminated.
+
+   Asserted on the decoded body, on how the stream ended, and on the pause
+   count. The count is the non-vacuity check: with no pause at all, a body
+   arriving whole would show only that the buffers were larger than this
+   arranged."
+  (format t "~%Harness: fetch-into, relaying to a client that reads slowly~%")
+  (let* ((pauses 0)
+         (ended :never)
+         (chunk-size 8192)
+         (payloads (loop for i below 100
+                         collect (make-string chunk-size
+                                              :initial-element
+                                              (code-char (+ 65 (mod i 26))))))
+         (expected (apply #'concatenate 'string payloads))
+         (script (append (list (%crlf-lines "HTTP/1.1 200 OK"
+                                      "Transfer-Encoding: chunked" ""))
+                         (loop for p in payloads
+                               collect (%crlf-lines (format nil "~x" chunk-size) p))
+                         (list (%crlf-lines "0" ""))))
+         (saved-backlog web-skeleton:*max-write-backlog*)
+         (saved-ws-message web-skeleton:*max-ws-message-size*))
+    ;; Global, not bound: the worker threads read them, and a LET here
+    ;; would be invisible to them. START-SERVER refuses a backlog that
+    ;; cannot hold a maximal WebSocket message, so that cap comes down too.
+    (setf web-skeleton:*max-write-backlog* (* 64 1024)
+          web-skeleton:*max-ws-message-size* (* 32 1024))
+    (unwind-protect
+         (%call-with-scripted-upstream
+          script
+          (lambda (up-port)
+            (with-test-server
+                (:handler
+                 (lambda (req)
+                   (declare (ignore req))
+                   (make-stream-response
+                    :on-open
+                    (lambda (client)
+                      ;; The kernel doubles a send buffer and keeps its own
+                      ;; floor, so this asks for as small as it will give.
+                      (web-skeleton::set-socket-option-int
+                       (web-skeleton::connection-fd client)
+                       web-skeleton::+sol-socket+ +so-sndbuf+ 4096)
+                      (fetch-into
+                       client
+                       (http-fetch
+                        :get (format nil "http://127.0.0.1:~d/body" up-port)
+                        :on-body (lambda (out chunk)
+                                   (declare (ignore out))
+                                   (unless (stream-send client chunk)
+                                     (incf pauses)
+                                     :pause))
+                        :then (lambda (status headers body)
+                                (declare (ignore headers body))
+                                (when status (stream-close client))
+                                nil))))
+                    :on-close (lambda (c reason)
+                                (declare (ignore c))
+                                (setf ended reason)))))
+              (let ((socket (make-instance (if (= (length *test-host*) 16)
+                                               'sb-bsd-sockets:inet6-socket
+                                               'sb-bsd-sockets:inet-socket)
+                                           :type :stream :protocol :tcp)))
+                ;; The receive buffer, set before the connect so the window the
+                ;; server sees is the small one from the start.
+                (web-skeleton::set-socket-option-int
+                 (sb-bsd-sockets:socket-file-descriptor socket)
+                 web-skeleton::+sol-socket+ +so-rcvbuf+ 4096)
+                (sb-bsd-sockets:socket-connect socket *test-host* *test-port*)
+                (let ((stream (sb-bsd-sockets:socket-make-stream
+                               socket :input t :output t
+                               :element-type '(unsigned-byte 8))))
+                  (unwind-protect
+                       (progn
+                         (%send-raw-get stream "/relay" :extra
+                                        (format nil "Connection: close~c~c"
+                                                #\Return #\Newline))
+                         ;; Behind from the start.
+                         (sleep 1)
+                         (let* ((buf (read-until-bounded stream :seconds 20))
+                                (raw (subseq buf 0 (fill-pointer buf)))
+                                (body (%decode-streamed-body raw)))
+                           (check "slow client: the whole body arrived, framed and in order"
+                                  (list (length body) (equal body expected))
+                                  (list (length expected) t))))
+                    (ignore-errors (close stream))
+                    (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+              (check "slow client: the relay paused on the client's queue"
+                     (plusp pauses) t)
+              (check "slow client: and the stream ended as a finished one"
+                     ended :done))))
+      (setf web-skeleton:*max-write-backlog* saved-backlog
+            web-skeleton:*max-ws-message-size* saved-ws-message))))
+
 (defun test-harness-fetch-into-dns-failure-e2e ()
   "A detached fetch to a name that will not resolve, end to end, through the
    real resolver.
 
-   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all, and there
-   were none before them. Every other e2e FETCH-INTO dials an IP literal,
-   which takes INITIATE-HTTP-FETCH's fast path on PARSE-IPV4-LITERAL and
-   never enters the function — which is how three defects lived there
-   behind a green suite. Every unit detector for them drives the seam; this
+   One of two e2e tests that reach INITIATE-DNS-LOOKUP at all. Every other
+   e2e FETCH-INTO dials an IP literal, which takes INITIATE-HTTP-FETCH's
+   fast path on PARSE-IPV4-LITERAL and never enters the function, so a
+   defect there would live behind a green suite. Every unit detector for
+   that function drives the seam; this
    one spawns getent.
 
    RFC 2606 reserves .invalid, so the lookup fails on every machine and
@@ -3317,22 +5195,21 @@
 (defun test-harness-ipv6-listener-e2e ()
   "The listener binds IPv6, and the harness can reach it.
 
-   MAKE-TCP-LISTENER has dispatched the socket family on the host vector's
-   length since it was written, and README documents all four forms — and
-   nothing in this suite had ever passed it sixteen bytes. The :HOST
-   plumbing makes that reachable; this is what reaches it.
+   MAKE-TCP-LISTENER dispatches the socket family on the host vector's
+   length, and README documents all four forms. This is the test that
+   passes it sixteen bytes, through the harness's :HOST plumbing.
 
    Not a detector for a defect in the framework, and it should not be read
-   as one: the v6 bind was correct before this branch and is correct after.
-   It is a detector for the *harness* code the branch added, which is new
-   and untested surface — CONNECT-TO-TEST-SERVER dispatching the client
-   family from the same vector MAKE-TCP-LISTENER dispatches the bind from.
-   Pin that branch to INET-SOCKET and this is the only test that notices.
+   as one: the v6 bind is right with or without it. It is a detector for
+   the *harness* code, which nothing else exercises —
+   CONNECT-TO-TEST-SERVER dispatching the client family from the same
+   vector MAKE-TCP-LISTENER dispatches the bind from. Pin that branch to
+   INET-SOCKET and this is the only test that notices.
 
    The other e2e tests cannot reach it. Their :HOST is either the literal
    four-byte loopback or whatever RESOLVE-HOST-BLOCKING answers for
    `localhost`, and that is IPv4 on any machine ordering IPv4 first in
-   /etc/hosts — this one, and the GitHub ubuntu runner. Depending on the
+   /etc/hosts, the GitHub ubuntu runner among them. Depending on the
    resolver to hand us a v6 address is exactly the environment dependence
    the relay test exists to avoid, so the address is named outright here.
 
@@ -3433,8 +5310,8 @@
    They fail in different directions and a single \"it signals\" check
    would cover one of them by accident. And a refused call must leave
    nothing behind — no outbound, and a callback that never fired — which
-   is the one place on this branch where zero is the right answer for a
-   counter.
+   is the one place among the FETCH-INTO tests where zero is the right
+   answer for a counter.
 
    The two disposition refusals bring a seventh check that is not a
    refusal: the same argument on the target it is meant for has to get
@@ -3472,13 +5349,18 @@
                :signalled))
       ;; Already outstanding. Two would race to apply the disposition and
       ;; whichever finished first would close the target under the other.
+      ;; On this worker's table, or the table guard ahead of this one
+      ;; refuses it first; and asserted on the text, so that guard cannot
+      ;; pass for this one.
       (let ((conn (web-skeleton::make-connection
                    :fd 1 :state :streaming :fetch-outstanding t))
-            (web-skeleton::*epoll-fd* 99))
+            (web-skeleton::*epoll-fd* 99)
+            (web-skeleton::*connections* (make-hash-table :test #'eql)))
+        (web-skeleton::register-connection conn)
         (check "refusal: a second outstanding fetch signals"
                (handler-case (progn (fetch-into conn (cont)) :no-signal)
-                 (error () :signalled))
-               :signalled))
+                 (error (e) (and (search "already has" (princ-to-string e)) :outstanding)))
+               :outstanding))
       ;; The three disposition refusals assert on the error's *text* where
       ;; the four above assert only that something signalled. Not a style
       ;; difference: these three fail into each other. With no event loop
@@ -3532,16 +5414,27 @@
       ;; the marker is set and then cleared, which is the setup-failure
       ;; path below.
       ;;
-      ;; What is worth asserting here is the property these four share
-      ;; that the marker cannot show: refusing did not consume the
-      ;; continuation, so the same one still reaches the next refusal
-      ;; rather than having been spent on the last.
-      (let ((conn (web-skeleton::make-connection
-                   :fd 1 :state :streaming :fetch-outstanding t)))
+      ;; What is worth asserting here is the property these share that the
+      ;; marker cannot show: refusing did not consume the continuation. One
+      ;; continuation, held, goes through two refusals in turn and comes
+      ;; out of both as it went in, its sink untouched, so the second
+      ;; refusal is the guard's own and not one for a fetch already spent.
+      (let* ((same (cont))
+             (sink-before (web-skeleton::http-fetch-continuation-sink same))
+             (wrong-state (web-skeleton::make-connection :fd 1 :state :read-http))
+             (outstanding (web-skeleton::make-connection
+                           :fd 1 :state :streaming :fetch-outstanding t))
+             (web-skeleton::*epoll-fd* 99)
+             (web-skeleton::*connections* (make-hash-table :test #'eql)))
+        (web-skeleton::register-connection outstanding)
         (check "refusal: refusing does not consume the continuation"
-               (handler-case (progn (fetch-into conn (cont)) :no-signal)
-                 (error () :signalled))
-               :signalled)
+               (list (handler-case (progn (fetch-into wrong-state same) :no-signal)
+                       (error (e) (and (search "state" (princ-to-string e)) :wrong-state)))
+                     (handler-case (progn (fetch-into outstanding same) :no-signal)
+                       (error (e) (and (search "already has" (princ-to-string e))
+                                       :outstanding)))
+                     (eq (web-skeleton::http-fetch-continuation-sink same) sink-before))
+               '(:wrong-state :outstanding t))
         (check "refusal: and still fired no callback" fires 0)))))
 
 (defun test-harness-detached-deadline-sweep ()
@@ -3563,21 +5456,20 @@
    the socket is held until the process ends and the app's :THEN never
    fires — the leak the abort sentinel exists to prevent.
 
-   The arm was not uncovered before this, and saying otherwise would be
-   the overstatement this branch keeps deleting:
-   TEST-HARNESS-FETCH-INTO-UPSTREAM-STALLS-E2E fails when it is removed,
-   because the sentinel does not arrive. What that test cannot see is
-   everything after the callback — it has no way to look inside the
-   worker's connection table. So what is new here is the reclamation
-   rather than the notification: the outbound is actually unregistered,
-   the callback fired exactly once rather than merely at least once, and
-   the target got DELIVER-DETACHED's disposition instead of being left
-   open behind a body that stopped.
+   The arm has other coverage, and saying otherwise would be an
+   overstatement: TEST-HARNESS-FETCH-INTO-UPSTREAM-STALLS-E2E fails when
+   it is removed, because the sentinel does not arrive. What that test
+   cannot see is everything after the callback — it has no way to look
+   inside the worker's connection table. So what this one adds is the
+   reclamation rather than the notification: the outbound is actually
+   unregistered, the callback fired exactly once rather than merely at
+   least once, and the target got DELIVER-DETACHED's disposition instead
+   of being left open behind a body that stopped.
 
-   **The target is deliberately left alive.** The first version of this
-   test closed it, which proved nothing: CLOSE-CONNECTION walks a dying
-   target's detached outbounds and reaps them itself, so every assertion
-   below passed with the sweeper's arm deleted outright. That walk is
+   **The target is deliberately left alive.** Closing it would prove
+   nothing: CLOSE-CONNECTION walks a dying target's detached outbounds and
+   reaps them itself, so every assertion below would pass with the
+   sweeper's arm deleted outright. That walk is
    real and covered by TEST-HARNESS-FETCH-INTO-TARGET-CLOSED-E2E. A live
    target is what leaves the sweeper as the only remaining reaper, which
    is the whole point of the arm.
@@ -3648,6 +5540,81 @@
                   (web-skeleton::lookup-connection
                    (web-skeleton::connection-fd target))
                   nil))
+      (ignore-errors (web-skeleton::%close epfd))
+      (ignore-errors (sb-bsd-sockets:socket-close target-sock))
+      (ignore-errors (sb-bsd-sockets:socket-close out-sock)))))
+
+(defun test-harness-detached-deadline-spares-a-draining-pause ()
+  "A paused detached outbound past its deadline is left alone while the
+   target it relays into still has a backlog draining.
+
+   The pause is waiting on that drain, and the drain is the client's to
+   take: a slow link emptying a full queue can outlast *FETCH-TIMEOUT*, and
+   reaping the relay then cuts a healthy body short. The target's
+   *WRITE-STALL-TIMEOUT* bounds it instead — a queue that stops moving
+   closes the target, and the target's teardown reaps the outbound.
+   TEST-HARNESS-DETACHED-DEADLINE-SWEEP is the other half: the same
+   fixture over an empty queue, where nothing is coming and the deadline
+   still reaps it.
+
+   The target's own fate is asserted too. Its queue moved a moment ago,
+   so neither the stall arm nor the stream's idle clock may take it,
+   though it produced nothing for longer than *STREAM-IDLE-TIMEOUT*."
+  (format t "~%Harness: a paused relay with a draining target, past its deadline~%")
+  (let* ((fires 0)
+         (target-sock (make-instance 'sb-bsd-sockets:inet-socket
+                                     :type :stream :protocol :tcp))
+         (out-sock (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream :protocol :tcp))
+         (epfd (web-skeleton::epoll-create))
+         (web-skeleton::*connections* (make-hash-table)))
+    (unwind-protect
+         (let* ((target (web-skeleton::make-connection
+                         :fd (web-skeleton::socket-fd target-sock)
+                         :socket target-sock
+                         :state :streaming
+                         :stream-framing :chunked
+                         ;; Produced nothing for an hour: only the moving
+                         ;; queue keeps this stream from being idle.
+                         :stream-produced-at (- (get-universal-time) 3600)
+                         :last-active (get-universal-time)))
+                (out (web-skeleton::make-connection
+                      :fd (web-skeleton::socket-fd out-sock)
+                      :socket out-sock
+                      :state :out-read
+                      :outbound-p t
+                      :fetch-sink :detached
+                      :fetch-method :GET
+                      :fetch-paused t
+                      :fetch-paused-at (- (get-universal-time) 120)
+                      :fetch-started-at (- (get-universal-time) 600)
+                      :fetch-deadline (- (get-universal-time) 300)
+                      :inbound-fd (web-skeleton::socket-fd target-sock)
+                      :last-active (get-universal-time)
+                      :fetch-callback
+                      (lambda (status headers body)
+                        (declare (ignore status headers body))
+                        (incf fires)
+                        nil))))
+           (web-skeleton::register-connection target)
+           (web-skeleton::register-connection out)
+           ;; The backlog, queued now, so its progress clock is fresh.
+           (web-skeleton::connection-append-write
+            target (sb-ext:string-to-octets "draining" :external-format :ascii))
+           (check "draining pause: the target has a backlog"
+                  (plusp (web-skeleton::connection-write-pending target)) t)
+           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           (check "draining pause: the outbound is still registered"
+                  (and (web-skeleton::lookup-connection
+                        (web-skeleton::connection-fd out))
+                       t)
+                  t)
+           (check "draining pause: and its callback has not fired" fires 0)
+           (check "draining pause: the target stream is still open"
+                  (and (web-skeleton::lookup-connection
+                        (web-skeleton::connection-fd target))
+                       t)
+                  t))
       (ignore-errors (web-skeleton::%close epfd))
       (ignore-errors (sb-bsd-sockets:socket-close target-sock))
       (ignore-errors (sb-bsd-sockets:socket-close out-sock)))))
@@ -3764,17 +5731,16 @@
                            (raw (subseq buf 0 (fill-pointer buf)))
                            (decoded (%decode-streamed-body raw)))
                       (check "upstream stall: the bytes already relayed arrived"
-                             (search "partial"
-                                     (sb-ext:octets-to-string
-                                      raw :external-format :latin-1))
-                             (search "partial"
-                                     (sb-ext:octets-to-string
-                                      raw :external-format :latin-1)))
+                             (not (null (search "partial"
+                                                (sb-ext:octets-to-string
+                                                 raw :external-format :latin-1))))
+                             t)
                       ;; The property. A terminator here would claim the
-                      ;; body was whole.
+                      ;; body was whole, and the decode would succeed;
+                      ;; failing, it answers its error's text.
                       (check "upstream stall: the client's decode fails"
-                             (search "chunked" decoded)
-                             (search "chunked" decoded))
+                             (not (null (search "chunked" decoded)))
+                             t)
                       (check "upstream stall: decode did not succeed short"
                              (string= decoded "partial") nil)))
                (ignore-errors (close stream))
@@ -3784,15 +5750,2700 @@
                   (census-await :outbound 0) 0))
       (setf web-skeleton:*fetch-timeout* saved))))
 
+(defun test-harness-fetch-into-refuses-malformed-chunks-e2e ()
+  "A relay refuses an upstream body that a buffered fetch refuses.
+
+   :ON-BODY is handed each chunk as the walk proves it, and nothing reads
+   a relayed body after that: COMPLETE-FETCH does not decode what has
+   already been delivered. The walk is the only judge such a body meets,
+   so it has to refuse what DECODE-CHUNKED-BODY refuses — here, chunk data
+   followed by two bytes that are not its CRLF. Accepted, the relay would
+   forward `hello` as a whole body, terminator and all, where a buffered
+   fetch of the same upstream answers 502, and it would drop the two bytes
+   it took for a CRLF.
+
+   The upstream is a byte-vector response from the test server itself, so
+   the framing reaches the wire exactly as written."
+  (format t "~%Harness: fetch-into refuses framing the decoder refuses~%")
+  (let ((port-box (list nil))
+        (handed nil)
+        (outcome nil))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (search "/up" (http-request-path req))
+               (%ascii (format nil "HTTP/1.1 200 OK~a~
+                                    Transfer-Encoding: chunked~a~
+                                    Connection: close~a~a~
+                                    5~ahelloXX0~a~a"
+                               *crlf* *crlf* *crlf* *crlf*
+                               *crlf* *crlf* *crlf*))
+               (make-stream-response
+                :on-open
+                (lambda (client)
+                  (fetch-into
+                   client
+                   (http-fetch
+                    :get (format nil "http://127.0.0.1:~d/up" (first port-box))
+                    :on-body (lambda (out chunk)
+                               (declare (ignore out))
+                               (push chunk handed)
+                               (stream-send client chunk)
+                               nil)
+                    :then (lambda (status headers body)
+                            (declare (ignore headers body))
+                            (setf outcome (if status :delivered :aborted))
+                            nil))))))))
+      (setf (first port-box) *test-port*)
+      (multiple-value-bind (socket stream) (%raw-connect)
+        (unwind-protect
+             (progn
+               (%send-raw-get stream "/relay" :extra
+                              (format nil "Connection: close~a" *crlf*))
+               (let* ((buf (read-until-bounded stream :seconds 5))
+                      (raw (subseq buf 0 (fill-pointer buf))))
+                 (check "malformed upstream: none of its body reached the client"
+                        (search "hello" (sb-ext:octets-to-string
+                                         raw :external-format :latin-1))
+                        nil)
+                 (check "malformed upstream: the client's body does not decode"
+                        (string= (%decode-streamed-body raw) "hello")
+                        nil)))
+          (ignore-errors (close stream))
+          (ignore-errors (sb-bsd-sockets:socket-close socket))))
+      (check "malformed upstream: :on-body was handed nothing" handed nil)
+      (check "malformed upstream: :then saw the abort sentinel" outcome :aborted)
+      (check "malformed upstream: no outbound left behind"
+             (census-await :outbound 0) 0))))
+
+(defun %raw-exchange (bytes &key (seconds 5) (half-close t))
+  "Send BYTES on a fresh connection to the test server and return all it
+   answered before closing, as a latin-1 string. HALF-CLOSE NIL keeps the
+   write side open, for a client that is still owed something — the one
+   that sent Expect: 100-continue and is waiting to be told to go on."
+  (multiple-value-bind (socket stream) (%raw-connect)
+    (unwind-protect
+         (progn
+           (write-sequence bytes stream)
+           (force-output stream)
+           (when half-close
+             (ignore-errors
+              (sb-bsd-sockets:socket-shutdown socket :direction :output)))
+           (let ((buf (read-until-bounded stream :seconds seconds)))
+             (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                      :external-format :latin-1)))
+      (ignore-errors (close stream))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun %post-bytes (path body &key (headers '()) chunked (version "1.1"))
+  "A POST of BODY to PATH, framed by Content-Length, or as one chunk and
+   the terminator when CHUNKED, with HEADERS added. Bytes, ready to send."
+  (%ascii
+   (with-output-to-string (s)
+     (format s "POST ~a HTTP/~a~aHost: localhost~a" path version *crlf* *crlf*)
+     (if chunked
+         (format s "Transfer-Encoding: chunked~a" *crlf*)
+         (format s "Content-Length: ~d~a" (length body) *crlf*))
+     (dolist (h headers) (format s "~a~a" h *crlf*))
+     (format s "~a" *crlf*)
+     (if chunked
+         (format s "~x~a~a~a0~a~a" (length body) *crlf* body *crlf* *crlf* *crlf*)
+         (format s "~a" body)))))
+
+(defun test-harness-body-handler-e2e ()
+  "A body handler, end to end: asked at the head with the body not yet
+   read, and obeyed — the default, a cap of the request's own either side
+   of *MAX-BODY-SIZE*, or an answer before the body.
+
+   *MAX-BODY-SIZE* is 16 for the run, so a 40-byte body is over the
+   default and under the 64 /big chooses. The handler answers the path and
+   the body's length, which says both which request it was handed and how
+   much of it arrived.
+
+   SETF rather than LET for *MAX-BODY-SIZE*: the worker reads it, and
+   dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: body handler, end to end~%")
+  (let ((saved web-skeleton:*max-body-size*)
+        (lock (sb-thread:make-mutex :name "body-handler-seen"))
+        (seen nil))
+    (setf web-skeleton:*max-body-size* 16)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (make-text-response
+                 200 (format nil "~a:~d" (http-request-path req)
+                             (length (or (http-request-body req) #())))))
+              :body-handler
+              (lambda (req)
+                (sb-thread:with-mutex (lock)
+                  (push (list (http-request-path req)
+                              (http-request-body req)
+                              (get-header req "x-probe"))
+                        seen))
+                (let ((path (http-request-path req)))
+                  (cond ((string= path "/big") (buffer-body :max-size 64))
+                        ((string= path "/small") (buffer-body :max-size 4))
+                        ((string= path "/deny") (make-text-response 401 "no"))
+                        ((string= path "/raise") (error "deliberate: body handler"))
+                        ((string= path "/junk") 42)
+                        (t nil)))))
+           (let ((forty (make-string 40 :initial-element #\x))
+                 (ten (make-string 10 :initial-element #\y)))
+             ;; ---- what the body handler is handed ----
+             (check "body handler: NIL reads the body as without one"
+                    (and (search "/plain:10" (%raw-exchange
+                                              (%post-bytes "/plain" ten
+                                                           :headers '("X-Probe: p1"))))
+                         t)
+                    t)
+             (check "body handler: handed the parsed head, and no body"
+                    (sb-thread:with-mutex (lock)
+                      (find "p1" seen :key #'third :test #'equal))
+                    '("/plain" nil "p1"))
+             (check "body handler: not asked about a request without a body"
+                    (progn
+                      (%raw-exchange (%ascii (format nil "GET /nobody HTTP/1.1~a~
+                                                          Host: x~aConnection: close~a~a"
+                                                     *crlf* *crlf* *crlf* *crlf*)))
+                      (sb-thread:with-mutex (lock)
+                        (find "/nobody" seen :key #'first :test #'equal)))
+                    nil)
+             ;; ---- caps either side of the default ----
+             (check "buffer-body: a cap above *max-body-size* takes a larger body"
+                    (and (search "200 OK" (%raw-exchange (%post-bytes "/big" forty)))
+                         (search "/big:40" (%raw-exchange (%post-bytes "/big" forty)))
+                         t)
+                    t)
+             (check "buffer-body: and a chunked one"
+                    (and (search "/big:40" (%raw-exchange
+                                            (%post-bytes "/big" forty :chunked t)))
+                         t)
+                    t)
+             (check "control: the same body without the plan is over the default"
+                    (and (search "413" (%raw-exchange (%post-bytes "/plain" forty)))
+                         t)
+                    t)
+             (check "buffer-body: a cap below *max-body-size* refuses, with 413"
+                    (and (search "413" (%raw-exchange (%post-bytes "/small" ten)))
+                         t)
+                    t)
+             (check "buffer-body: and refuses a chunked body as it arrives"
+                    (and (search "413" (%raw-exchange
+                                        (%post-bytes "/small" ten :chunked t)))
+                         t)
+                    t)
+             ;; ---- an answer before the body ----
+             ;; The client asked to be told whether to send its body and was
+             ;; told no: the answer arrives with the body never sent, without
+             ;; a 100 Continue ahead of it, and the server closes after it.
+             (let ((answer (%raw-exchange
+                            (%ascii (format nil "POST /deny HTTP/1.1~aHost: x~a~
+                                                 Content-Length: 4096~a~
+                                                 Expect: 100-continue~a~a"
+                                            *crlf* *crlf* *crlf* *crlf* *crlf*))
+                            :half-close nil)))
+               (check "answered before the body: the client is told 401, first"
+                      (search "HTTP/1.1 401" answer) 0)
+               (check "answered before the body: no 100 Continue invited it"
+                      (search "100 Continue" answer) nil)
+               (check "answered before the body: and the connection closes after it"
+                      (and (search "connection: close" answer) t) t))
+             (check "answered before the body: a body sent anyway changes nothing"
+                    (and (search "HTTP/1.1 401" (%raw-exchange (%post-bytes "/deny" ten)))
+                         t)
+                    t)
+             ;; ---- a body handler that fails ----
+             (check "body handler raising: the request is answered 500"
+                    (and (search "HTTP/1.1 500" (%raw-exchange (%post-bytes "/raise" ten)))
+                         t)
+                    t)
+             (check "body handler answering nonsense: 500"
+                    (and (search "HTTP/1.1 500" (%raw-exchange (%post-bytes "/junk" ten)))
+                         t)
+                    t)
+             ;; ---- Expect: 100-continue, accepted ----
+             ;; The head arrives alone, so the interim really is waited for:
+             ;; it goes out once the body handler has accepted the body.
+             (let ((answer (%raw-http-split-send
+                            (%ascii (format nil "POST /big HTTP/1.1~aHost: x~a~
+                                                 Content-Length: 40~a~
+                                                 Expect: 100-continue~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+                            (%ascii forty))))
+               (check "accepted with Expect: 100 Continue, then the answer"
+                      (let ((interim (search "HTTP/1.1 100 Continue" answer))
+                            (final (search "/big:40" answer)))
+                        (and interim final (< interim final) t))
+                      t))
+             ;; ---- the decision is the request's, not the connection's ----
+             ;; Two requests on one connection: /big's cap admits its forty
+             ;; bytes, and the request after it, which no plan covers, is held
+             ;; to the default again.
+             (let ((answer (%raw-exchange
+                            (concatenate '(vector (unsigned-byte 8))
+                                         (%post-bytes "/big" forty)
+                                         (%post-bytes "/plain" (subseq forty 0 20))))))
+               (check "keep-alive: the first request had its plan's cap"
+                      (and (search "/big:40" answer) t) t)
+               (check "keep-alive: the next one is held to the default again"
+                      (and (search "413" answer)
+                           (< (search "/big:40" answer) (search "413" answer))
+                           t)
+                      t))))
+      (setf web-skeleton:*max-body-size* saved))))
+
+(defun %pseudo-random-bytes (n seed)
+  "N bytes from a fixed linear-congruential sequence: the same body every
+   run, and no run of it that looks like chunked framing by design."
+  (let ((v (make-array n :element-type '(unsigned-byte 8)))
+        (x seed))
+    (dotimes (i n v)
+      (setf x (mod (+ (* x 1103515245) 12345) 2147483648)
+            (aref v i) (ldb (byte 8 16) x)))))
+
+(defun test-harness-receive-body-e2e ()
+  "A received body, end to end: handed to ON-DATA as it arrives, answered
+   by ON-END, ended by ON-ABORT exactly once on every way it can fail.
+
+   The body handler receives every path that starts /recv, accumulating
+   what ON-DATA is handed and answering with its length and SHA-256, so a
+   body that arrives reordered, short or doubled answers wrongly. The
+   other paths each fail one way, and ON-ABORT records the path and the
+   reason, so each failure is checked against the request that caused it.
+
+   The large bodies are what the window is for. A 4 MiB Content-Length
+   body is more than a wake-up hands over, so it goes through the yield; a
+   3 MiB body sent as a single chunk can only arrive whole if chunks are
+   handed over before they have landed. Both are checked for the read
+   buffer staying at the head and one window."
+  (format t "~%Harness: received bodies, end to end~%")
+  (let* ((lock (sb-thread:make-mutex :name "receive-e2e"))
+         (aborts nil)
+         (handed (make-hash-table :test #'equal))
+         (widest (make-hash-table :test #'equal))
+         (port-box (list nil)))
+    (flet ((note (table path value fn)
+             (sb-thread:with-mutex (lock)
+               (setf (gethash path table) (funcall fn (gethash path table 0) value))))
+           (aborted (path)
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r)))
+           (await-abort (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (make-text-response 200 (format nil "handler:~a" (http-request-path req))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (flet ((recv (&key (max-size (* 64 1024 1024)) data end)
+                        (let ((acc (make-array 0 :element-type '(unsigned-byte 8)
+                                                 :adjustable t :fill-pointer 0))
+                              (calls 0))
+                          (receive-body
+                           :max-size max-size
+                           :on-data
+                           (lambda (conn bytes)
+                             ;; From the second piece on, the buffer is the
+                             ;; head and one window.
+                             (when (> (incf calls) 1)
+                               (note widest path
+                                     (length (web-skeleton::connection-read-buf conn))
+                                     #'max))
+                             (note handed path (length bytes) #'+)
+                             (loop for b across bytes do (vector-push-extend b acc))
+                             (when data (funcall data bytes)))
+                           :on-end
+                           (lambda (conn)
+                             (declare (ignore conn))
+                             (if end
+                                 (funcall end acc)
+                                 (make-text-response
+                                  200 (format nil "~a:~d:~a" path (length acc)
+                                              (sha256-hex acc)))))
+                           :on-abort
+                           (lambda (conn reason)
+                             (declare (ignore conn))
+                             (sb-thread:with-mutex (lock)
+                               (push (cons path reason) aborts)))))))
+                 (cond
+                   ((string= path "/cap") (recv :max-size 1000))
+                   ((string= path "/refuse")
+                    (recv :data (lambda (b) (declare (ignore b))
+                                  (make-text-response 415 "not this"))))
+                   ((string= path "/raise-data")
+                    (recv :data (lambda (b) (declare (ignore b))
+                                  (error "deliberate: on-data"))))
+                   ((string= path "/raise-end")
+                    (recv :end (lambda (acc) (declare (ignore acc))
+                                 (error "deliberate: on-end"))))
+                   ((string= path "/end-upgrade")
+                    (recv :end (lambda (acc) (declare (ignore acc)) :upgrade)))
+                   ((string= path "/end-ws-upgrade")
+                    (recv :end (lambda (acc) (declare (ignore acc)) (ws-upgrade))))
+                   ((string= path "/unbounded") (recv :max-size nil))
+                   ((string= path "/fetch")
+                    (recv :end (lambda (acc)
+                                 (http-fetch
+                                  :get (format nil "http://127.0.0.1:~d/plain"
+                                               (first port-box))
+                                  :then (lambda (status headers body)
+                                          (declare (ignore headers))
+                                          (make-text-response
+                                           200 (format nil "fetched:~d:~a:~d" status
+                                                       (sb-ext:octets-to-string
+                                                        body :external-format :ascii)
+                                                       (length acc))))))))
+                   ((eql 0 (search "/recv" path)) (recv))
+                   (t nil))))))
+        (setf (first port-box) *test-port*)
+        (labels ((head (path &rest lines)
+                   (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~{~a~a~}~a"
+                                   path *crlf* *crlf*
+                                   (loop for l in lines append (list l *crlf*))
+                                   *crlf*)))
+                 (bytes (&rest parts)
+                   (apply #'concatenate '(vector (unsigned-byte 8)) parts))
+                 (answer-of (&rest parts)
+                   (%raw-exchange (apply #'bytes parts) :seconds 15)))
+          ;; ---- received whole, in order, through every window ----
+          (let* ((body (%pseudo-random-bytes (* 4 1024 1024) 7))
+                 (answer (answer-of (head "/recv-cl" "Content-Length: 4194304"
+                                          "Connection: close")
+                                    body)))
+            (check "received: a 4 MiB body arrives whole and in order"
+                   (and (search (format nil "/recv-cl:4194304:~a" (sha256-hex body))
+                                answer)
+                        t)
+                   t)
+            (check "received: the buffer held the head and one window"
+                   (<= (gethash "/recv-cl" widest 0)
+                       (+ 200 web-skeleton::+receive-window+))
+                   t))
+          (let* ((body (%pseudo-random-bytes (* 3 1024 1024) 11))
+                 (answer (answer-of (head "/recv-one-chunk"
+                                          "Transfer-Encoding: chunked"
+                                          "Connection: close")
+                                    (%ascii (format nil "~x~a" (length body) *crlf*))
+                                    body
+                                    (%ascii (format nil "~a0~a~a" *crlf* *crlf* *crlf*)))))
+            (check "received: one 3 MiB chunk is handed over as it lands"
+                   (and (search (format nil "/recv-one-chunk:3145728:~a"
+                                        (sha256-hex body))
+                                answer)
+                        t)
+                   t)
+            (check "received: and the buffer still held one window"
+                   (<= (gethash "/recv-one-chunk" widest 0)
+                       (+ 200 web-skeleton::+receive-window+))
+                   t))
+          ;; ---- Expect: 100-continue, and keep-alive after ----
+          (let ((answer (%raw-http-split-send
+                         (head "/recv-continue" "Content-Length: 5"
+                               "Expect: 100-continue" "Connection: close")
+                         (%ascii "hello"))))
+            (check "received: the interim, then ON-END's answer"
+                   (let ((interim (search "100 Continue" answer))
+                         (final (search "/recv-continue:5:" answer)))
+                     (and interim final (< interim final) t))
+                   t))
+          (let ((answer (answer-of (head "/recv-keep" "Content-Length: 3")
+                                   (%ascii "abc")
+                                   (%ascii (format nil "GET /after HTTP/1.1~aHost: x~a~
+                                                        Connection: close~a~a"
+                                                   *crlf* *crlf* *crlf* *crlf*)))))
+            (check "received: the request after a received body is served"
+                   (and (search "/recv-keep:3:" answer)
+                        (search "handler:/after" answer)
+                        t)
+                   t))
+          ;; ---- ON-END answering with a fetch ----
+          (check "received: ON-END may answer with a fetch"
+                 (and (search "fetched:200:handler:/plain:4"
+                              (answer-of (head "/fetch" "Content-Length: 4"
+                                               "Connection: close")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          ;; ---- refused, each with its reason ----
+          (check "cap: a declared length over it is 413"
+                 (and (search "HTTP/1.1 413"
+                              (answer-of (head "/cap" "Content-Length: 1001")
+                                         (%ascii (make-string 1001 :initial-element #\c))))
+                      t)
+                 t)
+          (check "cap: the declared length's ON-ABORT heard :too-large, once"
+                 (aborted "/cap") '(:too-large))
+          (sb-thread:with-mutex (lock) (setf aborts nil))
+          (check "cap: a chunked body passing it is 413"
+                 (and (search "HTTP/1.1 413"
+                              (answer-of (head "/cap" "Transfer-Encoding: chunked")
+                                         (%ascii (format nil "3e8~a~a~a3e8~a~a~a0~a~a"
+                                                         *crlf* (make-string 1000 :initial-element #\c)
+                                                         *crlf* *crlf*
+                                                         (make-string 1000 :initial-element #\d)
+                                                         *crlf* *crlf* *crlf*))))
+                      t)
+                 t)
+          (check "cap: and nothing past the cap was handed over"
+                 (<= (gethash "/cap" handed 0) 1000) t)
+          (check "cap: the chunked body's ON-ABORT heard :too-large, once"
+                 (aborted "/cap") '(:too-large))
+          (check "refused: ON-DATA's answer is the client's"
+                 (and (search "HTTP/1.1 415"
+                              (answer-of (head "/refuse" "Content-Length: 4")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "refused: ON-ABORT heard :refused" (aborted "/refuse") '(:refused))
+          (check "raised in ON-DATA: 500"
+                 (and (search "HTTP/1.1 500"
+                              (answer-of (head "/raise-data" "Content-Length: 4")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "raised in ON-DATA: ON-ABORT heard :error" (aborted "/raise-data")
+                 '(:error))
+          (check "raised in ON-END: 500"
+                 (and (search "HTTP/1.1 500"
+                              (answer-of (head "/raise-end" "Content-Length: 4"
+                                               "Connection: close")
+                                         (%ascii "abcd")))
+                      t)
+                 t)
+          (check "raised in ON-END: ON-ABORT heard :error" (aborted "/raise-end")
+                 '(:error))
+          ;; A request whose body was read is no handshake, whichever way
+          ;; ON-END asks to switch protocols.
+          (check "ON-END answering :upgrade, or a WS-UPGRADE: 500 each"
+                 (loop for path in '("/end-upgrade" "/end-ws-upgrade")
+                       collect (and (search "HTTP/1.1 500"
+                                            (answer-of (head path "Content-Length: 4"
+                                                             "Connection: close")
+                                                       (%ascii "abcd")))
+                                    t))
+                 '(t t))
+          (check "malformed: chunked framing that is wrong is 400"
+                 (and (search "HTTP/1.1 400"
+                              (answer-of (head "/recv-malformed"
+                                               "Transfer-Encoding: chunked")
+                                         (%ascii (format nil "5~ahelloXX" *crlf*))))
+                      t)
+                 t)
+          (check "malformed: ON-ABORT heard :malformed" (aborted "/recv-malformed")
+                 '(:malformed))
+          ;; ---- the client leaving ----
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (write-sequence (bytes (head "/recv-gone" "Content-Length: 1000")
+                                   (%ascii "0123456789"))
+                            stream)
+            (force-output stream)
+            (sleep 0.2)
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (await-abort "/recv-gone")
+          (check "gone: ON-ABORT heard :disconnected" (aborted "/recv-gone")
+                 '(:disconnected))
+          (check "gone: what had arrived was handed over"
+                 (gethash "/recv-gone" handed 0) 10)
+          ;; A declared length no buffer could hold is no reason to refuse a
+          ;; body that is never buffered.
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (write-sequence (bytes (head "/unbounded" "Content-Length: 21474836480")
+                                   (%ascii "0123456789"))
+                            stream)
+            (force-output stream)
+            (sleep 0.2)
+            (ignore-errors (close stream))
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (await-abort "/unbounded")
+          (check "unbounded: a 20 GiB declaration is received, not refused"
+                 (list (gethash "/unbounded" handed 0) (aborted "/unbounded"))
+                 '(10 (:disconnected)))
+          ;; ---- exactly once ----
+          (check "once: no body that ended well heard ON-ABORT"
+                 (loop for path in '("/recv-cl" "/recv-one-chunk" "/recv-continue"
+                                     "/recv-keep" "/fetch")
+                       always (null (aborted path)))
+                 t)))
+      ;; A body still arriving when the server drains: the drain closes it,
+      ;; and ON-ABORT hears :SHUTDOWN. The connection is opened inside the
+      ;; server's extent and the check made once WITH-TEST-SERVER's
+      ;; teardown has drained it.
+      (let ((socket nil) (stream nil))
+        (unwind-protect
+             (progn
+               (with-test-server
+                   (:handler (lambda (req) (declare (ignore req))
+                               (make-text-response 200 "ok"))
+                    :body-handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (receive-body
+                       :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                       :on-end (lambda (conn) (declare (ignore conn))
+                                 (make-text-response 200 "done"))
+                       :on-abort (lambda (conn reason)
+                                   (declare (ignore conn))
+                                   (sb-thread:with-mutex (lock)
+                                     (push (cons "/drain" reason) aborts))))))
+                 (multiple-value-setq (socket stream) (%raw-connect))
+                 (write-sequence (%ascii (format nil "POST /drain HTTP/1.1~aHost: x~a~
+                                                      Content-Length: 1000~a~a0123"
+                                                 *crlf* *crlf* *crlf* *crlf*))
+                                 stream)
+                 (force-output stream)
+                 (sleep 0.2))
+               (check "shutdown: a body still arriving hears :shutdown"
+                      (aborted "/drain") '(:shutdown)))
+          (when stream (ignore-errors (close stream)))
+          (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
+
+(defun test-harness-receive-body-paused-e2e ()
+  "A received body forwarded a part at a time: ON-DATA collects a part,
+   starts a fetch carrying it with FETCH-INTO, and pauses; the fetch's
+   :THEN resumes the body with BODY-RESUME; ON-END answers with one last
+   fetch for the remainder. The shape of an upload ferried on to object
+   storage as it arrives.
+
+   The upstream is the test server's own /store, which records each part.
+   What is checked is what the shape depends on: every part arrives, in
+   order, the parts together are the body, and while the body is paused
+   ON-DATA is never called — the pause holds."
+  (format t "~%Harness: a received body paused on the fetches it starts~%")
+  (let* ((lock (sb-thread:make-mutex :name "paused-e2e"))
+         (stored nil)
+         (pauses 0)
+         (while-paused 0)
+         (paused nil)
+         (port-box (list nil))
+         (part-size (* 256 1024))
+         (body (%pseudo-random-bytes (+ (* 4 part-size) 100) 23)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/store")
+               (progn
+                 (sb-thread:with-mutex (lock)
+                   (push (copy-seq (http-request-body req)) stored))
+                 (make-text-response 200 "stored"))
+               (make-error-response 404)))
+         :body-handler
+         (lambda (req)
+           (when (string= (http-request-path req) "/upload")
+             (let ((part (make-array 0 :element-type '(unsigned-byte 8)
+                                       :adjustable t :fill-pointer 0))
+                   (parts 0))
+               (flet ((store (bytes then)
+                        (http-fetch :put (format nil "http://127.0.0.1:~d/store"
+                                                 (first port-box))
+                                    :body (coerce bytes '(simple-array (unsigned-byte 8) (*)))
+                                    :then then)))
+                 (receive-body
+                  :max-size nil
+                  :on-data
+                  (lambda (conn bytes)
+                    (when paused (incf while-paused))
+                    (loop for b across bytes do (vector-push-extend b part))
+                    (when (>= (fill-pointer part) part-size)
+                      (let ((whole (subseq part 0 part-size))
+                            (rest (subseq part part-size)))
+                        (setf (fill-pointer part) 0)
+                        (loop for b across rest do (vector-push-extend b part))
+                        (incf parts)
+                        (incf pauses)
+                        (setf paused t)
+                        (fetch-into conn
+                                    (store whole
+                                           (lambda (status headers b)
+                                             (declare (ignore headers b))
+                                             (setf paused nil)
+                                             (if (eql status 200)
+                                                 (body-resume conn)
+                                                 (body-refuse conn (make-error-response 502)))
+                                             nil)))
+                        :pause)))
+                  :on-end
+                  ;; What is left is stored a part at a time too, each part's
+                  ;; :THEN chaining the next, so the parts fall on the same
+                  ;; boundaries however the reads happened to cut the body.
+                  (lambda (conn)
+                    (declare (ignore conn))
+                    (labels ((next (from)
+                               (let ((to (min (fill-pointer part) (+ from part-size))))
+                                 (incf parts)
+                                 (store (subseq part from to)
+                                        (lambda (status headers b)
+                                          (declare (ignore headers b))
+                                          (if (and (eql status 200)
+                                                   (< to (fill-pointer part)))
+                                              (next to)
+                                              (make-text-response
+                                               (or status 502)
+                                               (format nil "parts:~d" parts))))))))
+                      (next 0)))))))))
+      (setf (first port-box) *test-port*)
+      (let ((answer (%raw-exchange
+                     (concatenate '(vector (unsigned-byte 8))
+                                  (%ascii (format nil "POST /upload HTTP/1.1~aHost: x~a~
+                                                       Content-Length: ~d~a~
+                                                       Connection: close~a~a"
+                                                  *crlf* *crlf* (length body) *crlf*
+                                                  *crlf* *crlf*))
+                                  body)
+                     :seconds 20)))
+        (check "paused: the upload is answered after its last part is stored"
+               (and (search "parts:5" answer) t) t)
+        (let ((parts (reverse (sb-thread:with-mutex (lock) stored))))
+          (check "paused: every part reached the upstream"
+                 (length parts) 5)
+          (check "paused: in order, together the body"
+                 (sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) parts))
+                 (sha256-hex body)))
+        (check "paused: the body paused for the parts it forwarded"
+               (<= 1 pauses 4) t)
+        (check "paused: ON-DATA was not called while a pause held"
+               while-paused 0)))))
+
+(defun test-harness-receive-body-refused-from-a-callback-e2e ()
+  "A received body ended from outside ON-DATA: by BODY-REFUSE from a
+   fetch's :THEN, and by a failed fetch under each failure disposition.
+
+   The fetches go to a port with nothing listening, so each one fails
+   to connect. Under :CLOSE, the default, the body is ended and ON-ABORT
+   hears :UPSTREAM-FAILED; under :KEEP the body is left paused, its :THEN
+   sees the abort sentinel and answers with BODY-REFUSE, and ON-ABORT
+   hears :REFUSED."
+  (format t "~%Harness: a received body refused from a fetch's :then~%")
+  (let* ((lock (sb-thread:make-mutex :name "refuse-e2e"))
+         (aborts nil)
+         (dead-port (let ((s (make-instance 'sb-bsd-sockets:inet-socket
+                                            :type :stream :protocol :tcp)))
+                      (sb-bsd-sockets:socket-bind s #(127 0 0 1) 0)
+                      (prog1 (nth-value 1 (sb-bsd-sockets:socket-name s))
+                        (sb-bsd-sockets:socket-close s)))))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (receive-body
+                :on-data
+                (lambda (conn bytes)
+                  (declare (ignore bytes))
+                  (fetch-into
+                   conn
+                   (http-fetch :get (format nil "http://127.0.0.1:~d/" dead-port)
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers b))
+                                       (when (and (null status)
+                                                  (string= path "/keep"))
+                                         (body-refuse conn (make-text-response
+                                                            503 "upstream down")))
+                                       nil))
+                   :failure-disposition (if (string= path "/keep") :keep :close))
+                  :pause)
+                :on-end (lambda (conn) (declare (ignore conn))
+                          (make-text-response 200 "unexpected"))
+                :on-abort (lambda (conn reason)
+                            (declare (ignore conn))
+                            (sb-thread:with-mutex (lock)
+                              (push (cons path reason) aborts)))))))
+        (%raw-exchange (%post-bytes "/close" "abcd") :seconds 5)
+        (check "failed fetch, :close: the body is ended as :upstream-failed"
+               (aborted "/close") '(:upstream-failed))
+        (let ((answer (%raw-exchange (%post-bytes "/keep" "abcd") :seconds 5)))
+          (check "failed fetch, :keep: :then's BODY-REFUSE answers the client"
+                 (and (search "HTTP/1.1 503" answer) t) t))
+        (check "failed fetch, :keep: and ON-ABORT hears :refused"
+               (aborted "/keep") '(:refused))))))
+
+(defun test-harness-paused-body-waits-on-its-fetch-e2e ()
+  "A received body paused on a fetch it started is bounded by that fetch,
+   not by the stall clock.
+
+   *BODY-STALL-TIMEOUT* is 1 for the run and the upstream takes three
+   seconds to answer, so a stall clock still running through the pause
+   would close the body before the part was stored. The body is answered
+   instead, once the part is stored and the body resumed — which also
+   restarts the clock, so the rest of the body is timed afresh."
+  (format t "~%Harness: a paused body waits on its fetch~%")
+  (let ((saved web-skeleton:*body-stall-timeout*)
+        (listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (thread nil))
+    (setf web-skeleton:*body-stall-timeout* 1)
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 5)
+           (let ((port (nth-value 1 (sb-bsd-sockets:socket-name listener))))
+             (setf thread (%piecemeal-upstream
+                           listener
+                           (list (format nil "HTTP/1.1 200 OK~c~cContent-Length: 2~c~c~
+                                              Connection: close~c~c~c~c"
+                                         #\Return #\Newline #\Return #\Newline
+                                         #\Return #\Newline #\Return #\Newline)
+                                 "ok")
+                           :pause 3 :hold 0))
+             (with-test-server
+                 (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                  :body-handler
+                  (lambda (req)
+                    (declare (ignore req))
+                    (let ((sent nil))
+                      (receive-body
+                       :on-data
+                       (lambda (conn bytes)
+                         (declare (ignore bytes))
+                         (unless sent
+                           (setf sent t)
+                           (fetch-into
+                            conn
+                            (http-fetch :get (format nil "http://127.0.0.1:~d/" port)
+                                        :then (lambda (status headers b)
+                                                (declare (ignore status headers b))
+                                                (body-resume conn)
+                                                nil)))
+                           :pause))
+                       :on-end (lambda (conn) (declare (ignore conn))
+                                 (make-text-response 200 "stored"))))))
+               (let* ((start (get-internal-real-time))
+                      (answer (%raw-exchange (%post-bytes "/u" "abcd"
+                                                          :headers '("Connection: close"))
+                                             :seconds 10))
+                      (elapsed (/ (- (get-internal-real-time) start)
+                                  internal-time-units-per-second)))
+                 (check "waits: the body outlasted the stall clock on its fetch"
+                        (and (search "stored" answer) t) t)
+                 (check "precondition: the fetch took longer than the stall timeout"
+                        (> elapsed 2) t)))))
+      (setf web-skeleton:*body-stall-timeout* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close listener))
+      (when thread
+        (handler-case (sb-thread:join-thread thread :timeout 10)
+          (error () (ignore-errors (sb-thread:terminate-thread thread))))))))
+
+(defun %multipart-body (boundary parts &key (close t))
+  "A multipart/form-data body as a browser writes one: PARTS, each
+   (NAME FILENAME CONTENT) with CONTENT a string or bytes and FILENAME NIL
+   for a text field, divided by BOUNDARY. CLOSE NIL leaves the close
+   delimiter off, for a body that ends too soon. Bytes."
+  (let ((pieces '()))
+    (flet ((emit (x)
+             (push (if (stringp x) (sb-ext:string-to-octets x :external-format :utf-8) x)
+                   pieces)))
+      (dolist (part parts)
+        (destructuring-bind (name filename content) part
+          (emit (format nil "--~a~a" boundary *crlf*))
+          (emit (format nil "Content-Disposition: form-data; name=\"~a\"~@[; filename=\"~a\"~]~a"
+                        name filename *crlf*))
+          (when filename
+            (emit (format nil "Content-Type: application/octet-stream~a" *crlf*)))
+          (emit *crlf*)
+          (emit content)
+          (emit *crlf*)))
+      (when close
+        (emit (format nil "--~a--~a" boundary *crlf*))))
+    (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) (nreverse pieces))))
+
+(defun %form-post (path boundary body &key chunk-size (headers '()))
+  "A POST of the multipart BODY to PATH: framed by Content-Length, or
+   chunked in CHUNK-SIZE pieces. Bytes, ready to send."
+  (concatenate
+   '(simple-array (unsigned-byte 8) (*))
+   (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~
+                        Content-Type: multipart/form-data; boundary=~a~a~
+                        ~:[Content-Length: ~d~;Transfer-Encoding: chunked~*~]~a~
+                        ~{~a~a~}~a"
+                   path *crlf* *crlf* boundary *crlf*
+                   chunk-size (length body) *crlf*
+                   (loop for h in headers append (list h *crlf*))
+                   *crlf*))
+   (if chunk-size
+       (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+              (append
+               (loop for at from 0 below (length body) by chunk-size
+                     for to = (min (length body) (+ at chunk-size))
+                     collect (%ascii (format nil "~x~a" (- to at) *crlf*))
+                     collect (subseq body at to)
+                     collect (%ascii *crlf*))
+               (list (%ascii (format nil "0~a~a" *crlf* *crlf*)))))
+       body)))
+
+(defun test-harness-receive-multipart-e2e ()
+  "A form received as it arrives, end to end: its text fields collected
+   and handed to :ON-END, its file streamed and never held, and every way
+   such a body can be refused answered with its status and heard once by
+   :ON-ABORT with its reason.
+
+   The body handler receives every path that starts /form. :ON-PART
+   collects a part with no filename and streams one with a filename,
+   whose runs are kept and hashed at :ON-PART-END; :ON-END answers with
+   the fields and each file's name, length and SHA-256, so a file that
+   arrives reordered, short or doubled answers wrongly. The other paths
+   each fail one way, and :ON-ABORT records the path and the reason."
+  (format t "~%Harness: a form received as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "multipart-e2e"))
+         (aborts nil)
+         (seen nil)
+         (widest 0)
+         (boundary "----FormBoundary7MA4YWxkTrZu0gW")
+         (file (%pseudo-random-bytes (* 3 1024 1024) 41))
+         ;; The answer is UTF-8, and %RAW-EXCHANGE reads it as Latin-1.
+         (expected (sb-ext:octets-to-string
+                    (sb-ext:string-to-octets
+                     (format nil "fields:title=hello,note=Zoë;files:upload:~d:~a"
+                             (length file) (sha256-hex file))
+                     :external-format :utf-8)
+                    :external-format :latin-1)))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r)))
+           (parts-seen (path)
+             (sb-thread:with-mutex (lock)
+               (reverse (loop for (p . n) in seen when (string= p path) collect n))))
+           (answer-of (bytes) (%raw-exchange bytes :seconds 20)))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (if (string= (http-request-path req) "/parsed")
+                 ;; The buffered path: the body read whole, then parsed.
+                 ;; A raise is the request's answer, with its status.
+                 (make-text-response
+                  200 (format nil "parsed:~{~a~^,~}"
+                              (mapcar (lambda (p) (format nil "~a=~a" (form-part-name p)
+                                                          (length (form-part-body p))))
+                                      (parse-multipart req))))
+                 (make-text-response 200 (format nil "handler:~a" (http-request-path req)))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (when (eql 0 (search "/form" path))
+                 (let ((files '())
+                       (current nil)
+                       (runs 0))
+                   (receive-multipart
+                    req
+                    :max-size (* 64 1024 1024)
+                    :max-parts (if (string= path "/form-few") 2 1000)
+                    :max-collected-size (if (string= path "/form-small") 100 (* 1024 1024))
+                    :on-part
+                    (lambda (conn part)
+                      (declare (ignore conn))
+                      (sb-thread:with-mutex (lock) (push (cons path (form-part-name part)) seen))
+                      (cond
+                        ((and (string= path "/form-strict")
+                              (string= (form-part-name part) "evil"))
+                         (make-text-response 422 "unexpected field"))
+                        ((form-part-filename part)
+                         (setf current (make-array 0 :element-type '(unsigned-byte 8)
+                                                     :adjustable t :fill-pointer 0))
+                         :stream)
+                        (t nil)))
+                    :on-part-data
+                    (lambda (conn part bytes)
+                      (declare (ignore part))
+                      ;; From the second run on, the buffer is the head and
+                      ;; one window; the first can arrive in the buffer a
+                      ;; read filled before the plan was decided.
+                      (when (> (incf runs) 1)
+                        (sb-thread:with-mutex (lock)
+                          (setf widest (max widest (length (web-skeleton::connection-read-buf conn))))))
+                      (loop for b across bytes do (vector-push-extend b current))
+                      nil)
+                    :on-part-end
+                    (lambda (conn part)
+                      (declare (ignore conn))
+                      (cond
+                        ((form-part-filename part)
+                         (push (format nil "~a:~d:~a" (form-part-name part)
+                                       (fill-pointer current) (sha256-hex current))
+                               files)
+                         nil)
+                        ;; A field that decides whether the rest is wanted.
+                        ((and (string= (form-part-name part) "token")
+                              (not (equal (form-part-text part) "good")))
+                         (make-text-response 403 "bad token"))
+                        (t nil)))
+                    :on-end
+                    (lambda (conn parts)
+                      (declare (ignore conn))
+                      (make-text-response
+                       200 (format nil "fields:~{~a~^,~};files:~{~a~^,~}"
+                                   (mapcar (lambda (p) (format nil "~a=~a" (form-part-name p)
+                                                               (form-part-text p)))
+                                           parts)
+                                   (reverse files))))
+                    :on-abort
+                    (lambda (conn reason)
+                      (declare (ignore conn))
+                      (sb-thread:with-mutex (lock) (push (cons path reason) aborts)))))))))
+        (let ((form (%multipart-body boundary `(("title" nil "hello")
+                                                 ("upload" "data.bin" ,file)
+                                                 ("note" nil "Zoë")))))
+          ;; ---- received whole, in order, the file never held ----
+          (check "form: fields collected, the file streamed whole and in order"
+                 (and (search expected (answer-of (%form-post "/form" boundary form
+                                                              :headers '("Connection: close"))))
+                      t)
+                 t)
+          (check "form: the read buffer held the head and one window"
+                 (<= widest (+ 400 web-skeleton::+receive-window+)) t)
+          (check "form: and chunked, in pieces that cut the parts anywhere"
+                 (and (search expected (answer-of (%form-post "/form" boundary form
+                                                              :chunk-size 50003
+                                                              :headers '("Connection: close"))))
+                      t)
+                 t)
+          (check "form: nothing aborted the bodies that ended well" (aborted "/form") nil))
+        ;; ---- keep-alive after a received form ----
+        (let ((answer (answer-of
+                       (concatenate '(simple-array (unsigned-byte 8) (*))
+                                    (%form-post "/form-keep" boundary
+                                                (%multipart-body boundary '(("a" nil "1"))))
+                                    (%ascii (format nil "GET /after HTTP/1.1~aHost: x~a~
+                                                         Connection: close~a~a"
+                                                    *crlf* *crlf* *crlf* *crlf*))))))
+          (check "form: the request after a received form is served"
+                 (and (search "fields:a=1;files:" answer) (search "handler:/after" answer) t)
+                 t))
+        ;; ---- refused, each with its reason ----
+        (check "few: more parts than :max-parts is 413"
+               (and (search "HTTP/1.1 413"
+                            (answer-of (%form-post "/form-few" boundary
+                                                   (%multipart-body boundary '(("a" nil "1") ("b" nil "2")
+                                                                               ("c" nil "3"))))))
+                    t)
+               t)
+        (check "few: :on-abort heard :too-large" (aborted "/form-few") '(:too-large))
+        (check "small: collected fields past :max-collected-size are 413"
+               (and (search "HTTP/1.1 413"
+                            (answer-of (%form-post "/form-small" boundary
+                                                   (%multipart-body
+                                                    boundary `(("a" nil ,(make-string 200 :initial-element #\a)))))))
+                    t)
+               t)
+        (check "small: :on-abort heard :too-large" (aborted "/form-small") '(:too-large))
+        (check "strict: :on-part's answer refuses the body"
+               (and (search "HTTP/1.1 422"
+                            (answer-of (%form-post "/form-strict" boundary
+                                                   (%multipart-body boundary '(("token" nil "good")
+                                                                               ("evil" nil "x"))))))
+                    t)
+               t)
+        (check "strict: :on-abort heard :refused" (aborted "/form-strict") '(:refused))
+        (check "token: a field's :on-part-end refuses the body before the file"
+               (and (search "HTTP/1.1 403"
+                            (answer-of (%form-post "/form-token" boundary
+                                                   (%multipart-body boundary
+                                                                    `(("token" nil "bad")
+                                                                      ("upload" "big.bin" ,file))))))
+                    t)
+               t)
+        (check "token: :on-abort heard :refused" (aborted "/form-token") '(:refused))
+        (check "token: and the file part was never begun"
+               (parts-seen "/form-token") '("token"))
+        (check "malformed: a line beginning with the boundary that is not a delimiter is 400"
+               (and (search "HTTP/1.1 400"
+                            (answer-of (%form-post "/form-bad" boundary
+                                                   (concatenate
+                                                    '(simple-array (unsigned-byte 8) (*))
+                                                    (%multipart-body boundary '(("a" nil "1")) :close nil)
+                                                    (%ascii (format nil "--~aX~a" boundary *crlf*))))))
+                    t)
+               t)
+        (check "malformed: :on-abort heard :malformed" (aborted "/form-bad") '(:malformed))
+        (check "truncated: a body that ends before its close delimiter is 400"
+               (and (search "HTTP/1.1 400"
+                            (answer-of (%form-post "/form-short" boundary
+                                                   (%multipart-body boundary '(("a" nil "1")) :close nil))))
+                    t)
+               t)
+        (check "truncated: :on-abort heard :malformed" (aborted "/form-short") '(:malformed))
+        ;; ---- not a form: refused at the head ----
+        (let ((answer (%raw-exchange
+                       (%ascii (format nil "POST /form-type HTTP/1.1~aHost: x~a~
+                                            Content-Type: text/plain~a~
+                                            Content-Length: 4096~aExpect: 100-continue~a~a"
+                                       *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+                       :half-close nil)))
+          (check "type: a body that is not multipart/form-data is 415, before it is read"
+                 (list (search "HTTP/1.1 415" answer) (search "100 Continue" answer))
+                 '(0 nil)))
+        (check "type: no plan was accepted, so :on-abort heard nothing"
+               (sb-thread:with-mutex (lock) (assoc "/form-type" aborts :test #'string=))
+               nil)
+        ;; ---- buffered, and parsed by :handler ----
+        (check "parsed: a buffered form, parsed in :handler"
+               (and (search "parsed:a=1,f=4"
+                            (%raw-exchange (%form-post "/parsed" boundary
+                                                       (%multipart-body boundary '(("a" nil "1")
+                                                                                   ("f" "f.txt" "four")))
+                                                       :headers '("Connection: close"))))
+                    t)
+               t)
+        (check "parsed: a body that is not a form is answered 415 from the raise"
+               (and (search "HTTP/1.1 415" (%raw-exchange (%post-bytes "/parsed" "a=1"
+                                                                       :headers '("Content-Type: text/plain"))))
+                    t)
+               t)
+        (check "parsed: a malformed form is answered 400 from the raise"
+               (and (search "HTTP/1.1 400"
+                            (%raw-exchange (%form-post "/parsed" boundary
+                                                       (%multipart-body boundary '(("a" nil "1"))
+                                                                        :close nil))))
+                    t)
+               t)))))
+
+(defun test-harness-receive-multipart-paused-e2e ()
+  "A form whose file is forwarded upstream a piece at a time as it
+   arrives, the shape of a file ferried on to object storage: when a full
+   piece has been collected, a fetch carries it with FETCH-INTO and the
+   body pauses. The fetch's :THEN sends the next full piece if one is
+   already collected, and otherwise resumes the body; the file's
+   :ON-PART-END sends what is left. A text field after the file is read
+   once that last piece is stored. However the reads cut the body, the
+   pieces fall on the same boundaries, and a read that brings several of
+   them pauses inside itself.
+
+   The upstream is the test server's own /store. What is checked: every
+   piece arrives, in order, together the file; the field after the file
+   reaches :ON-END; and no callback is called while a pause holds."
+  (format t "~%Harness: a form's file forwarded upstream as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "multipart-paused-e2e"))
+         (stored nil)
+         (paused nil)
+         (while-paused 0)
+         (port-box (list nil))
+         (piece-size (* 128 1024))
+         (boundary "x7YqL")
+         (file (%pseudo-random-bytes (+ (* 5 piece-size) 777) 43)))
+    (with-test-server
+        (:handler
+         (lambda (req)
+           (if (string= (http-request-path req) "/store")
+               (progn
+                 (sb-thread:with-mutex (lock)
+                   (push (copy-seq (http-request-body req)) stored))
+                 (make-text-response 200 "stored"))
+               (make-error-response 404)))
+         :body-handler
+         (lambda (req)
+           (when (string= (http-request-path req) "/upload")
+             (let ((piece (make-array 0 :element-type '(unsigned-byte 8)
+                                        :adjustable t :fill-pointer 0))
+                   (file-ended nil)
+                   (pieces 0))
+               (labels ((take (k)
+                          ;; The first K bytes collected, removed.
+                          (let ((head (subseq piece 0 k))
+                                (rest (subseq piece k)))
+                            (setf (fill-pointer piece) 0)
+                            (loop for b across rest do (vector-push-extend b piece))
+                            (coerce head '(simple-array (unsigned-byte 8) (*)))))
+                        (next-piece ()
+                          ;; A full piece, or once the file has ended what is left.
+                          (let ((n (fill-pointer piece)))
+                            (cond ((>= n piece-size) (take piece-size))
+                                  ((and file-ended (plusp n)) (take n)))))
+                        (send (conn bytes)
+                          (incf pieces)
+                          (fetch-into conn
+                                      (http-fetch :put (format nil "http://127.0.0.1:~d/store"
+                                                               (first port-box))
+                                                  :body bytes
+                                                  :then (lambda (status headers b)
+                                                          (declare (ignore headers b))
+                                                          (if (eql status 200)
+                                                              (let ((more (next-piece)))
+                                                                (if more
+                                                                    (send conn more)
+                                                                    (progn (setf paused nil)
+                                                                           (body-resume conn))))
+                                                              (progn (setf paused nil)
+                                                                     (body-refuse conn (make-error-response 502))))
+                                                          nil))))
+                        (send-if-due (conn)
+                          (let ((due (next-piece)))
+                            (when due
+                              (setf paused t)
+                              (send conn due)
+                              :pause)))
+                        (note-call ()
+                          (when paused (incf while-paused))))
+                 (receive-multipart
+                  req
+                  :max-size nil
+                  :on-part (lambda (conn part)
+                             (declare (ignore conn))
+                             (note-call)
+                             (if (form-part-filename part) :stream nil))
+                  :on-part-data (lambda (conn part bytes)
+                                  (declare (ignore part))
+                                  (note-call)
+                                  (loop for b across bytes do (vector-push-extend b piece))
+                                  (send-if-due conn))
+                  :on-part-end (lambda (conn part)
+                                 (note-call)
+                                 (when (form-part-filename part)
+                                   (setf file-ended t)
+                                   (send-if-due conn)))
+                  :on-end (lambda (conn parts)
+                            (declare (ignore conn))
+                            (note-call)
+                            (make-text-response
+                             200 (format nil "pieces:~d;fields:~{~a~^,~}" pieces
+                                         (mapcar #'form-part-text parts))))))))))
+      (setf (first port-box) *test-port*)
+      (let* ((form (%multipart-body boundary `(("before" nil "1")
+                                                ("file" "f.bin" ,file)
+                                                ("after" nil "2"))))
+             (answer (%raw-exchange (%form-post "/upload" boundary form
+                                                :headers '("Connection: close"))
+                                    :seconds 20)))
+        (check "paused form: answered after the file's last piece, with the field after it"
+               (and (search "pieces:6;fields:1,2" answer) t) t)
+        (let ((pieces (reverse (sb-thread:with-mutex (lock) stored))))
+          (check "paused form: every piece reached the upstream" (length pieces) 6)
+          (check "paused form: in order, together the file"
+                 (sha256-hex (apply #'concatenate '(vector (unsigned-byte 8)) pieces))
+                 (sha256-hex file)))
+        (check "paused form: no callback was called while a pause held" while-paused 0)))))
+
+(defun test-harness-body-refused-from-inside-its-callback-e2e ()
+  "A callback that calls BODY-REFUSE itself, where returning its response
+   was the documented way, ends the body there: the client gets that
+   response, :ON-ABORT hears :REFUSED once, and nothing more of the body is
+   handed over — RECEIVE-BODY's :ON-DATA and RECEIVE-MULTIPART's
+   :ON-PART-DATA alike, the second with more parts in the same read."
+  (format t "~%Harness: a body refused from inside its own callback~%")
+  (let ((lock (sb-thread:make-mutex :name "refuse-inside-e2e"))
+        (aborts nil)
+        (calls nil))
+    (flet ((aborted (path)
+             (loop repeat 100
+                   until (sb-thread:with-mutex (lock) (assoc path aborts :test #'string=))
+                   do (sleep 0.05))
+             (sb-thread:with-mutex (lock)
+               (loop for (p . r) in aborts when (string= p path) collect r))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (flet ((abort-note (conn reason)
+                        (declare (ignore conn))
+                        (sb-thread:with-mutex (lock) (push (cons path reason) aborts)))
+                      (call-note (what)
+                        (sb-thread:with-mutex (lock) (push (cons path what) calls))))
+                 (if (string= path "/raw")
+                     (receive-body
+                      :on-data (lambda (conn bytes)
+                                 (declare (ignore bytes))
+                                 (call-note :data)
+                                 (body-refuse conn (make-text-response 403 "refused inside"))
+                                 nil)
+                      :on-end (lambda (conn) (declare (ignore conn))
+                                (call-note :end)
+                                (make-text-response 200 "unexpected"))
+                      :on-abort #'abort-note)
+                     (receive-multipart
+                      req
+                      :on-part (lambda (conn part) (declare (ignore conn))
+                                 (call-note (form-part-name part))
+                                 :stream)
+                      :on-part-data (lambda (conn part bytes)
+                                      (declare (ignore part bytes))
+                                      (body-refuse conn (make-text-response 403 "refused inside"))
+                                      nil)
+                      :on-end (lambda (conn parts) (declare (ignore conn parts))
+                                (call-note :end)
+                                (make-text-response 200 "unexpected"))
+                      :on-abort #'abort-note))))))
+        (check "inside, receive-body: the client gets the callback's response"
+               (and (search "HTTP/1.1 403" (%raw-exchange (%post-bytes "/raw" "abcdef")))
+                    t)
+               t)
+        (check "inside, receive-body: :on-abort heard :refused, once" (aborted "/raw") '(:refused))
+        (check "inside, receive-body: nothing was handed over after it"
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . w) in calls when (string= p "/raw") collect w))
+               '(:data))
+        (let ((boundary "b0"))
+          (check "inside, receive-multipart: the client gets the callback's response"
+                 (and (search "HTTP/1.1 403"
+                              (%raw-exchange (%form-post "/mp" boundary
+                                                         (%multipart-body boundary
+                                                                          '(("one" "1.txt" "first")
+                                                                            ("two" "2.txt" "second"))))))
+                      t)
+                 t))
+        (check "inside, receive-multipart: :on-abort heard :refused, once" (aborted "/mp") '(:refused))
+        (check "inside, receive-multipart: the next part in the same read was never begun"
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . w) in calls when (string= p "/mp") collect w))
+               '("one"))))))
+
+(defun %upload-upstream (&key (pace 0) early-status early-chunk close-after stall-after
+                              silent release)
+  "A listener on an ephemeral port playing an upstream that receives an
+   upload, once. Returns (values PORT THREAD); the thread's result is
+   (HEAD BODY), the request head as a string and the body decoded.
+
+   It reads the head, then the body — by its Content-Length, or chunked to
+   its terminator — at most 16 KiB a read and PACE seconds between reads,
+   and answers 200 with got:<length>:<sha-256> of what it received.
+   EARLY-STATUS answers with that status as soon as the head has arrived
+   and then reads on, as an upstream refusing an upload does. With
+   EARLY-CHUNK that answer is chunked, EARLY-CHUNK its first chunk and the
+   rest never sent, as an upstream streaming its answer would. CLOSE-AFTER
+   hangs up once that many bytes of body have arrived, answering nothing.
+   STALL-AFTER stops reading once that many have, holding the connection
+   open and answering nothing until the CAR of RELEASE is true, or ten
+   seconds have passed, and hangs up then. SILENT reads the whole body and
+   then holds on in the same way, answering nothing."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (values
+     (nth-value 1 (sb-bsd-sockets:socket-name listener))
+     (sb-thread:make-thread
+      (lambda ()
+        (unwind-protect
+             (handler-case
+                 (let* ((s (sb-bsd-sockets:socket-accept listener))
+                        (buf (make-array 0 :element-type '(unsigned-byte 8)
+                                           :adjustable t :fill-pointer 0))
+                        (piece (make-array 16384 :element-type '(unsigned-byte 8)))
+                        (head-end nil)
+                        (head nil)
+                        (resume 0))
+                   (labels ((receive ()
+                              (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive s piece nil)
+                                (declare (ignore b))
+                                (when (or (null n) (zerop n))
+                                  (return-from receive nil))
+                                (loop for i below n do (vector-push-extend (aref piece i) buf))
+                                n))
+                            (answer (status text)
+                              (let ((bytes (%ascii (format nil "HTTP/1.1 ~d X~aContent-Length: ~d~a~
+                                                                Connection: close~a~a~a"
+                                                           status *crlf* (length text) *crlf*
+                                                           *crlf* *crlf* text))))
+                                (sb-bsd-sockets:socket-send s bytes nil)))
+                            (begin-chunked (status chunk)
+                              (sb-bsd-sockets:socket-send
+                               s (%ascii (format nil "HTTP/1.1 ~d X~aTransfer-Encoding: chunked~a~a~
+                                                      ~x~a~a~a"
+                                                 status *crlf* *crlf* *crlf*
+                                                 (length chunk) *crlf* chunk *crlf*))
+                               nil))
+                            (hold-until-released ()
+                              (loop repeat 200 until (car release) do (sleep 0.05))
+                              (sb-bsd-sockets:socket-close s))
+                            (finish (body)
+                              ;; The body has all arrived.
+                              (cond (early-status)
+                                    (silent (hold-until-released))
+                                    (t (answer 200 (format nil "got:~d:~a" (length body)
+                                                           (sha256-hex body)))))
+                              (list head body)))
+                     (block %upload-upstream-read
+                       ;; The head.
+                       (loop until head-end
+                             do (unless (receive)
+                                  (return-from %upload-upstream-read nil))
+                                (setf head-end (web-skeleton::scan-crlf-crlf buf 0 (fill-pointer buf))))
+                       (setf head (sb-ext:octets-to-string buf :end (+ head-end 4)
+                                                               :external-format :latin-1))
+                       (when early-status
+                         (if early-chunk
+                             (begin-chunked early-status early-chunk)
+                             (answer early-status "refused")))
+                       ;; The body.
+                       (let* ((start (+ head-end 4))
+                              (declared (let ((at (search "content-length: " head :test #'char-equal)))
+                                          (and at (parse-integer head :start (+ at 16) :junk-allowed t)))))
+                         (setf resume start)
+                         (loop
+                           (let* ((end (fill-pointer buf))
+                                  (got (- end start)))
+                             (when (and close-after (>= got close-after))
+                               (sb-bsd-sockets:socket-close s)
+                               (return-from %upload-upstream-read (list head nil)))
+                             (when (and stall-after (>= got stall-after))
+                               (hold-until-released)
+                               (return-from %upload-upstream-read (list head nil)))
+                             (cond
+                               (declared
+                                (when (>= got declared)
+                                  (return-from %upload-upstream-read
+                                    (finish (coerce (subseq buf start (+ start declared))
+                                                    '(simple-array (unsigned-byte 8) (*)))))))
+                               (t
+                                (let ((walk (coerce buf '(simple-array (unsigned-byte 8) (*)))))
+                                  (multiple-value-bind (complete next)
+                                      (web-skeleton::chunked-body-complete-p walk start end resume)
+                                    (setf resume next)
+                                    (when complete
+                                      (return-from %upload-upstream-read
+                                        (finish (web-skeleton::decode-chunked-body
+                                                 walk start end))))))))
+                             (when (plusp pace) (sleep pace))
+                             (unless (receive)
+                               (return-from %upload-upstream-read (list head nil)))))))))
+               (error () nil))
+          (ignore-errors (sb-bsd-sockets:socket-close listener))))
+      :name "upload-upstream"))))
+
+(defun test-harness-streamed-request-body-e2e ()
+  "A request body forwarded upstream as it arrives, end to end: FORWARD-BODY
+   piping a received body into a streamed fetch, the client answered with
+   what the upstream said.
+
+   Each case has an upstream of its own, %UPLOAD-UPSTREAM, which checks
+   what it was sent. A body declared by Content-Length is forwarded with
+   the same length, one sent chunked is forwarded chunked, and both arrive
+   whole and in order. An upstream that reads slowly holds the client to
+   its pace — the body pauses, the upload's queue never passes
+   *MAX-WRITE-BACKLOG*, and the body still arrives whole. One that answers
+   before the body is sent answers the client, and one that hangs up
+   partway is a 502, both at once to a client that has sent part of its
+   body and stopped, its body refused; a :THEN that raises there is a 500,
+   and when :ON-BODY stops the upstream's answer, the client hears :THEN's
+   answer to the abort sentinel.
+   An upstream that cannot be dialed at all is a 502 as well, :THEN
+   hearing the abort sentinel. A client that hangs up partway leaves the
+   upstream a request that ended short, never one that reads as whole, and
+   a body still going upstream when the server drains ends as :SHUTDOWN."
+  (format t "~%Harness: a request body forwarded upstream as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "streamed-e2e"))
+         (aborts nil)
+         (thens nil)
+         (most-queued 0)
+         (pauses 0)
+         (upstream-port (list nil))
+         (body (%pseudo-random-bytes (* 3 1024 1024) 61)))
+    (labels ((then (status headers b)
+               (declare (ignore headers))
+               ;; The upstream's status passes through, so a client can be
+               ;; seen to hear it; the abort sentinel is a 502.
+               (if (eql status 200)
+                   (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
+                   (make-error-response (or status 502))))
+             (then-for (path)
+               ;; THEN, noting the status it heard for PATH.
+               (lambda (status headers b)
+                 (sb-thread:with-mutex (lock) (push (cons path status) thens))
+                 (then status headers b)))
+             (thens-for (path)
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . s) in thens when (string= p path) collect s)))
+             (upstream-url () (format nil "http://127.0.0.1:~d/up" (first upstream-port)))
+             (aborts-for (path)
+               (sb-thread:with-mutex (lock)
+                 (loop for (p . r) in aborts when (string= p path) collect r)))
+             (aborted (path)
+               ;; As ABORTS-FOR, once an abort has had its moment to land.
+               (loop repeat 100
+                     until (aborts-for path)
+                     do (sleep 0.05))
+               (aborts-for path))
+             (through (path &key chunk-size (pace 0) early-status close-after)
+               ;; (values ANSWER (HEAD BODY)) for BODY posted to PATH, chunked
+               ;; in CHUNK-SIZE pieces if given, with a fresh upstream that
+               ;; takes the rest.
+               (multiple-value-bind (port thread)
+                   (%upload-upstream :pace pace :early-status early-status
+                                     :close-after close-after)
+                 (setf (first upstream-port) port)
+                 (let ((answer (%exchange-or-why (%form-post-bytes path body
+                                                                :chunk-size chunk-size
+                                                                :headers '("Connection: close"))
+                                              :seconds 30)))
+                   (values answer
+                           (handler-case (sb-thread:join-thread thread :timeout 20)
+                             (error () nil))))))
+             (part-then-wait (path part &rest upstream-args)
+               ;; What the client hears for the head of BODY posted to PATH
+               ;; and its first PART bytes, sending nothing more, with a
+               ;; fresh upstream given UPSTREAM-ARGS. The client keeps its
+               ;; side open, so the body is neither complete nor abandoned:
+               ;; an answer has to come of the upstream alone.
+               (multiple-value-bind (port thread) (apply #'%upload-upstream upstream-args)
+                 (setf (first upstream-port) port)
+                 (let* ((request (%form-post-bytes path body :headers '("Connection: close")))
+                        (head-end (+ (web-skeleton::scan-crlf-crlf request 0 (length request)) 4)))
+                   (prog1 (%exchange-or-why (subseq request 0 (+ head-end part))
+                                            :half-close nil :seconds 10)
+                     (handler-case (sb-thread:join-thread thread :timeout 20)
+                       (error () nil)))))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (flet ((note-abort (conn reason)
+                        (declare (ignore conn))
+                        (sb-thread:with-mutex (lock) (push (cons path reason) aborts))))
+                 (cond
+                   ((string= path "/unreachable")
+                    (forward-body (http-fetch :put "http://255.255.255.255:9/up" :body :stream
+                                              :then (then-for path))
+                                  :max-size nil :on-abort #'note-abort))
+                   ((string= path "/early-raise")
+                    (forward-body (http-fetch :put (upstream-url) :body :stream
+                                              :then (lambda (status headers b)
+                                                      (declare (ignore status headers b))
+                                                      (error "a :then that raises")))
+                                  :max-size nil :on-abort #'note-abort))
+                   ;; :THEN's own answer, so the client can be seen to hear
+                   ;; it rather than a 502 of the framework's.
+                   ((string= path "/early-stop")
+                    (forward-body (http-fetch :put (upstream-url) :body :stream
+                                              :on-body (lambda (conn chunk)
+                                                         (declare (ignore conn chunk))
+                                                         :stop)
+                                              :then (lambda (status headers b)
+                                                      (declare (ignore headers b))
+                                                      (sb-thread:with-mutex (lock)
+                                                        (push (cons path status) thens))
+                                                      (make-text-response
+                                                       202 (format nil "then heard ~s" status))))
+                                  :max-size nil :on-abort #'note-abort))
+                   ((string= path "/length")
+                    (forward-body (http-fetch :put (upstream-url) :body :stream
+                                              :content-length (parse-integer
+                                                               (get-header req "content-length"))
+                                              :then #'then)
+                                  :max-size nil :on-abort #'note-abort))
+                   ;; By hand rather than by FORWARD-BODY, to watch the
+                   ;; upload's queue and count the pauses.
+                   ((string= path "/slow")
+                    (let ((put (http-fetch :put (upstream-url) :body :stream :then #'then)))
+                      (receive-body
+                       :max-size nil
+                       :on-data (lambda (conn bytes)
+                                  (unless (fetch-started-p put) (fetch-into conn put))
+                                  (let ((sent (fetch-send put bytes))
+                                        (carrier (web-skeleton::http-fetch-continuation-carrier put)))
+                                    (when carrier
+                                      (setf most-queued
+                                            (max most-queued
+                                                 (web-skeleton::connection-write-pending carrier))))
+                                    (cond ((eq sent t) nil)
+                                          ((null sent) (incf pauses) :pause)
+                                          (t (make-error-response 502)))))
+                       :on-end (lambda (conn) (declare (ignore conn)) put)
+                       :on-abort #'note-abort)))
+                   (t
+                    (forward-body (http-fetch :put (upstream-url) :body :stream :then #'then)
+                                  :max-size nil :on-abort #'note-abort)))))))
+        (let ((expected (format nil "got:~d:~a" (length body) (sha256-hex body))))
+          ;; ---- forwarded whole, framed as it arrived ----
+          (multiple-value-bind (answer seen) (through "/length")
+            (check "length: the upstream was told the length the client declared"
+                   (and seen (search (format nil "content-length: ~d" (length body))
+                                     (first seen) :test #'char-equal)
+                        t)
+                   t)
+            (check "length: and received the body whole and in order"
+                   (and seen (equalp (second seen) body)) t)
+            (check "length: the client heard what the upstream answered"
+                   (and (search "HTTP/1.1 200" answer) (search expected answer) t) t))
+          (multiple-value-bind (answer seen) (through "/chunked" :chunk-size 99991)
+            (check "chunked: forwarded chunked"
+                   (and seen (search "transfer-encoding: chunked" (first seen) :test #'char-equal) t)
+                   t)
+            (check "chunked: whole and in order, and the client heard the upstream"
+                   (list (and seen (equalp (second seen) body)) (and (search expected answer) t))
+                   '(t t)))
+          ;; ---- a slow upstream holds the client to its pace ----
+          (multiple-value-bind (answer seen) (through "/slow" :pace 0.002)
+            (check "slow: the body still arrives whole"
+                   (list (and seen (equalp (second seen) body)) (and (search expected answer) t))
+                   '(t t))
+            (check "slow: the body paused for the upstream" (plusp pauses) t)
+            (check "slow: and the upload's queue stayed within *max-write-backlog*"
+                   (<= most-queued web-skeleton:*max-write-backlog*) t))
+          ;; ---- an upstream that answers first ----
+          ;; Each client sends part of its body and then nothing, so the
+          ;; answer cannot wait for a run of the body to carry it, nor the
+          ;; body be complete before it, however much the sockets hold.
+          (let ((answer (part-then-wait "/early" (* 64 1024) :early-status 413)))
+            (check "early: the upstream's answer reached a client that had stopped sending"
+                   (and (search "HTTP/1.1 413" answer) t) t))
+          (check "early: and the rest of the body was refused" (aborted "/early") '(:refused))
+          (let ((answer (part-then-wait "/early-raise" (* 64 1024) :early-status 413)))
+            (check "early, :then raising: the client is answered 500"
+                   (and (search "HTTP/1.1 500" answer) t) t))
+          (check "early, :then raising: and the rest of the body was refused"
+                 (aborted "/early-raise") '(:refused))
+          ;; :on-body stops the answer at its first chunk, which ends the
+          ;; fetch the body was going to. Chunked, since :on-body is handed
+          ;; a chunked answer's chunks and no other answer's bytes.
+          (let ((answer (part-then-wait "/early-stop" (* 64 1024)
+                                        :early-status 200 :early-chunk "first")))
+            (check "early, stopped: the client that had stopped sending hears :then's answer"
+                   (and (search "HTTP/1.1 202" answer) (search "then heard NIL" answer) t) t))
+          (check "early, stopped: :then heard the abort sentinel, once"
+                 (thens-for "/early-stop") '(nil))
+          (check "early, stopped: and the rest of the body was refused"
+                 (aborted "/early-stop") '(:refused))
+          ;; ---- an upstream that hangs up partway ----
+          (let ((answer (part-then-wait "/fail" (* 320 1024) :close-after (* 256 1024))))
+            (check "fail: an upstream that hangs up partway is a 502 to a client that had stopped sending"
+                   (and (search "HTTP/1.1 502" answer) t) t))
+          (check "fail: and the rest of the body was refused" (aborted "/fail") '(:refused))
+          ;; ---- an upstream that cannot be dialed at all ----
+          ;; A TCP connect to a broadcast address fails in the connect
+          ;; itself, with ENETUNREACH, inside FETCH-INTO.
+          (let ((answer (%exchange-or-why (%form-post-bytes "/unreachable" (subseq body 0 1000)
+                                                            :headers '("Connection: close"))
+                                          :seconds 10)))
+            (check "unreachable: a connect refused at once is a 502"
+                   (and (search "HTTP/1.1 502" answer) t) t))
+          (check "unreachable: :then heard the abort sentinel, once"
+                 (thens-for "/unreachable") '(nil))
+          (check "unreachable: and the body was refused" (aborted "/unreachable") '(:refused))
+          ;; ---- a client that leaves partway ----
+          ;; The upstream must not be left holding what reads as a whole
+          ;; upload: no chunked terminator, and short of a declared length.
+          (multiple-value-bind (port thread) (%upload-upstream)
+            (setf (first upstream-port) port)
+            (multiple-value-bind (socket stream) (%raw-connect)
+              (unwind-protect
+                   (let ((request (%form-post-bytes "/gone" body
+                                                    :headers '("Connection: close"))))
+                     (handler-case
+                         (progn (write-sequence request stream
+                                                :end (floor (length request) 2))
+                                (force-output stream))
+                       (error () nil)))
+                (ignore-errors (close stream :abort t))
+                (ignore-errors (sb-bsd-sockets:socket-close socket))))
+            (let ((seen (sb-thread:join-thread thread :timeout 20 :default :timed-out)))
+              (check "gone: the upstream's request ended short of a whole body"
+                     (and (not (eq seen :timed-out)) (null (second seen))) t)))
+          (check "gone: and the body's end was heard as the client leaving"
+                 (aborted "/gone") '(:disconnected))
+          (check "nothing aborted the bodies forwarded whole"
+                 (list (aborts-for "/length") (aborts-for "/chunked") (aborts-for "/slow"))
+                 '(nil nil nil))))
+      ;; ---- a body still going upstream when the server drains ----
+      ;; The drain closes the fetch on its way to closing the connection,
+      ;; and the body ends as the drain ends every body still arriving, not
+      ;; as refused by the fetch's end. The check is made once
+      ;; WITH-TEST-SERVER's teardown has drained it.
+      (let ((release (list nil)) (thread nil) (socket nil) (stream nil))
+        (unwind-protect
+             (progn
+               (with-test-server
+                   (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                    :body-handler
+                    (lambda (req)
+                      (declare (ignore req))
+                      (forward-body (http-fetch :put (upstream-url) :body :stream :then #'then)
+                                    :max-size nil
+                                    :on-abort (lambda (conn reason)
+                                                (declare (ignore conn))
+                                                (sb-thread:with-mutex (lock)
+                                                  (push (cons "/drain" reason) aborts))))))
+                 (multiple-value-bind (port upstream)
+                     (%upload-upstream :stall-after 1 :release release)
+                   (setf (first upstream-port) port
+                         thread upstream))
+                 (multiple-value-setq (socket stream) (%raw-connect))
+                 (write-sequence (%ascii (format nil "POST /drain HTTP/1.1~aHost: x~a~
+                                                      Content-Length: 1000~a~a0123456789"
+                                                 *crlf* *crlf* *crlf* *crlf*))
+                                 stream)
+                 (force-output stream)
+                 (sleep 0.3))
+               (check "drain: a body still going upstream hears :shutdown"
+                      (aborted "/drain") '(:shutdown)))
+          (setf (car release) t)
+          (when thread (handler-case (sb-thread:join-thread thread :timeout 10) (error () nil)))
+          (when stream (ignore-errors (close stream)))
+          (when socket (ignore-errors (sb-bsd-sockets:socket-close socket))))))))
+
+(defun test-harness-forward-body-unstartable-as-the-server-stops-e2e ()
+  "FORWARD-BODY whose fetch cannot start, at the moment the server begins
+   to stop. The address filter refuses the first dial and starts the
+   shutdown in the same call, as a SIGTERM landing then would. The body is
+   then the drain's to end, and nothing more of it is read for the fetch:
+   it is not dialed again for the body's next run, its :THEN hears the
+   abort sentinel once, and ON-ABORT hears :SHUTDOWN.
+
+   The body is one write of 300 KiB, more than one window, so its next run
+   is in the kernel as the first is handed over. The upstream is a
+   listener that accepts nothing: a second dial, were there one, would
+   connect into its backlog."
+  (format t "~%Harness: forward-body's fetch refused as the server stops~%")
+  (let ((saved web-skeleton:*fetch-address-filter*)
+        (lock (sb-thread:make-mutex :name "unstartable-at-stop"))
+        (dials 0)
+        (thens nil)
+        (aborts nil)
+        (listener (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (setf web-skeleton:*fetch-address-filter*
+          (lambda (ip family host)
+            (declare (ignore ip family host))
+            (let ((n (sb-thread:with-mutex (lock) (incf dials))))
+              (if (= n 1)
+                  (progn (setf web-skeleton::*shutdown* t) nil)
+                  t))))
+    (unwind-protect
+         (progn
+           (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 4)
+           (with-test-server
+               (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+                :body-handler
+                (lambda (req)
+                  (declare (ignore req))
+                  (forward-body
+                   (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                            (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+                               :body :stream
+                               :then (lambda (status headers body)
+                                       (declare (ignore headers body))
+                                       (sb-thread:with-mutex (lock) (push status thens))
+                                       (make-error-response 502)))
+                   :max-size nil
+                   :on-abort (lambda (conn reason)
+                               (declare (ignore conn))
+                               (sb-thread:with-mutex (lock) (push reason aborts))))))
+             (%exchange-or-why (%form-post-bytes "/up" (%pseudo-random-bytes (* 300 1024) 23)
+                                                 :headers '("Connection: close"))
+                               :seconds 10))
+           ;; Read once WITH-TEST-SERVER's teardown has drained and joined
+           ;; the worker.
+           (sb-thread:with-mutex (lock)
+             (check "unstartable at the stop: the fetch was dialed once" dials 1)
+             (check "unstartable at the stop: :then heard the abort sentinel once"
+                    thens '(nil))
+             (check "unstartable at the stop: the drain ended the body" aborts '(:shutdown))))
+      (setf web-skeleton:*fetch-address-filter* saved)
+      (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-harness-a-send-before-its-fetch-starts-e2e ()
+  "A body whose ON-DATA sends its run with FETCH-SEND before the fetch has
+   started, then starts it, and pauses on the send's NIL, an order
+   FETCH-SEND allows. The run held for the fetch goes out once the
+   upstream has connected, and the body is resumed then, as a pause on
+   any NIL is, and the upload is answered by the upstream with what was
+   sent whole.
+
+   *FETCH-TIMEOUT* is 4 here, so a body never resumed would be ended by
+   its upload's deadline, unanswered, well inside the client's wait."
+  (format t "~%Harness: a body that sends before its fetch starts~%")
+  (let ((saved web-skeleton:*fetch-timeout*)
+        (upstream-port (list nil))
+        (body (%pseudo-random-bytes 300000 29)))
+    (setf web-skeleton:*fetch-timeout* 4)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (declare (ignore req))
+                (let ((put (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                                    (first upstream-port))
+                                       :body :stream
+                                       :then (lambda (status headers b)
+                                               (declare (ignore headers))
+                                               (if (eql status 200)
+                                                   (make-text-response
+                                                    200 (sb-ext:octets-to-string
+                                                         b :external-format :latin-1))
+                                                   (make-error-response 502))))))
+                  (receive-body
+                   :max-size nil
+                   :on-data (lambda (conn bytes)
+                              (let ((sent (fetch-send put bytes)))
+                                (unless (fetch-started-p put)
+                                  (fetch-into conn put))
+                                (cond ((eq sent t) nil)
+                                      ((null sent) :pause)
+                                      (t (make-error-response 502)))))
+                   :on-end (lambda (conn) (declare (ignore conn)) put)))))
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why (%form-post-bytes "/up" body
+                                                               :headers '("Connection: close"))
+                                             :seconds 15)))
+               (check "sent first: the upload is answered by the upstream, whole"
+                      (and (search (format nil "got:~d:~a" (length body) (sha256-hex body))
+                                   answer)
+                           t)
+                      t))
+             (handler-case (sb-thread:join-thread thread :timeout 10) (error () nil))))
+      (setf web-skeleton:*fetch-timeout* saved))))
+
+(defun test-harness-form-file-forwarded-e2e ()
+  "One file of a form forwarded upstream as it arrives, end to end: its
+   runs sent with FETCH-SEND from :ON-PART-DATA, :ON-END answering with
+   the fetch, and the client answered with what the upstream said once it
+   has.
+
+   The form has a text field before the file and one after it. Both reach
+   :ON-END collected while the file goes upstream unheld. The upstream,
+   %UPLOAD-UPSTREAM, reads slowly, so the body pauses on the upload inside
+   a run of the file and is resumed by the upload draining, and the field
+   after the file is read only after that. A file with no content still
+   makes its request, started at :ON-PART-END: the upstream gets an empty
+   body, and the client its answer."
+  (format t "~%Harness: a form's file forwarded upstream as it arrives~%")
+  (let* ((lock (sb-thread:make-mutex :name "form-forward-e2e"))
+         (fields nil)
+         (pauses 0)
+         (aborts nil)
+         (upstream-port (list nil))
+         (boundary "----FormBoundaryForwardQ3x")
+         (file (%pseudo-random-bytes (* 2 1024 1024) 71)))
+    (labels ((then (status headers b)
+               (declare (ignore headers))
+               (if (eql status 200)
+                   (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
+                   (make-error-response 502)))
+             (through (request &rest upstream-args)
+               (multiple-value-bind (port thread) (apply #'%upload-upstream upstream-args)
+                 (setf (first upstream-port) port)
+                 (let ((answer (%exchange-or-why request :seconds 30)))
+                   (values answer
+                           (handler-case (sb-thread:join-thread thread :timeout 20)
+                             (error () nil))))))
+             (form (path content)
+               (%form-post path boundary
+                           (%multipart-body boundary `(("title" nil "before")
+                                                       ("upload" "a.bin" ,content)
+                                                       ("note" nil "after")))
+                           :headers '("Connection: close"))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req))
+                   (put (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
+                                    :body :stream :then #'then)))
+               (receive-multipart
+                req
+                :max-size nil
+                :on-part (lambda (conn part)
+                           (declare (ignore conn))
+                           (if (form-part-filename part) :stream nil))
+                :on-part-data (lambda (conn part bytes)
+                                (declare (ignore part))
+                                (unless (fetch-started-p put)
+                                  (fetch-into conn put))
+                                (let ((sent (fetch-send put bytes)))
+                                  (cond ((eq sent t) nil)
+                                        ((null sent)
+                                         (sb-thread:with-mutex (lock) (incf pauses))
+                                         :pause)
+                                        (t (make-error-response 502)))))
+                :on-part-end (lambda (conn part)
+                               ;; A file with no content never started it.
+                               (when (and (form-part-filename part)
+                                          (not (fetch-started-p put)))
+                                 (fetch-into conn put))
+                               nil)
+                :on-end (lambda (conn parts)
+                          (declare (ignore conn))
+                          (sb-thread:with-mutex (lock)
+                            (push (cons path (loop for p in parts
+                                                   collect (cons (form-part-name p)
+                                                                 (form-part-text p))))
+                                  fields))
+                          put)
+                :on-abort (lambda (conn reason)
+                            (declare (ignore conn))
+                            (sb-thread:with-mutex (lock) (push (cons path reason) aborts)))))))
+        (flet ((fields-of (path)
+                 (sb-thread:with-mutex (lock) (cdr (assoc path fields :test #'string=)))))
+          (multiple-value-bind (answer seen) (through (form "/file" file) :pace 0.002)
+            (check "file: the upstream received the file, and only the file, whole"
+                   (and seen (equalp (second seen) file)) t)
+            (check "file: the client heard the upstream's answer"
+                   (and (search (format nil "got:~d:~a" (length file) (sha256-hex file)) answer)
+                        t)
+                   t)
+            (check "file: the fields either side of it reached :on-end"
+                   (fields-of "/file") '(("title" . "before") ("note" . "after")))
+            (check "file: the body paused on the upload" (plusp pauses) t))
+          (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+            (multiple-value-bind (answer seen) (through (form "/empty" empty))
+              (check "empty: the upstream got a request with an empty body"
+                     (and seen (equalp (second seen) empty)) t)
+              (check "empty: and the client its answer"
+                     (and (search (format nil "got:0:~a" (sha256-hex empty)) answer) t) t)
+              (check "empty: the fields reached :on-end"
+                     (fields-of "/empty") '(("title" . "before") ("note" . "after")))))
+          (check "nothing aborted either form" aborts nil))))))
+
+(defun test-harness-streamed-request-body-timing-e2e ()
+  "A streamed request body is timed on its progress: *FETCH-TIMEOUT*
+   bounds the body standing still, not the upload.
+
+   *FETCH-TIMEOUT* is 1 for the run. A client that sends its body a piece
+   every quarter of a second, for three and a half seconds, is forwarded
+   whole and answered 200: each piece moved the deadline out. An upstream
+   that takes the head and a little of the body and then reads no more,
+   holding the connection open, has the fetch ended once the body has
+   stood still past the deadline, and the client is answered 502 while the
+   upstream is still holding on. One that takes the whole body and never
+   answers is a fetch whose answer did not come: the wait for it starts
+   when the request has gone, and the client is answered 504.
+
+   SETF rather than LET for *FETCH-TIMEOUT*: the worker reads it, and
+   dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: a streamed request body is timed on its progress~%")
+  (let ((saved web-skeleton:*fetch-timeout*)
+        (upstream-port (list nil)))
+    (setf web-skeleton:*fetch-timeout* 1)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (declare (ignore req))
+                (forward-body
+                 (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
+                             :body :stream
+                             :then (lambda (status headers b)
+                                     (declare (ignore headers))
+                                     (if (eql status 200)
+                                         (make-text-response
+                                          200 (sb-ext:octets-to-string b :external-format :latin-1))
+                                         (make-error-response 502))))
+                 :max-size nil)))
+           (flet ((seconds-since (start)
+                    (/ (float (- (get-internal-real-time) start))
+                       internal-time-units-per-second)))
+             ;; ---- a body that keeps moving outlasts the deadline ----
+             (let* ((piece (%pseudo-random-bytes 1024 91))
+                    (pieces 14)
+                    (whole (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                                  (loop repeat pieces collect piece))))
+               (multiple-value-bind (port thread) (%upload-upstream)
+                 (setf (first upstream-port) port)
+                 (multiple-value-bind (socket stream) (%raw-connect)
+                   (unwind-protect
+                        (let ((start (get-internal-real-time)))
+                          (let* ((answer
+                                   (handler-case
+                                       (progn
+                                         (write-sequence
+                                          (%ascii (format nil "POST /up HTTP/1.1~aHost: x~a~
+                                                               Content-Length: ~d~a~
+                                                               Connection: close~a~a"
+                                                          *crlf* *crlf* (length whole) *crlf*
+                                                          *crlf* *crlf*))
+                                          stream)
+                                         (force-output stream)
+                                         (loop repeat pieces
+                                               do (sleep 0.25)
+                                                  (write-sequence piece stream)
+                                                  (force-output stream))
+                                         (let ((got (read-until-bounded stream :seconds 10)))
+                                           (sb-ext:octets-to-string (subseq got 0 (fill-pointer got))
+                                                                    :external-format :latin-1)))
+                                     (error (e) (format nil "no answer: ~a" e))))
+                                 (secs (seconds-since start))
+                                 (seen (handler-case (sb-thread:join-thread thread :timeout 10)
+                                         (error () nil))))
+                            (check "moving: the upload outlasted *fetch-timeout* several times over"
+                                   (> secs 3) t)
+                            (check "moving: and arrived whole" (and seen (equalp (second seen) whole)) t)
+                            (check "moving: and the client heard the upstream"
+                                   (and (search "HTTP/1.1 200" answer)
+                                        (search (format nil "got:~d:~a" (length whole)
+                                                        (sha256-hex whole))
+                                                answer)
+                                        t)
+                                   t)))
+                     (ignore-errors (close stream))
+                     (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+             ;; ---- an upstream that stops reading ----
+             ;; More body than the sockets on the way can hold, so it stands
+             ;; still once the upstream has stopped.
+             (let ((body (%pseudo-random-bytes (* 8 1024 1024) 92))
+                   (release (list nil)))
+               (multiple-value-bind (port thread)
+                   (%upload-upstream :stall-after (* 64 1024) :release release)
+                 (setf (first upstream-port) port)
+                 (let* ((start (get-internal-real-time))
+                        (answer (%exchange-or-why (%form-post-bytes "/up" body
+                                                                 :headers '("Connection: close"))
+                                               :seconds 20))
+                        (secs (seconds-since start)))
+                   (setf (first release) t)
+                   (handler-case (sb-thread:join-thread thread :timeout 10)
+                     (error () nil))
+                   (check "stalled: the client was answered 502"
+                          (and (search "HTTP/1.1 502" answer) t) t)
+                   (check "stalled: once the body stood still, with the upstream holding on"
+                          (< secs 8) t))))
+             ;; ---- an upstream that takes the body and never answers ----
+             ;; The request has gone, so this is the wait for an answer that
+             ;; does not come: a 504, as for any fetch that goes unanswered.
+             (let ((body (%pseudo-random-bytes (* 64 1024) 93))
+                   (release (list nil)))
+               (multiple-value-bind (port thread) (%upload-upstream :silent t :release release)
+                 (setf (first upstream-port) port)
+                 (let* ((start (get-internal-real-time))
+                        (answer (%exchange-or-why (%form-post-bytes "/up" body
+                                                                 :headers '("Connection: close"))
+                                               :seconds 20))
+                        (secs (seconds-since start)))
+                   (setf (first release) t)
+                   (let ((seen (handler-case (sb-thread:join-thread thread :timeout 10)
+                                 (error () nil))))
+                     (check "silent: the upstream had the whole body"
+                            (and seen (equalp (second seen) body)) t))
+                   (check "silent: the client was answered 504"
+                          (and (search "HTTP/1.1 504" answer) t) t)
+                   (check "silent: with the upstream holding on" (< secs 8) t))))))
+      (setf web-skeleton:*fetch-timeout* saved))))
+
+(defun test-harness-then-answers-with-a-started-fetch-e2e ()
+  "A fetch's :THEN may answer with a streamed fetch started earlier for the
+   same request, and the request is answered with what that fetch
+   answered, as when a handler or ON-END answers with one.
+
+   The body's first run goes to fetch A, which is finished with it, and
+   the body waits until A is over; the rest goes to fetch B. ON-END
+   answers with B, and B's :THEN answers with A, whose own :THEN ran when
+   A ended. A's answer asks to close the connection, and the client, which
+   did not ask, sees it closed once the answer is sent: the request's
+   framing follows the answer that answers it."
+  (format t "~%Harness: a fetch's :then answers with a fetch started earlier~%")
+  (let ((ports (list nil nil))
+        (body (%pseudo-random-bytes (* 512 1024) 95)))
+    (flet ((url (which) (format nil "http://127.0.0.1:~d/up" (nth which ports))))
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (declare (ignore req))
+             (let* ((a (http-fetch :put (url 0) :body :stream
+                                   :then (lambda (status headers b)
+                                           (declare (ignore headers))
+                                           (let ((r (make-text-response
+                                                     (if (eql status 200) 200 502)
+                                                     (format nil "a:~a"
+                                                             (and b (sb-ext:octets-to-string
+                                                                     b :external-format :latin-1))))))
+                                             (set-response-header r "connection" "close")
+                                             r))))
+                    (b (http-fetch :put (url 1) :body :stream
+                                   :then (lambda (status headers b)
+                                           (declare (ignore status headers b))
+                                           a))))
+               (receive-body
+                :max-size nil
+                :on-data (lambda (conn bytes)
+                           (cond
+                             ((not (fetch-started-p a))
+                              (fetch-into conn a)
+                              (fetch-send a bytes)
+                              (fetch-finish a)
+                              :pause)
+                             (t
+                              (unless (fetch-started-p b) (fetch-into conn b))
+                              (if (eq (fetch-send b bytes) t) nil :pause))))
+                :on-end (lambda (conn)
+                          (declare (ignore conn))
+                          (fetch-finish b)
+                          b)))))
+        (multiple-value-bind (port-a thread-a) (%upload-upstream)
+          (multiple-value-bind (port-b thread-b) (%upload-upstream)
+            (setf ports (list port-a port-b))
+            (let* ((start (get-internal-real-time))
+                   (reply (%exchange-or-why (%form-post-bytes "/two" body) :seconds 6 :half-close nil))
+                   (secs (/ (float (- (get-internal-real-time) start))
+                            internal-time-units-per-second))
+                   (seen-a (handler-case (sb-thread:join-thread thread-a :timeout 10)
+                             (error () nil)))
+                   (seen-b (handler-case (sb-thread:join-thread thread-b :timeout 10)
+                             (error () nil))))
+              (check "two: A and B between them had the whole body, in order"
+                     (and seen-a seen-b
+                          (equalp (concatenate '(simple-array (unsigned-byte 8) (*))
+                                               (second seen-a) (second seen-b))
+                                  body))
+                     t)
+              (check "two: the client was answered with what A answered"
+                     (and seen-a
+                          (search (format nil "a:got:~d:~a" (length (second seen-a))
+                                          (sha256-hex (second seen-a)))
+                                  reply)
+                          t)
+                     t)
+              (check "two: and the connection closed after it, as A's answer asked"
+                     (< secs 4) t))))))))
+
+(defun %answering-upstream (body-done &key (middle-after (* 1024 1024)))
+  "A listener on an ephemeral port playing an upstream that answers an
+   upload as it receives it, once. Returns (values PORT THREAD); the
+   thread's result is the request body it received, decoded.
+
+   It reads the head and answers at once with a chunked 200 and its first
+   chunk, first. Once MIDDLE-AFTER bytes of body have arrived it sends a
+   chunk middle. It reads the chunked body to its terminator, sets the CAR
+   of BODY-DONE, and sends a chunk second, and the end."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (values
+     (nth-value 1 (sb-bsd-sockets:socket-name listener))
+     (sb-thread:make-thread
+      (lambda ()
+        (unwind-protect
+             (handler-case
+                 (let ((s (sb-bsd-sockets:socket-accept listener))
+                       (buf (make-array 0 :element-type '(unsigned-byte 8)
+                                          :adjustable t :fill-pointer 0))
+                       (piece (make-array 16384 :element-type '(unsigned-byte 8)))
+                       (head-end nil))
+                   (flet ((receive ()
+                            (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive s piece nil)
+                              (declare (ignore b))
+                              (and n (plusp n)
+                                   (loop for i below n
+                                         do (vector-push-extend (aref piece i) buf)
+                                         finally (return t)))))
+                          (say (text)
+                            (sb-bsd-sockets:socket-send s (%ascii text) nil)))
+                     (block %answering-upstream-read
+                       (loop until head-end
+                             do (unless (receive) (return-from %answering-upstream-read nil))
+                                (setf head-end (web-skeleton::scan-crlf-crlf
+                                                buf 0 (fill-pointer buf))))
+                       (say (format nil "HTTP/1.1 200 OK~aTransfer-Encoding: chunked~a~
+                                         Connection: close~a~a5~afirst~a"
+                                    *crlf* *crlf* *crlf* *crlf* *crlf* *crlf*))
+                       (let ((start (+ head-end 4))
+                             (resume (+ head-end 4))
+                             (middle-sent nil))
+                         (loop
+                           (when (and (not middle-sent)
+                                      (>= (- (fill-pointer buf) start) middle-after))
+                             (setf middle-sent t)
+                             (say (format nil "6~amiddle~a" *crlf* *crlf*)))
+                           (let ((walk (coerce buf '(simple-array (unsigned-byte 8) (*)))))
+                             (multiple-value-bind (complete next)
+                                 (web-skeleton::chunked-body-complete-p
+                                  walk start (length walk) resume)
+                               (setf resume next)
+                               (when complete
+                                 (setf (car body-done) t)
+                                 (say (format nil "6~asecond~a0~a~a"
+                                              *crlf* *crlf* *crlf* *crlf*))
+                                 (sb-bsd-sockets:socket-close s)
+                                 (return-from %answering-upstream-read
+                                   (web-skeleton::decode-chunked-body
+                                    walk start (length walk))))))
+                           (sleep 0.002)
+                           (unless (receive)
+                             (return-from %answering-upstream-read nil)))))))
+               (error () nil))
+          (ignore-errors (sb-bsd-sockets:socket-close listener))))
+      :name "answering-upstream"))))
+
+(defun test-harness-answer-paused-while-the-request-goes-out-e2e ()
+  "An upstream that answers while the request body is still going out, and
+   an :ON-BODY that pauses on the answer's first chunk: the pause holds the
+   answer, and the request goes on going out.
+
+   The upstream answers at the head, sends a second chunk partway through
+   the body, and sends its last only once it has the whole body, and an
+   :ON-TICK resumes the fetch only once the upstream has said so. So the
+   body must reach the upstream while the fetch is paused, and nothing else
+   lets the test finish: a pause that held the request as well would leave
+   the upload waiting on a drain that never comes. The chunk sent partway
+   arrives while the request's writes are still being driven, and is not
+   read until the resume. Once resumed, the rest of the answer is read, and
+   the client hears :THEN."
+  (format t "~%Harness: an answer paused while the request goes out~%")
+  (let* ((saved web-skeleton:*worker-wake-interval*)
+         (lock (sb-thread:make-mutex :name "paused-answer"))
+         (body (%pseudo-random-bytes (* 4 1024 1024) 99))
+         (body-done (list nil))
+         ;; The outbound :ON-BODY paused, for :ON-TICK to resume. A variable
+         ;; the two closures share, not a (LIST NIL) box: SBCL 2.2.4 to 2.2.9
+         ;; drop the GC store barrier when a closure stores its argument into
+         ;; a cons its enclosing function made (lp#1982608, fixed in 2.2.10),
+         ;; and the connection stored here is young, so a collection could
+         ;; move it and leave the box pointing where it was.
+         (out-conn nil)
+         (resumed nil)
+         (chunks '())
+         (upstream-port (list nil)))
+    (setf web-skeleton:*worker-wake-interval* 0.05)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+              :body-handler
+              (lambda (req)
+                (declare (ignore req))
+                (forward-body
+                 (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
+                             :body :stream
+                             :on-body (lambda (conn chunk)
+                                        (sb-thread:with-mutex (lock)
+                                          (push (cons (sb-ext:octets-to-string
+                                                       chunk :external-format :latin-1)
+                                                      resumed)
+                                                chunks))
+                                        (unless out-conn
+                                          (setf out-conn conn)
+                                          :pause))
+                             :then (lambda (status headers b)
+                                     (declare (ignore headers b))
+                                     (make-text-response 200 (format nil "status:~a" status))))
+                 :max-size nil))
+              :on-tick (lambda (worker-id)
+                         (declare (ignore worker-id))
+                         (when (and out-conn (car body-done) (not resumed))
+                           (setf resumed t)
+                           (fetch-resume out-conn))))
+           (multiple-value-bind (port thread) (%answering-upstream body-done)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why (%form-post-bytes "/up" body
+                                                               :headers '("Connection: close"))
+                                             :seconds 30))
+                   (seen (sb-thread:join-thread thread :timeout 20 :default nil)))
+               (check "paused: the body reached the upstream while the answer was held"
+                      (and seen (equalp seen body)) t)
+               (check "paused: and the answer was read to its end, the rest only once resumed"
+                      (sb-thread:with-mutex (lock) (reverse chunks))
+                      '(("first" . nil) ("middle" . t) ("second" . t)))
+               (check "paused: and the client heard :then"
+                      (and (search "status:200" answer) t) t))))
+      (setf web-skeleton:*worker-wake-interval* saved))))
+
+(defun test-harness-streamed-request-body-from-a-tick-e2e ()
+  "A request body produced on the worker rather than received: a handler
+   answers with a streamed fetch, and :ON-TICK writes the fetch's body a
+   piece at a time, stopping when FETCH-SEND answers NIL. On a later tick it
+   asks again with an empty send, which sends nothing and answers T once the
+   upstream has caught up. The client is parked on the fetch throughout and
+   is answered with what the upstream said.
+
+   The upstream reads slowly, so the producer is told to wait and then to
+   go on, and between the two every piece arrives once and in order.
+
+   SETF rather than LET for *WORKER-WAKE-INTERVAL*, which paces the ticks:
+   the worker reads it, and dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: a request body produced on the worker's tick~%")
+  (let* ((saved web-skeleton:*worker-wake-interval*)
+         (lock (sb-thread:make-mutex :name "tick-producer"))
+         (box (list nil))
+         (polls '())
+         (piece-size (* 64 1024))
+         (pieces 48)
+         (whole (%pseudo-random-bytes (* piece-size pieces) 97))
+         (next 0)
+         (upstream-port (list nil))
+         (none (make-array 0 :element-type '(unsigned-byte 8))))
+    (setf web-skeleton:*worker-wake-interval* 0.05)
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (declare (ignore req))
+                         (setf (first box)
+                               (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                                        (first upstream-port))
+                                           :body :stream
+                                           :content-length (length whole)
+                                           :then (lambda (status headers b)
+                                                   (declare (ignore headers))
+                                                   (if (eql status 200)
+                                                       (make-text-response
+                                                        200 (sb-ext:octets-to-string
+                                                             b :external-format :latin-1))
+                                                       (make-error-response 502))))))
+              :on-tick (lambda (worker-id)
+                         (declare (ignore worker-id))
+                         (let ((put (first box)))
+                           (when (and put (fetch-started-p put) (< next pieces))
+                             (let ((ready (fetch-send put none)))
+                               (sb-thread:with-mutex (lock) (push ready polls))
+                               (loop while (and (eq ready t) (< next pieces))
+                                     do (setf ready (fetch-send
+                                                     put (subseq whole (* next piece-size)
+                                                                 (* (1+ next) piece-size))))
+                                        (incf next))
+                               (when (= next pieces)
+                                 (fetch-finish put)))))))
+           (multiple-value-bind (port thread) (%upload-upstream :pace 0.005)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why
+                            (%ascii (format nil "GET /export HTTP/1.1~aHost: x~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf*))
+                            :seconds 30))
+                   (seen (sb-thread:join-thread thread :timeout 20 :default nil)))
+               (check "tick: the upstream had the whole body, in order"
+                      (and seen (equalp (second seen) whole)) t)
+               (check "tick: and the client was answered with what it said"
+                      (and (search (format nil "got:~d:~a" (length whole) (sha256-hex whole))
+                                   answer)
+                           t)
+                      t)
+               (check "tick: the producer was told to wait, and then to go on"
+                      (sb-thread:with-mutex (lock)
+                        (list (and (member nil polls) t) (and (member t polls) t)))
+                      '(t t)))))
+      (setf web-skeleton:*worker-wake-interval* saved))))
+
+(defun %black-hole (port)
+  "A listener on 127.0.0.2:PORT that answers no connect. Its accept queue
+   is full, held by a connection never accepted, so the kernel drops each
+   SYN that arrives, and a connect to it waits as one to a black-holed
+   route does. Returns (values LISTENER FILLER), for the caller to close."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (filler (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 2) port)
+    (sb-bsd-sockets:socket-listen listener 0)
+    (sb-bsd-sockets:socket-connect filler #(127 0 0 2) port)
+    (values listener filler)))
+
+(defun test-harness-fetch-falls-back-to-the-next-address-e2e ()
+  "A name that resolves to more than one address is dialed at the next
+   when one does not answer: a fetch to a name whose first address is
+   127.0.0.2, where nothing answers, and whose second is the upstream's.
+
+   Refused, the next address is dialed at once, and so it is when the
+   connect fails in the call itself. Black-holed (%BLACK-HOLE),
+   it is dialed once *CONNECT-FALLBACK-DELAY* has passed, and an upload
+   streamed into the fetch meanwhile, queued on the first attempt, goes
+   with it and arrives whole. HTTP-FETCH-STREAM's blocking connect falls
+   back the same way.
+
+   The resolution is the test's: *DNS-LOOKUP-FN* and
+   *DNS-RESOLVE-BLOCKING-FN* answer every name with those two addresses,
+   in that order, as getent would for a name listed twice in /etc/hosts."
+  (format t "~%Harness: a fetch falls back to a name's next address~%")
+  (let ((saved-lookup web-skeleton::*dns-lookup-fn*)
+        (saved-blocking web-skeleton::*dns-resolve-blocking-fn*)
+        (next-addresses (list (cons (coerce #(127 0 0 1)
+                                            '(simple-array (unsigned-byte 8) (*)))
+                                    :inet)))
+        ;; A cell, so a case can change what the name resolves to first.
+        (first-address (list (coerce #(127 0 0 2) '(simple-array (unsigned-byte 8) (*)))))
+        (upstream-port (list nil))
+        (body (%pseudo-random-bytes (* 256 1024) 101)))
+    (setf web-skeleton::*dns-lookup-fn*
+          (lambda (conn epoll-fd fetch-req host port path)
+            (web-skeleton::initiate-http-fetch-to-address
+             conn epoll-fd fetch-req host port path (car first-address) :inet
+             :fallbacks next-addresses))
+          web-skeleton::*dns-resolve-blocking-fn*
+          (lambda (host)
+            (declare (ignore host))
+            (values (car first-address) :inet next-addresses)))
+    (unwind-protect
+         (with-test-server
+             (:handler (lambda (req)
+                         (if (string= (http-request-path req) "/plain")
+                             (make-text-response 200 "plain")
+                             (http-fetch :put (format nil "http://dual.test:~d/up"
+                                                      (first upstream-port))
+                                         :body "hello"
+                                         :then (lambda (status headers b)
+                                                 (declare (ignore headers))
+                                                 (make-text-response
+                                                  (or status 502)
+                                                  (if b (sb-ext:octets-to-string
+                                                         b :external-format :latin-1)
+                                                      "none"))))))
+              :body-handler
+              (lambda (req)
+                (when (string= (http-request-path req) "/upload")
+                  (forward-body
+                   (http-fetch :put (format nil "http://dual.test:~d/up" (first upstream-port))
+                               :body :stream
+                               :content-length (length body)
+                               :then (lambda (status headers b)
+                                       (declare (ignore headers))
+                                       (make-text-response
+                                        (or status 502)
+                                        (if b (sb-ext:octets-to-string
+                                               b :external-format :latin-1)
+                                            "none"))))
+                   :max-size nil))))
+           ;; ---- refused: the next address at once ----
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (let ((answer (%exchange-or-why
+                            (%ascii (format nil "GET /fetch HTTP/1.1~aHost: x~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf*))
+                            :seconds 10)))
+               (sb-thread:join-thread thread :timeout 10 :default nil)
+               (check "refused: answered from the name's next address"
+                      (and (search "HTTP/1.1 200" answer)
+                           (search (format nil "got:5:~a" (sha256-hex (%ascii "hello")))
+                                   answer)
+                           t)
+                      t)))
+           ;; ---- unreachable at once: the next address, from the same call ----
+           ;; A TCP connect to a broadcast address fails in the connect
+           ;; itself, with ENETUNREACH, so no connection is ever made for it.
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port
+                   (car first-address) (coerce #(255 255 255 255)
+                                               '(simple-array (unsigned-byte 8) (*))))
+             (let ((answer (%exchange-or-why
+                            (%ascii (format nil "GET /fetch HTTP/1.1~aHost: x~a~
+                                                 Connection: close~a~a"
+                                            *crlf* *crlf* *crlf* *crlf*))
+                            :seconds 10)))
+               (sb-thread:join-thread thread :timeout 10 :default nil)
+               (setf (car first-address) (coerce #(127 0 0 2)
+                                                 '(simple-array (unsigned-byte 8) (*))))
+               (check "unreachable at once: answered from the name's next address"
+                      (and (search "HTTP/1.1 200" answer) t)
+                      t)))
+           ;; ---- black-holed: the next address once its budget is spent ----
+           (multiple-value-bind (port thread) (%upload-upstream)
+             (setf (first upstream-port) port)
+             (multiple-value-bind (listener filler) (%black-hole port)
+               (unwind-protect
+                    (let* ((start (get-internal-real-time))
+                           (answer (%exchange-or-why
+                                    (%form-post-bytes "/upload" body
+                                                      :headers '("Connection: close"))
+                                    :seconds 20))
+                           (secs (/ (float (- (get-internal-real-time) start))
+                                    internal-time-units-per-second))
+                           (seen (sb-thread:join-thread thread :timeout 10 :default nil)))
+                      (check "black hole: the upload reached the next address whole"
+                             (and seen (equalp (second seen) body)) t)
+                      (check "black hole: and the client heard its answer"
+                             (and (search (format nil "got:~d:~a" (length body)
+                                                  (sha256-hex body))
+                                          answer)
+                                  t)
+                             t)
+                      (check "black hole: once the attempt's budget had passed, not the fetch's"
+                             (< (float web-skeleton::*connect-fallback-delay*) secs 10.0)
+                             t))
+                 (ignore-errors (sb-bsd-sockets:socket-close filler))
+                 (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+           ;; ---- the blocking path falls back the same way ----
+           (check "blocking: http-fetch-stream answered from the next address"
+                  (handler-case
+                      (http-fetch-stream :get (format nil "http://dual.test:~d/plain"
+                                                      *test-port*)
+                                         :on-line #'identity)
+                    (error (e) (princ-to-string e)))
+                  200))
+      (setf web-skeleton::*dns-lookup-fn* saved-lookup
+            web-skeleton::*dns-resolve-blocking-fn* saved-blocking))))
+
+(defun test-harness-a-response-is-written-from-its-read-e2e ()
+  "An ordinary keep-alive response is written from the read that produced
+   its request: one change of epoll interest per request, the keep-alive
+   reset's re-arming of readability, where arming writability and coming
+   back to write costs two. Pipelined requests keep the writability path,
+   and each is answered, in order.
+
+   Counted at EPOLL-MODIFY, wrapped for the run and restored after."
+  (format t "~%Harness: a response is written from its read~%")
+  (let ((real (symbol-function 'web-skeleton::epoll-modify))
+        (mods 0)
+        (lock (sb-thread:make-mutex :name "inline-count")))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'web-skeleton::epoll-modify)
+                 (lambda (&rest args)
+                   (sb-thread:with-mutex (lock) (incf mods))
+                   (apply real args)))
+           (with-test-server
+               (:handler (lambda (req)
+                           (make-text-response 200 (http-request-path req))))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (labels ((ask (&rest paths)
+                               ;; All of PATHS in one write; their answers,
+                               ;; bodies only, in order.
+                               (write-sequence
+                                (%ascii (format nil "~{GET ~a HTTP/1.1~aHost: x~a~a~}"
+                                                (loop for p in paths
+                                                      append (list p *crlf* *crlf* *crlf*))))
+                                stream)
+                               (force-output stream)
+                               (loop for p in paths
+                                     collect (let ((tail 0))
+                                               (loop until (= tail 4)
+                                                     do (let ((b (read-byte stream)))
+                                                          (setf tail
+                                                                (cond ((and (member tail '(0 2)) (= b 13)) (1+ tail))
+                                                                      ((and (member tail '(1 3)) (= b 10)) (1+ tail))
+                                                                      ((= b 13) 1)
+                                                                      (t 0)))))
+                                               (let ((body (make-array (length p)
+                                                                       :element-type '(unsigned-byte 8))))
+                                                 (read-sequence body stream)
+                                                 (sb-ext:octets-to-string body :external-format :ascii)))))
+                             (bounded (thunk)
+                               ;; THUNK's reads under a deadline, as every read
+                               ;; in this file is, and a close or a reset
+                               ;; answered as its text: a dropped response
+                               ;; fails a check rather than hanging the suite,
+                               ;; and a close fails one rather than ending it.
+                               (multiple-value-bind (result completed)
+                                   (web-skeleton-test-harness::call-with-read-deadline
+                                    20 (lambda ()
+                                         (handler-case (funcall thunk)
+                                           (error (e) (princ-to-string e)))))
+                                 (if completed result "no answer before the deadline"))))
+                      (check "inline: the warm-up is answered"
+                             (bounded (lambda () (dotimes (i 20) (ask "/warm")) :ok))
+                             :ok)
+                      (sb-thread:with-mutex (lock) (setf mods 0))
+                      (check "inline: two hundred requests are answered"
+                             (bounded (lambda () (dotimes (i 200) (ask "/one")) :ok))
+                             :ok)
+                      (check "inline: one change of interest per keep-alive request"
+                             (sb-thread:with-mutex (lock) (/ mods 200)) 1)
+                      (check "pipelined: three in one write, answered in order"
+                             (bounded (lambda () (ask "/a" "/bb" "/ccc")))
+                             '("/a" "/bb" "/ccc")))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (setf (symbol-function 'web-skeleton::epoll-modify) real))))
+
+(defun %exchange-or-why (bytes &rest args)
+  "%RAW-EXCHANGE, except that a connection reset or closed while the request
+   was still being written answers as the text of that error, so a check
+   reports it rather than the run ending on it."
+  (handler-case (apply #'%raw-exchange bytes args)
+    (error (e) (format nil "no answer: ~a" e))))
+
+(defun %form-post-bytes (path body &key chunk-size (headers '()))
+  "A POST of BODY, bytes, to PATH: framed by Content-Length, or chunked in
+   CHUNK-SIZE pieces. Bytes, ready to send."
+  (concatenate
+   '(simple-array (unsigned-byte 8) (*))
+   (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~
+                        ~:[Content-Length: ~d~;Transfer-Encoding: chunked~*~]~a~
+                        ~{~a~a~}~a"
+                   path *crlf* *crlf* chunk-size (length body) *crlf*
+                   (loop for h in headers append (list h *crlf*))
+                   *crlf*))
+   (if chunk-size
+       (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+              (append
+               (loop for at from 0 below (length body) by chunk-size
+                     for to = (min (length body) (+ at chunk-size))
+                     collect (%ascii (format nil "~x~a" (- to at) *crlf*))
+                     collect (subseq body at to)
+                     collect (%ascii *crlf*))
+               (list (%ascii (format nil "0~a~a" *crlf* *crlf*)))))
+       body)))
+
+(defun test-harness-body-stall-e2e ()
+  "A body a body handler accepted is timed on its progress, by
+   *BODY-STALL-TIMEOUT*; a body nobody accepted stays on *IDLE-TIMEOUT*,
+   a budget for the whole request.
+
+   *IDLE-TIMEOUT* is 1 and *BODY-STALL-TIMEOUT* 2 for the bodies that keep
+   arriving. A body arriving four bytes every 0.7 s takes about 3.5 s,
+   well past the idle budget and never 2 s without a byte: accepted, it is
+   served; not accepted, it is cut off.
+
+   A body that stops arriving is closed by the stall clock, and not before
+   the idle budget would have: the test that the clock really is a
+   different one. The sweep runs once a second on whole-second clocks, so
+   a close comes between T and T + 2 seconds after the last byte, and with
+   the stall budget at 2 the two windows overlap. The bodies that stop
+   arriving have it at 4: an idle close lands before 3 s, a stall close
+   after 4 s.
+
+   SETF for both timeouts, for the reason TEST-HARNESS-BODY-HANDLER-E2E
+   gives."
+  (format t "~%Harness: an accepted body is timed on its progress~%")
+  (let ((saved-idle web-skeleton:*idle-timeout*)
+        (saved-stall web-skeleton:*body-stall-timeout*)
+        (received-abort nil))
+    (setf web-skeleton:*idle-timeout* 1
+          web-skeleton:*body-stall-timeout* 2)
+    (unwind-protect
+         (with-test-server
+             (:handler
+              (lambda (req)
+                (make-text-response
+                 200 (format nil "~a:~d" (http-request-path req)
+                             (length (or (http-request-body req) #())))))
+              :body-handler
+              (lambda (req)
+                (let ((path (http-request-path req)))
+                  (cond
+                    ((string= path "/accepted") (buffer-body :max-size 64))
+                    ((string= path "/received")
+                     (receive-body
+                      :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                      :on-end (lambda (conn) (declare (ignore conn))
+                                (make-text-response 200 "done"))
+                      :on-abort (lambda (conn reason) (declare (ignore conn))
+                                  (setf received-abort reason))))
+                    (t nil)))))
+           (flet ((trickle (path)
+                    ;; Head first, then the body four bytes every 0.7 s.
+                    ;; Writes after the server has closed fail, and that is
+                    ;; one of the outcomes under test, so they are let fail.
+                    (multiple-value-bind (socket stream) (%raw-connect)
+                      (unwind-protect
+                           (progn
+                             (write-sequence
+                              (%ascii (format nil "POST ~a HTTP/1.1~aHost: x~a~
+                                                   Content-Length: 20~a~
+                                                   Connection: close~a~a"
+                                              path *crlf* *crlf* *crlf* *crlf* *crlf*))
+                              stream)
+                             (force-output stream)
+                             (ignore-errors
+                              (dotimes (i 5)
+                                (sleep 0.7)
+                                (write-sequence (%ascii "abcd") stream)
+                                (force-output stream)))
+                             (let ((buf (read-until-bounded stream :seconds 5)))
+                               (sb-ext:octets-to-string
+                                (subseq buf 0 (fill-pointer buf))
+                                :external-format :latin-1)))
+                        (ignore-errors (close stream))
+                        (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+             (check "accepted: a slow body that keeps arriving is served"
+                    (and (search "/accepted:20" (trickle "/accepted")) t)
+                    t)
+             (check "control: the same body nobody accepted is cut off"
+                    (search "/plain:20" (trickle "/plain"))
+                    nil)
+             ;; The clock is the request's. On a connection whose first
+             ;; request had its body accepted, the next one — which nobody
+             ;; accepted — is back on the whole-request budget. Kept, the
+             ;; first request's clock would let the second trickle a body
+             ;; past *IDLE-TIMEOUT*, a slow-drip budget handed to a request
+             ;; that never asked for one.
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (progn
+                      (write-sequence
+                       (%ascii (format nil "POST /accepted HTTP/1.1~aHost: x~a~
+                                            Content-Length: 4~a~aabcd"
+                                       *crlf* *crlf* *crlf* *crlf*))
+                       stream)
+                      (force-output stream)
+                      (let ((first-answer
+                              (read-until-bounded
+                               stream :seconds 5
+                                      :until (lambda (buf fill)
+                                               (search (%ascii "/accepted:4") buf
+                                                       :end2 fill)))))
+                        (check "keep-alive: the first request, accepted, is served"
+                               (and (search (%ascii "/accepted:4") first-answer) t)
+                               t))
+                      (write-sequence
+                       (%ascii (format nil "POST /plain HTTP/1.1~aHost: x~a~
+                                            Content-Length: 20~a~a"
+                                       *crlf* *crlf* *crlf* *crlf*))
+                       stream)
+                      (force-output stream)
+                      (ignore-errors
+                       (dotimes (i 5)
+                         (sleep 0.7)
+                         (write-sequence (%ascii "abcd") stream)
+                         (force-output stream)))
+                      (let ((rest (read-until-bounded stream :seconds 5)))
+                        (check "keep-alive: the next, not accepted, is cut off"
+                               (search (%ascii "/plain:20") rest)
+                               nil)))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+           ;; Four bytes, then nothing. Closed by the stall clock: after
+           ;; *BODY-STALL-TIMEOUT* of quiet and not at the idle budget.
+           ;; The budget at 4 from here on, so the windows are apart: see
+           ;; the docstring.
+           (setf web-skeleton:*body-stall-timeout* 4)
+           (multiple-value-bind (socket stream) (%raw-connect)
+             (unwind-protect
+                  (let ((start (get-internal-real-time)))
+                    (write-sequence
+                     (%ascii (format nil "POST /accepted HTTP/1.1~aHost: x~a~
+                                          Content-Length: 20~a~aabcd"
+                                     *crlf* *crlf* *crlf* *crlf*))
+                     stream)
+                    (force-output stream)
+                    (multiple-value-bind (buf reason)
+                        (read-until-bounded stream :seconds 10)
+                      (let ((elapsed (/ (- (get-internal-real-time) start)
+                                        internal-time-units-per-second)))
+                        (check "stalled: the connection is closed, with nothing sent"
+                               (list (and (member reason '(:eof :error)) t)
+                                     (fill-pointer buf))
+                               '(t 0))
+                        (check "stalled: not at the idle budget, but after the stall"
+                               (and (>= elapsed 3.5) (< elapsed 9) t)
+                               t))))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket))))
+           ;; A received body is timed the same way, and its ON-ABORT is
+           ;; told why it ended.
+           (multiple-value-bind (socket stream) (%raw-connect)
+             (unwind-protect
+                  (progn
+                    (write-sequence
+                     (%ascii (format nil "POST /received HTTP/1.1~aHost: x~a~
+                                          Content-Length: 20~a~aabcd"
+                                     *crlf* *crlf* *crlf* *crlf*))
+                     stream)
+                    (force-output stream)
+                    (read-until-bounded stream :seconds 10)
+                    (check "stalled: a received body's ON-ABORT hears :stalled"
+                           received-abort :stalled))
+               (ignore-errors (close stream))
+               (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+      (setf web-skeleton:*idle-timeout* saved-idle
+            web-skeleton:*body-stall-timeout* saved-stall))))
+
 (defun test-harness-fetch-into-target-closed-e2e ()
   "A client that leaves mid-relay tears the outbound down, once.
 
-   D5's arm reaches a detached outbound by walking, because nothing was
-   parked and AWAITING-FD names nothing. The subtlety is that it runs while
-   the target is still :STREAMING with a live fd — CONNECTION-CLOSE is
-   several lines below — so a disposition applied here would find it
-   :STREAMING, take the aborted branch, and call CLOSE-CONNECTION on the
-   connection already being closed one frame up.
+   CLOSE-CONNECTION's detached-outbound arm reaches its outbound by
+   walking, because nothing was parked and AWAITING-FD names nothing. The
+   subtlety is that it runs while the target is still :STREAMING with a
+   live fd — CONNECTION-CLOSE is several lines below — so a disposition
+   applied here would find it :STREAMING, take the aborted branch, and call
+   CLOSE-CONNECTION on the connection already being closed one frame up.
 
    It terminates, which is what makes it worth asserting: the outer frame
    would resume holding a descriptor the inner call already closed. Counted
@@ -3850,27 +8501,405 @@
                   closes 1))
       (setf (symbol-function 'web-skeleton::close-connection) real))))
 
+(defun %held-upstream ()
+  "A listener on an ephemeral port playing an upstream that takes one
+   connection, reads what arrives first, and then waits for the CAR of the
+   box it returns: :ANSWER sends a 200 whose body is ok, and anything else
+   hangs up, as ten seconds without either does. Returns
+   (values PORT BOX THREAD)."
+  (let ((listener (make-instance 'sb-bsd-sockets:inet-socket
+                                 :type :stream :protocol :tcp))
+        (box (list nil)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address listener) t)
+    (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen listener 1)
+    (values
+     (nth-value 1 (sb-bsd-sockets:socket-name listener))
+     box
+     (sb-thread:make-thread
+      (lambda ()
+        (unwind-protect
+             (handler-case
+                 (let ((s (sb-bsd-sockets:socket-accept listener))
+                       (piece (make-array 4096 :element-type '(unsigned-byte 8))))
+                   (sb-bsd-sockets:socket-receive s piece nil)
+                   (loop repeat 200 until (car box) do (sleep 0.05))
+                   (when (eq (car box) :answer)
+                     (sb-bsd-sockets:socket-send
+                      s (%ascii (format nil "HTTP/1.1 200 OK~aContent-Length: 2~a~aok"
+                                        *crlf* *crlf* *crlf*))
+                      nil)
+                     (sleep 0.2))
+                   (sb-bsd-sockets:socket-close s))
+               (error () nil))
+          (ignore-errors (sb-bsd-sockets:socket-close listener))))
+      :name "held-upstream"))))
+
+(defun test-harness-a-fetch-ends-with-what-it-was-started-for-e2e ()
+  "A detached fetch lasts no longer than what it was started for, so
+   nothing it does afterwards reaches what followed it on the connection.
+
+   On one keep-alive connection, /a's ON-DATA starts a fetch carrying its
+   first run and does not wait for it, and ON-END answers at once. The
+   fetch is ended with the body, its :THEN hearing the abort sentinel, and
+   its upstream hanging up later is nothing to /b, which follows with half
+   its body, starts a fetch of its own to wait on, and has the rest sent
+   after the hang-up: /b is answered, and its ON-ABORT hears nothing.
+
+   On another, /s1 relays an upstream into a stream and closes the stream
+   at once. Its fetch is ended once the stream's response has gone, and
+   /s2, next on the connection, starts a relay of its own rather than being
+   refused one as already outstanding.
+
+   /c's ON-DATA starts a fetch as /a's does, and ON-END answers with a
+   stream that stays open. The fetch ended with the body, so its upstream
+   answering afterwards does not close the stream.
+
+   /adopt's body goes into a streamed fetch whose upstream answers at the
+   head, and once that fetch has answered, the body starts another and
+   does not wait for it. ON-END answers with the first, which has ended.
+   The second is still running, and is ended with the body all the same,
+   so its upstream hanging up later is nothing to /next, which follows on
+   the connection. /adopt-stream is the same with the first fetch's answer
+   a stream: the second is ended before the stream begins, so its upstream
+   answering does not close the stream.
+
+   /retry relays into a stream whose client then leaves, and its :THEN
+   answers the abort sentinel by starting the fetch again. That is refused,
+   as a fetch already outstanding, and no outbound is left running into a
+   connection that has closed."
+  (format t "~%Harness: a detached fetch ends with what it was started for~%")
+  (let* ((lock (sb-thread:make-mutex :name "fetch-ends"))
+         (notes nil)
+         (port-box (list nil))
+         ;; /adopt's two upstreams: the one that answers first, the other.
+         (adopt-ports (list nil nil))
+         (terminator (format nil "0~a~a" *crlf* *crlf*)))
+    (labels ((note (&rest what)
+               (sb-thread:with-mutex (lock) (push what notes)))
+             (notes-of (path)
+               (sb-thread:with-mutex (lock)
+                 (reverse (loop for n in notes
+                                when (equal (first n) path) collect (rest n)))))
+             (url () (format nil "http://127.0.0.1:~d/up" (first port-box)))
+             (then-for (path)
+               (lambda (status headers body)
+                 (declare (ignore headers body))
+                 (note path :then status)
+                 nil))
+             (send (stream text)
+               (write-sequence (%ascii text) stream)
+               (force-output stream))
+             (post-head (path length)
+               (format nil "POST ~a HTTP/1.1~aHost: x~aContent-Length: ~d~a~a"
+                       path *crlf* *crlf* length *crlf* *crlf*))
+             (read-for (stream marker seconds)
+               ;; (values TEXT REASON): what arrives until MARKER has, or
+               ;; SECONDS pass.
+               (multiple-value-bind (buf reason)
+                   (read-until-bounded stream
+                                       :until (lambda (b n)
+                                                (search (%ascii marker) b :end2 n))
+                                       :seconds seconds)
+                 (values (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                                  :external-format :latin-1)
+                         reason))))
+      (with-test-server
+          (:handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (make-stream-response
+                :on-open (lambda (c)
+                           (handler-case
+                               (fetch-into
+                                c (http-fetch
+                                   :get (url)
+                                   :then (if (string= path "/retry")
+                                             ;; The sentinel answered by
+                                             ;; trying again.
+                                             (lambda (s h b)
+                                               (declare (ignore h b))
+                                               (note path :then s)
+                                               (unless s
+                                                 (handler-case
+                                                     (fetch-into c (http-fetch :get (url)
+                                                                               :then (then-for path)))
+                                                   (error () (note path :again-refused))))
+                                               nil)
+                                             (then-for path))))
+                             (error (e) (note path :refused (princ-to-string e))))
+                           (stream-send c (%ascii (format nil "from ~a" path)))
+                           (when (string= path "/s1")
+                             (stream-close c))))))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req))
+                   (started nil))
+               (receive-body
+                :on-data (lambda (conn bytes)
+                           (unless started
+                             (setf started t)
+                             (if (string= path "/b")
+                                 ;; Waited for: the body pauses on it.
+                                 (handler-case
+                                     (progn
+                                       (fetch-into conn
+                                                   (http-fetch :get (url)
+                                                               :then (lambda (s h b)
+                                                                       (declare (ignore h b))
+                                                                       (note path :then s)
+                                                                       (body-resume conn)
+                                                                       nil)))
+                                       :pause)
+                                   (error (e) (note path :refused (princ-to-string e)) nil))
+                                 ;; Not waited for.
+                                 (progn
+                                   (fetch-into conn (http-fetch :put (url) :body bytes
+                                                                :then (then-for path)))
+                                   nil))))
+                :on-end (lambda (conn)
+                          (declare (ignore conn))
+                          (if (string= path "/c")
+                              (make-stream-response
+                               :on-open (lambda (c) (stream-send c (%ascii "first"))))
+                              (make-text-response 200 (format nil "done ~a" path))))
+                :on-abort (lambda (conn reason)
+                            (declare (ignore conn))
+                            (note path :aborted reason))))))
+        ;; ---- a body's fetch, and the next request ----
+        (multiple-value-bind (port-a box-a thread-a) (%held-upstream)
+          (setf (first port-box) port-a)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "~ahello" (post-head "/a" 5)))
+                   (check "body: /a is answered at once"
+                          (nth-value 1 (read-for stream "done /a" 5)) :satisfied)
+                   (multiple-value-bind (port-b box-b thread-b) (%held-upstream)
+                     (setf (first port-box) port-b
+                           (car box-b) :answer)
+                     (send stream (format nil "~a01234" (post-head "/b" 10)))
+                     (sleep 0.3)
+                     (setf (car box-a) :hang-up)
+                     (sleep 0.3)
+                     (handler-case (send stream "56789") (error () nil))
+                     (check "body: /b, next on the connection, is answered"
+                            (nth-value 1 (read-for stream "done /b" 5)) :satisfied)
+                     (handler-case (sb-thread:join-thread thread-b :timeout 10) (error () nil))))
+              (setf (car box-a) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-a :timeout 10) (error () nil)))
+        (check "body: /a's fetch, not waited for, heard the abort sentinel"
+               (notes-of "/a") '((:then nil)))
+        (check "body: /b's own fetch was started and waited for, and nothing ended /b"
+               (notes-of "/b") '((:then 200)))
+        ;; ---- a stream's fetch, and the next stream ----
+        (multiple-value-bind (port-1 box-1 thread-1) (%held-upstream)
+          (setf (first port-box) port-1)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "GET /s1 HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                   (check "stream: /s1 closes itself"
+                          (nth-value 1 (read-for stream terminator 5)) :satisfied)
+                   (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+                     (setf (first port-box) port-2
+                           (car box-2) :answer)
+                     (send stream (format nil "GET /s2 HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                     (multiple-value-bind (text reason) (read-for stream terminator 5)
+                       (check "stream: /s2, next on the connection, relays and ends"
+                              (list reason (and (search "from /s2" text) t))
+                              '(:satisfied t)))
+                     (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil))))
+              (setf (car box-1) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        (check "stream: /s1's fetch was ended with its stream"
+               (notes-of "/s1") '((:then nil)))
+        (check "stream: /s2's relay was started, not refused, and delivered"
+               (notes-of "/s2") '((:then 200)))
+        ;; ---- a body's fetch, and the stream the body is answered with ----
+        (multiple-value-bind (port-c box-c thread-c) (%held-upstream)
+          (setf (first port-box) port-c)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "~ahello" (post-head "/c" 5)))
+                   (check "answered with a stream: the stream begins"
+                          (nth-value 1 (read-for stream "first" 5)) :satisfied)
+                   (setf (car box-c) :answer)
+                   (check "answered with a stream: its upstream answering does not close it"
+                          (nth-value 1 (read-for stream terminator 1.5)) :deadline))
+              (setf (car box-c) :hang-up)
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          (handler-case (sb-thread:join-thread thread-c :timeout 10) (error () nil)))
+        (check "answered with a stream: /c's fetch heard the abort sentinel"
+               (notes-of "/c") '((:then nil)))
+        ;; ---- a stream's client leaving, and a :THEN that tries again ----
+        (multiple-value-bind (port-r box-r thread-r) (%held-upstream)
+          (setf (first port-box) port-r)
+          (multiple-value-bind (socket stream) (%raw-connect)
+            (unwind-protect
+                 (progn
+                   (send stream (format nil "GET /retry HTTP/1.1~aHost: x~a~a" *crlf* *crlf* *crlf*))
+                   ;; The census is published once a second, so its outbound
+                   ;; is waited for here, and its count below is not one
+                   ;; from before the relay began.
+                   (check "leaving: the relay begins"
+                          (list (nth-value 1 (read-for stream "from /retry" 5))
+                                (census-await :outbound 1))
+                          '(:satisfied 1)))
+              (ignore-errors (close stream :abort t))
+              (ignore-errors (sb-bsd-sockets:socket-close socket))))
+          ;; Asked first, well inside the ten seconds after which the
+          ;; upstream hangs up and would take a fetch left running with it.
+          (check "leaving: no outbound is left running"
+                 (census-await :outbound 0) 0)
+          (check "leaving: a fetch into the closing connection, from the sentinel, was refused"
+                 (loop repeat 100
+                       until (member '(:again-refused) (notes-of "/retry") :test #'equal)
+                       do (sleep 0.05)
+                       finally (return (notes-of "/retry")))
+                 '((:then nil) (:again-refused)))
+          (setf (car box-r) :hang-up)
+          (handler-case (sb-thread:join-thread thread-r :timeout 10) (error () nil))))
+      ;; ---- answered with a fetch that has ended, another still running ----
+      (with-test-server
+          (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
+           :body-handler
+           (lambda (req)
+             (let ((path (http-request-path req)))
+               (if (string= path "/next")
+                   ;; A body with no fetch of its own.
+                   (receive-body
+                    :on-data (lambda (conn bytes) (declare (ignore conn bytes)) nil)
+                    :on-end (lambda (conn)
+                              (declare (ignore conn))
+                              (make-text-response 200 "done /next"))
+                    :on-abort (lambda (conn reason)
+                                (declare (ignore conn))
+                                (note path :aborted reason)))
+                   ;; /adopt and /adopt-stream, whose first fetch answers
+                   ;; with a stream that stays open.
+                   (let ((first-fetch
+                           (http-fetch :put (format nil "http://127.0.0.1:~d/up"
+                                                    (first adopt-ports))
+                                       :body :stream
+                                       :then (lambda (s h b)
+                                               (declare (ignore h b))
+                                               (note path :first s)
+                                               (if (string= path "/adopt-stream")
+                                                   (make-stream-response
+                                                    :on-open (lambda (c)
+                                                               (stream-send
+                                                                c (%ascii "first answered"))))
+                                                   (make-text-response 200 "first answered"))))))
+                     (receive-body
+                      :on-data (lambda (conn bytes)
+                                 (if (fetch-started-p first-fetch)
+                                     ;; It has answered, so the rest goes
+                                     ;; nowhere, and the body starts a fetch
+                                     ;; of its own that it does not wait for.
+                                     (when (eq (fetch-send first-fetch bytes) :ended)
+                                       (handler-case
+                                           (fetch-into conn
+                                                       (http-fetch
+                                                        :get (format nil "http://127.0.0.1:~d/up"
+                                                                     (second adopt-ports))
+                                                        :then (then-for (format nil "~a-second"
+                                                                                path))))
+                                         (error (e) (note path :refused (princ-to-string e)))))
+                                     (progn
+                                       (fetch-into conn first-fetch :failure-disposition :keep)
+                                       (fetch-send first-fetch bytes)))
+                                 nil)
+                      :on-end (lambda (conn) (declare (ignore conn)) first-fetch)
+                      :on-abort (lambda (conn reason)
+                                  (declare (ignore conn))
+                                  (note path :aborted reason))))))))
+        (multiple-value-bind (port-1 thread-1) (%upload-upstream :early-status 200)
+          (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+            (setf (first adopt-ports) port-1
+                  (second adopt-ports) port-2)
+            (multiple-value-bind (socket stream) (%raw-connect)
+              (unwind-protect
+                   (progn
+                     (send stream (format nil "~a01234" (post-head "/adopt" 10)))
+                     ;; The rest once the first fetch has answered.
+                     (loop repeat 100 until (notes-of "/adopt") do (sleep 0.05))
+                     (send stream "56789")
+                     (check "adopt: answered with the fetch that answered first"
+                            (nth-value 1 (read-for stream "first answered" 5)) :satisfied)
+                     (check "adopt: the fetch started after it was ended with the body"
+                            (loop repeat 40
+                                  until (notes-of "/adopt-second")
+                                  do (sleep 0.05)
+                                  finally (return (notes-of "/adopt-second")))
+                            '((:then nil)))
+                     (send stream (format nil "~a01234" (post-head "/next" 10)))
+                     (sleep 0.3)
+                     (setf (car box-2) :hang-up)
+                     (sleep 0.3)
+                     (handler-case (send stream "56789") (error () nil))
+                     (check "adopt: /next, next on the connection, is answered"
+                            (nth-value 1 (read-for stream "done /next" 5)) :satisfied))
+                (setf (car box-2) :hang-up)
+                (ignore-errors (close stream :abort t))
+                (ignore-errors (sb-bsd-sockets:socket-close socket))))
+            (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil)))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        ;; The same, answered with a stream: the fetch the body started
+        ;; after the first answered is ended before the stream begins, so
+        ;; its upstream answering does not close the stream.
+        (multiple-value-bind (port-1 thread-1) (%upload-upstream :early-status 200)
+          (multiple-value-bind (port-2 box-2 thread-2) (%held-upstream)
+            (setf (first adopt-ports) port-1
+                  (second adopt-ports) port-2)
+            (multiple-value-bind (socket stream) (%raw-connect)
+              (unwind-protect
+                   (progn
+                     (send stream (format nil "~a01234" (post-head "/adopt-stream" 10)))
+                     (loop repeat 100 until (notes-of "/adopt-stream") do (sleep 0.05))
+                     (send stream "56789")
+                     (check "adopt, a stream: the stream the first fetch answered with begins"
+                            (nth-value 1 (read-for stream "first answered" 5)) :satisfied)
+                     (setf (car box-2) :answer)
+                     (check "adopt, a stream: the other fetch's upstream answering does not close it"
+                            (nth-value 1 (read-for stream terminator 1.5)) :deadline))
+                (setf (car box-2) :hang-up)
+                (ignore-errors (close stream :abort t))
+                (ignore-errors (sb-bsd-sockets:socket-close socket))))
+            (handler-case (sb-thread:join-thread thread-2 :timeout 10) (error () nil)))
+          (handler-case (sb-thread:join-thread thread-1 :timeout 10) (error () nil)))
+        (check "adopt, a stream: the other fetch heard the abort sentinel"
+               (notes-of "/adopt-stream-second") '((:then nil)))
+        (check "adopt: each first fetch answered at the head, and nothing ended /next"
+               (list (notes-of "/adopt") (notes-of "/adopt-stream") (notes-of "/next"))
+               '(((:first 200)) ((:first 200)) nil))))))
+
 (defun %stop-verdict-pass (&optional target-disposition)
   "One HANDLE-OUTBOUND-READ pass over a complete chunked response whose
    :ON-BODY returns :STOP on the first chunk and NIL on the rest.
 
-   Returns (values FINAL CHUNKS LIVENESS FIRES REMAINING TARGET): the
-   status the fetch callback was handed (:NEVER if it never ran), the chunk
-   payloads in delivery order, one liveness reading per delivery taken from
-   inside the callback, how many times the callback fired, the connections
+   Returns (values FINAL CHUNKS FIRES REMAINING TARGET): the status the
+   fetch callback was handed (:NEVER if it never ran), the chunk payloads
+   in delivery order, how many times the callback fired, the connections
    still registered when the pass returned, and the target if one was
    asked for.
 
    TARGET-DISPOSITION, when given, puts a registered :WEBSOCKET target
    carrying it behind the outbound. Without it the outbound's INBOUND-FD is
-   -1, which is the arrangement the first two tests want: no target to
+   -1, which is the arrangement the first test wants: no target to
    survive, and a REMAINING of zero that means the outbound alone.
 
-   Shared by the three tests below because only the assertions differ. The
+   Shared by the two tests below because only the assertions differ. The
    arrangement is the whole fixture — a pass carrying several chunks with a
-   stop partway through — and written twice it would be two fixtures free
-   to drift apart while each claimed to hold everything but its own
-   question constant.
+   stop on the first — and written twice it would be two fixtures free to
+   drift apart while each claimed to hold everything but its own question
+   constant.
 
    A stub transport rather than a socket, for the reason
    TEST-FETCH-OK-EOF-WALKS-THE-BYTES uses one: whether several chunks land
@@ -3887,7 +8916,6 @@
                                          :external-format :ascii))
          (pos 0)
          (chunks nil)
-         (liveness nil)
          (fires 0)
          (final :never)
          (socket (make-instance 'sb-bsd-sockets:inet-socket
@@ -3927,25 +8955,13 @@
                       :last-active (get-universal-time)
                       :fetch-on-body
                       (lambda (c chunk)
+                        (declare (ignore c))
                         (push (sb-ext:octets-to-string
                                chunk :external-format :ascii)
                               chunks)
-                        ;; Read from inside the callback, because that is
-                        ;; the only frame the claim is about: the walk is
-                        ;; running underneath this one. CONNECTION-CLOSE
-                        ;; sets the fd to -1 and leaves the read buffer
-                        ;; alone, so a torn-down connection goes on being
-                        ;; walked and only these two slots say so.
-                        (let* ((fd (web-skeleton::connection-fd c))
-                               (live (>= fd 0))
-                               (registered
-                                 (and (web-skeleton::lookup-connection fd) t)))
-                          (push (cond ((and live registered) :live)
-                                      ((or live registered) :half-torn-down)
-                                      (t :torn-down))
-                                liveness))
-                        ;; Stop on the first, NIL for the rest. That
-                        ;; sequence is the one last-wins erases.
+                        ;; Stop on the first, NIL for the rest: a walk that
+                        ;; carried on past the verdict would hand those
+                        ;; over and record their answers.
                         (when (= (length chunks) 1) :stop))
                       :fetch-callback
                       (lambda (status headers body)
@@ -3970,93 +8986,38 @@
            (web-skeleton::register-connection conn)
            (web-skeleton::handle-outbound-read conn epfd)
            ;; REMAINING counts the target too when there is one, so the
-           ;; sticky test's "reclaimed" reading is taken without one.
-           (values final (reverse chunks) (reverse liveness) fires
+           ;; first test's "reclaimed" reading is taken without one.
+           (values final (reverse chunks) fires
                    (hash-table-count web-skeleton::*connections*)
                    target))
-      (ignore-errors (web-skeleton::%close epfd)))))
+      (ignore-errors (web-skeleton::%close epfd))
+      ;; The stop's teardown closes the socket; this is for a pass that
+      ;; never reached it. A closed socket takes a second close as a no-op.
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
-(defun test-fetch-stop-is-sticky-across-a-pass ()
-  "A :STOP on the first chunk of a pass survives the chunks that follow it.
+(defun test-fetch-stop-ends-the-pass-at-its-chunk ()
+  "A :STOP on the first chunk of a pass ends the fetch there: no later
+   chunk is handed over, though the whole response is in the buffer, and
+   :THEN gets the abort sentinel.
 
-   :ON-BODY's answer was captured last-answer-wins, which is right for
-   :PAUSE — it describes a write backlog that may have drained by the next
-   chunk — and wrong for :STOP, which describes the fetch and has no
-   verdict that retracts it. Under last-wins an app that stopped on the
-   first of three chunks in one pass had its stop erased by the NIL it
-   returned for the second, and the fetch ran to completion with the cancel
-   silently dropped.
-
-   The sentinel is one assertion covering both halves of the verdict.
-   Last-wins loses the stop and COMPLETE-FETCH delivers a 200; so does an
-   implementation that keeps the stop but tests it after COMPLETE in the
-   cond. Only sticky, and ahead of COMPLETE, produces the abort sentinel.
+   Two checks, each against its own wrong implementation. The chunks are
+   the one against a walk that carries on past the verdict: it would hand
+   over all three. The sentinel is the one against a stop that loses to the
+   response completing: the terminator is in the buffer, and a walk left
+   to reach it would have COMPLETE-FETCH report 200.
 
    %STOP-VERDICT-PASS has why the fixture is shaped as it is, and in
    particular why its response is complete — which is also why this is not
-   a smaller copy of the end-to-end test. A stop taken mid-body leaves no
-   chunked terminator, so a COMPLETE-FETCH routing raises out of
-   DECODE-CHUNKED-BODY and the fetch ends on the sentinel anyway, by the
-   wrong road. Here the accumulated body parses, 200 is what COMPLETE-FETCH
-   actually reports, and this is the only place that reading is refused.
-
-   The chunks are asserted too, and not as decoration: they are what proves
-   the pass carried anything after the stop. Without them this would pass
-   against a single-chunk pass, which is the arrangement that cannot fail."
-  (format t "~%Fetch: :STOP is sticky across a pass~%")
-  (multiple-value-bind (final chunks liveness fires remaining)
+   a smaller copy of the end-to-end test, whose stopped upstream never
+   sends a terminator at all."
+  (format t "~%Fetch: :STOP ends the pass at its chunk~%")
+  (multiple-value-bind (final chunks fires remaining)
       (%stop-verdict-pass)
-    (declare (ignore liveness))
-    ;; The discriminating one.
-    (check "stop sticky: the fetch ended on the abort sentinel" final nil)
-    (check "stop sticky: the pass carried chunks past the stop"
-           chunks *chunked-corpus*)
-    (check "stop sticky: the fetch ended exactly once" fires 1)
-    (check "stop sticky: the outbound was reclaimed" remaining 0)))
-
-(defun test-fetch-stop-does-not-tear-down-mid-walk ()
-  "A :STOP is recorded during the walk and acted on after it.
-
-   The verdict is captured into a local and the teardown happens in the
-   cond that runs once OUTBOUND-RESPONSE-COMPLETE-P has returned. Tearing
-   down from inside the callback instead is the obvious shortcut, it is
-   what a synchronous cancel would have to do, and nothing else in this
-   suite can see the difference.
-
-   That is the whole reason this is its own test rather than a claim riding
-   along on its neighbour. Under a synchronous teardown CLOSE-OUTBOUND runs
-   from inside the callback and every other reading comes out identical:
-   CONNECTION-CLOSE sets the fd to -1 without touching the read buffer, so
-   the walk carries on over a closed connection and still delivers every
-   chunk; the callback has already fired exactly once; the connection is
-   already unregistered; and the cond's stop arm, reached afterwards, finds
-   (>= fd 0) false and quietly does nothing. Sentinel, chunks, count and
-   reclamation all pass. The verification claim would have had no detector
-   at all.
-
-   The reading that discriminates is taken from inside the callback, the
-   only frame with the walk still underneath it. Live and registered for
-   every chunk of the pass is the deferred design; :TORN-DOWN from the
-   second chunk on is the shortcut.
-
-   One check, because the list guards itself. Its contents are the claim
-   and its length is the non-vacuity condition — a one-element reading
-   means the pass never carried anything past the stop, which is the
-   arrangement in which this cannot fail, and it reports as a failure
-   rather than as a pass.
-
-   The length is also coupled to the fixture's chunk count, which is worth
-   knowing before changing the fixture. *CHUNKED-CORPUS* has three
-   payloads; give it a fourth and this fails on the count rather than on
-   the claim. That is the price of folding the guard into the assertion,
-   and it is the right trade here — two separate checks could drift apart,
-   where this one goes red loudly and points at the line that moved."
-  (format t "~%Fetch: :STOP defers teardown to the cond~%")
-  (multiple-value-bind (final chunks liveness fires remaining)
-      (%stop-verdict-pass)
-    (declare (ignore final chunks fires remaining))
-    (check "stop deferred: the connection was live for every chunk of the pass"
-           liveness '(:live :live :live))))
+    (check "stop: the fetch ended on the abort sentinel" final nil)
+    (check "stop: no chunk after the stop was handed over"
+           chunks (list (first *chunked-corpus*)))
+    (check "stop: the fetch ended exactly once" fires 1)
+    (check "stop: the outbound was reclaimed" remaining 0)))
 
 (defun %ws-disposition-pass (disposition)
   "Run DELIVER-DETACHED's aborted arm against a :WEBSOCKET target carrying
@@ -4098,18 +9059,18 @@
 
 (defun test-fetch-failure-disposition-crosses-the-seam ()
   "FETCH-INTO writes the disposition and DELIVER-DETACHED reads it. This is
-   the wire between them, which nothing was watching.
+   the wire between them.
 
-   Both ends were covered and the wire was not. The refusal tests reach
-   FETCH-INTO's guards and stop there, which is before the write. The two
-   disposition fixtures set the slot themselves through MAKE-CONNECTION's
-   initarg, so they check the read against a value no production code ever
-   put there. Delete the disposition clause from FETCH-INTO's setf and the
-   slot keeps its :CLOSE default — :KEEP accepted, validated, and silently
-   ignored, which is the exact hazard the issue names — and every test on
-   this branch stayed green.
+   The ends are covered elsewhere and the wire is not. The refusal tests
+   reach FETCH-INTO's guards and stop there, which is before the write.
+   The two disposition fixtures set the slot themselves through
+   MAKE-CONNECTION's initarg, so they check the read against a value no
+   production code put there. Delete the disposition clause from
+   FETCH-INTO's setf and the slot keeps its :CLOSE default — :KEEP
+   accepted, validated, and silently ignored — and every other test stays
+   green.
 
-   The mode has a name now: *pre-arranged*. A fixture performs the step
+   That mode is *pre-arranged*. A fixture performs the step
    production is responsible for performing, then checks the consumer of
    that step. It is not vacuous, it can fail; not partial, it covers its
    claim; not confounded, it passes for the right reason. What it cannot do
@@ -4171,11 +9132,10 @@
    through (LOOKUP-CONNECTION TARGET-FD), and *CONNECTIONS* is per-worker
    while fds are unique across the process, so that lookup answers NIL.
 
-   The consequence is this branch's own thesis from a seventh direction.
-   FETCH-OUTSTANDING is set and never cleared, so every later FETCH-INTO on
-   that connection is refused for the rest of its life — which is exactly
-   what DELIVER-DNS-ERROR did before it delegated — and the failure
-   disposition never applies, so a :STREAMING target sits to
+   The consequence: FETCH-OUTSTANDING is set and never cleared, so every
+   later FETCH-INTO on that connection is refused for the rest of its
+   life, and the failure disposition never applies, so a :STREAMING
+   target sits to
    *STREAM-IDLE-TIMEOUT* when its upstream fails.
 
    Two calls differing only in registration. The refused one is the claim.
@@ -4224,7 +9184,7 @@
                          t))
                   t)
            ;; The control. Registering the same connection is the only
-           ;; change, and the call now reaches INITIATE-FETCH.
+           ;; difference, and the call then reaches INITIATE-FETCH.
            (web-skeleton::register-connection conn)
            (check "fetch-into: and the same call is accepted once it is owned"
                   (attempt
@@ -4373,9 +9333,9 @@
    which is the shape that ships."
   (format t "~%Fetch: a stop is not governed by :failure-disposition~%")
   (dolist (disposition '(:close :keep))
-    (multiple-value-bind (final chunks liveness fires remaining target)
+    (multiple-value-bind (final chunks fires remaining target)
         (%stop-verdict-pass disposition)
-      (declare (ignore final chunks liveness fires remaining))
+      (declare (ignore final chunks fires remaining))
       (check (format nil "stop vs ~a: the target survived" disposition)
              (web-skeleton::connection-state target) :websocket)
       (check (format nil "stop vs ~a: nothing was written to it" disposition)
@@ -4394,22 +9354,21 @@
    window is 8, which is what keeps the deadline sweeper from passing this
    test on the stop's behalf.
 
-   :THEN must see the abort sentinel, and which wrong implementation that
-   catches was measured rather than reasoned about. COMPLETE-FETCH with
-   :FRAMING-COMPLETE T — a copy of the arm directly above it in the cond,
-   and so the likeliest mistake — suppresses the body decode, delivers a
+   :THEN must see the abort sentinel, which is what catches this wrong
+   implementation: COMPLETE-FETCH with :FRAMING-COMPLETE T — a copy of the
+   arm directly above it in the cond, and so the likeliest mistake —
+   suppresses the body decode, delivers a
    200, and passes every other check here: the disposition leaves the
    target alone, the stream survives, the second fetch runs. Only this
    check fails, on exactly the report the verdict exists to prevent.
 
    Plain COMPLETE-FETCH, without that keyword, is caught elsewhere and not
    here, which is worth stating rather than leaving to be discovered. A
-   chunked upstream stopped mid-body has no terminator, so
-   DECODE-CHUNKED-BODY raises, HANDLE-OUTBOUND-EVENT's handler routes it
-   to DELIVER-FETCH-ERROR, and :THEN receives the sentinel by the wrong
-   road. TEST-FETCH-STOP-IS-STICKY-ACROSS-A-PASS is the detector for that
-   shape: its upstream response is complete, so COMPLETE-FETCH parses it
-   and reports 200 with or without the keyword.
+   stopped walk has not reached a terminator, so COMPLETE-FETCH refuses
+   the relay as ended early and routes it to DELIVER-FETCH-ERROR, and
+   :THEN receives the sentinel by the wrong road. That road applies the
+   failure disposition, so TEST-FETCH-STOP-IGNORES-THE-FAILURE-DISPOSITION
+   is the detector for it: at :CLOSE the target does not survive.
 
    The target must survive, asserted through its own body: the client
    decodes what was relayed plus what was written after the stop,
@@ -4546,10 +9505,9 @@
    assertion would hold just as well against a census that counted
    nothing.
 
-   The first draft of this test read the count from :THEN and measured a
-   peak of 0, because COMPLETE-FETCH tears the outbound down before it
-   invokes the callback. The non-vacuity check is the only reason that was
-   noticed rather than shipped as a passing test of nothing."
+   The count is not read from :THEN. COMPLETE-FETCH tears the outbound
+   down before it invokes the callback, so a peak read there is 0, and
+   only the non-vacuity check would say so rather than pass on nothing."
   (format t "~%Harness: census, outbound returns to zero after a fetch~%")
   (let ((port-box (list nil))
         (peak 0))
@@ -4611,6 +9569,9 @@
   (test-harness-expect-100-continue-e2e)
   (test-harness-head-fetch-e2e)
   (test-harness-body-at-max-size-e2e)
+  (test-harness-large-body-grows-the-buffer-e2e)
+  (test-harness-split-head-then-pipelined-e2e)
+  (test-harness-full-buffer-answered-promptly-e2e)
   (test-harness-pipelined-with-fin-e2e)
   (test-worker-id-is-public-and-holds-still-per-connection)
   (test-connection-serial-does-not-repeat-when-an-fd-does)
@@ -4621,6 +9582,9 @@
   (test-harness-chunked-body-cap-e2e)
   (test-harness-chunked-expect-100-continue-e2e)
   (test-harness-cached-response-survives-head-e2e)
+  (test-harness-a-head-with-no-fields-e2e)
+  (test-harness-host-field-e2e)
+  (test-harness-content-length-spellings-e2e)
   (test-harness-http10-keepalive-no-mutation-e2e)
   (test-harness-http10-expect-100-continue-no-fire-e2e)
   (test-harness-expect-417-on-unknown-e2e)
@@ -4631,14 +9595,31 @@
   (test-harness-fetch-callback-connection-close-honored-e2e)
   (test-harness-awaiting-timeout-answers-504-e2e)
   (test-harness-close-delimited-fetch-e2e)
+  (test-harness-fetch-latin-1-header-e2e)
+  (test-harness-accept-failure-is-retried-e2e)
+  (test-harness-client-errors-log-once-a-minute-e2e)
+  (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
+  (test-harness-address-filter-asked-once-e2e)
+  (test-harness-hostname-fetches-leave-no-zombie-e2e)
   (test-harness-http11-server-close-stamps-connection-close-e2e)
   (test-refuse-connection-drains)
   (test-harness-connection-limit-e2e)
+  (test-harness-refusals-are-reported-not-logged-each)
+  (test-harness-descriptor-limit-e2e)
   (test-harness-workers-zero-rejected)
   (test-harness-write-stall-timeout-zero-rejected)
   (test-harness-write-backlog-minimum-rejected)
   (test-harness-fetch-stream-plain-e2e)
+  (test-harness-fetch-stream-plain-read-timeout-e2e)
+  (test-harness-fetch-stream-plain-lines-arrive-as-sent-e2e)
+  (test-harness-fetch-stream-plain-write-timeout-e2e)
+  (test-harness-fetch-bodiless-status-kept-alive-e2e)
+  (test-harness-fetch-non-chunked-coding-e2e)
+  (test-harness-upstream-header-limits-e2e)
+  (test-harness-serves-without-tls-e2e)
+  (test-harness-a-worker-left-behind-stays-with-its-run)
+  (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-streaming-e2e)
@@ -4649,21 +9630,45 @@
   (test-fetch-ok-eof-walks-the-bytes)
   (test-harness-fetch-on-body-eof-together-e2e)
   (test-harness-fetch-on-body-truncated-chunked-e2e)
+  (test-harness-fetch-on-body-relays-past-the-cap-e2e)
+  (test-harness-fetch-into-relays-past-the-cap-e2e)
   (test-harness-fetch-on-body-stop-parked-e2e)
   (test-harness-stream-does-not-hold-worker-e2e)
   (test-harness-census-outbound-returns-to-zero-e2e)
   (test-harness-fetch-into-refusals)
   (test-harness-fetch-into-setup-failure)
   (test-harness-detached-deadline-sweep)
+  (test-harness-detached-deadline-spares-a-draining-pause)
   (test-harness-fetch-into-relay-e2e)
+  (test-harness-fetch-into-relays-to-a-slow-client-e2e)
   (test-harness-fetch-into-chained-e2e)
   (test-harness-fetch-into-dns-failure-e2e)
   (test-harness-ipv6-listener-e2e)
 
   (test-harness-fetch-into-upstream-stalls-e2e)
+  (test-harness-fetch-into-refuses-malformed-chunks-e2e)
+  (test-harness-body-handler-e2e)
+  (test-harness-receive-body-e2e)
+  (test-harness-receive-body-paused-e2e)
+  (test-harness-receive-body-refused-from-a-callback-e2e)
+  (test-harness-paused-body-waits-on-its-fetch-e2e)
+  (test-harness-receive-multipart-e2e)
+  (test-harness-receive-multipart-paused-e2e)
+  (test-harness-body-refused-from-inside-its-callback-e2e)
+  (test-harness-streamed-request-body-e2e)
+  (test-harness-forward-body-unstartable-as-the-server-stops-e2e)
+  (test-harness-a-send-before-its-fetch-starts-e2e)
+  (test-harness-form-file-forwarded-e2e)
+  (test-harness-streamed-request-body-timing-e2e)
+  (test-harness-then-answers-with-a-started-fetch-e2e)
+  (test-harness-streamed-request-body-from-a-tick-e2e)
+  (test-harness-answer-paused-while-the-request-goes-out-e2e)
+  (test-harness-fetch-falls-back-to-the-next-address-e2e)
+  (test-harness-a-response-is-written-from-its-read-e2e)
+  (test-harness-body-stall-e2e)
   (test-harness-fetch-into-target-closed-e2e)
-  (test-fetch-stop-is-sticky-across-a-pass)
-  (test-fetch-stop-does-not-tear-down-mid-walk)
+  (test-harness-a-fetch-ends-with-what-it-was-started-for-e2e)
+  (test-fetch-stop-ends-the-pass-at-its-chunk)
   (test-fetch-stop-ignores-the-failure-disposition)
   (test-fetch-failure-disposition-both-directions)
   (test-fetch-aborted-ws-at-the-backlog-bound)

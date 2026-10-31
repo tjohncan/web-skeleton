@@ -16,12 +16,16 @@
 
 (defun u32-right-rotate (n count)
   "Rotate 32-bit integer N right by COUNT bits."
+  (declare (type (unsigned-byte 32) n)
+           (type (integer 0 32) count))
   (logand #xFFFFFFFF
           (logior (ash n (- count))
                   (ash n (- 32 count)))))
 
 (defun u32-right-shift (n count)
   "Shift 32-bit integer N right by COUNT bits (zero-fill)."
+  (declare (type (unsigned-byte 32) n)
+           (type (integer 0 32) count))
   (ash n (- count)))
 
 ;;; ---------------------------------------------------------------------------
@@ -32,30 +36,36 @@
                  sha256-small-sigma0 sha256-small-sigma1))
 
 (defun sha256-ch (x y z)
+  (declare (type (unsigned-byte 32) x y z))
   (logand #xFFFFFFFF (logxor (logand x y) (logand (logxor x #xFFFFFFFF) z))))
 
 (defun sha256-maj (x y z)
+  (declare (type (unsigned-byte 32) x y z))
   (logand #xFFFFFFFF (logxor (logand x y) (logand x z) (logand y z))))
 
 (defun sha256-big-sigma0 (x)
+  (declare (type (unsigned-byte 32) x))
   (logand #xFFFFFFFF
           (logxor (u32-right-rotate x 2)
                   (u32-right-rotate x 13)
                   (u32-right-rotate x 22))))
 
 (defun sha256-big-sigma1 (x)
+  (declare (type (unsigned-byte 32) x))
   (logand #xFFFFFFFF
           (logxor (u32-right-rotate x 6)
                   (u32-right-rotate x 11)
                   (u32-right-rotate x 25))))
 
 (defun sha256-small-sigma0 (x)
+  (declare (type (unsigned-byte 32) x))
   (logand #xFFFFFFFF
           (logxor (u32-right-rotate x 7)
                   (u32-right-rotate x 18)
                   (u32-right-shift x 3))))
 
 (defun sha256-small-sigma1 (x)
+  (declare (type (unsigned-byte 32) x))
   (logand #xFFFFFFFF
           (logxor (u32-right-rotate x 17)
                   (u32-right-rotate x 19)
@@ -121,10 +131,17 @@
    Both exist to keep the hot loop allocation-free; see
    SHA1-PROCESS-BLOCK for the full rationale. Every W slot is written
    before it is read, so reuse needs no clearing, and SHA256-LISP
-   allocates W per call, so concurrent digests never share one."
+   allocates W per call, so concurrent digests never share one.
+
+   Every word is declared (UNSIGNED-BYTE 32), so the masked sums and
+   rotations are machine arithmetic; see SHA1-PROCESS-BLOCK on the safety
+   kept. The table is bound to a typed local, since a special's type is
+   unknown wherever it is read."
   (declare (type (simple-array (unsigned-byte 8) (*)) data)
            (type (simple-array (unsigned-byte 32) (*)) w)
-           (type fixnum start))
+           (type fixnum start)
+           (type (unsigned-byte 32) h0 h1 h2 h3 h4 h5 h6 h7)
+           (optimize speed))
   ;; First 16 words: big-endian from the block
   (loop for i of-type fixnum from 0 below 16
         for offset of-type fixnum = (+ start (* i 4))
@@ -141,13 +158,16 @@
                        (sha256-small-sigma0 (aref w (- i 15)))
                        (aref w (- i 16)))))
   ;; Initialize working variables
-  (let ((a h0) (b h1) (c h2) (d h3) (e h4) (f h5) (g h6) (h h7))
+  (let ((k *sha256-k*)
+        (a h0) (b h1) (c h2) (d h3) (e h4) (f h5) (g h6) (h h7))
+    (declare (type (simple-array (unsigned-byte 32) (64)) k)
+             (type (unsigned-byte 32) a b c d e f g h))
     ;; 64 rounds
     (loop for i of-type fixnum from 0 below 64
           do (let* ((t1 (u32+ h
                               (sha256-big-sigma1 e)
                               (sha256-ch e f g)
-                              (aref *sha256-k* i)
+                              (aref k i)
                               (aref w i)))
                     (t2 (u32+ (sha256-big-sigma0 a)
                               (sha256-maj a b c))))
@@ -167,8 +187,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun sha256-lisp (data)
-  "Pure-Lisp SHA-256 (FIPS 180-4). Takes a byte vector, returns a
-   32-byte digest vector. Always reachable under this name regardless
+  "Pure-Lisp SHA-256 (FIPS 180-4). Takes an (unsigned-byte 8) vector
+   through OCTETS-ARGUMENT, as SHA256-LIBSSL does, and returns a 32-byte
+   digest vector. Always reachable under this name regardless
    of whether web-skeleton-tls has been loaded — the TLS system swaps
    the public SHA256 symbol to a libssl-backed version at load time
    via SETF SYMBOL-FUNCTION, but this function stays accessible
@@ -178,7 +199,7 @@
    DO NOT declaim SHA256 inline: the libssl swap works through the
    function cell, and an inlined caller would bypass the cell and keep
    calling whichever implementation was visible at compile time."
-  (let ((padded (sha256-pad data))
+  (let ((padded (sha256-pad (octets-argument data 'sha256)))
         ;; One scratch schedule for the whole digest — see
         ;; SHA256-PROCESS-BLOCK. Allocated per call, so concurrent
         ;; digests stay independent.
@@ -207,7 +228,9 @@
         digest))))
 
 (defun sha256 (data)
-  "Compute SHA-256 digest of DATA (byte vector). Returns a 32-byte vector.
+  "Compute SHA-256 digest of DATA, an (unsigned-byte 8) vector; a string is
+   refused, with the call that makes one into bytes (see OCTETS-ARGUMENT).
+   Returns a 32-byte vector.
    Delegates to SHA256-LISP by default; web-skeleton-tls replaces this
    function with a libssl-backed version at load time. SHA256-HEX,
    HMAC-SHA256, and any other caller picks up the swap transparently by

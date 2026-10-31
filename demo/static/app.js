@@ -65,17 +65,24 @@ function connect(onOpen) {
   }
   appendLog('[status] connecting...', 'status');
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  ws = new WebSocket(proto + location.host + '/ws');
-  ws.onopen = function() {
+  // Each handler below acts only while SOCK is still the page's socket. A
+  // post made while the last one is closing opens this one, and that one's
+  // events, its close above all, must not land here: clearing this socket's
+  // worker row, counting a reconnect, scheduling another.
+  const sock = new WebSocket(proto + location.host + '/ws');
+  ws = sock;
+  sock.onopen = function() {
+    if (sock !== ws) return;
     reconnectAttempts = 0;
     appendLog('[status] connected', 'status');
     // Ask which worker owns this socket. Binary, because the bulletin box
     // sends text and only text — so a control frame cannot collide with
     // anything a visitor is able to type, in either direction.
-    ws.send(new TextEncoder().encode('worker'));
+    sock.send(new TextEncoder().encode('worker'));
     if (onOpen) onOpen();
   };
-  ws.onmessage = function(e) {
+  sock.onmessage = function(e) {
+    if (sock !== ws) return;
     // A posted line is four fields on three TABs — sequence, stamp, sender,
     // text — parsed below.
     //
@@ -116,7 +123,8 @@ function connect(onOpen) {
       appendLog(e.data, 'recv');
     }
   };
-  ws.onclose = function() {
+  sock.onclose = function() {
+    if (sock !== ws) return;
     // The worker and handle belonged to that socket. A reconnect may land on
     // another worker under a new serial, and asks again when it opens; until
     // then — and for good, once reconnecting gives up — no row is this page's
@@ -129,13 +137,25 @@ function connect(onOpen) {
       appendLog('[status] disconnected — reconnecting (' + reconnectAttempts + '/' + maxReconnectAttempts + ')...', 'status');
       setTimeout(connect, 2000);
     } else {
-      appendLog('[status] disconnected', 'status');
+      // A post opens a socket from here, so the line says how to get back.
+      appendLog('[status] disconnected — post a line to reconnect', 'status');
     }
   };
-  ws.onerror = function(e) {
+  sock.onerror = function(e) {
+    if (sock !== ws) return;
     appendLog('[error] connection error', 'err');
   };
 }
+
+// Back in view after reconnecting gave up: one more try, as a post would make,
+// so a page left in a background tab through an outage finds its way back.
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'visible'
+      && reconnectAttempts >= maxReconnectAttempts
+      && (!ws || ws.readyState === 3)) {
+    connect();
+  }
+});
 
 // No local echo. Your own line arrives the way everyone else's does — posted
 // to the shared buffer, then handed out by each worker on its own next tick.
@@ -273,6 +293,9 @@ function showPanel(name) {
   Array.prototype.forEach.call(tabs.querySelectorAll('.tab'), function (t) {
     const on = t.getAttribute('data-panel') === name;
     t.setAttribute('aria-selected', on ? 'true' : 'false');
+    // Roving tabindex, as WAI-ARIA's tabs pattern has it: Tab reaches the
+    // selected tab and leaves the list, and the arrow keys move within it.
+    t.tabIndex = on ? 0 : -1;
   });
   ['x-ray', 'x-periments'].forEach(function (id) {
     document.getElementById(id).hidden = (id !== name);
@@ -285,12 +308,32 @@ tabs.addEventListener('click', function (e) {
   if (t) showPanel(t.getAttribute('data-panel'));
 });
 
+// Left and Right move to the neighbouring tab, wrapping; Home and End to the
+// first and the last. The tab moved to is selected as it takes focus, the
+// pattern's automatic activation: both panels are already in the page, so
+// showing one costs nothing.
+tabs.addEventListener('keydown', function (e) {
+  const all = Array.prototype.slice.call(tabs.querySelectorAll('.tab'));
+  const at = all.indexOf(document.activeElement);
+  if (at < 0) return;
+  let to = null;
+  if (e.key === 'ArrowRight') to = (at + 1) % all.length;
+  else if (e.key === 'ArrowLeft') to = (at - 1 + all.length) % all.length;
+  else if (e.key === 'Home') to = 0;
+  else if (e.key === 'End') to = all.length - 1;
+  if (to === null) return;
+  e.preventDefault();
+  all[to].focus();
+  showPanel(all[to].getAttribute('data-panel'));
+});
+
 
 // ---------------------------------------------------------------------------
 // x-periments: the lab
 //
-// Three ordinary GETs, each shown whole — the request as the server parsed
-// it, the response as the browser received it, and both clocks.
+// Three ordinary GETs and a form post, each shown whole — the request as the
+// server parsed it, the response as the browser received it, and both
+// clocks.
 //
 // The request block is the server's account of what arrived, not this file's
 // account of what it sent. fetch() does not expose the bytes the browser put
@@ -365,6 +408,33 @@ const LAB_TOOLS = [
                               times: r.times,
                               signature_bytes: r.signature_bytes }, null, 2);
     }
+  },
+  {
+    id: 'upload',
+    title: 'form post',
+    // The one sample with a body. The form is posted the way a browser posts
+    // one, multipart/form-data, and the server reads it as it arrives: a file
+    // is counted as it passes and let go, so nothing is stored anywhere.
+    note: 'read as it arrives and never stored - the answer is what the parser saw, up to 4 MiB',
+    path: '/lab/upload',
+    method: 'POST',
+    fields: [
+      { name: 'title', type: 'text', wide: true, value: 'web-skeleton',
+        placeholder: 'a text field' },
+      { name: 'file', type: 'file' }
+    ],
+    answer: function (r) {
+      const lines = [];
+      r.fields.forEach(function (f) {
+        lines.push('field ' + f.name + ': ' + JSON.stringify(f.value));
+      });
+      r.files.forEach(function (f) {
+        lines.push('file  ' + f.name + ': ' + JSON.stringify(f.filename) + ', ' +
+                   (f.content_type || 'no type') + ', ' + n(f.bytes) + ' bytes' +
+                   (f.bytes ? ', first bytes ' + f.first_bytes : ''));
+      });
+      return lines.length ? lines.join('\n') : 'no parts';
+    }
   }
 ];
 
@@ -403,6 +473,10 @@ function labCard(tool) {
         opt.value = o;
         input.appendChild(opt);
       });
+    } else if (f.type === 'file') {
+      input = el('input');
+      input.type = 'file';
+      input.multiple = true;
     } else {
       input = el('input');
       input.type = 'text';
@@ -410,6 +484,8 @@ function labCard(tool) {
       if (f.value) input.value = f.value;
       if (f.wide) input.className = 'wide';
     }
+    // Named, so a form posted whole carries each field under its name.
+    input.name = f.name;
     input.setAttribute('aria-label', f.name);
     inputs[f.name] = input;
     form.appendChild(input);
@@ -466,18 +542,27 @@ function labCard(tool) {
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    const params = new URLSearchParams();
-    tool.fields.forEach(function (f) {
-      const v = inputs[f.name].value;
-      // An empty optional field is left out rather than sent empty: the
-      // request shown below should be the one that was made.
-      if (v !== '') params.set(f.name, v);
-    });
+    let url = tool.path;
+    let init;
+    if (tool.method === 'POST') {
+      // The form itself, as a browser would post it: an empty file input
+      // goes as the empty part a browser sends for one.
+      init = { method: 'POST', body: new FormData(form) };
+    } else {
+      const params = new URLSearchParams();
+      tool.fields.forEach(function (f) {
+        const v = inputs[f.name].value;
+        // An empty optional field is left out rather than sent empty: the
+        // request shown below should be the one that was made.
+        if (v !== '') params.set(f.name, v);
+      });
+      url = tool.path + '?' + params.toString();
+    }
     run.disabled = true;
     const sentAt = new Date();
     const t0 = performance.now();
     let res = null;
-    fetch(tool.path + '?' + params.toString())
+    fetch(url, init)
       .then(function (r) { res = r; return r.text(); })
       .then(function (raw) {
         // Parsed for the answer and the timings; shown as it came for the

@@ -71,26 +71,25 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Readiness and ownership
 ;;;
-;;; There used to be a FIND-FREE-PORT here: bind port 0, close, hand the
-;;; number to START-SERVER, which rebound it milliseconds later. The gap
-;;; between that close and that rebind cost two investigations. Every
-;;; listener sets SO_REUSEPORT, so a second process handed the same
-;;; number in the gap did not fail its bind — both held the port and the
-;;; kernel split traffic between them, silently, measured at 17/23 across
-;;; 40 requests. From inside a test that looked like a ten-second read
+;;; START-SERVER takes :PORT 0 and reports the bound port through
+;;; :ON-LISTEN, so the number is never knowable before a listener holds
+;;; it. The alternative — bind port 0, close, and hand the number to
+;;; START-SERVER to rebind milliseconds later — leaves a gap between the
+;;; close and the rebind. Every listener sets SO_REUSEPORT, so a second
+;;; process handed the same number in the gap does not fail its bind:
+;;; both hold the port and the kernel splits traffic between them,
+;;; silently. From inside a test that looks like a ten-second read
 ;;; deadline expiring somewhere unrelated to whatever was being changed.
 ;;;
-;;; START-SERVER now takes :PORT 0 and reports the bound port through
-;;; :ON-LISTEN, so the number is never knowable before a listener holds
-;;; it and there is no gap to lose. CHECK-OWNS-PORT stays anyway — see
-;;; its docstring for why a closed hole still gets a detector.
+;;; CHECK-OWNS-PORT is kept anyway — see its docstring for why a closed
+;;; hole still gets a detector.
 ;;; ---------------------------------------------------------------------------
 
 (defun check-owns-port (nonce)
   "Confirm the server answering *TEST-PORT* is the one this test started.
 
-   START-SERVER resolving port 0 itself closes the close-then-rebind
-   window this was written for, so the probe is a detector against that
+   START-SERVER resolving port 0 itself leaves no close-then-rebind
+   window, so the probe is a detector against that
    resolution regressing rather than a warning about a live hazard. It
    costs one request per server start and nothing else would report the
    regression: with SO_REUSEPORT a shared port produces no error
@@ -147,7 +146,8 @@
 ;;; Live test server
 ;;; ---------------------------------------------------------------------------
 
-(defmacro with-test-server ((&key handler ws-handler host on-tick (workers 1))
+(defmacro with-test-server ((&key handler ws-handler body-handler host on-tick
+                                  (workers 1))
                             &body body)
   "Spin a server on an ephemeral port, bind *TEST-PORT* for BODY, tear down
    on scope exit (signal + bounded join + fallback terminate).
@@ -157,10 +157,10 @@
    Raise it only for a property that is about workers rather than about
    connections — ON-TICK firing on each of them, say.
 
-   ON-TICK is passed through to START-SERVER unchanged, including NIL.
-   Shutdown hooks are isolated: REGISTER-CLEANUP calls made from inside
-   BODY (directly or via a handler) fire during this server's teardown
-   and do not leak into the caller's framework state. The outer
+   ON-TICK and BODY-HANDLER are passed through to START-SERVER unchanged,
+   including NIL. Shutdown hooks are isolated: REGISTER-CLEANUP calls made
+   from inside BODY (directly or via a handler) fire during this server's
+   teardown and do not leak into the caller's framework state. The outer
    *SHUTDOWN-HOOKS* list is saved on entry and restored on exit.
 
    HOST is what the listener binds, a 4-byte IPv4 or 16-byte IPv6 vector as
@@ -171,10 +171,11 @@
    reader thread has to pass the address and port into that thread rather
    than read the specials from inside it."
   `(call-with-test-server ,handler ,ws-handler (lambda () ,@body) ,host
-                          ,on-tick ,workers))
+                          ,on-tick ,workers ,body-handler))
 
 (defun call-with-test-server (handler ws-handler thunk &optional host
-                                                        on-tick (workers 1))
+                                                        on-tick (workers 1)
+                                                        body-handler)
   (let ((saved-hooks web-skeleton::*shutdown-hooks*)
         (saved-drain web-skeleton:*drain-timeout*)
         (saved-poll  web-skeleton:*worker-wake-interval*)
@@ -216,6 +217,7 @@
                                    :port 0
                                    :workers workers
                                    :on-tick on-tick
+                                   :body-handler body-handler
                                    :on-listen
                                    (lambda (p)
                                      (setf bound-port p)

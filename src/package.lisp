@@ -24,6 +24,8 @@
            #:url-decode
            #:form-decode
            #:match-path
+           #:*match-path-literals*
+           #:canonical-path
            ;; HTTP response
            #:http-response
            #:http-response-status
@@ -109,13 +111,22 @@
            #:build-ws-frame
            #:build-ws-close
            #:ws-send
+           #:ws-close
+           #:ws-upgrade
+           #:ws-choose-protocol
+           #:ws-offered-protocols
            ;; Static files
            #:load-static-files
            #:serve-static
+           #:*extra-mime-types*
            ;; HTTP client (non-blocking outbound fetch)
            #:http-fetch
            #:defer-to-fetch
            #:fetch-into
+           #:fetch-send
+           #:fetch-finish
+           #:fetch-started-p
+           #:forward-body
            #:http-fetch-stream
            #:parse-url
            #:parse-ipv4-literal
@@ -134,12 +145,33 @@
            #:*max-outbound-response-size*
            #:*max-streaming-line-size*
            #:*max-interim-responses*
+           #:*max-upstream-header-count*
+           #:*max-upstream-header-line-length*
+           #:*max-upstream-total-header-bytes*
            #:*json-max-depth*
            #:*json-max-string-length*
            #:*max-ws-payload-size*
            #:*max-ws-message-size*
            #:*max-connections*
+           #:*listen-backlog*
            #:*max-write-backlog*
+           ;; Request bodies, decided at the head
+           #:buffer-body
+           #:receive-body
+           #:body-resume
+           #:body-refuse
+           ;; multipart/form-data
+           #:form-part
+           #:form-part-name
+           #:form-part-filename
+           #:form-part-content-type
+           #:form-part-headers
+           #:form-part-body
+           #:parse-multipart
+           #:receive-multipart
+           #:find-form-part
+           #:find-form-parts
+           #:form-part-text
            ;; Streaming responses
            #:make-stream-response
            #:stream-send
@@ -154,11 +186,15 @@
            #:*stream-keepalive-interval*
            ;; Connection lifecycle
            #:*idle-timeout*
+           #:*body-stall-timeout*
+           #:*linger-timeout*
            #:*ws-idle-timeout*
+           #:*ws-message-timeout*
            #:*ws-ping-interval*
            #:*ws-max-missed-pongs*
            #:*write-stall-timeout*
            #:*fetch-timeout*
+           #:*connect-fallback-delay*
            ;; DNS cache (opt-in — 0 disables)
            #:*dns-cache-ttl*
            #:*dns-cache-max-entries*
@@ -175,4 +211,5 @@
            #:store-update-plist
            #:store-delete
            #:store-map
-           #:store-count))
+           #:store-count
+           #:stop-store-reaper))

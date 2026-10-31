@@ -117,7 +117,7 @@ h2 {
   color: var(--bone-dim);
   border-collapse: collapse;
   width: 100%;
-  max-width: 40em;
+  max-width: 64em;
 }
 
 .limbs th {
@@ -229,6 +229,22 @@ h2 {
 .tool-form input { flex: 0 1 14em; min-width: 8em; }
 .tool-form input.wide { flex: 1 1 24em; }
 
+/* A file input's own button, in the page's colours rather than the
+   browser's. */
+.tool-form input[type=file] { flex: 1 1 18em; padding: 0.35em; }
+.tool-form input[type=file]::file-selector-button {
+  margin-right: 0.8em;
+  padding: 0.2em 0.9em;
+  font-family: monospace;
+  font-size: 0.92em;
+  background: var(--purple-deep);
+  color: var(--bone-bright);
+  border: 1px solid var(--purple);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.tool-form input[type=file]::file-selector-button:hover { background: var(--purple); }
+
 .tool-form select {
   padding: 0.5em;
   font-family: monospace;
@@ -290,7 +306,7 @@ h2 {
 
 /* Who said it */
 
-/* Long enough now that a mid-stamp line break would be unreadable. */
+/* Long enough that a mid-stamp line break would be unreadable. */
 .when { color: var(--bone-dim); white-space: nowrap; }
 .who { color: var(--purple); }
 
@@ -303,7 +319,6 @@ h2 {
    fixed-width, so the slack lands in the third, which is the one that grows. */
 .scroll-x { overflow-x: auto; }
 
-.limbs { max-width: 64em; }
 .limbs th:nth-child(1), .limbs td:nth-child(1),
 .limbs th:nth-child(2), .limbs td:nth-child(2) { white-space: nowrap; }
 .limbs th:nth-child(1), .limbs td:nth-child(1) { width: 5em; }
