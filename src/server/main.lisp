@@ -1241,10 +1241,13 @@
               (unregister-connection conn)))
           t)
       (error (e)
-        ;; Throttled with a failed accept: ACCEPT-PENDING goes on to the
-        ;; next queued connection, and a set-up failing for one is likely
-        ;; to fail for each.
-        (log-throttled :error :accept-failed "accept failed: ~a" e)
+        ;; Throttled: ACCEPT-PENDING goes on to the next queued connection,
+        ;; and a set-up failing for one is likely to fail for each. Under a
+        ;; kind of its own, apart from the failed accept above: sharing one,
+        ;; either line would hold the other back for a minute, and the
+        ;; count on the line that did log would be of both causes.
+        (log-throttled :error :accept-setup-failed
+                       "accepted connection could not be set up, closed: ~a" e)
         (ignore-errors (sb-bsd-sockets:socket-close client-socket))
         t))))
 

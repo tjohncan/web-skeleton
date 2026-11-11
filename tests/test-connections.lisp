@@ -3799,8 +3799,8 @@
    next client to arrive. The set-up is made to fail here by an epoll fd
    that is not one, which EPOLL-ADD refuses; two clients are queued, and
    the backlog is empty afterwards, with nothing left in the table. The
-   failure is logged once for the two, throttled as a failed accept is,
-   since one that fails for a connection is likely to fail for each."
+   failure is logged once for the two, throttled, since one that fails for
+   a connection is likely to fail for each."
   (format t "~%accept: on past a connection it could not set up~%")
   (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
          (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
@@ -3827,11 +3827,85 @@
            (check "set-up failing: logged once for the two"
                   (let ((text (get-output-stream-string log)))
                     (loop with start = 0
-                          for at = (search "accept failed" text :start2 start)
+                          for at = (search "could not be set up" text
+                                           :start2 start)
                           while at count t do (setf start (1+ at))))
                   1))
       (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
       (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-set-up-failures-and-failed-accepts-are-throttled-apart ()
+  "A connection that could not be set up and an accept that failed are
+   logged under a throttle kind each: neither holds the other's line back,
+   and each line counts its own.
+
+   The two have different causes, and a failed accept is the one an
+   operator has to hear about: the process is out of descriptors or
+   memory. Under a shared kind, the first set-up failure would keep that
+   line out of the log for a minute, and the count on whichever line came
+   next would be of both.
+
+   The set-up fails as in the test above, by an epoll fd that is not one;
+   the accept fails on a listener that is closed. Two set-up failures and
+   three failed accepts, then a minute on as far as the throttle can
+   tell, and one more of each. Each kind logs its first at once, and the
+   line a minute on carries one held back for the set-up, two for the
+   accept."
+  (format t "~%accept: set-up failures and failed accepts are throttled apart~%")
+  (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+         (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+         (closed (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp))
+         (clients nil)
+         (log (make-string-output-stream))
+         (web-skeleton::*connections* (make-hash-table :test #'eql))
+         (web-skeleton:*log-stream* log)
+         (web-skeleton::*log-throttle* (make-hash-table :test #'eq)))
+    (sb-bsd-sockets:socket-close closed)
+    (flet ((queue-a-client ()
+             (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                     :type :stream :protocol :tcp)))
+               (push c clients)
+               (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)))
+           (lines-saying (what text)
+             (loop with start = 0
+                   for at = (search what text :start2 start)
+                   while at
+                   collect (subseq text at (position #\Newline text :start at))
+                   do (setf start (1+ at))))
+           (held-back (line)
+             (let ((at (and line (search "(and " line))))
+               (and at (parse-integer line :start (+ at 5) :junk-allowed t)))))
+      (unwind-protect
+           (progn
+             (queue-a-client)
+             (queue-a-client)
+             (check "throttled apart: two set-ups fail, and the backlog drains"
+                    (web-skeleton::accept-pending listener -1) nil)
+             (check "throttled apart: the closed listener's accept fails"
+                    (web-skeleton::accept-pending closed -1) t)
+             (web-skeleton::accept-pending closed -1)
+             (web-skeleton::accept-pending closed -1)
+             (let ((text (get-output-stream-string log)))
+               (check "throttled apart: the set-up failure is logged once"
+                      (length (lines-saying "could not be set up" text)) 1)
+               (check "throttled apart: and the failed accept behind it, at once"
+                      (length (lines-saying "socket-accept failed" text)) 1))
+             ;; A minute on, as far as the throttle can tell.
+             (loop for entry being the hash-values of web-skeleton::*log-throttle*
+                   do (decf (car entry) 61))
+             (queue-a-client)
+             (web-skeleton::accept-pending listener -1)
+             (web-skeleton::accept-pending closed -1)
+             (let ((text (get-output-stream-string log)))
+               (check "throttled apart: a minute on, the set-up line counts its one"
+                      (mapcar #'held-back (lines-saying "could not be set up" text))
+                      '(1))
+               (check "throttled apart: and the accept line its two"
+                      (mapcar #'held-back (lines-saying "socket-accept failed" text))
+                      '(2))))
+        (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
+        (ignore-errors (sb-bsd-sockets:socket-close listener))))))
 
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
@@ -6031,6 +6105,7 @@
   (test-numeric-settings-validated-at-boot)
   (test-listen-backlog-reaches-the-listener)
   (test-accept-goes-on-past-a-connection-it-could-not-set-up)
+  (test-set-up-failures-and-failed-accepts-are-throttled-apart)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)
