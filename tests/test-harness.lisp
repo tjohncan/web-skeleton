@@ -7512,20 +7512,43 @@
    a run of the file and is resumed by the upload draining, and the field
    after the file is read only after that. A file with no content still
    makes its request, started at :ON-PART-END: the upstream gets an empty
-   body, and the client its answer."
+   body, and the client its answer.
+
+   A check that fails says what it saw in place of what it wanted. The
+   client's answer is printed as it came, the upstream's side as how much
+   of a request it read, and the last two checks hold what FETCH-SEND
+   answered when it took no bytes and what each upload's :THEN heard. An
+   upload that ended before the file had gone shows in all of them, and
+   between them they say where it ended."
   (format t "~%Harness: a form's file forwarded upstream as it arrives~%")
   (let* ((lock (sb-thread:make-mutex :name "form-forward-e2e"))
          (fields nil)
          (pauses 0)
          (aborts nil)
+         (refused nil)
+         (heard nil)
          (upstream-port (list nil))
          (boundary "----FormBoundaryForwardQ3x")
          (file (%pseudo-random-bytes (* 2 1024 1024) 71)))
-    (labels ((then (status headers b)
-               (declare (ignore headers))
-               (if (eql status 200)
-                   (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
-                   (make-error-response 502)))
+    (labels ((then-for (path)
+               (lambda (status headers b)
+                 (declare (ignore headers))
+                 (sb-thread:with-mutex (lock) (push (cons path status) heard))
+                 (if (eql status 200)
+                     (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
+                     (make-error-response 502))))
+             (or-what-arrived (seen wanted)
+               ;; T when the upstream read a request whose body is WANTED,
+               ;; and otherwise how much of one it did read, for the check
+               ;; to print.
+               (cond ((null seen) "the upstream read no request")
+                     ((null (second seen)) "the upstream read a head, and no whole body")
+                     ((equalp (second seen) wanted) t)
+                     (t (format nil "the upstream read another body, of ~d bytes"
+                                (length (second seen))))))
+             (or-the-answer (text answer)
+               ;; T when ANSWER has TEXT in it, and otherwise ANSWER.
+               (if (search text answer) t answer))
              (through (request &rest upstream-args)
                (multiple-value-bind (port thread) (apply #'%upload-upstream upstream-args)
                  (setf (first upstream-port) port)
@@ -7543,9 +7566,9 @@
           (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
            :body-handler
            (lambda (req)
-             (let ((path (http-request-path req))
-                   (put (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
-                                    :body :stream :then #'then)))
+             (let* ((path (http-request-path req))
+                    (put (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
+                                     :body :stream :then (then-for path))))
                (receive-multipart
                 req
                 :max-size nil
@@ -7561,7 +7584,10 @@
                                         ((null sent)
                                          (sb-thread:with-mutex (lock) (incf pauses))
                                          :pause)
-                                        (t (make-error-response 502)))))
+                                        (t
+                                         (sb-thread:with-mutex (lock)
+                                           (push (cons path sent) refused))
+                                         (make-error-response 502)))))
                 :on-part-end (lambda (conn part)
                                ;; A file with no content never started it.
                                (when (and (form-part-filename part)
@@ -7583,10 +7609,10 @@
                  (sb-thread:with-mutex (lock) (cdr (assoc path fields :test #'string=)))))
           (multiple-value-bind (answer seen) (through (form "/file" file) :pace 0.002)
             (check "file: the upstream received the file, and only the file, whole"
-                   (and seen (equalp (second seen) file)) t)
+                   (or-what-arrived seen file) t)
             (check "file: the client heard the upstream's answer"
-                   (and (search (format nil "got:~d:~a" (length file) (sha256-hex file)) answer)
-                        t)
+                   (or-the-answer (format nil "got:~d:~a" (length file) (sha256-hex file))
+                                  answer)
                    t)
             (check "file: the fields either side of it reached :on-end"
                    (fields-of "/file") '(("title" . "before") ("note" . "after")))
@@ -7594,12 +7620,17 @@
           (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
             (multiple-value-bind (answer seen) (through (form "/empty" empty))
               (check "empty: the upstream got a request with an empty body"
-                     (and seen (equalp (second seen) empty)) t)
+                     (or-what-arrived seen empty) t)
               (check "empty: and the client its answer"
-                     (and (search (format nil "got:0:~a" (sha256-hex empty)) answer) t) t)
+                     (or-the-answer (format nil "got:0:~a" (sha256-hex empty)) answer) t)
               (check "empty: the fields reached :on-end"
                      (fields-of "/empty") '(("title" . "before") ("note" . "after")))))
-          (check "nothing aborted either form" aborts nil))))))
+          (check "nothing aborted either form" aborts nil)
+          (check "FETCH-SEND took every run of the file, or held it"
+                 (sb-thread:with-mutex (lock) (reverse refused)) nil)
+          (check "each upload's :then heard the upstream's 200, once"
+                 (sb-thread:with-mutex (lock) (reverse heard))
+                 '(("/file" . 200) ("/empty" . 200))))))))
 
 (defun test-harness-streamed-request-body-timing-e2e ()
   "A streamed request body is timed on its progress: *FETCH-TIMEOUT*
