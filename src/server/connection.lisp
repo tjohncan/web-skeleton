@@ -705,6 +705,13 @@
     (when plan
       (abort-received-body plan conn reason))))
 
+(defconstant +getent-output-limit+ 8192
+  "The most of `getent ahosts` output a lookup holds, in bytes. An
+   answer is a STREAM, a DGRAM and a RAW line for each address, well
+   under 1 KiB for an ordinary name. One number for the pipe a worker
+   reads through epoll and for the one RESOLVE-HOST-BLOCKING reads
+   itself, so both give up on the same answer.")
+
 (defun connection-read-cap (conn)
   "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
@@ -725,13 +732,11 @@
      (+ *max-ws-payload-size* 14))
     ;; DNS pipe output is 'getent ahosts <host>' stdout — a handful of
     ;; STREAM / DGRAM / RAW lines per address family, typically well
-    ;; under 1 KiB. Cap at 8 KiB to match RESOLVE-HOST-BLOCKING's
-    ;; explicit 8192-byte cap on the synchronous path; reusing
-    ;; *MAX-OUTBOUND-RESPONSE-SIZE* here would let a pathological NSS
-    ;; module produce an 8 MiB buffer for what is definitionally a few
-    ;; lines.
+    ;; under 1 KiB. Reusing *MAX-OUTBOUND-RESPONSE-SIZE* here would let a
+    ;; pathological NSS module produce an 8 MiB buffer for what is
+    ;; definitionally a few lines.
     ((eq (connection-state conn) :out-dns)
-     8192)
+     +getent-output-limit+)
     ((connection-outbound-p conn)
      *max-outbound-response-size*)
     ;; A body being received is handed over a window at a time, so the

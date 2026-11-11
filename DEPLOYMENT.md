@@ -440,8 +440,9 @@ across each of three setup phases. `http-fetch` is not, for either scheme;
 see the async budget below.
 
 1. **DNS resolution** — shared `getent ahosts` subprocess,
-   spawned with `:wait nil` and deadline-polled until exit or
-   `*fetch-timeout*` expires. On expiry, the child is killed with
+   its output read as it arrives, with `poll(2)` on the pipe, until it
+   ends or `*fetch-timeout*` expires: a lookup takes as long as `getent`
+   does. On expiry, the child is killed with
    SIGKILL so a hung libc resolver (unresponsive nameserver,
    slow NSS module, hung mDNS responder) cannot pin the worker thread.
    Same resolver as the async path, so `/etc/hosts`, NSS, Docker DNS,
@@ -767,9 +768,9 @@ address to fall back on.
 `http-fetch-stream`, over either scheme, uses the same `getent` subprocess
 synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
-The only difference from the async path is that the subprocess
-runs with `:wait nil` and the caller deadline-polls in short slices
-instead of parking in epoll. There is one DNS primitive across the framework.
+The only difference from the async path is that the caller waits on
+the subprocess's pipe itself, with `poll(2)`, instead of parking in
+epoll. There is one DNS primitive across the framework.
 
 Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 `/etc/hosts`, `/etc/nsswitch.conf`, Docker's embedded DNS, LDAP, mDNS

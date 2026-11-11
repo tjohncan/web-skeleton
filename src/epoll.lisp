@@ -470,22 +470,27 @@
 ;;; poll(2) — block until an fd is ready
 ;;; ---------------------------------------------------------------------------
 
+(defconstant +pollin+  #x001)
 (defconstant +pollout+ #x004)
 
 (defvar *poll-buf* nil
   "Pre-allocated 8-byte buffer for poll calls. Bound per-worker.")
 
-(defun poll-writable (fd timeout-ms)
-  "Block until FD is writable or TIMEOUT-MS elapses.
-   Returns T if writable, NIL on timeout or EINTR. Other poll(2)
+(defun poll-one (fd events timeout-ms)
+  "Block until FD reports one of EVENTS or TIMEOUT-MS elapses.
+   Returns T if it did, NIL on timeout or EINTR. Other poll(2)
    errors (EBADF/EINVAL/EFAULT/ENOMEM) raise — silently masking them
-   as timeouts would turn programming mistakes into mysterious hangs."
+   as timeouts would turn programming mistakes into mysterious hangs.
+
+   The kernel reports an error or a hang-up on FD whatever EVENTS asks
+   for, and that answers T as well: the read or write the caller makes
+   next is what says which it was."
   ;; struct pollfd: int fd (4) + short events (2) + short revents (2) = 8 bytes
   (let ((buf (or *poll-buf*
                  (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))))
     (pack-le-u32 buf 0 fd)
-    (setf (aref buf 4) (logand +pollout+ #xFF)
-          (aref buf 5) (logand (ash +pollout+ -8) #xFF))
+    (setf (aref buf 4) (logand events #xFF)
+          (aref buf 5) (logand (ash events -8) #xFF))
     (sb-sys:with-pinned-objects (buf)
       (let ((n (%poll (sb-sys:vector-sap buf) 1 timeout-ms)))
         (cond
@@ -495,6 +500,17 @@
                (if (= err +eintr+)
                    nil                            ; spurious wake-up
                    (error "poll failed: ~a" (errno-string err))))))))))
+
+(defun poll-writable (fd timeout-ms)
+  "Block until FD is writable or TIMEOUT-MS elapses. Returns T if
+   writable, NIL on timeout or EINTR, and raises as POLL-ONE does."
+  (poll-one fd +pollout+ timeout-ms))
+
+(defun poll-readable (fd timeout-ms)
+  "Block until FD has something to read, the end of its stream included,
+   or TIMEOUT-MS elapses. Returns T if it has, NIL on timeout or EINTR,
+   and raises as POLL-ONE does."
+  (poll-one fd +pollin+ timeout-ms))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Bounded blocking connect

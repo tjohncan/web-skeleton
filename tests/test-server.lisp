@@ -9538,6 +9538,90 @@
       (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
       (sb-int:unencapsulate 'sb-ext:process-close 'watched))))
 
+(defun test-blocking-lookup-reads-getents-answer-as-it-arrives ()
+  "RESOLVE-HOST-BLOCKING's answer is getent's output up to its end, read
+   as it arrives: it has the answer when the output ends, gives up at
+   once on output past +GETENT-OUTPUT-LIMIT+, and gives up on a child
+   that says nothing when *FETCH-TIMEOUT* has passed.
+
+   SPAWN-GETENT is replaced by a shell child for each case, so no name is
+   looked up.
+
+   The first child prints an address, closes its output and stays. A
+   lookup that waited for the exit before it read would wait the timeout
+   out and answer NIL. The answer ends where the output does, so the
+   address comes back, and the child is killed.
+
+   The second prints address lines without end, more than a pipe holds
+   unread. Read as it arrives, that is past the limit after 8 KiB and
+   the lookup fails long before the timeout. Left unread until an exit,
+   it would stop the child writing, and the exit would never come.
+
+   The third prints nothing and stays. The lookup gives up once the
+   timeout has passed, not sooner, and kills it."
+  (format t "~%Blocking lookup: getent's answer is read as it arrives~%")
+  (let ((command nil)
+        (children nil)
+        (web-skeleton:*fetch-address-filter* nil))
+    (sb-int:encapsulate 'web-skeleton::spawn-getent 'shell-child
+                        (lambda (f host)
+                          (declare (ignore f host))
+                          (let ((child (sb-ext:run-program
+                                        "/bin/sh" (list "-c" command)
+                                        :output :stream :wait nil)))
+                            (push child children)
+                            child)))
+    (unwind-protect
+         (flet ((lookup (sh-command timeout)
+                  ;; What the lookup answered, as a list, and how many
+                  ;; seconds it took to.
+                  (setf command sh-command)
+                  (let* ((web-skeleton:*fetch-timeout* timeout)
+                         (start (get-internal-real-time))
+                         (answer (multiple-value-list
+                                  (web-skeleton::resolve-host-blocking
+                                   "name.invalid"))))
+                    (values answer
+                            (/ (- (get-internal-real-time) start)
+                               internal-time-units-per-second))))
+                (last-child-alive-p ()
+                  (and (sb-ext:process-alive-p (first children)) t)))
+           ;; Both descriptors closed, because RUN-PROGRAM gives a child the
+           ;; one pipe for its output and its errors unless told otherwise,
+           ;; and the pipe ends only when neither holds it.
+           (let ((answer (lookup "printf '10.0.0.5 STREAM internal\\n'; exec sleep 30 >&- 2>&-"
+                                 10)))
+             (check "blocking lookup: the answer is there when the output ends"
+                    (list (and (first answer) (coerce (first answer) 'list))
+                          (second answer))
+                    '((10 0 0 5) :inet))
+             (check "blocking lookup: and the child that stayed is killed"
+                    (last-child-alive-p) nil))
+           (multiple-value-bind (answer seconds)
+               (lookup "exec yes '10.0.0.5 STREAM internal'" 20)
+             (check "blocking lookup: output past the limit is no answer"
+                    answer '(nil))
+             (check "blocking lookup: said long before the timeout"
+                    (< seconds 10) t)
+             (check "blocking lookup: and the child still writing is killed"
+                    (last-child-alive-p) nil))
+           (multiple-value-bind (answer seconds) (lookup "exec sleep 30" 1)
+             (check "blocking lookup: a child that says nothing is no answer"
+                    answer '(nil))
+             (check "blocking lookup: given up on when the timeout has passed"
+                    (>= seconds 0.9) t)
+             (check "blocking lookup: and killed"
+                    (last-child-alive-p) nil))
+           (check "control: each lookup ran the child it was given"
+                  (length children) 3))
+      (sb-int:unencapsulate 'web-skeleton::spawn-getent 'shell-child)
+      (dolist (child children)
+        (ignore-errors
+         (when (sb-ext:process-alive-p child)
+           (sb-ext:process-kill child 9)))
+        (ignore-errors (sb-ext:process-wait child))
+        (ignore-errors (sb-ext:process-close child))))))
+
 (defun test-dns-error-ends-a-detached-fetch ()
   "A detached fetch to a name that will not resolve releases its target.
 
@@ -10025,6 +10109,7 @@
   (test-dns-ready-hands-on-every-address)
   (test-dns-lookup-sink)
   (test-dns-child-closed-only-once-dead)
+  (test-blocking-lookup-reads-getents-answer-as-it-arrives)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-dns-dial-failure-is-not-a-lookup-failure)
