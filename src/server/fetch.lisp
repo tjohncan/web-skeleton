@@ -3590,11 +3590,15 @@
                   (http-fetch-continuation-answered fetch) t)))
       ;; SERIOUS-CONDITION, not ERROR: see HANDLE-CLIENT-READ's last catch.
       (serious-condition (e)
-        (log-warn "detached fetch callback raised for fd ~d: ~a" target-fd e))))
-  ;; Looked up again: the callback may have closed the connection, and on
-  ;; a reused fd number it may not even be the same one.
-  (let ((target (lookup-connection target-fd)))
-    (when (and target (not (connection-fetch-outstanding target)))
+        (log-warn "detached fetch callback raised for fd ~d: ~a" target-fd e)))
+    ;; Looked up again, and held to the connection the fetch was started
+    ;; for. The callback may have closed that one, and a descriptor opened
+    ;; since may have taken its number: whatever answers to the number then
+    ;; is not this fetch's to dispose of. CLOSE-CONNECTION and
+    ;; CLOSE-OUTBOUND make the same check after the application has run.
+    (when (and target
+               (eq (lookup-connection target-fd) target)
+               (not (connection-fetch-outstanding target)))
       (case (connection-state target)
         (:streaming
          (ecase outcome

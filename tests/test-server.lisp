@@ -9920,6 +9920,81 @@
         (ignore-errors (web-skeleton::%close below)))
       (ignore-errors (web-skeleton::%close epfd)))))
 
+(defun test-a-detached-fetch-disposes-of-its-own-target-alone ()
+  "A detached fetch that failed applies its failure disposition to the
+   connection it was started for, and to nothing that has that
+   connection's descriptor number afterwards.
+
+   The fetch's :THEN hears the abort sentinel and closes the target. A
+   connection then stands on the number that freed: a :STREAMING one, the
+   state the disposition closes. A :THEN cannot register such a connection
+   itself, since all it can open is an outbound, whose states the
+   disposition has no arm for. This one stands in for whatever a later
+   change lets take the number, so that what protects it is the check on
+   the target and not the list of states.
+
+   Epoll descriptors stand in for the connections, and the second is put
+   on the freed number with dup2, as in the test above. The second check
+   is what makes the third mean something: as the :THEN returned, the
+   target was closed and the stranger stood on its number."
+  (format t "~%A detached fetch disposes of its own target alone~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (target-fd (web-skeleton::epoll-create))
+         (events (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+         (stranger nil)
+         (standing nil)
+         (heard 0))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (web-skeleton::*epoll-fd* epfd)
+                (web-skeleton:*log-stream* (make-broadcast-stream))
+                (target (web-skeleton::make-connection
+                         :fd target-fd :state :websocket :last-active 0
+                         :fetch-outstanding t)))
+           (web-skeleton::register-connection target)
+           (web-skeleton::epoll-add epfd target-fd events)
+           (web-skeleton::deliver-detached
+            target-fd epfd
+            (lambda (s h b)
+              (declare (ignore s h b))
+              (incf heard)
+              (web-skeleton::close-connection target epfd)
+              (let ((fd (web-skeleton::epoll-create)))
+                (unless (= fd target-fd)
+                  (unwind-protect
+                       (unless (= (sb-alien:alien-funcall
+                                   (sb-alien:extern-alien
+                                    "dup2" (function sb-alien:int sb-alien:int
+                                                     sb-alien:int))
+                                   fd target-fd)
+                                  target-fd)
+                         (error "dup2 onto fd ~d failed" target-fd))
+                    (web-skeleton::%close fd))))
+              (setf stranger (web-skeleton::make-connection
+                              :fd target-fd :state :streaming :last-active 0))
+              (web-skeleton::register-connection stranger)
+              (web-skeleton::epoll-add epfd target-fd events)
+              (setf standing
+                    (list (web-skeleton::connection-fd target)
+                          (eq (web-skeleton::lookup-connection target-fd)
+                              stranger)))
+              nil)
+            :aborted)
+           (check "own target alone: the :then heard the sentinel once" heard 1)
+           (check "own target alone: it left a stranger on the closed target's number"
+                  standing '(-1 t))
+           (check "own target alone: and the stranger was left as it was"
+                  (and stranger
+                       (list (web-skeleton::connection-fd stranger)
+                             (web-skeleton::connection-state stranger)
+                             (eq (web-skeleton::lookup-connection target-fd)
+                                 stranger)))
+                  (list target-fd :streaming t)))
+      ;; The target's number is the stranger's once the :THEN has run, and
+      ;; closed already if the disposition reached it.
+      (ignore-errors (web-skeleton::%close target-fd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -9954,6 +10029,7 @@
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-dns-dial-failure-is-not-a-lookup-failure)
   (test-a-then-that-closes-its-target-mid-teardown)
+  (test-a-detached-fetch-disposes-of-its-own-target-alone)
   (test-documented-settings-are-exported)
   (test-errno-names)
   (test-descriptor-limit)
