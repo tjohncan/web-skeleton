@@ -331,6 +331,71 @@
                   t))
       (setf web-skeleton:*json-max-string-length* saved))))
 
+(defun test-json-parsed-strings-are-simple-and-exact ()
+  "Every string JSON-PARSE returns, key or value, is a simple string of
+   characters with room for its own and no more, whether or not it had
+   an escape in it, and whatever kind of string it was parsed out of.
+
+   A string is read into an accumulator only from its first escape on,
+   and the accumulator is adjustable with room to spare. Handed back as
+   it stands, each string of a parsed document would hold that room for
+   as long as the document was kept, 64 characters at the least for a
+   key of one, and no declared or checked SIMPLE-STRING would take it.
+
+   The two ways a string is read agree as well: what stands before an
+   escape is copied whole, and *JSON-MAX-STRING-LENGTH* is met at the
+   same character on either side of one."
+  (format t "~%JSON: parsed strings are simple strings of their own size~%")
+  (flet ((shape (s)
+           (list (typep s '(simple-array character (*)))
+                 (length s) (array-total-size s))))
+    ;; A base string in is a character string out, as any other is.
+    (check "exact: a string parsed out of a base string"
+           (shape (json-parse (coerce "\"plain\"" 'simple-base-string)))
+           '(t 5 5))
+    (let ((alist (json-object-alist
+                  (json-parse "{\"key\":\"value\",\"k\\u00e9y\":\"v\\nalue\"}"))))
+      (check "exact: a key with no escape" (shape (car (first alist))) '(t 3 3))
+      (check "exact: its value, with none" (shape (cdr (first alist))) '(t 5 5))
+      (check "exact: a key with an escape" (shape (car (second alist))) '(t 3 3))
+      (check "exact: its value, with one" (shape (cdr (second alist))) '(t 6 6)))
+    (check "exact: the empty string" (shape (json-parse "\"\"")) '(t 0 0))
+    (let* ((plain (make-string 200 :initial-element #\a))
+           (parsed (json-parse (concatenate 'string "\"" plain "\\n" plain "\""))))
+      (check "exact: 200 characters, an escape and 200 more, all there in order"
+             (equal parsed (concatenate 'string plain (string #\Newline) plain))
+             t)
+      (check "exact: and a string of just that length" (shape parsed) '(t 401 401)))
+    (let ((parsed (json-parse (with-output-to-string (s)
+                                (write-char #\" s)
+                                (dotimes (i 100) (write-string "\\n" s))
+                                (write-string "\\uD83D\\uDE00" s)
+                                (write-char #\" s)))))
+      (check "exact: a hundred escapes and a surrogate pair, each one character"
+             (list (count #\Newline parsed) (char-code (char parsed 100)))
+             (list 100 #x1F600))
+      (check "exact: in a string of a hundred and one" (shape parsed) '(t 101 101))))
+  (let ((web-skeleton:*json-max-string-length* 32))
+    (flet ((accepted-p (before after)
+             ;; Whether a string of BEFORE plain characters, an escape and
+             ;; AFTER more parses, as its length or NIL.
+             (handler-case
+                 (length (json-parse
+                          (concatenate 'string "\""
+                                       (make-string before :initial-element #\a)
+                                       "\\n"
+                                       (make-string after :initial-element #\a)
+                                       "\"")))
+               (error () nil))))
+      (check "cap: 31 characters and an escape make the 32 allowed"
+             (accepted-p 31 0) 32)
+      (check "cap: 32 and an escape are one too many"
+             (accepted-p 32 0) nil)
+      (check "cap: an escape and 31 characters make the 32 allowed"
+             (accepted-p 0 31) 32)
+      (check "cap: an escape and 32 are one too many"
+             (accepted-p 0 32) nil))))
+
 (defun test-json-first-repeated-key ()
   "FIRST-REPEATED-KEY, which JSON-PARSE and multipart's parameters find a
    repeated name with, answers the repeat a reader going in order meets
@@ -385,6 +450,7 @@
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-serialize)
+  (test-json-parsed-strings-are-simple-and-exact)
   (test-json-first-repeated-key)
   (report-suite "JSON")
   (zerop *tests-failed*))

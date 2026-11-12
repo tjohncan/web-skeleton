@@ -94,27 +94,81 @@
   "Parse a JSON string starting at the opening quote at POS.
    Handles all escape sequences including \\uXXXX.
    Returns (values string new-pos).
-   Caller is responsible for checking the opening quote."
+   Caller is responsible for checking the opening quote.
+
+   The string returned is a (SIMPLE-ARRAY CHARACTER (*)) of exactly its
+   length, whatever kind of string STR is. One with no escape in it is
+   its characters as they stand in STR: found by the scan here, and
+   copied once. One with an escape is finished by
+   JSON-PARSE-ESCAPED-STRING from the escape on."
   (incf pos)
-  (let ((out (make-array 64 :element-type 'character :fill-pointer 0 :adjustable t))
+  (let ((start pos)
         (len (length str)))
-    (flet ((push-char (c)
-             ;; Bound the per-string accumulator at
-             ;; *JSON-MAX-STRING-LENGTH*. Without this cap an attacker-
-             ;; controlled response body (up to *MAX-OUTBOUND-RESPONSE-
-             ;; SIZE* = 8 MiB) could force an 8 MiB per-string allocation
-             ;; across many keys and values.
-             (when (>= (fill-pointer out) *json-max-string-length*)
-               (error "json: string exceeds ~d characters"
-                      *json-max-string-length*))
-             (vector-push-extend c out)))
     (loop
       (when (>= pos len)
         (error "json: unterminated string"))
       (let ((ch (char str pos)))
         (cond
           ((char= ch #\")
-           (return (values (coerce out 'string) (1+ pos))))
+           ;; MAKE-STRING and not SUBSEQ, which answers a string of STR's
+           ;; own element type: a base string in would be a base string
+           ;; out, and no place for a character an application puts there.
+           (let ((out (make-string (- pos start))))
+             (replace out str :start2 start :end2 pos)
+             (return (values out (1+ pos)))))
+          ((char= ch #\\)
+           (return (json-parse-escaped-string str start pos)))
+          ;; RFC 8259 §7: control characters U+0000-U+001F must be escaped
+          ((< (char-code ch) #x20)
+           (error "json: unescaped control character U+~4,'0X at ~d"
+                  (char-code ch) pos))
+          ;; *JSON-MAX-STRING-LENGTH*, as JSON-PARSE-ESCAPED-STRING holds
+          ;; its accumulator to it: met at the first character past it.
+          ((>= (- pos start) *json-max-string-length*)
+           (error "json: string exceeds ~d characters"
+                  *json-max-string-length*))
+          (t (incf pos)))))))
+
+(defun json-parse-escaped-string (str start pos)
+  "The JSON string whose first character is at START and whose first
+   escape is at POS, everything between having been scanned already.
+   Returns (values string new-pos), as JSON-PARSE-STRING does and for it.
+
+   Decoded into a buffer as long as the string is written, which is room
+   enough: an escape is never longer decoded than written. What was
+   decoded is copied out at the end, a string of its own length.
+   A buffer handed back as it stood, with its room to spare, would keep
+   that room for as long as the parsed document was kept."
+  (let* ((len (length str))
+         ;; Where the string ends as written: the first quote no escape
+         ;; covers, or the end of STR for a string never closed, which the
+         ;; loop below is left to report.
+         (close (loop with i = pos
+                      do (cond ((>= i len) (return len))
+                               ((char= (char str i) #\") (return i))
+                               ((char= (char str i) #\\) (incf i 2))
+                               (t (incf i)))))
+         (out (make-string (min (- close start) *json-max-string-length*)))
+         (n (- pos start)))
+    (replace out str :start2 start :end2 pos)
+    (flet ((push-char (c)
+             ;; Bound the decoded string at *JSON-MAX-STRING-LENGTH*.
+             ;; Without this cap an attacker-controlled response body
+             ;; (up to *MAX-OUTBOUND-RESPONSE-SIZE* = 8 MiB) could force
+             ;; an 8 MiB per-string allocation across many keys and
+             ;; values.
+             (when (>= n *json-max-string-length*)
+               (error "json: string exceeds ~d characters"
+                      *json-max-string-length*))
+             (setf (schar out n) c)
+             (incf n)))
+    (loop
+      (when (>= pos len)
+        (error "json: unterminated string"))
+      (let ((ch (char str pos)))
+        (cond
+          ((char= ch #\")
+           (return (values (subseq out 0 n) (1+ pos))))
           ((char= ch #\\)
            (incf pos)
            (when (>= pos len)

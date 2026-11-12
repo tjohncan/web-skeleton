@@ -41,30 +41,40 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun %base64-encode (bytes alphabet padp)
-  "Internal encoder. ALPHABET is a 64-char string. PADP controls = padding."
+  "Internal encoder. ALPHABET is a 64-char string. PADP controls = padding.
+   Returns a SIMPLE-STRING of exactly the encoded length."
   (let* ((len (length bytes))
-         (out (make-array (* 4 (ceiling (max len 1) 3))
-                          :element-type 'character
-                          :fill-pointer 0)))
-    (loop for i from 0 below len by 3
-          do (let* ((b0 (aref bytes i))
-                    (b1 (if (< (+ i 1) len) (aref bytes (+ i 1)) 0))
-                    (b2 (if (< (+ i 2) len) (aref bytes (+ i 2)) 0))
-                    (triplet (logior (ash b0 16) (ash b1 8) b2))
-                    (c0 (logand #x3F (ash triplet -18)))
-                    (c1 (logand #x3F (ash triplet -12)))
-                    (c2 (logand #x3F (ash triplet -6)))
-                    (c3 (logand #x3F triplet))
-                    (remaining (- len i)))
-               (vector-push (char alphabet c0) out)
-               (vector-push (char alphabet c1) out)
-               (if (> remaining 1)
-                   (vector-push (char alphabet c2) out)
-                   (when padp (vector-push #\= out)))
-               (if (> remaining 2)
-                   (vector-push (char alphabet c3) out)
-                   (when padp (vector-push #\= out)))))
-    (coerce out 'string)))
+         ;; Four characters for every three bytes. A last group of one
+         ;; byte or two is four with padding, and two or three without.
+         ;; So the length is known before any character is, and the
+         ;; result is allocated at it once, as %BASE64-DECODE's is.
+         (out (make-string (if padp
+                               (* 4 (ceiling len 3))
+                               (+ (* 4 (floor len 3))
+                                  (ecase (mod len 3) (0 0) (1 2) (2 3))))))
+         (o 0))
+    (flet ((put (c)
+             (setf (schar out o) c)
+             (incf o)))
+      (loop for i from 0 below len by 3
+            do (let* ((b0 (aref bytes i))
+                      (b1 (if (< (+ i 1) len) (aref bytes (+ i 1)) 0))
+                      (b2 (if (< (+ i 2) len) (aref bytes (+ i 2)) 0))
+                      (triplet (logior (ash b0 16) (ash b1 8) b2))
+                      (c0 (logand #x3F (ash triplet -18)))
+                      (c1 (logand #x3F (ash triplet -12)))
+                      (c2 (logand #x3F (ash triplet -6)))
+                      (c3 (logand #x3F triplet))
+                      (remaining (- len i)))
+                 (put (char alphabet c0))
+                 (put (char alphabet c1))
+                 (if (> remaining 1)
+                     (put (char alphabet c2))
+                     (when padp (put #\=)))
+                 (if (> remaining 2)
+                     (put (char alphabet c3))
+                     (when padp (put #\=))))))
+    out))
 
 (defun base64-encode (bytes)
   "Encode a byte vector into a base64 string (standard alphabet, with padding)."

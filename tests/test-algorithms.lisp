@@ -76,6 +76,28 @@
                                "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
 
+(defun test-encoded-strings-are-simple-and-exact ()
+  "BASE64-ENCODE, BASE64URL-ENCODE and RANDOM-TOKEN return SIMPLE-STRINGs
+   with room for their own characters and no more: for a last group of
+   one byte, of two and of three, with padding and without, and for no
+   bytes at all.
+
+   The encoded length follows from the byte count, so the string is made
+   at that length. One filled through a fill pointer instead is no
+   SIMPLE-STRING however exactly it was sized, and every token and
+   WebSocket accept key is such a string."
+  (format t "~%Base64: encoded strings are simple strings of their own size~%")
+  (flet ((shape (s)
+           (list (typep s 'simple-string) (length s) (array-total-size s)))
+         (bytes (n)
+           (make-array n :element-type '(unsigned-byte 8) :initial-element 255)))
+    (loop for (n padded bare) in '((0 0 0) (1 4 2) (2 4 3) (3 4 4) (4 8 6) (32 44 43))
+          do (check (format nil "exact: base64 of ~d byte~:p" n)
+                    (shape (base64-encode (bytes n))) (list t padded padded))
+             (check (format nil "exact: base64url of ~d byte~:p" n)
+                    (shape (base64url-encode (bytes n))) (list t bare bare)))
+    (check "exact: a random token" (shape (random-token)) '(t 43 43))))
+
 (defun test-base64-decode ()
   (format t "~%Base64 Decode~%")
   ;; A decode that should succeed goes through ATTEMPT, so one that raises
@@ -801,6 +823,7 @@
   (test-sha1)
   (test-sha256)
   (test-base64)
+  (test-encoded-strings-are-simple-and-exact)
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)
