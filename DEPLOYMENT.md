@@ -2490,6 +2490,39 @@ way. web-skeleton's own code, its TLS system and the demo have no store
 of the first shape. Code built on them with 2.2.9 should keep to the
 second, or be built with 2.2.10 or later.
 
+### Clocks
+
+Every interval the framework measures is taken on a monotonic clock,
+read through `get-internal-real-time`: idle and stall timeouts, a
+fetch's deadline, a DNS cache entry's life, a drain's deadline, and the
+event loop's once-a-second work. Setting the system's clock, by NTP
+after a boot or a resume, by a hypervisor or by hand, neither fires any
+of them nor holds any back. That clock does not run while the machine
+is suspended, so a timeout does not count the time it spent asleep.
+
+The system's clock is read for what is a date: the `Date` header, a log
+line's timestamp, and a JWT's `exp` and `nbf`. A token is judged by the
+system's clock as it stands, so a host whose clock is wrong accepts and
+refuses tokens to match.
+
+An application's time divides the same way, and `monotonic-seconds`
+reads the first clock for it, in whole seconds: how long a session has
+been idle, a rate limit's window, a cached value's age, an uptime. The
+predicate a store's reaper is given might be:
+
+```lisp
+(defun session-expired-p (session)
+  (> (- (monotonic-seconds) (getf session :seen-at)) 1800))
+```
+
+Readings start at about a billion rather than at zero, so a slot left
+at 0 is longer ago than any limit and can stand for "never". A reading
+means something only in the process that took it, since every process
+starts at the same one: what is written to disk, sent to a client or
+shared with another process is a date, from `get-universal-time`. An
+interval finer than a second can be read from `get-internal-real-time`
+itself, which moves in steps of the kernel's tick, a few milliseconds.
+
 ### getent
 
 Hostnames are resolved by running `getent ahosts` with

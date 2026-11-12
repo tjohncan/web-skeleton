@@ -838,7 +838,7 @@
           (if (or (connection-ws-frag-buf conn)
                   (plusp (connection-read-pos conn)))
               (when (zerop (connection-ws-message-at conn))
-                (setf (connection-ws-message-at conn) (get-universal-time)))
+                (setf (connection-ws-message-at conn) (monotonic-seconds)))
               (setf (connection-ws-message-at conn) 0))
           (return))
         ;; Advance past this frame
@@ -868,7 +868,7 @@
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
-                   (setf (connection-last-active conn) (get-universal-time)
+                   (setf (connection-last-active conn) (monotonic-seconds)
                          (connection-ws-message-at conn) 0)
                    (when ws-handler
                      (handled frame)))
@@ -926,7 +926,7 @@
                    (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in reassembled text fd ~d"
                                   (connection-fd conn))
                    (return-from websocket-on-read (close-with 1007)))
-                 (setf (connection-last-active conn) (get-universal-time)
+                 (setf (connection-last-active conn) (monotonic-seconds)
                        (connection-ws-message-at conn) 0)
                  (when ws-handler
                    (handled (make-ws-frame

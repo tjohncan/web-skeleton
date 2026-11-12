@@ -269,7 +269,7 @@
     (let ((entry (gethash host *dns-cache*)))
       (when entry
         (cond
-          ((>= (get-universal-time) (dns-cache-entry-expires-at entry))
+          ((>= (monotonic-seconds) (dns-cache-entry-expires-at entry))
            (remhash host *dns-cache*)
            nil)
           ((not (fetch-address-allowed-p (dns-cache-entry-ip entry)
@@ -298,7 +298,7 @@
    would stretch an outage well past its cause."
   (when (and *dns-cache* (> *dns-cache-ttl* 0))
     (when (>= (hash-table-count *dns-cache*) *dns-cache-max-entries*)
-      (let ((now (get-universal-time))
+      (let ((now (monotonic-seconds))
             (dead nil))
         (maphash (lambda (k v)
                    (when (>= now (dns-cache-entry-expires-at v))
@@ -311,7 +311,7 @@
           (clrhash *dns-cache*))))
     (setf (gethash host *dns-cache*)
           (make-dns-cache-entry ip family
-                                (+ (get-universal-time) *dns-cache-ttl*)
+                                (+ (monotonic-seconds) *dns-cache-ttl*)
                                 fallbacks))
     (log-debug "dns: cached ~a -> ~a for ~ds"
                host (format-ip ip) *dns-cache-ttl*)))
@@ -391,8 +391,8 @@
                     ;; :AWAITING sweep over the whole exchange and a
                     ;; detached one has nothing at all, so what matters
                     ;; here is that it is bounded.
-                    :fetch-started-at (get-universal-time)
-                    :fetch-deadline (+ (get-universal-time) *fetch-timeout*)
+                    :fetch-started-at (monotonic-seconds)
+                    :fetch-deadline (+ (monotonic-seconds) *fetch-timeout*)
                     :fetch-continuation fetch-req
                     ;; Carried so HANDLE-DNS-READY can name the host when
                     ;; it runs the getent output past the address filter.
@@ -402,7 +402,7 @@
                                  conn epoll-fd fetch-req
                                  host port path ip family
                                  :fallbacks fallbacks))
-                    :last-active (get-universal-time)))
+                    :last-active (monotonic-seconds)))
              (set-nonblocking out-fd)
              (register-connection dns-conn)
              (epoll-add epoll-fd out-fd (logior +epollin+ +epollet+))

@@ -162,7 +162,7 @@
     (if (null table)
         (apply #'log-msg level format-string args)
         (let ((entry (gethash kind table))
-              (now (get-universal-time)))
+              (now (monotonic-seconds)))
           (cond
             ((null entry)
              (setf (gethash kind table) (cons now 0))

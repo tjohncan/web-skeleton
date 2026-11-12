@@ -765,7 +765,7 @@
                          :external-format :ascii))
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
@@ -846,7 +846,7 @@
                                  (make-text-response 200 "ok")))))
                   (total (+ (* 512 1024) (* (1+ rounds) window) 100))
                   (conn (web-skeleton::make-connection
-                         :fd -1 :last-active (get-universal-time)
+                         :fd -1 :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (lambda (buffer start max-bytes)
                                     (let ((n (min max-bytes (- (fill-pointer kernel) taken))))
                                       (if (zerop n)
@@ -1368,7 +1368,7 @@
             (web-skeleton::*connections* (make-hash-table :test #'eql))
             (web-skeleton::*epoll-fd* 999)
             (,conn (web-skeleton::make-connection
-                    :fd ,fd :last-active (get-universal-time)
+                    :fd ,fd :last-active (web-skeleton::monotonic-seconds)
                     :read-fn (lambda (buffer start max-bytes)
                                (let ((n (min max-bytes (- (fill-pointer ,kernel) ,taken))))
                                  (if (zerop n)
@@ -1973,7 +1973,7 @@
            (let ((epfd (web-skeleton::epoll-create))
                  (in-fd (web-skeleton::epoll-create))
                  (out-fd (web-skeleton::epoll-create))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                          (web-skeleton:*log-stream* (make-broadcast-stream))
@@ -2077,7 +2077,7 @@
                           (web-skeleton::*epoll-fd* epfd)
                           (web-skeleton:*log-stream* (make-broadcast-stream)))
                       (multiple-value-bind (result made)
-                          (funcall fn epfd (get-universal-time))
+                          (funcall fn epfd (web-skeleton::monotonic-seconds))
                         (setf conns made)
                         result))
                  (dolist (conn conns)
@@ -2689,11 +2689,11 @@
                           :outbound-p t
                           :fetch-sink :detached
                           :fetch-paused t
-                          :fetch-paused-at (- (get-universal-time) 5)
-                          :fetch-started-at (- (get-universal-time) 10)
-                          :fetch-deadline (+ (get-universal-time) 20)
+                          :fetch-paused-at (- (web-skeleton::monotonic-seconds) 5)
+                          :fetch-started-at (- (web-skeleton::monotonic-seconds) 10)
+                          :fetch-deadline (+ (web-skeleton::monotonic-seconds) 20)
                           :inbound-fd tgt-fd
-                          :last-active (get-universal-time)))
+                          :last-active (web-skeleton::monotonic-seconds)))
                     ;; The target: a streaming connection with the
                     ;; back-link the pause left on it.
                     (tgt (web-skeleton::make-connection
@@ -2701,7 +2701,7 @@
                           :stream-framing (when (eq target-state :streaming)
                                             :chunked)
                           :paused-outbound-fd out-fd
-                          :last-active (get-universal-time))))
+                          :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking out-fd)
                (web-skeleton::set-nonblocking tgt-fd)
                (web-skeleton::register-connection out)
@@ -2833,7 +2833,7 @@
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :streaming
                          :stream-framing :chunked
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (when back-up
                ;; A send buffer as small as the kernel will give.
@@ -3005,12 +3005,12 @@
                               :fd ffd :socket fserver :state :streaming
                               :stream-framing :chunked
                               :stream-on-close on-close
-                              :last-active (get-universal-time)))
+                              :last-active (web-skeleton::monotonic-seconds)))
                     (owned (web-skeleton::make-connection
                             :fd ofd :socket oserver :state :streaming
                             :stream-framing :chunked
                             :stream-on-close on-close
-                            :last-active (get-universal-time))))
+                            :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking ffd)
                (web-skeleton::set-nonblocking ofd)
                ;; On neither the table nor the epoll set.
@@ -3088,7 +3088,7 @@
                   (target (web-skeleton::make-connection
                            :fd tgt-fd :socket server :state :websocket
                            :fetch-outstanding t
-                           :last-active (get-universal-time)))
+                           :last-active (web-skeleton::monotonic-seconds)))
                   (frame (web-skeleton::build-ws-frame
                           web-skeleton::+ws-op-binary+
                           (make-array (* 512 1024)
@@ -3167,7 +3167,7 @@
                   (web-skeleton::*epoll-fd* epfd)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (stream (sb-bsd-sockets:socket-make-stream
                            client :input t :output t
                            :element-type '(unsigned-byte 8)))
@@ -3273,10 +3273,10 @@
                     (web-skeleton::*epoll-fd* epfd)
                     (conn-a (web-skeleton::make-connection
                              :fd a-fd :socket a-server :state :websocket
-                             :last-active (get-universal-time)))
+                             :last-active (web-skeleton::monotonic-seconds)))
                     (conn-b (web-skeleton::make-connection
                              :fd b-fd :socket b-server :state :websocket
-                             :last-active (get-universal-time)))
+                             :last-active (web-skeleton::monotonic-seconds)))
                     (big (web-skeleton::build-ws-frame
                           web-skeleton::+ws-op-binary+
                           (make-array (* 512 1024)
@@ -3906,6 +3906,36 @@
                       '(2))))
         (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
         (ignore-errors (sb-bsd-sockets:socket-close listener))))))
+
+(defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
+  "MONOTONIC-SECONDS, which every interval is measured on, reads whole
+   seconds, never backwards, from a start so high that a timestamp slot
+   left at 0 is long ago to any timeout; it is not read from the system's
+   clock; and an application can name it.
+
+   The system's clock is ruled out by wrapping GET-UNIVERSAL-TIME to
+   answer a day behind, as after the clock is set back: a reading taken
+   then is no earlier than one taken before. What a step does to a
+   running server is TEST-HARNESS-A-CLOCK-STEP-MOVES-NO-DEADLINE-E2E's
+   to show."
+  (format t "~%monotonic-seconds: high, forward, and apart from the date~%")
+  (let ((first (web-skeleton::monotonic-seconds)))
+    (check "monotonic: a whole number of seconds" (integerp first) t)
+    (check "monotonic: at or past its start, a billion seconds"
+           (>= first web-skeleton::+monotonic-seconds-start+ 1000000000) t)
+    (check "monotonic: so a slot left at 0 is older than a day-long timeout"
+           (> (- first 0) 86400) t)
+    (check "monotonic: a second reading is not before the first"
+           (>= (web-skeleton::monotonic-seconds) first) t)
+    (sb-int:encapsulate 'get-universal-time 'set-back
+                        (lambda (f) (- (funcall f) 86400)))
+    (unwind-protect
+         (check "monotonic: nor is one taken with the system's clock set back a day"
+                (>= (web-skeleton::monotonic-seconds) first) t)
+      (sb-int:unencapsulate 'get-universal-time 'set-back))
+    (check "monotonic: exported, for an application's own intervals"
+           (nth-value 1 (find-symbol "MONOTONIC-SECONDS" :web-skeleton))
+           :external)))
 
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
@@ -5038,7 +5068,7 @@
                   (web-skeleton::*epoll-fd* epfd)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
@@ -5082,7 +5112,7 @@
                   (web-skeleton:*max-write-backlog* 64)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd web-skeleton::+epollet+)
              (web-skeleton::connection-append-write
@@ -5111,7 +5141,7 @@
                   (web-skeleton:*log-stream* log)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (frames (concatenate '(vector (unsigned-byte 8))
                                        (%ws-client-frame 1 "bye")
                                        (%ws-client-frame 1 "after"))))
@@ -6106,6 +6136,7 @@
   (test-listen-backlog-reaches-the-listener)
   (test-accept-goes-on-past-a-connection-it-could-not-set-up)
   (test-set-up-failures-and-failed-accepts-are-throttled-apart)
+  (test-monotonic-seconds-reads-high-and-apart-from-the-date)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)

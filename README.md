@@ -123,6 +123,7 @@ run-tests.lisp             Entry point — load test suite and run
 run-pure-lisp-tests.lisp   Entry point — verify pure-Lisp crypto paths
 src/
   package.lisp     Package (namespace) declaration
+  clock.lisp       The monotonic clock intervals and deadlines are measured on
   log.lisp         Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   counters.lisp    Per-worker counts only the framework sees: accepts, responses, frames
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
@@ -227,6 +228,12 @@ tests/
 - **Connection lifecycle** — idle timeout for HTTP (slowloris protection),
   server-initiated ping/pong for dead WebSocket detection,
   configurable idle timeout for inactive WebSocket connections
+- **A clock that is never set** — every timeout and deadline is measured on
+  a monotonic clock, so setting the system's clock (NTP after a boot, a
+  hypervisor resyncing its guest, a date set by hand) fires none of them
+  early and holds none back. `monotonic-seconds` reads the same clock for
+  an application's own intervals, a session's idle time or a rate limit's
+  window, and `get-universal-time` is left for what is a date
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits. A rejection carries the

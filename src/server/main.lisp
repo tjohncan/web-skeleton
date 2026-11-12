@@ -468,7 +468,7 @@
                 conn)))
     (connection-queue-write conn bytes)
     (setf (connection-state conn) :write-response
-          (connection-last-active conn) (get-universal-time))
+          (connection-last-active conn) (monotonic-seconds))
     (epoll-modify epoll-fd (connection-fd conn)
                   (logior +epollout+ +epollet+))))
 
@@ -1285,7 +1285,7 @@
     (close-connection conn epoll-fd)
     (return-from begin-lingering-close))
   (setf (connection-state conn) :lingering
-        (connection-last-active conn) (get-universal-time))
+        (connection-last-active conn) (monotonic-seconds))
   (epoll-modify epoll-fd (connection-fd conn) (logior +epollin+ +epollet+))
   ;; Edge-triggered: what the client sent before this moment raises no new
   ;; edge, so the first drain is now.
@@ -1492,12 +1492,12 @@
    set on it. A connection that lands in a state phase 1 would have
    handled is handed to WIND-DOWN as it lands, so the WebSocket gets its
    1001 like every other, rather than sitting until the deadline."
-  (let ((deadline (+ (get-universal-time) *drain-timeout*)))
+  (let ((deadline (+ (monotonic-seconds) *drain-timeout*)))
     (loop
       (when (zerop (hash-table-count *connections*))
         (log-info "all connections drained")
         (return))
-      (when (> (get-universal-time) deadline)
+      (when (> (monotonic-seconds) deadline)
         (log-warn "drain timeout — force-closing ~d connection~:p"
                   (hash-table-count *connections*))
         (return))
@@ -1559,8 +1559,8 @@
              (connection-stream-on-close conn) (stream-response-on-close sresp)
              (connection-stream-keepalive conn) (stream-response-keepalive sresp)
              (connection-state conn) :streaming
-             (connection-last-active conn) (get-universal-time)
-             (connection-stream-produced-at conn) (get-universal-time))
+             (connection-last-active conn) (monotonic-seconds)
+             (connection-stream-produced-at conn) (monotonic-seconds))
        (let ((on-open (stream-response-on-open sresp)))
          (when on-open
            (funcall on-open conn)))
@@ -1722,7 +1722,7 @@
 (defun answer-request (conn epoll-fd handler)
   "CONN's request is complete: parse it, hand it to HANDLER, and set out
    whatever HANDLER answers."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (let ((request (connection-parse-request conn)))
     (log-debug "~a ~a~@[?~a~] HTTP/~a ~a"
                (http-request-method request)
@@ -1745,7 +1745,7 @@
    and the raise goes on to HANDLE-CLIENT-READ's catch, which answers 500.
    :UPGRADE is refused here by name, since a request with a body has had
    it read and is no handshake."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (let ((plan (claim-body-receiver conn))
         (request (connection-request conn)))
     (log-debug "~a ~a: body received (~d bytes)"
@@ -2182,7 +2182,7 @@
    activity is the correct semantics for a slow-pipe client, and
    dispatch-time + keep-alive-reset bumps alone would not survive
    a response that takes longer than *IDLE-TIMEOUT* to flush."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (handler-case
       (let* ((backlog (plusp (connection-write-pending conn)))
              (result (connection-on-write conn)))
@@ -2251,7 +2251,7 @@
                           ;; that holds whoever sets it next.
                           (connection-linger conn) nil
                           (connection-state conn) :read-http
-                          (connection-last-active conn) (get-universal-time))
+                          (connection-last-active conn) (monotonic-seconds))
                     (epoll-modify epoll-fd (connection-fd conn)
                                  (logior +epollin+ +epollet+))
                     ;; Edge-triggered: data may already be waiting from a
@@ -2422,8 +2422,8 @@
    later START-SERVER has begun. Either way it drains first, so a response
    a handler finished after its run was told to stop still goes out."
   (let ((listener-fd    (socket-fd listener-socket))
-        (last-ping-time  (get-universal-time))
-        (last-sweep-time (get-universal-time))
+        (last-ping-time  (monotonic-seconds))
+        (last-sweep-time (monotonic-seconds))
         ;; T while an accept has failed with the backlog possibly not
         ;; drained; the maintenance tick retries. See ACCEPT-PENDING.
         (accept-retry    nil)
@@ -2457,7 +2457,7 @@
       ;; table multiple times per second. 1 s is fine: idle
       ;; timeouts are measured in 10 s+ units, so sub-second sweep
       ;; granularity is pure waste.
-      (let ((now (get-universal-time)))
+      (let ((now (monotonic-seconds)))
         (when (>= (- now last-sweep-time) 1)
           (sweep-idle-connections epoll-fd now)
           ;; Rides the same 1 s gate rather than taking a third timer.
@@ -3001,7 +3001,7 @@
   ;; keeps fresh. Checked at boot rather than at the first parked request,
   ;; for the reason the two above give: a misconfiguration should not wait
   ;; for the shape that reveals it. Whole seconds, since the fetch path adds
-  ;; it to GET-UNIVERSAL-TIME; the eleventh says why that rules out a
+  ;; it to MONOTONIC-SECONDS; the eleventh says why that rules out a
   ;; fraction.
   (unless (and (integerp *fetch-timeout*) (plusp *fetch-timeout*))
     (error "start-server: *fetch-timeout* is ~s; it must be a positive whole ~
@@ -3097,9 +3097,9 @@
   ;; body, no limit on connections, no interim response.
   ;;
   ;; A fraction is fine for a setting held against a difference of two
-  ;; clock readings. One added to GET-UNIVERSAL-TIME takes whole seconds:
-  ;; the deadline lands in an integer slot, and a float at the clock's
-  ;; magnitude would resolve only to 256 seconds besides.
+  ;; clock readings. One added to MONOTONIC-SECONDS takes whole seconds:
+  ;; the deadline lands in an integer slot, and a single float at the
+  ;; clock's magnitude would resolve only to a minute or two besides.
   (loop for (name kind) in '((*idle-timeout* :seconds)
                              (*ws-idle-timeout* :seconds)
                              (*ws-message-timeout* :seconds)

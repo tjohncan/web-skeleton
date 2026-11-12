@@ -47,6 +47,8 @@
            #:log-error
            #:*log-level*
            #:*log-stream*
+           ;; The clock intervals are measured on
+           #:monotonic-seconds
            ;; Algorithms
            #:sha1
            #:sha1-hex

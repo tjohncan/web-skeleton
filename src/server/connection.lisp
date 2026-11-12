@@ -435,9 +435,10 @@
   ;; while no fragmented message is arriving. See WS-FRAG-APPEND.
   (ws-frag-buf   nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (ws-frag-total  0  :type fixnum)            ; bytes of frag-buf in use
-  ;; Universal time the WebSocket message still arriving began: its first
-  ;; fragment, or the first bytes of a frame not yet whole. 0 while no
-  ;; message is unfinished. *WS-MESSAGE-TIMEOUT* is measured from it.
+  ;; When the WebSocket message still arriving began, as MONOTONIC-SECONDS
+  ;; read it: its first fragment, or the first bytes of a frame not yet
+  ;; whole. 0 while no message is unfinished. *WS-MESSAGE-TIMEOUT* is
+  ;; measured from it.
   (ws-message-at  0  :type integer)
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
@@ -481,7 +482,7 @@
                      :socket client-socket
                      :serial (incf *connection-serial*)
                      :remote-addr addr
-                     :last-active (get-universal-time))))
+                     :last-active (monotonic-seconds))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cleanup
@@ -1698,7 +1699,7 @@
                   (setf peer-finished (and (member result '(:eof :ok-eof)) t))
                   (when (member result '(:ok :ok-eof :ok-want-write))
                     (setf (connection-body-progress-at conn)
-                          (get-universal-time)))))))))
+                          (monotonic-seconds)))))))))
 
 (defun connection-begin-body (conn peer-finished)
   "Start reading the body of CONN's request, whose head has arrived and
@@ -2146,7 +2147,7 @@
        ;; a wake-up that read nothing is not progress.
        (when (and (plusp (connection-body-progress-at conn))
                   (member read-result '(:ok :ok-eof :ok-want-write)))
-         (setf (connection-body-progress-at conn) (get-universal-time)))
+         (setf (connection-body-progress-at conn) (monotonic-seconds)))
        (cond
          ;; Paused: what this read brought waits in the buffer, within the
          ;; window, for BODY-RESUME. Only a stale event can get here — a
@@ -2491,7 +2492,7 @@
        (setf (connection-write-buf conn) bytes
              (connection-write-pos conn) 0
              (connection-write-end conn) len
-             (connection-write-progress-at conn) (get-universal-time))
+             (connection-write-progress-at conn) (monotonic-seconds))
        t)
       (t (%queue-tail conn bytes) t))))
 
@@ -2607,7 +2608,7 @@
           (connection-write-end conn) end
           ;; Guard above proves nothing was pending, so this is always the
           ;; start of an episode.
-          (connection-write-progress-at conn) (get-universal-time))))
+          (connection-write-progress-at conn) (monotonic-seconds))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write
@@ -2630,11 +2631,12 @@
    reported unwritable — is not coming."
   (let ((wrote nil))
     (flet ((finish (result)
-             ;; One timestamp per pass rather than per chunk. GET-UNIVERSAL-TIME
-             ;; is a syscall and this loop runs per writable event; the stall
-             ;; deadline is in seconds, so per-chunk resolution buys nothing.
+             ;; One timestamp per pass rather than per chunk. Reading the
+             ;; clock is a call out and this loop runs per writable event; the
+             ;; stall deadline is in seconds, so per-chunk resolution buys
+             ;; nothing.
              (when wrote
-               (setf (connection-write-progress-at conn) (get-universal-time)))
+               (setf (connection-write-progress-at conn) (monotonic-seconds)))
              result))
       (loop
         (let* ((pos (connection-write-pos conn))

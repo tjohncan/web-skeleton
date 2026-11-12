@@ -6172,7 +6172,7 @@
                     (let ((signalled
                             (handler-case
                                 (progn (web-skeleton::sweep-idle-connections
-                                        epfd (get-universal-time))
+                                        epfd (web-skeleton::monotonic-seconds))
                                        nil)
                               (error (e) (princ-to-string e)))))
                       (list signalled
@@ -6445,7 +6445,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-connecting
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :handshake-fn (%scripted-handshake-fn
                                         '(:want-write :want-read :done)
                                         calls))))
@@ -6500,7 +6500,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-connecting
-                         :outbound-p t :last-active (get-universal-time))))
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking peer-fd)
              (web-skeleton::connection-queue-write
               conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
@@ -6527,7 +6527,7 @@
                   (conn (web-skeleton::make-connection
                          :fd (web-skeleton::socket-fd server)
                          :socket server :state :out-handshake
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :handshake-fn (%scripted-handshake-fn '(:raise) calls))))
              (check-error "handshake: a failed handshake raises"
                           (web-skeleton::handle-outbound-handshake conn epfd))
@@ -6578,7 +6578,7 @@
                             (lambda () (incf released)))))
                   (inbound (web-skeleton::make-connection
                             :fd -1 :state :read-http
-                            :last-active (get-universal-time)))
+                            :last-active (web-skeleton::monotonic-seconds)))
                   (fetch-req (web-skeleton::make-http-fetch-continuation
                               :method :GET
                               :url (format nil "https://right.test:~d/" port)
@@ -6630,11 +6630,11 @@
                     (web-skeleton::*connections* (make-hash-table :test #'eql))
                     (inbound (web-skeleton::make-connection
                               :fd in-fd :socket in-server :state :streaming
-                              :last-active (get-universal-time)))
+                              :last-active (web-skeleton::monotonic-seconds)))
                     (outbound (web-skeleton::make-connection
                                :fd out-fd :socket out-server :state :out-read
                                :outbound-p t :inbound-fd in-fd
-                               :last-active (get-universal-time))))
+                               :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::register-connection inbound)
                (web-skeleton::register-connection outbound)
                ;; The state a pause leaves behind.
@@ -6706,7 +6706,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-read
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (%scripted-read-fn '(:want-write 12 :again) reads)
                          :write-fn (%scripted-write-fn '(99) writes
                                                        (make-array 0 :fill-pointer 0
@@ -6754,7 +6754,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-write
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (%scripted-read-fn '(:again) reads)
                          :write-fn (%scripted-write-fn '(:want-read 5) writes sink))))
              (web-skeleton::register-connection conn)
@@ -7155,7 +7155,7 @@
            (let ((epfd (web-skeleton::epoll-create))
                  (connfd (web-skeleton::epoll-create))
                  (log (make-string-output-stream))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let ((conn (web-skeleton::make-connection
                                :fd connfd :state state
@@ -7366,7 +7366,7 @@
            ;; if any, and the fragment bytes it still holds.
            (let ((epfd (web-skeleton::epoll-create))
                  (connfd (web-skeleton::epoll-create))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                          (web-skeleton:*log-stream* (make-broadcast-stream))
@@ -7650,7 +7650,7 @@
                   (seen nil)
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-read
-                         :outbound-p t :last-active (get-universal-time)))
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   ;; Three chunks in one write, so they all land in one
@@ -8084,7 +8084,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :read-http
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   (request (web-skeleton::make-http-request
@@ -8194,7 +8194,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :read-http
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   (request (web-skeleton::make-http-request
@@ -8252,10 +8252,10 @@
            ;; LAST-ACTIVE would miss every one of them.
            (let ((conn (web-skeleton::make-connection
                         :fd connfd :state :streaming
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
              (setf (web-skeleton::connection-stream-framing conn) :chunked
                    (web-skeleton::connection-stream-produced-at conn)
-                   (- (get-universal-time) age)
+                   (- (web-skeleton::monotonic-seconds) age)
                    (web-skeleton::connection-stream-keepalive conn) keepalive)
              (web-skeleton::epoll-add
               epfd connfd (logior web-skeleton::+epollin+
@@ -8269,7 +8269,7 @@
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
                  (reason :never)
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (let ((conn (streaming-conn epfd connfd
                                          :age (+ web-skeleton:*stream-idle-timeout*
                                                  1))))
@@ -8287,7 +8287,7 @@
           (connfd (web-skeleton::epoll-create)))
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (streaming-conn epfd connfd :age 1)
              (web-skeleton::sweep-idle-connections epfd now)
              (check "stream idle: a recent stream is left alone"
@@ -8304,7 +8304,7 @@
       (let ((epfd (web-skeleton::epoll-create)))
         (unwind-protect
              (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (now (get-universal-time))
+                    (now (web-skeleton::monotonic-seconds))
                     (ka (sb-ext:string-to-octets ":ka" :external-format :ascii))
                     (conn (web-skeleton::make-connection
                            :fd (web-skeleton::socket-fd server)
@@ -8348,7 +8348,7 @@
           (connfd (web-skeleton::epoll-create)))
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (let ((conn (streaming-conn
                           epfd connfd
                           :age (+ web-skeleton:*stream-keepalive-interval* 1))))
@@ -8572,7 +8572,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   ;; Half a megabyte, against a shrunk send buffer and a
                   ;; client that never reads. The two paths are only
@@ -8651,7 +8651,7 @@
                         :fd -1 :state :closing :last-active 0))
                   (new (web-skeleton::make-connection
                         :fd fd :socket server :state :read-http
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::register-connection new)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
                                                       web-skeleton::+epollet+))
@@ -8691,7 +8691,7 @@
                           :fd (web-skeleton::socket-fd server) :socket server
                           :state :streaming :stream-framing :chunked
                           :stream-on-close on-close
-                          :last-active (get-universal-time))))
+                          :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
                (%reset-socket client)
                (%await-arrival (web-skeleton::socket-fd server) :bytes 0 :fin t)
@@ -8741,7 +8741,7 @@
                  :fetch-sink :detached
                  :inbound-fd (web-skeleton::connection-fd target)
                  :fetch-method :GET
-                 :last-active (get-universal-time)
+                 :last-active (web-skeleton::monotonic-seconds)
                  :fetch-on-body (lambda (c chunk)
                                   (declare (ignore c))
                                   (web-skeleton:stream-send target chunk)
@@ -8800,7 +8800,7 @@
          (let* ((conn (web-skeleton::make-connection
                        :fd (sb-sys:fd-stream-fd sink)
                        :state :websocket
-                       :last-active (get-universal-time)))
+                       :last-active (web-skeleton::monotonic-seconds)))
                 (web-skeleton::*connections* (make-hash-table :test #'eql)))
            (web-skeleton::register-connection conn)
            (web-skeleton::ping-ws-connections epfd)
@@ -9311,7 +9311,7 @@
           (web-skeleton::*dns-cache-ttl* 60))
       (setf (gethash "stale.example" web-skeleton::*dns-cache*)
             (web-skeleton::make-dns-cache-entry
-             v4 :inet (- (get-universal-time) 1)))   ; expired one second ago
+             v4 :inet (- (web-skeleton::monotonic-seconds) 1)))   ; expired one second ago
       (check "expired entry misses"
              (web-skeleton::dns-cache-lookup "stale.example") nil)
       (check "expired entry is evicted on lookup"
@@ -9652,7 +9652,7 @@
                          :fd targetfd :state :websocket
                          :fetch-outstanding t
                          :fetch-failure-disposition :close
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (dns-conn (web-skeleton::make-connection
                            :fd dnsfd :state :out-dns
                            :outbound-p t
@@ -9662,7 +9662,7 @@
                                              (declare (ignore s h b))
                                              (incf fires)
                                              nil)
-                           :last-active (get-universal-time))))
+                           :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::register-connection dns-conn)
            (web-skeleton::deliver-dns-error dns-conn epfd)
@@ -9703,7 +9703,7 @@
                                                                  (list (coerce (car a) 'list)
                                                                        (cdr a)))
                                                                fallbacks))))
-                           :last-active (get-universal-time))))
+                           :last-active (web-skeleton::monotonic-seconds))))
            (replace buf out)
            (setf (web-skeleton::connection-read-buf dns-conn) buf
                  (web-skeleton::connection-read-pos dns-conn) (length out))
@@ -9760,7 +9760,7 @@
                                     :fd targetfd :state :websocket
                                     :fetch-outstanding t
                                     :fetch-failure-disposition :close
-                                    :last-active (get-universal-time)))
+                                    :last-active (web-skeleton::monotonic-seconds)))
                            (dns-conn (web-skeleton::make-connection
                                       :fd dnsfd :state :out-dns
                                       :outbound-p t
@@ -9774,7 +9774,7 @@
                                       (lambda (s h b)
                                         (declare (ignore s h b))
                                         nil)
-                                      :last-active (get-universal-time))))
+                                      :last-active (web-skeleton::monotonic-seconds))))
                       (replace buf line)
                       (setf (web-skeleton::connection-read-buf dns-conn) buf
                             (web-skeleton::connection-read-pos dns-conn)
@@ -9855,7 +9855,7 @@
                                   :fd targetfd :state :websocket
                                   :fetch-outstanding t
                                   :fetch-failure-disposition :close
-                                  :last-active (get-universal-time)))
+                                  :last-active (web-skeleton::monotonic-seconds)))
                          (dns-conn (web-skeleton::make-connection
                                     :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
                                     :state :out-dns :outbound-p t :fetch-sink :detached
@@ -9864,7 +9864,7 @@
                                     :fetch-callback (lambda (s h b)
                                                       (declare (ignore s h b))
                                                       nil)
-                                    :last-active (get-universal-time))))
+                                    :last-active (web-skeleton::monotonic-seconds))))
                     (replace buf bytes)
                     (setf (web-skeleton::connection-read-buf dns-conn) buf
                           (web-skeleton::connection-read-pos dns-conn) (length bytes))

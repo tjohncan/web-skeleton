@@ -5,7 +5,11 @@
   :license "MIT"
   :depends-on ("sb-bsd-sockets")
   :components ((:file "src/package")
-               (:file "src/log" :depends-on ("src/package"))
+               (:file "src/clock" :depends-on ("src/package"))
+               ;; src/clock for the minute LOG-THROTTLED measures; every file
+               ;; that times anything depends on this one, and has the clock
+               ;; through it.
+               (:file "src/log" :depends-on ("src/package" "src/clock"))
                (:file "src/counters" :depends-on ("src/package"))
                (:file "src/epoll" :depends-on ("src/package"))
                (:file "src/address" :depends-on ("src/package"))

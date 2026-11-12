@@ -1254,6 +1254,98 @@
              (check "control: the accept did fail first" failed t))
         (sb-int:unencapsulate 'sb-bsd-sockets:socket-accept 'fail-once)))))
 
+(defun test-harness-a-clock-step-moves-no-deadline-e2e ()
+  "Setting the system's clock neither fires a timeout nor holds one back.
+
+   GET-UNIVERSAL-TIME is wrapped while a server runs, to answer two hours
+   ahead and then two hours behind, as the system's clock reads after it
+   has been stepped. Intervals are measured on MONOTONIC-SECONDS, which
+   the wrap does not reach.
+
+   Ahead: a keep-alive connection that has answered one request sits idle
+   for two seconds, well inside *IDLE-TIMEOUT*, and answers a second.
+   Measured on the system's clock it would be two hours idle at the next
+   sweep, and closed. A response's Date is two hours ahead meanwhile,
+   which is the control: the wrap is in force, and what is a date follows
+   it.
+
+   Behind: *IDLE-TIMEOUT* is 1 for the run, and a connection that sends
+   nothing is closed within a few seconds. Measured on the system's clock
+   the loop's once-a-second work would wait for the clock to make the two
+   hours up, and nothing would be swept until it had.
+
+   SETF rather than LET for *IDLE-TIMEOUT*: the worker reads it, and
+   dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: a step of the system's clock moves no deadline~%")
+  (let ((offset 0)
+        (saved-idle web-skeleton:*idle-timeout*))
+    (sb-int:encapsulate 'get-universal-time 'stepped
+                        (lambda (f) (+ (funcall f) offset)))
+    (unwind-protect
+         (flet ((answered-p (buf fill)
+                  ;; A head, and the two bytes of body the handler sends.
+                  (let ((head-end (web-skeleton::scan-crlf-crlf buf 0 fill)))
+                    (and head-end (>= fill (+ head-end 4 2)))))
+                (text-of (buf)
+                  (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                           :external-format :latin-1)))
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (flet ((ask ()
+                             ;; The answer to one GET on the connection, or
+                             ;; why there was none.
+                             (handler-case
+                                 (progn
+                                   (%send-raw-get stream "/")
+                                   (text-of (read-until-bounded
+                                             stream :until #'answered-p :seconds 5)))
+                               (error (e) (format nil "no answer: ~a" e)))))
+                      (check "ahead: control, the connection answers a request"
+                             (let ((answer (ask)))
+                               (subseq answer 0 (min 12 (length answer))))
+                             "HTTP/1.1 200")
+                      (setf offset 7200)
+                      ;; On a connection of its own, so that it is answered
+                      ;; whatever becomes of the one being kept.
+                      (let ((headers (nth-value 1 (test-http-request :get "/")))
+                            (real (- (get-universal-time) offset)))
+                        (check "control: a response's Date is the stepped clock's"
+                               (let ((date (cdr (assoc "date" headers
+                                                       :test #'string-equal))))
+                                 (and (loop for slip from -3 to 3
+                                              thereis (equal date
+                                                             (web-skeleton::http-date
+                                                              (+ real 7200 slip))))
+                                      t))
+                               t))
+                      (sleep 2.2)
+                      (check "ahead: idle two seconds, two hours ahead, it answers another"
+                             (let ((answer (ask)))
+                               (subseq answer 0 (min 12 (length answer))))
+                             "HTTP/1.1 200"))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+           (setf offset 0
+                 web-skeleton:*idle-timeout* 1)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (setf offset -7200)
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (check "behind: a connection that says nothing is still swept"
+                           (nth-value 1 (read-until-bounded stream :seconds 6))
+                           :eof)
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (sb-int:unencapsulate 'get-universal-time 'stepped)
+      (setf web-skeleton:*idle-timeout* saved-idle))))
+
 (defun test-harness-client-errors-log-once-a-minute-e2e ()
   "A flood of requests a client gets wrong logs a line, not a flood.
 
@@ -1602,7 +1694,7 @@
                       :outbound-p t
                       :inbound-fd -1
                       :fetch-method :GET
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-on-body
                       (lambda (c chunk)
                         (declare (ignore c))
@@ -5493,7 +5585,7 @@
                          :fd (web-skeleton::socket-fd target-sock)
                          :socket target-sock
                          :state :streaming
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (out (web-skeleton::make-connection
                       :fd (web-skeleton::socket-fd out-sock)
                       :socket out-sock
@@ -5503,14 +5595,14 @@
                       :fetch-method :GET
                       ;; Paused, and therefore subscribed to nothing.
                       :fetch-paused t
-                      :fetch-paused-at (get-universal-time)
+                      :fetch-paused-at (web-skeleton::monotonic-seconds)
                       ;; Already past its deadline: the sweeper's test is
                       ;; (> now deadline), so this is the state a real one
                       ;; reaches after *FETCH-TIMEOUT* of no progress.
-                      :fetch-started-at (- (get-universal-time) 600)
-                      :fetch-deadline (- (get-universal-time) 300)
+                      :fetch-started-at (- (web-skeleton::monotonic-seconds) 600)
+                      :fetch-deadline (- (web-skeleton::monotonic-seconds) 300)
                       :inbound-fd (web-skeleton::socket-fd target-sock)
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-callback
                       (lambda (status headers body)
                         (declare (ignore headers body))
@@ -5524,7 +5616,7 @@
                         (web-skeleton::connection-fd out))
                        t)
                   t)
-           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           (web-skeleton::sweep-idle-connections epfd (web-skeleton::monotonic-seconds))
            ;; The three the arm exists for.
            (check "detached sweep: the expired outbound was reaped"
                   (web-skeleton::lookup-connection
@@ -5576,8 +5668,8 @@
                          :stream-framing :chunked
                          ;; Produced nothing for an hour: only the moving
                          ;; queue keeps this stream from being idle.
-                         :stream-produced-at (- (get-universal-time) 3600)
-                         :last-active (get-universal-time)))
+                         :stream-produced-at (- (web-skeleton::monotonic-seconds) 3600)
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (out (web-skeleton::make-connection
                       :fd (web-skeleton::socket-fd out-sock)
                       :socket out-sock
@@ -5586,11 +5678,11 @@
                       :fetch-sink :detached
                       :fetch-method :GET
                       :fetch-paused t
-                      :fetch-paused-at (- (get-universal-time) 120)
-                      :fetch-started-at (- (get-universal-time) 600)
-                      :fetch-deadline (- (get-universal-time) 300)
+                      :fetch-paused-at (- (web-skeleton::monotonic-seconds) 120)
+                      :fetch-started-at (- (web-skeleton::monotonic-seconds) 600)
+                      :fetch-deadline (- (web-skeleton::monotonic-seconds) 300)
                       :inbound-fd (web-skeleton::socket-fd target-sock)
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-callback
                       (lambda (status headers body)
                         (declare (ignore status headers body))
@@ -5603,7 +5695,7 @@
             target (sb-ext:string-to-octets "draining" :external-format :ascii))
            (check "draining pause: the target has a backlog"
                   (plusp (web-skeleton::connection-write-pending target)) t)
-           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           (web-skeleton::sweep-idle-connections epfd (web-skeleton::monotonic-seconds))
            (check "draining pause: the outbound is still registered"
                   (and (web-skeleton::lookup-connection
                         (web-skeleton::connection-fd out))
@@ -8967,7 +9059,7 @@
                              :state :websocket
                              :fetch-outstanding t
                              :fetch-failure-disposition target-disposition
-                             :last-active (get-universal-time))))
+                             :last-active (web-skeleton::monotonic-seconds))))
                      (web-skeleton::register-connection c)
                      c))))
     (unwind-protect
@@ -8983,7 +9075,7 @@
                       :fetch-sink :detached
                       :inbound-fd (if target (web-skeleton::connection-fd target) -1)
                       :fetch-method :GET
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-on-body
                       (lambda (c chunk)
                         (declare (ignore c))
@@ -9077,7 +9169,7 @@
                         :state :websocket
                         :fetch-outstanding t
                         :fetch-failure-disposition disposition
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::deliver-detached
             4242 epfd
@@ -9131,7 +9223,7 @@
                 (let ((target (web-skeleton::make-connection
                                :fd 4242
                                :state :websocket
-                               :last-active (get-universal-time))))
+                               :last-active (web-skeleton::monotonic-seconds))))
                   (web-skeleton::register-connection target)
                   (fetch-into target
                               (http-fetch :get "http://127.0.0.1:1/x"
@@ -9199,7 +9291,7 @@
                 (conn (web-skeleton::make-connection
                        :fd 4242
                        :state :streaming
-                       :last-active (get-universal-time))))
+                       :last-active (web-skeleton::monotonic-seconds))))
            ;; Not registered: what a connection owned by another worker
            ;; looks like from here.
            (check "fetch-into: a connection this worker does not own is refused"
@@ -9294,7 +9386,7 @@
                         :state :websocket
                         :fetch-outstanding t
                         :fetch-failure-disposition :close
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::connection-append-write
             target (make-array 8 :element-type '(unsigned-byte 8)
@@ -9628,6 +9720,7 @@
   (test-harness-close-delimited-fetch-e2e)
   (test-harness-fetch-latin-1-header-e2e)
   (test-harness-accept-failure-is-retried-e2e)
+  (test-harness-a-clock-step-moves-no-deadline-e2e)
   (test-harness-client-errors-log-once-a-minute-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)

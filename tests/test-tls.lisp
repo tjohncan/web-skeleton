@@ -590,7 +590,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                   (conn (web-skeleton::make-connection
                                          :fd fd :socket socket :state :out-read
                                          :outbound-p t
-                                         :last-active (get-universal-time)
+                                         :last-active (web-skeleton::monotonic-seconds)
                                          :read-fn
                                          (let ((inner (funcall
                                                        (tls-sym "SSL-CONNECTION-READER")
@@ -738,7 +738,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                              (conn (web-skeleton::make-connection
                                     :fd fd :socket socket :state :out-write
                                     :outbound-p t
-                                    :last-active (get-universal-time)
+                                    :last-active (web-skeleton::monotonic-seconds)
                                     :write-fn write-fn :close-fn release-fn)))
                         (unwind-protect
                              (progn
@@ -817,7 +817,7 @@ printf 'TAIL-MARKER\\n' >> body.txt
                                          :fd (web-skeleton::socket-fd socket)
                                          :socket socket :state :out-write
                                          :outbound-p t
-                                         :last-active (get-universal-time)
+                                         :last-active (web-skeleton::monotonic-seconds)
                                          :write-fn
                                          (lambda (b st n)
                                            (incf (car writes))

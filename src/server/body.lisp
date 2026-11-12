@@ -192,7 +192,7 @@
    body accepted by a body handler is timed on, and for a :RECEIVE plan,
    the receiver itself."
   (setf (connection-body-limit conn) (body-plan-max-size plan)
-        (connection-body-progress-at conn) (get-universal-time))
+        (connection-body-progress-at conn) (monotonic-seconds))
   (when (eq (body-plan-kind plan) :receive)
     (setf (connection-body-receiver conn) plan
           (connection-body-received conn) 0
@@ -235,7 +235,7 @@
              (connection-fd conn)))
     (when (and (connection-body-receiver conn) (connection-body-paused conn))
       (setf (connection-body-paused conn) nil
-            (connection-body-progress-at conn) (get-universal-time))
+            (connection-body-progress-at conn) (monotonic-seconds))
       (epoll-modify *epoll-fd* (connection-fd conn)
                     (logior +epollin+ +epollout+ +epollet+))
       t)))

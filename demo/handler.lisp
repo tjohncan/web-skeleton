@@ -554,12 +554,17 @@
   "2208988800. Unix seconds plus this is a Lisp universal time.")
 
 (defun %now-us ()
-  "Microseconds of wall time: for timing a handler, refilling a post budget,
-   and stamping a bulletin line.
+  "Microseconds of wall time: for stamping a bulletin line, which is a
+   date, and for timing a handler, which is an interval too short for the
+   clock the demo's other intervals are read from.
 
-   Not GET-INTERNAL-REAL-TIME: its clock ticks too coarsely to time a
-   handler, so every lab request would report itself as instantaneous,
-   which reads as a broken field rather than as a fast server.
+   That clock is the framework's MONOTONIC-SECONDS: the uptime, the
+   /healthz ticks and the post budget count whole seconds on it, and a
+   step of the system's clock moves none of them. It will not time a
+   handler. It is GET-INTERNAL-REAL-TIME in whole seconds, and that
+   clock ticks too coarsely even read directly, so every lab request
+   would report itself as instantaneous, which reads as a broken field
+   rather than as a fast server.
 
    Not CLOCK_MONOTONIC through SB-UNIX:CLOCK-GETTIME either, though it is
    the right clock. That symbol is external on some SBCLs and internal on
@@ -572,12 +577,8 @@
    resolution. What it costs is that it is wall time, so an interval
    measured across a clock step is not an interval.
 
-   So every subtraction of two of these clamps at zero: the lab's handler
-   timer, and the post budget's refill. A backward step then reads as no
-   time having passed, never as negative time. Unclamped, the budget would
-   turn a one-hour backward step into minus three thousand six hundred
-   posts, and a connection that had posted before the step would stay
-   locked out for the hour it takes to earn them back.
+   So the lab's handler timer clamps its subtraction at zero: a backward
+   step then reads as no time having passed, never as negative time.
 
    The bulletin's stamps are not clamped, and say so where they are taken:
    a stamp is the time the server believed it was, and a clock that stepped
@@ -889,8 +890,10 @@
 ;;; paths, no addresses, no headers, no message contents. The page is public.
 
 (defvar *started-at* nil
-  "Universal time START-DEMO ran. An application fact, not a framework one —
-   the framework has no opinion about when this app began.")
+  "What MONOTONIC-SECONDS read when START-DEMO ran, for the uptime the
+   census reports: an interval, so the clock a step of the system's cannot
+   move. An application fact, not a framework one — the framework has no
+   opinion about when this app began.")
 
 (defun %states-json (states)
   "A :STATES plist into a JSON object with string keys.
@@ -926,11 +929,12 @@
    that; one that has not passed at all is stuck in something.")
 
 (defvar *last-tick* nil
-  "Per-worker vector of the universal time each worker last passed its loop.
-   Written only by its own worker, from BULLETIN-TICK; read by whichever
-   worker answers /healthz. The same shape as *FANNED*, and for the same
-   reason needs no lock: one writer per slot, and a read that is a tick
-   stale costs nothing.")
+  "Per-worker vector of what MONOTONIC-SECONDS read when each worker last
+   passed its loop, and 0 for one that never has: readings start far above
+   zero, so 0 is long ago. Written only by its own worker, from
+   BULLETIN-TICK; read by whichever worker answers /healthz. The same shape
+   as *FANNED*, and for the same reason needs no lock: one writer per slot,
+   and a read that is a tick stale costs nothing.")
 
 (defun handle-healthz (request)
   "200 when every worker has passed its loop recently, 503 naming the ones
@@ -948,7 +952,7 @@
   (declare (ignore request))
   (if (null *last-tick*)
       (make-text-response 503 (format nil "not started~%"))
-      (let* ((now (get-universal-time))
+      (let* ((now (monotonic-seconds))
              (stale (loop for at across *last-tick*
                           for i from 0
                           when (> (- now at) *healthz-stale-after*)
@@ -967,7 +971,7 @@
          (json (json-serialize
                 (make-json-object
                  (list (cons "uptime" (if *started-at*
-                                          (- (get-universal-time) *started-at*)
+                                          (- (monotonic-seconds) *started-at*)
                                           0))
                        (cons "workers" (or (getf c :workers) 0))
                        (cons "total"   (or (getf c :total) 0))
@@ -1147,7 +1151,7 @@
    newer than this worker has sent — the :ON-TICK docstring asks a hook not to
    block the loop it runs on, and a lock taken twenty times a second for
    nothing is the slow version of doing exactly that."
-  (setf (aref *last-tick* worker-id) (get-universal-time))
+  (setf (aref *last-tick* worker-id) (monotonic-seconds))
   (let ((latest *bulletin-latest*))
     (when (> latest (aref *fanned* worker-id))
       ;; NEW always holds the line LATEST names. BULLETIN-POST publishes LATEST
@@ -1207,6 +1211,13 @@
   "Spend one post from CONN's budget, or refuse. A token bucket: *POST-BURST*
    posts at once, then *POST-REFILL-PER-SECOND*.
 
+   The refill is counted in whole seconds on MONOTONIC-SECONDS, a post
+   earned as each second turns. It is an interval, and an interval read off
+   the system's clock moves when that clock is set: an hour's step backward
+   would be minus three thousand six hundred posts, and a connection that
+   had posted before it would stay locked out for the hour it takes to earn
+   them back.
+
    Second value is T the first time a refusal lands after an allowed post, so
    the sender is told once per run of refusals rather than once per frame —
    an answer to every dropped frame would be a write for every write, handed
@@ -1214,16 +1225,13 @@
   (let ((table (and *worker-id* (aref *post-budgets* *worker-id*))))
     (if (null table)
         (values t nil)
-        (let* ((now (%now-us))
+        (let* ((now (monotonic-seconds))
                (b (or (gethash conn table)
                       (setf (gethash conn table)
                             (make-post-budget :tokens *post-burst* :at now))))
-               ;; Clamped: see %NOW-US. A clock stepped backward makes this
-               ;; negative, and a negative refill is a lockout.
-               (elapsed (max 0 (- now (budget-at b))))
                (tokens (min *post-burst*
                             (+ (budget-tokens b)
-                               (* (/ elapsed 1000000)
+                               (* (- now (budget-at b))
                                   *post-refill-per-second*)))))
           (setf (budget-at b) now)
           (if (>= tokens 1)
@@ -1401,7 +1409,7 @@
   (setf *instance* instance
         *backlink-url* backlink
         *public-url* public-url)
-  (setf *started-at* (get-universal-time)
+  (setf *started-at* (monotonic-seconds)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0)
         ;; Zero, not now: a worker that never starts should read as wedged

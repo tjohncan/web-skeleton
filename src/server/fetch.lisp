@@ -81,7 +81,7 @@
   (answer nil))
 
 (defparameter *fetch-timeout* 30
-  "Seconds, whole: the fetch path adds it to GET-UNIVERSAL-TIME, and
+  "Seconds, whole: the fetch path adds it to MONOTONIC-SECONDS, and
    START-SERVER refuses a fraction. A total on the HTTP-FETCH path, both
    schemes: the inbound parks in :AWAITING and the reaper bounds the
    whole exchange, handshake included, however many reads and writes it
@@ -2138,16 +2138,16 @@
                                  :fetch-on-body (http-fetch-continuation-on-body fetch-req)
                                  :fetch-method (http-fetch-continuation-method fetch-req)
                                  :fetch-sink (http-fetch-continuation-sink fetch-req)
-                                 :fetch-started-at (or started-at (get-universal-time))
-                                 :fetch-deadline (+ (or started-at (get-universal-time))
+                                 :fetch-started-at (or started-at (monotonic-seconds))
+                                 :fetch-deadline (+ (or started-at (monotonic-seconds))
                                                     *fetch-timeout*)
                                  :fallback-addresses fallbacks
                                  :connect-deadline (if fallbacks
-                                                       (+ (get-universal-time)
+                                                       (+ (monotonic-seconds)
                                                           *connect-fallback-delay*)
                                                        0)
                                  :fetch-continuation fetch-req
-                                 :last-active (get-universal-time)))
+                                 :last-active (monotonic-seconds)))
                  ;; Before the request is queued and before epoll is armed:
                  ;; HANDLE-OUTBOUND-CONNECT keys on HANDSHAKE-FN, so no path
                  ;; may reach a write with the transport half installed.
@@ -2668,10 +2668,10 @@
    point both were waiting on the body, which progress bounded."
   (setf (connection-state conn) :out-read
         (connection-interest-inverted conn) nil
-        (connection-fetch-deadline conn) (+ (get-universal-time) *fetch-timeout*))
+        (connection-fetch-deadline conn) (+ (monotonic-seconds) *fetch-timeout*))
   (let ((in (awaiting-inbound-for (connection-inbound-fd conn) (connection-fd conn))))
     (when in
-      (setf (connection-last-active in) (get-universal-time))))
+      (setf (connection-last-active in) (monotonic-seconds))))
   ;; A fetch :ON-BODY has paused reads nothing until FETCH-RESUME, which
   ;; wakes it from :OUT-READ as from any pause there.
   (epoll-modify epoll-fd (connection-fd conn)
@@ -2684,7 +2684,7 @@
    the upstream took more — so its deadline moves out again. While a
    request body is going out the deadline is a bound on silence, not on
    the whole: an upload takes as long as it keeps moving."
-  (setf (connection-fetch-deadline out) (+ (get-universal-time) *fetch-timeout*)))
+  (setf (connection-fetch-deadline out) (+ (monotonic-seconds) *fetch-timeout*)))
 
 (defun release-send-waiter (out epoll-fd)
   "OUT's streamed request body has drained. If its application was told
@@ -2919,7 +2919,7 @@
               (connection-fetch-sink carrier) :inbound
               (connection-state conn) :awaiting
               (connection-awaiting-fd conn) (connection-fd carrier)
-              (connection-last-active conn) (get-universal-time))
+              (connection-last-active conn) (monotonic-seconds))
         :parked)))
 
 (defun forward-body (fetch &key (max-size *max-body-size*) on-abort)
@@ -3050,7 +3050,7 @@
     ;; stated in README Limitations rather than papered over here.
     (when (plusp (connection-fetch-paused-at conn))
       (incf (connection-fetch-deadline conn)
-            (max 0 (- (get-universal-time)
+            (max 0 (- (monotonic-seconds)
                       (connection-fetch-paused-at conn)))))
     (setf (connection-fetch-paused conn) nil
           (connection-fetch-paused-at conn) 0)
@@ -3302,7 +3302,7 @@
    on it: HANDLE-OUTBOUND-SEND, whose read this pause came from, arms its
    writes again before it returns."
   (setf (connection-fetch-paused conn) t
-        (connection-fetch-paused-at conn) (get-universal-time)
+        (connection-fetch-paused-at conn) (monotonic-seconds)
         (connection-fetch-rewalk conn) t
         (connection-interest-inverted conn) nil)
   (epoll-modify epoll-fd (connection-fd conn) +epollet+)
@@ -3872,7 +3872,7 @@
                   (queue-final-response inbound response)
                   (setf (connection-state inbound) :write-response
                         (connection-awaiting-fd inbound) -1
-                        (connection-last-active inbound) (get-universal-time))
+                        (connection-last-active inbound) (monotonic-seconds))
                   (epoll-modify epoll-fd (connection-fd inbound)
                                 (logior +epollout+ +epollet+))
                   (log-debug "fetch: resumed fd ~d" inbound-fd))
@@ -3889,7 +3889,7 @@
                   (connection-queue-write inbound err-bytes)
                   (setf (connection-state inbound) :write-response
                         (connection-awaiting-fd inbound) -1
-                        (connection-last-active inbound) (get-universal-time))
+                        (connection-last-active inbound) (monotonic-seconds))
                   (epoll-modify epoll-fd (connection-fd inbound)
                                 (logior +epollout+ +epollet+)))))
             ;; Inbound vanished between :awaiting parking and now
@@ -3927,7 +3927,7 @@
           (connection-queue-write inbound err-bytes)
           (setf (connection-state inbound) :write-response
                 (connection-awaiting-fd inbound) -1
-                (connection-last-active inbound) (get-universal-time))
+                (connection-last-active inbound) (monotonic-seconds))
           (epoll-modify epoll-fd (connection-fd inbound)
                        (logior +epollout+ +epollet+)))))))
 
