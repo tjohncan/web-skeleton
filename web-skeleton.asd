@@ -26,6 +26,7 @@
                (:file "src/algorithms/ecdsa"  :depends-on ("src/package"
                                                            "src/algorithms/octets"))
                (:file "src/algorithms/base64" :depends-on ("src/package"))
+               (:file "src/algorithms/siphash" :depends-on ("src/package"))
                (:file "src/random" :depends-on ("src/package"
                                                  "src/algorithms/base64"))
                (:file "src/server/http"  :depends-on ("src/counters" "src/package"
@@ -118,6 +119,11 @@
                                                        "src/server/dns"
                                                        "src/server/streaming"
                                                        "src/server/body"))
+               ;; src/algorithms/siphash for WITH-SIPHASH-2-4, a macro, so
+               ;; it has to be there when this file is compiled; src/random
+               ;; for the bytes the stores' secret is drawn from.
                (:file "src/store" :depends-on ("src/package"
                                                 "src/log"
+                                                "src/random"
+                                                "src/algorithms/siphash"
                                                 "src/server/main"))))

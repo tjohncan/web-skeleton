@@ -98,6 +98,54 @@
                     (shape (base64url-encode (bytes n))) (list t bare bare)))
     (check "exact: a random token" (shape (random-token)) '(t 43 43))))
 
+(defun test-siphash ()
+  "SIPHASH-2-4 against the reference implementation's test vectors: under
+   the key 00 01 .. 0f, the 64 messages of 0 to 63 bytes that count up
+   from 00. Every length of last word is among them, and messages of
+   seven whole words and more."
+  (format t "~%SipHash-2-4~%")
+  (flet ((counting-up (n)
+           (coerce (loop for i below n collect i)
+                   '(simple-array (unsigned-byte 8) (*)))))
+    (let ((key (web-skeleton::sip-key-from-octets (counting-up 16)))
+          (expected
+            #(#x726FDB47DD0E0E31 #x74F839C593DC67FD #x0D6C8009D9A94F5A
+              #x85676696D7FB7E2D #xCF2794E0277187B7 #x18765564CD99A68D
+              #xCBC9466E58FEE3CE #xAB0200F58B01D137 #x93F5F5799A932462
+              #x9E0082DF0BA9E4B0 #x7A5DBBC594DDB9F3 #xF4B32F46226BADA7
+              #x751E8FBC860EE5FB #x14EA5627C0843D90 #xF723CA908E7AF2EE
+              #xA129CA6149BE45E5 #x3F2ACC7F57C29BDB #x699AE9F52CBE4794
+              #x4BC1B3F0968DD39C #xBB6DC91DA77961BD #xBED65CF21AA2EE98
+              #xD0F2CBB02E3B67C7 #x93536795E3A33E88 #xA80C038CCD5CCEC8
+              #xB8AD50C6F649AF94 #xBCE192DE8A85B8EA #x17D835B85BBB15F3
+              #x2F2E6163076BCFAD #xDE4DAAACA71DC9A5 #xA6A2506687956571
+              #xAD87A3535C49EF28 #x32D892FAD841C342 #x7127512F72F27CCE
+              #xA7F32346F95978E3 #x12E0B01ABB051238 #x15E034D40FA197AE
+              #x314DFFBE0815A3B4 #x027990F029623981 #xCADCD4E59EF40C4D
+              #x9ABFD8766A33735C #x0E3EA96B5304A7D0 #xAD0C42D6FC585992
+              #x187306C89BC215A9 #xD4A60ABCF3792B95 #xF935451DE4F21DF2
+              #xA9538F0419755787 #xDB9ACDDFF56CA510 #xD06C98CD5C0975EB
+              #xE612A3CB9ECBA951 #xC766E62CFCADAF96 #xEE64435A9752FE72
+              #xA192D576B245165A #x0A8787BF8ECB74B2 #x81B3E73D20B49B6F
+              #x7FA8220BA3B2ECEA #x245731C13CA42499 #xB78DBFAF3A8D83BD
+              #xEA1AD565322A1A0B #x60E61C23A3795013 #x6606D7E446282B93
+              #x6CA4ECB15C5F91E1 #x9F626DA15C9625F3 #xE51B38608EF25F57
+              #x958A324CEB064572)))
+      (check "siphash: the key 00..0f is two little-endian words"
+             (list (web-skeleton::sip-key-k0 key) (web-skeleton::sip-key-k1 key))
+             '(#x0706050403020100 #x0F0E0D0C0B0A0908))
+      (check "siphash: the empty message"
+             (web-skeleton::siphash-2-4 key (counting-up 0)) #x726FDB47DD0E0E31)
+      ;; The message the SipHash paper works through in its appendix.
+      (check "siphash: fifteen bytes, the paper's worked example"
+             (web-skeleton::siphash-2-4 key (counting-up 15)) #xA129CA6149BE45E5)
+      (check "siphash: every reference vector, by the lengths that differ"
+             (loop for n from 0 below 64
+                   unless (= (web-skeleton::siphash-2-4 key (counting-up n))
+                             (aref expected n))
+                     collect n)
+             nil))))
+
 (defun test-base64-decode ()
   (format t "~%Base64 Decode~%")
   ;; A decode that should succeed goes through ATTEMPT, so one that raises
@@ -824,6 +872,7 @@
   (test-sha256)
   (test-base64)
   (test-encoded-strings-are-simple-and-exact)
+  (test-siphash)
   (test-base64-decode)
   (test-base64url)
   (test-ecdsa)

@@ -1694,6 +1694,28 @@ function above does on every call.
 All operations hold an internal mutex,
 so stores are safe to share across worker threads in the same process.
 
+**Keys a client chooses.** A store made with the default `:test` hashes
+its keys with SipHash-2-4 under a secret, so it can be keyed by what a
+client sends: a username, an API key, an address. SBCL's own hash of a
+key can be worked out by anyone, and keys chosen to land in one bucket
+of the table make each one added walk all the others, under the store's
+mutex, until they expire. Where a key lands under the secret cannot be
+worked out without it.
+
+- Strings, integers and lists of them, to any depth, are hashed whole.
+  A key of another kind (a symbol, a pathname, a structure) is hashed
+  from its `sxhash`, and two that `sxhash` cannot tell apart still land
+  together. Build a key a client has a hand in out of strings and
+  integers.
+- A store made with another `:test` (`eql`, `equalp`) hashes as SBCL
+  does. Key such a store by something the server chooses, a session id
+  it generated say, or by an HMAC of the client's value.
+- The secret is the process's own, drawn from `/dev/urandom` when a
+  store first needs it. A binary built with `save-lisp-and-die` does
+  not carry it: it is forgotten at the save, and a store saved with
+  entries in it files them again under the secret the started process
+  draws.
+
 For stores with a reaper, supply both `:expiry-fn` and `:reap-interval`:
 
 ```lisp

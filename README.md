@@ -139,6 +139,7 @@ src/
     sha256.lisp      SHA-256 digest (FIPS 180-4)
     hmac.lisp        HMAC-SHA256 (RFC 2104)
     base64.lisp      Base64 encoder/decoder + URL-safe variant (RFC 4648)
+    siphash.lisp     SipHash-2-4, the keyed hash a store files its keys under
     ecdsa.lisp       ECDSA P-256 signature verification (FIPS 186-4)
   server/
     connection.lisp    Connection state machine, read/write buffers
@@ -164,7 +165,7 @@ tests/
   run.lisp               Test utilities and combined runner
   harness.lisp           Ephemeral-port live server and request/frame builders
   ecdsa-corpus.lisp      P-256 verify cases with OpenSSL's verdicts, for the ECDSA tests
-  test-algorithms.lisp   SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
+  test-algorithms.lisp   SHA-1, SHA-256, Base64, SipHash, ECDSA, HMAC, hex test vectors
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
   test-connections.lisp  Request bodies, a connection's life, the runtime
@@ -406,6 +407,8 @@ tests/
   is held in memory twice and a full GET still takes the zero-work path
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
+  Keys are hashed with SipHash-2-4 under a secret of the process's own, so a
+  store keyed by what a client sends cannot be made to pile its keys into one bucket.
   Optional background reaper sweeps entries on an app-supplied predicate
   and registers its stop via the cleanup hook machinery — no app-side teardown needed;
   `stop-store-reaper` retires one early
