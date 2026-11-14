@@ -1855,7 +1855,7 @@ All three empty forms round-trip to themselves.
 so handler code written against either representation works:
 
 ```lisp
-(json-get (json-parse body) "user_id")
+(json-get (json-parse-bytes (http-request-body request)) "user_id")
 ```
 
 `json-object-alist` gets the underlying alist when you need to walk it, and
@@ -1892,14 +1892,27 @@ recover it; typing objects is the only fix that works in both directions.
 `json-parse` signals `json-parse-error` for a string that is not JSON, or
 is JSON past one of the parser's bounds (`*json-max-depth*`,
 `*json-max-string-length*`, the digits a number may have), and signals
-nothing else for any string. Caught by name, a malformed body is the
-client's 400 and a fault in the handler stays a 500:
+nothing else for any string.
+
+A request's body is bytes, and `json-parse-bytes` reads a document from
+those: it decodes them as UTF-8 and hands the text to `json-parse`. Bytes
+that are not UTF-8 are a `json-parse-error` as well, so one catch by name
+answers a malformed body whichever it was. That is the client's 400, and
+a fault in the handler stays a 500:
 
 ```lisp
-(handler-case (json-parse text)
+(handler-case (json-parse-bytes (http-request-body request))
   (json-parse-error ()
     (make-error-response 400 "malformed JSON")))
 ```
+
+A request that carried no body has `NIL` for one. `json-parse-bytes`
+reads that as no bytes and refuses it as the empty string is refused, so
+the catch above answers it too and a handler needs no check of its own.
+The decoding is strict, and no other encoding is guessed at: RFC 8259
+has a document sent between systems encoded as UTF-8. A string handed to
+`json-parse-bytes` is a `type-error`, the caller's mistake and not the
+client's.
 
 A catch of `error` around the parse takes it too, since it is one, and
 takes the handler's own bugs with it: a mistake inside the form answers
@@ -1907,14 +1920,10 @@ every caller "malformed JSON".
 
 The framework does not answer it on a handler's behalf. One that escapes
 a handler is that handler's error like any other, a 500, because the
-text is not always the client's: an upstream's reply read in a `:then`
-goes through the same parser, and so does a JWKS document.
+document is not always the client's: an upstream's reply read in a
+`:then` goes through the same parser, and so does a JWKS document.
 `json-parse-error-message` is the complaint without the `json:` it is
 printed under.
-
-Decoding is a step before the parser. A request's body is bytes, and
-`sb-ext:octets-to-string` signals a condition of SBCL's own for bytes
-that are not UTF-8, which is not a `json-parse-error`.
 
 ### Query parameter parsing
 

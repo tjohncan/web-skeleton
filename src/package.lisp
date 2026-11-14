@@ -86,6 +86,7 @@
            #:jwt-claim
            ;; JSON
            #:json-parse
+           #:json-parse-bytes
            #:json-parse-error
            #:json-parse-error-message
            #:json-serialize

@@ -496,6 +496,81 @@
              (nth-value 1 (find-symbol name :web-skeleton))
              :external))))
 
+(defun test-json-parse-bytes-reads-utf-8-and-refuses-the-rest ()
+  "JSON-PARSE-BYTES reads a document from its bytes as JSON-PARSE reads it
+   from its text, and refuses with JSON-PARSE-ERROR both bytes that are
+   not UTF-8 and UTF-8 that is not JSON: one catch by name answers a
+   malformed body, whichever it was.
+
+   A request that carried no body has NIL for one, and NIL is refused as
+   no bytes are, which is as the empty string is. A string is not bytes:
+   that is the caller's mistake, and a TYPE-ERROR."
+  (format t "~%JSON: a document from its bytes~%")
+  (labels ((octets (&rest bytes)
+             (coerce bytes '(simple-array (unsigned-byte 8) (*))))
+           (utf-8 (text)
+             (sb-ext:string-to-octets text :external-format :utf-8))
+           (refusal (bytes)
+             ;; The message BYTES are refused with. Any other condition
+             ;; answers its type, and bytes that parse answer :PARSED.
+             (handler-case (progn (json-parse-bytes bytes) :parsed)
+               (json-parse-error (e) (json-parse-error-message e))
+               (error (e) (type-of e)))))
+    (let ((doc (format nil "{\"name\":\"caf~c\",\"face\":\"~c\",~
+                            \"n\":[1,2.5,true,null]}"
+                       (code-char #xE9) (code-char #x1F600))))
+      (check "bytes: a document reads as its text does"
+             (json-serialize (json-parse-bytes (utf-8 doc)))
+             (json-serialize (json-parse doc))))
+    (check "bytes: two bytes of one character are one character"
+           (map 'list #'char-code (json-parse-bytes (octets 34 #xC3 #xA9 34)))
+           '(#xE9))
+    (check "bytes: a byte order mark before the document is skipped"
+           (json-object-alist
+            (json-parse-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
+                                           (octets #xEF #xBB #xBF)
+                                           (utf-8 "{\"x\":1}"))))
+           '(("x" . 1)))
+    ;; Most sit inside a JSON string's quotes, where the parser would take
+    ;; any character: what refuses them is the decoding.
+    (dolist (case '(("a byte that begins nothing" (34 #xFF 34))
+                    ("a continuation with no lead" (34 #x80 34))
+                    ("a Latin-1 e-acute" (34 #xE9 34))
+                    ("an overlong form" (34 #xC0 #x80 34))
+                    ("an encoded surrogate" (34 #xED #xA0 #x80 34))
+                    ("a code point past U+10FFFF" (34 #xF4 #x90 #x80 #x80 34))
+                    ("a character cut short at the end" (34 #xC3))
+                    ("UTF-16 under its mark" (#xFF #xFE #x7B 0 #x7D 0))))
+      (destructuring-bind (name bytes) case
+        (check (format nil "bytes: ~a is not UTF-8" name)
+               (refusal (apply #'octets bytes))
+               "the bytes are not UTF-8")))
+    (check "bytes: UTF-8 that is not JSON is refused in the parser's words"
+           (refusal (utf-8 "{\"a\" 1}"))
+           "expected ':' at 5")
+    ;; Every byte of it is UTF-8, a NUL after each character, and JSON has
+    ;; no place for a NUL.
+    (check "bytes: UTF-16 with no mark decodes, and is not JSON"
+           (refusal (octets #x7B 0 #x7D 0))
+           "expected string key at 1")
+    (let ((of-the-empty-string (handler-case (progn (json-parse "") :parsed)
+                                 (json-parse-error (e)
+                                   (json-parse-error-message e)))))
+      (check "bytes: the empty string is refused"
+             of-the-empty-string "unexpected end of input")
+      (check "bytes: no bytes are refused as the empty string is"
+             (refusal (octets)) of-the-empty-string)
+      (check "bytes: NIL, the body of a request without one, likewise"
+             (refusal nil) of-the-empty-string))
+    (check "bytes: a string is not bytes, and the caller's TYPE-ERROR"
+           (handler-case (progn (json-parse-bytes "{}") :parsed)
+             (json-parse-error () :taken-for-a-malformed-document)
+             (type-error () :type-error))
+           :type-error)
+    (check "bytes: JSON-PARSE-BYTES is exported"
+           (nth-value 1 (find-symbol "JSON-PARSE-BYTES" :web-skeleton))
+           :external)))
+
 (defun test-json ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -504,6 +579,7 @@
   (test-json-parse)
   (test-json-parse-errors)
   (test-json-parse-error-is-a-condition-of-its-own)
+  (test-json-parse-bytes-reads-utf-8-and-refuses-the-rest)
   (test-json-serialize)
   (test-json-parsed-strings-are-simple-and-exact)
   (test-json-first-repeated-key)

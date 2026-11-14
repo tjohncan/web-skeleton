@@ -77,13 +77,14 @@
   (:documentation
    "The text given to JSON-PARSE is not JSON, or is JSON past one of the
     parser's bounds: *JSON-MAX-DEPTH*, *JSON-MAX-STRING-LENGTH*, the digits
-    a number may have. MESSAGE says what was wrong and where.
+    a number may have. Or the bytes given to JSON-PARSE-BYTES are not
+    UTF-8. MESSAGE says what was wrong and where.
 
-    The parser signals this for a string it refuses and nothing else, so
-    a caller can catch it by name. That is what tells a body a client got
-    wrong, which is the client's 400, from a fault in the caller's own
-    code, which is a 500 and should stay one: a catch of ERROR around the
-    parse takes both.
+    The parser signals this for the text or the bytes it refuses and
+    nothing else, so a caller can catch it by name. That is what tells a
+    body a client got wrong, which is the client's 400, from a fault in
+    the caller's own code, which is a 500 and should stay one: a catch of
+    ERROR around the parse takes both.
 
     Nothing answers it on the caller's behalf. One that escapes a handler
     is that handler's error like any other, because the text is not
@@ -506,7 +507,8 @@
    each of which serializes back to itself.
 
    Signals JSON-PARSE-ERROR for a string that is not JSON, or is past one
-   of the parser's bounds, and no other condition for any string.
+   of the parser's bounds, and no other condition for any string. A
+   document held as bytes, a request's body, goes to JSON-PARSE-BYTES.
 
    A leading U+FEFF (UTF-8 BOM when decoded via UTF-8) is silently
    skipped per RFC 8259 §8.1. Windows text editors, older .NET
@@ -521,6 +523,30 @@
         (when (< end (length str))
           (json-parse-error "unexpected content at position ~d" end)))
       val)))
+
+(defun json-parse-bytes (bytes)
+  "Parse a JSON document from its bytes: decode them as UTF-8 and hand
+   the text to JSON-PARSE, whose value this returns. A request's body and
+   an upstream's reply are bytes.
+
+   Bytes that are not UTF-8 signal JSON-PARSE-ERROR, as text that is not
+   JSON does, so one catch by name answers a malformed body whichever it
+   was. RFC 8259 §8.1 has a document sent between systems encoded as
+   UTF-8, and the bytes are read as that: no other encoding is guessed
+   at. The decoding is strict. An overlong form, an encoded surrogate and
+   a character cut short at the end are each refused.
+
+   BYTES is a vector of octets, or NIL. NIL is read as no bytes, and
+   refused as the empty string is: it is what HTTP-REQUEST-BODY answers
+   for a request that carried no body, which is the client's doing as a
+   malformed one is. Any other argument, a string for one, is the
+   caller's mistake and a TYPE-ERROR."
+  (json-parse
+   (if (null bytes)
+       ""
+       (handler-case (sb-ext:octets-to-string bytes :external-format :utf-8)
+         (sb-int:character-decoding-error ()
+           (json-parse-error "the bytes are not UTF-8"))))))
 
 (defun json-get (obj key)
   "Look up KEY (string) in OBJ. Returns the value, or NIL if absent.

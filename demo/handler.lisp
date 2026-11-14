@@ -773,9 +773,7 @@
                   (error "not a JWS compact serialization: it needs exactly ~
                           three base64url segments, with no = padding"))
                 (flet ((seg (i)
-                         (json-parse (sb-ext:octets-to-string
-                                      (base64url-decode (nth i parts))
-                                      :external-format :utf-8))))
+                         (json-parse-bytes (base64url-decode (nth i parts)))))
                   (let* ((header (seg 0))
                          (payload (seg 1))
                          (sig (base64url-decode (third parts)))
