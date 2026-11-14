@@ -226,7 +226,7 @@ specific status, not a blanket 400:
 | `503 Service Unavailable` | The worker is at `*max-connections*`, or the process is nearly out of descriptors (see "Descriptors" under "Environment") — carries `Retry-After: 2` |
 | `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed. For a request answered with a streamed fetch, the wait starts once its body has gone; see "Sending a request body as it is produced" |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
-| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
+| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled. What was raised is logged at WARN, through the throttle: see "Logging holds the only shared lock" |
 
 **A `Host` that passes is still the client's.** The 400 holds it to the
 grammar, and the grammar allows characters that matter in a page: a
@@ -1518,6 +1518,26 @@ that parses and dispatches cleanly logs nothing at all. At `:debug` it is
 several acquisitions per request with every worker serialized behind
 them, which is worth knowing before turning `:debug` on under load rather
 than after.
+
+What a client can cause at will is logged through a throttle, so that a
+flood of it is a line and a count rather than a line a request: the
+first of a kind at once, and after it at most one a minute on each
+worker, saying how many were held back. A malformed request, a bad
+WebSocket frame and a refused connection are each a kind.
+
+An error that escapes a handler is logged the same way, a kind to each
+condition type, so a flood of one error leaves the first of another to
+show. A handler that raises on what a client sends is a handler a
+client can make raise as often as it likes. Every such request is still
+answered 500 and counted in the census. The log shows the first of the
+minute, and what the same condition type raises later in it, in another
+place or with another message, is counted and not shown: errors
+signalled with `(error "...")` are all one type. While developing, when
+the same error raised again is the line you are looking for:
+
+```lisp
+(setf *throttle-handler-errors* nil)   ; log every one
+```
 
 Two operational consequences:
 

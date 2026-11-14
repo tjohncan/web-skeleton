@@ -3907,6 +3907,74 @@
         (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
         (ignore-errors (sb-bsd-sockets:socket-close listener))))))
 
+(defun test-handler-errors-are-throttled-by-condition-type ()
+  "LOG-HANDLER-ERROR, which logs what escapes a handler, holds each
+   condition type to the throttle's pace on its own: a flood of one error
+   logs its first and counts the rest, and the first of another type
+   still logs at once. A request handler's and a WebSocket handler's are
+   kinds apart. *THROTTLE-HANDLER-ERRORS* set to NIL logs every one.
+
+   A line that held nothing back carries no count: a kind's second line,
+   an hour after its first, reads as its first did.
+
+   Driven directly, under a table as a worker binds one. What a running
+   server logs for a handler that raises is
+   TEST-HARNESS-A-HANDLER-THAT-RAISES-LOGS-A-LINE-NOT-A-FLOOD-E2E's to
+   show."
+  (format t "~%handler errors: throttled by condition type~%")
+  (let ((log (make-string-output-stream))
+        (plain (make-condition 'simple-error
+                               :format-control "the ~a failed"
+                               :format-arguments '("lookup")))
+        (typed (make-condition 'simple-type-error
+                               :format-control "a ~a was expected"
+                               :format-arguments '("string")
+                               :datum 5 :expected-type 'string)))
+    (flet ((lines-saying (what text)
+             (loop with start = 0
+                   for at = (search what text :start2 start)
+                   while at
+                   collect (subseq text at (position #\Newline text :start at))
+                   do (setf start (1+ at))))
+           (request-error (condition fd)
+             (web-skeleton::log-handler-error
+              :handler-error condition "error fd ~d: ~a" fd condition)))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton:*throttle-handler-errors* t)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (fd 4) (request-error plain fd))
+        (request-error typed 9)
+        (web-skeleton::log-handler-error
+         :ws-handler-error plain "ws handler error fd ~d: ~a" 7 plain)
+        (let ((text (get-output-stream-string log)))
+          (check "by type: four of one error log its first, and no more"
+                 (lines-saying "[WARN] error fd" text)
+                 '("[WARN] error fd 0: the lookup failed"
+                   "[WARN] error fd 9: a string was expected"))
+          (check "by type: a WebSocket handler's are a kind apart, and log"
+                 (lines-saying "ws handler error fd" text)
+                 '("ws handler error fd 7: the lookup failed")))
+        ;; A minute on, as far as the throttle can tell.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (decf (car entry) 61))
+        (request-error plain 4)
+        (request-error typed 10)
+        (let ((text (get-output-stream-string log)))
+          (check "by type: a minute on, the flooded type's line counts its three"
+                 (and (search "error fd 4: the lookup failed (and 3 more like it"
+                              text)
+                      t)
+                 t)
+          (check "by type: and the other's, which held none back, counts nothing"
+                 (lines-saying "[WARN] error fd 10" text)
+                 '("[WARN] error fd 10: a string was expected")))
+        (setf web-skeleton:*throttle-handler-errors* nil)
+        (dotimes (fd 3) (request-error plain (+ 20 fd)))
+        (check "by type: with the setting off, every one logs"
+               (length (lines-saying "[WARN] error fd 2"
+                                     (get-output-stream-string log)))
+               3)))))
+
 (defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
   "MONOTONIC-SECONDS, which every interval is measured on, reads whole
    seconds, never backwards, from a start so high that a timestamp slot
@@ -6136,6 +6204,7 @@
   (test-listen-backlog-reaches-the-listener)
   (test-accept-goes-on-past-a-connection-it-could-not-set-up)
   (test-set-up-failures-and-failed-accepts-are-throttled-apart)
+  (test-handler-errors-are-throttled-by-condition-type)
   (test-monotonic-seconds-reads-high-and-apart-from-the-date)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)

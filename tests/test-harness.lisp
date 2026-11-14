@@ -1430,6 +1430,66 @@
                    finally (return n))
              1))))
 
+(defun test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e ()
+  "Requests whose handler raises are each answered 500, and are logged as
+   a line and a count, not as a line each.
+
+   A handler that raises on what it is sent raises as often as a client
+   sends it, and every log line holds the one lock all workers share. The
+   handler here raises a TYPE-ERROR on one path and a plain error on
+   another. Ten requests to the first log one line, and the first to the
+   second still logs behind them: each condition type is throttled on its
+   own, so a flood of one error does not hide another. With
+   *THROTTLE-HANDLER-ERRORS* off, all twelve log.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a handler that raises logs a line, not a flood~%")
+  (flet ((run (throttle)
+           ;; Ten requests to /typed and two to /plain, with the setting as
+           ;; THROTTLE: their statuses, and how many handler-error lines
+           ;; the worker logged.
+           (let ((saved-stream web-skeleton::*log-stream*)
+                 (saved-setting web-skeleton:*throttle-handler-errors*)
+                 (log (make-string-output-stream))
+                 (statuses nil))
+             (unwind-protect
+                  (progn
+                    (setf web-skeleton::*log-stream* log
+                          web-skeleton:*throttle-handler-errors* throttle)
+                    (with-test-server
+                        (:handler (lambda (req)
+                                    (if (string= (http-request-path req) "/typed")
+                                        (error 'type-error :datum 5
+                                                           :expected-type 'string)
+                                        (error "the lookup failed"))))
+                      (dotimes (i 10)
+                        (push (attempt (values (test-http-request :get "/typed")))
+                              statuses))
+                      (dotimes (i 2)
+                        (push (attempt (values (test-http-request :get "/plain")))
+                              statuses))))
+               (setf web-skeleton::*log-stream* saved-stream
+                     web-skeleton:*throttle-handler-errors* saved-setting))
+             (values statuses
+                     (let ((text (get-output-stream-string log)))
+                       (loop with n = 0 and start = 0
+                             for at = (search "[WARN] error fd" text :start2 start)
+                             while at do (incf n) (setf start (1+ at))
+                             finally (return n)))))))
+    (multiple-value-bind (statuses lines) (run t)
+      (check "control: all twelve requests were answered 500"
+             (list (length statuses) (every (lambda (s) (eql s 500)) statuses))
+             '(12 t))
+      (check "ten of one error and two of another log a line for each error"
+             lines 2))
+    (multiple-value-bind (statuses lines) (run nil)
+      (check "control: and are answered 500 with the throttle off"
+             (list (length statuses) (every (lambda (s) (eql s 500)) statuses))
+             '(12 t))
+      (check "with *throttle-handler-errors* off, all twelve log"
+             lines 12))))
+
 (defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
   "Accept once, read the request head, write PIECES (strings, one byte per
    character) one at a time with PAUSE seconds between them, then hold the
@@ -9722,6 +9782,7 @@
   (test-harness-accept-failure-is-retried-e2e)
   (test-harness-a-clock-step-moves-no-deadline-e2e)
   (test-harness-client-errors-log-once-a-minute-e2e)
+  (test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-address-filter-asked-once-e2e)

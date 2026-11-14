@@ -1868,6 +1868,35 @@
               (type-of decision))))
     (connection-begin-body conn peer-finished)))
 
+(defparameter *throttle-handler-errors* t
+  "Whether the line logged for an error that escapes a handler goes
+   through LOG-THROTTLED: the first of a condition type logged at once,
+   and after it at most one a minute on each worker, carrying a count of
+   the ones held back. NIL logs every one.
+
+   On, because a handler that raises on what a client sends is a handler
+   a client can make raise at will, one line a request, each of them
+   through the one lock every worker logs under. Each such request is
+   still answered 500 and counted in the census whatever this is.
+
+   Off suits development, where the same error raised again ten seconds
+   after a change is the line being looked for.")
+
+(defun log-handler-error (kind condition format-string &rest args)
+  "Log CONDITION, which escaped application code, at WARN.
+
+   Throttled by KIND and the condition's type together, so that a flood of
+   one error leaves the first of another to be logged: a client that can
+   make a handler raise chooses how often, and should not get to choose
+   what else the log shows. By its type and not its text, because the
+   text can be the client's to vary, and a table keyed by it would grow
+   as a client pleased. Errors signalled with a bare format string are all
+   SIMPLE-ERROR, and throttle as one."
+  (if *throttle-handler-errors*
+      (apply #'log-throttled :warn (list kind (type-of condition))
+             format-string args)
+      (apply #'log-warn format-string args)))
+
 (defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection.
    State dispatch is permissive: a stale EPOLLIN for a connection
@@ -1968,8 +1997,9 @@
                       ;; the queue; appending a close frame instead would
                       ;; land it where the peer is still reading payload
                       ;; and be taken as continuation of the partial one.
-                      (log-warn "ws handler error fd ~d: ~a"
-                                (connection-fd conn) e)
+                      (log-handler-error :ws-handler-error e
+                                         "ws handler error fd ~d: ~a"
+                                         (connection-fd conn) e)
                       (close-connection conn epoll-fd)
                       (return-from handle-client-read)))
                 ;; The replies are queued already, by WEBSOCKET-ON-READ, in
@@ -2155,7 +2185,8 @@
                    (connection-fd conn) e)
         (close-connection conn epoll-fd :disconnected)
         (return-from handle-client-read nil))
-      (log-warn "error fd ~d: ~a" (connection-fd conn) e)
+      (log-handler-error :handler-error e
+                         "error fd ~d: ~a" (connection-fd conn) e)
       ;; A body still being received hears :ERROR: its ON-DATA, or the
       ;; body handler, is what raised.
       (notify-body-aborted conn :error)
@@ -2576,7 +2607,8 @@
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
-              (*log-throttle* (make-hash-table :test #'eq))
+              ;; EQUAL, for the kinds that are a list: see LOG-THROTTLED.
+              (*log-throttle* (make-hash-table :test #'equal))
               (*stream-drain-buf*
                 (make-array 4096 :element-type '(unsigned-byte 8)))
               ;; CAR is the second the string was built for. 0 can never

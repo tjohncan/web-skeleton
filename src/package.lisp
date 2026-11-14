@@ -47,6 +47,7 @@
            #:log-error
            #:*log-level*
            #:*log-stream*
+           #:*throttle-handler-errors*
            ;; The clock intervals are measured on
            #:monotonic-seconds
            ;; Algorithms

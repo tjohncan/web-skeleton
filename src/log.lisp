@@ -20,8 +20,9 @@
    At the :INFO default that costs nothing measurable: a request that
    parses and dispatches cleanly logs nothing at all, and neither does a
    WebSocket's upgrade or close. What a client can cause at will, such as
-   a malformed request or a bad frame, goes through LOG-THROTTLED, which
-   logs once a minute per worker. At :DEBUG it is several acquisitions
+   a malformed request, a bad frame, or an error a handler raises on what
+   it was sent, goes through LOG-THROTTLED, which logs once a minute per
+   worker. At :DEBUG it is several acquisitions
    per request, with every worker serialized behind them.
 
    Two consequences worth knowing before building on it. An access log
@@ -147,7 +148,8 @@
 (defun log-throttled (level kind format-string &rest args)
   "Log a line a client can cause at will — a malformed request, a bad
    WebSocket frame. The first of KIND logs at once, and after it at most
-   one a minute per worker, carrying a count of the lines held back.
+   one a minute per worker, carrying a count of the lines held back when
+   there were any.
 
    Every line holds *LOG-LOCK*, the one lock every worker contends for,
    across a format and a flush, and these cost a client one write each. A
@@ -157,7 +159,12 @@
 
    The one throttle the framework's logging has: REPORT-REFUSAL's
    connection-limit line and RUN-EVENT-LOOP's :ON-TICK error report come
-   through here too, each under its own KIND."
+   through here too, each under its own KIND.
+
+   KIND is a keyword, or a list of one and what tells its lines apart, as
+   LOG-HANDLER-ERROR's is of a keyword and a condition's type. A worker's
+   table compares them with EQUAL. What a list holds has to be something
+   there are few of: the table keeps an entry for each kind it has seen."
   (let ((table *log-throttle*))
     (if (null table)
         (apply #'log-msg level format-string args)
@@ -168,8 +175,12 @@
              (setf (gethash kind table) (cons now 0))
              (apply #'log-msg level format-string args))
             ((>= (- now (car entry)) 60)
-             (log-msg level "~? (and ~d more like it in the last ~d seconds)"
-                      format-string args (cdr entry) (- now (car entry)))
+             ;; A line that held nothing back says nothing about it: one
+             ;; error a day would otherwise carry a count of none.
+             (if (plusp (cdr entry))
+                 (log-msg level "~? (and ~d more like it in the last ~d seconds)"
+                          format-string args (cdr entry) (- now (car entry)))
+                 (apply #'log-msg level format-string args))
              (setf (car entry) now
                    (cdr entry) 0))
             (t (incf (cdr entry))))))))

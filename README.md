@@ -180,7 +180,12 @@ tests/
 
 - **Handler abstraction** — `start-server` accepts `:handler` and `:ws-handler`
   functions. The framework handles sockets, HTTP, and WebSocket protocol;
-  the application provides routing and message handling
+  the application provides routing and message handling. A handler that
+  raises costs its request a 500, or its WebSocket the connection, and a
+  log line: the first of a condition type at once, then at most one a
+  minute per worker with a count, so a client that can make a handler raise
+  cannot fill the log with it. `*throttle-handler-errors*` set to `nil`
+  logs every one
 - **Worker thread pool** — one event loop per CPU core, each with its own
   listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
   Kernel distributes accepts across workers. Zero shared state in the hot path
@@ -721,6 +726,7 @@ All configurable via `setf` before calling `start-server`.
 |--------------------------------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `*log-level*`                  | `:info`   | Minimum log level (`:debug`, `:info`, `:warn`, `:error`)                                                                                                                                                                                           |
 | `*log-stream*`                 | `nil`     | Stream for log output (`nil` uses `*standard-output*`)                                                                                                                                                                                             |
+| `*throttle-handler-errors*`    | `t`       | An error that escapes a handler is logged through the throttle: the first of a condition type at once, then at most one a minute per worker with a count. `nil` logs every one, which suits development                                            |
 | `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes). Validated when the server starts                                                                                                                                                                                    |
 | `*max-header-count*`           | `100`     | Max number of headers per request. Validated when the server starts                                                                                                                                                                                |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes). Validated when the server starts                                                                                                                                                                                   |
