@@ -1867,6 +1867,35 @@ the second emits it for the first, turning `[["a",1],["b",2]]` into
 The information is destroyed at parse time, so no heuristic downstream can
 recover it; typing objects is the only fix that works in both directions.
 
+### A document that is not JSON
+
+`json-parse` signals `json-parse-error` for a string that is not JSON, or
+is JSON past one of the parser's bounds (`*json-max-depth*`,
+`*json-max-string-length*`, the digits a number may have), and signals
+nothing else for any string. Caught by name, a malformed body is the
+client's 400 and a fault in the handler stays a 500:
+
+```lisp
+(handler-case (json-parse text)
+  (json-parse-error ()
+    (make-error-response 400 "malformed JSON")))
+```
+
+A catch of `error` around the parse takes it too, since it is one, and
+takes the handler's own bugs with it: a mistake inside the form answers
+every caller "malformed JSON".
+
+The framework does not answer it on a handler's behalf. One that escapes
+a handler is that handler's error like any other, a 500, because the
+text is not always the client's: an upstream's reply read in a `:then`
+goes through the same parser, and so does a JWKS document.
+`json-parse-error-message` is the complaint without the `json:` it is
+printed under.
+
+Decoding is a step before the parser. A request's body is bytes, and
+`sb-ext:octets-to-string` signals a condition of SBCL's own for bytes
+that are not UTF-8, which is not a `json-parse-error`.
+
 ### Query parameter parsing
 
 `get-query-param` reparses the query string on each call.

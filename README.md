@@ -332,7 +332,10 @@ tests/
   `[["a",1],["b",2]]` as `{"a":[1],"b":[2]}`: well-formed and silently wrong.
   To emit an object from data you built yourself, wrap it:
   `(json-serialize (make-json-object '(("a" . 1))))`.
-  Handles all escape sequences including `\uXXXX` and surrogate pairs
+  Handles all escape sequences including `\uXXXX` and surrogate pairs.
+  What is not JSON is refused with `json-parse-error`, a condition of its
+  own, so a handler can answer a malformed body 400 by name and leave its
+  own faults to be 500s
 - **SHA-1** & **SHA-256** — complete implementations per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
 - **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648).
@@ -464,8 +467,9 @@ tests/
   JSON round-trip tests, HTTP parser tests, JWT validation tests.
   Alongside those, generated-input properties over fixed seeds: the request
   parser signals only `http-parse-error` and never leaks another condition
-  type, JSON and base64 round-trip, base64 accepts only the canonical
-  spelling of the bytes it yields, and byte ranges stay inside the resource.
+  type, the JSON parser only `json-parse-error`, JSON and base64
+  round-trip, base64 accepts only the canonical spelling of the bytes it
+  yields, and byte ranges stay inside the resource.
   Plus parity assertions between paths that must agree — the buffered and
   streaming chunked decoders on the same framing, the same generated
   chunked corpus driven through the request path so the inbound and

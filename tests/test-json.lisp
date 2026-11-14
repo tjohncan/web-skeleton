@@ -111,8 +111,11 @@
   (format t "~%JSON Parser Errors~%")
 
   (flet ((signals-error-p (thunk)
+           ;; T for the parser's own condition, which a caller catches by
+           ;; name; any other answers its type, and fails the check.
            (handler-case (progn (funcall thunk) nil)
-             (error () t))))
+             (json-parse-error () t)
+             (error (e) (type-of e)))))
     ;; JSON's digits are ASCII. DIGIT-CHAR-P is true of every Unicode
     ;; digit, so dispatching on it sent U+0663 to the number reader, which
     ;; refused it as a number missing its digit.
@@ -307,7 +310,8 @@
   (check "BOM-only input still errors cleanly"
          (handler-case
              (progn (json-parse (string (code-char #xFEFF))) nil)
-           (error () t))
+           (json-parse-error () t)
+           (error (e) (type-of e)))
          t)
 
   ;; *JSON-MAX-STRING-LENGTH* caps the JSON-PARSE-STRING accumulator
@@ -327,7 +331,8 @@
                       (progn (json-parse
                               (concatenate 'string "\"" over-cap "\""))
                              nil)
-                    (error () t))
+                    (json-parse-error () t)
+                    (error (e) (type-of e)))
                   t))
       (setf web-skeleton:*json-max-string-length* saved))))
 
@@ -386,7 +391,8 @@
                                        "\\n"
                                        (make-string after :initial-element #\a)
                                        "\"")))
-               (error () nil))))
+               (json-parse-error () nil)
+               (error (e) (type-of e)))))
       (check "cap: 31 characters and an escape make the 32 allowed"
              (accepted-p 31 0) 32)
       (check "cap: 32 and an escape are one too many"
@@ -442,6 +448,54 @@
       (check "repeat: as a reader in order finds it, on 500 random key lists"
              disagreements 0))))
 
+(defun test-json-parse-error-is-a-condition-of-its-own ()
+  "What JSON-PARSE refuses, it refuses with JSON-PARSE-ERROR: a condition a
+   caller can name, so that a catch around a parse takes a malformed
+   document and leaves the caller's own faults to surface.
+
+   It is an ERROR, so a catch of ERROR written against a plain one still
+   takes it, and it prints as the plain one did. The parser's bounds
+   signal it as its grammar does. The serializer's refusals do not: what
+   it is handed is the caller's own data, and a fault there is the
+   caller's."
+  (format t "~%JSON: the parser's own condition~%")
+  (flet ((raised (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error (e) e))))
+    (let ((e (raised (lambda () (json-parse "{\"a\" 1}")))))
+      (check "condition: a malformed document signals JSON-PARSE-ERROR"
+             (typep e 'json-parse-error) t)
+      (check "condition: which is an ERROR, as a catch of one expects"
+             (typep e 'error) t)
+      (check "condition: its message says what and where"
+             (and (typep e 'json-parse-error) (json-parse-error-message e))
+             "expected ':' at 5")
+      (check "condition: and it prints under the parser's name"
+             (princ-to-string e) "json: expected ':' at 5"))
+    (check "condition: nesting past *JSON-MAX-DEPTH* signals it"
+           (typep (raised (lambda ()
+                            (json-parse (make-string 300 :initial-element #\[))))
+                  'json-parse-error)
+           t)
+    (check "condition: a number past what a double holds signals it"
+           (typep (raised (lambda () (json-parse "1e9999"))) 'json-parse-error)
+           t)
+    (let ((e (raised (lambda () (json-serialize '(1 . 2))))))
+      (check "condition: the serializer's refusal is an error, and not this one"
+             (list (typep e 'error) (typep e 'json-parse-error))
+             '(t nil)))
+    (check "condition: a caller's own fault passes a catch of it by name"
+           ;; The document is well formed, and LENGTH of its number is not.
+           (handler-case
+               (handler-case (length (json-get (json-parse "{\"n\":1}") "n"))
+                 (json-parse-error () :taken-for-a-malformed-document))
+             (type-error () :left-to-surface))
+           :left-to-surface)
+    (dolist (name '("JSON-PARSE-ERROR" "JSON-PARSE-ERROR-MESSAGE"))
+      (check (format nil "condition: ~a is exported" name)
+             (nth-value 1 (find-symbol name :web-skeleton))
+             :external))))
+
 (defun test-json ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -449,6 +503,7 @@
   (format t "~%=== JSON Tests ===~%")
   (test-json-parse)
   (test-json-parse-errors)
+  (test-json-parse-error-is-a-condition-of-its-own)
   (test-json-serialize)
   (test-json-parsed-strings-are-simple-and-exact)
   (test-json-first-repeated-key)
