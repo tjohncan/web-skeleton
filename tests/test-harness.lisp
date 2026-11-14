@@ -1352,10 +1352,11 @@
    Every log line holds *LOG-LOCK*, the one lock all workers share, across
    a format and a flush, and a malformed request costs a client one write.
    LOG-THROTTLED logs the first of a kind at once and then at most once a
-   minute per worker, with a count of the ones held back. The first half
-   drives it directly; the second sends twenty requests with an unknown
-   method to a real server and counts the lines its worker wrote, and the
-   third twenty plain GETs to a route that upgrades."
+   minute per worker, with a count of the ones held back on a line of its
+   own. The first half drives it directly; the second sends twenty
+   requests with an unknown method to a real server and counts the lines
+   its worker wrote, and the third twenty plain GETs to a route that
+   upgrades."
   (format t "~%Harness: a flood of bad requests logs a line, not a flood~%")
   (let ((out (make-string-output-stream)))
     (let ((web-skeleton::*log-stream* out)
@@ -1374,8 +1375,14 @@
              (search "bad thing 1" text) nil)
       (check "throttle: another kind logs on its own"
              (and (search "other thing" text) t) t)
-      (check "throttle: a minute on, one line carries the count"
-             (and (search "bad thing 5 (and 4 more like it" text) t) t)))
+      ;; Not the number of seconds, which is 61 or, should a second turn
+      ;; between the first line and the last, 62.
+      (check "throttle: a minute on, the kind's next line is behind their count"
+             (let ((count (search "[WARN] test-kind: 4 more lines held back in the last 6"
+                                  text))
+                   (next (search (format nil "[WARN] bad thing 5~%") text)))
+               (and count next (< count next)))
+             t)))
   (let ((out (make-string-output-stream)))
     (let ((web-skeleton::*log-stream* out)
           (web-skeleton::*log-level* :info)
@@ -1489,6 +1496,75 @@
              '(12 t))
       (check "with *throttle-handler-errors* off, all twelve log"
              lines 12))))
+
+(defun test-harness-a-burst-that-ends-has-its-count-logged-e2e ()
+  "A burst of requests whose handler raises, and then none: the count of
+   the lines held back is logged once the minute is up, by the worker's
+   once-a-second pass, with no further line of that kind to bring it out.
+
+   Five requests raise, which logs the first and holds four back. A sixth
+   is answered by aging the worker's throttle table a minute, from the
+   handler, on whose thread that table is bound. Nothing raises after it.
+   The :ON-TICK hook watches for the table to empty, which is the pass
+   forgetting the kind, and the test waits on that and not on a number of
+   seconds.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a burst that ends has its count logged~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (saved-setting web-skeleton:*throttle-handler-errors*)
+        (log (make-string-output-stream))
+        (statuses nil)
+        (aged nil)
+        (forgotten nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log
+                 web-skeleton:*throttle-handler-errors* t)
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (cond ((string= (http-request-path req) "/a-minute-on")
+                         (loop for entry being the hash-values
+                                 of web-skeleton::*log-throttle*
+                               do (decf (car entry) 61))
+                         (setf aged t)
+                         (make-text-response 200 "aged"))
+                        (t (error "the lookup failed"))))
+                :on-tick
+                (lambda (worker-id)
+                  (declare (ignore worker-id))
+                  (when (and aged
+                             (zerop (hash-table-count
+                                     web-skeleton::*log-throttle*)))
+                    (setf forgotten t))))
+             (dotimes (i 5)
+               (push (attempt (values (test-http-request :get "/raise")))
+                     statuses))
+             (push (attempt (values (test-http-request :get "/a-minute-on")))
+                   statuses)
+             ;; The pass comes once a second. Ten are room for it on a
+             ;; machine with other things to do.
+             (loop repeat 200
+                   until forgotten
+                   do (sleep 0.05))))
+      (setf web-skeleton::*log-stream* saved-stream
+            web-skeleton:*throttle-handler-errors* saved-setting))
+    (let* ((text (get-output-stream-string log))
+           (line (search "[WARN] error fd" text))
+           (count (search "[WARN] handler-error (simple-error): 4 more lines held back in the last "
+                          text)))
+      (check "control: five requests were answered 500, and the sixth 200"
+             (reverse statuses) '(500 500 500 500 500 200))
+      (check "the pass ended the kind's minute, with no line to prompt it"
+             forgotten t)
+      (check "one line was logged for the five"
+             (and line (null (search "[WARN] error fd" text :start2 (1+ line))))
+             t)
+      (check "and behind it, the count of the other four"
+             (and line count (< line count))
+             t))))
 
 (defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
   "Accept once, read the request head, write PIECES (strings, one byte per
@@ -9783,6 +9859,7 @@
   (test-harness-a-clock-step-moves-no-deadline-e2e)
   (test-harness-client-errors-log-once-a-minute-e2e)
   (test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e)
+  (test-harness-a-burst-that-ends-has-its-count-logged-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-address-filter-asked-once-e2e)

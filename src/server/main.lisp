@@ -1871,8 +1871,8 @@
 (defparameter *throttle-handler-errors* t
   "Whether the line logged for an error that escapes a handler goes
    through LOG-THROTTLED: the first of a condition type logged at once,
-   and after it at most one a minute on each worker, carrying a count of
-   the ones held back. NIL logs every one.
+   and after it at most one a minute on each worker, with a count of the
+   ones held back. NIL logs every one.
 
    On, because a handler that raises on what a client sends is a handler
    a client can make raise at will, one line a request, each of them
@@ -2511,6 +2511,11 @@
           ;; enough for a server that has run out of descriptors.
           (when accept-retry
             (setf accept-retry (accept-pending listener-socket epoll-fd)))
+          ;; And so does ending a throttled log line's minute, which logs
+          ;; the count of what its kind held back. A burst that has ended
+          ;; sends no further line to end it, and a second is as fine as
+          ;; a count over a minute needs.
+          (flush-log-throttle now)
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)

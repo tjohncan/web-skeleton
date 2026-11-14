@@ -1520,10 +1520,22 @@ them, which is worth knowing before turning `:debug` on under load rather
 than after.
 
 What a client can cause at will is logged through a throttle, so that a
-flood of it is a line and a count rather than a line a request: the
-first of a kind at once, and after it at most one a minute on each
-worker, saying how many were held back. A malformed request, a bad
-WebSocket frame and a refused connection are each a kind.
+flood of it is a line and a count rather than a line a request. The
+first of a kind is logged at once. The ones that follow it within a
+minute are counted and not logged, and when the minute is up their count
+is logged on a line of its own, under the kind's name:
+
+```
+2026-01-01 12:00:00.004 [WARN] parse error fd 12: unrecognized method: BOGUS
+2026-01-01 12:01:00.463 [WARN] parse-error: 37 more lines held back in the last 60 seconds
+```
+
+The next line of that kind is then a first again. Each worker counts its
+own, and logs a count from its once-a-second pass: a burst that has
+ended has its count in the log within a second or so of the minute being
+up, with no further line of its kind needed to bring it out. A count a
+worker still holds when it stops is not logged. A malformed request, a
+bad WebSocket frame and a refused connection are each a kind.
 
 An error that escapes a handler is logged the same way, a kind to each
 condition type, so a flood of one error leaves the first of another to
@@ -1532,8 +1544,10 @@ client can make raise as often as it likes. Every such request is still
 answered 500 and counted in the census. The log shows the first of the
 minute, and what the same condition type raises later in it, in another
 place or with another message, is counted and not shown: errors
-signalled with `(error "...")` are all one type. While developing, when
-the same error raised again is the line you are looking for:
+signalled with `(error "...")` are all one type. The count names the
+type, as `handler-error (simple-error): 4 more lines held back in the
+last 60 seconds`. While developing, when the same error raised again is
+the line you are looking for:
 
 ```lisp
 (setf *throttle-handler-errors* nil)   ; log every one

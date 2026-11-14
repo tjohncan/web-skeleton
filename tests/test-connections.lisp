@@ -3848,9 +3848,9 @@
    The set-up fails as in the test above, by an epoll fd that is not one;
    the accept fails on a listener that is closed. Two set-up failures and
    three failed accepts, then a minute on as far as the throttle can
-   tell, and one more of each. Each kind logs its first at once, and the
-   line a minute on carries one held back for the set-up, two for the
-   accept."
+   tell, and one more of each. Each kind logs its first at once, and a
+   minute on its count is logged ahead of its next line: one held back
+   for the set-up, two for the accept."
   (format t "~%accept: set-up failures and failed accepts are throttled apart~%")
   (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
          (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
@@ -3873,9 +3873,16 @@
                    while at
                    collect (subseq text at (position #\Newline text :start at))
                    do (setf start (1+ at))))
-           (held-back (line)
-             (let ((at (and line (search "(and " line))))
-               (and at (parse-integer line :start (+ at 5) :junk-allowed t)))))
+           (held-back (kind text)
+             ;; The count in each line that gives KIND's, as
+             ;; "accept-failed: 2 more lines held back in the last ...".
+             (let ((label (format nil "] ~a: " kind)))
+               (loop with start = 0
+                     for at = (search label text :start2 start)
+                     while at
+                     collect (parse-integer text :start (+ at (length label))
+                                                 :junk-allowed t)
+                     do (setf start (1+ at))))))
       (unwind-protect
            (progn
              (queue-a-client)
@@ -3898,12 +3905,14 @@
              (web-skeleton::accept-pending listener -1)
              (web-skeleton::accept-pending closed -1)
              (let ((text (get-output-stream-string log)))
-               (check "throttled apart: a minute on, the set-up line counts its one"
-                      (mapcar #'held-back (lines-saying "could not be set up" text))
-                      '(1))
-               (check "throttled apart: and the accept line its two"
-                      (mapcar #'held-back (lines-saying "socket-accept failed" text))
-                      '(2))))
+               (check "throttled apart: a minute on, the set-up's count is one"
+                      (held-back "accept-setup-failed" text) '(1))
+               (check "throttled apart: and the accept's is two"
+                      (held-back "accept-failed" text) '(2))
+               (check "throttled apart: each kind's next line logs behind it"
+                      (list (length (lines-saying "could not be set up" text))
+                            (length (lines-saying "socket-accept failed" text)))
+                      '(1 1))))
         (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
         (ignore-errors (sb-bsd-sockets:socket-close listener))))))
 
@@ -3914,8 +3923,9 @@
    still logs at once. A request handler's and a WebSocket handler's are
    kinds apart. *THROTTLE-HANDLER-ERRORS* set to NIL logs every one.
 
-   A line that held nothing back carries no count: a kind's second line,
-   an hour after its first, reads as its first did.
+   A minute on, the flooded type's count is logged under its name, and a
+   type that held nothing back has none: its second line, a minute after
+   its first, comes with nothing ahead of it.
 
    Driven directly, under a table as a worker binds one. What a running
    server logs for a handler that raises is
@@ -3960,20 +3970,91 @@
         (request-error plain 4)
         (request-error typed 10)
         (let ((text (get-output-stream-string log)))
-          (check "by type: a minute on, the flooded type's line counts its three"
-                 (and (search "error fd 4: the lookup failed (and 3 more like it"
-                              text)
-                      t)
-                 t)
-          (check "by type: and the other's, which held none back, counts nothing"
-                 (lines-saying "[WARN] error fd 10" text)
-                 '("[WARN] error fd 10: a string was expected")))
+          (check "by type: a minute on, the flooded type's count is its three"
+                 (mapcar (lambda (line)
+                           (subseq line 0 (search " in the last" line)))
+                         (lines-saying "handler-error (" text))
+                 '("handler-error (simple-error): 3 more lines held back"))
+          (check "by type: the other, which held none back, has no count"
+                 (lines-saying "simple-type-error" text) nil)
+          (check "by type: and both log their next line in full"
+                 (lines-saying "[WARN] error fd" text)
+                 '("[WARN] error fd 4: the lookup failed"
+                   "[WARN] error fd 10: a string was expected")))
         (setf web-skeleton:*throttle-handler-errors* nil)
         (dotimes (fd 3) (request-error plain (+ 20 fd)))
         (check "by type: with the setting off, every one logs"
                (length (lines-saying "[WARN] error fd 2"
                                      (get-output-stream-string log)))
                3)))))
+
+(defun test-flush-log-throttle-logs-a-count-and-forgets-the-kind ()
+  "FLUSH-LOG-THROTTLE, which a worker calls once a second, ends the minute
+   of each kind whose line was logged a minute before: what the kind held
+   back is logged as a count under its name, at the level its lines log
+   at, and the kind is forgotten, so that its next line logs as a first.
+
+   That is what reports a burst that has ended. With the count left to
+   the kind's next line, five lines and then silence are one line in the
+   log for as long as the silence lasts.
+
+   A kind inside its minute is left alone. One that held nothing back is
+   forgotten with nothing said, and so is one whose lines are below
+   *LOG-LEVEL*. Outside a worker, with no table, there is nothing to do.
+
+   Driven directly, under a table as a worker binds one, with each kind's
+   time set by hand and the pass's handed in. That a running worker makes
+   the call is TEST-HARNESS-A-BURST-THAT-ENDS-HAS-ITS-COUNT-LOGGED-E2E's
+   to show."
+  (format t "~%log throttle: the worker's pass ends a kind's minute~%")
+  (let ((log (make-string-output-stream)))
+    (flet ((logged ()
+             ;; The lines logged since the last call, from the level on.
+             (let ((text (get-output-stream-string log)))
+               (loop with start = 0
+                     for end = (position #\Newline text :start start)
+                     while end
+                     collect (subseq text (position #\[ text :start start) end)
+                     do (setf start (1+ end))))))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton::*log-level* :info)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (i 5)
+          (web-skeleton::log-throttled :warn :burst "burst ~d" i))
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :error (list :raised 'type-error)
+                                       "raised ~d" i))
+        (dotimes (i 2)
+          (web-skeleton::log-throttled :warn :pair "pair ~d" i))
+        (web-skeleton::log-throttled :warn :once "once")
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :debug :unheard "unheard ~d" i))
+        (check "pass: each kind's first line is logged, and no other"
+               (logged)
+               '("[WARN] burst 0" "[ERROR] raised 0" "[WARN] pair 0"
+                 "[WARN] once"))
+        ;; Every kind's line logged at second 1000, as far as the table says.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 1000))
+        (web-skeleton::flush-log-throttle 1059)
+        (check "pass: inside the minute nothing is said, and nothing forgotten"
+               (list (logged) (hash-table-count web-skeleton::*log-throttle*))
+               '(nil 5))
+        (web-skeleton::flush-log-throttle 1060)
+        (check "pass: at the minute, each count under its kind's name and level"
+               (sort (logged) #'string<)
+               '("[ERROR] raised (type-error): 2 more lines held back in the last 60 seconds"
+                 "[WARN] burst: 4 more lines held back in the last 60 seconds"
+                 "[WARN] pair: 1 more line held back in the last 60 seconds"))
+        (check "pass: and every kind forgotten, those with nothing to say too"
+               (hash-table-count web-skeleton::*log-throttle*) 0)
+        (web-skeleton::log-throttled :warn :burst "burst ~d" 5)
+        (check "pass: the kind's next line logs as a first, nothing ahead of it"
+               (logged) '("[WARN] burst 5"))
+        (let ((web-skeleton::*log-throttle* nil))
+          (check "pass: outside a worker there is no table, and nothing to do"
+                 (list (web-skeleton::flush-log-throttle 2000) (logged))
+                 '(nil nil)))))))
 
 (defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
   "MONOTONIC-SECONDS, which every interval is measured on, reads whole
@@ -6205,6 +6286,7 @@
   (test-accept-goes-on-past-a-connection-it-could-not-set-up)
   (test-set-up-failures-and-failed-accepts-are-throttled-apart)
   (test-handler-errors-are-throttled-by-condition-type)
+  (test-flush-log-throttle-logs-a-count-and-forgets-the-kind)
   (test-monotonic-seconds-reads-high-and-apart-from-the-date)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
