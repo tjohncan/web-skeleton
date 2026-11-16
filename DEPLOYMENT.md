@@ -2640,6 +2640,28 @@ Outbound TLS is the optional `web-skeleton-tls` system, which loads
 libssl, and it needs a CA bundle to verify against: see
 "TLS trust anchors" above.
 
+### CPUs and workers
+
+Unless `:workers` says otherwise, `start-server` starts a worker for each
+CPU the process can use, which is not always each core the host has. It
+is the least of what limits the process:
+
+- **A CPU quota**, a container's `--cpus` or a systemd unit's
+  `CPUQuota=`. That is `cpu.max` in the process's own cgroup, and in each
+  cgroup above it, since a limit on a slice binds what runs inside it.
+  It is rounded up, so half a core is one worker. cgroup v1's
+  `cpu.cfs_quota_us` and `cpu.cfs_period_us` are read the same way.
+- **The CPUs it may run on**, a container's `--cpuset-cpus` or any other
+  affinity mask.
+- **The host's cores**, when nothing narrows them.
+
+So a unit with `CPUQuota=50%` on a sixteen-core host starts one worker,
+and one with `CPUQuota=350%` four. The cgroup hierarchy is read where
+distributions mount it, `/sys/fs/cgroup`; mounted elsewhere, a quota is
+not seen and the count is the CPUs the process may run on. It is read
+once, as the server starts: a limit changed under a running server takes
+effect in the kernel at once, and in the worker count at the next start.
+
 ### Descriptors
 
 Every connection is a descriptor, and so is each fetch's socket and DNS

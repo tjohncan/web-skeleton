@@ -807,7 +807,9 @@ On Linux's default (`net.ipv6.bindv6only = 0`) the IPv6 wildcard serves
 IPv4 peers too, as v4-mapped addresses logged as `0:0:0:0:0:ffff:a.b.c.d`,
 so it is the one listener a dual-stack host needs.
 IPv6 loopback is `:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)`.
-The number of workers defaults to the number of CPU cores.
+The number of workers defaults to the CPUs the process can use: the
+host's cores, or fewer under a container's or a systemd unit's CPU limit
+(DEPLOYMENT.md, "CPUs and workers").
 Without a handler, the server returns 501 for all requests.
 
 ## Async HTTP fetch

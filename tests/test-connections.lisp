@@ -6380,6 +6380,124 @@
     (check "cpu-count: answers a positive integer"
            (and (integerp n) (plusp n)) t)))
 
+(defun test-cpu-count-reads-a-quota-where-the-process-is ()
+  "A CPU quota is read in the cgroup the process is in and in each one
+   above it, and the tightest of them is the answer.
+
+   A service systemd starts on a host is in a cgroup of its own, and a
+   CPUQuota= on the unit is that cgroup's cpu.max. The root of the
+   hierarchy has none there, so a quota read at the root alone is missed,
+   and the service starts a worker for every core of the host to share
+   what the quota leaves it. A container sees its own cgroup as the root,
+   which is the one place the root is the right place to read.
+
+   The reading is driven on a tree of files made for the test, laid out
+   as the kernel lays out a hierarchy. Whether this process is itself in
+   a cgroup with a quota is the host's, and CI's is not."
+  (format t "~%cpu-count: a quota is read where the process is~%")
+  ;; /proc/self/cgroup, a line a hierarchy.
+  (flet ((placed (&rest lines)
+           (multiple-value-list (web-skeleton::parse-proc-cgroup lines))))
+    (check "proc cgroup: a service on a v2 host"
+           (placed "0::/system.slice/web.service")
+           '("/system.slice/web.service" nil))
+    (check "proc cgroup: a container, which sees its own cgroup as the root"
+           (placed "0::/")
+           '("/" nil))
+    (check "proc cgroup: v1, the hierarchy with the cpu controller among its own"
+           (placed "12:pids:/docker/abc" "5:cpu,cpuacct:/docker/abc"
+                   "3:cpuset:/" "1:name=systemd:/docker/abc")
+           '(nil "/docker/abc"))
+    (check "proc cgroup: cpuacct and cpuset are not the cpu controller"
+           (placed "5:cpuacct:/a" "3:cpuset:/b" "2:cpuset,cpuacct:/c")
+           '(nil nil))
+    (check "proc cgroup: cpu named last, or alone"
+           (placed "5:cpuacct,cpu:/a")
+           '(nil "/a"))
+    (check "proc cgroup: a hybrid host has both"
+           (placed "4:cpu,cpuacct:/" "0::/user.slice/session-1.scope")
+           '("/user.slice/session-1.scope" "/"))
+    (check "proc cgroup: the path is the rest of the line, a colon in it too"
+           (placed "0::/system.slice/a:b.service")
+           '("/system.slice/a:b.service" nil))
+    (check "proc cgroup: nothing to read, or nothing in the shape, places it nowhere"
+           (list (placed) (placed "" "no colons here" "0:"))
+           '((nil nil) (nil nil))))
+  ;; The cgroups a limit can come from, the process's own first.
+  (check "ancestry: a cgroup, each one above it, and the root"
+         (web-skeleton::cgroup-ancestry "/system.slice/web.service")
+         '("system.slice/web.service/" "system.slice/" ""))
+  (check "ancestry: the root, and no path at all, are the root alone"
+         (list (web-skeleton::cgroup-ancestry "/")
+               (web-skeleton::cgroup-ancestry nil))
+         '(("") ("")))
+  (check "ancestry: a path that climbs out of what is mounted is the root alone"
+         (web-skeleton::cgroup-ancestry "/../../system.slice/web.service")
+         '(""))
+  ;; The reading, on a tree laid out as the kernel lays one out.
+  (let ((root (scratch-path "ws-cgroup" "/")))
+    (flet ((put (file line)
+             ;; By the system's spelling of the name, as it is read: one
+             ;; of these has a backslash in it.
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string root file))))
+               (ensure-directories-exist path)
+               (with-open-file (out path :direction :output
+                                         :if-exists :supersede)
+                 (write-line line out)))))
+      (unwind-protect
+           (progn
+             ;; v2: half a core on the unit, nothing above it limited.
+             (put "v2/system.slice/web.service/cpu.max" "50000 100000")
+             (put "v2/system.slice/cpu.max" "max 100000")
+             (check "v2: a unit's own quota is read, though the root has none"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/system.slice/web.service")
+                    1)
+             (check "v2: read at the root alone, as a container reads it, there is none"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/") "/")
+                    nil)
+             ;; A slice of two cores holding a unit allowed eight.
+             (put "v2/tight.slice/wide.service/cpu.max" "800000 100000")
+             (put "v2/tight.slice/cpu.max" "200000 100000")
+             (check "v2: a tighter limit above the process binds it"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/tight.slice/wide.service")
+                    2)
+             ;; A container whose /proc/self/cgroup names the host's path:
+             ;; nothing is mounted under that name, and the root is its own.
+             (put "v2b/cpu.max" "150000 100000")
+             (check "v2: a path with nothing mounted under it still reads the root"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2b/") "/docker/abc")
+                    2)
+             ;; systemd writes a dash in a unit's name as \x2d.
+             (put "v2/system.slice/system-a\\x2db.slice/cpu.max" "300000 100000")
+             (check "v2: a directory named as systemd escapes one is read by that name"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/system.slice/system-a\\x2db.slice")
+                    3)
+             ;; v1: the pair of files, in the cpu controller's hierarchy.
+             (put "v1/system.slice/web.service/cpu.cfs_quota_us" "50000")
+             (put "v1/system.slice/web.service/cpu.cfs_period_us" "100000")
+             (put "v1/system.slice/cpu.cfs_quota_us" "-1")
+             (put "v1/system.slice/cpu.cfs_period_us" "100000")
+             (check "v1: a unit's own quota is read the same way"
+                    (list (web-skeleton::cgroup-v1-workers
+                           (concatenate 'string root "v1/")
+                           "/system.slice/web.service")
+                          (web-skeleton::cgroup-v1-workers
+                           (concatenate 'string root "v1/") "/"))
+                    '(1 nil)))
+        (ignore-errors
+         (sb-ext:run-program "/bin/rm" (list "-rf" root) :wait t
+                                                         :output nil
+                                                         :error nil))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -6428,6 +6546,7 @@
   (test-stream-close-arms-the-write-path)
   (test-stream-close-refuses-a-foreign-connection)
   (test-cpu-count-parsers)
+  (test-cpu-count-reads-a-quota-where-the-process-is)
   (test-ws-oversized-frame-close-code)
   (test-ws-fragments-are-held-as-their-bytes)
   (test-small-writes-are-queued-joined)

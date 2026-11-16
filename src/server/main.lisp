@@ -2773,13 +2773,23 @@
 ;;;
 ;;; The answer nearest the truth is asked for first:
 ;;;
-;;;   cgroup v2   /sys/fs/cgroup/cpu.max          "QUOTA PERIOD" or "max PERIOD"
+;;;   cgroup v2   cpu.max                            "QUOTA PERIOD" or "max PERIOD"
 ;;;   cgroup v1   cpu.cfs_quota_us / cfs_period_us   quota -1 means unlimited
 ;;;   affinity    sched_getaffinity(2)               cpuset, and nothing else
 ;;;   topology    /sys/devices/system/cpu/online     the host's cores
 ;;;
 ;;; Each source answers NIL when it has nothing to say — no file, an unlimited
 ;;; quota, a shape it cannot parse — and the smallest of what remains wins.
+;;;
+;;; A quota is read where the process is, and in every cgroup above that,
+;;; since a limit on a parent binds its children. /proc/self/cgroup says
+;;; where. A container sees its own cgroup as the root of the hierarchy, so
+;;; there the root is all there is to read. A service systemd starts on a
+;;; host is not at the root: it is in /system.slice/NAME.service, where a
+;;; CPUQuota= puts its cpu.max, and the root has none. Read at the root
+;;; alone, that limit is missed, and the half a core in the first paragraph
+;;; is shared between a worker for every core of the host by the other
+;;; route.
 ;;;
 ;;; The smallest, not the first, because the sources answer different
 ;;; questions. A quota says how much CPU time may be consumed; an affinity
@@ -2802,12 +2812,25 @@
 ;;; reach.
 ;;; ---------------------------------------------------------------------------
 
+(defun %read-lines (path)
+  "The lines of PATH, or NIL if it cannot be read.
+
+   PATH is the system's spelling of the name and is parsed as that. A
+   cgroup's holds whatever its unit was called, and systemd writes a dash
+   in a unit's name as \\x2d: read as a Lisp namestring, that backslash
+   would be an escape and a * or a [ a wildcard."
+  (handler-case
+      (with-open-file (s (sb-ext:parse-native-namestring path)
+                         :if-does-not-exist nil)
+        (when s
+          (loop for line = (read-line s nil nil)
+                while line
+                collect line)))
+    (error () nil)))
+
 (defun %read-first-line (path)
   "First line of PATH, or NIL if it cannot be read."
-  (handler-case
-      (with-open-file (s path :if-does-not-exist nil)
-        (when s (read-line s nil nil)))
-    (error () nil)))
+  (first (%read-lines path)))
 
 (defun quota-to-workers (quota period)
   "Workers implied by a CPU quota of QUOTA per PERIOD, or NIL if either is
@@ -2919,20 +2942,91 @@
                                counts)))
     (when usable (reduce #'min usable))))
 
+(defun parse-proc-cgroup (lines)
+  "Where /proc/self/cgroup's LINES put this process, as (VALUES UNIFIED
+   CPU): its path in the cgroup v2 hierarchy, and its path in the v1
+   hierarchy that carries the cpu controller. Each is NIL when no line
+   gives it.
+
+   A line is ID:CONTROLLERS:PATH. The v2 hierarchy's is 0 with no
+   controllers. A v1 line names its controllers with commas between them,
+   and cpu has to be one of them whole: cpuacct and cpuset are other
+   controllers. The path is the rest of the line, colons and all."
+  (let ((unified nil)
+        (cpu nil))
+    (dolist (line lines (values unified cpu))
+      (let* ((first (position #\: line))
+             (second (and first (position #\: line :start (1+ first)))))
+        (when second
+          (let ((path (string-right-trim '(#\Return) (subseq line (1+ second)))))
+            (cond
+              ((and (string= line "0" :end1 first) (= second (1+ first)))
+               (setf unified path))
+              ((loop with start = (1+ first)
+                     for comma = (position #\, line :start start :end second)
+                     thereis (string= line "cpu" :start1 start
+                                                 :end1 (or comma second))
+                     while comma
+                     do (setf start (1+ comma)))
+               (setf cpu path)))))))))
+
+(defun cgroup-ancestry (path)
+  "The cgroups that limit one at PATH, itself first and the root of its
+   hierarchy last: each as a directory under that root, ending in a slash,
+   the root itself being the empty string. \"/a/b\" is (\"a/b/\" \"a/\" \"\").
+
+   NIL and \"/\" are the root alone. So is a path that climbs with \"..\",
+   which is how /proc/self/cgroup writes a cgroup outside the part of the
+   hierarchy this process can see: nothing under the root answers for it."
+  (let ((names (loop with start = 0
+                     for slash = (position #\/ path :start start)
+                     for end = (or slash (length path))
+                     when (< start end)
+                       collect (subseq path start end)
+                     while slash
+                     do (setf start (1+ slash)))))
+    (when (member ".." names :test #'string=)
+      (setf names nil))
+    (loop for depth from (length names) downto 0
+          collect (format nil "~{~a/~}" (subseq names 0 depth)))))
+
+(defun cgroup-v2-workers (root path)
+  "The fewest workers a cpu.max allows the cgroup at PATH, read there and
+   in each cgroup above it up to ROOT, where the v2 hierarchy is mounted.
+   NIL when none of them sets a limit."
+  (apply #'fewest-cpus
+         (mapcar (lambda (directory)
+                   (parse-cpu-max
+                    (%read-first-line
+                     (concatenate 'string root directory "cpu.max"))))
+                 (cgroup-ancestry path))))
+
+(defun cgroup-v1-workers (root path)
+  "CGROUP-V2-WORKERS for the v1 hierarchy that carries the cpu controller,
+   mounted at ROOT, where a limit is the pair of files PARSE-CFS-QUOTA
+   reads."
+  (flet ((line (directory file)
+           (%read-first-line (concatenate 'string root directory file))))
+    (apply #'fewest-cpus
+           (mapcar (lambda (directory)
+                     (parse-cfs-quota (line directory "cpu.cfs_quota_us")
+                                      (line directory "cpu.cfs_period_us")))
+                   (cgroup-ancestry path)))))
+
 (defun cpu-count ()
   "Workers this process can usefully run. See the section banner for the
-   sources and why the least of them wins."
-  (or (fewest-cpus
-       (parse-cpu-max (%read-first-line "/sys/fs/cgroup/cpu.max"))
-       (parse-cfs-quota
-        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
-       (affinity-cpu-count)
-       (parse-cpu-list (%read-first-line "/sys/devices/system/cpu/online")))
-      (progn
-        (log-warn "cpu-count: no CPU information available, ~
-                   defaulting to 1 worker")
-        1)))
+   sources, where a quota is read, and why the least of them wins."
+  (multiple-value-bind (unified cpu)
+      (parse-proc-cgroup (%read-lines "/proc/self/cgroup"))
+    (or (fewest-cpus
+         (cgroup-v2-workers "/sys/fs/cgroup/" unified)
+         (cgroup-v1-workers "/sys/fs/cgroup/cpu/" cpu)
+         (affinity-cpu-count)
+         (parse-cpu-list (%read-first-line "/sys/devices/system/cpu/online")))
+        (progn
+          (log-warn "cpu-count: no CPU information available, ~
+                     defaulting to 1 worker")
+          1))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
