@@ -2026,11 +2026,15 @@
                    ;; Mark as closing so on-write knows to disconnect
                    (setf (connection-state conn) :closing))
                   ;; A reply met *MAX-WRITE-BACKLOG*; WEBSOCKET-ON-READ's
-                  ;; QUEUE-REPLY has why the connection goes.
+                  ;; QUEUE-REPLY has why the connection goes. Logged
+                  ;; through the throttle, as the lines for a bad frame
+                  ;; are: a client that sends and never reads its replies
+                  ;; has this one for each connection it opens.
                   ((eq response :backlog-full)
-                   (log-warn "ws backlog full fd ~d (~d bytes pending) — closing"
-                             (connection-fd conn)
-                             (connection-write-pending conn))
+                   (log-throttled
+                    :warn :ws-backlog-full
+                    "ws backlog full fd ~d (~d bytes pending) — closing"
+                    (connection-fd conn) (connection-write-pending conn))
                    (close-connection conn epoll-fd)
                    (return-from handle-client-read))
                   ;; The ws-handler closed the connection outright, as
@@ -2042,6 +2046,14 @@
                   ;; consuming one shifts the rest down — so a partial
                   ;; frame exceeds our limit: close with 1009 to prevent a
                   ;; spin loop.
+                  ;;
+                  ;; A backstop, which no client reaches while the two
+                  ;; bounds agree. CONNECTION-READ-CAP is the payload cap
+                  ;; and the largest header, and TRY-PARSE-WS-FRAME refuses
+                  ;; a frame declaring more than the payload cap at its
+                  ;; header, so a buffer that is full holds a whole first
+                  ;; frame. The line is the server's own inconsistency if
+                  ;; it is ever logged, and is not throttled.
                   (t
                    (when (>= (connection-read-pos conn)
                              (length (connection-read-buf conn)))

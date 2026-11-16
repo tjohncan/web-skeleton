@@ -5570,6 +5570,126 @@
                  (ignore-errors (sb-bsd-sockets:socket-close sock))))))
       (setf web-skeleton:*linger-timeout* saved))))
 
+(defun test-ws-backlog-full-is-logged-through-the-throttle ()
+  "A WebSocket closed because a reply met *MAX-WRITE-BACKLOG* is logged
+   through LOG-THROTTLED, under a kind of its own, as the lines for a bad
+   frame are. A client that sends and never reads its replies can have the
+   line once for each connection it opens, and every line holds *LOG-LOCK*
+   across a format and a flush.
+
+   Three connections over loopback pairs, each with its queue at the bound
+   and a message whose handler returns a reply: one line, and two counted.
+   Driven directly, under a table as a worker binds one."
+  (format t "~%ws: a reply refused at the backlog is logged through the throttle~%")
+  (let ((log (make-string-output-stream))
+        (closed 0))
+    (let ((web-skeleton:*log-stream* log)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* (make-hash-table :test #'equal))
+          (web-skeleton:*max-write-backlog* 64))
+      (dotimes (i 3)
+        (multiple-value-bind (server client) (%loopback-pair)
+          (let ((epfd (web-skeleton::epoll-create)))
+            (unwind-protect
+                 (let* ((fd (web-skeleton::socket-fd server))
+                        (web-skeleton::*connections* (make-hash-table :test #'eql))
+                        (web-skeleton::*epoll-fd* epfd)
+                        (conn (web-skeleton::make-connection
+                               :fd fd :socket server :state :websocket
+                               :last-active (web-skeleton::monotonic-seconds)))
+                        (frame (%ws-client-frame 1 "hello")))
+                   (web-skeleton::set-nonblocking fd)
+                   (web-skeleton::register-connection conn)
+                   (web-skeleton::epoll-add epfd fd
+                                            (logior web-skeleton::+epollin+
+                                                    web-skeleton::+epollet+))
+                   (web-skeleton::connection-append-write
+                    conn (make-array 64 :element-type '(unsigned-byte 8)
+                                        :initial-element 65))
+                   (let ((out (sb-bsd-sockets:socket-make-stream
+                               client :output t
+                                      :element-type '(unsigned-byte 8))))
+                     (write-sequence frame out)
+                     (finish-output out))
+                   (%await-arrival fd :bytes (length frame))
+                   (web-skeleton::handle-client-read
+                    conn epfd nil
+                    (lambda (c f)
+                      (declare (ignore c f))
+                      (web-skeleton:build-ws-text "reply")))
+                   (when (minusp (web-skeleton::connection-fd conn))
+                     (incf closed)))
+              (ignore-errors (web-skeleton::%close epfd))
+              (ignore-errors (sb-bsd-sockets:socket-close server))
+              (ignore-errors (sb-bsd-sockets:socket-close client))))))
+      (let* ((text (get-output-stream-string log))
+             (lines (loop with start = 0
+                          for at = (search "ws backlog full" text :start2 start)
+                          while at
+                          count t
+                          do (setf start (1+ at))))
+             (entry (gethash :ws-backlog-full web-skeleton::*log-throttle*)))
+        (check "ws backlog: control, each of the three was closed for it"
+               closed 3)
+        (check "ws backlog: one line for the three, and the other two counted"
+               (list lines (and entry (second entry)))
+               '(1 2))))))
+
+(defun test-ws-largest-frame-fills-the-read-buffer-and-is-delivered ()
+  "A frame of exactly *MAX-WS-PAYLOAD-SIZE*, under the longest header a
+   client can send, fills the read buffer to its cap and is delivered.
+
+   The cap is the payload cap and that header, 14 bytes, so the largest
+   frame TRY-PARSE-WS-FRAME accepts is the most the buffer holds, and a
+   buffer that is full holds a whole frame. HANDLE-CLIENT-READ closes a
+   WebSocket whose buffer is full with no frame in it, as a backstop
+   against the two bounds parting: this is the frame that would reach it
+   first if they did."
+  (format t "~%ws: the largest frame fills the read buffer and is delivered~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (payloads nil))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*max-ws-payload-size* 65536)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (web-skeleton::monotonic-seconds)))
+                  ;; A binary frame of 65536 bytes: FIN and the opcode, the
+                  ;; mask bit with 127 for a 64-bit length, the length, a
+                  ;; mask of zeros, which leaves the payload as it is.
+                  (frame (make-array (+ 14 65536) :element-type '(unsigned-byte 8)
+                                                  :initial-element 7)))
+             (replace frame #(#x82 #xFF 0 0 0 0 0 1 0 0 0 0 0 0))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (let ((out (sb-bsd-sockets:socket-make-stream
+                         client :output t :element-type '(unsigned-byte 8))))
+               (write-sequence frame out)
+               (finish-output out))
+             (check "largest frame: control, the frame is as long as the read cap"
+                    (list (length frame) (web-skeleton::connection-read-cap conn))
+                    '(65550 65550))
+             (%await-arrival fd :bytes (length frame))
+             (web-skeleton::handle-client-read
+              conn epfd nil
+              (lambda (c f)
+                (declare (ignore c))
+                (push (length (web-skeleton::ws-frame-payload f)) payloads)
+                nil))
+             (check "largest frame: delivered whole, and the connection kept"
+                    (list payloads
+                          (web-skeleton::connection-state conn)
+                          (web-skeleton::connection-read-pos conn))
+                    '((65536) :websocket 0)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
+
 (defun test-ws-message-deadline-e2e ()
   "A peer that begins a fragmented message and never finishes it is closed
    with 1008 once *WS-MESSAGE-TIMEOUT* has passed, though the connection is
@@ -6534,6 +6654,8 @@
   (test-ws-close)
   (test-ws-close-from-a-handler-e2e)
   (test-ws-server-close-lingers-for-a-client-still-sending-e2e)
+  (test-ws-backlog-full-is-logged-through-the-throttle)
+  (test-ws-largest-frame-fills-the-read-buffer-and-is-delivered)
   (test-ws-message-deadline-e2e)
   (test-ws-upgrade-shapes-the-101)
   (test-ws-upgrade-subprotocol-e2e)
