@@ -3050,6 +3050,95 @@
           1))))
 
 ;;; ---------------------------------------------------------------------------
+;;; The port claim
+;;;
+;;; Every listener sets SO_REUSEPORT, which is what lets each worker hold
+;;; the port. It also lets a second server bind it: that bind does not
+;;; fail, the kernel divides arriving connections between the two servers,
+;;; each answering its share from its own state, and nothing in either log
+;;; says so. So a server claims its port number before it binds, and a
+;;; second one finds the claim held.
+;;;
+;;; The claim is a Unix socket bound in the abstract namespace, under a
+;;; name made from the port number. Such a name is not a file: nothing is
+;;; left behind to clean up, and the kernel frees it when the socket is
+;;; closed or its process ends, however it ends. Binding a name that is
+;;; held fails at once with EADDRINUSE: looking and taking are one step,
+;;; with no gap between them for a second server to start in. Connecting
+;;; to the port, to see whether anything answers there, has that gap. The
+;;; abstract namespace belongs to a network namespace, as ports do: two
+;;; containers that cannot share a port do not see each other's claims.
+;;;
+;;; The name holds the port and not the address. A listener on one address
+;;; and a wildcard listener on the same port are both bound without error
+;;; too, and the kernel gives each connection to the more specific of
+;;; them, so those two servers also take part of each other's traffic
+;;; unannounced. The cost is that two servers on two addresses of one
+;;; host, which share nothing, cannot use one port number unless the
+;;; second says :SHARE-PORT.
+;;;
+;;; Only a server that takes the claim is refused by it. Another program
+;;; that sets SO_REUSEPORT, under the same user, binds the port all the
+;;; same.
+;;; ---------------------------------------------------------------------------
+
+(defun port-claim-name (port)
+  "The abstract socket name that is the claim on PORT. /proc/net/unix and
+   `ss -xa` list it, after an @, for as long as a server holds it."
+  (format nil "web-skeleton/port/~d" port))
+
+(defun claim-port (port)
+  "Take the claim on PORT: see the banner above. Answers the socket that
+   holds it, for RELEASE-PORT-CLAIM to close; :HELD when another server
+   holds it, in this process or another; or NIL when no claim could be
+   attempted, which is logged and leaves the port without one.
+
+   A claim that cannot be attempted does not stop a server. The socket
+   fails where the process is allowed no Unix sockets, under a systemd
+   unit's RestrictAddressFamilies= without AF_UNIX say, or has no
+   descriptor to spare, and neither is a second server on the port.
+
+   Always a stream socket: the kernel keeps abstract names by socket type,
+   so a claim of another type would not meet this one."
+  (let ((socket nil))
+    (handler-case
+        (progn
+          (setf socket (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                      :type :stream))
+          (sb-bsd-sockets:socket-bind socket (port-claim-name port))
+          socket)
+      (sb-bsd-sockets:address-in-use-error ()
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        :held)
+      (error (e)
+        (when socket
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))
+        (log-warn "port ~d: its claim could not be attempted (~a), so a ~
+                   second server on it would not be refused"
+                  port e)
+        nil))))
+
+(defun release-port-claim (claim)
+  "Close CLAIM when it is a claim held: CLAIM-PORT's other answers hold
+   nothing."
+  (when (typep claim 'sb-bsd-sockets:socket)
+    (ignore-errors (sb-bsd-sockets:socket-close claim))))
+
+(defun retake-port-claim (claim port)
+  "CLAIM, unless it is :HELD: then CLAIM-PORT's answer for PORT, asked
+   again. A server that joined another's port (:SHARE-PORT) calls this on
+   each pass of its wait, so it holds the claim from the pass after the
+   other let go, and a third server is refused as a second would be."
+  (if (eq claim :held)
+      (let ((taken (claim-port port)))
+        (when (typep taken 'sb-bsd-sockets:socket)
+          (log-info "port ~d: this server holds the claim, the one it ~
+                     joined having let go of it"
+                    port))
+        taken)
+      claim))
+
+;;; ---------------------------------------------------------------------------
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
@@ -3062,8 +3151,30 @@
       (error "start-server: cannot listen on ~a: ~a"
              (format-peer-addr host port) e))))
 
+(defun make-claimed-listener (host)
+  "The first listener for a port the kernel chooses, on HOST, and the
+   claim on that port: two values, the second as CLAIM-PORT answers.
+
+   The kernel does not choose a port a listener on HOST holds, but the
+   number may be one another server has claimed: a server on another
+   address, or one between taking its claim and binding. That listener is
+   closed and the kernel asked again, so a server on a port of the
+   kernel's choosing shares it with no other and is not refused either."
+  (loop repeat 16
+        do (let* ((listener (make-first-listener host 0))
+                  (claim (claim-port
+                          (nth-value 1 (sb-bsd-sockets:socket-name
+                                        listener)))))
+             (if (eq claim :held)
+                 (sb-bsd-sockets:socket-close listener)
+                 (return (values listener claim))))
+        finally (error "start-server: each of sixteen ports the kernel ~
+                        chose was claimed by another web-skeleton server.")))
+
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler body-handler on-listen on-tick)
+                          handler ws-handler body-handler on-listen on-tick
+                          share-port
+                     &aux claim)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -3080,6 +3191,8 @@
      see src/server/body.lisp, and src/server/multipart.lisp for a form
      received as it arrives.
    ON-TICK: function (worker-id), a symbol naming one, or NIL.
+   SHARE-PORT: true to start beside a server that has claimed PORT, where
+     this one would otherwise be refused; see the end of this docstring.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
 
@@ -3140,10 +3253,26 @@
    spawned, whichever kind of port was asked for. A port that cannot be
    bound — one another program holds, a privileged one, an address the
    host does not have — is therefore an error from this function, naming
-   the address, and not each worker failing its bind once a second."
+   the address, and not each worker failing its bind once a second.
+
+   A second server on PORT is refused. Its bind would not fail, every
+   listener setting SO_REUSEPORT, so before it binds this function takes a
+   claim on the port number, holds it until it returns, and signals an
+   error when another server holds it: one in another process, or another
+   call of this function in this one. The section above CLAIM-PORT says
+   what the claim is and what it does not cover. SHARE-PORT true starts
+   beside the holder instead, which is how a new process takes over from
+   the one it replaces with no gap between them: it logs that it joined,
+   and takes the claim itself once the other lets go. With :PORT 0 there
+   is nothing to refuse: a number another server has claimed is passed
+   over for the next the kernel offers."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
+  ;; Read as a number below, for the claim's name and for the bind.
+  (unless (typep port '(integer 0 65535))
+    (error "start-server: :port must be an integer from 0 to 65535, got ~s"
+           port))
   ;; WS-SEND checks this too, but only WS-SEND does, and a handler that
   ;; returns a frame instead of pushing one never goes through it — that
   ;; path appends directly. A zero here would therefore leave the primary
@@ -3329,6 +3458,27 @@
                       (:positive-whole-seconds "a positive whole number of seconds")
                       (:count "an integer, 0 or more")
                       (:positive-count "a positive integer"))))
+  ;; Twelfth, and the one check that takes something: the claim on PORT.
+  ;; Taken here, while a refusal still leaves everything as it was: an
+  ;; earlier run's workers, and a server running in this image, are not
+  ;; touched by a start that is refused. A port the kernel is to choose is
+  ;; claimed further down, when there is a number to claim.
+  ;;
+  ;; CLAIM is the lambda list's &AUX: the cleanup that lets go of it is
+  ;; this function's last, and has it in scope without one more level
+  ;; around everything between here and there.
+  (unless (zerop port)
+    (setf claim (claim-port port))
+    (when (and (eq claim :held) (not share-port))
+      (error "start-server: port ~d is claimed by another web-skeleton ~
+              server, in this process or another. This one's bind would ~
+              not fail, every listener setting SO_REUSEPORT: both would ~
+              serve, the kernel dividing connections between them, with ~
+              nothing in either log. Stop the other first, or pass ~
+              :SHARE-PORT T to start beside it, as a process taking over ~
+              from the one it replaces does. The claim is on the port ~
+              number, whatever the address."
+             port)))
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
@@ -3381,11 +3531,28 @@
                 ;; closed and rebound: a port that is closed and rebound is
                 ;; free for an instant, and the docstring above is about
                 ;; what gets into that instant.
-                (let* ((listener0 (make-first-listener host port))
+                ;;
+                ;; A port given by number was claimed above. One the
+                ;; kernel chooses is claimed as it is bound.
+                (let* ((listener0 (if (zerop port)
+                                      (multiple-value-bind (listener taken)
+                                          (make-claimed-listener host)
+                                        (setf claim taken)
+                                        listener)
+                                      (make-first-listener host port)))
                        (port (nth-value 1 (sb-bsd-sockets:socket-name
                                            listener0))))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
+                  ;; At WARN though it was asked for: two servers on one
+                  ;; port is what the claim is there to prevent, and a
+                  ;; log that shows only warnings should show it.
+                  (when (eq claim :held)
+                    (log-warn "port ~d is claimed by another web-skeleton ~
+                               server, which this one has joined ~
+                               (:share-port): connections are divided ~
+                               between the two until one of them stops"
+                              port))
                   ;; Before the workers, which read it at every accept.
                   (let ((wanted (descriptors-wanted workers)))
                     (multiple-value-bind (limit before) (raise-descriptor-limit wanted)
@@ -3456,6 +3623,10 @@
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
                                (loop (sleep *worker-wake-interval*)
+                                     ;; Joined to another server's port,
+                                     ;; this one takes the claim when that
+                                     ;; one lets go.
+                                     (setf claim (retake-port-claim claim port))
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))
@@ -3509,4 +3680,10 @@
               (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
       ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
       (ignore-errors
-       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe)))))
+       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))
+      ;; And let go of the port's claim, whether or not every worker
+      ;; stopped. The claim stands for a START-SERVER that is running, so a
+      ;; later one in this image, on the same port, is not refused by its
+      ;; own process; *RUN-GENERATION* has what becomes of a worker still
+      ;; running then.
+      (release-port-claim claim))))

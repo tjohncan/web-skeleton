@@ -3588,6 +3588,288 @@
            (search "worker 0" (get-output-stream-string log))
            nil)))
 
+(defun %unix-socket-listed-p (name)
+  "True when /proc/net/unix lists a socket bound to NAME, an abstract name
+   written as the file shows one, with its @."
+  (handler-case
+      (with-open-file (in "/proc/net/unix" :if-does-not-exist nil)
+        (and in
+             (loop for line = (read-line in nil nil)
+                   while line
+                   thereis (let ((at (search name line :from-end t)))
+                             (and at (= (+ at (length name))
+                                        (length line)))))))
+    (error () nil)))
+
+(defun %port-of (socket)
+  (nth-value 1 (sb-bsd-sockets:socket-name socket)))
+
+(defun test-harness-a-port-claim-has-one-holder ()
+  "CLAIM-PORT gives a port's claim to the first that asks and tells the
+   second it is held, and the claim is there to take again once the first
+   has let go. While it is held it is listed under the name
+   PORT-CLAIM-NAME gives, which is the name an operator looks for.
+
+   The number is one the kernel chose for a listener held open here."
+  (format t "~%Harness: a port's claim has one holder~%")
+  (let ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0)))
+    (unwind-protect
+         (let* ((port (%port-of holder))
+                (name (format nil "@web-skeleton/port/~d" port))
+                (taken (web-skeleton::claim-port port))
+                (asked (web-skeleton::claim-port port)))
+           (unwind-protect
+                (progn
+                  (check "port claim: the first that asks holds it"
+                         (typep taken 'sb-bsd-sockets:socket) t)
+                  (check "port claim: the second is told it is held"
+                         asked :held)
+                  ;; Read again when a read misses it: the file is walked
+                  ;; in pieces, and a walk can skip a row while other
+                  ;; sockets come and go.
+                  (check "port claim: listed under its name while held"
+                         (loop repeat 40
+                               thereis (%unix-socket-listed-p name)
+                               do (sleep 0.025))
+                         t)
+                  (web-skeleton::release-port-claim taken)
+                  (check "port claim: not listed once let go"
+                         (%unix-socket-listed-p name) nil)
+                  (let ((again (web-skeleton::claim-port port)))
+                    (check "port claim: and there to take again"
+                           (typep again 'sb-bsd-sockets:socket) t)
+                    (web-skeleton::release-port-claim again)))
+             (web-skeleton::release-port-claim taken)
+             (web-skeleton::release-port-claim asked)))
+      (sb-bsd-sockets:socket-close holder)))
+  ;; With no descriptor to make the socket from, the claim cannot be
+  ;; attempted: that is logged, and is not an answer of :HELD, which would
+  ;; refuse the start. The soft limit is put at 0 for the one call, where
+  ;; every new descriptor fails with EMFILE and those open stay open.
+  (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
+    (flet ((set-soft (n)
+             (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
+                                      :initial-contents (list n hard))))
+               (sb-sys:with-pinned-objects (buf)
+                 (web-skeleton::%setrlimit web-skeleton::+rlimit-nofile+
+                                           (sb-sys:vector-sap buf))))))
+      (let* ((log (make-string-output-stream))
+             (got (let ((web-skeleton::*log-stream* log)
+                        (web-skeleton::*log-level* :warn))
+                    (unwind-protect
+                         (progn (set-soft 0)
+                                (web-skeleton::claim-port 1))
+                      (set-soft soft))))
+             (text (get-output-stream-string log)))
+        (check "port claim: one that cannot be attempted is not held, and is logged"
+               (list got
+                     (not (null (search "could not be attempted" text)))
+                     (not (null (search "Socket error in \"socket\"" text))))
+               '(nil t t))))))
+
+(defun test-harness-a-claimed-port-refuses-a-second-server ()
+  "START-SERVER on a port whose claim another holds signals, naming the
+   port, and has begun no run. With :SHARE-PORT it starts and serves,
+   says that it joined, takes the claim once the other lets go, and lets
+   go of it in turn when it returns.
+
+   The other server is a claim taken by hand. That is all a second server
+   process is to this one, since the kernel does not say whose a name is,
+   and two real ones do not fit in one image: a later START-SERVER stops
+   the workers of an earlier.
+
+   The number is one the kernel chose for a listener, claimed while the
+   listener still held it. The listener is closed before the servers
+   start, so the port is free and only its claim is held.
+
+   Each start runs on a thread joined with a bound, so a refusal that
+   does not come is a failed check and not a server serving for good."
+  (format t "~%Harness: a claimed port refuses a second server~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (saved-level web-skeleton::*log-level*)
+        (log (make-string-output-stream))
+        (logged "")
+        (other nil))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log
+          web-skeleton::*log-level* :info)
+    (flet ((start (port up &rest keys)
+             ;; A thread running START-SERVER on PORT; what it signaled,
+             ;; if it did, is the thread's value.
+             (sb-thread:make-thread
+              (lambda ()
+                (handler-case
+                    (progn
+                      (apply #'start-server
+                             :host #(127 0 0 1) :port port :workers 1
+                             :on-listen (lambda (p)
+                                          (declare (ignore p))
+                                          (sb-thread:signal-semaphore up))
+                             :handler (lambda (req)
+                                        (declare (ignore req))
+                                        (make-text-response 200 "joined"))
+                             keys)
+                      nil)
+                  (error (e) (princ-to-string e))))
+              :name "claimed-port-probe"))
+           (finish (thread seconds)
+             ;; THREAD's value once it ends, asking the server to stop if
+             ;; it has not ended by itself in SECONDS.
+             (handler-case (sb-thread:join-thread thread :timeout seconds)
+               (error ()
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread thread :timeout 10)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread thread))
+                     (ignore-errors (sb-thread:join-thread thread))
+                     :never-ended))))))
+      (unwind-protect
+           (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (sb-bsd-sockets:socket-close holder)
+             (check "claimed port: control, the claim is taken by hand"
+                    (typep other 'sb-bsd-sockets:socket) t)
+             ;; Refused.
+             (let* ((generation web-skeleton::*run-generation*)
+                    (message (finish (start port (sb-thread:make-semaphore)) 3)))
+               (check "claimed port: a second server is refused, naming the port"
+                      (and (stringp message)
+                           (search (format nil "port ~d is claimed" port) message)
+                           (search ":SHARE-PORT" message)
+                           t)
+                      t)
+               (check "claimed port: and the refused start began no run"
+                      (- web-skeleton::*run-generation* generation) 0))
+             ;; Joined.
+             (setf web-skeleton::*shutdown* nil)
+             (let* ((up (sb-thread:make-semaphore))
+                    (server (start port up :share-port t)))
+               (unwind-protect
+                    (progn
+                      (check "claimed port: with :share-port the server starts"
+                             (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                             t)
+                      (check "claimed port: and serves"
+                             (%port-answers-with-p port "joined") t)
+                      (web-skeleton::release-port-claim other)
+                      ;; Asking takes the claim when it is free, so what is
+                      ;; taken is given straight back and asked for again:
+                      ;; the server asks on every pass of its wait.
+                      (check "claimed port: it takes the claim once the other lets go"
+                             (loop repeat 100
+                                   for got = (web-skeleton::claim-port port)
+                                   when (eq got :held) return t
+                                   do (web-skeleton::release-port-claim got)
+                                      (sleep 0.05))
+                             t))
+                 (setf web-skeleton::*shutdown* t)
+                 (finish server 10)))
+             (setf logged (get-output-stream-string log))
+             (let ((free (web-skeleton::claim-port port)))
+               (check "claimed port: and lets go of it when it returns"
+                      (typep free 'sb-bsd-sockets:socket) t)
+               (web-skeleton::release-port-claim free)))
+        (web-skeleton::release-port-claim other)
+        (setf web-skeleton::*shutdown* t
+              web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll
+              web-skeleton::*log-stream* saved-stream
+              web-skeleton::*log-level* saved-level)))
+    (check "claimed port: the log says it joined, and that it took the claim"
+           (list (not (null (search "which this one has joined" logged)))
+                 (not (null (search "this server holds the claim" logged))))
+           '(t t))))
+
+(defun test-harness-a-kernel-chosen-port-is-claimed-too ()
+  "A server on a port the kernel chose holds that port's claim while it
+   serves and has let go when it returns, and a number another server has
+   claimed is passed over for the next the kernel offers.
+
+   The passing over is asked of MAKE-CLAIMED-LISTENER with CLAIM-PORT
+   answering :HELD for the first number, since which number the kernel
+   offers is not this test's to choose. The listeners it made are
+   collected, to see the one passed over closed."
+  (format t "~%Harness: a port the kernel chose is claimed too~%")
+  (let ((served nil))
+    (%call-with-bare-server 1
+      (lambda (port)
+        (setf served port)
+        (let ((got (and port (web-skeleton::claim-port port))))
+          (check "kernel-chosen port: its claim is held while the server serves"
+                 got :held)
+          (web-skeleton::release-port-claim got))))
+    (let ((free (and served (web-skeleton::claim-port served))))
+      (check "kernel-chosen port: and let go when the server has returned"
+             (typep free 'sb-bsd-sockets:socket) t)
+      (web-skeleton::release-port-claim free)))
+  (let ((asked nil)
+        (made nil)
+        (always nil))
+    (sb-int:encapsulate
+     'web-skeleton::claim-port 'held-at-first
+     (lambda (real port)
+       (push port asked)
+       (if (or always (null (cdr asked)))
+           :held
+           (funcall real port))))
+    (sb-int:encapsulate
+     'web-skeleton::make-tcp-listener 'collected
+     (lambda (real host port)
+       (let ((listener (funcall real host port)))
+         (push listener made)
+         listener)))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (listener claim)
+               (web-skeleton::make-claimed-listener #(127 0 0 1))
+             (unwind-protect
+                  (progn
+                    (check "passed over: the kernel was asked twice"
+                           (length asked) 2)
+                    (check "passed over: the first listener is closed, the second kept"
+                           (mapcar #'sb-bsd-sockets:socket-open-p (reverse made))
+                           '(nil t))
+                    (check "passed over: the listener is on the number it claimed"
+                           (list (= (%port-of listener) (first asked))
+                                 (typep claim 'sb-bsd-sockets:socket))
+                           '(t t)))
+               (web-skeleton::release-port-claim claim)
+               (ignore-errors (sb-bsd-sockets:socket-close listener))))
+           ;; Every number claimed: the start says so, with no listener
+           ;; left open behind it.
+           (setf asked nil made nil always t)
+           (check "passed over: sixteen claimed numbers end the start, by name"
+                  (handler-case
+                      (progn (web-skeleton::make-claimed-listener #(127 0 0 1))
+                             :returned)
+                    (error (e)
+                      (and (search "sixteen ports" (princ-to-string e)) t)))
+                  t)
+           (check "passed over: and each of the sixteen listeners was closed"
+                  (list (length made)
+                        (count-if #'sb-bsd-sockets:socket-open-p made))
+                  '(16 0)))
+      (sb-int:unencapsulate 'web-skeleton::claim-port 'held-at-first)
+      (sb-int:unencapsulate 'web-skeleton::make-tcp-listener 'collected)
+      (dolist (listener made)
+        (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+  (check "start-server: a :port that is no port number is refused by name"
+         (handler-case (progn (start-server :port 70000 :workers 1) :returned)
+           (error (e)
+             (and (search ":port must be an integer from 0 to 65535"
+                          (princ-to-string e))
+                  t)))
+         t))
+
 (defun %raw-connect ()
   "A raw socket to the live test server, plus its byte stream.
 
@@ -9951,6 +10233,9 @@
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-a-port-that-cannot-be-bound-fails-the-start)
+  (test-harness-a-port-claim-has-one-holder)
+  (test-harness-a-claimed-port-refuses-a-second-server)
+  (test-harness-a-kernel-chosen-port-is-claimed-too)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)

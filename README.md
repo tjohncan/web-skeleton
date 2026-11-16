@@ -770,7 +770,7 @@ All configurable via `setf` before calling `start-server`.
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes. Must be positive; validated when the server starts |
 
 The `host`, `port`, `workers`, `handler`, `ws-handler`, `body-handler`,
-`on-listen`, and `on-tick` are passed as keyword arguments:
+`on-listen`, `on-tick`, and `share-port` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)
@@ -803,6 +803,16 @@ It binds that first socket for a port given by number too, before it
 starts a worker. A port that cannot be bound, because another program
 holds it, or it is a privileged one, or the host has no such address, is
 an error from `start-server` that names the address.
+
+A second server on a port is refused as well, though its bind would not
+fail. `start-server` claims the port number before it binds, and signals
+an error when another web-skeleton server holds the claim: a second
+process started by mistake, or a second call in one image.
+`:share-port t` starts beside the holder instead, which is how a new
+process takes over from the one it replaces with no gap. With `:port 0`
+nothing is refused, and a claimed number is passed over. DEPLOYMENT.md,
+"One server to a port", has what the claim is, how to see who holds it,
+and what it does not cover.
 
 `:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector
 and dispatches the listener family accordingly.

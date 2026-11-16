@@ -208,64 +208,6 @@
                nil))))
 
 ;;; ---------------------------------------------------------------------------
-;;; The port guard
-;;; ---------------------------------------------------------------------------
-
-(defun %port-already-served-p (host port)
-  "T if something already answers on PORT at HOST, the address about to be
-   bound, or on loopback when HOST is a wildcard.
-
-   Every listener this framework opens sets SO_REUSEPORT, which is what lets
-   one worker per core hold the same port. The cost is that a *second server
-   process* binding it does not fail either — it joins. Both then serve, the
-   kernel splits arriving connections between them by 4-tuple hash, and
-   nothing anywhere reports it: no error, no warning, no log line on either
-   side.
-
-   For this demo that surfaces as the room quietly dividing. Each process has
-   its own bulletin, so a tab only ever hears the tabs the kernel hashed the
-   same way, and which group a tab lands in is invisible from inside it. It
-   costs an afternoon to diagnose and one connect() to prevent.
-
-   The check races anything started in the gap before the bind, which is
-   fine: the case that actually happens is a previous run that did not die.
-
-   Probed at HOST because that is the address a second server has to share
-   for the kernel to pool the two, and a server bound to one address does not
-   answer on loopback. A wildcard is probed on loopback, which every wildcard
-   listener answers on.
-
-   The connect is bounded, at two seconds. Loopback answers at once, but an
-   interface whose firewall drops SYNs would hold a blocking connect for the
-   kernel's own timeout, minutes, before START-DEMO bound anything. A connect
-   still going at the bound is taken for nothing there: a listener on this
-   host answers well inside it."
-  (let* ((v6 (= (length host) 16))
-         (target (cond ((notevery #'zerop host) host)
-                       (v6 #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))
-                       (t #(127 0 0 1)))))
-    (handler-case
-        (let ((probe (make-instance (if v6
-                                        'sb-bsd-sockets:inet6-socket
-                                        'sb-bsd-sockets:inet-socket)
-                                    :type :stream :protocol :tcp)))
-          (unwind-protect
-               (progn
-                 (setf (sb-bsd-sockets:non-blocking-mode probe) t)
-                 ;; In progress is the usual answer off loopback, and the
-                 ;; connect goes on while the wait below watches it.
-                 (handler-case (sb-bsd-sockets:socket-connect probe target port)
-                   (sb-bsd-sockets:operation-in-progress () nil))
-                 ;; Writable is a connect that has finished, made or refused;
-                 ;; only a made one has a peer to name.
-                 (and (sb-sys:wait-until-fd-usable
-                       (sb-bsd-sockets:socket-file-descriptor probe) :output 2)
-                      (handler-case (progn (sb-bsd-sockets:socket-peername probe) t)
-                        (error () nil))))
-            (ignore-errors (sb-bsd-sockets:socket-close probe))))
-      (error () nil))))
-
-;;; ---------------------------------------------------------------------------
 ;;; Peer handles
 ;;; ---------------------------------------------------------------------------
 
@@ -1362,10 +1304,24 @@
 ;;; Entry points
 ;;; ---------------------------------------------------------------------------
 
+(defvar *serving* nil
+  "True while START-DEMO serves in this image. The bulletin, the counters
+   and the page cache are the image's, one of each, and START-DEMO sets
+   them up before it starts the server: a second START-DEMO would reset
+   them under the first, so it is refused before it has touched any.")
+
 (defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
                         (instance (bytes-to-hex (random-bytes 2)))
                         backlink public-url)
   "Start the demo server.
+
+   One demo to a port, and one to an image. A second demo process on the
+   port is refused by START-SERVER, which claims the port before it binds:
+   every listener sets SO_REUSEPORT, so that second bind would not fail,
+   and two demos would each keep a bulletin of their own, a tab hearing
+   only the tabs the kernel sent the same way, the room divided in two
+   with no error anywhere. A second START-DEMO in an image already serving
+   one is refused here; see *SERVING*.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
    inside a container: nothing outside the container can reach a socket bound
@@ -1396,12 +1352,10 @@
    long as the demo serves, putting it back when START-SERVER returns. A
    server started beside the demo in one image runs at that cadence too
    while the demo does."
-  (when (%port-already-served-p host port)
-    (error "start-demo: something is already answering on port ~d.~%~
-            SO_REUSEPORT means a second server binds it rather than failing, ~
-            and both would serve — the kernel splitting connections between ~
-            them, each with its own bulletin, so the room divides in two with ~
-            no error anywhere. Stop the other one first." port))
+  (when *serving*
+    (error "start-demo: the demo is already serving in this image. Its ~
+            bulletin, counters and pages are the image's, and a second ~
+            start would reset them under the first. Stop that one first."))
   (setf *demo-host* (%self-fetch-host host)
         *demo-port* port)
   (setf *instance* instance
@@ -1452,7 +1406,8 @@
   (let ((wake *worker-wake-interval*))
     (unwind-protect
          (progn
-           (setf *worker-wake-interval* 0.05)
+           (setf *worker-wake-interval* 0.05
+                 *serving* t)
            (start-server :host host
                          :port port
                          :workers workers
@@ -1460,7 +1415,8 @@
                          :body-handler #'decide-body
                          :ws-handler #'handle-ws-message
                          :on-tick #'bulletin-tick))
-      (setf *worker-wake-interval* wake))))
+      (setf *worker-wake-interval* wake
+            *serving* nil))))
 
 (defun main ()
   (start-demo))

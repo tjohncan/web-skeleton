@@ -157,6 +157,28 @@
           web-skeleton-demo::*last-tick* nil)))
 
 ;;; ---------------------------------------------------------------------------
+;;; One demo to an image. START-DEMO sets up the bulletin and the counters
+;;; before it starts the server, so a second one is refused before it has
+;;; reset the first's. Asked with :WORKERS 0, which START-SERVER refuses, so
+;;; that a START-DEMO that got past its own refusal still returns.
+;;; ---------------------------------------------------------------------------
+
+(format t "~%A second START-DEMO in an image that is serving one~%")
+(let ((bulletin (web-skeleton:make-store :test #'eql)))
+  (setf web-skeleton-demo::*bulletin* bulletin)
+  (unwind-protect
+       (let ((web-skeleton-demo::*serving* t))
+         (owed (handler-case (progn (web-skeleton-demo::start-demo :workers 0)
+                                    :started)
+                 (error (e) (and (search "already serving in this image"
+                                         (princ-to-string e))
+                                 :refused)))
+               :refused "it is refused, by name")
+         (owed (eq web-skeleton-demo::*bulletin* bulletin) t
+               "and the bulletin is still the one the first is using"))
+    (setf web-skeleton-demo::*bulletin* nil)))
+
+;;; ---------------------------------------------------------------------------
 ;;; What the demo counts in seconds: each worker's last pass, for /healthz,
 ;;; and a connection's post budget. Both read MONOTONIC-SECONDS, which is held
 ;;; here and moved by hand, so a second has passed when a check says it has.

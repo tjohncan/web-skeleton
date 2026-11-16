@@ -209,6 +209,75 @@ after a second or more and nothing on this side logs.
 Linux clamps the backlog to `net.core.somaxconn`;
 raising `*listen-backlog*` past it needs that sysctl raised as well.
 
+### One server to a port
+
+Every listener sets `SO_REUSEPORT`, which is what lets each worker hold
+the port. It would also let a second server process bind the same port:
+that bind succeeds, the kernel divides arriving connections between the
+two processes, each answers its share from its own memory, and neither
+log says anything. A start script run twice is enough to do it.
+
+So `start-server` claims its port number before it binds, and a second
+server, in another process or from a second call in the same image, finds
+the claim held and is refused:
+
+```
+start-server: port 8081 is claimed by another web-skeleton server, in this process or another. ...
+```
+
+The error comes before anything else has happened: no listener is bound,
+no worker started, and a server already running in the image is left as
+it was.
+
+**What the claim is.** A Unix socket bound in Linux's abstract namespace
+under the name `web-skeleton/port/8081`. It is not a file, so there is
+nothing to clean up and nothing a crash leaves behind: the kernel frees
+the name when the process ends, however it ends. `/proc/net/unix` lists
+it as `@web-skeleton/port/8081`, and this names the process holding it:
+
+```
+ss -xap | grep web-skeleton/port
+```
+
+**Replacing a process with no gap.** Start the new process with
+`:share-port t` while the old one serves, then stop the old one. The new
+server logs, at WARN, that it joined a claimed port; both serve while
+they overlap, the kernel dividing connections between them; and when the
+old one stops the new one takes the claim, within a
+`*worker-wake-interval*`, and logs that it has. A server started the
+plain way after that is refused again. A start script that always
+replaces this way can always pass `:share-port t`: on a port nobody has
+claimed it takes the claim as a plain start does. Such a script is then
+never refused, a mistaken second run of it included, which is what
+passing the keyword every time gives up.
+
+**What the claim covers, and what it does not.**
+
+- **The port number, whatever the address.** A server on one address and
+  a server on the wildcard address of the same port are both bound
+  without error too, and the kernel gives each connection to the more
+  specific of the two, so they are one port to the claim. The cost is
+  that two servers on two addresses of one host, which share nothing,
+  cannot use the same port number unless the second passes
+  `:share-port t`.
+- **Servers built on this framework, and no other program.** Another
+  program that sets `SO_REUSEPORT`, run by the same user, binds the port
+  all the same. One that does not set it makes this server's bind fail,
+  and `start-server` says so by name.
+- **One network namespace.** Abstract names belong to a network
+  namespace, as ports do. Two containers that each have their own can
+  serve the same port number and do not see each other's claims; two
+  processes that share one, `--network host` say, share ports and claims
+  alike.
+- **Not `:port 0`.** The kernel does not choose a port that a listener
+  on the address holds, and a number another server has claimed is passed
+  over for the next the kernel offers, so such a start is never refused.
+- **Not where Unix sockets are forbidden.** Under a systemd unit whose
+  `RestrictAddressFamilies=` leaves out `AF_UNIX`, the claim cannot be
+  taken. The server logs that at WARN and starts without one.
+- **A guard against a mistake, not a lock.** Any local user can bind the
+  name, as any can bind an unprivileged port.
+
 ### Status codes the framework itself sends
 
 A request the framework rejects before your handler sees it gets a
