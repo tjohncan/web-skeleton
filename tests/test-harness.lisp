@@ -3522,6 +3522,72 @@
             (check "port 0: every worker listens on the reported port"
                    n workers)))))))
 
+(defun test-harness-a-port-that-cannot-be-bound-fails-the-start ()
+  "START-SERVER on a port another program holds signals an error naming
+   the address, and spawns no worker.
+
+   The other program is a listener without SO_REUSEPORT, so this server's
+   bind fails with EADDRINUSE; with the option set on both, the port would
+   be shared and nothing would fail. A start that left the bind to its
+   workers would have each of them failing it in RUN-WORKER's restart
+   loop, once a second, and would never return. So the start runs on a
+   thread joined with a bound, and no error inside the bound is a failed
+   check and not a suite that does not end."
+  (format t "~%Harness: a port that cannot be bound fails the start~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (holder (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp))
+        (message nil))
+    ;; Global SETF: a worker, should one be spawned, reads these from a
+    ;; thread START-SERVER made.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-bind holder #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen holder 1)
+           (let* ((port (nth-value 1 (sb-bsd-sockets:socket-name holder)))
+                  (start (sb-thread:make-thread
+                          (lambda ()
+                            (handler-case
+                                (start-server
+                                 :host #(127 0 0 1) :port port :workers 2
+                                 :handler (lambda (r) (declare (ignore r))))
+                              (error (e) (setf message (princ-to-string e)))))
+                          :name "unbindable-port-probe")))
+             (handler-case (sb-thread:join-thread start :timeout 3)
+               (error ()
+                 ;; Still serving, or trying to: ask it to stop before
+                 ;; falling back to ending the thread.
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread start :timeout 10)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread start))
+                     (ignore-errors (sb-thread:join-thread start))))))
+             (check "unbindable port: the start signals, naming the address"
+                    (and message
+                         (search (format nil "cannot listen on 127.0.0.1:~d" port)
+                                 message)
+                         (search "EADDRINUSE" message)
+                         t)
+                    t)))
+      (ignore-errors (sb-bsd-sockets:socket-close holder))
+      (setf web-skeleton::*shutdown* t
+            web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll
+            web-skeleton::*log-stream* saved-stream))
+    (check "unbindable port: and no worker was started"
+           (search "worker 0" (get-output-stream-string log))
+           nil)))
+
 (defun %raw-connect ()
   "A raw socket to the live test server, plus its byte stream.
 
@@ -9884,6 +9950,7 @@
   (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
+  (test-harness-a-port-that-cannot-be-bound-fails-the-start)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)

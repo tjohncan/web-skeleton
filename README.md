@@ -799,6 +799,11 @@ splits traffic between them, with nothing in either log. `start-server`
 hands its own bound socket to worker 0, so the port is never free between
 being chosen and being served.
 
+It binds that first socket for a port given by number too, before it
+starts a worker. A port that cannot be bound, because another program
+holds it, or it is a privileged one, or the host has no such address, is
+an error from `start-server` that names the address.
+
 `:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector
 and dispatches the listener family accordingly.
 Use `:host #(0 0 0 0)` to listen on all IPv4 interfaces,

@@ -39,13 +39,21 @@
                                     'sb-bsd-sockets:inet6-socket)
                                 :type :stream
                                 :protocol :tcp)))
-    (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
-    (set-socket-option-int (socket-fd socket)
-                           +sol-socket+ +so-reuseport+ 1)
-    (sb-bsd-sockets:socket-bind socket host port)
-    (sb-bsd-sockets:socket-listen socket *listen-backlog*)
-    (set-nonblocking (socket-fd socket))
-    socket))
+    ;; A socket whose bind or listen the kernel refuses is closed here. Left
+    ;; to its finalizer it would hold a descriptor until a collection ran:
+    ;; one for each try of a worker whose port is not to be had.
+    (handler-case
+        (progn
+          (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
+          (set-socket-option-int (socket-fd socket)
+                                 +sol-socket+ +so-reuseport+ 1)
+          (sb-bsd-sockets:socket-bind socket host port)
+          (sb-bsd-sockets:socket-listen socket *listen-backlog*)
+          (set-nonblocking (socket-fd socket))
+          socket)
+      (error (e)
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        (error e)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Per-worker connection table
@@ -2596,10 +2604,11 @@
    why.
 
    LISTENER, when supplied, is an already-bound socket this worker
-   adopts instead of binding one of its own. START-SERVER hands one to
-   worker 0 when :PORT was 0, so that the kernel-assigned port is held
-   by a real listener from the first instant it is knowable — see
-   START-SERVER for why closing it and rebinding is not survivable.
+   adopts instead of binding one of its own. START-SERVER binds the first
+   listener itself and hands it to worker 0: a port that cannot be bound
+   then fails the start, and a kernel-assigned port is held by a real
+   listener from the first instant it is knowable — see START-SERVER for
+   both, and for why closing it and rebinding is not survivable.
 
    Adopted for the first pass only. A restart after a crash binds
    normally, and lands on the right port because by then PORT is the
@@ -3044,6 +3053,15 @@
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
+(defun make-first-listener (host port)
+  "MAKE-TCP-LISTENER for the listener START-SERVER binds itself, with a
+   bind or a listen the kernel refuses turned into an error that names the
+   address, as START-SERVER's other refusals name what they refuse."
+  (handler-case (make-tcp-listener host port)
+    (sb-bsd-sockets:socket-error (e)
+      (error "start-server: cannot listen on ~a: ~a"
+             (format-peer-addr host port) e))))
+
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler body-handler on-listen on-tick)
   "Start the server with WORKERS event loops on HOST:PORT.
@@ -3116,7 +3134,13 @@
    handed that number in the gap does not fail its bind: both hold the
    port and the kernel splits traffic between them, silently, with
    nothing in either log. Resolving here means the port is never free
-   between being chosen and being served."
+   between being chosen and being served.
+
+   The first listener is bound on the calling thread, before a worker is
+   spawned, whichever kind of port was asked for. A port that cannot be
+   bound — one another program holds, a privileged one, an address the
+   host does not have — is therefore an error from this function, naming
+   the address, and not each worker failing its bind once a second."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
@@ -3334,8 +3358,18 @@
                                  (declare (ignore signal info context))
                                  (setf *shutdown* t)))))
            (unwind-protect
-                ;; Resolve port 0 here, once, rather than letting the
-                ;; workers each pass it to bind(2). Two things break if
+                ;; The first listener is bound here, on the calling thread,
+                ;; and not by a worker, for two reasons.
+                ;;
+                ;; A port that cannot be bound fails the start. A worker
+                ;; whose bind fails restarts and tries again, once a
+                ;; second: left to the workers, a port another program
+                ;; holds would have every one of them doing that for as
+                ;; long as the process ran, with this function in its wait
+                ;; below and its caller told nothing.
+                ;;
+                ;; And port 0 is resolved here, once, rather than by the
+                ;; workers each passing it to bind(2). Two things break if
                 ;; they do: N workers on port 0 land on N *different*
                 ;; ephemeral ports, and RUN-WORKER's restart loop rebinds,
                 ;; so a crashed worker would come back somewhere its
@@ -3347,12 +3381,9 @@
                 ;; closed and rebound: a port that is closed and rebound is
                 ;; free for an instant, and the docstring above is about
                 ;; what gets into that instant.
-                (let* ((listener0 (when (zerop port)
-                                    (make-tcp-listener host port)))
-                       (port (if listener0
-                                 (nth-value 1 (sb-bsd-sockets:socket-name
-                                               listener0))
-                                 port)))
+                (let* ((listener0 (make-first-listener host port))
+                       (port (nth-value 1 (sb-bsd-sockets:socket-name
+                                           listener0))))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
                   ;; Before the workers, which read it at every accept.
