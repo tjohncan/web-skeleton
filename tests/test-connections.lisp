@@ -5201,13 +5201,17 @@
 
 (defun test-ws-close ()
   "WS-CLOSE ends a WebSocket from the server's side: a close frame with the
-   code asked for, then the connection goes. A peer at *MAX-WRITE-BACKLOG*
-   has no room for the frame and is closed at once. An application whose
-   own events outran a peer has this as its answer, the one DEPLOYMENT.md
-   gives, where before it could only drop frames and keep the socket.
+   code asked for, then a lingering close. The write side is shut down
+   behind the frame, and the connection is kept until its client finishes
+   or *LINGER-TIMEOUT* passes; with *LINGER-TIMEOUT* 0 it goes with the
+   frame. A peer at *MAX-WRITE-BACKLOG* has no room for the frame and is
+   closed at once. An application whose own events outran a peer has this
+   as its answer, the one DEPLOYMENT.md gives.
 
    Driven over a loopback pair, so the client reads the frame off a real
-   socket and the close is the event loop's own write path finishing."
+   socket and the close is the event loop's own write path finishing. What
+   the linger is for, a client still sending when the server closes, is
+   TEST-WS-SERVER-CLOSE-LINGERS-FOR-A-CLIENT-STILL-SENDING-E2E's to show."
   (format t "~%ws-close: closing a WebSocket from the server's side~%")
   (multiple-value-bind (server client) (%loopback-pair)
     (let ((epfd (web-skeleton::epoll-create)))
@@ -5236,18 +5240,73 @@
                     (handler-case (progn (web-skeleton:ws-close conn) :closed)
                       (error () :refused))
                     :refused)
-             ;; The write path the arming hands it to: the frame goes out
-             ;; and the connection with it.
+             ;; The write path the arming hands it to: the frame goes out,
+             ;; the write side is shut down behind it, and the connection
+             ;; lingers for its client to finish.
              (web-skeleton::handle-client-write conn epfd)
-             (check "ws-close: once written, the connection is gone"
-                    (web-skeleton::lookup-connection fd) nil)
+             (check "ws-close: once written, the close lingers"
+                    (list (eq (web-skeleton::lookup-connection fd) conn)
+                          (web-skeleton::connection-state conn))
+                    (list t :lingering))
              (let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
                (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive client buf nil)
                  (declare (ignore b))
                  (check "ws-close: the client read a close frame with the code"
                         (list n (aref buf 0)
                               (logior (ash (aref buf 2) 8) (aref buf 3)))
-                        (list 4 #x88 1013)))))
+                        (list 4 #x88 1013)))
+               (check "ws-close: and behind it the end of the stream"
+                      (nth-value 1 (sb-bsd-sockets:socket-receive client buf nil))
+                      0))
+             ;; A client that never finishes is the sweep's to close, once
+             ;; *LINGER-TIMEOUT* has passed since the linger began.
+             (let ((began (web-skeleton::connection-last-active conn)))
+               (check "ws-close: the linger is over once *LINGER-TIMEOUT* has passed"
+                      (list (web-skeleton::inbound-overdue
+                             conn (+ began web-skeleton:*linger-timeout*))
+                            (web-skeleton::inbound-overdue
+                             conn (+ began web-skeleton:*linger-timeout* 1)))
+                      (list nil :idle)))
+             ;; And one that finishes ends it there, with its FIN.
+             (check "ws-close: at the client's FIN, the connection is gone"
+                    (and (eq (web-skeleton::lookup-connection fd) conn)
+                         (progn
+                           (sb-bsd-sockets:socket-close client)
+                           (%await-arrival fd :bytes 0 :fin t)
+                           (web-skeleton::handle-client-read conn epfd nil nil)
+                           (list (web-skeleton::lookup-connection fd)
+                                 (web-skeleton::connection-fd conn))))
+                    (list nil -1)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+  ;; With no linger allowed, the frame goes out and the connection with it.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*linger-timeout* 0)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (web-skeleton::monotonic-seconds))))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (web-skeleton:ws-close conn 1013)
+             (web-skeleton::handle-client-write conn epfd)
+             (check "ws-close with *linger-timeout* 0: once written, the connection is gone"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd conn))
+                    (list nil -1))
+             (let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
+               (check "ws-close with *linger-timeout* 0: its close frame sent first"
+                      (list (nth-value 1 (sb-bsd-sockets:socket-receive client buf nil))
+                            (aref buf 0)
+                            (logior (ash (aref buf 2) 8) (aref buf 3)))
+                      (list 4 #x88 1013))))
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client)))))
@@ -5417,6 +5476,99 @@
                (multiple-value-list
                 (exchange (%ws-client-frame 1 "bye, with a reply")))
                '((8) 1000 0 :eof ("bye, with a reply")))))))
+
+(defun test-ws-server-close-lingers-for-a-client-still-sending-e2e ()
+  "A WebSocket the server closes while its client is still sending ends
+   with the close frame and then a FIN, and the client's sends go on
+   succeeding meanwhile: the server shuts down its write side behind the
+   frame and discards what arrives, as BEGIN-LINGERING-CLOSE does after an
+   early error response.
+
+   The client declares a binary frame of 1 MiB, past *MAX-WS-PAYLOAD-SIZE*,
+   which is refused at its header with 1009, and sends the payload all the
+   same, 64 KiB at a time, as a client that had begun the message would.
+   Closed at once instead, the connection is reset by the first of that
+   payload to arrive, the client's next send fails, and a client that
+   takes a failed send for the end of the connection never reads the code
+   that says why.
+
+   The connection is kept until the client finishes, and is gone when it
+   has. *LINGER-TIMEOUT* is 30 for the run, so that only the client's FIN
+   can be what ends the linger inside the wait: SETF rather than LET, as
+   the worker reads it. The :ON-TICK hook reads the worker's connection
+   table, which is bound on the worker."
+  (format t "~%WebSocket: the server's close lingers for a client still sending~%")
+  (let ((saved web-skeleton:*linger-timeout*)
+        (states :unseen))
+    (setf web-skeleton:*linger-timeout* 30)
+    (unwind-protect
+         (with-test-server
+             (:workers 1
+              :handler (lambda (req) (declare (ignore req)) :upgrade)
+              :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil)
+              ;; The states of the worker's connections, as of its last pass.
+              :on-tick (lambda (worker-id)
+                         (declare (ignore worker-id))
+                         (setf states
+                               (loop for conn being the hash-values
+                                       of web-skeleton::*connections*
+                                     collect (web-skeleton::connection-state
+                                              conn)))))
+           (flet ((within (seconds test)
+                    (loop repeat (ceiling seconds 0.02)
+                          thereis (funcall test)
+                          do (sleep 0.02))))
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                                  :element-type '(unsigned-byte 8)))
+                    (chunk (make-array 65536 :element-type '(unsigned-byte 8)
+                                             :initial-element 0))
+                    (sent 0))
+               (unwind-protect
+                    (progn
+                      (%ws-client-upgrade stream)
+                      ;; The header of a masked binary frame of 1 MiB: FIN
+                      ;; and the opcode, the mask bit with 127 for a 64-bit
+                      ;; length, the length, the mask.
+                      (write-sequence
+                       (coerce #(#x82 #xFF 0 0 0 0 0 #x10 0 0 55 11 202 99)
+                               '(simple-array (unsigned-byte 8) (*)))
+                       stream)
+                      (force-output stream)
+                      (check "ws close lingers: the frame is refused at its header, with 1009"
+                             (coerce (read-until-bounded
+                                      stream :seconds 3
+                                      :until (lambda (b fill)
+                                               (declare (ignore b))
+                                               (>= fill 4)))
+                                     'list)
+                             '(#x88 2 3 #xF1))
+                      ;; The payload the header promised, as a client that
+                      ;; has not read the refusal yet goes on to send it.
+                      (handler-case
+                          (dotimes (i 16)
+                            (write-sequence chunk stream)
+                            (force-output stream)
+                            (incf sent))
+                        (error () nil))
+                      (check "ws close lingers: every send of the payload succeeds"
+                             sent 16)
+                      (multiple-value-bind (more reason)
+                          (read-until-bounded stream :seconds 3)
+                        (check "ws close lingers: behind the close frame is the end of the stream, and no reset"
+                               (list (length more) reason) '(0 :eof)))
+                      (check "ws close lingers: the connection is kept while its client has not finished"
+                             (within 5 (lambda () (equal states '(:lingering))))
+                             t)
+                      (ignore-errors (close stream))
+                      (ignore-errors (sb-bsd-sockets:socket-close sock))
+                      (check "ws close lingers: and is gone once it has"
+                             (within 5 (lambda () (null states)))
+                             t))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (setf web-skeleton:*linger-timeout* saved))))
 
 (defun test-ws-message-deadline-e2e ()
   "A peer that begins a fragmented message and never finishes it is closed
@@ -6263,6 +6415,7 @@
   (test-ws-send-refuses-a-closing-websocket)
   (test-ws-close)
   (test-ws-close-from-a-handler-e2e)
+  (test-ws-server-close-lingers-for-a-client-still-sending-e2e)
   (test-ws-message-deadline-e2e)
   (test-ws-upgrade-shapes-the-101)
   (test-ws-upgrade-subprotocol-e2e)

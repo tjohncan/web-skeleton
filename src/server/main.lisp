@@ -395,18 +395,22 @@
    as activity.")
 
 (defparameter *linger-timeout* 2
-  "Seconds a connection closed after an early error response may go on
-   reading — and discarding — what its client is still sending, before it
-   is closed. 0 closes at once.
+  "Seconds a connection closed after an early error response, or a
+   WebSocket closed after its close frame, may go on reading — and
+   discarding — what its client is still sending, before it is closed.
+   0 closes at once.
 
    An answer given before the request has been read in full — a 413 for a
    body over the cap, a 431, any refusal of the request line or head —
-   leaves the client mid-send. Closing then, with its bytes unread, makes
-   Linux answer RST rather than FIN, which discards response bytes not yet
-   sent and tells the peer the connection failed. See
-   BEGIN-LINGERING-CLOSE. Bounded by time alone: the bytes are the
-   client's to send, so draining them costs what receiving them would
-   have.")
+   leaves the client mid-send. So does a close frame the server sends
+   first: behind it come the payload of a frame refused at its header as
+   too large, the rest of a message a protocol error or
+   *WS-MESSAGE-TIMEOUT* cut off, the frames an application's WS-CLOSE met
+   on their way. Closing then, with the client's bytes unread, makes Linux
+   answer RST rather than FIN, which discards bytes not yet sent and tells
+   the peer the connection failed. See BEGIN-LINGERING-CLOSE. Bounded by
+   time alone: the bytes are the client's to send, so draining them costs
+   what receiving them would have.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -1256,11 +1260,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun begin-lingering-close (conn epoll-fd)
-  "Close CONN after an early error response the way RFC 9112 §9.6 asks of
-   a server that answers before it has read the request: shut down the
-   write side, so the response is followed by a FIN, then read and discard
-   whatever the client is still sending until it stops or *LINGER-TIMEOUT*
-   runs out, and only then close.
+  "Close CONN the way RFC 9112 §9.6 asks of a server that answers before
+   it has read the request, and RFC 6455 §7.1.1 gives for a WebSocket
+   whose close frame has gone out: shut down the write side, so what was
+   sent is followed by a FIN, then read and discard whatever the client is
+   still sending until it stops or *LINGER-TIMEOUT* runs out, and only
+   then close.
 
    Closing at once, with the client's bytes unread in the kernel, makes
    Linux abort the connection with RST rather than end it with FIN: any
@@ -1269,6 +1274,9 @@
    a small response read promptly survives. What survives elsewhere
    depends on the peer — a proxy or client stack that treats a reset as a
    failure may not pass the answer on — and the FIN removes the question.
+   For a WebSocket the answer is the close frame, and the code in it is
+   all that tells the client why. A client whose send fails on a reset
+   may report an abnormal closure and never read it.
 
    What the linger can promise has two limits. A client still sending
    when *LINGER-TIMEOUT* runs out is closed with bytes unread, so it gets
@@ -2109,8 +2117,9 @@
              ;; spurious wake-up, or a transport that wants to write before
              ;; it can read. Nothing to do for either.
              (t nil))))
-        ;; Closing after an early error answer: discard what the client is
-        ;; still sending, and close at its FIN. See BEGIN-LINGERING-CLOSE.
+        ;; Closing after an early error answer, or after a WebSocket's close
+        ;; frame: discard what the client is still sending, and close at
+        ;; its FIN. See BEGIN-LINGERING-CLOSE.
         (:lingering (linger-discard conn epoll-fd))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
@@ -2238,7 +2247,8 @@
               (if (connection-close-after-p conn)
                   ;; An early error answer lingers, so the response is
                   ;; followed by a FIN and not a reset; see
-                  ;; BEGIN-LINGERING-CLOSE. Every other close is at once.
+                  ;; BEGIN-LINGERING-CLOSE. Every other response's close is
+                  ;; at once.
                   (if (and (connection-linger conn) (plusp *linger-timeout*))
                       (begin-lingering-close conn epoll-fd)
                       (close-connection conn epoll-fd))
@@ -2344,8 +2354,18 @@
               (epoll-modify epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+)))
              (:closing
-              ;; Close frame sent — disconnect
-              (close-connection conn epoll-fd))
+              ;; What was queued has gone out, a close frame last wherever
+              ;; one was queued. When the server is the one closing, its
+              ;; peer is usually still sending: the payload of a frame
+              ;; refused at its header, the rest of a message cut off.
+              ;; Closed with those bytes unread, the connection is reset,
+              ;; which can cost the peer the close frame and the code in
+              ;; it. So the close lingers; see BEGIN-LINGERING-CLOSE. A
+              ;; peer that closed first has nothing left to send, and the
+              ;; linger ends at its FIN, which it may have sent already.
+              (if (plusp *linger-timeout*)
+                  (begin-lingering-close conn epoll-fd)
+                  (close-connection conn epoll-fd)))
              (:sending-100-continue
               ;; 100 Continue flushed — switch to reading the body.
               ;; Returning :keep-alive tells the main loop to re-enter

@@ -121,7 +121,10 @@
   ;;   :ws-upgrade            — sending WebSocket handshake
   ;;   :websocket             — reading/writing WebSocket frames
   ;;   :streaming             — response head sent, app is producing a body
-  ;;   :closing               — sending close frame (disconnect when done)
+  ;;   :closing               — sending close frame (lingering close when done)
+  ;;   :lingering             — write side shut down, discarding what the
+  ;;                            client still sends until it finishes or
+  ;;                            *LINGER-TIMEOUT* runs out
   ;;   :awaiting              — parked, waiting for outbound fetch to complete
   ;;   :out-dns               — outbound: getent subprocess resolving hostname
   ;;   :out-connecting        — outbound: TCP connect in progress
