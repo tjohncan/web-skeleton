@@ -671,6 +671,17 @@ read about here.
   length to forward, so its upload reaches such an upstream a piece at a
   time, each piece a request of its own (DEPLOYMENT.md, "Forms and file
   uploads").
+- **A fetch never reuses a connection.** `http-fetch`, `fetch-into` and
+  `http-fetch-stream` each open a connection for their one request and
+  close it when the response has ended. The request goes out with
+  `Connection: close`, and the connection is closed whatever the
+  upstream answered, so a `keep-alive` passed in `:headers` changes the
+  header and nothing else. Over `https://` that is a full TLS handshake
+  for every fetch as well, with no session to resume. An application
+  that calls an upstream for every request it serves, an auth check or
+  a gateway route, pays for both each time, as latency and as the
+  worker's CPU. `*dns-cache-ttl*` removes the name lookup and nothing
+  more (DEPLOYMENT.md, "One connection a fetch").
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing

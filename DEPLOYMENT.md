@@ -929,6 +929,39 @@ verification is wired to a DNS name and matching an IP SAN is not
 implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 `*dns-cache-ttl*` is it.
 
+### One connection a fetch
+
+An outbound fetch opens a connection, sends its one request, and closes
+the connection when the response has ended. That is so for `http-fetch`,
+`fetch-into` and `http-fetch-stream`, over either scheme:
+
+- **No keep-alive.** The request goes out with `Connection: close`
+  unless `:headers` gives another value, and the connection is closed
+  either way. An upstream that answers `keep-alive` to a request that
+  asked for it has its connection closed all the same.
+- **No TLS session to resume.** Over `https://` every fetch makes a full
+  handshake, the certificate verified again each time.
+
+So a fetch costs a TCP handshake, and over HTTPS a TLS handshake on top
+of it: two round trips to the upstream, or three under TLS 1.2, before
+the request's own, and the handshake's arithmetic on the worker's
+thread. An application that makes an upstream call for every request it
+serves, an auth check or a token introspection or a gateway route, pays
+that each time.
+
+What an application can do about it:
+
+- **Cache the name.** `*dns-cache-ttl*` removes the `getent` child, and
+  nothing more: the connection and the handshake are still made.
+- **Verify a token where it arrives.** `jwt-verify` checks a signature
+  against keys the application already holds, where an introspection
+  endpoint is a fetch for every request.
+- **Keep the upstream's connections somewhere else.** A proxy on the
+  same host that holds connections open to the upstream (nginx with
+  `keepalive` in its `upstream` block and HTTP/1.1 to it) turns each
+  fetch into a short plain-HTTP connection over loopback, and the proxy
+  pays the handshakes once for many requests.
+
 ### The write backlog bound
 
 A connection holds one buffer being flushed and, on the paths that queue,
