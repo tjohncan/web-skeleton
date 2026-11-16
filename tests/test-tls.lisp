@@ -19,6 +19,8 @@
         (test-ssl-ctx-init)
         (test-tls-client-ssl)
         (test-tls-end-to-end)
+        (test-tls-a-failed-handshake-says-why)
+        (test-missing-trust-anchors-hint)
         (test-tls-blocking-read-timeout-is-reported-as-one)
         (test-https-stream-survives-collections)
         (test-tls-ssl-pending)
@@ -347,6 +349,252 @@ printf 'TAIL-MARKER\\n' >> body.txt
       (ignore-errors
        (sb-ext:run-program "/bin/rm" (list "-rf" dir) :wait t
                                                       :output nil :error nil)))))
+
+(defparameter *tls-stranger-fixture-script* "
+set -e
+mkdir -p \"$1\"
+cd \"$1\"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -subj /CN=ws-test-ca-nobody-trusts -days 2 -sha256 >/dev/null 2>&1
+printf 'subjectAltName=DNS:right.test\\n' > right.ext
+openssl req -newkey rsa:2048 -nodes -keyout right.key -out right.csr -subj /CN=right.test >/dev/null 2>&1
+openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out right.pem -days 2 -sha256 -extfile right.ext >/dev/null 2>&1
+"
+  "Generates a leaf for right.test under a CA that no test loads into the
+   shared context.
+
+   The CA is named apart from *TLS-FIXTURE-SCRIPT*'s. The shared context
+   keeps every CA a test has loaded, each named ws-test-ca, and an issuer
+   found there by name and refused by its key is another failure than an
+   issuer not found.")
+
+(defun test-tls-a-failed-handshake-says-why ()
+  "A handshake that fails is raised with OpenSSL's reason for it, where
+   SSL_get_error's answer, 1 for nearly every one of them, is all it would
+   otherwise say. A certificate that does not verify names the check that
+   refused it, by its text and its number, and a peer that is not speaking
+   TLS names what was made of its bytes.
+
+   Three peers: s_server presenting a leaf whose issuer nothing here
+   trusts, s_server presenting a leaf the fixture's CA issued for another
+   host, and a listener that answers in plain HTTP. Each is met twice, by
+   the blocking TLS-CONNECT and by SSL-HANDSHAKE-STEPPER, the event loop's,
+   which is run here on a blocking socket so that a call takes the
+   handshake to its end.
+
+   MISSING-TRUST-ANCHORS-HINT ends the first reason when this host has no
+   certificate authority where OpenSSL looks for one, and on no other. The
+   expected text asks the same question, so the check holds on a host with
+   a CA bundle and on one without."
+  (format t "~%TLS: a failed handshake says why~%")
+  (let ((dir (scratch-path "ws-tls"))
+        (stranger (scratch-path "ws-tls-stranger")))
+    (labels ((blocking (port)
+               ;; What TLS-CONNECT raises for the peer on PORT.
+               (let ((web-skeleton::*dns-resolve-blocking-fn*
+                       (lambda (host)
+                         (declare (ignore host))
+                         (values #(127 0 0 1) :inet))))
+                 (handler-case
+                     (multiple-value-bind (ssl socket)
+                         (funcall (tls-sym "TLS-CONNECT") "right.test" port)
+                       (funcall (tls-sym "TLS-CLOSE") ssl socket)
+                       :connected)
+                   (error (e) (princ-to-string e)))))
+             (stepped (port)
+               ;; What the event loop's handshake step raises for it.
+               (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                                            :type :stream :protocol :tcp))
+                     (ssl nil))
+                 (unwind-protect
+                      (handler-case
+                          (progn
+                            (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
+                            (setf ssl (funcall
+                                       (tls-sym "TLS-CLIENT-SSL") "right.test"
+                                       (sb-bsd-sockets:socket-file-descriptor
+                                        socket)))
+                            (loop with step = (funcall
+                                               (tls-sym "SSL-HANDSHAKE-STEPPER")
+                                               ssl)
+                                  repeat 100
+                                  when (eq (funcall step) :done)
+                                    return :connected
+                                  finally (return :unfinished)))
+                        (error (e) (princ-to-string e)))
+                   (when ssl
+                     (ignore-errors (funcall (tls-sym "%SSL-FREE") ssl)))
+                   (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+             (kind (outcome)
+               ;; Which of HANDSHAKE-FAILURE-REASON's arms OUTCOME's reason
+               ;; came from, :BARE-CODE being the arm with nothing to say.
+               (let* ((mark "SSL_connect failed: ")
+                      (at (and (stringp outcome) (search mark outcome)))
+                      (reason (and at (subseq outcome (+ at (length mark))))))
+                 (flet ((begins (prefix)
+                          (eql 0 (search prefix reason))))
+                   (cond ((null reason) outcome)
+                         ((begins "certificate verification failed: ")
+                          :certificate)
+                         ((begins "transport error ") :transport)
+                         ((begins "the peer closed ") :closed)
+                         ((begins "error ") :bare-code)
+                         (t :protocol))))))
+      (unwind-protect
+           (progn
+             (sb-ext:run-program "/bin/sh" (list "-c" *tls-fixture-script* "sh" dir)
+                                 :wait t :output nil :error nil)
+             (sb-ext:run-program "/bin/sh"
+                                 (list "-c" *tls-stranger-fixture-script* "sh"
+                                       stranger)
+                                 :wait t :output nil :error nil)
+             (unless (and (probe-file (format nil "~a/wrong.pem" dir))
+                          (probe-file (format nil "~a/right.pem" stranger)))
+               (check "handshake reason: fixture certificates generated" nil t)
+               (return-from test-tls-a-failed-handshake-says-why))
+             (funcall (tls-sym "%SSL-CTX-LOAD-VERIFY-LOCATIONS")
+                      (funcall (tls-sym "ENSURE-SSL-CTX"))
+                      (format nil "~a/ca.pem" dir)
+                      nil)
+             ;; An issuer nothing trusts.
+             (%call-with-tls-peer
+              stranger "right"
+              (lambda (port)
+                (check "handshake reason: peer came up (unknown issuer)"
+                       (not (null port)) t)
+                (when port
+                  (let ((reason
+                          (format nil "SSL_connect failed: certificate ~
+                                       verification failed: unable to get ~
+                                       local issuer certificate (verify ~
+                                       error 20)~@[. ~a~]"
+                                  (multiple-value-call
+                                      (tls-sym "MISSING-TRUST-ANCHORS-HINT")
+                                    (funcall (tls-sym "TRUST-ANCHOR-PLACES"))))))
+                    (check "handshake reason: an unknown issuer, from TLS-CONNECT"
+                           (blocking port)
+                           (format nil "tls-connect right.test:~d failed: ~a"
+                                   port reason))
+                    (check "handshake reason: an unknown issuer, from the stepper"
+                           (stepped port) reason)))))
+             ;; A trusted issuer, and a certificate for somebody else.
+             (%call-with-tls-peer
+              dir "wrong"
+              (lambda (port)
+                (check "handshake reason: peer came up (another host's)"
+                       (not (null port)) t)
+                (when port
+                  (flet ((says-mismatch (outcome)
+                           (list (kind outcome)
+                                 (and (stringp outcome)
+                                      (search "hostname mismatch (verify error 62)"
+                                              outcome :test #'char-equal)
+                                      t))))
+                    (check "handshake reason: another host's certificate, from TLS-CONNECT"
+                           (says-mismatch (blocking port)) '(:certificate t))
+                    (check "handshake reason: another host's certificate, from the stepper"
+                           (says-mismatch (stepped port)) '(:certificate t))))))
+             ;; A peer that answers in plain HTTP, once for each path: the
+             ;; listener takes one connection.
+             (dolist (path (list (cons "TLS-CONNECT" #'blocking)
+                                 (cons "the stepper" #'stepped)))
+               (%call-with-scripted-upstream
+                (list (crlf "HTTP/1.1 400 Bad Request" "Connection: close") 2)
+                (lambda (port)
+                  (check (format nil "handshake reason: a peer not speaking TLS, from ~a"
+                                 (car path))
+                         (kind (funcall (cdr path) port))
+                         :protocol))
+                :read-request nil)))
+        (ignore-errors
+         (sb-ext:run-program "/bin/rm" (list "-rf" dir stranger) :wait t
+                                                                  :output nil
+                                                                  :error nil))))))
+
+(defun test-missing-trust-anchors-hint ()
+  "MISSING-TRUST-ANCHORS-HINT says that no certificate authority was found
+   exactly when the file is absent, empty or a link to nothing, and no
+   directory holds a certificate under a hashed name. It names the places
+   it looked and the two variables that would point OpenSSL elsewhere.
+
+   This is how a failed handshake on an image with no CA bundle comes to
+   say so. The places are handed in, a scratch directory's, since the ones
+   a process really has are fixed when it starts."
+  (format t "~%TLS: a host with no CA certificates is told so~%")
+  (let* ((root (scratch-path "ws-anchors" "/"))
+         (bundle (format nil "~abundle/cert.pem" root))
+         (empty (format nil "~aempty" root))
+         (unhashed (format nil "~aunhashed" root))
+         (hashed (format nil "~ahashed" root))
+         (absent (format nil "~aabsent" root))
+         (hint (tls-sym "MISSING-TRUST-ANCHORS-HINT")))
+    (flet ((touch (path)
+             (ensure-directories-exist path)
+             (with-open-file (out path :direction :output :if-exists :supersede)
+               (write-line "placeholder" out))))
+      (unwind-protect
+           (progn
+             (touch bundle)
+             (ensure-directories-exist (format nil "~a/" empty))
+             (touch (format nil "~a/ca-certificates.crt" unhashed))
+             (touch (format nil "~a/4a6481c9.0" hashed))
+             (check "anchors: colons separate the directories, and empty names are dropped"
+                    (list (funcall (tls-sym "COLON-SEPARATED") "/a:/b/c")
+                          (funcall (tls-sym "COLON-SEPARATED") "/a")
+                          (funcall (tls-sym "COLON-SEPARATED") ":/a::/b:")
+                          (funcall (tls-sym "COLON-SEPARATED") ""))
+                    '(("/a" "/b/c") ("/a") ("/a" "/b") nil))
+             (check "anchors: no file and no directory is none found, and the hint says where and what to set"
+                    (funcall hint absent (list absent))
+                    (format nil "No CA certificates were found at ~a or in ~a: ~
+                                 install a CA bundle (ca-certificates), or ~
+                                 point SSL_CERT_FILE or SSL_CERT_DIR at one"
+                            absent absent))
+             (check "anchors: an empty directory holds none, nor one of files not named by a hash"
+                    (and (funcall hint absent (list empty unhashed)) t)
+                    t)
+             (check "anchors: the hint lists every directory it looked in"
+                    (and (search (format nil " or in ~a, ~a: " empty unhashed)
+                                 (funcall hint absent (list empty unhashed)))
+                         t)
+                    t)
+             (check "anchors: with no directory to look in, only the file is named"
+                    (and (search (format nil " found at ~a: " absent)
+                                 (funcall hint absent nil))
+                         t)
+                    t)
+             (check "anchors: a file that exists is one found, and there is no hint"
+                    (funcall hint bundle (list absent)) nil)
+             ;; As a host is left where OpenSSL's package brings the file as
+             ;; a link to a bundle that another package would have brought.
+             (let ((link (format nil "~alink/cert.pem" root))
+                   (hollow (format nil "~ahollow/cert.pem" root)))
+               (ensure-directories-exist link)
+               (ensure-directories-exist hollow)
+               (with-open-file (out hollow :direction :output
+                                           :if-exists :supersede)
+                 (declare (ignorable out)))
+               (check "anchors: a link to a bundle that is not there is none found, nor is an empty file"
+                      (list (sb-ext:process-exit-code
+                             (sb-ext:run-program
+                              "ln" (list "-s" (format nil "~anowhere.crt" root)
+                                         link)
+                              :search t :wait t :output nil :error nil))
+                            (and (funcall hint link nil) t)
+                            (and (funcall hint hollow nil) t))
+                      '(0 t t)))
+             (check "anchors: so is a certificate under a hashed name, in any of the directories"
+                    (funcall hint absent (list empty hashed)) nil)
+             (multiple-value-bind (file directories)
+                 (funcall (tls-sym "TRUST-ANCHOR-PLACES"))
+               (check "anchors: this process's own places are a file and a list of directories"
+                      (list (stringp file)
+                            (and (listp directories)
+                                 (every #'stringp directories)))
+                      '(t t))))
+        (ignore-errors
+         (sb-ext:run-program "/bin/rm" (list "-rf" root) :wait t
+                                                         :output nil
+                                                         :error nil))))))
 
 (defun test-tls-blocking-read-timeout-is-reported-as-one ()
   "HTTP-FETCH-STREAM over https:// to a peer that takes the request and

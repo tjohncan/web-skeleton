@@ -224,7 +224,51 @@
   (ssl (* t))
   (type sb-alien:int))
 
+;;; Why a handshake failed. SSL_get_error answers SSL_ERROR_SSL for a
+;;; certificate that did not verify and for a protocol failure alike, which
+;;; says only that the reason is elsewhere. A certificate's is kept on the
+;;; SSL, as its verify result, and a protocol failure's is on the error
+;;; queue. HANDSHAKE-FAILURE-REASON reads both.
+(sb-alien:define-alien-routine ("SSL_get_verify_result" %ssl-get-verify-result)
+    sb-alien:long
+  (ssl (* t)))
+
+(sb-alien:define-alien-routine ("X509_verify_cert_error_string"
+                                %x509-verify-cert-error-string)
+    sb-alien:c-string
+  (n sb-alien:long))
+
+(sb-alien:define-alien-routine ("ERR_peek_error" %err-peek-error)
+    sb-alien:unsigned-long)
+
+(sb-alien:define-alien-routine ("ERR_reason_error_string"
+                                %err-reason-error-string)
+    sb-alien:c-string
+  (e sb-alien:unsigned-long))
+
+;;; Where SSL_CTX_set_default_verify_paths points a context: the names of
+;;; the two environment variables it reads, and the file and directory
+;;; compiled into libcrypto that it uses when they are not set.
+(sb-alien:define-alien-routine ("X509_get_default_cert_file_env"
+                                %x509-get-default-cert-file-env)
+    sb-alien:c-string)
+
+(sb-alien:define-alien-routine ("X509_get_default_cert_file"
+                                %x509-get-default-cert-file)
+    sb-alien:c-string)
+
+(sb-alien:define-alien-routine ("X509_get_default_cert_dir_env"
+                                %x509-get-default-cert-dir-env)
+    sb-alien:c-string)
+
+(sb-alien:define-alien-routine ("X509_get_default_cert_dir"
+                                %x509-get-default-cert-dir)
+    sb-alien:c-string)
+
 ;;; Constants
+(defconstant +x509-v-ok+ 0
+  "SSL_get_verify_result of a certificate that verified, and of a handshake
+   that never came to verify one.")
 (defconstant +ssl-verify-peer+ 1)
 (defconstant +ssl-ctrl-set-tlsext-hostname+ 55)
 (defconstant +ssl-ctrl-set-min-proto-version+ 123)
@@ -279,8 +323,8 @@
           (error "SSL_CTX_new failed"))
         ;; Free the context on any failure below. Nothing cached it yet —
         ;; *SSL-CTX* is only set on the success path — so without this
-        ;; every retry of a failing init leaks another SSL_CTX, and the
-        ;; CA check is a failure an app retries on every single fetch.
+        ;; every retry of a failing init leaks another SSL_CTX, and an app
+        ;; retries a failing init on every single fetch.
         (unwind-protect
              (progn
                ;; Require TLS 1.2+ (RFC 8996 deprecates 1.0/1.1). SSL_CTX_ctrl
@@ -308,24 +352,17 @@
                ;; terminator.
                (when (>= (%openssl-version-num) +openssl-3+)
                  (%ssl-ctx-set-options ctx +ssl-op-ignore-unexpected-eof+))
-               ;; Load system CA certificates. Raising rather than warning:
-               ;; SSL_VERIFY_PEER is set two lines down, so with no trust
-               ;; anchors every handshake fails anyway — a warning would be
-               ;; fail-closed too, but would leave the operator to derive
-               ;; that from one startup line and an unrelated-looking stream
-               ;; of handshake errors afterwards. This is init refusing to hand
-               ;; back a context that cannot do the one thing it is for,
-               ;; which is what the two checks above it already do.
-               ;;
-               ;; Safe to raise here because ENSURE-SSL-CTX is called from
-               ;; TLS-CONNECT, not at startup: a plain-HTTP server on a
-               ;; distroless image still boots, and only an actual HTTPS
-               ;; fetch — which would fail regardless — says why.
+               ;; Point the context at the system's certificate authorities:
+               ;; the places TRUST-ANCHOR-PLACES names. A host with none is
+               ;; not found out here. This answers 1 whether or not anything
+               ;; is there to load: a missing file is no error to it, and a
+               ;; directory is only read when a certificate is looked up.
+               ;; SSL_VERIFY_PEER is set two lines down, so on such a host
+               ;; every handshake fails to verify, which is fail-closed, and
+               ;; HANDSHAKE-FAILURE-REASON is where the missing bundle is
+               ;; named: in the error of each fetch that met it.
                (when (zerop (%ssl-ctx-set-default-verify-paths ctx))
-                 (error "tls: no system CA certificates found, so every HTTPS ~
-                         fetch would fail certificate verification. Install a ~
-                         CA bundle (ca-certificates), or point SSL_CERT_FILE / ~
-                         SSL_CERT_DIR at one."))
+                 (error "SSL_CTX_set_default_verify_paths failed"))
                ;; Enable peer certificate verification
                (%ssl-ctx-set-verify ctx +ssl-verify-peer+ (sb-sys:int-sap 0))
                (setf *ssl-ctx* ctx
@@ -389,6 +426,114 @@
         (when ssl (ignore-errors (%ssl-free ssl)))
         (error "tls-client-ssl ~a: ~a" hostname e)))))
 
+(defun colon-separated (listed)
+  "The names in LISTED, a string with colons between them as SSL_CERT_DIR
+   lists directories, without the empty ones."
+  (loop with start = 0
+        for colon = (position #\: listed :start start)
+        for end = (or colon (length listed))
+        when (< start end)
+          collect (subseq listed start end)
+        while colon
+        do (setf start (1+ colon))))
+
+(defun trust-anchor-places ()
+  "Where OpenSSL looks for the certificate authorities the shared context
+   trusts, as (VALUES FILE DIRECTORIES): the file SSL_CERT_FILE names and
+   the directories SSL_CERT_DIR lists, when the process has those set, and
+   otherwise the file and the directory compiled into libcrypto. The
+   variables' names are asked of OpenSSL as the two defaults are."
+  (flet ((place (variable compiled-in)
+           (or (sb-ext:posix-getenv variable) compiled-in)))
+    (values (place (%x509-get-default-cert-file-env)
+                   (%x509-get-default-cert-file))
+            (colon-separated (place (%x509-get-default-cert-dir-env)
+                                    (%x509-get-default-cert-dir))))))
+
+(defun trust-anchors-found-p (file directories)
+  "True when FILE can be opened and holds something, or one of DIRECTORIES
+   holds a certificate under the name OpenSSL finds one by there: a hash
+   of its subject and a number, .0 for the first of a hash.
+
+   FILE is opened and not probed. Where OpenSSL's own package installs
+   the file as a link to the bundle another package brings, a host
+   without the bundle has the link, and PROBE-FILE answers for a link
+   that leads nowhere as for a file.
+
+   A look at the places and no more. A file of something other than
+   certificates counts as found, and what OpenSSL says of a handshake is
+   then its own reason alone."
+  (flet ((native (name &optional as-directory)
+           (sb-ext:parse-native-namestring name nil *default-pathname-defaults*
+                                           :as-directory as-directory)))
+    (and (or (ignore-errors
+              (with-open-file (in (native file)
+                                  :element-type '(unsigned-byte 8)
+                                  :if-does-not-exist nil)
+                (and in (plusp (file-length in)))))
+             (some (lambda (place)
+                     (ignore-errors
+                      (directory (merge-pathnames
+                                  (make-pathname :name :wild :type "0")
+                                  (native place t))
+                                 :resolve-symlinks nil)))
+                   directories))
+         t)))
+
+(defun missing-trust-anchors-hint (file directories)
+  "NIL when a certificate authority is found at FILE or in DIRECTORIES, and
+   otherwise the sentence saying that none was and what to do about it,
+   for the end of a handshake error.
+
+   It is what tells the operator of an image with no CA bundle, a
+   distroless or scratch one, why every HTTPS fetch fails. OpenSSL's own
+   reason there is that it could not find the certificate's issuer, which
+   reads the same for one unknown issuer as for having none at all."
+  (unless (trust-anchors-found-p file directories)
+    (format nil "No CA certificates were found at ~a~@[ or in ~{~a~^, ~}~]: ~
+                 install a CA bundle (ca-certificates), or point ~a or ~a ~
+                 at one"
+            file directories
+            (%x509-get-default-cert-file-env)
+            (%x509-get-default-cert-dir-env))))
+
+(defun handshake-failure-reason (ssl err errno)
+  "Why the handshake on SSL failed, as text: ERR is what SSL_get_error
+   answered for the SSL_connect that failed, and ERRNO what that call left.
+
+   SSL_get_error's answer alone says almost nothing. An expired
+   certificate, one issued for another host, an issuer nobody trusts and a
+   peer that does not speak TLS are each SSL_ERROR_SSL, 1. OpenSSL has the
+   reason in one of three places:
+
+   - A certificate that did not verify left the check that refused it on
+     the SSL, as its verify result. MISSING-TRUST-ANCHORS-HINT follows it
+     when this host has no certificate authority to verify against, where
+     every certificate is refused.
+   - A failure that is not the certificate's is on the error queue, and
+     the first error there is the one that began it: an alert the peer
+     sent, a record that is not TLS.
+   - SSL_ERROR_SYSCALL is the socket's failure, which ERRNO names. With
+     ERRNO 0 the peer closed in the middle of the handshake.
+
+   Called after SSL_get_error, before anything else touches the queue,
+   which %SSL-CONNECT emptied ahead of the call that failed."
+  (let ((verify (%ssl-get-verify-result ssl)))
+    (cond
+      ((/= verify +x509-v-ok+)
+       (format nil "certificate verification failed: ~a (verify error ~d)~
+                    ~@[. ~a~]"
+               (%x509-verify-cert-error-string verify) verify
+               (multiple-value-call #'missing-trust-anchors-hint
+                 (trust-anchor-places))))
+      ((= err +ssl-error-syscall+)
+       (if (zerop errno)
+           "the peer closed the connection during the handshake"
+           (format nil "transport error ~a" (errno-string errno))))
+      (t
+       (or (%err-reason-error-string (%err-peek-error))
+           (format nil "error ~d" err))))))
+
 (defun ssl-handshake-stepper (ssl)
   "A handshake step function for CONNECTION-HANDSHAKE-FN. Each call runs
    SSL_connect once and answers :DONE, :WANT-READ, :WANT-WRITE, or raises.
@@ -401,16 +546,20 @@
 
    Only the two WANT codes are continuable. Anything else is a failed
    handshake, and treating one as retryable would spin the event loop on a
-   connection that is never going to complete."
+   connection that is never going to complete. It is raised with
+   HANDSHAKE-FAILURE-REASON's account of why."
   (lambda ()
-    (let ((result (%ssl-connect ssl)))
+    (let* ((result (%ssl-connect ssl))
+           ;; Before SSL_get_error, which can set errno itself.
+           (errno (if (= result 1) 0 (get-errno))))
       (if (= result 1)
           :done
           (let ((err (%ssl-get-error ssl result)))
             (cond
               ((= err +ssl-error-want-read+)  :want-read)
               ((= err +ssl-error-want-write+) :want-write)
-              (t (error "SSL_connect failed: error ~d" err))))))))
+              (t (error "SSL_connect failed: ~a"
+                        (handshake-failure-reason ssl err errno)))))))))
 
 (defun tls-connect (hostname port)
   "Open a blocking TLS connection to HOSTNAME:PORT.
@@ -451,7 +600,9 @@
                        (if (or (= err +ssl-error-want-read+)
                                (= err +ssl-error-want-write+))
                            (blocking-want-or-raise "SSL_connect" errno)
-                           (error "SSL_connect failed: error ~d" err)))))))
+                           (error "SSL_connect failed: ~a"
+                                  (handshake-failure-reason
+                                   ssl err errno))))))))
             (values ssl socket))
         (error (e)
           (when ssl

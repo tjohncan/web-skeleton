@@ -652,17 +652,45 @@ Don't rely on cleanup-path exceptions propagating back to the caller — they do
 
 ### TLS trust anchors
 
-**A missing CA store raises rather than warning.** `SSL_VERIFY_PEER` is
-set, so a process with no trust anchors fails every handshake regardless.
-Raising is not what makes it fail-closed; it is what makes the failure
-legible, said once at the first HTTPS fetch rather than left to be
-inferred from an unrelated-looking stream of handshake errors.
+An `https://` fetch verifies the upstream's certificate against the
+host's certificate authorities, where OpenSSL finds them: the file
+`SSL_CERT_FILE` names and the directories `SSL_CERT_DIR` lists, and
+without those the `cert.pem` and `certs` under the directory
+`openssl version -d` prints. `SSL_VERIFY_PEER` is set, and nothing turns
+it off.
 
-This bites on distroless and scratch images. Install a CA bundle
-(`ca-certificates`), or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at one. A
-plain-HTTP server on such an image still boots: the check runs when a TLS
-connection is opened, not at startup, so nothing that never fetches over
-HTTPS is affected.
+**A handshake that fails says why.** The fetch fails as any other does,
+with a `502` to a parked request and its `:then` called for cleanup, and
+the log has OpenSSL's reason for it:
+
+```
+2026-01-01 12:00:00.004 [ERROR] outbound error fd 13: SSL_connect failed: certificate verification failed: unable to get local issuer certificate (verify error 20)
+```
+
+A certificate issued for another name reads `hostname mismatch (verify
+error 62)`. A failure that is not the certificate's is given in OpenSSL's
+words for it, `tlsv1 alert protocol version` from a peer with nothing
+from TLS 1.2 up to offer, and one that is the socket's as `transport
+error` with the errno. `http-fetch-stream` raises the same text.
+
+**A host with no CA bundle fails every handshake, and is told so.** With
+nothing to verify against, no certificate verifies, which is fail-closed.
+OpenSSL does not say that a trust store is empty when it is given one,
+so nothing is refused before a fetch is tried. Each handshake fails, and
+when no certificate is found in the places above the reason goes on to
+say so:
+
+```
+... unable to get local issuer certificate (verify error 20). No CA certificates were found at /usr/lib/ssl/cert.pem or in /usr/lib/ssl/certs: install a CA bundle (ca-certificates), or point SSL_CERT_FILE or SSL_CERT_DIR at one
+```
+
+That is a distroless or scratch image, or a slim one where OpenSSL is
+installed and `ca-certificates` is not. A plain-HTTP server on such an
+image is unaffected: nothing but an HTTPS fetch looks for a certificate
+authority. Found means a file that opens and is not empty, or a
+directory holding a certificate under its hashed name, as
+`ca-certificates` lays them out. A bundle of the wrong authorities is
+found, and OpenSSL's reason is then the whole of the message.
 
 ### Fetch URL safety (SSRF)
 
