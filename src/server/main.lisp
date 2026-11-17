@@ -418,7 +418,12 @@
    answer RST rather than FIN, which discards bytes not yet sent and tells
    the peer the connection failed. See BEGIN-LINGERING-CLOSE. Bounded by
    time alone: the bytes are the client's to send, so draining them costs
-   what receiving them would have.")
+   what receiving them would have.
+
+   Not at shutdown. The drain closes a connection once what it was owed
+   has gone out, the 1001 it sends each WebSocket included, and waits on
+   no client for the rest: see DRAIN-PENDING-WRITES. A client in the
+   middle of a send when the server stops can meet a reset there.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -1438,6 +1443,11 @@
              ;; reads a truncated chunked body, which is exactly what
              ;; happened, and a terminator would claim a complete response
              ;; the app never finished sending. The app hears :SHUTDOWN.
+             ;;
+             ;; A lingering close is cut short the same way. What that
+             ;; connection was owed has gone out, and the linger is a wait
+             ;; for its client to finish sending, which a server that is
+             ;; stopping does not make.
              ((:read-http :read-body :sending-100-continue :awaiting :streaming
                :lingering)
               (close-connection conn epoll-fd :shutdown))
@@ -1507,7 +1517,12 @@
    a 101 becomes :WEBSOCKET, which clears the close-after mark the drain
    set on it. A connection that lands in a state phase 1 would have
    handled is handed to WIND-DOWN as it lands, so the WebSocket gets its
-   1001 like every other, rather than sitting until the deadline."
+   1001 like every other, rather than sitting until the deadline.
+
+   One that lands in :LINGERING, its response or its close frame gone
+   out, is closed there and then. Only writes are dispatched here, so
+   nothing would read and discard what its client still sends, and the
+   drain does not wait on a client for that."
   (let ((deadline (+ (monotonic-seconds) *drain-timeout*)))
     (loop
       (when (zerop (hash-table-count *connections*))
