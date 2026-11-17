@@ -3124,19 +3124,34 @@
   (when (typep claim 'sb-bsd-sockets:socket)
     (ignore-errors (sb-bsd-sockets:socket-close claim))))
 
-(defun retake-port-claim (claim port)
-  "CLAIM, unless it is :HELD: then CLAIM-PORT's answer for PORT, asked
-   again. A server that joined another's port (:SHARE-PORT) calls this on
-   each pass of its wait, so it holds the claim from the pass after the
-   other let go, and a third server is refused as a second would be."
-  (if (eq claim :held)
+(defun retake-port-claim (claim port asked-at now)
+  "For a server that joined another's port (:SHARE-PORT): ask for the
+   claim on PORT again when CLAIM is :HELD and it was last asked for at
+   another second than NOW. Returns (VALUES CLAIM ASKED-AT) as they stand
+   afterwards. ASKED-AT and NOW are MONOTONIC-SECONDS readings.
+
+   START-SERVER calls this from its wait, so a server that joined holds
+   the claim within a second or so of the other letting go, and a third
+   server is refused as a second would be. Once a second and not once a
+   pass: the wait's interval is the application's to shorten, and two
+   servers that share a port for good, on two addresses, would otherwise
+   make a socket and fail to bind it at every pass for as long as they
+   ran.
+
+   Still :HELD when the asking could not be made at all, which CLAIM-PORT
+   has logged. An attempt that failed for want of a descriptor says
+   nothing of the next one, and a server that stopped asking would leave
+   its port unclaimed for good."
+  (if (and (eq claim :held) (/= now asked-at))
       (let ((taken (claim-port port)))
-        (when (typep taken 'sb-bsd-sockets:socket)
-          (log-info "port ~d: this server holds the claim, the one it ~
-                     joined having let go of it"
-                    port))
-        taken)
-      claim))
+        (values (cond ((typep taken 'sb-bsd-sockets:socket)
+                       (log-info "port ~d: this server holds the claim, the ~
+                                  one it joined having let go of it"
+                                 port)
+                       taken)
+                      (t :held))
+                now))
+      (values claim asked-at)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
@@ -3466,7 +3481,10 @@
   ;;
   ;; CLAIM is the lambda list's &AUX: the cleanup that lets go of it is
   ;; this function's last, and has it in scope without one more level
-  ;; around everything between here and there.
+  ;; around everything between here and there. Between here and that
+  ;; cleanup's UNWIND-PROTECT are four assignments and nothing that waits.
+  ;; A thread ended in the middle of them leaves the claim to its
+  ;; socket's finalizer, which closes it at a collection.
   (unless (zerop port)
     (setf claim (claim-port port))
     (when (and (eq claim :held) (not share-port))
@@ -3579,7 +3597,10 @@
                   ;; the drain cleanup can signal and join them.
                   (let ((threads nil)
                         (generation *run-generation*)
-                        (census *connection-census*))
+                        (census *connection-census*)
+                        ;; When the claim was last asked for again: see
+                        ;; RETAKE-PORT-CLAIM.
+                        (claim-asked-at 0))
                     (unwind-protect
                          (progn
                            (dotimes (i workers)
@@ -3626,7 +3647,12 @@
                                      ;; Joined to another server's port,
                                      ;; this one takes the claim when that
                                      ;; one lets go.
-                                     (setf claim (retake-port-claim claim port))
+                                     (when (eq claim :held)
+                                       (multiple-value-setq
+                                           (claim claim-asked-at)
+                                         (retake-port-claim
+                                          claim port claim-asked-at
+                                          (monotonic-seconds))))
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))

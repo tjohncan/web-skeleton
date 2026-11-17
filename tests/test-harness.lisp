@@ -3638,7 +3638,46 @@
                   (let ((again (web-skeleton::claim-port port)))
                     (check "port claim: and there to take again"
                            (typep again 'sb-bsd-sockets:socket) t)
-                    (web-skeleton::release-port-claim again)))
+                    (web-skeleton::release-port-claim again))
+                  ;; A server that joined asks again through
+                  ;; RETAKE-PORT-CLAIM, a second apart. CLAIM-PORT's
+                  ;; answers are scripted for it here: an asking that could
+                  ;; not be made, then a claim another holds, then its own.
+                  (let ((scripted (list nil :held))
+                        (askings 0))
+                    (sb-int:encapsulate
+                     'web-skeleton::claim-port 'scripted
+                     (lambda (real port)
+                       (incf askings)
+                       (if scripted
+                           (pop scripted)
+                           (funcall real port))))
+                    (unwind-protect
+                         (flet ((retake (claim asked-at now)
+                                  (multiple-value-list
+                                   (web-skeleton::retake-port-claim
+                                    claim port asked-at now))))
+                           (check "retake: an asking that could not be made leaves it held, to ask again"
+                                  (retake :held 0 100) '(:held 100))
+                           (check "retake: it is not asked for twice in one second"
+                                  (list (retake :held 100 100) askings)
+                                  '((:held 100) 1))
+                           (check "retake: the second after, it is, and another holds it still"
+                                  (list (retake :held 100 101) askings)
+                                  '((:held 101) 2))
+                           (destructuring-bind (claim asked-at)
+                               (retake :held 101 102)
+                             (check "retake: taken once the other has let go"
+                                    (list (typep claim 'sb-bsd-sockets:socket)
+                                          asked-at askings)
+                                    '(t 102 3))
+                             (check "retake: a claim in hand is not asked for again"
+                                    (list (eq (first (retake claim 102 103)) claim)
+                                          askings)
+                                    '(t 3))
+                             (web-skeleton::release-port-claim claim)))
+                      (sb-int:unencapsulate 'web-skeleton::claim-port
+                                            'scripted))))
              (web-skeleton::release-port-claim taken)
              (web-skeleton::release-port-claim asked)))
       (sb-bsd-sockets:socket-close holder)))

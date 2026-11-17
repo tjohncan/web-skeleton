@@ -243,8 +243,8 @@ ss -xap | grep web-skeleton/port
 `:share-port t` while the old one serves, then stop the old one. The new
 server logs, at WARN, that it joined a claimed port; both serve while
 they overlap, the kernel dividing connections between them; and when the
-old one stops the new one takes the claim, within a
-`*worker-wake-interval*`, and logs that it has. A server started the
+old one stops the new one takes the claim, within a second or so, and
+logs that it has. A server started the
 plain way after that is refused again. A start script that always
 replaces this way can always pass `:share-port t`: on a port nobody has
 claimed it takes the claim as a plain start does. Such a script is then
