@@ -3681,30 +3681,28 @@
              (web-skeleton::release-port-claim taken)
              (web-skeleton::release-port-claim asked)))
       (sb-bsd-sockets:socket-close holder)))
-  ;; With no descriptor to make the socket from, the claim cannot be
-  ;; attempted: that is logged, and is not an answer of :HELD, which would
-  ;; refuse the start. The soft limit is put at 0 for the one call, where
-  ;; every new descriptor fails with EMFILE and those open stay open.
-  (multiple-value-bind (soft hard) (web-skeleton::descriptor-limits)
-    (flet ((set-soft (n)
-             (let ((buf (make-array 2 :element-type '(unsigned-byte 64)
-                                      :initial-contents (list n hard))))
-               (sb-sys:with-pinned-objects (buf)
-                 (web-skeleton::%setrlimit web-skeleton::+rlimit-nofile+
-                                           (sb-sys:vector-sap buf))))))
-      (let* ((log (make-string-output-stream))
-             (got (let ((web-skeleton::*log-stream* log)
-                        (web-skeleton::*log-level* :warn))
-                    (unwind-protect
-                         (progn (set-soft 0)
-                                (web-skeleton::claim-port 1))
-                      (set-soft soft))))
-             (text (get-output-stream-string log)))
-        (check "port claim: one that cannot be attempted is not held, and is logged"
-               (list got
-                     (not (null (search "could not be attempted" text)))
-                     (not (null (search "Socket error in \"socket\"" text))))
-               '(nil t t))))))
+  ;; A claim that cannot be attempted: that is logged, and is not an answer
+  ;; of :HELD, which would refuse the start. The attempt is made to fail
+  ;; here by PORT-CLAIM-NAME signalling, which CLAIM-PORT meets where it
+  ;; would meet a socket the kernel refused to bind. Nothing of the
+  ;; process is touched to arrange it: a descriptor limit lowered for the
+  ;; call would be lowered for every other thread as well.
+  (let ((log (make-string-output-stream)))
+    (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused
+                        (lambda (real port)
+                          (declare (ignore real port))
+                          (error "no name to bind")))
+    (let ((got (unwind-protect
+                    (let ((web-skeleton::*log-stream* log)
+                          (web-skeleton::*log-level* :warn))
+                      (web-skeleton::claim-port 1))
+                 (sb-int:unencapsulate 'web-skeleton::port-claim-name
+                                       'refused))))
+      (check "port claim: one that cannot be attempted is not held, and is logged"
+             (list got
+                   (not (null (search "could not be attempted (no name to bind)"
+                                      (get-output-stream-string log)))))
+             '(nil t)))))
 
 (defun test-harness-a-claimed-port-refuses-a-second-server ()
   "START-SERVER on a port whose claim another holds signals, naming the
