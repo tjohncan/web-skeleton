@@ -399,6 +399,81 @@
                   (store-get by-function (copy-seq "k")) :v))
       (sb-int:unencapsulate 'web-skeleton::store-key-hash 'counted))))
 
+(defun test-store-keys-known-by-identity-are-filed-by-the-object ()
+  "A store made with the default TEST files a key EQUAL knows only by
+   identity, a vector that is not a string or a structure or a symbol, in
+   a table SBCL hashes by the object, and not under STORE-KEY-HASH.
+
+   STORE-KEY-HASH has only SXHASH to tell two such keys apart by, and
+   SXHASH answers alike for any two vectors that are not strings: filed
+   under it, the two thousand byte vectors here would sit in one place,
+   each walked past at every lookup. Where they are filed is what is
+   checked, by the count of each table, with a string key as the control
+   that the other table is still the one for what a client chooses.
+
+   Every operation then finds such a key where it is filed: by the object
+   and not by another that holds the same, as EQUAL has it."
+  (format t "~%Store: a key known by identity is filed by the object~%")
+  (flet ((octets (i)
+           (let ((v (make-array 4 :element-type '(unsigned-byte 8)
+                                  :initial-element 0)))
+             (setf (aref v 0) (mod i 256)
+                   (aref v 1) (floor i 256))
+             v)))
+    (let* ((s (make-store :expiry-fn (lambda (k v)
+                                       (declare (ignore k))
+                                       (eq v :doomed))
+                          :reap-interval 3600))
+           (vectors (loop for i below 2000 collect (octets i)))
+           (object (make-json-object nil))
+           (one (first vectors)))
+      (unwind-protect
+           (progn
+             (dolist (v vectors) (store-set s v :a-vector))
+             (store-set s "a string" :a-string)
+             (store-set s object :an-object)
+             (store-set s :a-symbol :a-symbol)
+             (check "identity: vectors, a structure and a symbol are in the table SBCL hashes"
+                    (list (hash-table-count (web-skeleton::store-table s))
+                          (hash-table-count (web-skeleton::store-others s)))
+                    '(1 2002))
+             (check "identity: the count is of both tables" (store-count s) 2003)
+             (check "identity: each is found by the object"
+                    (list (store-get s one) (store-get s object)
+                          (store-get s :a-symbol) (store-get s "a string"))
+                    '(:a-vector :an-object :a-symbol :a-string))
+             (check "identity: and not by another vector that holds the same"
+                    (multiple-value-list (store-get s (copy-seq one)))
+                    '(nil nil))
+             (check "identity: STORE-UPDATE reads and writes it where it is filed"
+                    (list (store-update s one (lambda (old) (list old :updated)))
+                          (store-get s one)
+                          (store-count s))
+                    '((:a-vector :updated) (:a-vector :updated) 2003))
+             (check "identity: STORE-MAP visits both tables"
+                    (let ((seen 0))
+                      (store-map s (lambda (k v) (declare (ignore k v)) (incf seen)))
+                      seen)
+                    2003)
+             (check "identity: STORE-DELETE removes it, once"
+                    (list (store-delete s one) (store-delete s one)
+                          (store-count s))
+                    '(t nil 2002))
+             (store-set s (second vectors) :doomed)
+             (store-set s "a string" :doomed)
+             (check "identity: the reaper's sweep removes from both tables"
+                    (list (web-skeleton::reap-store s) (store-count s)
+                          (store-get s (second vectors)) (store-get s "a string"))
+                    '(2 2000 nil nil)))
+        (stop-store-reaper s))))
+  (let ((plain (make-store :test 'eql))
+        (key (vector 1 2)))
+    (store-set plain key :found)
+    (check "identity: a store with another TEST has the one table, and files there"
+           (list (web-skeleton::store-others plain) (store-get plain key)
+                 (store-count plain))
+           '(nil :found 1))))
+
 (defun test-store-secret-is-not-saved-with-an-image ()
   "The stores' secret is not carried into a saved image, and a store
    saved with entries in it still finds them in the process started from
@@ -462,6 +537,7 @@
   (test-store-key-hash-is-siphash-of-the-whole-key)
   (test-store-key-hash-agrees-with-equal)
   (test-store-default-table-hashes-with-the-secret)
+  (test-store-keys-known-by-identity-are-filed-by-the-object)
   (test-store-secret-is-not-saved-with-an-image)
   (report-suite "Store")
   (zerop *tests-failed*))

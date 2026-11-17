@@ -1867,10 +1867,13 @@ mutex, until they expire. Where a key lands under the secret cannot be
 worked out without it.
 
 - Strings, integers and lists of them, to any depth, are hashed whole.
-  A key of another kind (a symbol, a pathname, a structure) is hashed
-  from its `sxhash`, and two that `sxhash` cannot tell apart still land
-  together. Build a key a client has a hand in out of strings and
-  integers.
+  A float, a character or a pathname is hashed from its `sxhash`, and
+  two that `sxhash` cannot tell apart still land together. Build a key a
+  client has a hand in out of strings and integers.
+- A key `equal` knows only by identity, a symbol or a structure or a
+  vector that is not a string, is no client's to choose: it is that one
+  object or it is not. Such a key is filed by the object, as SBCL files
+  it, in a second table beside the first.
 - A store made with another `:test` (`eql`, `equalp`) hashes as SBCL
   does. Key such a store by something the server chooses, a session id
   it generated say, or by an HMAC of the client's value.

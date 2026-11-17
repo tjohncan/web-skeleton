@@ -31,9 +31,11 @@
   (lock           nil)
   ;; KEYED is true of a store whose table hashes with STORE-KEY-HASH, and
   ;; FILED-UNDER is then the secret its entries are filed under: see
-  ;; STORE-TABLE-IN-USE.
+  ;; STORE-TABLE-IN-USE. OTHERS is such a store's second table, for the
+  ;; keys EQUAL knows only by identity: see STORE-TABLE-FOR.
   (keyed          nil)
   (filed-under    nil)
+  (others         nil :type (or null hash-table))
   (expiry-fn      nil :type (or null function))
   ;; REAP-INTERVAL accepts any positive real — integer in production
   ;; (seconds between sweeps), float permitted so the test suite can
@@ -230,10 +232,13 @@
    built of, and each is hashed whole, with its length, so no two such
    keys hash alike by construction.
 
-   Any other key (a symbol, a character, a float, a pathname, a
-   structure) goes in as its SXHASH, which is equal for EQUAL objects by
+   Anything else, a character, a float, a pathname, or a symbol inside a
+   list, goes in as its SXHASH, which is equal for EQUAL objects by
    definition. The secret still decides where it lands, but two that
-   SXHASH cannot tell apart land together."
+   SXHASH cannot tell apart land together. That is all of some kinds of
+   object, every vector that is not a string for one, which is why a key
+   EQUAL knows only by identity is not filed under this hash at all: see
+   STORE-TABLE-FOR."
   (let ((secret (store-hash-secret)))
     (or (typecase key
           ((simple-array character (*))
@@ -244,7 +249,8 @@
 
 (defun store-table-in-use (store)
   "STORE's table, ready to have a key looked up in it. Called with the
-   store's mutex held, by every operation that hashes a key.
+   store's mutex held, before a key is hashed in it: by STORE-TABLE-FOR
+   for an operation on one key, and by the reaper's sweep.
 
    A keyed table's entries are filed under the secret that was current
    when they went in, and FILED-UNDER remembers which. It differs from
@@ -267,6 +273,28 @@
           (setf (store-filed-under store) secret))))
     table))
 
+(defun store-table-for (store key)
+  "The table of STORE that KEY is filed in, ready to have it looked up.
+   Called with the store's mutex held, by every operation on one key.
+
+   A keyed store has two. EQUAL compares a string, a cons, a number, a
+   character, a bit vector and a pathname by what they hold. Those are
+   what a client's input is made into, and they are filed under
+   STORE-KEY-HASH. Every other key EQUAL compares by identity: a symbol,
+   a structure, a vector that is not a string. Such a key is the one
+   object or it is not, which no client chooses, and it is filed in
+   OTHERS, a table SBCL hashes itself, by the object.
+
+   STORE-KEY-HASH would have only SXHASH to tell two such keys apart by,
+   and SXHASH answers alike for any two vectors that are not strings.
+   Filed under it, a store keyed by byte vectors would keep every one in
+   the same place and walk them all at each lookup."
+  (if (and (store-keyed store)
+           (not (typep key '(or string cons number character
+                                bit-vector pathname))))
+      (store-others store)
+      (store-table-in-use store)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Public API
 ;;; ---------------------------------------------------------------------------
@@ -284,9 +312,11 @@
 
    With the default TEST, keys are hashed by STORE-KEY-HASH, under a
    secret, so a store may be keyed by what a client chooses: a client
-   cannot choose keys that land together. A store made with another TEST
-   hashes as SBCL does, which anyone can work out; key such a store by
-   something the server chooses."
+   cannot choose keys that land together. A key EQUAL knows only by
+   identity, a symbol or a structure or a vector that is not a string, is
+   filed by the object, as SBCL files it. A store made with another TEST
+   hashes as SBCL does throughout, which anyone can work out; key such a
+   store by something the server chooses."
   (when (or (and expiry-fn (null reap-interval))
             (and reap-interval (null expiry-fn)))
     (error "make-store: :expiry-fn and :reap-interval must be supplied together"))
@@ -297,6 +327,7 @@
                                              :hash-function 'store-key-hash)
                             (make-hash-table :test test))
                  :keyed keyed
+                 :others (and keyed (make-hash-table :test 'equal))
                  :lock  (sb-thread:make-mutex :name "store")
                  :expiry-fn expiry-fn
                  :reap-interval reap-interval)))
@@ -309,12 +340,12 @@
    PRESENT-P distinguishes an explicit NIL value from a missing key.
    Callers that never store NIL can ignore the second value."
   (sb-thread:with-mutex ((store-lock store))
-    (gethash key (store-table-in-use store))))
+    (gethash key (store-table-for store key))))
 
 (defun store-set (store key value)
   "Set KEY to VALUE in STORE. Returns VALUE."
   (sb-thread:with-mutex ((store-lock store))
-    (setf (gethash key (store-table-in-use store)) value)))
+    (setf (gethash key (store-table-for store key)) value)))
 
 (defun store-update (store key fn)
   "Atomically update the value for KEY by calling FN on the current value.
@@ -323,7 +354,7 @@
    mutex, so concurrent STORE-UPDATE calls for the same key serialize
    cleanly — compare-and-swap for free. Returns the new value."
   (sb-thread:with-mutex ((store-lock store))
-    (let* ((table (store-table-in-use store))
+    (let* ((table (store-table-for store key))
            (new (funcall fn (gethash key table))))
       (setf (gethash key table) new)
       new)))
@@ -349,12 +380,14 @@
 (defun store-delete (store key)
   "Remove KEY from STORE. Returns T if it was present, NIL if not."
   (sb-thread:with-mutex ((store-lock store))
-    (remhash key (store-table-in-use store))))
+    (remhash key (store-table-for store key))))
 
 (defun store-count (store)
   "Return the number of entries in STORE."
   (sb-thread:with-mutex ((store-lock store))
-    (hash-table-count (store-table store))))
+    (let ((others (store-others store)))
+      (+ (hash-table-count (store-table store))
+         (if others (hash-table-count others) 0)))))
 
 (defun store-map (store fn)
   "Call (FN KEY VALUE) for each entry in STORE under the store's mutex.
@@ -365,7 +398,10 @@
    Downstream apps rarely need this; the optional reaper subsumes the
    common walk-and-delete pattern. Returns NIL."
   (sb-thread:with-mutex ((store-lock store))
-    (maphash fn (store-table store)))
+    (maphash fn (store-table store))
+    (let ((others (store-others store)))
+      (when others
+        (maphash fn others))))
   nil)
 
 ;;; ---------------------------------------------------------------------------
@@ -380,16 +416,20 @@
    between collect and delete cannot cause spurious removal of a value
    a caller just replaced."
   (let ((expiry-fn (store-expiry-fn store))
-        (doomed '()))
+        (removed 0))
     (sb-thread:with-mutex ((store-lock store))
-      (let ((table (store-table-in-use store)))
-        (maphash (lambda (k v)
-                   (when (funcall expiry-fn k v)
-                     (push k doomed)))
-                 table)
-        (dolist (k doomed)
-          (remhash k table))))
-    (length doomed)))
+      ;; Each of the store's tables in turn: see STORE-TABLE-FOR.
+      (dolist (table (list (store-table-in-use store) (store-others store)))
+        (when table
+          (let ((doomed '()))
+            (maphash (lambda (k v)
+                       (when (funcall expiry-fn k v)
+                         (push k doomed)))
+                     table)
+            (dolist (k doomed)
+              (remhash k table))
+            (incf removed (length doomed))))))
+    removed))
 
 (defun start-store-reaper (store)
   "Spawn the reaper thread for STORE and register its stop function in
