@@ -384,10 +384,16 @@ openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out ri
    MISSING-TRUST-ANCHORS-HINT ends the first reason when this host has no
    certificate authority where OpenSSL looks for one, and on no other. The
    expected text asks the same question, so the check holds on a host with
-   a CA bundle and on one without."
+   a CA bundle and on one without.
+
+   The hint is a look at the filesystem, made on the thread the handshake
+   failed on, so its calls are counted: one for each handshake that failed
+   for want of an issuer, which a missing store can cause, and none for a
+   certificate issued to another host, which it cannot."
   (format t "~%TLS: a failed handshake says why~%")
   (let ((dir (scratch-path "ws-tls"))
-        (stranger (scratch-path "ws-tls-stranger")))
+        (stranger (scratch-path "ws-tls-stranger"))
+        (hints 0))
     (labels ((blocking (port)
                ;; What TLS-CONNECT raises for the peer on PORT.
                (let ((web-skeleton::*dns-resolve-blocking-fn*
@@ -455,6 +461,10 @@ openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out ri
                       (funcall (tls-sym "ENSURE-SSL-CTX"))
                       (format nil "~a/ca.pem" dir)
                       nil)
+             (sb-int:encapsulate (tls-sym "MISSING-TRUST-ANCHORS-HINT") 'counted
+                                 (lambda (real file directories)
+                                   (incf hints)
+                                   (funcall real file directories)))
              ;; An issuer nothing trusts.
              (%call-with-tls-peer
               stranger "right"
@@ -470,12 +480,15 @@ openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out ri
                                   (multiple-value-call
                                       (tls-sym "MISSING-TRUST-ANCHORS-HINT")
                                     (funcall (tls-sym "TRUST-ANCHOR-PLACES"))))))
+                    (setf hints 0)
                     (check "handshake reason: an unknown issuer, from TLS-CONNECT"
                            (blocking port)
                            (format nil "tls-connect right.test:~d failed: ~a"
                                    port reason))
                     (check "handshake reason: an unknown issuer, from the stepper"
-                           (stepped port) reason)))))
+                           (stepped port) reason)
+                    (check "handshake reason: the CA store was looked for after each"
+                           hints 2)))))
              ;; A trusted issuer, and a certificate for somebody else.
              (%call-with-tls-peer
               dir "wrong"
@@ -489,10 +502,13 @@ openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out ri
                                       (search "hostname mismatch (verify error 62)"
                                               outcome :test #'char-equal)
                                       t))))
+                    (setf hints 0)
                     (check "handshake reason: another host's certificate, from TLS-CONNECT"
                            (says-mismatch (blocking port)) '(:certificate t))
                     (check "handshake reason: another host's certificate, from the stepper"
-                           (says-mismatch (stepped port)) '(:certificate t))))))
+                           (says-mismatch (stepped port)) '(:certificate t))
+                    (check "handshake reason: and the CA store was looked for after neither"
+                           hints 0)))))
              ;; A peer that answers in plain HTTP, once for each path: the
              ;; listener takes one connection.
              (dolist (path (list (cons "TLS-CONNECT" #'blocking)
@@ -505,6 +521,8 @@ openssl x509 -req -in right.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out ri
                          (kind (funcall (cdr path) port))
                          :protocol))
                 :read-request nil)))
+        (ignore-errors
+         (sb-int:unencapsulate (tls-sym "MISSING-TRUST-ANCHORS-HINT") 'counted))
         (ignore-errors
          (sb-ext:run-program "/bin/rm" (list "-rf" dir stranger) :wait t
                                                                   :output nil

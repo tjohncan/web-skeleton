@@ -497,6 +497,18 @@
             (%x509-get-default-cert-file-env)
             (%x509-get-default-cert-dir-env))))
 
+(defun issuer-not-found-p (verify)
+  "True of the verify results OpenSSL gives a certificate whose issuer it
+   did not find among those it trusts. They are the ones a host with no
+   certificate authorities gives every certificate. Any other refusal, of
+   an expired certificate or one issued for another host, got as far as
+   an issuer that was found."
+  (member verify '(2      ; unable to get issuer certificate
+                   18     ; self-signed certificate
+                   19     ; self-signed certificate in certificate chain
+                   20     ; unable to get local issuer certificate
+                   21)))  ; unable to verify the first certificate
+
 (defun handshake-failure-reason (ssl err errno)
   "Why the handshake on SSL failed, as text: ERR is what SSL_get_error
    answered for the SSL_connect that failed, and ERRNO what that call left.
@@ -509,7 +521,11 @@
    - A certificate that did not verify left the check that refused it on
      the SSL, as its verify result. MISSING-TRUST-ANCHORS-HINT follows it
      when this host has no certificate authority to verify against, where
-     every certificate is refused.
+     every certificate is refused. The hint is asked for only after a
+     refusal for want of an issuer (ISSUER-NOT-FOUND-P), which is the one
+     a missing store causes: asking opens a file and may list a
+     directory, on the worker's thread, and an upstream with an expired
+     certificate would otherwise have it done for every fetch.
    - A failure that is not the certificate's is on the error queue, and
      the first error there is the one that began it: an alert the peer
      sent, a record that is not TLS.
@@ -524,8 +540,9 @@
        (format nil "certificate verification failed: ~a (verify error ~d)~
                     ~@[. ~a~]"
                (%x509-verify-cert-error-string verify) verify
-               (multiple-value-call #'missing-trust-anchors-hint
-                 (trust-anchor-places))))
+               (and (issuer-not-found-p verify)
+                    (multiple-value-call #'missing-trust-anchors-hint
+                      (trust-anchor-places)))))
       ((= err +ssl-error-syscall+)
        (if (zerop errno)
            "the peer closed the connection during the handshake"
