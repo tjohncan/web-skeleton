@@ -813,7 +813,9 @@ being chosen and being served.
 It binds that first socket for a port given by number too, before it
 starts a worker. A port that cannot be bound, because another program
 holds it, or it is a privileged one, or the host has no such address, is
-an error from `start-server` that names the address.
+an error from `start-server` that names the address. That refusal and
+the claim's below both come before `start-server` has changed anything,
+so a server already running in the image is left as it was.
 
 A second server on a port is refused as well, though its bind would not
 fail. `start-server` claims the port number before it binds, and signals

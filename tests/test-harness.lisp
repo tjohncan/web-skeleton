@@ -3588,6 +3588,67 @@
            (search "worker 0" (get-output-stream-string log))
            nil)))
 
+(defun test-harness-a-start-refused-at-its-bind-leaves-a-running-server-alone ()
+  "A START-SERVER refused because its port cannot be bound has changed
+   nothing first: no run has begun, the census is still the running
+   server's, and a server already running in the image goes on serving.
+
+   A later START-SERVER stops the workers of an earlier one in the image,
+   by the run it begins. So a refusal that came after the run began
+   would leave the running server's port served by nothing, though its
+   caller was told the start had been refused.
+
+   The running server is one on a kernel-chosen port. The refused start
+   asks for a port held by a listener without SO_REUSEPORT, so that its
+   bind fails, and runs on a thread joined with a bound."
+  (format t "~%Harness: a start refused at its bind leaves a running server alone~%")
+  (%call-with-bare-server 1
+    (lambda (port)
+      (let ((holder (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp))
+            (message nil))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-bind holder #(127 0 0 1) 0)
+               (sb-bsd-sockets:socket-listen holder 1)
+               (check "refused bind: control, the running server answers"
+                      (%port-answers-with-p port "bare")
+                      t)
+               (let* ((held (%port-of holder))
+                      (generation web-skeleton::*run-generation*)
+                      (census web-skeleton::*connection-census*)
+                      (start (sb-thread:make-thread
+                              (lambda ()
+                                (handler-case
+                                    (start-server
+                                     :host #(127 0 0 1) :port held :workers 1
+                                     :handler (lambda (r) (declare (ignore r))))
+                                  (error (e)
+                                    (setf message (princ-to-string e)))))
+                              :name "refused-bind-probe")))
+                 (handler-case (sb-thread:join-thread start :timeout 5)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread start))
+                     (ignore-errors (sb-thread:join-thread start))))
+                 (check "refused bind: the start was refused, naming the address"
+                        (and message
+                             (search (format nil "cannot listen on 127.0.0.1:~d"
+                                             held)
+                                     message)
+                             t)
+                        t)
+                 (check "refused bind: no run began, and the census is the running server's"
+                        (list (- web-skeleton::*run-generation* generation)
+                              (eq web-skeleton::*connection-census* census))
+                        '(0 t))
+                 ;; Several passes of the running server's loop, each of
+                 ;; which would see a run begun since its own and stop.
+                 (sleep 0.3)
+                 (check "refused bind: and the running server still answers"
+                        (%port-answers-with-p port "bare")
+                        t)))
+          (ignore-errors (sb-bsd-sockets:socket-close holder)))))))
+
 (defun %unix-socket-listed-p (name)
   "True when /proc/net/unix lists a socket bound to NAME, an abstract name
    written as the file shows one, with its @."
@@ -10270,6 +10331,7 @@
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
   (test-harness-a-port-that-cannot-be-bound-fails-the-start)
+  (test-harness-a-start-refused-at-its-bind-leaves-a-running-server-alone)
   (test-harness-a-port-claim-has-one-holder)
   (test-harness-a-claimed-port-refuses-a-second-server)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

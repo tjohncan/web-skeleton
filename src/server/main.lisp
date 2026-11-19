@@ -3204,7 +3204,7 @@
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler body-handler on-listen on-tick
                           share-port
-                     &aux claim)
+                     &aux claim listener0)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -3283,7 +3283,10 @@
    spawned, whichever kind of port was asked for. A port that cannot be
    bound — one another program holds, a privileged one, an address the
    host does not have — is therefore an error from this function, naming
-   the address, and not each worker failing its bind once a second.
+   the address, and not each worker failing its bind once a second. The
+   bind, like the claim below, comes before this call has changed
+   anything: a start refused by either leaves a server already running in
+   this image as it was.
 
    A second server on PORT is refused. Its bind would not fail, every
    listener setting SO_REUSEPORT, so before it binds this function takes a
@@ -3488,30 +3491,62 @@
                       (:positive-whole-seconds "a positive whole number of seconds")
                       (:count "an integer, 0 or more")
                       (:positive-count "a positive integer"))))
-  ;; Twelfth, and the one check that takes something: the claim on PORT.
-  ;; Taken here, while a refusal still leaves everything as it was: an
-  ;; earlier run's workers, and a server running in this image, are not
-  ;; touched by a start that is refused. A port the kernel is to choose is
-  ;; claimed further down, when there is a number to claim.
+  ;; Twelfth and last, and the two that take something: the claim on PORT
+  ;; and the first listener. Both come before anything changes, so a start
+  ;; refused by either leaves everything as it was: an earlier run's
+  ;; workers, and a server running in this image, are not touched by it.
   ;;
-  ;; CLAIM is the lambda list's &AUX: the cleanup that lets go of it is
-  ;; this function's last, and has it in scope without one more level
-  ;; around everything between here and there. Between here and that
-  ;; cleanup's UNWIND-PROTECT are four assignments and nothing that waits.
-  ;; A thread ended in the middle of them leaves the claim to its
-  ;; socket's finalizer, which closes it at a collection.
-  (unless (zerop port)
-    (setf claim (claim-port port))
-    (when (and (eq claim :held) (not share-port))
-      (error "start-server: port ~d is claimed by another web-skeleton ~
-              server, in this process or another. This one's bind would ~
-              not fail, every listener setting SO_REUSEPORT: both would ~
-              serve, the kernel dividing connections between them, with ~
-              nothing in either log. Stop the other first, or pass ~
-              :SHARE-PORT T to start beside it, as a process taking over ~
-              from the one it replaces does. The claim is on the port ~
-              number, whatever the address."
-             port)))
+  ;; The first listener is bound here, on the calling thread, and not by a
+  ;; worker, for two reasons. A port that cannot be bound fails the start:
+  ;; a worker whose bind fails restarts and tries again, once a second, so
+  ;; left to the workers, a port another program holds would have every
+  ;; one of them doing that for as long as the process ran, with this
+  ;; function in its wait below and its caller told nothing. And port 0 is
+  ;; resolved here, once, rather than by the workers each passing it to
+  ;; bind(2). Two things break if they do: N workers on port 0 land on N
+  ;; *different* ephemeral ports, and RUN-WORKER's restart loop rebinds,
+  ;; so a crashed worker would come back somewhere its siblings are not.
+  ;; Neither shows up as an error — the server keeps serving on whichever
+  ;; port the caller happens to have been told about.
+  ;;
+  ;; The socket bound here is handed to worker 0 rather than closed and
+  ;; rebound: a port that is closed and rebound is free for an instant, and
+  ;; the docstring above is about what gets into that instant. A port given
+  ;; by number is claimed before it is bound; one the kernel chooses is
+  ;; claimed as it is bound, when there is a number to claim.
+  ;;
+  ;; CLAIM and LISTENER0 are the lambda list's &AUX: the cleanup that lets
+  ;; go of them is this function's last, and has them in scope without one
+  ;; more level around everything between here and there. Between here and
+  ;; that cleanup's UNWIND-PROTECT are four assignments and nothing that
+  ;; waits. A thread ended in the middle of them leaves the claim and the
+  ;; listener to their sockets' finalizers, which close them at a
+  ;; collection.
+  (cond
+    ((zerop port)
+     (multiple-value-setq (listener0 claim) (make-claimed-listener host)))
+    (t
+     (setf claim (claim-port port))
+     (when (and (eq claim :held) (not share-port))
+       (error "start-server: port ~d is claimed by another web-skeleton ~
+               server, in this process or another. This one's bind would ~
+               not fail, every listener setting SO_REUSEPORT: both would ~
+               serve, the kernel dividing connections between them, with ~
+               nothing in either log. Stop the other first, or pass ~
+               :SHARE-PORT T to start beside it, as a process taking over ~
+               from the one it replaces does. The claim is on the port ~
+               number, whatever the address."
+              port))
+     ;; A bind that is refused lets go of the claim on its way out, since
+     ;; the cleanup that otherwise would is not reached yet.
+     (let ((bound nil))
+       (unwind-protect
+            (setf listener0 (make-first-listener host port)
+                  bound t)
+         (unless bound
+           (release-port-claim claim))))))
+  ;; From here the start changes things, and nothing below refuses it.
+  ;;
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
@@ -3541,40 +3576,10 @@
                                  (declare (ignore signal info context))
                                  (setf *shutdown* t)))))
            (unwind-protect
-                ;; The first listener is bound here, on the calling thread,
-                ;; and not by a worker, for two reasons.
-                ;;
-                ;; A port that cannot be bound fails the start. A worker
-                ;; whose bind fails restarts and tries again, once a
-                ;; second: left to the workers, a port another program
-                ;; holds would have every one of them doing that for as
-                ;; long as the process ran, with this function in its wait
-                ;; below and its caller told nothing.
-                ;;
-                ;; And port 0 is resolved here, once, rather than by the
-                ;; workers each passing it to bind(2). Two things break if
-                ;; they do: N workers on port 0 land on N *different*
-                ;; ephemeral ports, and RUN-WORKER's restart loop rebinds,
-                ;; so a crashed worker would come back somewhere its
-                ;; siblings are not. Neither shows up as an error — the
-                ;; server keeps serving on whichever port the caller
-                ;; happens to have been told about.
-                ;;
-                ;; The socket bound here is handed to worker 0 rather than
-                ;; closed and rebound: a port that is closed and rebound is
-                ;; free for an instant, and the docstring above is about
-                ;; what gets into that instant.
-                ;;
-                ;; A port given by number was claimed above. One the
-                ;; kernel chooses is claimed as it is bound.
-                (let* ((listener0 (if (zerop port)
-                                      (multiple-value-bind (listener taken)
-                                          (make-claimed-listener host)
-                                        (setf claim taken)
-                                        listener)
-                                      (make-first-listener host port)))
-                       (port (nth-value 1 (sb-bsd-sockets:socket-name
-                                           listener0))))
+                (progn
+                  ;; The number the kernel chose, when it was asked to.
+                  (setf port (nth-value 1 (sb-bsd-sockets:socket-name
+                                           listener0)))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
                   ;; At WARN though it was asked for: two servers on one
@@ -3678,12 +3683,6 @@
                       ;; exit, interactive-interrupt, AND a MAKE-THREAD
                       ;; raise partway through the spawn loop.
                       (setf *shutdown* t)
-                      ;; Non-NIL only if MAKE-THREAD raised before worker 0
-                      ;; adopted it, in which case nothing else will ever
-                      ;; close it.
-                      (when listener0
-                        (ignore-errors
-                         (sb-bsd-sockets:socket-close listener0)))
                       ;; A worker still inside a handler or a callback when
                       ;; its join gives up is still running, and is said to
                       ;; be, by name, rather than this returning under a
@@ -3722,6 +3721,11 @@
       ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
       (ignore-errors
        (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))
+      ;; The first listener, when worker 0 never adopted it: MAKE-THREAD
+      ;; raised before worker 0's thread existed, or something raised
+      ;; between the bind and the spawn. Nothing else will ever close it.
+      (when listener0
+        (ignore-errors (sb-bsd-sockets:socket-close listener0)))
       ;; And let go of the port's claim, whether or not every worker
       ;; stopped. The claim stands for a START-SERVER that is running, so a
       ;; later one in this image, on the same port, is not refused by its
