@@ -4820,6 +4820,60 @@
            (not (null (search "crashed" (get-output-stream-string log))))
            t)))
 
+(defun test-harness-empty-lines-before-a-request-line-e2e ()
+  "Empty lines before a request line are skipped: between two requests
+   on a kept-alive connection, after a POST's body, and at the start of a
+   connection. RFC 9112 §2.2 asks this of a server, for the CRLF some
+   clients send after a body, which is otherwise the next request's first
+   line, an empty one, answered 400 with the connection closed.
+
+   A CRLF and nothing else is an empty line: a lone LF in front of a
+   request is refused, as it is anywhere in a head. And the empty lines
+   in front of one request are counted against *MAX-REQUEST-LINE-LENGTH*,
+   so a request behind more of them than that is refused with 400."
+  (format t "~%Harness: empty lines before a request line~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "path=~a" (http-request-path req)))))
+    (flet ((exchange (&rest parts)
+             (%raw-exchange (%ascii (apply #'concatenate 'string parts))))
+           (get-line (path &optional close)
+             (format nil "GET ~a HTTP/1.1~aHost: localhost~a~@[Connection: close~a~]~a"
+                     path *crlf* *crlf* (and close *crlf*) *crlf*)))
+      (let ((between (exchange (get-line "/one") *crlf* (get-line "/two" t)))
+            (after-body (exchange "POST /form HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Content-Length: 5" *crlf* *crlf*
+                                  "HELLO" *crlf*
+                                  (get-line "/after" t)))
+            (opening (exchange *crlf* *crlf* (get-line "/fresh" t)))
+            (lone-lf (exchange (string #\Newline) (get-line "/lf" t)))
+            (too-many (exchange (with-output-to-string (s)
+                                  (loop repeat (1+ (floor *max-request-line-length* 2))
+                                        do (write-string *crlf* s)))
+                                (get-line "/far" t))))
+        (check "empty lines: a CRLF between kept-alive requests is skipped"
+               (list (not (null (search "path=/one" between)))
+                     (not (null (search "path=/two" between)))
+                     (search "HTTP/1.1 400" between))
+               '(t t nil))
+        (check "empty lines: and one after a POST's body"
+               (list (not (null (search "path=/form" after-body)))
+                     (not (null (search "path=/after" after-body))))
+               '(t t))
+        (check "empty lines: and two at the start of a connection"
+               (not (null (search "path=/fresh" opening)))
+               t)
+        (check "empty lines: a lone LF in front of a request is refused"
+               (list (not (null (search "HTTP/1.1 400" lone-lf)))
+                     (search "path=/lf" lone-lf))
+               '(t nil))
+        (check "empty lines: more of them than a request line may be is refused"
+               (list (not (null (search "HTTP/1.1 400" too-many)))
+                     (search "path=/far" too-many))
+               '(t nil))))))
+
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
    pipelined behind it.
@@ -10369,6 +10423,7 @@
   (test-connection-serial-does-not-repeat-when-an-fd-does)
   (test-connection-serial-survives-a-worker-restart)
   (test-harness-pipelined-after-body-e2e)
+  (test-harness-empty-lines-before-a-request-line-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
   (test-harness-chunked-body-cap-e2e)

@@ -245,7 +245,9 @@ tests/
   status that describes it — 413 over a size cap, 414 for the request
   line, 431 for headers, 501 for an unimplemented method or transfer
   coding, 505 for a version that isn't 1.0 or 1.1 — rather than answering
-  everything with 400
+  everything with 400. Empty lines (CRLF) before a request line are
+  skipped, as RFC 9112 §2.2 asks, up to `*max-request-line-length*` bytes
+  of them
 - **HTTP response builder** — status codes, headers, body serialization.
   Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
   verbatim, for content a string cannot carry (a generated image, a zip, a
@@ -740,7 +742,7 @@ All configurable via `setf` before calling `start-server`.
 | `*log-level*`                  | `:info`   | Minimum log level (`:debug`, `:info`, `:warn`, `:error`)                                                                                                                                                                                           |
 | `*log-stream*`                 | `nil`     | Stream for log output (`nil` uses `*standard-output*`)                                                                                                                                                                                             |
 | `*throttle-handler-errors*`    | `t`       | An error that escapes a handler is logged through the throttle: the first of a condition type at once, then at most one a minute per worker with a count. `nil` logs every one, which suits development                                            |
-| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes). Validated when the server starts                                                                                                                                                                                    |
+| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes), and the most bytes of empty lines skipped before one. Validated when the server starts                                                                                                                              |
 | `*max-header-count*`           | `100`     | Max number of headers per request. Validated when the server starts                                                                                                                                                                                |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes). Validated when the server starts                                                                                                                                                                                   |
 | `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431. Validated when the server starts |

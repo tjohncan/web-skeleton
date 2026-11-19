@@ -219,6 +219,11 @@
   ;; waits for an end it has already sent.
   (header-scan-pos 0 :type fixnum)
   (header-end    0 :type fixnum)             ; byte offset where body starts
+  ;; Bytes of empty lines dropped from in front of this request's line,
+  ;; counted against *MAX-REQUEST-LINE-LENGTH*: see DROP-EMPTY-LINES. Back
+  ;; to 0 once the request's head is found, so a request kept alive behind
+  ;; it starts a count of its own.
+  (empty-lines   0 :type fixnum)
   ;; Byte offset one past the whole request on the wire — headers, the
   ;; CRLFCRLF, and every byte the body's framing occupies. Read by the
   ;; keep-alive reset and the ws-upgrade completion to find where pipelined
@@ -619,6 +624,42 @@
      *max-request-line-length*
      (* 2 *max-header-count*)  ; CRLF ending each header
      4))                       ; request-line and blank-line CRLFs
+
+(defun drop-empty-lines (conn)
+  "Drop the CRLFs at the front of CONN's read buffer, where a request
+   line is expected. RFC 9112 §2.2 asks a server to ignore at least one
+   empty line received before a request line: some clients send a CRLF
+   after a POST body, and on a kept-alive connection it is otherwise the
+   next request's first line, an empty one, refused.
+
+   A CRLF and nothing else. A lone LF, or a CR followed by anything but an
+   LF, is left for the parser, which refuses it there as it refuses one
+   anywhere in a head; a CR at the end of what has arrived waits for the
+   byte after it.
+
+   Counted for the request, and refused with 400 past
+   *MAX-REQUEST-LINE-LENGTH*, the most a request line may be: a peer that
+   sends nothing but empty lines is answered, not read from until
+   *IDLE-TIMEOUT*. Dropped from the buffer rather than stepped over in it,
+   because everything after reads the request from offset 0, the search
+   for its end and the budget the head is held to included."
+  (let* ((buf (connection-read-buf conn))
+         (end (connection-read-pos conn))
+         (drop (loop with i = 0
+                     while (and (< (1+ i) end)
+                                (= (aref buf i) 13)
+                                (= (aref buf (1+ i)) 10))
+                     do (incf i 2)
+                     finally (return i))))
+    (when (plusp drop)
+      (when (> (incf (connection-empty-lines conn) drop)
+               *max-request-line-length*)
+        (http-parse-error "more than ~d bytes of empty lines before the ~
+                           request line"
+                          *max-request-line-length*))
+      (replace buf buf :start2 drop :end2 end)
+      (setf (connection-read-pos conn) (- end drop)
+            (connection-header-scan-pos conn) 0))))
 
 (defun refuse-unterminated-head (buf end)
   "Refuse the request head in BUF[0..END), which has passed
@@ -1898,6 +1939,9 @@
     ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.
     (ecase (connection-state conn)
       (:read-http
+       ;; First, so that the search for the head's end and the budget the
+       ;; head is held to both start from the request's first line.
+       (drop-empty-lines conn)
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
                                           (max 0 (- (connection-header-scan-pos
                                                      conn)
@@ -1916,6 +1960,9 @@
                     ;; then run from HEADER-END + 2 to HEADER-END, which
                     ;; every scanner below reads as none.
                     (req-line-end (scan-crlf buf 0 (+ header-end 2))))
+               ;; Its head has ended: the empty lines in front of it were
+               ;; this request's, and the next request counts its own.
+               (setf (connection-empty-lines conn) 0)
                (unless req-line-end
                  (http-parse-error "no CRLF in request line"))
                ;; Verify the request line ends with HTTP/1.x before
