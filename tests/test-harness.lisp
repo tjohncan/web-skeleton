@@ -3887,6 +3887,93 @@
                  (not (null (search "this server holds the claim" logged))))
            '(t t))))
 
+(defun test-harness-a-superseded-run-lets-go-of-its-claim ()
+  "A START-SERVER whose run a later one in the image has replaced lets go
+   of its port's claim, and stops asking for a claim it was waiting on.
+
+   Its workers stop for the later run, so nothing of it serves the port.
+   A claim it kept would have the next server started there refused, for
+   a server that is not serving; one it went on asking for would be taken
+   once its holder let go, with the same result. Its call still waits for
+   shutdown, since returning through its cleanup would stop the later run
+   as well.
+
+   The later run is stood in for by moving *RUN-GENERATION* on by hand,
+   which is all a later START-SERVER is to the wait of an earlier one.
+   Who holds a claim is asked of CLAIM-PORT, its answer given straight
+   back: a claim that is free is taken, and let go again."
+  (format t "~%Harness: a superseded run lets go of its port's claim~%")
+  (flet ((free-p (port)
+           (let ((got (web-skeleton::claim-port port)))
+             (web-skeleton::release-port-claim got)
+             (typep got 'sb-bsd-sockets:socket))))
+    ;; A claim it holds: its own, on the port the kernel chose for it.
+    (%call-with-bare-server 1
+      (lambda (port)
+        (check "superseded: control, the serving run holds its port's claim"
+               (free-p port)
+               nil)
+        (incf web-skeleton::*run-generation*)
+        (check "superseded: the claim it held is let go"
+               (loop repeat 40
+                     thereis (free-p port)
+                     do (sleep 0.05))
+               t)))
+    ;; A claim it was waiting on, having joined a port with :SHARE-PORT.
+    (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+          (saved-drain *drain-timeout*)
+          (saved-poll *worker-wake-interval*)
+          (holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+          (up (sb-thread:make-semaphore))
+          (other nil)
+          (server nil))
+      ;; Global SETF: the workers read these from threads START-SERVER
+      ;; spawns.
+      (setf web-skeleton::*shutdown-hooks* nil
+            web-skeleton::*shutdown* nil
+            *drain-timeout* 1
+            *worker-wake-interval* 0.05)
+      (unwind-protect
+           (let ((port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (sb-bsd-sockets:socket-close holder)
+             (setf server
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (start-server
+                       :host #(127 0 0 1) :port port :workers 1 :share-port t
+                       :on-listen (lambda (p)
+                                    (declare (ignore p))
+                                    (sb-thread:signal-semaphore up))
+                       :handler (lambda (req)
+                                  (declare (ignore req))
+                                  (make-text-response 200 "joined"))))
+                    :name "superseded-joiner"))
+             (check "superseded: control, a server joined a port whose claim another holds"
+                    (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                    t)
+             (incf web-skeleton::*run-generation*)
+             ;; Passes enough for its wait to have seen the run move on.
+             (sleep 0.3)
+             (web-skeleton::release-port-claim other)
+             (setf other nil)
+             ;; Past the second in which it would have asked again.
+             (sleep 1.5)
+             (check "superseded: and a claim it was waiting on is not taken once free"
+                    (free-p port)
+                    t))
+        (web-skeleton::release-port-claim other)
+        (ignore-errors (sb-bsd-sockets:socket-close holder))
+        (setf web-skeleton::*shutdown* t)
+        (when server
+          (handler-case (sb-thread:join-thread server :timeout 10)
+            (error ()
+              (ignore-errors (sb-thread:terminate-thread server))
+              (ignore-errors (sb-thread:join-thread server)))))
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll)))))
+
 (defun test-harness-a-kernel-chosen-port-is-claimed-too ()
   "A server on a port the kernel chose holds that port's claim while it
    serves and has let go when it returns, and a number another server has
@@ -10334,6 +10421,7 @@
   (test-harness-a-start-refused-at-its-bind-leaves-a-running-server-alone)
   (test-harness-a-port-claim-has-one-holder)
   (test-harness-a-claimed-port-refuses-a-second-server)
+  (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-kernel-chosen-port-is-claimed-too)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)

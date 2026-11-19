@@ -3290,7 +3290,8 @@
 
    A second server on PORT is refused. Its bind would not fail, every
    listener setting SO_REUSEPORT, so before it binds this function takes a
-   claim on the port number, holds it until it returns, and signals an
+   claim on the port number, holds it until it returns, or until a later
+   call in this image begins a run and its workers stop, and signals an
    error when another server holds it: one in another process, or another
    call of this function in this one. The section above CLAIM-PORT says
    what the claim is and what it does not cover. SHARE-PORT true starts
@@ -3664,6 +3665,25 @@
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
                                (loop (sleep *worker-wake-interval*)
+                                     ;; A later START-SERVER in this image
+                                     ;; has begun a run, and this run's
+                                     ;; workers stop for it. Nothing of
+                                     ;; this run serves the port, so its
+                                     ;; claim is let go, or no longer
+                                     ;; asked for. Only that: returning
+                                     ;; through the cleanup below would
+                                     ;; stop the later run as well.
+                                     (when (and claim
+                                                (/= generation
+                                                    *run-generation*))
+                                       (log-info "port ~d: claim ~:[let ~
+                                                  go~;no longer asked ~
+                                                  for~], a later ~
+                                                  start-server in this ~
+                                                  image having begun a run"
+                                                 port (eq claim :held))
+                                       (release-port-claim claim)
+                                       (setf claim nil))
                                      ;; Joined to another server's port,
                                      ;; this one takes the claim when that
                                      ;; one lets go.
