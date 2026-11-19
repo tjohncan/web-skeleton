@@ -5022,6 +5022,76 @@
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
+(defun test-static-aliases-follow-a-reload ()
+  "A load moves the aliases of the files it brings to those files, and
+   never takes the place of a file.
+
+   /page answers for page.html and /docs for docs/index.html. Loaded
+   again with both files changed, each alias answers for the file now at
+   its path, not for the one the first load brought. When x.html and
+   x/index.html both want /x, x.html has it, here with the index loaded
+   by an earlier call, so that the alias it got there is in the way. And
+   a file loaded at an alias's path keeps that path.
+
+   What an entry serves is told by its ETag, a hash of its content."
+  (format t "~%Static: aliases follow a reload~%")
+  (let ((scratch (sb-ext:parse-native-namestring
+                  (scratch-path "ws-static-reload" "/")))
+        (saved-cache web-skeleton::*static-cache*))
+    (ensure-directories-exist (merge-pathnames "docs/" scratch))
+    (ensure-directories-exist (merge-pathnames "both/" scratch))
+    (flet ((write-file (rel text)
+             (with-open-file (s (merge-pathnames rel scratch)
+                                :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+               (write-sequence (sb-ext:string-to-octets
+                                text :external-format :utf-8)
+                               s)))
+           (etag (path)
+             (let ((entry (gethash path web-skeleton::*static-cache*)))
+               (and entry (web-skeleton::static-entry-etag entry))))
+           (load-tree ()
+             (web-skeleton::load-static-files (namestring scratch))))
+      (unwind-protect
+           (progn
+             (setf web-skeleton::*static-cache*
+                   (make-hash-table :test #'equal))
+             (write-file "page.html" "page, the first")
+             (write-file "docs/index.html" "docs, the first")
+             (write-file "both/index.html" "both, the index")
+             (write-file "real.html" "real, the page")
+             (load-tree)
+             (let ((first-page (etag "/page")))
+               (write-file "page.html" "page, the second")
+               (write-file "docs/index.html" "docs, the second")
+               (write-file "both.html" "both, the page")
+               (write-file "real" "real, a file of its own")
+               (load-tree)
+               (check "reload: control, the first load's /page is not the page now there"
+                      (list (not (null first-page))
+                            (equal first-page (etag "/page.html")))
+                      '(t nil)))
+             (check "reload: /page answers for the page.html now there"
+                    (equal (etag "/page") (etag "/page.html"))
+                    t)
+             (check "reload: /docs answers for the docs/index.html now there"
+                    (equal (etag "/docs") (etag "/docs/index.html"))
+                    t)
+             (check "reload: /both is both.html, which an earlier load's index had"
+                    (list (equal (etag "/both") (etag "/both.html"))
+                          (equal (etag "/both") (etag "/both/index.html")))
+                    '(t nil))
+             (load-tree)
+             (check "reload: a file loaded at an alias's path keeps it"
+                    (list (not (null (etag "/real")))
+                          (equal (etag "/real") (etag "/real.html")))
+                    '(t nil)))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (ignore-errors
+         (sb-ext:delete-directory scratch :recursive t))))))
+
 (defun test-static-range-copies-nothing ()
   "A 206 for a static file allocates its head and not its body, and the
    body still arrives whole and in place.
@@ -10150,6 +10220,7 @@
   (test-static-names-with-pathname-syntax)
   (test-static-responses-carry-the-connection-line)
   (test-static-etag)
+  (test-static-aliases-follow-a-reload)
   (test-static-range)
   (test-static-range-copies-nothing)
   (test-static-date)

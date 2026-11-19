@@ -116,7 +116,8 @@ So every spelling that reaches a file is one the router reads the same way,
 and a guard's literal covers all of them. An application that checks the
 raw path itself should compare `(canonical-path path)`, the router's
 reading. A guard must also cover the file's aliases. `serve-static` answers
-`/x` for `x.html`, and both `/dir` and `/dir/` for `dir/index.html`.
+`/x` for `x.html`, and both `/dir` and `/dir/` for `dir/index.html`. When
+both `x.html` and `x/index.html` are loaded, `/x` is `x.html`.
 
 ### Configuration
 
