@@ -1693,7 +1693,8 @@ The next line of that kind is then a first again. Each worker counts its
 own, and logs a count from its once-a-second pass: a burst that has
 ended has its count in the log within a second or so of the minute being
 up, with no further line of its kind needed to bring it out. A count a
-worker still holds when it stops is not logged. A malformed request, a
+worker still holds when it stops, or crashes, is logged as it goes, over
+the seconds its minute had run. A malformed request, a
 bad WebSocket frame and a refused connection are each a kind.
 
 An error that escapes a handler is logged the same way, a kind to each

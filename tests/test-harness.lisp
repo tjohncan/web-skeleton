@@ -1566,6 +1566,47 @@
              (and line count (< line count))
              t))))
 
+(defun test-harness-a-stopping-worker-logs-what-it-held-back-e2e ()
+  "A worker that stops logs the count of what its throttle held back in
+   its last minute, on its way out. Three requests whose handler raises
+   log one line and hold two back; the server is stopped well inside the
+   minute, so no pass of the worker's has ended it; and the count of the
+   two is in the log behind the line.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a stopping worker logs what it held back~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (saved-setting web-skeleton:*throttle-handler-errors*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log
+                 web-skeleton:*throttle-handler-errors* t)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (error "the lookup failed")))
+             (dotimes (i 3)
+               (push (attempt (values (test-http-request :get "/raise")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved-stream
+            web-skeleton:*throttle-handler-errors* saved-setting))
+    (let* ((text (get-output-stream-string log))
+           (line (search "[WARN] error fd" text))
+           (count (search "[WARN] handler-error (simple-error): 2 more lines held back in the last "
+                          text)))
+      (check "stopping: control, three requests answered 500 and one line logged"
+             (list (reverse statuses)
+                   (and line
+                        (null (search "[WARN] error fd" text :start2 (1+ line)))
+                        t))
+             '((500 500 500) t))
+      (check "stopping: and once the worker has stopped, the count of the other two"
+             (and line count (< line count) t)
+             t))))
+
 (defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
   "Accept once, read the request head, write PIECES (strings, one byte per
    character) one at a time with PAUSE seconds between them, then hold the
@@ -10786,6 +10827,7 @@
   (test-harness-client-errors-log-once-a-minute-e2e)
   (test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e)
   (test-harness-a-burst-that-ends-has-its-count-logged-e2e)
+  (test-harness-a-stopping-worker-logs-what-it-held-back-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-address-filter-asked-once-e2e)

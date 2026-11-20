@@ -163,8 +163,9 @@
    A kind's minute is ended by whichever comes first: its next line,
    here, or the worker's once-a-second pass, in FLUSH-LOG-THROTTLE. The
    pass is what reports a burst that has ended: left to the kind's next
-   line, the count would wait however long that line took to come. What a
-   kind held back in the minute a worker stops in goes unreported.
+   line, the count would wait however long that line took to come. And a
+   worker that stops or crashes ends every kind's minute as it goes, so
+   what the kind held back in the worker's last minute is reported too.
 
    The one throttle the framework's logging has: REPORT-REFUSAL's
    connection-limit line and RUN-EVENT-LOOP's :ON-TICK error report come
@@ -209,22 +210,25 @@
                    (format nil "~(~a~)" kind))
                held-back (- now logged-at)))))
 
-(defun flush-log-throttle (now)
+(defun flush-log-throttle (now &key all)
   "End the minute of each kind in this worker's *LOG-THROTTLE* whose line
-   was logged a minute or more before NOW, a MONOTONIC-SECONDS reading:
-   its count is logged if it held any lines back, and the kind is
-   forgotten. Nothing to do outside a worker.
+   was logged a minute or more before NOW, a MONOTONIC-SECONDS reading,
+   or of every kind when ALL is true: its count is logged if it held any
+   lines back, and the kind is forgotten. Nothing to do outside a worker.
 
    Called from the worker's once-a-second pass, so a count is logged
    within a second or so of its minute being up, whether or not another
    line of that kind ever comes. Forgetting the kind is also what keeps
-   the table to the kinds seen in the last minute."
+   the table to the kinds seen in the last minute. And with ALL from
+   RUN-WORKER's cleanup, which runs as the worker stops or crashes and
+   whose table goes with it: a count of the worker's last minute is
+   logged then, over the seconds that minute ran."
   (let ((table *log-throttle*))
     (when table
       ;; MAPHASH allows the entry it is visiting to be removed from the
       ;; table under it, and no entry but that one.
       (maphash (lambda (kind entry)
-                 (when (>= (- now (first entry)) 60)
+                 (when (or all (>= (- now (first entry)) 60))
                    (end-throttled-minute kind entry now)
                    (remhash kind table)))
                table))))

@@ -4056,6 +4056,48 @@
                  (list (web-skeleton::flush-log-throttle 2000) (logged))
                  '(nil nil)))))))
 
+(defun test-flush-log-throttle-all-ends-every-kinds-minute ()
+  "FLUSH-LOG-THROTTLE with :ALL, which RUN-WORKER's cleanup calls as a
+   worker stops or crashes, ends every kind's minute however young: what
+   each kind held back is logged as a count over the seconds its minute
+   ran, and every kind is forgotten. The same kinds, inside their minute,
+   are left alone by the once-a-second pass.
+
+   Driven directly, under a table as a worker binds one. That a stopping
+   worker makes the call is
+   TEST-HARNESS-A-STOPPING-WORKER-LOGS-WHAT-IT-HELD-BACK-E2E's to show."
+  (format t "~%log throttle: a worker's last minute is counted as it goes~%")
+  (let ((log (make-string-output-stream)))
+    (flet ((logged ()
+             ;; The lines logged since the last call, from the level on.
+             (let ((text (get-output-stream-string log)))
+               (loop with start = 0
+                     for end = (position #\Newline text :start start)
+                     while end
+                     collect (subseq text (position #\[ text :start start) end)
+                     do (setf start (1+ end))))))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton::*log-level* :info)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :warn :burst "burst ~d" i))
+        (web-skeleton::log-throttled :warn :once "once")
+        (logged)
+        ;; Both kinds' lines logged at second 1000, as far as the table says.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 1000))
+        (web-skeleton::flush-log-throttle 1010)
+        (check "all: control, the pass leaves kinds inside their minute alone"
+               (list (logged) (hash-table-count web-skeleton::*log-throttle*))
+               '(nil 2))
+        (attempt (web-skeleton::flush-log-throttle 1010 :all t))
+        (check "all: with it, a count over the seconds its minute ran"
+               (logged)
+               '("[WARN] burst: 2 more lines held back in the last 10 seconds"))
+        (check "all: and every kind forgotten"
+               (hash-table-count web-skeleton::*log-throttle*)
+               0)))))
+
 (defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
   "MONOTONIC-SECONDS, which every interval is measured on, reads whole
    seconds, never backwards, from a start so high that a timestamp slot
@@ -6681,6 +6723,7 @@
   (test-set-up-failures-and-failed-accepts-are-throttled-apart)
   (test-handler-errors-are-throttled-by-condition-type)
   (test-flush-log-throttle-logs-a-count-and-forgets-the-kind)
+  (test-flush-log-throttle-all-ends-every-kinds-minute)
   (test-monotonic-seconds-reads-high-and-apart-from-the-date)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)

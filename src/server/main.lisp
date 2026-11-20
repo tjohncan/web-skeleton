@@ -2790,6 +2790,13 @@
                      ;; child that would not die would hold the worker's
                      ;; exit.
                      (reap-dns-children)
+                     ;; What the throttle held back in this pass's last
+                     ;; minute, logged as the worker goes, from a stop or a
+                     ;; crash alike: the table is this pass's and goes with
+                     ;; it. IGNORE-ERRORS, since the log stream may be what
+                     ;; failed.
+                     (ignore-errors
+                      (flush-log-throttle (monotonic-seconds) :all t))
                      ;; Drop this worker's published counts on the way out,
                      ;; or a torn down server leaves totals a later reader
                      ;; would sum into a fresh one's.
