@@ -805,9 +805,11 @@ caller need not know which kind it asked for.
 ```
 
 Resolve the port this way rather than binding port 0 yourself, reading the
-number, closing, and passing it in. Every listener sets `SO_REUSEPORT`, so
-a second process handed that number in the gap between your close and the
-server's bind does not fail its bind — both hold the port and the kernel
+number, closing, and passing it in. The port is free between your close
+and the server's bind, and anything may take it. Another web-skeleton
+server handed that number refuses this start, or is refused by it, by the
+claim below; but another program that sets `SO_REUSEPORT`, run by the
+same user, binds it all the same — both hold the port and the kernel
 splits traffic between them, with nothing in either log. `start-server`
 hands its own bound socket to worker 0, so the port is never free between
 being chosen and being served.
@@ -821,9 +823,11 @@ so a server already running in the image is left as it was.
 
 A second server on a port is refused as well, though its bind would not
 fail. `start-server` claims the port number before it binds, and signals
-an error when another web-skeleton server holds the claim: a second
-process started by mistake, or a second call in one image.
-`:share-port t` starts beside the holder instead, which is how a new
+an error when another web-skeleton server holds the claim and a socket
+listens where this one would bind: a second process started by mistake,
+or a second call in one image. A claim held where nothing listens
+refuses nothing: the start says so at WARN, and takes the claim once it
+is free. `:share-port t` starts beside the holder instead, which is how a new
 process takes over from the one it replaces with no gap. With `:port 0`
 nothing is refused, and a claimed number is passed over. DEPLOYMENT.md,
 "One server to a port", has what the claim is, how to see who holds it,

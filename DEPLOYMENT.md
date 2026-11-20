@@ -218,17 +218,27 @@ that bind succeeds, the kernel divides arriving connections between the
 two processes, each answers its share from its own memory, and neither
 log says anything. A start script run twice is enough to do it.
 
-So `start-server` claims its port number before it binds, and a second
+So `start-server` claims its port number before it binds. A second
 server, in another process or from a second call in the same image, finds
-the claim held and is refused:
+the claim held and the first server listening where it would bind, and
+is refused:
 
 ```
-start-server: port 8081 is claimed by another web-skeleton server, in this process or another. ...
+start-server: port 8081 is claimed by another web-skeleton server, in this process or another, and a socket listens where this one would bind, 127.0.0.1:8081. ...
 ```
 
-The error comes before anything else has happened: no listener is bound,
-no worker started, and a server already running in the image is left as
-it was.
+The error comes before anything else has happened, as the one for a port
+that cannot be bound does: no listener is bound, no worker started, and a
+server already running in the image is left as it was.
+
+**A claim held where nothing listens.** A start that finds the claim held
+looks at the port too, for up to a second, since a server takes its claim
+a moment before it binds. If nothing listens where it would bind by then,
+the holder does not serve there: a process that took the name, which any
+local process can do, whatever user it runs as; a server on another
+address of the host; or a server this image has replaced. The start goes
+on without the claim, says so at WARN with the `ss` line below to find
+the holder, and takes the claim once it is free.
 
 **What the claim is.** A Unix socket bound in Linux's abstract namespace
 under the name `web-skeleton/port/8081`. It is not a file, so there is
@@ -254,13 +264,16 @@ passing the keyword every time gives up.
 
 **What the claim covers, and what it does not.**
 
-- **The port number, whatever the address.** A server on one address and
-  a server on the wildcard address of the same port are both bound
-  without error too, and the kernel gives each connection to the more
-  specific of the two, so they are one port to the claim. The cost is
-  that two servers on two addresses of one host, which share nothing,
-  cannot use the same port number unless the second passes
-  `:share-port t`.
+- **The addresses that share connections, as the kernel has them.** The
+  claim is on the port number, and the look at the port is a bind, so it
+  meets what the kernel would have this server share connections with: a
+  listener on the same address, on the wildcard address of the same
+  port, or, for a server on the wildcard, on any one address of it. The
+  kernel gives each connection to the more specific of two such
+  listeners, so each server would take part of the other's traffic, and
+  the start is refused. Two servers on two addresses of one host share
+  nothing: the second starts beside the first, without the claim, and
+  says so.
 - **Servers built on this framework, and no other program.** Another
   program that sets `SO_REUSEPORT`, run by the same user, binds the port
   all the same. One that does not set it makes this server's bind fail,
@@ -271,13 +284,16 @@ passing the keyword every time gives up.
   processes that share one, `--network host` say, share ports and claims
   alike.
 - **Not `:port 0`.** The kernel does not choose a port that a listener
-  on the address holds, and a number another server has claimed is passed
-  over for the next the kernel offers, so such a start is never refused.
+  on the address holds, and a number whose claim is held, whether or not
+  anything listens on it, is passed over for the next the kernel offers,
+  so such a start is never refused.
 - **Not where Unix sockets are forbidden.** Under a systemd unit whose
   `RestrictAddressFamilies=` leaves out `AF_UNIX`, the claim cannot be
   taken. The server logs that at WARN and starts without one.
-- **A guard against a mistake, not a lock.** Any local user can bind the
-  name, as any can bind an unprivileged port.
+- **A guard against a mistake, not a lock.** Any local process can bind
+  the claim's name, whatever user it runs as, and a name held where
+  nothing listens refuses nothing. A process that cannot bind the port, a
+  privileged one say, cannot keep a server off it by holding its name.
 
 ### Status codes the framework itself sends
 
