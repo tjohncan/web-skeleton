@@ -4323,6 +4323,37 @@
         (when listener
           (ignore-errors (sb-bsd-sockets:socket-close listener)))))))
 
+(defun test-harness-a-stopped-server-puts-sbcls-sigterm-handler-back ()
+  "START-SERVER's run, once it has ended, puts back SBCL's own SIGTERM
+   handler, which ends the process, in place of the one the run
+   installed, which only sets *SHUTDOWN*. SB-SYS:ENABLE-INTERRUPT answers
+   NIL whatever a signal's handler is, and NIL cannot be installed, so a
+   run that put back what it was answered left its own handler in place
+   for good: SIGTERM then set a flag nothing read, and the process went
+   on.
+
+   What the run installs is recorded by wrapping ENABLE-INTERRUPT, since
+   a handler read back is NIL whichever it is."
+  (format t "~%Harness: a stopped server puts SBCL's SIGTERM handler back~%")
+  (let ((installed nil))
+    (sb-int:encapsulate 'sb-sys:enable-interrupt 'recorded
+                        (lambda (real signal handler &rest more)
+                          (push (cons signal handler) installed)
+                          (apply real signal handler more)))
+    (unwind-protect
+         (%call-with-bare-server 1 (lambda (port) (declare (ignore port))))
+      (sb-int:unencapsulate 'sb-sys:enable-interrupt 'recorded))
+    (let ((sigterm (remove sb-unix:sigterm installed :key #'car :test-not #'eql)))
+      (check "sigterm: control, the run installed a handler of its own"
+             (and (= (length sigterm) 2) (functionp (cdr (second sigterm))))
+             t)
+      (check "sigterm: and its end put SBCL's own back"
+             (cdr (first sigterm))
+             (symbol-function (find-symbol "SIGTERM-HANDLER" "SB-UNIX")))
+      (check "sigterm: and nothing tried to install NIL, which SBCL refuses"
+             (find nil installed :key #'cdr)
+             nil))))
+
 (defun test-harness-a-drain-closes-its-listener-first ()
   "A worker that begins its drain closes its listener then, not once the
    drain has ended. Open, the listener stays in the port's SO_REUSEPORT
@@ -11000,6 +11031,7 @@
   (test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim)
   (test-harness-a-listener-with-no-claim-refuses-a-start)
   (test-harness-starts-past-a-held-claim-go-one-at-a-time)
+  (test-harness-a-stopped-server-puts-sbcls-sigterm-handler-back)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

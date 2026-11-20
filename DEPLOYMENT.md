@@ -2778,6 +2778,18 @@ shared with another process is a date, from `get-universal-time`. An
 interval finer than a second can be read from `get-internal-real-time`
 itself, which moves in steps of the kernel's tick, a few milliseconds.
 
+### Signals
+
+While `start-server` runs, SIGPIPE is ignored, so that a write to a peer
+that has gone fails with `EPIPE`, and SIGTERM stops the server as Ctrl-C
+does. When it returns it puts back SBCL's own SIGTERM handler, which ends
+the process. SBCL gives no way to read the handler a signal had before:
+`sb-sys:enable-interrupt` answers `nil` whatever is installed. So a
+SIGTERM handler an application installed before calling `start-server`
+is not put back; install it again once `start-server` has returned.
+SIGPIPE stays ignored, which is what SBCL's own handling of it comes to
+for the process.
+
 ### getent
 
 Hostnames are resolved by running `getent ahosts` with

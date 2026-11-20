@@ -3327,6 +3327,17 @@
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
+(defun sbcl-sigterm-handler ()
+  "The SIGTERM handler SBCL installs at startup, which ends the process,
+   for START-SERVER to put back when its run ends: SB-UNIX::SIGTERM-HANDLER,
+   an internal function present on every SBCL this supports. Looked up by
+   name, so that an SBCL without it is handed :DEFAULT instead, which ends
+   the process too, without SBCL's exit hooks."
+  (let ((name (find-symbol "SIGTERM-HANDLER" "SB-UNIX")))
+    (if (and name (fboundp name))
+        (symbol-function name)
+        :default)))
+
 (defun make-first-listener (host port)
   "MAKE-TCP-LISTENER for the listener START-SERVER binds itself, with a
    bind or a listen the kernel refuses turned into an error that names the
@@ -3764,24 +3775,29 @@
   ;; Replaced rather than cleared, so a second START-SERVER in one image
   ;; cannot inherit a previous run's counts.
   (setf *connection-census* (make-array workers :initial-element nil))
-  ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
-  ;; be called from inside a host SBCL image (a REPL, a test runner, an
-  ;; orchestrator) without permanently stealing the signals.
-  ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
-  ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
+  ;; For the run, SIGPIPE is ignored, so that a write to a peer that has
+  ;; gone returns EPIPE, and SIGTERM sets *SHUTDOWN*, as Ctrl-C does.
   ;;
-  ;; Two nested unwind-protects, one per signal: SIGPIPE in the
-  ;; outer, SIGTERM in the inner. If SIGTERM install raises, the
-  ;; outer cleanup still restores SIGPIPE. If both succeed and the
-  ;; body raises (MAKE-THREAD exhaustion, etc.), both cleanups run.
-  ;; A single parallel let would leak SIGPIPE if the SIGTERM init
-  ;; form raised before the body was entered.
-  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)))
+  ;; SBCL does not say what a signal's handler was: ENABLE-INTERRUPT
+  ;; answers NIL whatever is installed, its own handlers included, and
+  ;; NIL cannot be installed back. So when the run ends this puts back
+  ;; SBCL's own SIGTERM handler (SBCL-SIGTERM-HANDLER), which ends the
+  ;; process, and leaves SIGPIPE ignored, which is what SBCL's handling of
+  ;; it comes to for the process: a write to a closed peer fails with
+  ;; EPIPE either way. A SIGTERM handler an application installed before
+  ;; START-SERVER is not put back; see DEPLOYMENT.md, "Signals".
+  ;;
+  ;; SIGTERM's in an UNWIND-PROTECT of its own, inside the one for the
+  ;; claim and the first listener, so that a raise anywhere after it is
+  ;; installed still puts SBCL's back.
+  (progn
+    (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
     (unwind-protect
-         (let ((prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
-                               (lambda (signal info context)
-                                 (declare (ignore signal info context))
-                                 (setf *shutdown* t)))))
+         (progn
+           (sb-sys:enable-interrupt sb-unix:sigterm
+                                    (lambda (signal info context)
+                                      (declare (ignore signal info context))
+                                      (setf *shutdown* t)))
            (unwind-protect
                 (progn
                   ;; The number the kernel chose, when it was asked to.
@@ -3951,12 +3967,10 @@
                             (log-info "stopped")
                             (log-warn "stopped, with ~d worker~:p still running"
                                       still-running))))))
-             ;; Inner cleanup: restore SIGTERM
+             ;; Inner cleanup: SBCL's own SIGTERM handler back.
              (ignore-errors
-              (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
-      ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
-      (ignore-errors
-       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe))
+              (sb-sys:enable-interrupt sb-unix:sigterm
+                                       (sbcl-sigterm-handler)))))
       ;; The first listener, when worker 0 never adopted it: MAKE-THREAD
       ;; raised before worker 0's thread existed, or something raised
       ;; between the bind and the spawn. Nothing else will ever close it.
