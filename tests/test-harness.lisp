@@ -4184,6 +4184,58 @@
            (sb-bsd-sockets:connection-refused-error () t))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
+(defun test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim ()
+  "A start that finds its port's claim held asks for it again on each pass
+   of its look; an asking that could not be made at all, for want of a
+   descriptor say, answers NIL. That is no claim: the start goes on as
+   past any held claim, saying so at WARN, and takes the claim once its
+   holder lets go. Taken for the claim, the start would run with none
+   and never ask again, leaving the name free for a second server to
+   take and join it with no look at the port.
+
+   The holder is a name bound by hand, with nothing listening. CLAIM-PORT
+   answers the start's first asking itself, and NIL for the next two,
+   which fall in the look, as it does when the socket cannot be made."
+  (format t "~%Harness: a claim asking that fails in the look is not the claim~%")
+  (let ((other nil)
+        (askings 0))
+    (%with-claim-test-servers (start finish log)
+      (sb-int:encapsulate 'web-skeleton::claim-port 'refused-in-the-look
+                          (lambda (real port)
+                            (if (<= 2 (incf askings) 3)
+                                nil
+                                (funcall real port))))
+      (unwind-protect
+           (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (setf askings 0)
+             (sb-bsd-sockets:socket-close holder)
+             (multiple-value-bind (server up) (start port #(127 0 0 1))
+               (check "failed asking: control, the start goes on"
+                      (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                      t)
+               (sb-int:unencapsulate 'web-skeleton::claim-port
+                                     'refused-in-the-look)
+               (web-skeleton::release-port-claim other)
+               (setf other nil)
+               (check "failed asking: it takes the claim once let go"
+                      (loop repeat 60
+                            for got = (web-skeleton::claim-port port)
+                            when (eq got :held) return t
+                            do (web-skeleton::release-port-claim got)
+                               (sleep 0.05))
+                      t)
+               (setf web-skeleton::*shutdown* t)
+               (finish server 10)
+               (setf web-skeleton::*shutdown* nil)))
+        (sb-int:unencapsulate 'web-skeleton::claim-port 'refused-in-the-look)
+        (web-skeleton::release-port-claim other))
+      (check "failed asking: and said at WARN that it went on past a held claim"
+             (not (null (search "nothing listens where this server binds"
+                                (get-output-stream-string log))))
+             t))))
+
 (defun test-harness-a-drain-closes-its-listener-first ()
   "A worker that begins its drain closes its listener then, not once the
    drain has ended. Open, the listener stays in the port's SO_REUSEPORT
@@ -10858,6 +10910,7 @@
   (test-harness-a-claimed-port-refuses-a-second-server)
   (test-harness-a-claim-held-where-nothing-listens-refuses-nothing)
   (test-harness-a-held-claim-refuses-by-what-listens)
+  (test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

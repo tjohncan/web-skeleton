@@ -3220,9 +3220,10 @@
 
      :LISTENING      a socket listens there, and the start is refused
      :TAKEN, CLAIM   the claim came free meanwhile and is this start's,
-                     CLAIM being what CLAIM-PORT answered
+                     CLAIM being the socket that holds it
      :ABSENT         still held when the second is up, and nothing
-                     listening, or no way to look
+                     listening, or no way to look; an asking that could
+                     not be made counts as held
 
    A second server is listening well within the second: START-SERVER
    binds straight after it claims. A holder that is not listening by then
@@ -3232,8 +3233,12 @@
       (case (port-listened-p host port)
         ((t) (return :listening))
         (:unknown (return :absent)))
+      ;; Taken only when the answer is a socket. An asking that could not
+      ;; be made, NIL, says nothing of the holder, and the look goes on,
+      ;; ending held as RETAKE-PORT-CLAIM stays held after one: a start
+      ;; that took NIL for the claim would never ask for it again.
       (let ((claim (claim-port port)))
-        (unless (eq claim :held)
+        (when (typep claim 'sb-bsd-sockets:socket)
           (return (values :taken claim))))
       (when (>= (get-internal-real-time) deadline)
         (return :absent))
