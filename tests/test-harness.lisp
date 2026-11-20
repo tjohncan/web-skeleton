@@ -4285,6 +4285,44 @@
                  (setf web-skeleton::*shutdown* nil)))
           (sb-bsd-sockets:socket-close listener))))))
 
+(defun test-harness-starts-past-a-held-claim-go-one-at-a-time ()
+  "Two starts that go on past a held claim, where nothing listens, look
+   at the port and bind one at a time, so the second meets the first's
+   listener and is refused. Made together without that, each would find
+   nothing listening through its look, and both would bind.
+
+   The first start is stood in for by hand: its lock, PORT-START-NAME,
+   held while the second start waits for it, and then its listener,
+   opened 1.3 s on, later than the second start's own look would end,
+   with the lock let go. The claim is held by hand with nothing
+   listening, as a draining server holds it."
+  (format t "~%Harness: starts past a held claim go one at a time~%")
+  (%with-claim-test-servers (start finish log)
+    (let* ((chosen (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+           (port (%port-of chosen))
+           (other (web-skeleton::claim-port port))
+           (lock (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                :type :stream))
+           (listener nil))
+      (sb-bsd-sockets:socket-close chosen)
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind lock (web-skeleton::port-start-name port))
+             (let ((second (start port #(127 0 0 1))))
+               (sleep 1.3)
+               (setf listener (web-skeleton::make-tcp-listener #(127 0 0 1) port))
+               (sb-bsd-sockets:socket-close lock)
+               (let ((message (finish second 5)))
+                 (check "one at a time: the second start looks once the first has bound, and is refused"
+                        (and (stringp message)
+                             (search (format nil "port ~d is claimed" port) message)
+                             t)
+                        t))))
+        (ignore-errors (sb-bsd-sockets:socket-close lock))
+        (web-skeleton::release-port-claim other)
+        (when listener
+          (ignore-errors (sb-bsd-sockets:socket-close listener)))))))
+
 (defun test-harness-a-drain-closes-its-listener-first ()
   "A worker that begins its drain closes its listener then, not once the
    drain has ended. Open, the listener stays in the port's SO_REUSEPORT
@@ -10961,6 +10999,7 @@
   (test-harness-a-held-claim-refuses-by-what-listens)
   (test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim)
   (test-harness-a-listener-with-no-claim-refuses-a-start)
+  (test-harness-starts-past-a-held-claim-go-one-at-a-time)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

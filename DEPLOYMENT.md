@@ -238,7 +238,10 @@ the holder does not serve there: a process that took the name, which any
 local process can do, whatever user it runs as; a server on another
 address of the host; or a server this image has replaced. The start goes
 on without the claim, says so at WARN with the `ss` line below to find
-the holder, and takes the claim once it is free.
+the holder, and takes the claim once it is free. Two starts made
+together past such a claim go one at a time, through a second name,
+`web-skeleton/port/8081/starting`, held from the look through the bind:
+the second meets the first one's listener and is refused.
 
 **What the claim is.** A Unix socket bound in Linux's abstract namespace
 under the name `web-skeleton/port/8081`. It is not a file, so there is

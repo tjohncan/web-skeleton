@@ -3127,7 +3127,10 @@
 ;;; takes the claim, or can take none, looks once: a socket listening
 ;;; there holds no claim, a server between holders in a handover, one
 ;;; whose claim could not be attempted or that was built without it, or
-;;; another program, and the start is refused all the same.
+;;; another program, and the start is refused all the same. Two starts
+;;; going on past a held claim at once would each find nothing listening,
+;;; so they look and bind one at a time, under a second name
+;;; (TAKE-PORT-START), and the second meets the first's listener.
 ;;;
 ;;; The look is a bind, so it asks the kernel's own question: whether a
 ;;; socket listens at an address that would share connections with this
@@ -3246,6 +3249,47 @@
           (return (values :taken claim))))
       (when (>= (get-internal-real-time) deadline)
         (return :absent))
+      (sleep 0.05))))
+
+(defun port-start-name (port)
+  "The abstract socket name held by a start going on past PORT's claim
+   held: see TAKE-PORT-START."
+  (format nil "web-skeleton/port/~d/starting" port))
+
+(defun take-port-start (port)
+  "For a start that found PORT's claim held: the lock that has such
+   starts look at the port and bind one at a time, a name bound as the
+   claim is, under PORT-START-NAME. Without it, two starts made together
+   past a holder that does not listen, a squatter or an old server
+   draining, would each find nothing listening and both bind. One at a
+   time, the second looks once the first has bound, and meets its
+   listener.
+
+   Asked for every 50 ms for up to two seconds, which outlasts another
+   start's look and bind. Answers the socket that holds it, to be let go
+   of with RELEASE-PORT-CLAIM once the start has bound or been refused;
+   or NIL when the two seconds ran out, the name held by a process that
+   is not starting, or when it could not be attempted. The start then
+   goes on without it, as past any held name."
+  (let ((name (port-start-name port))
+        (deadline (+ (get-internal-real-time)
+                     (* 2 internal-time-units-per-second))))
+    (loop
+      (let ((socket nil))
+        (handler-case
+            (progn
+              (setf socket (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                          :type :stream))
+              (sb-bsd-sockets:socket-bind socket name)
+              (return socket))
+          (sb-bsd-sockets:address-in-use-error ()
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (error ()
+            (when socket
+              (ignore-errors (sb-bsd-sockets:socket-close socket)))
+            (return nil))))
+      (when (>= (get-internal-real-time) deadline)
+        (return nil))
       (sleep 0.05))))
 
 (defun retake-port-claim (claim port asked-at now)
@@ -3646,51 +3690,68 @@
      (multiple-value-setq (listener0 claim) (make-claimed-listener host)))
     (t
      (setf claim (claim-port port))
-     ;; A socket listening where this server would bind refuses the start,
-     ;; whoever holds the claim; held where nothing listens, the claim
-     ;; refuses nothing, and the start goes on to take it once it is free.
-     ;; See the banner above CLAIM-PORT.
-     (cond
-       (share-port)
-       ((eq claim :held)
-        (multiple-value-bind (standing taken) (held-claim-standing host port)
-          (case standing
-            (:listening
-             (error "start-server: port ~d is claimed by another web-skeleton ~
-                     server, in this process or another, and a socket ~
-                     listens where this one would bind, ~a. This one's bind ~
-                     would not fail, every listener setting SO_REUSEPORT: ~
-                     both would serve, the kernel dividing connections ~
-                     between them, with nothing in either log. Stop the ~
-                     other first, or pass :SHARE-PORT T to start beside it, ~
-                     as a process taking over from the one it replaces does."
-                    port (format-peer-addr host port)))
-            (:taken
-             (setf claim taken)))))
-       ;; The claim is this start's, or none could be had. A socket
-       ;; listening all the same takes no claim: a server between holders
-       ;; in a handover, one whose claim could not be attempted or that
-       ;; was built without it, or another program that sets SO_REUSEPORT.
-       ((eq (port-listened-p host port) t)
-        (release-port-claim claim)
-        (setf claim nil)
-        (error "start-server: cannot listen on ~a: a socket already listens ~
-                there (EADDRINUSE, to a bind without SO_REUSEPORT), and no ~
-                web-skeleton server holds the port's claim: a server between ~
-                holders, one that could not take the claim or was built ~
-                without it, or another program. If it sets SO_REUSEPORT as ~
-                this user, this one's bind would not fail, and both would ~
-                serve the port, the kernel dividing connections between ~
-                them. Stop it first, or pass :SHARE-PORT T to start beside it."
-               (format-peer-addr host port))))
-     ;; A bind that is refused lets go of the claim on its way out, since
-     ;; the cleanup that otherwise would is not reached yet.
-     (let ((bound nil))
+     ;; Held only by a start that goes on past a held claim, from its look
+     ;; through its bind: see TAKE-PORT-START.
+     (let ((starting nil))
        (unwind-protect
-            (setf listener0 (make-first-listener host port)
-                  bound t)
-         (unless bound
-           (release-port-claim claim))))))
+            (progn
+              ;; A socket listening where this server would bind refuses
+              ;; the start, whoever holds the claim; held where nothing
+              ;; listens, the claim refuses nothing, and the start goes on
+              ;; to take it once it is free. See the banner above
+              ;; CLAIM-PORT.
+              (cond
+                (share-port)
+                ((eq claim :held)
+                 (setf starting (take-port-start port))
+                 (multiple-value-bind (standing taken)
+                     (held-claim-standing host port)
+                   (case standing
+                     (:listening
+                      (error "start-server: port ~d is claimed by another ~
+                              web-skeleton server, in this process or ~
+                              another, and a socket listens where this one ~
+                              would bind, ~a. This one's bind would not ~
+                              fail, every listener setting SO_REUSEPORT: ~
+                              both would serve, the kernel dividing ~
+                              connections between them, with nothing in ~
+                              either log. Stop the other first, or pass ~
+                              :SHARE-PORT T to start beside it, as a process ~
+                              taking over from the one it replaces does."
+                             port (format-peer-addr host port)))
+                     (:taken
+                      (setf claim taken)))))
+                ;; The claim is this start's, or none could be had. A
+                ;; socket listening all the same takes no claim: a server
+                ;; between holders in a handover, one whose claim could
+                ;; not be attempted or that was built without it, or
+                ;; another program that sets SO_REUSEPORT.
+                ((eq (port-listened-p host port) t)
+                 (release-port-claim claim)
+                 (setf claim nil)
+                 (error "start-server: cannot listen on ~a: a socket already ~
+                         listens there (EADDRINUSE, to a bind without ~
+                         SO_REUSEPORT), and no web-skeleton server holds the ~
+                         port's claim: a server between holders, one that ~
+                         could not take the claim or was built without it, ~
+                         or another program. If it sets SO_REUSEPORT as this ~
+                         user, this one's bind would not fail, and both would ~
+                         serve the port, the kernel dividing connections ~
+                         between them. Stop it first, or pass :SHARE-PORT T ~
+                         to start beside it."
+                        (format-peer-addr host port))))
+              ;; A bind that is refused lets go of the claim on its way
+              ;; out, since the cleanup that otherwise would is not
+              ;; reached yet.
+              (let ((bound nil))
+                (unwind-protect
+                     (setf listener0 (make-first-listener host port)
+                           bound t)
+                  (unless bound
+                    (release-port-claim claim)))))
+         ;; Bound or refused, this start has decided, and the next such
+         ;; start may look.
+         (release-port-claim starting)))))
   ;; From here the start changes things, and nothing below refuses it.
   ;;
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
