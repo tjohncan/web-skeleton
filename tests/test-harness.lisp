@@ -4132,6 +4132,99 @@
                      t))))
         :late 0.2))))
 
+(defun %connect-refused-p (port)
+  "T when a connect to 127.0.0.1:PORT is refused, NIL when it is made."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (unwind-protect
+         (handler-case
+             (progn (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
+                    nil)
+           (sb-bsd-sockets:connection-refused-error () t))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun test-harness-a-drain-closes-its-listener-first ()
+  "A worker that begins its drain closes its listener then, not once the
+   drain has ended. Open, the listener stays in the port's SO_REUSEPORT
+   group, and the kernel goes on completing connections into its queue
+   that nothing will accept, which the close at the end of the drain
+   resets: in a handover, a share of the new connections for as long as
+   the old server drains, with a server beside it that would have served
+   them.
+
+   A client asks for a 32 MiB response and reads none of it, which holds
+   the drain until *DRAIN-TIMEOUT*, three seconds here. Shutdown is asked
+   for, and a connect to the port is tried until it is refused: within a
+   second and a half, the drain still going, and not only once it has
+   run out.
+
+   Started by hand rather than through WITH-TEST-SERVER, to choose the
+   drain's length and to ask for shutdown while the server is serving."
+  (format t "~%Harness: a drain closes its listener first~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (big (make-string (* 32 1024 1024) :initial-element #\x))
+        (up (sb-thread:make-semaphore))
+        (bound nil)
+        (server nil)
+        (stuck nil))
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 3
+          *worker-wake-interval* 0.05)
+    (unwind-protect
+         (progn
+           (setf server
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (start-server
+                     :host #(127 0 0 1) :port 0 :workers 1
+                     :on-listen (lambda (p)
+                                  (setf bound p)
+                                  (sb-thread:signal-semaphore up))
+                     :handler (lambda (req)
+                                (declare (ignore req))
+                                (make-text-response 200 big))))
+                  :name "drain-listener-server"))
+           (check "drain listener: control, the server started"
+                  (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                  t)
+           (setf stuck (make-instance 'sb-bsd-sockets:inet-socket
+                                      :type :stream :protocol :tcp))
+           (sb-bsd-sockets:socket-connect stuck #(127 0 0 1) bound)
+           (let ((stream (sb-bsd-sockets:socket-make-stream
+                          stuck :output t :element-type '(unsigned-byte 8))))
+             (write-sequence (%ascii (format nil "GET /big HTTP/1.1~aHost: localhost~a~a"
+                                             *crlf* *crlf* *crlf*))
+                             stream)
+             (force-output stream))
+           ;; The response begun, and stuck behind the unread window.
+           (sleep 0.3)
+           (check "drain listener: control, a connect is made while it serves"
+                  (%connect-refused-p bound)
+                  nil)
+           (let ((asked (get-internal-real-time)))
+             (setf web-skeleton::*shutdown* t)
+             (let ((refused (loop repeat 100
+                                  thereis (%connect-refused-p bound)
+                                  do (sleep 0.05))))
+               (check "drain listener: refused while the drain still has its connection"
+                      (list refused
+                            (< (- (get-internal-real-time) asked)
+                               (* 1.5 internal-time-units-per-second)))
+                      '(t t)))))
+      (setf web-skeleton::*shutdown* t)
+      (when stuck (ignore-errors (sb-bsd-sockets:socket-close stuck)))
+      (when server
+        (handler-case (sb-thread:join-thread server :timeout 15)
+          (error ()
+            (ignore-errors (sb-thread:terminate-thread server))
+            (ignore-errors (sb-thread:join-thread server)))))
+      (setf web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll))))
+
 (defun test-harness-a-superseded-run-lets-go-of-its-claim ()
   "A START-SERVER whose run a later one in the image has replaced lets go
    of its port's claim, and stops asking for a claim it was waiting on.
@@ -10724,6 +10817,7 @@
   (test-harness-a-claim-held-where-nothing-listens-refuses-nothing)
   (test-harness-a-held-claim-refuses-by-what-listens)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
+  (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)

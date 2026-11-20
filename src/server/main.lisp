@@ -1416,10 +1416,21 @@
 
 (defun drain-connections (listener-socket epoll-fd event-buf)
   "Gracefully drain all active connections during shutdown.
-   Stops accepting, sends WebSocket close frames, lets writes flush,
+   Closes the listener, sends WebSocket close frames, lets writes flush,
    force-closes anything remaining after *drain-timeout*."
-  ;; Stop accepting new connections
+  ;; Stop accepting new connections, by closing the listener and not only
+  ;; taking it out of epoll. Left open, it stays in the port's SO_REUSEPORT
+  ;; group: the kernel goes on handing it new connections and completing
+  ;; them into its queue, which nothing accepts, and they are reset when it
+  ;; closes after the drain. Closed, the connections go to the listeners
+  ;; left on the port, a server started beside this one with :SHARE-PORT
+  ;; to take over from it among them. What its queue holds as it closes is
+  ;; reset all the same, unless net.ipv4.tcp_migrate_req hands it to
+  ;; another listener on the port. RUN-WORKER closes the listener again on
+  ;; its way out, which SOCKET-CLOSE makes nothing: the socket's
+  ;; descriptor is -1 once closed.
   (ignore-errors (epoll-remove epoll-fd (socket-fd listener-socket)))
+  (ignore-errors (sb-bsd-sockets:socket-close listener-socket))
   (let ((count (hash-table-count *connections*)))
     (when (zerop count)
       (return-from drain-connections))
@@ -2531,8 +2542,16 @@
                 (flags (epoll-event-flags event-buf i)))
             (if (= fd listener-fd)
                 ;; Edge-triggered: accept until none pending, or until an
-                ;; accept fails and the tick has to retry.
-                (setf accept-retry (accept-pending listener-socket epoll-fd))
+                ;; accept fails and the tick has to retry. Not once this
+                ;; worker is stopping: a connection accepted then has its
+                ;; request unread when the drain begins, and the drain
+                ;; closes it, which resets it. Left in the queue, it goes
+                ;; to another listener on the port when the drain closes
+                ;; this one, where net.ipv4.tcp_migrate_req allows; see
+                ;; DRAIN-CONNECTIONS.
+                (unless (worker-stopping-p)
+                  (setf accept-retry
+                        (accept-pending listener-socket epoll-fd)))
                 (dispatch-connection-event fd flags (svref owners i)
                                            epoll-fd handler ws-handler))))
         ;; Held past the batch, a closed connection would wait here for the
@@ -2563,8 +2582,9 @@
           (reap-dns-children)
           ;; And so does retrying a backlog an accept failure left
           ;; queued: no edge will report it, and a second is soon
-          ;; enough for a server that has run out of descriptors.
-          (when accept-retry
+          ;; enough for a server that has run out of descriptors. Not
+          ;; once the worker is stopping, as for the listener's event.
+          (when (and accept-retry (not (worker-stopping-p)))
             (setf accept-retry (accept-pending listener-socket epoll-fd)))
           ;; And so does ending a throttled log line's minute, which logs
           ;; the count of what its kind held back. A burst that has ended

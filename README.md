@@ -464,7 +464,7 @@ tests/
   libssl-backed implementations via `setf symbol-function`;
   the pure-Lisp versions remain reachable internally and `hmac-sha256` benefits
   transparently because it calls `sha256` through the function cell
-- **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting,
+- **Graceful shutdown** — on Ctrl-C or SIGTERM, closes its listeners,
   sends WebSocket close frames, flushes in-progress writes,
   force-closes after drain timeout
 - **Shutdown cleanup hooks** — apps register zero-argument functions via

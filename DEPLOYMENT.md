@@ -256,7 +256,19 @@ server logs, at WARN, that it joined a claimed port; both serve while
 they overlap, the kernel dividing connections between them; and when the
 old one stops the new one takes the claim, within a second or so, and
 logs that it has. A server started the
-plain way after that is refused again. A start script that always
+plain way after that is refused again.
+
+A stopping server accepts nothing more once it has been told to stop, and
+closes its listeners as its drain begins, so new connections go to the
+new server while the old one finishes what it was already sending. A
+connection the kernel had completed into an old listener's queue by then
+is reset when that listener closes, unless `net.ipv4.tcp_migrate_req` is
+1 (Linux 5.14 and later): then the kernel hands it to the new server's
+listener, and every connection that arrives once the old server has been
+told to stop is served by the new one. A request the old server had
+accepted and not yet read in full is closed, as at any shutdown. A plain
+start made while the old server drains is not refused either: the old
+server still holds the claim, but nothing listens. A start script that always
 replaces this way can always pass `:share-port t`: on a port nobody has
 claimed it takes the claim as a plain start does. Such a script is then
 never refused, a mistaken second run of it included, which is what
