@@ -1875,6 +1875,14 @@ worked out without it.
   vector that is not a string, is no client's to choose: it is that one
   object or it is not. Such a key is filed by the object, as SBCL files
   it, in a second table beside the first.
+- That is so of such an object as the whole key, and not inside a list.
+  There it is hashed from its `sxhash`, one value for every vector that
+  is not a string, so list keys that differ only in such a vector all
+  land together, as they do in SBCL's own `equal` table. Nothing is lost
+  by not making them: `equal` compares that vector by identity, so a
+  fresh vector holding the same bytes is another key, and a key made
+  from a digest's bytes never finds what was stored under it. Make it a
+  string: `sha256-hex` for a digest, `bytes-to-hex` for other bytes.
 - A store made with another `:test` (`eql`, `equalp`) hashes as SBCL
   does. Key such a store by something the server chooses, a session id
   it generated say, or by an HMAC of the client's value.

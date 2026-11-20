@@ -238,7 +238,12 @@
    SXHASH cannot tell apart land together. That is all of some kinds of
    object, every vector that is not a string for one, which is why a key
    EQUAL knows only by identity is not filed under this hash at all: see
-   STORE-TABLE-FOR."
+   STORE-TABLE-FOR. Inside a list such a vector is hashed here all the
+   same, so list keys that differ only in one land together, as in SBCL's
+   own EQUAL table. EQUAL compares that vector by identity, so such a key
+   is found only by a list holding the same vector, never by one holding
+   another with the same bytes; DEPLOYMENT.md's \"Concurrent store\" says
+   to make it a string."
   (let ((secret (store-hash-secret)))
     (or (typecase key
           ((simple-array character (*))
