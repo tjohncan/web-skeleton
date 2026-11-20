@@ -4354,6 +4354,83 @@
              (find nil installed :key #'cdr)
              nil))))
 
+(defun test-harness-a-replaced-run-returns-and-leaves-the-later-run-its-own ()
+  "A START-SERVER replaced by a later one in the image returns once its
+   workers have stopped, and leaves *SHUTDOWN*, the shutdown hooks and
+   SIGTERM's handler to the later run. The later run serves on; a hook
+   registered for it runs once, at its end; and SBCL's SIGTERM handler
+   goes back only once the later run has ended too. Left waiting for
+   *SHUTDOWN*, the replaced call woke when the later run was stopped and
+   ran that run's hooks on its own thread, before that run had drained.
+
+   Two real runs, each on a kernel-chosen port, the second started while
+   the first serves. What is installed for SIGTERM is recorded by wrapping
+   ENABLE-INTERRUPT, since a handler read back is NIL whichever it is."
+  (format t "~%Harness: a replaced run returns, and leaves the later run its own~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (installed nil)
+        (hooks 0)
+        (sbcl (symbol-function (find-symbol "SIGTERM-HANDLER" "SB-UNIX"))))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05)
+    (sb-int:encapsulate 'sb-sys:enable-interrupt 'recorded
+                        (lambda (real signal handler &rest more)
+                          (when (eql signal sb-unix:sigterm)
+                            (push handler installed))
+                          (apply real signal handler more)))
+    (flet ((run (name)
+             ;; A thread running START-SERVER, and a function answering
+             ;; the port it listens on once it does.
+             (let ((up (sb-thread:make-semaphore))
+                   (port nil))
+               (values (sb-thread:make-thread
+                        (lambda ()
+                          (start-server
+                           :host #(127 0 0 1) :port 0 :workers 1
+                           :on-listen (lambda (p)
+                                        (setf port p)
+                                        (sb-thread:signal-semaphore up))
+                           :handler (lambda (req)
+                                      (declare (ignore req))
+                                      (make-text-response 200 name))))
+                        :name name)
+                       (lambda ()
+                         (and (sb-thread:wait-on-semaphore up :timeout 10)
+                              port))))))
+      (unwind-protect
+           (multiple-value-bind (earlier earlier-port) (run "earlier")
+             (funcall earlier-port)
+             (multiple-value-bind (later later-port) (run "later")
+               (let ((port (funcall later-port)))
+                 (web-skeleton:register-cleanup (lambda () (incf hooks)))
+                 (check "replaced: the earlier call returns, with *SHUTDOWN* left clear"
+                        (list (handler-case
+                                  (progn (sb-thread:join-thread earlier :timeout 5) t)
+                                (error () nil))
+                              web-skeleton::*shutdown*)
+                        '(t nil))
+                 (check "replaced: the later run serves on, its hook not run, SBCL's handler not back"
+                        (list (%port-answers-with-p port "later")
+                              hooks
+                              (not (null (find sbcl installed))))
+                        '(t 0 nil))
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread later :timeout 15)
+                   (error () nil))
+                 (check "replaced: the later run's end runs its hook once, and puts SBCL's handler back"
+                        (list hooks (eq (first installed) sbcl))
+                        '(1 t)))))
+        (setf web-skeleton::*shutdown* t)
+        (sb-int:unencapsulate 'sb-sys:enable-interrupt 'recorded)
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll)))))
+
 (defun test-harness-a-drain-closes-its-listener-first ()
   "A worker that begins its drain closes its listener then, not once the
    drain has ended. Open, the listener stays in the port's SO_REUSEPORT
@@ -11032,6 +11109,7 @@
   (test-harness-a-listener-with-no-claim-refuses-a-start)
   (test-harness-starts-past-a-held-claim-go-one-at-a-time)
   (test-harness-a-stopped-server-puts-sbcls-sigterm-handler-back)
+  (test-harness-a-replaced-run-returns-and-leaves-the-later-run-its-own)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

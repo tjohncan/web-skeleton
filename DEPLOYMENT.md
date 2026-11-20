@@ -1893,6 +1893,10 @@ is therefore stopped for good after the first run: start it again, and
 register its hook again, before the next `start-server`, as the `start`
 function above does on every call.
 
+A `start-server` that a later one in the same image replaces returns as
+soon as its workers have stopped, and runs no hooks: those registered
+for the later run run at that run's end, after its own drain.
+
 ### Concurrent store
 
 `make-store` returns a thread-safe hash-table-backed store for app-level state
@@ -2782,13 +2786,14 @@ itself, which moves in steps of the kernel's tick, a few milliseconds.
 
 While `start-server` runs, SIGPIPE is ignored, so that a write to a peer
 that has gone fails with `EPIPE`, and SIGTERM stops the server as Ctrl-C
-does. When it returns it puts back SBCL's own SIGTERM handler, which ends
-the process. SBCL gives no way to read the handler a signal had before:
-`sb-sys:enable-interrupt` answers `nil` whatever is installed. So a
-SIGTERM handler an application installed before calling `start-server`
-is not put back; install it again once `start-server` has returned.
-SIGPIPE stays ignored, which is what SBCL's own handling of it comes to
-for the process.
+does. When the last `start-server` running in the image returns, it puts
+back SBCL's own SIGTERM handler, which ends the process: one that a later
+call has replaced leaves SIGTERM to that call. SBCL gives no way to read
+the handler a signal had before: `sb-sys:enable-interrupt` answers `nil`
+whatever is installed. So a SIGTERM handler an application installed
+before calling `start-server` is not put back; install it again once
+`start-server` has returned. SIGPIPE stays ignored, which is what SBCL's
+own handling of it comes to for the process.
 
 ### getent
 

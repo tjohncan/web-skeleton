@@ -3338,6 +3338,34 @@
         (symbol-function name)
         :default)))
 
+(sb-ext:defglobal *runs-holding-sigterm* 0
+  "How many START-SERVER runs in this image hold SIGTERM: see
+   RELEASE-RUN-SIGNALS. Changed under *SIGNALS-LOCK*.")
+
+(sb-ext:defglobal *signals-lock* (sb-thread:make-mutex :name "start-server signals")
+  "Held while a run takes SIGTERM or gives it back.")
+
+(defun hold-run-signals ()
+  "Install the run's SIGTERM handler, which sets *SHUTDOWN* as Ctrl-C
+   does, and count the run among those holding it. Counted only once it
+   is installed, so a raise from the install leaves the count as it was."
+  (sb-thread:with-mutex (*signals-lock*)
+    (sb-sys:enable-interrupt sb-unix:sigterm
+                             (lambda (signal info context)
+                               (declare (ignore signal info context))
+                               (setf *shutdown* t)))
+    (incf *runs-holding-sigterm*)))
+
+(defun release-run-signals ()
+  "Count the run out of those holding SIGTERM, and when it was the last,
+   put SBCL's own handler back (SBCL-SIGTERM-HANDLER). Only then: a run a
+   later one in this image has replaced ends while the later one runs,
+   and SBCL's handler back at that moment would have SIGTERM end the
+   process under the later run, undrained."
+  (sb-thread:with-mutex (*signals-lock*)
+    (when (zerop (decf *runs-holding-sigterm*))
+      (sb-sys:enable-interrupt sb-unix:sigterm (sbcl-sigterm-handler)))))
+
 (defun make-first-listener (host port)
   "MAKE-TCP-LISTENER for the listener START-SERVER binds itself, with a
    bind or a listen the kernel refuses turned into an error that names the
@@ -3370,7 +3398,7 @@
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
                           handler ws-handler body-handler on-listen on-tick
                           share-port
-                     &aux claim listener0)
+                     &aux claim listener0 replaced)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -3459,8 +3487,7 @@
 
    A second server on PORT is refused. Its bind would not fail, every
    listener setting SO_REUSEPORT, so before it binds this function takes a
-   claim on the port number, holds it until it returns, or until a later
-   call in this image begins a run and its workers stop, and signals an
+   claim on the port number, holds it until it returns, and signals an
    error when a socket listens where this server would bind: a server in
    another process, or another call of this function in this one, whether
    or not it holds the claim. A claim held where nothing listens, by a
@@ -3472,7 +3499,13 @@
    between them: it logs that it joined, and takes the claim itself once
    the other lets go. With :PORT 0 there is nothing to refuse: a number
    another server has claimed is passed over for the next the kernel
-   offers."
+   offers.
+
+   A later call of this function in this image replaces a running one:
+   that run's workers stop, and its call lets go of its claim and
+   returns. It leaves *SHUTDOWN*, the shutdown hooks and SIGTERM's
+   handler to the later run, whose end runs the hooks after its own drain
+   and, once no run is left, puts SBCL's SIGTERM handler back."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
@@ -3780,9 +3813,9 @@
   ;;
   ;; SBCL does not say what a signal's handler was: ENABLE-INTERRUPT
   ;; answers NIL whatever is installed, its own handlers included, and
-  ;; NIL cannot be installed back. So when the run ends this puts back
-  ;; SBCL's own SIGTERM handler (SBCL-SIGTERM-HANDLER), which ends the
-  ;; process, and leaves SIGPIPE ignored, which is what SBCL's handling of
+  ;; NIL cannot be installed back. So when the last run in the image ends,
+  ;; SBCL's own SIGTERM handler goes back (RELEASE-RUN-SIGNALS), which ends
+  ;; the process, and SIGPIPE stays ignored, which is what SBCL's handling of
   ;; it comes to for the process: a write to a closed peer fails with
   ;; EPIPE either way. A SIGTERM handler an application installed before
   ;; START-SERVER is not put back; see DEPLOYMENT.md, "Signals".
@@ -3794,10 +3827,7 @@
     (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
     (unwind-protect
          (progn
-           (sb-sys:enable-interrupt sb-unix:sigterm
-                                    (lambda (signal info context)
-                                      (declare (ignore signal info context))
-                                      (setf *shutdown* t)))
+           (hold-run-signals)
            (unwind-protect
                 (progn
                   ;; The number the kernel chose, when it was asked to.
@@ -3902,20 +3932,21 @@
                                      ;; workers stop for it. Nothing of
                                      ;; this run serves the port, so its
                                      ;; claim is let go, or no longer
-                                     ;; asked for. Only that: returning
-                                     ;; through the cleanup below would
-                                     ;; stop the later run as well.
-                                     (when (and claim
-                                                (/= generation
-                                                    *run-generation*))
-                                       (log-info "port ~d: claim ~:[let ~
-                                                  go~;no longer asked ~
-                                                  for~], a later ~
-                                                  start-server in this ~
-                                                  image having begun a run"
-                                                 port (eq claim :held))
+                                     ;; asked for, and the run ends
+                                     ;; through a cleanup that leaves
+                                     ;; *SHUTDOWN*, the shutdown hooks
+                                     ;; and SIGTERM's handler to the
+                                     ;; later run: see REPLACED.
+                                     (when (/= generation *run-generation*)
+                                       (log-info "port ~d: this run ends, ~
+                                                  a later start-server in ~
+                                                  this image having begun ~
+                                                  one"
+                                                 port)
                                        (release-port-claim claim)
-                                       (setf claim nil))
+                                       (setf claim nil
+                                             replaced t)
+                                       (return))
                                      ;; Joined to another server's port,
                                      ;; this one takes the claim when that
                                      ;; one lets go.
@@ -3933,8 +3964,11 @@
                                (log-info "interrupted — shutting down"))))
                       ;; Signal workers to drain and stop. Runs on normal
                       ;; exit, interactive-interrupt, AND a MAKE-THREAD
-                      ;; raise partway through the spawn loop.
-                      (setf *shutdown* t)
+                      ;; raise partway through the spawn loop. Not for a
+                      ;; replaced run: *SHUTDOWN* is the later run's, and
+                      ;; this run's workers stop for that run already.
+                      (unless replaced
+                        (setf *shutdown* t))
                       ;; A worker still inside a handler or a callback when
                       ;; its join gives up is still running, and is said to
                       ;; be, by name, rather than this returning under a
@@ -3961,16 +3995,18 @@
                         ;; cleanup before returning. Hooks own their own error
                         ;; handling — one raising hook cannot block the rest,
                         ;; cannot block the "stopped" log, and cannot prevent
-                        ;; START-SERVER from returning to its caller.
-                        (run-shutdown-hooks)
+                        ;; START-SERVER from returning to its caller. A
+                        ;; replaced run leaves them to the later run, whose
+                        ;; own end runs them once its workers have drained.
+                        (unless replaced
+                          (run-shutdown-hooks))
                         (if (zerop still-running)
                             (log-info "stopped")
                             (log-warn "stopped, with ~d worker~:p still running"
                                       still-running))))))
-             ;; Inner cleanup: SBCL's own SIGTERM handler back.
-             (ignore-errors
-              (sb-sys:enable-interrupt sb-unix:sigterm
-                                       (sbcl-sigterm-handler)))))
+             ;; Inner cleanup: SBCL's own SIGTERM handler back, once no
+             ;; run holds SIGTERM any more.
+             (ignore-errors (release-run-signals))))
       ;; The first listener, when worker 0 never adopted it: MAKE-THREAD
       ;; raised before worker 0's thread existed, or something raised
       ;; between the bind and the spawn. Nothing else will ever close it.
