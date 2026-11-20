@@ -3123,7 +3123,11 @@
 ;;; goes on without the claim and takes it once it is free. The look is
 ;;; given a second (HELD-CLAIM-STANDING): a server takes its claim a moment
 ;;; before it binds, and a second server started in that moment would
-;;; otherwise find nothing listening yet and go on beside it.
+;;; otherwise find nothing listening yet and go on beside it. A start that
+;;; takes the claim, or can take none, looks once: a socket listening
+;;; there holds no claim, a server between holders in a handover, one
+;;; whose claim could not be attempted or that was built without it, or
+;;; another program, and the start is refused all the same.
 ;;;
 ;;; The look is a bind, so it asks the kernel's own question: whether a
 ;;; socket listens at an address that would share connections with this
@@ -3133,9 +3137,9 @@
 ;;; traffic. Listeners on two addresses of one host do not meet, and two
 ;;; servers there start side by side, the second without the claim.
 ;;;
-;;; Only a server that takes the claim is refused by it. Another program
-;;; that sets SO_REUSEPORT, under the same user, binds the port all the
-;;; same.
+;;; What starts after a server is not seen by it: another program that sets
+;;; SO_REUSEPORT, under the same user, binds beside a running server all
+;;; the same.
 ;;; ---------------------------------------------------------------------------
 
 (defun port-claim-name (port)
@@ -3402,9 +3406,9 @@
    listener setting SO_REUSEPORT, so before it binds this function takes a
    claim on the port number, holds it until it returns, or until a later
    call in this image begins a run and its workers stop, and signals an
-   error when another holds the claim and a socket listens where this
-   server would bind: a server in another process, or another call of
-   this function in this one. A claim held where nothing listens, by a
+   error when a socket listens where this server would bind: a server in
+   another process, or another call of this function in this one, whether
+   or not it holds the claim. A claim held where nothing listens, by a
    process that does not serve there, refuses nothing: the start logs
    that at WARN, goes on without the claim, and takes it once it is free.
    The section above CLAIM-PORT says what the claim is and what it does
@@ -3642,24 +3646,43 @@
      (multiple-value-setq (listener0 claim) (make-claimed-listener host)))
     (t
      (setf claim (claim-port port))
-     ;; Held, the start is refused if a socket listens where this server
-     ;; would bind, and otherwise goes on, the claim still :HELD, to be
-     ;; taken once it is free: see the banner above CLAIM-PORT.
-     (when (and (eq claim :held) (not share-port))
-       (multiple-value-bind (standing taken) (held-claim-standing host port)
-         (case standing
-           (:listening
-            (error "start-server: port ~d is claimed by another web-skeleton ~
-                    server, in this process or another, and a socket ~
-                    listens where this one would bind, ~a. This one's bind ~
-                    would not fail, every listener setting SO_REUSEPORT: ~
-                    both would serve, the kernel dividing connections ~
-                    between them, with nothing in either log. Stop the ~
-                    other first, or pass :SHARE-PORT T to start beside it, ~
-                    as a process taking over from the one it replaces does."
-                   port (format-peer-addr host port)))
-           (:taken
-            (setf claim taken)))))
+     ;; A socket listening where this server would bind refuses the start,
+     ;; whoever holds the claim; held where nothing listens, the claim
+     ;; refuses nothing, and the start goes on to take it once it is free.
+     ;; See the banner above CLAIM-PORT.
+     (cond
+       (share-port)
+       ((eq claim :held)
+        (multiple-value-bind (standing taken) (held-claim-standing host port)
+          (case standing
+            (:listening
+             (error "start-server: port ~d is claimed by another web-skeleton ~
+                     server, in this process or another, and a socket ~
+                     listens where this one would bind, ~a. This one's bind ~
+                     would not fail, every listener setting SO_REUSEPORT: ~
+                     both would serve, the kernel dividing connections ~
+                     between them, with nothing in either log. Stop the ~
+                     other first, or pass :SHARE-PORT T to start beside it, ~
+                     as a process taking over from the one it replaces does."
+                    port (format-peer-addr host port)))
+            (:taken
+             (setf claim taken)))))
+       ;; The claim is this start's, or none could be had. A socket
+       ;; listening all the same takes no claim: a server between holders
+       ;; in a handover, one whose claim could not be attempted or that
+       ;; was built without it, or another program that sets SO_REUSEPORT.
+       ((eq (port-listened-p host port) t)
+        (release-port-claim claim)
+        (setf claim nil)
+        (error "start-server: cannot listen on ~a: a socket already listens ~
+                there (EADDRINUSE, to a bind without SO_REUSEPORT), and no ~
+                web-skeleton server holds the port's claim: a server between ~
+                holders, one that could not take the claim or was built ~
+                without it, or another program. If it sets SO_REUSEPORT as ~
+                this user, this one's bind would not fail, and both would ~
+                serve the port, the kernel dividing connections between ~
+                them. Stop it first, or pass :SHARE-PORT T to start beside it."
+               (format-peer-addr host port))))
      ;; A bind that is refused lets go of the claim on its way out, since
      ;; the cleanup that otherwise would is not reached yet.
      (let ((bound nil))

@@ -218,10 +218,10 @@ that bind succeeds, the kernel divides arriving connections between the
 two processes, each answers its share from its own memory, and neither
 log says anything. A start script run twice is enough to do it.
 
-So `start-server` claims its port number before it binds. A second
-server, in another process or from a second call in the same image, finds
-the claim held and the first server listening where it would bind, and
-is refused:
+So `start-server` claims its port number and looks at the port before it
+binds. A second server, in another process or from a second call in the
+same image, finds the first one listening where it would bind, and is
+refused:
 
 ```
 start-server: port 8081 is claimed by another web-skeleton server, in this process or another, and a socket listens where this one would bind, 127.0.0.1:8081. ...
@@ -259,16 +259,22 @@ logs that it has. A server started the
 plain way after that is refused again.
 
 A stopping server accepts nothing more once it has been told to stop, and
-closes its listeners as its drain begins, so new connections go to the
-new server while the old one finishes what it was already sending. A
-connection the kernel had completed into an old listener's queue by then
-is reset when that listener closes, unless `net.ipv4.tcp_migrate_req` is
-1 (Linux 5.14 and later): then the kernel hands it to the new server's
-listener, and every connection that arrives once the old server has been
-told to stop is served by the new one. A request the old server had
-accepted and not yet read in full is closed, as at any shutdown. A plain
-start made while the old server drains is not refused either: the old
-server still holds the claim, but nothing listens. A start script that always
+closes its listeners as its drain begins, which a worker idle in its
+event loop comes to within `*worker-wake-interval*` of the stop. New
+connections then go to the new server while the old one finishes what
+it was already sending. A connection the kernel completed into an old
+listener's queue before that is reset when the listener closes, unless
+`net.ipv4.tcp_migrate_req` is 1 (Linux 5.14 and later): then the kernel
+hands it to the new server's listener, and every connection that arrives
+once the old server has been told to stop is served by the new one.
+Without it, an idle worker's first connection after the stop is
+typically lost that way. A request the old server had accepted and not
+yet read in full is closed, as at any shutdown.
+
+A plain start during a handover is refused, since the new server
+listens. With no other server on the port, one made once the old
+server's listeners have closed is not refused: the old server still
+holds the claim, but nothing listens. A start script that always
 replaces this way can always pass `:share-port t`: on a port nobody has
 claimed it takes the claim as a plain start does. Such a script is then
 never refused, a mistaken second run of it included, which is what
@@ -286,10 +292,13 @@ passing the keyword every time gives up.
   the start is refused. Two servers on two addresses of one host share
   nothing: the second starts beside the first, without the claim, and
   says so.
-- **Servers built on this framework, and no other program.** Another
-  program that sets `SO_REUSEPORT`, run by the same user, binds the port
-  all the same. One that does not set it makes this server's bind fail,
-  and `start-server` says so by name.
+- **What listens before this server starts, not what starts after it.**
+  A start is refused beside any socket listening where it would bind,
+  whether or not that holds the claim: a server between holders in a
+  handover, one whose claim could not be taken or that was built without
+  it, or another program. A program that starts after this server and
+  sets `SO_REUSEPORT`, run by the same user, binds beside it all the
+  same: nothing on this side sees it.
 - **One network namespace.** Abstract names belong to a network
   namespace, as ports do. Two containers that each have their own can
   serve the same port number and do not see each other's claims; two

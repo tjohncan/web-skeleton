@@ -2709,7 +2709,9 @@
 
    Server A's handler is inside a slow request when shutdown is asked for,
    so A's join gives up on that worker and START-SERVER returns, saying
-   so. Server B starts on the same port. When A's handler returns, its
+   so. Server B starts on the same port, beside A's worker, which still
+   listens there: with :SHARE-PORT, since a plain start beside a listener
+   is refused. When A's handler returns, its
    worker finds *SHUTDOWN* cleared by B and, keyed on the flag alone, went
    back to serving: listener open, old handler, and SO_REUSEPORT splitting
    connections between it and B. Every request made after A's handler
@@ -2740,6 +2742,9 @@
               (lambda ()
                 (start-server
                  :host #(127 0 0 1) :port port* :workers 1
+                 ;; For B, beside A's worker: see the docstring. A's
+                 ;; :PORT 0 has no use for it.
+                 :share-port t
                  :on-listen (lambda (p)
                               (setf port p)
                               (sb-thread:signal-semaphore semaphore))
@@ -4235,6 +4240,50 @@
              (not (null (search "nothing listens where this server binds"
                                 (get-output-stream-string log))))
              t))))
+
+(defun test-harness-a-listener-with-no-claim-refuses-a-start ()
+  "A start that finds its port's claim free, and takes it, looks at the
+   port all the same: a socket listening where it would bind holds no
+   claim, a server between holders in a handover, one built without the
+   claim, or another program, and the start is refused, letting go of
+   the claim it took. With :SHARE-PORT it starts beside it, as asked.
+
+   The listener sets SO_REUSEPORT, as a server's does, so that a start
+   that did not look would bind beside it without error and serve."
+  (format t "~%Harness: a listener with no claim refuses a start~%")
+  (%with-claim-test-servers (start finish log)
+    (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+           (port (%port-of listener)))
+      (flet ((claim-free-p ()
+               (let ((got (web-skeleton::claim-port port)))
+                 (web-skeleton::release-port-claim got)
+                 (typep got 'sb-bsd-sockets:socket))))
+        (unwind-protect
+             (progn
+               (check "no claim: control, a socket listens and the name is free"
+                      (list (eq (web-skeleton::port-listened-p #(127 0 0 1) port) t)
+                            (claim-free-p))
+                      '(t t))
+               (let ((message (finish (start port #(127 0 0 1)) 5)))
+                 (check "no claim: a start beside the listener is refused, naming the address"
+                        (and (stringp message)
+                             (search (format nil "cannot listen on 127.0.0.1:~d" port)
+                                     message)
+                             (search ":SHARE-PORT" message)
+                             t)
+                        t))
+               (check "no claim: and lets go of the claim it took"
+                      (claim-free-p)
+                      t)
+               (multiple-value-bind (server up)
+                   (start port #(127 0 0 1) :share-port t)
+                 (check "no claim: control, with :share-port it starts beside it"
+                        (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                        t)
+                 (setf web-skeleton::*shutdown* t)
+                 (finish server 10)
+                 (setf web-skeleton::*shutdown* nil)))
+          (sb-bsd-sockets:socket-close listener))))))
 
 (defun test-harness-a-drain-closes-its-listener-first ()
   "A worker that begins its drain closes its listener then, not once the
@@ -10911,6 +10960,7 @@
   (test-harness-a-claim-held-where-nothing-listens-refuses-nothing)
   (test-harness-a-held-claim-refuses-by-what-listens)
   (test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim)
+  (test-harness-a-listener-with-no-claim-refuses-a-start)
   (test-harness-a-superseded-run-lets-go-of-its-claim)
   (test-harness-a-drain-closes-its-listener-first)
   (test-harness-a-kernel-chosen-port-is-claimed-too)

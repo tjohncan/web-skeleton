@@ -822,10 +822,10 @@ the claim's below both come before `start-server` has changed anything,
 so a server already running in the image is left as it was.
 
 A second server on a port is refused as well, though its bind would not
-fail. `start-server` claims the port number before it binds, and signals
-an error when another web-skeleton server holds the claim and a socket
-listens where this one would bind: a second process started by mistake,
-or a second call in one image. A claim held where nothing listens
+fail. `start-server` claims the port number and looks at the port before
+it binds, and signals an error when a socket listens where this one would
+bind: a second process started by mistake, or a second call in one image,
+whether or not it holds the claim. A claim held where nothing listens
 refuses nothing: the start says so at WARN, and takes the claim once it
 is free. `:share-port t` starts beside the holder instead, which is how a new
 process takes over from the one it replaces with no gap. With `:port 0`
