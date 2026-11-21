@@ -201,14 +201,16 @@
    The line names the kind in lower case, a list's first element with the
    rest in parentheses after it: \"parse-error: 3 more lines held back in
    the last 60 seconds\", or \"handler-error (type-error): ...\" for an
-   error that escaped a handler."
+   error that escaped a handler. The seconds are whole ones and never
+   fewer than one: a minute ended early, as a worker stops, can end in
+   the second it began, and its count is then \"in the last 1 second\"."
   (destructuring-bind (logged-at held-back level) entry
     (when (plusp held-back)
-      (log-msg level "~a: ~d more line~:p held back in the last ~d seconds"
+      (log-msg level "~a: ~d more line~:p held back in the last ~d second~:p"
                (if (consp kind)
                    (format nil "~(~a (~{~a~^ ~})~)" (first kind) (rest kind))
                    (format nil "~(~a~)" kind))
-               held-back (- now logged-at)))))
+               held-back (max 1 (- now logged-at))))))
 
 (defun flush-log-throttle (now &key all)
   "End the minute of each kind in this worker's *LOG-THROTTLE* whose line

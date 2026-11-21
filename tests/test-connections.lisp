@@ -4096,7 +4096,18 @@
                '("[WARN] burst: 2 more lines held back in the last 10 seconds"))
         (check "all: and every kind forgotten"
                (hash-table-count web-skeleton::*log-throttle*)
-               0)))))
+               0)
+        ;; A minute ended in the second it began, as a worker that stops
+        ;; just after a burst ends it.
+        (dotimes (i 2)
+          (web-skeleton::log-throttled :warn :quick "quick ~d" i))
+        (logged)
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 2000))
+        (web-skeleton::flush-log-throttle 2000 :all t)
+        (check "all: a minute ended in its first second is counted over one"
+               (logged)
+               '("[WARN] quick: 1 more line held back in the last 1 second"))))))
 
 (defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
   "MONOTONIC-SECONDS, which every interval is measured on, reads whole
