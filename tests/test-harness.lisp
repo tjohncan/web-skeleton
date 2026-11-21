@@ -3711,6 +3711,35 @@
 (defun %port-of (socket)
   (nth-value 1 (sb-bsd-sockets:socket-name socket)))
 
+(defun %log-so-far (log)
+  "What LOG, a string stream a server's lines go to, holds so far, left
+   in it for whoever reads it next: read and written back under
+   *LOG-LOCK*, which every line is written under."
+  (sb-thread:with-mutex (web-skeleton::*log-lock*)
+    (let ((text (get-output-stream-string log)))
+      (write-string text log)
+      text)))
+
+(defun %server-took-claim-p (log port)
+  "True when the server whose lines go to LOG holds PORT's claim within
+   five seconds: the line it logs on taking the claim is looked for every
+   50 ms, and the claim, asked for once after it, is found held.
+
+   Looked for in the log, and not by asking for the claim until it is
+   found held. An asking holds the claim's name for a moment, and a
+   server that asks in that moment is told it is held, and asks again a
+   second later. A test that asks every 50 ms from the moment the server
+   listens keeps step with the server's wait, which wakes every 50 ms
+   from the same moment, and can be holding the name at each of the
+   server's askings."
+  (let ((line (format nil "port ~d: this server holds the claim" port)))
+    (and (loop repeat 100
+               thereis (search line (%log-so-far log))
+               do (sleep 0.05))
+         (let ((got (web-skeleton::claim-port port)))
+           (web-skeleton::release-port-claim got)
+           (eq got :held)))))
+
 (defun test-harness-a-port-claim-has-one-holder ()
   "CLAIM-PORT gives a port's claim to the first that asks and tells the
    second it is held, and the claim is there to take again once the first
@@ -3904,15 +3933,8 @@
                       (check "claimed port: and serves"
                              (%port-answers-with-p port "joined") t)
                       (web-skeleton::release-port-claim other)
-                      ;; Asking takes the claim when it is free, so what is
-                      ;; taken is given straight back and asked for again:
-                      ;; the server asks on every pass of its wait.
                       (check "claimed port: it takes the claim once the other lets go"
-                             (loop repeat 100
-                                   for got = (web-skeleton::claim-port port)
-                                   when (eq got :held) return t
-                                   do (web-skeleton::release-port-claim got)
-                                      (sleep 0.05))
+                             (%server-took-claim-p log port)
                              t))
                  (setf web-skeleton::*shutdown* t)
                  (finish server 10)))
@@ -4067,15 +4089,8 @@
                              t)
                       (web-skeleton::release-port-claim other)
                       (setf other nil)
-                      ;; Asking takes the claim when it is free, so what
-                      ;; is taken is given straight back and asked for
-                      ;; again, until the server is the one holding it.
                       (check "held, nothing listening: it takes the claim once let go"
-                             (loop repeat 60
-                                   for got = (web-skeleton::claim-port port)
-                                   when (eq got :held) return t
-                                   do (web-skeleton::release-port-claim got)
-                                      (sleep 0.05))
+                             (%server-took-claim-p log port)
                              t))
                  (setf web-skeleton::*shutdown* t)
                  (finish server 10)
@@ -4225,11 +4240,7 @@
                (web-skeleton::release-port-claim other)
                (setf other nil)
                (check "failed asking: it takes the claim once let go"
-                      (loop repeat 60
-                            for got = (web-skeleton::claim-port port)
-                            when (eq got :held) return t
-                            do (web-skeleton::release-port-claim got)
-                               (sleep 0.05))
+                      (%server-took-claim-p log port)
                       t)
                (setf web-skeleton::*shutdown* t)
                (finish server 10)
