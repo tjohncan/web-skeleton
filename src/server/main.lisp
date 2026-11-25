@@ -971,7 +971,9 @@
 
    A hook runs once, at the end of the run it was registered before or
    during: the run that fires the hooks consumes them, so a second
-   START-SERVER in the same image runs only the hooks registered since."
+   START-SERVER in the same image runs only the hooks registered since.
+   A run that a later START-SERVER replaces fires none: its hooks run at
+   the end of the run that replaced it."
   (sb-thread:with-mutex (*shutdown-hooks-lock*)
     (push fn *shutdown-hooks*))
   fn)

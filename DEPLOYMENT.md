@@ -1894,8 +1894,9 @@ register its hook again, before the next `start-server`, as the `start`
 function above does on every call.
 
 A `start-server` that a later one in the same image replaces returns as
-soon as its workers have stopped, and runs no hooks: those registered
-for the later run run at that run's end, after its own drain.
+soon as its workers have stopped, and runs no hooks. Its hooks, and
+those registered for the later run, run at the later run's end, after
+its own drain.
 
 ### Concurrent store
 
@@ -1953,12 +1954,14 @@ Supplying `:expiry-fn` without `:reap-interval` (or vice versa) signals
 an error at `make-store` time rather than silently skipping the reaper.
 
 The reaper sleeps between sweeps and costs nothing while it waits. It
-stops when the `start-server` run it was made before or during ends, since
-that run consumes the hook. A store made once at load time, as above, and
-used across several runs in one image (a server restarted at the REPL)
-reaps during the first only; make it in the function that starts the
-server when that matters. `stop-store-reaper` stops one sooner, for a
-store the application retires, and lets the store be collected.
+stops when the `start-server` run it was made before or during ends,
+since that run consumes the hook, or, for a run that a later
+`start-server` replaces, when the later run ends. A store made once at
+load time, as above, and used across several runs in one image (a
+server restarted at the REPL) reaps during the first only; make it in
+the function that starts the server when that matters.
+`stop-store-reaper` stops one sooner, for a store the application
+retires, and lets the store be collected.
 
 Two locking hazards to know about:
 
