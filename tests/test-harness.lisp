@@ -4194,14 +4194,27 @@
         :late 0.2))))
 
 (defun %connect-refused-p (port)
-  "T when a connect to 127.0.0.1:PORT is refused, NIL when it is made."
+  "T when a connect to 127.0.0.1:PORT is refused, NIL when it is made.
+
+   Made includes made and then reset before the connect returned. The
+   connection is completed into the listener's queue, and its arrival is
+   what wakes an idle worker that has been told to stop. That worker
+   accepts nothing more and closes the listener as its drain begins, and
+   the kernel resets the connection still in the queue. The listener was
+   open when the connection arrived, so it was not refused.
+   SB-BSD-SOCKETS signals that reset as a plain SOCKET-ERROR."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
                                :type :stream :protocol :tcp)))
     (unwind-protect
          (handler-case
              (progn (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
                     nil)
-           (sb-bsd-sockets:connection-refused-error () t))
+           (sb-bsd-sockets:connection-refused-error () t)
+           (sb-bsd-sockets:socket-error (e)
+             ;; 104 is ECONNRESET on Linux.
+             (if (eql (sb-bsd-sockets::socket-error-errno e) 104)
+                 nil
+                 (error e))))
       (ignore-errors (sb-bsd-sockets:socket-close socket)))))
 
 (defun test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim ()
