@@ -3152,17 +3152,25 @@
    `ss -xa` list it, after an @, for as long as a server holds it."
   (format nil "web-skeleton/port/~d" port))
 
-(defun claim-port (port)
+(defun claim-port (port &key (warn t))
   "Take the claim on PORT: see the banner above. Answers the socket that
    holds it, for RELEASE-PORT-CLAIM to close; :HELD when it is held, by
    another server in this process or another, or by any process that has
-   bound the name; or NIL when no claim could be attempted, which is
-   logged and leaves the port without one.
+   bound the name; or NIL when no claim could be attempted, which leaves
+   the port without one and is logged when WARN is true.
 
    A claim that cannot be attempted does not stop a server. The socket
    fails where the process is allowed no Unix sockets, under a systemd
    unit's RestrictAddressFamilies= without AF_UNIX say, or has no
-   descriptor to spare, and neither is a second server on the port.
+   descriptor to spare, and neither is a second server on the port. The
+   look at the port still refuses a start beside a listening server.
+   What goes unguarded is two starts at the same moment, which both look
+   before either has bound.
+
+   WARN false is for a caller that asks again and again:
+   HELD-CLAIM-STANDING, every 50 ms of its look, and RETAKE-PORT-CLAIM,
+   which passes it true only for the first of a run of askings that
+   cannot be made.
 
    Always a stream socket: the kernel keeps abstract names by socket type,
    so a claim of another type would not meet this one."
@@ -3179,9 +3187,12 @@
       (error (e)
         (when socket
           (ignore-errors (sb-bsd-sockets:socket-close socket)))
-        (log-warn "port ~d: its claim could not be attempted (~a), so a ~
-                   second server on it would not be refused"
-                  port e)
+        (when warn
+          (log-warn "port ~d: its claim could not be attempted (~a), so ~
+                     this server has none: a start beside a listening ~
+                     server is still refused, but two starts at the same ~
+                     moment would not see each other"
+                    port e))
         nil))))
 
 (defun release-port-claim (claim)
@@ -3245,8 +3256,11 @@
       ;; Taken only when the answer is a socket. An asking that could not
       ;; be made, NIL, says nothing of the holder, and the look goes on,
       ;; ending held as RETAKE-PORT-CLAIM stays held after one: a start
-      ;; that took NIL for the claim would never ask for it again.
-      (let ((claim (claim-port port)))
+      ;; that took NIL for the claim would never ask for it again. Nor is
+      ;; such an asking logged, up to twenty times in the second: the
+      ;; start logs how its look ended, and the wait logs the first of its
+      ;; own askings that cannot be made.
+      (let ((claim (claim-port port :warn nil)))
         (when (typep claim 'sb-bsd-sockets:socket)
           (return (values :taken claim))))
       (when (>= (get-internal-real-time) deadline)
@@ -3294,13 +3308,14 @@
         (return nil))
       (sleep 0.05))))
 
-(defun retake-port-claim (claim port asked-at now)
+(defun retake-port-claim (claim port asked-at now &optional failing)
   "For a server started while another held its port's claim, beside it
    with :SHARE-PORT or past a holder that does not serve where it binds:
    ask for the claim on PORT again when CLAIM is :HELD and it was last
-   asked for at another second than NOW. Returns (VALUES CLAIM ASKED-AT)
-   as they stand afterwards. ASKED-AT and NOW are MONOTONIC-SECONDS
-   readings.
+   asked for at another second than NOW. Returns (VALUES CLAIM ASKED-AT
+   FAILING) as they stand afterwards. ASKED-AT and NOW are
+   MONOTONIC-SECONDS readings, and FAILING is true when the last asking
+   could not be made.
 
    START-SERVER calls this from its wait, so a server so started holds
    the claim within a second or so of the other letting go, and a third
@@ -3310,20 +3325,23 @@
    make a socket and fail to bind it at every pass for as long as they
    ran.
 
-   Still :HELD when the asking could not be made at all, which CLAIM-PORT
-   has logged. An attempt that failed for want of a descriptor says
-   nothing of the next one, and a server that stopped asking would leave
-   its port unclaimed for good."
+   Still :HELD when the asking could not be made at all. An attempt that
+   failed for want of a descriptor says nothing of the next one, and a
+   server that stopped asking would leave its port unclaimed for good.
+   CLAIM-PORT logs the first asking of such a run, made with FAILING
+   false, and not the ones after it, a second apart for as long as the
+   shortage lasts. An asking that is made ends the run."
   (if (and (eq claim :held) (/= now asked-at))
-      (let ((taken (claim-port port)))
+      (let ((taken (claim-port port :warn (not failing))))
         (values (cond ((typep taken 'sb-bsd-sockets:socket)
                        (log-info "port ~d: this server holds the claim, its ~
                                   holder having let go of it"
                                  port)
                        taken)
                       (t :held))
-                now))
-      (values claim asked-at)))
+                now
+                (null taken)))
+      (values claim asked-at failing)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
@@ -3883,9 +3901,11 @@
                   (let ((threads nil)
                         (generation *run-generation*)
                         (census *connection-census*)
-                        ;; When the claim was last asked for again: see
+                        ;; When the claim was last asked for again, and
+                        ;; whether that asking could not be made: see
                         ;; RETAKE-PORT-CLAIM.
-                        (claim-asked-at 0))
+                        (claim-asked-at 0)
+                        (claim-failing nil))
                     (unwind-protect
                          (progn
                            (dotimes (i workers)
@@ -3954,10 +3974,10 @@
                                      ;; one lets go.
                                      (when (eq claim :held)
                                        (multiple-value-setq
-                                           (claim claim-asked-at)
+                                           (claim claim-asked-at claim-failing)
                                          (retake-port-claim
                                           claim port claim-asked-at
-                                          (monotonic-seconds))))
+                                          (monotonic-seconds) claim-failing)))
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))

@@ -3783,16 +3783,20 @@
                         (askings 0))
                     (sb-int:encapsulate
                      'web-skeleton::claim-port 'scripted
-                     (lambda (real port)
+                     (lambda (real port &rest keys)
                        (incf askings)
                        (if scripted
                            (pop scripted)
-                           (funcall real port))))
+                           (apply real port keys))))
                     (unwind-protect
                          (flet ((retake (claim asked-at now)
-                                  (multiple-value-list
-                                   (web-skeleton::retake-port-claim
-                                    claim port asked-at now))))
+                                  ;; CLAIM and ASKED-AT. Whether an asking
+                                  ;; could not be made is checked below,
+                                  ;; where it is logged.
+                                  (subseq (multiple-value-list
+                                           (web-skeleton::retake-port-claim
+                                            claim port asked-at now))
+                                          0 2)))
                            (check "retake: an asking that could not be made leaves it held, to ask again"
                                   (retake :held 0 100) '(:held 100))
                            (check "retake: it is not asked for twice in one second"
@@ -3823,22 +3827,59 @@
   ;; would meet a socket the kernel refused to bind. Nothing of the
   ;; process is touched to arrange it: a descriptor limit lowered for the
   ;; call would be lowered for every other thread as well.
-  (let ((log (make-string-output-stream)))
-    (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused
-                        (lambda (real port)
-                          (declare (ignore real port))
-                          (error "no name to bind")))
-    (let ((got (unwind-protect
-                    (let ((web-skeleton::*log-stream* log)
-                          (web-skeleton::*log-level* :warn))
-                      (web-skeleton::claim-port 1))
-                 (sb-int:unencapsulate 'web-skeleton::port-claim-name
-                                       'refused))))
-      (check "port claim: one that cannot be attempted is not held, and is logged"
-             (list got
-                   (not (null (search "could not be attempted (no name to bind)"
-                                      (get-output-stream-string log)))))
-             '(nil t)))))
+  (let ((log (make-string-output-stream))
+        (refusals 0))
+    (flet ((logged (text)
+             ;; How many times LOG says TEXT so far.
+             (let ((so-far (%log-so-far log)))
+               (loop for at = (search text so-far)
+                       then (search text so-far :start2 (1+ at))
+                     while at
+                     count t))))
+      (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused
+                          (lambda (real port)
+                            (if (plusp refusals)
+                                (progn (decf refusals)
+                                       (error "no name to bind"))
+                                (funcall real port))))
+      (unwind-protect
+           (let ((web-skeleton::*log-stream* log)
+                 (web-skeleton::*log-level* :warn))
+             (setf refusals 1)
+             (check "port claim: one that cannot be attempted is not held, and is logged with what is still refused"
+                    (list (web-skeleton::claim-port 1)
+                          (logged "could not be attempted (no name to bind)")
+                          (logged "a start beside a listening server is still refused"))
+                    '(nil 1 1))
+             (setf refusals 1)
+             (check "port claim: with :WARN NIL it is not logged"
+                    (list (web-skeleton::claim-port 1 :warn nil)
+                          (logged "could not be attempted"))
+                    '(nil 1))
+             ;; RETAKE-PORT-CLAIM asks once a second for as long as a
+             ;; shortage lasts. The name is held here, so an asking that
+             ;; is made answers :HELD.
+             (let ((holder (web-skeleton::claim-port 1)))
+               (unwind-protect
+                    (flet ((retake (asked-at now failing)
+                             (multiple-value-list
+                              (web-skeleton::retake-port-claim
+                               :held 1 asked-at now failing))))
+                      (setf refusals 2)
+                      (check "retake: a run of askings that cannot be made is logged at its first"
+                             (list (retake 0 200 nil) (retake 200 201 t)
+                                   (logged "could not be attempted"))
+                             '((:held 200 t) (:held 201 t) 2))
+                      (check "retake: an asking that is made ends the run"
+                             (retake 201 202 t)
+                             '(:held 202 nil))
+                      (setf refusals 1)
+                      (check "retake: and the next that cannot be made is logged again"
+                             (list (retake 202 203 nil)
+                                   (logged "could not be attempted"))
+                             '((:held 203 t) 3)))
+                 (web-skeleton::release-port-claim holder))))
+        (sb-int:unencapsulate 'web-skeleton::port-claim-name 'refused)))))
 
 (defun test-harness-a-claimed-port-refuses-a-second-server ()
   "START-SERVER on a port whose claim another holds signals, naming the
@@ -4226,17 +4267,19 @@
    and never ask again, leaving the name free for a second server to
    take and join it with no look at the port.
 
-   The holder is a name bound by hand, with nothing listening. CLAIM-PORT
-   answers the start's first asking itself, and NIL for the next two,
-   which fall in the look, as it does when the socket cannot be made."
+   The holder is a name bound by hand, with nothing listening. The
+   start's first asking is made, and the next two, which fall in the
+   look, fail as a bind the kernel refuses does, by PORT-CLAIM-NAME
+   signalling. The look logs neither: an asking that cannot be made says
+   nothing of the holder, and the start logs how its look ended."
   (format t "~%Harness: a claim asking that fails in the look is not the claim~%")
   (let ((other nil)
         (askings 0))
     (%with-claim-test-servers (start finish log)
-      (sb-int:encapsulate 'web-skeleton::claim-port 'refused-in-the-look
+      (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused-in-the-look
                           (lambda (real port)
                             (if (<= 2 (incf askings) 3)
-                                nil
+                                (error "no name to bind")
                                 (funcall real port))))
       (unwind-protect
            (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
@@ -4248,7 +4291,7 @@
                (check "failed asking: control, the start goes on"
                       (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
                       t)
-               (sb-int:unencapsulate 'web-skeleton::claim-port
+               (sb-int:unencapsulate 'web-skeleton::port-claim-name
                                      'refused-in-the-look)
                (web-skeleton::release-port-claim other)
                (setf other nil)
@@ -4258,12 +4301,15 @@
                (setf web-skeleton::*shutdown* t)
                (finish server 10)
                (setf web-skeleton::*shutdown* nil)))
-        (sb-int:unencapsulate 'web-skeleton::claim-port 'refused-in-the-look)
+        (sb-int:unencapsulate 'web-skeleton::port-claim-name 'refused-in-the-look)
         (web-skeleton::release-port-claim other))
-      (check "failed asking: and said at WARN that it went on past a held claim"
-             (not (null (search "nothing listens where this server binds"
-                                (get-output-stream-string log))))
-             t))))
+      (let ((logged (get-output-stream-string log)))
+        (check "failed asking: and said at WARN that it went on past a held claim"
+               (not (null (search "nothing listens where this server binds" logged)))
+               t)
+        (check "failed asking: and logged neither asking that could not be made"
+               (search "could not be attempted" logged)
+               nil)))))
 
 (defun test-harness-a-listener-with-no-claim-refuses-a-start ()
   "A start that finds its port's claim free, and takes it, looks at the
