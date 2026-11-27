@@ -146,9 +146,7 @@
                (payload-b64 (second parts))
                (sig-b64 (third parts))
                ;; Decode header and payload
-               (header (json-parse (sb-ext:octets-to-string
-                                    (base64url-decode header-b64)
-                                    :external-format :utf-8)))
+               (header (json-parse-bytes (base64url-decode header-b64)))
                (alg (json-get header "alg"))
                (kid (json-get header "kid")))
           ;; Must be ES256
@@ -173,9 +171,7 @@
             ;; Decode claims and check exp/nbf BEFORE expensive crypto.
             ;; This prevents DoS via expired tokens forcing ECDSA verification.
             ;; Safe: we already parse unauthenticated JSON for the header above.
-            (let* ((claims (json-parse (sb-ext:octets-to-string
-                                        (base64url-decode payload-b64)
-                                        :external-format :utf-8)))
+            (let* ((claims (json-parse-bytes (base64url-decode payload-b64)))
                    (now (jwt-current-time)))
               ;; RFC 7519 §7.2 step 10. JSON-GET answers NIL on anything
               ;; that is not an object, so without this a signed 5 would

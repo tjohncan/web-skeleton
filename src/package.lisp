@@ -47,6 +47,9 @@
            #:log-error
            #:*log-level*
            #:*log-stream*
+           #:*throttle-handler-errors*
+           ;; The clock intervals are measured on
+           #:monotonic-seconds
            ;; Algorithms
            #:sha1
            #:sha1-hex
@@ -83,6 +86,9 @@
            #:jwt-claim
            ;; JSON
            #:json-parse
+           #:json-parse-bytes
+           #:json-parse-error
+           #:json-parse-error-message
            #:json-serialize
            #:json-get
            #:json-object

@@ -5022,6 +5022,76 @@
         (ignore-errors
          (sb-ext:delete-directory scratch))))))
 
+(defun test-static-aliases-follow-a-reload ()
+  "A load moves the aliases of the files it brings to those files, and
+   never takes the place of a file.
+
+   /page answers for page.html and /docs for docs/index.html. Loaded
+   again with both files changed, each alias answers for the file now at
+   its path, not for the one the first load brought. When x.html and
+   x/index.html both want /x, x.html has it, here with the index loaded
+   by an earlier call, so that the alias it got there is in the way. And
+   a file loaded at an alias's path keeps that path.
+
+   What an entry serves is told by its ETag, a hash of its content."
+  (format t "~%Static: aliases follow a reload~%")
+  (let ((scratch (sb-ext:parse-native-namestring
+                  (scratch-path "ws-static-reload" "/")))
+        (saved-cache web-skeleton::*static-cache*))
+    (ensure-directories-exist (merge-pathnames "docs/" scratch))
+    (ensure-directories-exist (merge-pathnames "both/" scratch))
+    (flet ((write-file (rel text)
+             (with-open-file (s (merge-pathnames rel scratch)
+                                :direction :output
+                                :element-type '(unsigned-byte 8)
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+               (write-sequence (sb-ext:string-to-octets
+                                text :external-format :utf-8)
+                               s)))
+           (etag (path)
+             (let ((entry (gethash path web-skeleton::*static-cache*)))
+               (and entry (web-skeleton::static-entry-etag entry))))
+           (load-tree ()
+             (web-skeleton::load-static-files (namestring scratch))))
+      (unwind-protect
+           (progn
+             (setf web-skeleton::*static-cache*
+                   (make-hash-table :test #'equal))
+             (write-file "page.html" "page, the first")
+             (write-file "docs/index.html" "docs, the first")
+             (write-file "both/index.html" "both, the index")
+             (write-file "real.html" "real, the page")
+             (load-tree)
+             (let ((first-page (etag "/page")))
+               (write-file "page.html" "page, the second")
+               (write-file "docs/index.html" "docs, the second")
+               (write-file "both.html" "both, the page")
+               (write-file "real" "real, a file of its own")
+               (load-tree)
+               (check "reload: control, the first load's /page is not the page now there"
+                      (list (not (null first-page))
+                            (equal first-page (etag "/page.html")))
+                      '(t nil)))
+             (check "reload: /page answers for the page.html now there"
+                    (equal (etag "/page") (etag "/page.html"))
+                    t)
+             (check "reload: /docs answers for the docs/index.html now there"
+                    (equal (etag "/docs") (etag "/docs/index.html"))
+                    t)
+             (check "reload: /both is both.html, which an earlier load's index had"
+                    (list (equal (etag "/both") (etag "/both.html"))
+                          (equal (etag "/both") (etag "/both/index.html")))
+                    '(t nil))
+             (load-tree)
+             (check "reload: a file loaded at an alias's path keeps it"
+                    (list (not (null (etag "/real")))
+                          (equal (etag "/real") (etag "/real.html")))
+                    '(t nil)))
+        (setf web-skeleton::*static-cache* saved-cache)
+        (ignore-errors
+         (sb-ext:delete-directory scratch :recursive t))))))
+
 (defun test-static-range-copies-nothing ()
   "A 206 for a static file allocates its head and not its body, and the
    body still arrives whole and in place.
@@ -6172,7 +6242,7 @@
                     (let ((signalled
                             (handler-case
                                 (progn (web-skeleton::sweep-idle-connections
-                                        epfd (get-universal-time))
+                                        epfd (web-skeleton::monotonic-seconds))
                                        nil)
                               (error (e) (princ-to-string e)))))
                       (list signalled
@@ -6445,7 +6515,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-connecting
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :handshake-fn (%scripted-handshake-fn
                                         '(:want-write :want-read :done)
                                         calls))))
@@ -6500,7 +6570,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-connecting
-                         :outbound-p t :last-active (get-universal-time))))
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking peer-fd)
              (web-skeleton::connection-queue-write
               conn (sb-ext:string-to-octets "GET / HTTP/1.1" :external-format :ascii))
@@ -6527,7 +6597,7 @@
                   (conn (web-skeleton::make-connection
                          :fd (web-skeleton::socket-fd server)
                          :socket server :state :out-handshake
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :handshake-fn (%scripted-handshake-fn '(:raise) calls))))
              (check-error "handshake: a failed handshake raises"
                           (web-skeleton::handle-outbound-handshake conn epfd))
@@ -6578,7 +6648,7 @@
                             (lambda () (incf released)))))
                   (inbound (web-skeleton::make-connection
                             :fd -1 :state :read-http
-                            :last-active (get-universal-time)))
+                            :last-active (web-skeleton::monotonic-seconds)))
                   (fetch-req (web-skeleton::make-http-fetch-continuation
                               :method :GET
                               :url (format nil "https://right.test:~d/" port)
@@ -6630,11 +6700,11 @@
                     (web-skeleton::*connections* (make-hash-table :test #'eql))
                     (inbound (web-skeleton::make-connection
                               :fd in-fd :socket in-server :state :streaming
-                              :last-active (get-universal-time)))
+                              :last-active (web-skeleton::monotonic-seconds)))
                     (outbound (web-skeleton::make-connection
                                :fd out-fd :socket out-server :state :out-read
                                :outbound-p t :inbound-fd in-fd
-                               :last-active (get-universal-time))))
+                               :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::register-connection inbound)
                (web-skeleton::register-connection outbound)
                ;; The state a pause leaves behind.
@@ -6706,7 +6776,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-read
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (%scripted-read-fn '(:want-write 12 :again) reads)
                          :write-fn (%scripted-write-fn '(99) writes
                                                        (make-array 0 :fill-pointer 0
@@ -6754,7 +6824,7 @@
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-write
-                         :outbound-p t :last-active (get-universal-time)
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (%scripted-read-fn '(:again) reads)
                          :write-fn (%scripted-write-fn '(:want-read 5) writes sink))))
              (web-skeleton::register-connection conn)
@@ -7155,7 +7225,7 @@
            (let ((epfd (web-skeleton::epoll-create))
                  (connfd (web-skeleton::epoll-create))
                  (log (make-string-output-stream))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let ((conn (web-skeleton::make-connection
                                :fd connfd :state state
@@ -7366,7 +7436,7 @@
            ;; if any, and the fragment bytes it still holds.
            (let ((epfd (web-skeleton::epoll-create))
                  (connfd (web-skeleton::epoll-create))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                          (web-skeleton:*log-stream* (make-broadcast-stream))
@@ -7650,7 +7720,7 @@
                   (seen nil)
                   (conn (web-skeleton::make-connection
                          :fd out-fd :socket server :state :out-read
-                         :outbound-p t :last-active (get-universal-time)))
+                         :outbound-p t :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   ;; Three chunks in one write, so they all land in one
@@ -8084,7 +8154,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :read-http
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   (request (web-skeleton::make-http-request
@@ -8194,7 +8264,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :read-http
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   (web-skeleton::*epoll-fd* epfd)
                   (request (web-skeleton::make-http-request
@@ -8252,10 +8322,10 @@
            ;; LAST-ACTIVE would miss every one of them.
            (let ((conn (web-skeleton::make-connection
                         :fd connfd :state :streaming
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
              (setf (web-skeleton::connection-stream-framing conn) :chunked
                    (web-skeleton::connection-stream-produced-at conn)
-                   (- (get-universal-time) age)
+                   (- (web-skeleton::monotonic-seconds) age)
                    (web-skeleton::connection-stream-keepalive conn) keepalive)
              (web-skeleton::epoll-add
               epfd connfd (logior web-skeleton::+epollin+
@@ -8269,7 +8339,7 @@
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
                  (reason :never)
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (let ((conn (streaming-conn epfd connfd
                                          :age (+ web-skeleton:*stream-idle-timeout*
                                                  1))))
@@ -8287,7 +8357,7 @@
           (connfd (web-skeleton::epoll-create)))
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (streaming-conn epfd connfd :age 1)
              (web-skeleton::sweep-idle-connections epfd now)
              (check "stream idle: a recent stream is left alone"
@@ -8304,7 +8374,7 @@
       (let ((epfd (web-skeleton::epoll-create)))
         (unwind-protect
              (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                    (now (get-universal-time))
+                    (now (web-skeleton::monotonic-seconds))
                     (ka (sb-ext:string-to-octets ":ka" :external-format :ascii))
                     (conn (web-skeleton::make-connection
                            :fd (web-skeleton::socket-fd server)
@@ -8348,7 +8418,7 @@
           (connfd (web-skeleton::epoll-create)))
       (unwind-protect
            (let ((web-skeleton::*connections* (make-hash-table :test #'eql))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (let ((conn (streaming-conn
                           epfd connfd
                           :age (+ web-skeleton:*stream-keepalive-interval* 1))))
@@ -8572,7 +8642,7 @@
            (let* ((server-fd (web-skeleton::socket-fd server))
                   (conn (web-skeleton::make-connection
                          :fd server-fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (web-skeleton::*connections* (make-hash-table :test #'eql))
                   ;; Half a megabyte, against a shrunk send buffer and a
                   ;; client that never reads. The two paths are only
@@ -8651,7 +8721,7 @@
                         :fd -1 :state :closing :last-active 0))
                   (new (web-skeleton::make-connection
                         :fd fd :socket server :state :read-http
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::register-connection new)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
                                                       web-skeleton::+epollet+))
@@ -8691,7 +8761,7 @@
                           :fd (web-skeleton::socket-fd server) :socket server
                           :state :streaming :stream-framing :chunked
                           :stream-on-close on-close
-                          :last-active (get-universal-time))))
+                          :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking (web-skeleton::socket-fd server))
                (%reset-socket client)
                (%await-arrival (web-skeleton::socket-fd server) :bytes 0 :fin t)
@@ -8741,7 +8811,7 @@
                  :fetch-sink :detached
                  :inbound-fd (web-skeleton::connection-fd target)
                  :fetch-method :GET
-                 :last-active (get-universal-time)
+                 :last-active (web-skeleton::monotonic-seconds)
                  :fetch-on-body (lambda (c chunk)
                                   (declare (ignore c))
                                   (web-skeleton:stream-send target chunk)
@@ -8800,7 +8870,7 @@
          (let* ((conn (web-skeleton::make-connection
                        :fd (sb-sys:fd-stream-fd sink)
                        :state :websocket
-                       :last-active (get-universal-time)))
+                       :last-active (web-skeleton::monotonic-seconds)))
                 (web-skeleton::*connections* (make-hash-table :test #'eql)))
            (web-skeleton::register-connection conn)
            (web-skeleton::ping-ws-connections epfd)
@@ -9311,7 +9381,7 @@
           (web-skeleton::*dns-cache-ttl* 60))
       (setf (gethash "stale.example" web-skeleton::*dns-cache*)
             (web-skeleton::make-dns-cache-entry
-             v4 :inet (- (get-universal-time) 1)))   ; expired one second ago
+             v4 :inet (- (web-skeleton::monotonic-seconds) 1)))   ; expired one second ago
       (check "expired entry misses"
              (web-skeleton::dns-cache-lookup "stale.example") nil)
       (check "expired entry is evicted on lookup"
@@ -9538,6 +9608,90 @@
       (sb-int:unencapsulate 'sb-ext:process-kill 'held-alive)
       (sb-int:unencapsulate 'sb-ext:process-close 'watched))))
 
+(defun test-blocking-lookup-reads-getents-answer-as-it-arrives ()
+  "RESOLVE-HOST-BLOCKING's answer is getent's output up to its end, read
+   as it arrives: it has the answer when the output ends, gives up at
+   once on output past +GETENT-OUTPUT-LIMIT+, and gives up on a child
+   that says nothing when *FETCH-TIMEOUT* has passed.
+
+   SPAWN-GETENT is replaced by a shell child for each case, so no name is
+   looked up.
+
+   The first child prints an address, closes its output and stays. A
+   lookup that waited for the exit before it read would wait the timeout
+   out and answer NIL. The answer ends where the output does, so the
+   address comes back, and the child is killed.
+
+   The second prints address lines without end, more than a pipe holds
+   unread. Read as it arrives, that is past the limit after 8 KiB and
+   the lookup fails long before the timeout. Left unread until an exit,
+   it would stop the child writing, and the exit would never come.
+
+   The third prints nothing and stays. The lookup gives up once the
+   timeout has passed, not sooner, and kills it."
+  (format t "~%Blocking lookup: getent's answer is read as it arrives~%")
+  (let ((command nil)
+        (children nil)
+        (web-skeleton:*fetch-address-filter* nil))
+    (sb-int:encapsulate 'web-skeleton::spawn-getent 'shell-child
+                        (lambda (f host)
+                          (declare (ignore f host))
+                          (let ((child (sb-ext:run-program
+                                        "/bin/sh" (list "-c" command)
+                                        :output :stream :wait nil)))
+                            (push child children)
+                            child)))
+    (unwind-protect
+         (flet ((lookup (sh-command timeout)
+                  ;; What the lookup answered, as a list, and how many
+                  ;; seconds it took to.
+                  (setf command sh-command)
+                  (let* ((web-skeleton:*fetch-timeout* timeout)
+                         (start (get-internal-real-time))
+                         (answer (multiple-value-list
+                                  (web-skeleton::resolve-host-blocking
+                                   "name.invalid"))))
+                    (values answer
+                            (/ (- (get-internal-real-time) start)
+                               internal-time-units-per-second))))
+                (last-child-alive-p ()
+                  (and (sb-ext:process-alive-p (first children)) t)))
+           ;; Both descriptors closed, because RUN-PROGRAM gives a child the
+           ;; one pipe for its output and its errors unless told otherwise,
+           ;; and the pipe ends only when neither holds it.
+           (let ((answer (lookup "printf '10.0.0.5 STREAM internal\\n'; exec sleep 30 >&- 2>&-"
+                                 10)))
+             (check "blocking lookup: the answer is there when the output ends"
+                    (list (and (first answer) (coerce (first answer) 'list))
+                          (second answer))
+                    '((10 0 0 5) :inet))
+             (check "blocking lookup: and the child that stayed is killed"
+                    (last-child-alive-p) nil))
+           (multiple-value-bind (answer seconds)
+               (lookup "exec yes '10.0.0.5 STREAM internal'" 20)
+             (check "blocking lookup: output past the limit is no answer"
+                    answer '(nil))
+             (check "blocking lookup: said long before the timeout"
+                    (< seconds 10) t)
+             (check "blocking lookup: and the child still writing is killed"
+                    (last-child-alive-p) nil))
+           (multiple-value-bind (answer seconds) (lookup "exec sleep 30" 1)
+             (check "blocking lookup: a child that says nothing is no answer"
+                    answer '(nil))
+             (check "blocking lookup: given up on when the timeout has passed"
+                    (>= seconds 0.9) t)
+             (check "blocking lookup: and killed"
+                    (last-child-alive-p) nil))
+           (check "control: each lookup ran the child it was given"
+                  (length children) 3))
+      (sb-int:unencapsulate 'web-skeleton::spawn-getent 'shell-child)
+      (dolist (child children)
+        (ignore-errors
+         (when (sb-ext:process-alive-p child)
+           (sb-ext:process-kill child 9)))
+        (ignore-errors (sb-ext:process-wait child))
+        (ignore-errors (sb-ext:process-close child))))))
+
 (defun test-dns-error-ends-a-detached-fetch ()
   "A detached fetch to a name that will not resolve releases its target.
 
@@ -9568,7 +9722,7 @@
                          :fd targetfd :state :websocket
                          :fetch-outstanding t
                          :fetch-failure-disposition :close
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (dns-conn (web-skeleton::make-connection
                            :fd dnsfd :state :out-dns
                            :outbound-p t
@@ -9578,7 +9732,7 @@
                                              (declare (ignore s h b))
                                              (incf fires)
                                              nil)
-                           :last-active (get-universal-time))))
+                           :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::register-connection dns-conn)
            (web-skeleton::deliver-dns-error dns-conn epfd)
@@ -9619,7 +9773,7 @@
                                                                  (list (coerce (car a) 'list)
                                                                        (cdr a)))
                                                                fallbacks))))
-                           :last-active (get-universal-time))))
+                           :last-active (web-skeleton::monotonic-seconds))))
            (replace buf out)
            (setf (web-skeleton::connection-read-buf dns-conn) buf
                  (web-skeleton::connection-read-pos dns-conn) (length out))
@@ -9676,7 +9830,7 @@
                                     :fd targetfd :state :websocket
                                     :fetch-outstanding t
                                     :fetch-failure-disposition :close
-                                    :last-active (get-universal-time)))
+                                    :last-active (web-skeleton::monotonic-seconds)))
                            (dns-conn (web-skeleton::make-connection
                                       :fd dnsfd :state :out-dns
                                       :outbound-p t
@@ -9690,7 +9844,7 @@
                                       (lambda (s h b)
                                         (declare (ignore s h b))
                                         nil)
-                                      :last-active (get-universal-time))))
+                                      :last-active (web-skeleton::monotonic-seconds))))
                       (replace buf line)
                       (setf (web-skeleton::connection-read-buf dns-conn) buf
                             (web-skeleton::connection-read-pos dns-conn)
@@ -9771,7 +9925,7 @@
                                   :fd targetfd :state :websocket
                                   :fetch-outstanding t
                                   :fetch-failure-disposition :close
-                                  :last-active (get-universal-time)))
+                                  :last-active (web-skeleton::monotonic-seconds)))
                          (dns-conn (web-skeleton::make-connection
                                     :fd (sb-sys:fd-stream-fd (sb-ext:process-output proc))
                                     :state :out-dns :outbound-p t :fetch-sink :detached
@@ -9780,7 +9934,7 @@
                                     :fetch-callback (lambda (s h b)
                                                       (declare (ignore s h b))
                                                       nil)
-                                    :last-active (get-universal-time))))
+                                    :last-active (web-skeleton::monotonic-seconds))))
                     (replace buf bytes)
                     (setf (web-skeleton::connection-read-buf dns-conn) buf
                           (web-skeleton::connection-read-pos dns-conn) (length bytes))
@@ -9920,6 +10074,81 @@
         (ignore-errors (web-skeleton::%close below)))
       (ignore-errors (web-skeleton::%close epfd)))))
 
+(defun test-a-detached-fetch-disposes-of-its-own-target-alone ()
+  "A detached fetch that failed applies its failure disposition to the
+   connection it was started for, and to nothing that has that
+   connection's descriptor number afterwards.
+
+   The fetch's :THEN hears the abort sentinel and closes the target. A
+   connection then stands on the number that freed: a :STREAMING one, the
+   state the disposition closes. A :THEN cannot register such a connection
+   itself, since all it can open is an outbound, whose states the
+   disposition has no arm for. This one stands in for whatever a later
+   change lets take the number, so that what protects it is the check on
+   the target and not the list of states.
+
+   Epoll descriptors stand in for the connections, and the second is put
+   on the freed number with dup2, as in the test above. The second check
+   is what makes the third mean something: as the :THEN returned, the
+   target was closed and the stranger stood on its number."
+  (format t "~%A detached fetch disposes of its own target alone~%")
+  (let* ((epfd (web-skeleton::epoll-create))
+         (target-fd (web-skeleton::epoll-create))
+         (events (logior web-skeleton::+epollin+ web-skeleton::+epollet+))
+         (stranger nil)
+         (standing nil)
+         (heard 0))
+    (unwind-protect
+         (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
+                (web-skeleton::*epoll-fd* epfd)
+                (web-skeleton:*log-stream* (make-broadcast-stream))
+                (target (web-skeleton::make-connection
+                         :fd target-fd :state :websocket :last-active 0
+                         :fetch-outstanding t)))
+           (web-skeleton::register-connection target)
+           (web-skeleton::epoll-add epfd target-fd events)
+           (web-skeleton::deliver-detached
+            target-fd epfd
+            (lambda (s h b)
+              (declare (ignore s h b))
+              (incf heard)
+              (web-skeleton::close-connection target epfd)
+              (let ((fd (web-skeleton::epoll-create)))
+                (unless (= fd target-fd)
+                  (unwind-protect
+                       (unless (= (sb-alien:alien-funcall
+                                   (sb-alien:extern-alien
+                                    "dup2" (function sb-alien:int sb-alien:int
+                                                     sb-alien:int))
+                                   fd target-fd)
+                                  target-fd)
+                         (error "dup2 onto fd ~d failed" target-fd))
+                    (web-skeleton::%close fd))))
+              (setf stranger (web-skeleton::make-connection
+                              :fd target-fd :state :streaming :last-active 0))
+              (web-skeleton::register-connection stranger)
+              (web-skeleton::epoll-add epfd target-fd events)
+              (setf standing
+                    (list (web-skeleton::connection-fd target)
+                          (eq (web-skeleton::lookup-connection target-fd)
+                              stranger)))
+              nil)
+            :aborted)
+           (check "own target alone: the :then heard the sentinel once" heard 1)
+           (check "own target alone: it left a stranger on the closed target's number"
+                  standing '(-1 t))
+           (check "own target alone: and the stranger was left as it was"
+                  (and stranger
+                       (list (web-skeleton::connection-fd stranger)
+                             (web-skeleton::connection-state stranger)
+                             (eq (web-skeleton::lookup-connection target-fd)
+                                 stranger)))
+                  (list target-fd :streaming t)))
+      ;; The target's number is the stranger's once the :THEN has run, and
+      ;; closed already if the disposition reached it.
+      (ignore-errors (web-skeleton::%close target-fd))
+      (ignore-errors (web-skeleton::%close epfd)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -9950,10 +10179,12 @@
   (test-dns-ready-hands-on-every-address)
   (test-dns-lookup-sink)
   (test-dns-child-closed-only-once-dead)
+  (test-blocking-lookup-reads-getents-answer-as-it-arrives)
   (test-dns-error-ends-a-detached-fetch)
   (test-dns-chain-success-survives-a-failed-teardown)
   (test-dns-dial-failure-is-not-a-lookup-failure)
   (test-a-then-that-closes-its-target-mid-teardown)
+  (test-a-detached-fetch-disposes-of-its-own-target-alone)
   (test-documented-settings-are-exported)
   (test-errno-names)
   (test-descriptor-limit)
@@ -9989,6 +10220,7 @@
   (test-static-names-with-pathname-syntax)
   (test-static-responses-carry-the-connection-line)
   (test-static-etag)
+  (test-static-aliases-follow-a-reload)
   (test-static-range)
   (test-static-range-copies-nothing)
   (test-static-date)

@@ -67,6 +67,39 @@
    that need larger strings; do not disable.")
 
 ;;; ---------------------------------------------------------------------------
+;;; The parser's condition
+;;; ---------------------------------------------------------------------------
+
+(define-condition json-parse-error (error)
+  ((message :initarg :message :reader json-parse-error-message))
+  (:report (lambda (condition stream)
+             (format stream "json: ~a" (json-parse-error-message condition))))
+  (:documentation
+   "The text given to JSON-PARSE is not JSON, or is JSON past one of the
+    parser's bounds: *JSON-MAX-DEPTH*, *JSON-MAX-STRING-LENGTH*, the digits
+    a number may have. Or the bytes given to JSON-PARSE-BYTES are not
+    UTF-8. MESSAGE says what was wrong and where.
+
+    The parser signals this for the text or the bytes it refuses and
+    nothing else, so a caller can catch it by name. That is what tells a
+    body a client got wrong, which is the client's 400, from a fault in
+    the caller's own code, which is a 500 and should stay one: a catch of
+    ERROR around the parse takes both.
+
+    Nothing answers it on the caller's behalf. One that escapes a handler
+    is that handler's error like any other, because the text is not
+    always the client's: an upstream's reply read in a fetch callback
+    goes through the same parser, and its fault is not a bad request."))
+
+;; Never returns, which the compiler is told so that a call reads to it as
+;; ERROR does: nothing is expected back where one stands for a value.
+(declaim (ftype (function (string &rest t) nil) json-parse-error))
+(defun json-parse-error (format-string &rest args)
+  "Signal a JSON-PARSE-ERROR with a formatted message."
+  (error 'json-parse-error
+         :message (apply #'format nil format-string args)))
+
+;;; ---------------------------------------------------------------------------
 ;;; Object representation
 ;;; ---------------------------------------------------------------------------
 
@@ -94,31 +127,85 @@
   "Parse a JSON string starting at the opening quote at POS.
    Handles all escape sequences including \\uXXXX.
    Returns (values string new-pos).
-   Caller is responsible for checking the opening quote."
+   Caller is responsible for checking the opening quote.
+
+   The string returned is a (SIMPLE-ARRAY CHARACTER (*)) of exactly its
+   length, whatever kind of string STR is. One with no escape in it is
+   its characters as they stand in STR: found by the scan here, and
+   copied once. One with an escape is finished by
+   JSON-PARSE-ESCAPED-STRING from the escape on."
   (incf pos)
-  (let ((out (make-array 64 :element-type 'character :fill-pointer 0 :adjustable t))
+  (let ((start pos)
         (len (length str)))
-    (flet ((push-char (c)
-             ;; Bound the per-string accumulator at
-             ;; *JSON-MAX-STRING-LENGTH*. Without this cap an attacker-
-             ;; controlled response body (up to *MAX-OUTBOUND-RESPONSE-
-             ;; SIZE* = 8 MiB) could force an 8 MiB per-string allocation
-             ;; across many keys and values.
-             (when (>= (fill-pointer out) *json-max-string-length*)
-               (error "json: string exceeds ~d characters"
-                      *json-max-string-length*))
-             (vector-push-extend c out)))
     (loop
       (when (>= pos len)
-        (error "json: unterminated string"))
+        (json-parse-error "unterminated string"))
       (let ((ch (char str pos)))
         (cond
           ((char= ch #\")
-           (return (values (coerce out 'string) (1+ pos))))
+           ;; MAKE-STRING and not SUBSEQ, which answers a string of STR's
+           ;; own element type: a base string in would be a base string
+           ;; out, and no place for a character an application puts there.
+           (let ((out (make-string (- pos start))))
+             (replace out str :start2 start :end2 pos)
+             (return (values out (1+ pos)))))
+          ((char= ch #\\)
+           (return (json-parse-escaped-string str start pos)))
+          ;; RFC 8259 §7: control characters U+0000-U+001F must be escaped
+          ((< (char-code ch) #x20)
+           (json-parse-error "unescaped control character U+~4,'0X at ~d"
+                             (char-code ch) pos))
+          ;; *JSON-MAX-STRING-LENGTH*, as JSON-PARSE-ESCAPED-STRING holds
+          ;; its accumulator to it: met at the first character past it.
+          ((>= (- pos start) *json-max-string-length*)
+           (json-parse-error "string exceeds ~d characters"
+                             *json-max-string-length*))
+          (t (incf pos)))))))
+
+(defun json-parse-escaped-string (str start pos)
+  "The JSON string whose first character is at START and whose first
+   escape is at POS, everything between having been scanned already.
+   Returns (values string new-pos), as JSON-PARSE-STRING does and for it.
+
+   Decoded into a buffer as long as the string is written, which is room
+   enough: an escape is never longer decoded than written. What was
+   decoded is copied out at the end, a string of its own length.
+   A buffer handed back as it stood, with its room to spare, would keep
+   that room for as long as the parsed document was kept."
+  (let* ((len (length str))
+         ;; Where the string ends as written: the first quote no escape
+         ;; covers, or the end of STR for a string never closed, which the
+         ;; loop below is left to report.
+         (close (loop with i = pos
+                      do (cond ((>= i len) (return len))
+                               ((char= (char str i) #\") (return i))
+                               ((char= (char str i) #\\) (incf i 2))
+                               (t (incf i)))))
+         (out (make-string (min (- close start) *json-max-string-length*)))
+         (n (- pos start)))
+    (replace out str :start2 start :end2 pos)
+    (flet ((push-char (c)
+             ;; Bound the decoded string at *JSON-MAX-STRING-LENGTH*.
+             ;; Without this cap an attacker-controlled response body
+             ;; (up to *MAX-OUTBOUND-RESPONSE-SIZE* = 8 MiB) could force
+             ;; an 8 MiB per-string allocation across many keys and
+             ;; values.
+             (when (>= n *json-max-string-length*)
+               (json-parse-error "string exceeds ~d characters"
+                                 *json-max-string-length*))
+             (setf (schar out n) c)
+             (incf n)))
+    (loop
+      (when (>= pos len)
+        (json-parse-error "unterminated string"))
+      (let ((ch (char str pos)))
+        (cond
+          ((char= ch #\")
+           (return (values (subseq out 0 n) (1+ pos))))
           ((char= ch #\\)
            (incf pos)
            (when (>= pos len)
-             (error "json: unterminated escape"))
+             (json-parse-error "unterminated escape"))
            (let ((esc (char str pos)))
              (case esc
                (#\n (push-char #\Newline))
@@ -132,15 +219,16 @@
                (#\u
                 ;; \uXXXX — exactly 4 hex digits required (RFC 8259 §7)
                 (when (> (+ pos 5) len)
-                  (error "json: truncated \\uXXXX escape at ~d" (1- pos)))
+                  (json-parse-error "truncated \\uXXXX escape at ~d" (1- pos)))
                 (let ((code (let ((hs (1+ pos)) (he (+ pos 5)))
                               (loop for k from hs below he
                                     for ch = (char str k)
                                     unless (or (char<= #\0 ch #\9)
                                                (char<= #\a ch #\f)
                                                (char<= #\A ch #\F))
-                                    do (error "json: invalid hex digit '~c' in \\u escape at ~d"
-                                              ch (1- pos)))
+                                    do (json-parse-error
+                                        "invalid hex digit '~c' in \\u escape at ~d"
+                                        ch (1- pos)))
                               (parse-integer str :start hs :end he :radix 16))))
                   ;; Handle surrogate pairs for characters above U+FFFF
                   (cond
@@ -157,32 +245,35 @@
                                             unless (or (char<= #\0 ch #\9)
                                                        (char<= #\a ch #\f)
                                                        (char<= #\A ch #\F))
-                                            do (error "json: invalid hex digit '~c' in \\u escape at ~d"
-                                                      ch low-start))
+                                            do (json-parse-error
+                                                "invalid hex digit '~c' in \\u escape at ~d"
+                                                ch low-start))
                                       (parse-integer str :start ls :end le :radix 16))))
                              (unless (<= #xDC00 low #xDFFF)
-                               (error "json: expected low surrogate after \\u~4,'0X at ~d"
-                                      code (1- pos)))
+                               (json-parse-error
+                                "expected low surrogate after \\u~4,'0X at ~d"
+                                code (1- pos)))
                              (let ((cp (+ #x10000
                                           (ash (- code #xD800) 10)
                                           (- low #xDC00))))
                                (push-char (code-char cp)))
                              (incf pos 10))
-                           (error "json: lone high surrogate \\u~4,'0X at ~d"
-                                  code (1- pos)))))
+                           (json-parse-error
+                            "lone high surrogate \\u~4,'0X at ~d"
+                            code (1- pos)))))
                     ((<= #xDC00 code #xDFFF)
-                     (error "json: lone low surrogate \\u~4,'0X at ~d"
-                            code (1- pos)))
+                     (json-parse-error "lone low surrogate \\u~4,'0X at ~d"
+                                       code (1- pos)))
                     (t
                      (push-char (code-char code))
                      (incf pos 4)))))
-               (t (error "json: invalid escape \\~c at ~d" esc (1- pos)))))
+               (t (json-parse-error "invalid escape \\~c at ~d" esc (1- pos)))))
            (incf pos))
           (t
            ;; RFC 8259 §7: control characters U+0000-U+001F must be escaped
            (when (< (char-code ch) #x20)
-             (error "json: unescaped control character U+~4,'0X at ~d"
-                    (char-code ch) pos))
+             (json-parse-error "unescaped control character U+~4,'0X at ~d"
+                               (char-code ch) pos))
            (push-char ch)
            (incf pos))))))))
 
@@ -197,23 +288,23 @@
       ;; Leading zeros not allowed (except bare 0)
       (when (and (< pos len) (char= (char str pos) #\0)
                  (< (1+ pos) len) (char<= #\0 (char str (1+ pos)) #\9))
-        (error "json: leading zeros not allowed at ~d" start))
+        (json-parse-error "leading zeros not allowed at ~d" start))
       (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
             do (incf pos))
       (when (= pos digit-start)
-        (error "json: expected digit at ~d" pos))
+        (json-parse-error "expected digit at ~d" pos))
       ;; Cap integer digits to prevent O(n²) bignum construction DoS
       (when (> (- pos digit-start) 300)
-        (error "json: integer too many digits at ~d" start)))
+        (json-parse-error "integer too many digits at ~d" start)))
     (when (and (< pos len) (char= (char str pos) #\.))
       (incf pos)
       (let ((frac-start pos))
         (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos frac-start)
-          (error "json: no digits after decimal point at ~d" start))
+          (json-parse-error "no digits after decimal point at ~d" start))
         (when (> (- pos frac-start) 300)
-          (error "json: fractional part too many digits at ~d" start))))
+          (json-parse-error "fractional part too many digits at ~d" start))))
     (when (and (< pos len) (member (char str pos) '(#\e #\E)))
       (incf pos)
       (when (and (< pos len) (member (char str pos) '(#\+ #\-)))
@@ -222,9 +313,9 @@
         (loop while (and (< pos len) (char<= #\0 (char str pos) #\9))
               do (incf pos))
         (when (= pos exp-start)
-          (error "json: no digits in exponent at ~d" start))
+          (json-parse-error "no digits in exponent at ~d" start))
         (when (> (- pos exp-start) 20)
-          (error "json: exponent too many digits at ~d" start))))
+          (json-parse-error "exponent too many digits at ~d" start))))
     (let ((num-str (subseq str start pos)))
       ;; Floats: read-from-string with *read-eval* NIL is safe here —
       ;; input is pre-validated to [0-9.eE+-] by the loop above.
@@ -254,11 +345,11 @@
                          ;; condition leaking through.
                          (val (handler-case (read-from-string num-str)
                                 (error ()
-                                  (error "json: number out of range at ~d"
-                                         start)))))
+                                  (json-parse-error "number out of range at ~d"
+                                                    start)))))
                     (when (or (sb-ext:float-infinity-p val)
                               (sb-ext:float-nan-p val))
-                      (error "json: number out of range at ~d" start))
+                      (json-parse-error "number out of range at ~d" start))
                     val)
                   (parse-integer num-str))
               pos))))
@@ -266,10 +357,10 @@
 (defun json-parse-value (str pos &optional (depth 0))
   "Parse a JSON value at POS. Returns (values value new-pos)."
   (when (> depth *json-max-depth*)
-    (error "json: nesting too deep (max ~d)" *json-max-depth*))
+    (json-parse-error "nesting too deep (max ~d)" *json-max-depth*))
   (setf pos (json-skip-whitespace str pos))
   (when (>= pos (length str))
-    (error "json: unexpected end of input"))
+    (json-parse-error "unexpected end of input"))
   (let ((ch (char str pos)))
     (cond
       ((char= ch #\") (json-parse-string str pos))
@@ -278,23 +369,23 @@
       ((char= ch #\t)
        (unless (and (<= (+ pos 4) (length str))
                     (string= str "true" :start1 pos :end1 (+ pos 4)))
-         (error "json: invalid literal at ~d" pos))
+         (json-parse-error "invalid literal at ~d" pos))
        (values t (+ pos 4)))
       ((char= ch #\f)
        (unless (and (<= (+ pos 5) (length str))
                     (string= str "false" :start1 pos :end1 (+ pos 5)))
-         (error "json: invalid literal at ~d" pos))
+         (json-parse-error "invalid literal at ~d" pos))
        (values :false (+ pos 5)))
       ((char= ch #\n)
        (unless (and (<= (+ pos 4) (length str))
                     (string= str "null" :start1 pos :end1 (+ pos 4)))
-         (error "json: invalid literal at ~d" pos))
+         (json-parse-error "invalid literal at ~d" pos))
        (values :null (+ pos 4)))
       ;; ASCII digits only: DIGIT-CHAR-P is true of every Unicode digit,
       ;; U+0663 among them, which JSON's grammar does not admit.
       ((or (char<= #\0 ch #\9) (char= ch #\-))
        (json-parse-number str pos))
-      (t (error "json: unexpected character '~a' at ~d" ch pos)))))
+      (t (json-parse-error "unexpected character '~a' at ~d" ch pos)))))
 
 (defun first-repeated-key (entries)
   "The entry of ENTRIES, conses whose cars are strings, given in the order
@@ -340,7 +431,8 @@
    Rejecting is the honest option."
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
-  (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
+  (when (>= pos (length str))
+    (json-parse-error "unterminated object at ~d" pos))
   (when (char= (char str pos) #\})
     (return-from json-parse-object (values (make-json-object nil) (1+ pos))))
   (let ((pairs nil)
@@ -349,42 +441,45 @@
         (keys nil))
     (loop
       (setf pos (json-skip-whitespace str pos))
-      (when (>= pos (length str)) (error "json: unterminated object at ~d" pos))
+      (when (>= pos (length str))
+        (json-parse-error "unterminated object at ~d" pos))
       ;; Object keys must be quoted strings (RFC 8259 §4). This is the
       ;; one json-parse-string call site without an upstream dispatch,
       ;; so the check belongs here rather than inside json-parse-string.
       (unless (char= (char str pos) #\")
-        (error "json: expected string key at ~d" pos))
+        (json-parse-error "expected string key at ~d" pos))
       (let ((key-pos pos))
         (multiple-value-bind (key new-pos) (json-parse-string str pos)
           (push (cons key key-pos) keys)
           (setf pos (json-skip-whitespace str new-pos))
           (when (>= pos (length str))
-            (error "json: unterminated object at ~d" pos))
+            (json-parse-error "unterminated object at ~d" pos))
           (unless (char= (char str pos) #\:)
-            (error "json: expected ':' at ~d" pos))
+            (json-parse-error "expected ':' at ~d" pos))
           (incf pos)
           (multiple-value-bind (val new-pos2)
               (json-parse-value str pos (1+ depth))
             (push (cons key val) pairs)
             (setf pos (json-skip-whitespace str new-pos2))
             (when (>= pos (length str))
-              (error "json: unterminated object at ~d" pos))
+              (json-parse-error "unterminated object at ~d" pos))
             (cond
               ((char= (char str pos) #\,) (incf pos))
               ((char= (char str pos) #\})
                (let ((repeat (first-repeated-key (nreverse keys))))
                  (when repeat
-                   (error "json: duplicate key ~s at ~d" (car repeat) (cdr repeat))))
+                   (json-parse-error "duplicate key ~s at ~d"
+                                     (car repeat) (cdr repeat))))
                (return (values (make-json-object (nreverse pairs)) (1+ pos))))
-              (t (error "json: expected ',' or '}' at ~d" pos)))))))))
+              (t (json-parse-error "expected ',' or '}' at ~d" pos)))))))))
 
 (defun json-parse-array (str pos &optional (depth 0))
   "Parse a JSON array at POS. Returns (values list new-pos).
    Caller (json-parse-value) has already dispatched on the opening '['."
   (incf pos)
   (setf pos (json-skip-whitespace str pos))
-  (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
+  (when (>= pos (length str))
+    (json-parse-error "unterminated array at ~d" pos))
   (when (char= (char str pos) #\])
     (return-from json-parse-array (values nil (1+ pos))))
   (let ((items nil))
@@ -392,12 +487,13 @@
       (multiple-value-bind (val new-pos) (json-parse-value str pos (1+ depth))
         (push val items)
         (setf pos (json-skip-whitespace str new-pos))
-        (when (>= pos (length str)) (error "json: unterminated array at ~d" pos))
+        (when (>= pos (length str))
+          (json-parse-error "unterminated array at ~d" pos))
         (cond
           ((char= (char str pos) #\,) (incf pos))
           ((char= (char str pos) #\])
            (return (values (nreverse items) (1+ pos))))
-          (t (error "json: expected ',' or ']' at ~d" pos)))))))
+          (t (json-parse-error "expected ',' or ']' at ~d" pos)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public parser interface
@@ -410,6 +506,10 @@
    JSON-OBJECT, [] is NIL, and null is :NULL — three distinct values,
    each of which serializes back to itself.
 
+   Signals JSON-PARSE-ERROR for a string that is not JSON, or is past one
+   of the parser's bounds, and no other condition for any string. A
+   document held as bytes, a request's body, goes to JSON-PARSE-BYTES.
+
    A leading U+FEFF (UTF-8 BOM when decoded via UTF-8) is silently
    skipped per RFC 8259 §8.1. Windows text editors, older .NET
    APIs, and some Python encoders on Windows prepend one; rejecting
@@ -421,8 +521,32 @@
     (multiple-value-bind (val pos) (json-parse-value str start)
       (let ((end (json-skip-whitespace str pos)))
         (when (< end (length str))
-          (error "json: unexpected content at position ~d" end)))
+          (json-parse-error "unexpected content at position ~d" end)))
       val)))
+
+(defun json-parse-bytes (bytes)
+  "Parse a JSON document from its bytes: decode them as UTF-8 and hand
+   the text to JSON-PARSE, whose value this returns. A request's body and
+   an upstream's reply are bytes.
+
+   Bytes that are not UTF-8 signal JSON-PARSE-ERROR, as text that is not
+   JSON does, so one catch by name answers a malformed body whichever it
+   was. RFC 8259 §8.1 has a document sent between systems encoded as
+   UTF-8, and the bytes are read as that: no other encoding is guessed
+   at. The decoding is strict. An overlong form, an encoded surrogate and
+   a character cut short at the end are each refused.
+
+   BYTES is a vector of octets, or NIL. NIL is read as no bytes, and
+   refused as the empty string is: it is what HTTP-REQUEST-BODY answers
+   for a request that carried no body, which is the client's doing as a
+   malformed one is. Any other argument, a string for one, is the
+   caller's mistake and a TYPE-ERROR."
+  (json-parse
+   (if (null bytes)
+       ""
+       (handler-case (sb-ext:octets-to-string bytes :external-format :utf-8)
+         (sb-int:character-decoding-error ()
+           (json-parse-error "the bytes are not UTF-8"))))))
 
 (defun json-get (obj key)
   "Look up KEY (string) in OBJ. Returns the value, or NIL if absent.

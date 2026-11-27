@@ -116,7 +116,8 @@ So every spelling that reaches a file is one the router reads the same way,
 and a guard's literal covers all of them. An application that checks the
 raw path itself should compare `(canonical-path path)`, the router's
 reading. A guard must also cover the file's aliases. `serve-static` answers
-`/x` for `x.html`, and both `/dir` and `/dir/` for `dir/index.html`.
+`/x` for `x.html`, and both `/dir` and `/dir/` for `dir/index.html`. When
+both `x.html` and `x/index.html` are loaded, `/x` is `x.html`.
 
 ### Configuration
 
@@ -209,6 +210,115 @@ after a second or more and nothing on this side logs.
 Linux clamps the backlog to `net.core.somaxconn`;
 raising `*listen-backlog*` past it needs that sysctl raised as well.
 
+### One server to a port
+
+Every listener sets `SO_REUSEPORT`, which is what lets each worker hold
+the port. It would also let a second server process bind the same port:
+that bind succeeds, the kernel divides arriving connections between the
+two processes, each answers its share from its own memory, and neither
+log says anything. A start script run twice is enough to do it.
+
+So `start-server` claims its port number and looks at the port before it
+binds. A second server, in another process or from a second call in the
+same image, finds the first one listening where it would bind, and is
+refused:
+
+```
+start-server: port 8081 is claimed by another web-skeleton server, in this process or another, and a socket listens where this one would bind, 127.0.0.1:8081. ...
+```
+
+The error comes before anything else has happened, as the one for a port
+that cannot be bound does: no listener is bound, no worker started, and a
+server already running in the image is left as it was.
+
+**A claim held where nothing listens.** A start that finds the claim held
+looks at the port too, for up to a second, since a server takes its claim
+a moment before it binds. If nothing listens where it would bind by then,
+the holder does not serve there: a process that took the name, which any
+local process can do, whatever user it runs as; a server on another
+address of the host; or a server this image has replaced. The start goes
+on without the claim, says so at WARN with the `ss` line below to find
+the holder, and takes the claim once it is free. Two starts made
+together past such a claim go one at a time, through a second name,
+`web-skeleton/port/8081/starting`, held from the look through the bind:
+the second meets the first one's listener and is refused.
+
+**What the claim is.** A Unix socket bound in Linux's abstract namespace
+under the name `web-skeleton/port/8081`. It is not a file, so there is
+nothing to clean up and nothing a crash leaves behind: the kernel frees
+the name when the process ends, however it ends. `/proc/net/unix` lists
+it as `@web-skeleton/port/8081`, and this names the process holding it:
+
+```
+ss -xap | grep web-skeleton/port
+```
+
+**Replacing a process with no gap.** Start the new process with
+`:share-port t` while the old one serves, then stop the old one. The new
+server logs, at WARN, that it joined a claimed port; both serve while
+they overlap, the kernel dividing connections between them; and when the
+old one stops the new one takes the claim, within a second or so, and
+logs that it has. A server started the
+plain way after that is refused again.
+
+A stopping server accepts nothing more once it has been told to stop, and
+closes its listeners as its drain begins, which a worker idle in its
+event loop comes to within `*worker-wake-interval*` of the stop. New
+connections then go to the new server while the old one finishes what
+it was already sending. A connection the kernel completed into an old
+listener's queue before that is reset when the listener closes, unless
+`net.ipv4.tcp_migrate_req` is 1 (Linux 5.14 and later): then the kernel
+hands it to the new server's listener, and every connection that arrives
+once the old server has been told to stop is served by the new one.
+Without it, an idle worker's first connection after the stop is
+typically lost that way. A request the old server had accepted and not
+yet read in full is closed, as at any shutdown.
+
+A plain start during a handover is refused, since the new server
+listens. With no other server on the port, one made once the old
+server's listeners have closed is not refused: the old server still
+holds the claim, but nothing listens. A start script that always
+replaces this way can always pass `:share-port t`: on a port nobody has
+claimed it takes the claim as a plain start does. Such a script is then
+never refused, a mistaken second run of it included, which is what
+passing the keyword every time gives up.
+
+**What the claim covers, and what it does not.**
+
+- **The addresses that share connections, as the kernel has them.** The
+  claim is on the port number, and the look at the port is a bind, so it
+  meets what the kernel would have this server share connections with: a
+  listener on the same address, on the wildcard address of the same
+  port, or, for a server on the wildcard, on any one address of it. The
+  kernel gives each connection to the more specific of two such
+  listeners, so each server would take part of the other's traffic, and
+  the start is refused. Two servers on two addresses of one host share
+  nothing: the second starts beside the first, without the claim, and
+  says so.
+- **What listens before this server starts, not what starts after it.**
+  A start is refused beside any socket listening where it would bind,
+  whether or not that holds the claim: a server between holders in a
+  handover, one whose claim could not be taken or that was built without
+  it, or another program. A program that starts after this server and
+  sets `SO_REUSEPORT`, run by the same user, binds beside it all the
+  same: nothing on this side sees it.
+- **One network namespace.** Abstract names belong to a network
+  namespace, as ports do. Two containers that each have their own can
+  serve the same port number and do not see each other's claims; two
+  processes that share one, `--network host` say, share ports and claims
+  alike.
+- **Not `:port 0`.** The kernel does not choose a port that a listener
+  on the address holds, and a number whose claim is held, whether or not
+  anything listens on it, is passed over for the next the kernel offers,
+  so such a start is never refused.
+- **Not where Unix sockets are forbidden.** Under a systemd unit whose
+  `RestrictAddressFamilies=` leaves out `AF_UNIX`, the claim cannot be
+  taken. The server logs that at WARN and starts without one.
+- **A guard against a mistake, not a lock.** Any local process can bind
+  the claim's name, whatever user it runs as, and a name held where
+  nothing listens refuses nothing. A process that cannot bind the port, a
+  privileged one say, cannot keep a server off it by holding its name.
+
 ### Status codes the framework itself sends
 
 A request the framework rejects before your handler sees it gets a
@@ -226,7 +336,7 @@ specific status, not a blanket 400:
 | `503 Service Unavailable` | The worker is at `*max-connections*`, or the process is nearly out of descriptors (see "Descriptors" under "Environment") — carries `Retry-After: 2` |
 | `504 Gateway Timeout` | A handler deferred to a fetch and the fetch never came back within `*fetch-timeout*` — the parked connection is answered rather than closed. For a request answered with a streamed fetch, the wait starts once its body has gone; see "Sending a request body as it is produced" |
 | `505 HTTP Version Not Supported` | Anything that is not HTTP/1.0 or HTTP/1.1 — including an HTTP/2 prior-knowledge preface |
-| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled |
+| `500 Internal Server Error` | Your handler raised — an error, a timeout it set itself (`sb-ext:with-timeout`, or `sb-sys:with-deadline` around a wait), or a storage condition: recursion past the control stack, or one allocation larger than the heap has left. Any of these costs that request and nothing more. Once a response has begun — a stream's head is out, a WebSocket is open — the connection is closed instead of answered, since a 500 there would arrive inside the first response. A heap worn out by many small allocations can be beyond any catch: the collector can run out of room itself, and that ends the process before anything is signalled. What was raised is logged at WARN, through the throttle: see "Logging holds the only shared lock" |
 
 **A `Host` that passes is still the client's.** The 400 holds it to the
 grammar, and the grammar allows characters that matter in a page: a
@@ -440,8 +550,9 @@ across each of three setup phases. `http-fetch` is not, for either scheme;
 see the async budget below.
 
 1. **DNS resolution** — shared `getent ahosts` subprocess,
-   spawned with `:wait nil` and deadline-polled until exit or
-   `*fetch-timeout*` expires. On expiry, the child is killed with
+   its output read as it arrives, with `poll(2)` on the pipe, until it
+   ends or `*fetch-timeout*` expires: a lookup takes as long as `getent`
+   does. On expiry, the child is killed with
    SIGKILL so a hung libc resolver (unresponsive nameserver,
    slow NSS module, hung mDNS responder) cannot pin the worker thread.
    Same resolver as the async path, so `/etc/hosts`, NSS, Docker DNS,
@@ -651,17 +762,45 @@ Don't rely on cleanup-path exceptions propagating back to the caller — they do
 
 ### TLS trust anchors
 
-**A missing CA store raises rather than warning.** `SSL_VERIFY_PEER` is
-set, so a process with no trust anchors fails every handshake regardless.
-Raising is not what makes it fail-closed; it is what makes the failure
-legible, said once at the first HTTPS fetch rather than left to be
-inferred from an unrelated-looking stream of handshake errors.
+An `https://` fetch verifies the upstream's certificate against the
+host's certificate authorities, where OpenSSL finds them: the file
+`SSL_CERT_FILE` names and the directories `SSL_CERT_DIR` lists, and
+without those the `cert.pem` and `certs` under the directory
+`openssl version -d` prints. `SSL_VERIFY_PEER` is set, and nothing turns
+it off.
 
-This bites on distroless and scratch images. Install a CA bundle
-(`ca-certificates`), or point `SSL_CERT_FILE` / `SSL_CERT_DIR` at one. A
-plain-HTTP server on such an image still boots: the check runs when a TLS
-connection is opened, not at startup, so nothing that never fetches over
-HTTPS is affected.
+**A handshake that fails says why.** The fetch fails as any other does,
+with a `502` to a parked request and its `:then` called for cleanup, and
+the log has OpenSSL's reason for it:
+
+```
+2026-01-01 12:00:00.004 [ERROR] outbound error fd 13: SSL_connect failed: certificate verification failed: unable to get local issuer certificate (verify error 20)
+```
+
+A certificate issued for another name reads `hostname mismatch (verify
+error 62)`. A failure that is not the certificate's is given in OpenSSL's
+words for it, `tlsv1 alert protocol version` from a peer with nothing
+from TLS 1.2 up to offer, and one that is the socket's as `transport
+error` with the errno. `http-fetch-stream` raises the same text.
+
+**A host with no CA bundle fails every handshake, and is told so.** With
+nothing to verify against, no certificate verifies, which is fail-closed.
+OpenSSL does not say that a trust store is empty when it is given one,
+so nothing is refused before a fetch is tried. Each handshake fails, and
+when no certificate is found in the places above the reason goes on to
+say so:
+
+```
+... unable to get local issuer certificate (verify error 20). No CA certificates were found at /usr/lib/ssl/cert.pem or in /usr/lib/ssl/certs: install a CA bundle (ca-certificates), or point SSL_CERT_FILE or SSL_CERT_DIR at one
+```
+
+That is a distroless or scratch image, or a slim one where OpenSSL is
+installed and `ca-certificates` is not. A plain-HTTP server on such an
+image is unaffected: nothing but an HTTPS fetch looks for a certificate
+authority. Found means a file that opens and is not empty, or a
+directory holding a certificate under its hashed name, as
+`ca-certificates` lays them out. A bundle of the wrong authorities is
+found, and OpenSSL's reason is then the whole of the message.
 
 ### Fetch URL safety (SSRF)
 
@@ -767,9 +906,9 @@ address to fall back on.
 `http-fetch-stream`, over either scheme, uses the same `getent` subprocess
 synchronously via `resolve-host-blocking` — same parser,
 same parity with `/etc/hosts` and NSS, same family selection logic.
-The only difference from the async path is that the subprocess
-runs with `:wait nil` and the caller deadline-polls in short slices
-instead of parking in epoll. There is one DNS primitive across the framework.
+The only difference from the async path is that the caller waits on
+the subprocess's pipe itself, with `poll(2)`, instead of parking in
+epoll. There is one DNS primitive across the framework.
 
 Semantic parity with `sb-bsd-sockets:get-host-by-name` is preserved:
 `/etc/hosts`, `/etc/nsswitch.conf`, Docker's embedded DNS, LDAP, mDNS
@@ -830,6 +969,39 @@ the call site, hitting the numeric fast path. That does not work for HTTPS:
 verification is wired to a DNS name and matching an IP SAN is not
 implemented. So an HTTPS upstream has no app-side way to skip `getent` —
 `*dns-cache-ttl*` is it.
+
+### One connection a fetch
+
+An outbound fetch opens a connection, sends its one request, and closes
+the connection when the response has ended. That is so for `http-fetch`,
+`fetch-into` and `http-fetch-stream`, over either scheme:
+
+- **No keep-alive.** The request goes out with `Connection: close`
+  unless `:headers` gives another value, and the connection is closed
+  either way. An upstream that answers `keep-alive` to a request that
+  asked for it has its connection closed all the same.
+- **No TLS session to resume.** Over `https://` every fetch makes a full
+  handshake, the certificate verified again each time.
+
+So a fetch costs a TCP handshake, and over HTTPS a TLS handshake on top
+of it: two round trips to the upstream, or three under TLS 1.2, before
+the request's own, and the handshake's arithmetic on the worker's
+thread. An application that makes an upstream call for every request it
+serves, an auth check or a token introspection or a gateway route, pays
+that each time.
+
+What an application can do about it:
+
+- **Cache the name.** `*dns-cache-ttl*` removes the `getent` child, and
+  nothing more: the connection and the handshake are still made.
+- **Verify a token where it arrives.** `jwt-verify` checks a signature
+  against keys the application already holds, where an introspection
+  endpoint is a fetch for every request.
+- **Keep the upstream's connections somewhere else.** A proxy on the
+  same host that holds connections open to the upstream (nginx with
+  `keepalive` in its `upstream` block and HTTP/1.1 to it) turns each
+  fetch into a short plain-HTTP connection over loopback, and the proxy
+  pays the handshakes once for many requests.
 
 ### The write backlog bound
 
@@ -1518,6 +1690,41 @@ several acquisitions per request with every worker serialized behind
 them, which is worth knowing before turning `:debug` on under load rather
 than after.
 
+What a client can cause at will is logged through a throttle, so that a
+flood of it is a line and a count rather than a line a request. The
+first of a kind is logged at once. The ones that follow it within a
+minute are counted and not logged, and when the minute is up their count
+is logged on a line of its own, under the kind's name:
+
+```
+2026-01-01 12:00:00.004 [WARN] parse error fd 12: unrecognized method: BOGUS
+2026-01-01 12:01:00.463 [WARN] parse-error: 37 more lines held back in the last 60 seconds
+```
+
+The next line of that kind is then a first again. Each worker counts its
+own, and logs a count from its once-a-second pass: a burst that has
+ended has its count in the log within a second or so of the minute being
+up, with no further line of its kind needed to bring it out. A count a
+worker still holds when it stops, or crashes, is logged as it goes, over
+the seconds its minute had run. A malformed request, a
+bad WebSocket frame and a refused connection are each a kind.
+
+An error that escapes a handler is logged the same way, a kind to each
+condition type, so a flood of one error leaves the first of another to
+show. A handler that raises on what a client sends is a handler a
+client can make raise as often as it likes. Every such request is still
+answered 500 and counted in the census. The log shows the first of the
+minute, and what the same condition type raises later in it, in another
+place or with another message, is counted and not shown: errors
+signalled with `(error "...")` are all one type. The count names the
+type, as `handler-error (simple-error): 4 more lines held back in the
+last 60 seconds`. While developing, when the same error raised again is
+the line you are looking for:
+
+```lisp
+(setf *throttle-handler-errors* nil)   ; log every one
+```
+
 Two operational consequences:
 
 - **`*log-stream*` pointed at a slow consumer stalls the server, not one
@@ -1686,12 +1893,50 @@ is therefore stopped for good after the first run: start it again, and
 register its hook again, before the next `start-server`, as the `start`
 function above does on every call.
 
+A `start-server` that a later one in the same image replaces returns as
+soon as its workers have stopped, and runs no hooks. Its hooks, and
+those registered for the later run, run at the later run's end, after
+its own drain.
+
 ### Concurrent store
 
 `make-store` returns a thread-safe hash-table-backed store for app-level state
 (sessions, caches, rate-limit counters).
 All operations hold an internal mutex,
 so stores are safe to share across worker threads in the same process.
+
+**Keys a client chooses.** A store made with the default `:test` hashes
+its keys with SipHash-2-4 under a secret, so it can be keyed by what a
+client sends: a username, an API key, an address. SBCL's own hash of a
+key can be worked out by anyone, and keys chosen to land in one bucket
+of the table make each one added walk all the others, under the store's
+mutex, until they expire. Where a key lands under the secret cannot be
+worked out without it.
+
+- Strings, integers and lists of them, to any depth, are hashed whole.
+  A float, a character or a pathname is hashed from its `sxhash`, and
+  two that `sxhash` cannot tell apart still land together. Build a key a
+  client has a hand in out of strings and integers.
+- A key `equal` knows only by identity, a symbol or a structure or a
+  vector that is not a string, is no client's to choose: it is that one
+  object or it is not. Such a key is filed by the object, as SBCL files
+  it, in a second table beside the first.
+- That is so of such an object as the whole key, and not inside a list.
+  There it is hashed from its `sxhash`, one value for every vector that
+  is not a string, so list keys that differ only in such a vector all
+  land together, as they do in SBCL's own `equal` table. Nothing is lost
+  by not making them: `equal` compares that vector by identity, so a
+  fresh vector holding the same bytes is another key, and a key made
+  from a digest's bytes never finds what was stored under it. Make it a
+  string: `sha256-hex` for a digest, `bytes-to-hex` for other bytes.
+- A store made with another `:test` (`eql`, `equalp`) hashes as SBCL
+  does. Key such a store by something the server chooses, a session id
+  it generated say, or by an HMAC of the client's value.
+- The secret is the process's own, drawn from `/dev/urandom` when a
+  store first needs it. A binary built with `save-lisp-and-die` does
+  not carry it: it is forgotten at the save, and a store saved with
+  entries in it files them again under the secret the started process
+  draws.
 
 For stores with a reaper, supply both `:expiry-fn` and `:reap-interval`:
 
@@ -1709,12 +1954,14 @@ Supplying `:expiry-fn` without `:reap-interval` (or vice versa) signals
 an error at `make-store` time rather than silently skipping the reaper.
 
 The reaper sleeps between sweeps and costs nothing while it waits. It
-stops when the `start-server` run it was made before or during ends, since
-that run consumes the hook. A store made once at load time, as above, and
-used across several runs in one image (a server restarted at the REPL)
-reaps during the first only; make it in the function that starts the
-server when that matters. `stop-store-reaper` stops one sooner, for a
-store the application retires, and lets the store be collected.
+stops when the `start-server` run it was made before or during ends,
+since that run consumes the hook, or, for a run that a later
+`start-server` replaces, when the later run ends. A store made once at
+load time, as above, and used across several runs in one image (a
+server restarted at the REPL) reaps during the first only; make it in
+the function that starts the server when that matters.
+`stop-store-reaper` stops one sooner, for a store the application
+retires, and lets the store be collected.
 
 Two locking hazards to know about:
 
@@ -1812,7 +2059,7 @@ All three empty forms round-trip to themselves.
 so handler code written against either representation works:
 
 ```lisp
-(json-get (json-parse body) "user_id")
+(json-get (json-parse-bytes (http-request-body request)) "user_id")
 ```
 
 `json-object-alist` gets the underlying alist when you need to walk it, and
@@ -1843,6 +2090,44 @@ the second emits it for the first, turning `[["a",1],["b",2]]` into
 `{"a":[1],"b":[2]}`. Well-formed, silently wrong, no error anywhere.
 The information is destroyed at parse time, so no heuristic downstream can
 recover it; typing objects is the only fix that works in both directions.
+
+### A document that is not JSON
+
+`json-parse` signals `json-parse-error` for a string that is not JSON, or
+is JSON past one of the parser's bounds (`*json-max-depth*`,
+`*json-max-string-length*`, the digits a number may have), and signals
+nothing else for any string.
+
+A request's body is bytes, and `json-parse-bytes` reads a document from
+those: it decodes them as UTF-8 and hands the text to `json-parse`. Bytes
+that are not UTF-8 are a `json-parse-error` as well, so one catch by name
+answers a malformed body whichever it was. That is the client's 400, and
+a fault in the handler stays a 500:
+
+```lisp
+(handler-case (json-parse-bytes (http-request-body request))
+  (json-parse-error ()
+    (make-error-response 400 "malformed JSON")))
+```
+
+A request that carried no body has `NIL` for one. `json-parse-bytes`
+reads that as no bytes and refuses it as the empty string is refused, so
+the catch above answers it too and a handler needs no check of its own.
+The decoding is strict, and no other encoding is guessed at: RFC 8259
+has a document sent between systems encoded as UTF-8. A string handed to
+`json-parse-bytes` is a `type-error`, the caller's mistake and not the
+client's.
+
+A catch of `error` around the parse takes it too, since it is one, and
+takes the handler's own bugs with it: a mistake inside the form answers
+every caller "malformed JSON".
+
+The framework does not answer it on a handler's behalf. One that escapes
+a handler is that handler's error like any other, a 500, because the
+document is not always the client's: an upstream's reply read in a
+`:then` goes through the same parser, and so does a JWKS document.
+`json-parse-error-message` is the complaint without the `json:` it is
+printed under.
 
 ### Query parameter parsing
 
@@ -2467,6 +2752,52 @@ way. web-skeleton's own code, its TLS system and the demo have no store
 of the first shape. Code built on them with 2.2.9 should keep to the
 second, or be built with 2.2.10 or later.
 
+### Clocks
+
+Every interval the framework measures is taken on a monotonic clock,
+read through `get-internal-real-time`: idle and stall timeouts, a
+fetch's deadline, a DNS cache entry's life, a drain's deadline, and the
+event loop's once-a-second work. Setting the system's clock, by NTP
+after a boot or a resume, by a hypervisor or by hand, neither fires any
+of them nor holds any back. That clock does not run while the machine
+is suspended, so a timeout does not count the time it spent asleep.
+
+The system's clock is read for what is a date: the `Date` header, a log
+line's timestamp, and a JWT's `exp` and `nbf`. A token is judged by the
+system's clock as it stands, so a host whose clock is wrong accepts and
+refuses tokens to match.
+
+An application's time divides the same way, and `monotonic-seconds`
+reads the first clock for it, in whole seconds: how long a session has
+been idle, a rate limit's window, a cached value's age, an uptime. The
+predicate a store's reaper is given might be:
+
+```lisp
+(defun session-expired-p (session)
+  (> (- (monotonic-seconds) (getf session :seen-at)) 1800))
+```
+
+Readings start at about a billion rather than at zero, so a slot left
+at 0 is longer ago than any limit and can stand for "never". A reading
+means something only in the process that took it, since every process
+starts at the same one: what is written to disk, sent to a client or
+shared with another process is a date, from `get-universal-time`. An
+interval finer than a second can be read from `get-internal-real-time`
+itself, which moves in steps of the kernel's tick, a few milliseconds.
+
+### Signals
+
+While `start-server` runs, SIGPIPE is ignored, so that a write to a peer
+that has gone fails with `EPIPE`, and SIGTERM stops the server as Ctrl-C
+does. When the last `start-server` running in the image returns, it puts
+back SBCL's own SIGTERM handler, which ends the process: one that a later
+call has replaced leaves SIGTERM to that call. SBCL gives no way to read
+the handler a signal had before: `sb-sys:enable-interrupt` answers `nil`
+whatever is installed. So a SIGTERM handler an application installed
+before calling `start-server` is not put back; install it again once
+`start-server` has returned. SIGPIPE stays ignored, which is what SBCL's
+own handling of it comes to for the process.
+
 ### getent
 
 Hostnames are resolved by running `getent ahosts` with
@@ -2483,6 +2814,28 @@ Debian. Other getents are untested.
 Outbound TLS is the optional `web-skeleton-tls` system, which loads
 libssl, and it needs a CA bundle to verify against: see
 "TLS trust anchors" above.
+
+### CPUs and workers
+
+Unless `:workers` says otherwise, `start-server` starts a worker for each
+CPU the process can use, which is not always each core the host has. It
+is the least of what limits the process:
+
+- **A CPU quota**, a container's `--cpus` or a systemd unit's
+  `CPUQuota=`. That is `cpu.max` in the process's own cgroup, and in each
+  cgroup above it, since a limit on a slice binds what runs inside it.
+  It is rounded up, so half a core is one worker. cgroup v1's
+  `cpu.cfs_quota_us` and `cpu.cfs_period_us` are read the same way.
+- **The CPUs it may run on**, a container's `--cpuset-cpus` or any other
+  affinity mask.
+- **The host's cores**, when nothing narrows them.
+
+So a unit with `CPUQuota=50%` on a sixteen-core host starts one worker,
+and one with `CPUQuota=350%` four. The cgroup hierarchy is read where
+distributions mount it, `/sys/fs/cgroup`; mounted elsewhere, a quota is
+not seen and the count is the CPUs the process may run on. It is read
+once, as the server starts: a limit changed under a running server takes
+effect in the kernel at once, and in the worker count at the next start.
 
 ### Descriptors
 

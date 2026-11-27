@@ -11,7 +11,8 @@
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *max-request-line-length* 8192
-  "Maximum length of the HTTP request line in bytes.")
+  "Maximum length of the HTTP request line in bytes, and the most bytes of
+   empty lines a client may send before one: see DROP-EMPTY-LINES.")
 
 (defparameter *max-header-count* 100
   "Maximum number of headers allowed in a single request.")

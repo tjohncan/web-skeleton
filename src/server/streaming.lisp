@@ -395,7 +395,7 @@
       ((connection-append-write conn framed)
        ;; The production clock, not LAST-ACTIVE — see
        ;; CONNECTION-STREAM-PRODUCED-AT.
-       (setf (connection-stream-produced-at conn) (get-universal-time))
+       (setf (connection-stream-produced-at conn) (monotonic-seconds))
        (stream-flush conn))
       (t
        (error "stream-send: fd ~d is at *max-write-backlog* (~d bytes ~

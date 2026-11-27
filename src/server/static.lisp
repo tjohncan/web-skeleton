@@ -168,7 +168,11 @@
   (etag                  nil :type (or null string))
   (last-modified         ""  :type string)
   (headers               nil :type list)
-  (content-length          0 :type fixnum))
+  (content-length          0 :type fixnum)
+  ;; On an alias's entry, the entry of the file it answers for: /x for
+  ;; x.html, /dir for dir/index.html. The alias is a copy of that entry,
+  ;; sharing its pieces. NIL on a file's own entry. See LOAD-STATIC-FILES.
+  (alias-of              nil :type (or null static-entry)))
 
 (defvar *static-cache* (make-hash-table :test #'equal)
   "Maps URL path (string) to STATIC-ENTRY struct.
@@ -385,6 +389,13 @@
    Files are read into memory and pre-formatted as complete HTTP responses.
    URL paths are derived by stripping DIRECTORY from the file path.
    Additive — can be called multiple times. Collisions: last wins.
+
+   A page is also served without its .html, /x for x.html, and a
+   directory's index.html at the directory's bare path, /dir for
+   dir/index.html. Such an alias never takes the place of a file loaded
+   at its path, and a later load moves it to the file it brings. When
+   both x.html and x/index.html are loaded, /x is x.html, and x/ is the
+   index.
    All or nothing: a call that signals, at the cap, a substitutions key or
    a header value, leaves the cache as it found it.
    Dotfiles and dot-directories are skipped (.git/, .env) — except
@@ -536,44 +547,56 @@
         (maphash (lambda (url-path response)
                    (setf (gethash url-path *static-cache*) response))
                  loaded))
-        ;; Second pass: register extensionless aliases for .html files
-        ;; e.g., /login.html also serves at /login
-        ;; Actual files take priority — don't overwrite existing entries
-        (let ((aliases 0)
-              (pending nil))
-          ;; Collect aliases first — modifying a hash table during maphash
-          ;; is undefined per the CL spec
-          (maphash (lambda (url-path response)
-                     (let ((len (length url-path)))
-                       ;; /foo.html → /foo
-                       (when (and (> len 5)
-                                  (string= url-path ".html"
-                                           :start1 (- len 5)))
-                         (let ((alias (subseq url-path 0 (- len 5))))
-                           (unless (gethash alias *static-cache*)
-                             (push (cons alias response) pending))))
-                       ;; /dir/index.html → /dir (no trailing slash).
-                       ;; /dir/ already falls through to index.html via
-                       ;; the runtime lookup in SERVE-STATIC; this alias
-                       ;; closes the /dir (bare) gap so both forms hit
-                       ;; the same entry, consistent with the .html
-                       ;; extensionless alias above.
-                       (when (and (>= len 11)
-                                  (string= url-path "/index.html"
-                                           :start1 (- len 11)))
-                         (let ((alias (subseq url-path 0 (- len 11))))
-                           ;; /index.html at root would alias to empty —
-                           ;; skip, the root case is served via exact
-                           ;; match on /index.html plus the /-prefix
-                           ;; runtime fallback.
-                           (when (and (> (length alias) 0)
-                                      (not (gethash alias *static-cache*)))
-                             (push (cons alias response) pending))))))
-                   *static-cache*)
-          (dolist (entry pending)
-            (setf (gethash (car entry) *static-cache*) (cdr entry))
-            (incf aliases)
-            (log-debug "static: alias ~a" (car entry)))
+        ;; Second pass: the aliases. /login answers for login.html, and
+        ;; /dir for dir/index.html: /dir/ already falls through to
+        ;; index.html in SERVE-STATIC, and this closes the bare /dir gap.
+        ;; /index.html at the root would alias to the empty path, and is
+        ;; left out: the root is served by its exact path and the /
+        ;; fallback.
+        ;;
+        ;; An alias is a copy of its file's entry, sharing the file's
+        ;; pieces, with ALIAS-OF naming the file's entry. That is how a
+        ;; later load tells an alias, which it replaces with one for the
+        ;; file now at that path, from a file, which no alias replaces. An
+        ;; alias already answering for the file at its path is left as it
+        ;; is. When x.html and x/index.html both want /x, x.html has it,
+        ;; whatever order the cache is walked in: the order a server
+        ;; commonly tries a name in, the page before the directory. x/
+        ;; still answers for the index.
+        (let ((wanted (make-hash-table :test #'equal))
+              (aliases 0))
+          ;; Collected first: the cache is not changed while MAPHASH walks
+          ;; it. Each alias keeps the file it wants most, a page (1) over
+          ;; a directory's index (0).
+          (flet ((want (alias rank file)
+                   (let ((had (gethash alias wanted)))
+                     (when (or (null had) (> rank (car had)))
+                       (setf (gethash alias wanted) (cons rank file))))))
+            (maphash (lambda (url-path entry)
+                       (unless (static-entry-alias-of entry)
+                         (let ((len (length url-path)))
+                           (when (and (> len 5)
+                                      (string= url-path ".html"
+                                               :start1 (- len 5)))
+                             (want (subseq url-path 0 (- len 5)) 1 entry))
+                           (when (and (> len 11)
+                                      (string= url-path "/index.html"
+                                               :start1 (- len 11)))
+                             (want (subseq url-path 0 (- len 11)) 0 entry)))))
+                     *static-cache*))
+          (maphash (lambda (alias choice)
+                     (let ((file (cdr choice))
+                           (there (gethash alias *static-cache*)))
+                       (when (or (null there)
+                                 (and (static-entry-alias-of there)
+                                      (not (eq (static-entry-alias-of there)
+                                               file))))
+                         (let ((entry (copy-static-entry file)))
+                           (setf (static-entry-alias-of entry) file
+                                 (gethash alias *static-cache*) entry))
+                         (incf aliases)
+                         (log-debug "static: alias ~a" alias))))
+                   wanted)
           (log-info "loaded ~d static file~:p (~:d bytes cached, ~d ~a)"
                     count total-bytes aliases
                     (if (= aliases 1) "alias" "aliases")))))))

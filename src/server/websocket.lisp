@@ -564,14 +564,16 @@
    reason, and the two agree: both refuse every cross-worker call, not
    only the ones that happen to leave a remainder.
 
-   Signals if CONN is not an open WebSocket, :CLOSING included. A close
-   frame is queued or sent by then, the echo of the peer's or the drain's
-   own, and RFC 6455 §5.5.1 allows no data frame after it. The connection
-   stays on the table until the write path flushes that frame and closes,
-   so the ownership check passes, and an application keeping its own
-   registry meets one on the pass its client closed. This refusal is what
-   README tells such a registry to prune on. MAP-WORKER-WEBSOCKETS visits
-   open WebSockets only, so a walk through it never sees one.
+   Signals if CONN is not an open WebSocket, :CLOSING and :LINGERING
+   included. A close frame is queued or sent by then, the echo of the
+   peer's or the drain's own, and RFC 6455 §5.5.1 allows no data frame
+   after it. The connection stays on the table while the write path
+   flushes that frame, and then while the close lingers for the peer to
+   finish (BEGIN-LINGERING-CLOSE), so the ownership check passes, and an
+   application keeping its own registry meets one on the pass its client
+   closed. This refusal is what README tells such a registry to prune on.
+   MAP-WORKER-WEBSOCKETS visits open WebSockets only, so a walk through it
+   never sees one.
 
    The wrong worker, not the wrong thread. Asking whether an fd is on this
    worker's table takes a worker to ask from, so a call off the event loop
@@ -652,7 +654,9 @@
 
 (defun ws-close (conn &optional (code 1000))
   "Close the WebSocket CONN from the application's side. Queues a close
-   frame carrying CODE and closes the connection once it has gone out.
+   frame carrying CODE and closes the connection once it has gone out, as
+   BEGIN-LINGERING-CLOSE does: a peer still sending reads the frame and
+   then the end of the stream, where a close at once would reset it.
    Returns T.
 
    The answer DEPLOYMENT.md gives an application whose own events have
@@ -838,7 +842,7 @@
           (if (or (connection-ws-frag-buf conn)
                   (plusp (connection-read-pos conn)))
               (when (zerop (connection-ws-message-at conn))
-                (setf (connection-ws-message-at conn) (get-universal-time)))
+                (setf (connection-ws-message-at conn) (monotonic-seconds)))
               (setf (connection-ws-message-at conn) 0))
           (return))
         ;; Advance past this frame
@@ -868,7 +872,7 @@
                    (log-debug "ws recv opcode ~d (~d bytes) fd ~d"
                               opcode (length (ws-frame-payload frame))
                               (connection-fd conn))
-                   (setf (connection-last-active conn) (get-universal-time)
+                   (setf (connection-last-active conn) (monotonic-seconds)
                          (connection-ws-message-at conn) 0)
                    (when ws-handler
                      (handled frame)))
@@ -926,7 +930,7 @@
                    (log-throttled :warn :ws-utf-8 "ws invalid UTF-8 in reassembled text fd ~d"
                                   (connection-fd conn))
                    (return-from websocket-on-read (close-with 1007)))
-                 (setf (connection-last-active conn) (get-universal-time)
+                 (setf (connection-last-active conn) (monotonic-seconds)
                        (connection-ws-message-at conn) 0)
                  (when ws-handler
                    (handled (make-ws-frame

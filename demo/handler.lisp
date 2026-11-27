@@ -208,64 +208,6 @@
                nil))))
 
 ;;; ---------------------------------------------------------------------------
-;;; The port guard
-;;; ---------------------------------------------------------------------------
-
-(defun %port-already-served-p (host port)
-  "T if something already answers on PORT at HOST, the address about to be
-   bound, or on loopback when HOST is a wildcard.
-
-   Every listener this framework opens sets SO_REUSEPORT, which is what lets
-   one worker per core hold the same port. The cost is that a *second server
-   process* binding it does not fail either — it joins. Both then serve, the
-   kernel splits arriving connections between them by 4-tuple hash, and
-   nothing anywhere reports it: no error, no warning, no log line on either
-   side.
-
-   For this demo that surfaces as the room quietly dividing. Each process has
-   its own bulletin, so a tab only ever hears the tabs the kernel hashed the
-   same way, and which group a tab lands in is invisible from inside it. It
-   costs an afternoon to diagnose and one connect() to prevent.
-
-   The check races anything started in the gap before the bind, which is
-   fine: the case that actually happens is a previous run that did not die.
-
-   Probed at HOST because that is the address a second server has to share
-   for the kernel to pool the two, and a server bound to one address does not
-   answer on loopback. A wildcard is probed on loopback, which every wildcard
-   listener answers on.
-
-   The connect is bounded, at two seconds. Loopback answers at once, but an
-   interface whose firewall drops SYNs would hold a blocking connect for the
-   kernel's own timeout, minutes, before START-DEMO bound anything. A connect
-   still going at the bound is taken for nothing there: a listener on this
-   host answers well inside it."
-  (let* ((v6 (= (length host) 16))
-         (target (cond ((notevery #'zerop host) host)
-                       (v6 #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))
-                       (t #(127 0 0 1)))))
-    (handler-case
-        (let ((probe (make-instance (if v6
-                                        'sb-bsd-sockets:inet6-socket
-                                        'sb-bsd-sockets:inet-socket)
-                                    :type :stream :protocol :tcp)))
-          (unwind-protect
-               (progn
-                 (setf (sb-bsd-sockets:non-blocking-mode probe) t)
-                 ;; In progress is the usual answer off loopback, and the
-                 ;; connect goes on while the wait below watches it.
-                 (handler-case (sb-bsd-sockets:socket-connect probe target port)
-                   (sb-bsd-sockets:operation-in-progress () nil))
-                 ;; Writable is a connect that has finished, made or refused;
-                 ;; only a made one has a peer to name.
-                 (and (sb-sys:wait-until-fd-usable
-                       (sb-bsd-sockets:socket-file-descriptor probe) :output 2)
-                      (handler-case (progn (sb-bsd-sockets:socket-peername probe) t)
-                        (error () nil))))
-            (ignore-errors (sb-bsd-sockets:socket-close probe))))
-      (error () nil))))
-
-;;; ---------------------------------------------------------------------------
 ;;; Peer handles
 ;;; ---------------------------------------------------------------------------
 
@@ -554,12 +496,17 @@
   "2208988800. Unix seconds plus this is a Lisp universal time.")
 
 (defun %now-us ()
-  "Microseconds of wall time: for timing a handler, refilling a post budget,
-   and stamping a bulletin line.
+  "Microseconds of wall time: for stamping a bulletin line, which is a
+   date, and for timing a handler, which is an interval too short for the
+   clock the demo's other intervals are read from.
 
-   Not GET-INTERNAL-REAL-TIME: its clock ticks too coarsely to time a
-   handler, so every lab request would report itself as instantaneous,
-   which reads as a broken field rather than as a fast server.
+   That clock is the framework's MONOTONIC-SECONDS: the uptime, the
+   /healthz ticks and the post budget count whole seconds on it, and a
+   step of the system's clock moves none of them. It will not time a
+   handler. It is GET-INTERNAL-REAL-TIME in whole seconds, and that
+   clock ticks too coarsely even read directly, so every lab request
+   would report itself as instantaneous, which reads as a broken field
+   rather than as a fast server.
 
    Not CLOCK_MONOTONIC through SB-UNIX:CLOCK-GETTIME either, though it is
    the right clock. That symbol is external on some SBCLs and internal on
@@ -572,12 +519,8 @@
    resolution. What it costs is that it is wall time, so an interval
    measured across a clock step is not an interval.
 
-   So every subtraction of two of these clamps at zero: the lab's handler
-   timer, and the post budget's refill. A backward step then reads as no
-   time having passed, never as negative time. Unclamped, the budget would
-   turn a one-hour backward step into minus three thousand six hundred
-   posts, and a connection that had posted before the step would stay
-   locked out for the hour it takes to earn them back.
+   So the lab's handler timer clamps its subtraction at zero: a backward
+   step then reads as no time having passed, never as negative time.
 
    The bulletin's stamps are not clamped, and say so where they are taken:
    a stamp is the time the server believed it was, and a clock that stepped
@@ -772,9 +715,7 @@
                   (error "not a JWS compact serialization: it needs exactly ~
                           three base64url segments, with no = padding"))
                 (flet ((seg (i)
-                         (json-parse (sb-ext:octets-to-string
-                                      (base64url-decode (nth i parts))
-                                      :external-format :utf-8))))
+                         (json-parse-bytes (base64url-decode (nth i parts)))))
                   (let* ((header (seg 0))
                          (payload (seg 1))
                          (sig (base64url-decode (third parts)))
@@ -889,8 +830,10 @@
 ;;; paths, no addresses, no headers, no message contents. The page is public.
 
 (defvar *started-at* nil
-  "Universal time START-DEMO ran. An application fact, not a framework one —
-   the framework has no opinion about when this app began.")
+  "What MONOTONIC-SECONDS read when START-DEMO ran, for the uptime the
+   census reports: an interval, so the clock a step of the system's cannot
+   move. An application fact, not a framework one — the framework has no
+   opinion about when this app began.")
 
 (defun %states-json (states)
   "A :STATES plist into a JSON object with string keys.
@@ -926,11 +869,12 @@
    that; one that has not passed at all is stuck in something.")
 
 (defvar *last-tick* nil
-  "Per-worker vector of the universal time each worker last passed its loop.
-   Written only by its own worker, from BULLETIN-TICK; read by whichever
-   worker answers /healthz. The same shape as *FANNED*, and for the same
-   reason needs no lock: one writer per slot, and a read that is a tick
-   stale costs nothing.")
+  "Per-worker vector of what MONOTONIC-SECONDS read when each worker last
+   passed its loop, and 0 for one that never has: readings start far above
+   zero, so 0 is long ago. Written only by its own worker, from
+   BULLETIN-TICK; read by whichever worker answers /healthz. The same shape
+   as *FANNED*, and for the same reason needs no lock: one writer per slot,
+   and a read that is a tick stale costs nothing.")
 
 (defun handle-healthz (request)
   "200 when every worker has passed its loop recently, 503 naming the ones
@@ -948,7 +892,7 @@
   (declare (ignore request))
   (if (null *last-tick*)
       (make-text-response 503 (format nil "not started~%"))
-      (let* ((now (get-universal-time))
+      (let* ((now (monotonic-seconds))
              (stale (loop for at across *last-tick*
                           for i from 0
                           when (> (- now at) *healthz-stale-after*)
@@ -967,7 +911,7 @@
          (json (json-serialize
                 (make-json-object
                  (list (cons "uptime" (if *started-at*
-                                          (- (get-universal-time) *started-at*)
+                                          (- (monotonic-seconds) *started-at*)
                                           0))
                        (cons "workers" (or (getf c :workers) 0))
                        (cons "total"   (or (getf c :total) 0))
@@ -1147,7 +1091,7 @@
    newer than this worker has sent — the :ON-TICK docstring asks a hook not to
    block the loop it runs on, and a lock taken twenty times a second for
    nothing is the slow version of doing exactly that."
-  (setf (aref *last-tick* worker-id) (get-universal-time))
+  (setf (aref *last-tick* worker-id) (monotonic-seconds))
   (let ((latest *bulletin-latest*))
     (when (> latest (aref *fanned* worker-id))
       ;; NEW always holds the line LATEST names. BULLETIN-POST publishes LATEST
@@ -1207,6 +1151,13 @@
   "Spend one post from CONN's budget, or refuse. A token bucket: *POST-BURST*
    posts at once, then *POST-REFILL-PER-SECOND*.
 
+   The refill is counted in whole seconds on MONOTONIC-SECONDS, a post
+   earned as each second turns. It is an interval, and an interval read off
+   the system's clock moves when that clock is set: an hour's step backward
+   would be minus three thousand six hundred posts, and a connection that
+   had posted before it would stay locked out for the hour it takes to earn
+   them back.
+
    Second value is T the first time a refusal lands after an allowed post, so
    the sender is told once per run of refusals rather than once per frame —
    an answer to every dropped frame would be a write for every write, handed
@@ -1214,16 +1165,13 @@
   (let ((table (and *worker-id* (aref *post-budgets* *worker-id*))))
     (if (null table)
         (values t nil)
-        (let* ((now (%now-us))
+        (let* ((now (monotonic-seconds))
                (b (or (gethash conn table)
                       (setf (gethash conn table)
                             (make-post-budget :tokens *post-burst* :at now))))
-               ;; Clamped: see %NOW-US. A clock stepped backward makes this
-               ;; negative, and a negative refill is a lockout.
-               (elapsed (max 0 (- now (budget-at b))))
                (tokens (min *post-burst*
                             (+ (budget-tokens b)
-                               (* (/ elapsed 1000000)
+                               (* (- now (budget-at b))
                                   *post-refill-per-second*)))))
           (setf (budget-at b) now)
           (if (>= tokens 1)
@@ -1356,10 +1304,24 @@
 ;;; Entry points
 ;;; ---------------------------------------------------------------------------
 
+(defvar *serving* nil
+  "True while START-DEMO serves in this image. The bulletin, the counters
+   and the page cache are the image's, one of each, and START-DEMO sets
+   them up before it starts the server: a second START-DEMO would reset
+   them under the first, so it is refused before it has touched any.")
+
 (defun start-demo (&key (host #(127 0 0 1)) (port 8081) (workers 4)
                         (instance (bytes-to-hex (random-bytes 2)))
                         backlink public-url)
   "Start the demo server.
+
+   One demo to a port, and one to an image. A second demo process on the
+   port is refused by START-SERVER, which claims the port before it binds:
+   every listener sets SO_REUSEPORT, so that second bind would not fail,
+   and two demos would each keep a bulletin of their own, a tab hearing
+   only the tabs the kernel sent the same way, the room divided in two
+   with no error anywhere. A second START-DEMO in an image already serving
+   one is refused here; see *SERVING*.
 
    HOST defaults to loopback, which is what you want on a laptop and wrong
    inside a container: nothing outside the container can reach a socket bound
@@ -1390,18 +1352,16 @@
    long as the demo serves, putting it back when START-SERVER returns. A
    server started beside the demo in one image runs at that cadence too
    while the demo does."
-  (when (%port-already-served-p host port)
-    (error "start-demo: something is already answering on port ~d.~%~
-            SO_REUSEPORT means a second server binds it rather than failing, ~
-            and both would serve — the kernel splitting connections between ~
-            them, each with its own bulletin, so the room divides in two with ~
-            no error anywhere. Stop the other one first." port))
+  (when *serving*
+    (error "start-demo: the demo is already serving in this image. Its ~
+            bulletin, counters and pages are the image's, and a second ~
+            start would reset them under the first. Stop that one first."))
   (setf *demo-host* (%self-fetch-host host)
         *demo-port* port)
   (setf *instance* instance
         *backlink-url* backlink
         *public-url* public-url)
-  (setf *started-at* (get-universal-time)
+  (setf *started-at* (monotonic-seconds)
         *bulletin* (make-store :test #'eql)
         *fanned* (make-array workers :initial-element 0)
         ;; Zero, not now: a worker that never starts should read as wedged
@@ -1446,7 +1406,8 @@
   (let ((wake *worker-wake-interval*))
     (unwind-protect
          (progn
-           (setf *worker-wake-interval* 0.05)
+           (setf *worker-wake-interval* 0.05
+                 *serving* t)
            (start-server :host host
                          :port port
                          :workers workers
@@ -1454,7 +1415,8 @@
                          :body-handler #'decide-body
                          :ws-handler #'handle-ws-message
                          :on-tick #'bulletin-tick))
-      (setf *worker-wake-interval* wake))))
+      (setf *worker-wake-interval* wake
+            *serving* nil))))
 
 (defun main ()
   (start-demo))

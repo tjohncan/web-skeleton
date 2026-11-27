@@ -121,7 +121,10 @@
   ;;   :ws-upgrade            — sending WebSocket handshake
   ;;   :websocket             — reading/writing WebSocket frames
   ;;   :streaming             — response head sent, app is producing a body
-  ;;   :closing               — sending close frame (disconnect when done)
+  ;;   :closing               — sending close frame (lingering close when done)
+  ;;   :lingering             — write side shut down, discarding what the
+  ;;                            client still sends until it finishes or
+  ;;                            *LINGER-TIMEOUT* runs out
   ;;   :awaiting              — parked, waiting for outbound fetch to complete
   ;;   :out-dns               — outbound: getent subprocess resolving hostname
   ;;   :out-connecting        — outbound: TCP connect in progress
@@ -216,6 +219,11 @@
   ;; waits for an end it has already sent.
   (header-scan-pos 0 :type fixnum)
   (header-end    0 :type fixnum)             ; byte offset where body starts
+  ;; Bytes of empty lines dropped from in front of this request's line,
+  ;; counted against *MAX-REQUEST-LINE-LENGTH*: see DROP-EMPTY-LINES. Back
+  ;; to 0 once the request's head is found, so a request kept alive behind
+  ;; it starts a count of its own.
+  (empty-lines   0 :type fixnum)
   ;; Byte offset one past the whole request on the wire — headers, the
   ;; CRLFCRLF, and every byte the body's framing occupies. Read by the
   ;; keep-alive reset and the ws-upgrade completion to find where pipelined
@@ -435,9 +443,10 @@
   ;; while no fragmented message is arriving. See WS-FRAG-APPEND.
   (ws-frag-buf   nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (ws-frag-total  0  :type fixnum)            ; bytes of frag-buf in use
-  ;; Universal time the WebSocket message still arriving began: its first
-  ;; fragment, or the first bytes of a frame not yet whole. 0 while no
-  ;; message is unfinished. *WS-MESSAGE-TIMEOUT* is measured from it.
+  ;; When the WebSocket message still arriving began, as MONOTONIC-SECONDS
+  ;; read it: its first fragment, or the first bytes of a frame not yet
+  ;; whole. 0 while no message is unfinished. *WS-MESSAGE-TIMEOUT* is
+  ;; measured from it.
   (ws-message-at  0  :type integer)
   ;; DNS lookup (set during :out-dns phase on an outbound connection)
   (dns-process nil)                           ; sb-ext:process running getent
@@ -481,7 +490,7 @@
                      :socket client-socket
                      :serial (incf *connection-serial*)
                      :remote-addr addr
-                     :last-active (get-universal-time))))
+                     :last-active (monotonic-seconds))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cleanup
@@ -616,6 +625,42 @@
      (* 2 *max-header-count*)  ; CRLF ending each header
      4))                       ; request-line and blank-line CRLFs
 
+(defun drop-empty-lines (conn)
+  "Drop the CRLFs at the front of CONN's read buffer, where a request
+   line is expected. RFC 9112 §2.2 asks a server to ignore at least one
+   empty line received before a request line: some clients send a CRLF
+   after a POST body, and on a kept-alive connection it is otherwise the
+   next request's first line, an empty one, refused.
+
+   A CRLF and nothing else. A lone LF, or a CR followed by anything but an
+   LF, is left for the parser, which refuses it there as it refuses one
+   anywhere in a head; a CR at the end of what has arrived waits for the
+   byte after it.
+
+   Counted for the request, and refused with 400 past
+   *MAX-REQUEST-LINE-LENGTH*, the most a request line may be: a peer that
+   sends nothing but empty lines is answered, not read from until
+   *IDLE-TIMEOUT*. Dropped from the buffer rather than stepped over in it,
+   because everything after reads the request from offset 0, the search
+   for its end and the budget the head is held to included."
+  (let* ((buf (connection-read-buf conn))
+         (end (connection-read-pos conn))
+         (drop (loop with i = 0
+                     while (and (< (1+ i) end)
+                                (= (aref buf i) 13)
+                                (= (aref buf (1+ i)) 10))
+                     do (incf i 2)
+                     finally (return i))))
+    (when (plusp drop)
+      (when (> (incf (connection-empty-lines conn) drop)
+               *max-request-line-length*)
+        (http-parse-error "more than ~d bytes of empty lines before the ~
+                           request line"
+                          *max-request-line-length*))
+      (replace buf buf :start2 drop :end2 end)
+      (setf (connection-read-pos conn) (- end drop)
+            (connection-header-scan-pos conn) 0))))
+
 (defun refuse-unterminated-head (buf end)
   "Refuse the request head in BUF[0..END), which has passed
    REQUEST-HEAD-BUDGET without its blank line, with the status its first
@@ -705,6 +750,13 @@
     (when plan
       (abort-received-body plan conn reason))))
 
+(defconstant +getent-output-limit+ 8192
+  "The most of `getent ahosts` output a lookup holds, in bytes. An
+   answer is a STREAM, a DGRAM and a RAW line for each address, well
+   under 1 KiB for an ordinary name. One number for the pipe a worker
+   reads through epoll and for the one RESOLVE-HOST-BLOCKING reads
+   itself, so both give up on the same answer.")
+
 (defun connection-read-cap (conn)
   "Ceiling on CONN's read buffer, by state and direction:
      :websocket         → *max-ws-payload-size* + 14 (masked header)
@@ -725,13 +777,11 @@
      (+ *max-ws-payload-size* 14))
     ;; DNS pipe output is 'getent ahosts <host>' stdout — a handful of
     ;; STREAM / DGRAM / RAW lines per address family, typically well
-    ;; under 1 KiB. Cap at 8 KiB to match RESOLVE-HOST-BLOCKING's
-    ;; explicit 8192-byte cap on the synchronous path; reusing
-    ;; *MAX-OUTBOUND-RESPONSE-SIZE* here would let a pathological NSS
-    ;; module produce an 8 MiB buffer for what is definitionally a few
-    ;; lines.
+    ;; under 1 KiB. Reusing *MAX-OUTBOUND-RESPONSE-SIZE* here would let a
+    ;; pathological NSS module produce an 8 MiB buffer for what is
+    ;; definitionally a few lines.
     ((eq (connection-state conn) :out-dns)
-     8192)
+     +getent-output-limit+)
     ((connection-outbound-p conn)
      *max-outbound-response-size*)
     ;; A body being received is handed over a window at a time, so the
@@ -1693,7 +1743,7 @@
                   (setf peer-finished (and (member result '(:eof :ok-eof)) t))
                   (when (member result '(:ok :ok-eof :ok-want-write))
                     (setf (connection-body-progress-at conn)
-                          (get-universal-time)))))))))
+                          (monotonic-seconds)))))))))
 
 (defun connection-begin-body (conn peer-finished)
   "Start reading the body of CONN's request, whose head has arrived and
@@ -1889,6 +1939,9 @@
     ;; Other states (:write-response, :ws-upgrade, :closing) watch EPOLLOUT only.
     (ecase (connection-state conn)
       (:read-http
+       ;; First, so that the search for the head's end and the budget the
+       ;; head is held to both start from the request's first line.
+       (drop-empty-lines conn)
        (let ((header-end (scan-crlf-crlf (connection-read-buf conn)
                                           (max 0 (- (connection-header-scan-pos
                                                      conn)
@@ -1907,6 +1960,9 @@
                     ;; then run from HEADER-END + 2 to HEADER-END, which
                     ;; every scanner below reads as none.
                     (req-line-end (scan-crlf buf 0 (+ header-end 2))))
+               ;; Its head has ended: the empty lines in front of it were
+               ;; this request's, and the next request counts its own.
+               (setf (connection-empty-lines conn) 0)
                (unless req-line-end
                  (http-parse-error "no CRLF in request line"))
                ;; Verify the request line ends with HTTP/1.x before
@@ -2141,7 +2197,7 @@
        ;; a wake-up that read nothing is not progress.
        (when (and (plusp (connection-body-progress-at conn))
                   (member read-result '(:ok :ok-eof :ok-want-write)))
-         (setf (connection-body-progress-at conn) (get-universal-time)))
+         (setf (connection-body-progress-at conn) (monotonic-seconds)))
        (cond
          ;; Paused: what this read brought waits in the buffer, within the
          ;; window, for BODY-RESUME. Only a stale event can get here — a
@@ -2486,7 +2542,7 @@
        (setf (connection-write-buf conn) bytes
              (connection-write-pos conn) 0
              (connection-write-end conn) len
-             (connection-write-progress-at conn) (get-universal-time))
+             (connection-write-progress-at conn) (monotonic-seconds))
        t)
       (t (%queue-tail conn bytes) t))))
 
@@ -2602,7 +2658,7 @@
           (connection-write-end conn) end
           ;; Guard above proves nothing was pending, so this is always the
           ;; start of an episode.
-          (connection-write-progress-at conn) (get-universal-time))))
+          (connection-write-progress-at conn) (monotonic-seconds))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; State machine: on-write
@@ -2625,11 +2681,12 @@
    reported unwritable — is not coming."
   (let ((wrote nil))
     (flet ((finish (result)
-             ;; One timestamp per pass rather than per chunk. GET-UNIVERSAL-TIME
-             ;; is a syscall and this loop runs per writable event; the stall
-             ;; deadline is in seconds, so per-chunk resolution buys nothing.
+             ;; One timestamp per pass rather than per chunk. Reading the
+             ;; clock is a call out and this loop runs per writable event; the
+             ;; stall deadline is in seconds, so per-chunk resolution buys
+             ;; nothing.
              (when wrote
-               (setf (connection-write-progress-at conn) (get-universal-time)))
+               (setf (connection-write-progress-at conn) (monotonic-seconds)))
              result))
       (loop
         (let* ((pos (connection-write-pos conn))

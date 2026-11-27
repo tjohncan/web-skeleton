@@ -264,6 +264,161 @@
               (format t "    in:  ~s~%    out: ~s~%" v back))))))
     bad))
 
+(defparameter *json-damage-alphabet*
+  (concatenate 'string
+               "{}[]\",:\\/ -+.0123456789eEutfnrlasbxAF"
+               (list #\Tab #\Newline (code-char 0) (code-char 31)
+                     (code-char #xE9) (code-char #xFEFF) (code-char #x1F600)))
+  "What a damaged document has put into it: the characters JSON's grammar
+   turns on, the letters of its literals and escapes, digits, and a few
+   from outside ASCII and below U+0020.")
+
+(defparameter *json-damage-fragments*
+  '("\\uD800" "\\uDC00" "\\uD83D\\uDE00" "\\uD83Dx" "\\u12" "\\u00zz" "\\q"
+    "1e9999" "-1e9999" "1e" "1." "-" "01" "0.5" "[[" "]]" "{\"a\":1,\"a\":2}"
+    "\"a\":" "\"\\" "\"" "tru" "nul" "fals" ",," "::")
+  "Pieces put into a damaged document whole, for the complaints a single
+   character seldom reaches: a surrogate with and without its pair, an
+   escape cut short, a number past a double, a key twice.")
+
+(defun gen-damaged-json ()
+  "A serialized JSON value with a few edits made to it: a character or a
+   fragment put in, a character dropped or replaced, or the text cut
+   short. One time in eight, characters of the alphabet alone.
+
+   Uniformly random text is refused at its first character, which
+   exercises one line of the parser. A document damaged in a place or two
+   gets as far as the damage, wherever that is: inside a string, an
+   escape, a number, between a key and its value."
+  (flet ((damage ()
+           (char *json-damage-alphabet* (random (length *json-damage-alphabet*))))
+         (fragment ()
+           (nth (random (length *json-damage-fragments*))
+                *json-damage-fragments*)))
+    (if (zerop (random 8))
+        (let ((s (make-string (random 24))))
+          (dotimes (i (length s) s)
+            (setf (char s i) (damage))))
+        (let ((text (web-skeleton:json-serialize (gen-json-value))))
+          (dotimes (edit (random 4) text)
+            (declare (ignorable edit))
+            (let ((at (random (1+ (length text)))))
+              (setf text
+                    (ecase (random 4)
+                      (0 (concatenate 'string (subseq text 0 at)
+                                      (if (zerop (random 2))
+                                          (string (damage))
+                                          (fragment))
+                                      (subseq text at)))
+                      (1 (if (< at (length text))
+                             (concatenate 'string (subseq text 0 at)
+                                          (subseq text (1+ at)))
+                             text))
+                      (2 (if (< at (length text))
+                             (let ((copy (copy-seq text)))
+                               (setf (char copy at) (damage))
+                               copy)
+                             text))
+                      (3 (subseq text 0 at))))))))))
+
+(defun prop-json-parser-total (seed)
+  "JSON-PARSE of a string either returns a value or signals
+   JSON-PARSE-ERROR. Any other condition escaping is a bug: a caller
+   catches that one by name to answer a malformed body, and takes
+   anything else for a fault of its own."
+  (let ((bad nil))
+    (dotimes (i *fuzz-iterations*)
+      (declare (ignorable i))
+      (let ((text (gen-damaged-json)))
+        (handler-case (web-skeleton:json-parse text)
+          (web-skeleton:json-parse-error () nil)
+          (serious-condition (e)
+            (unless bad
+              (setf bad (type-of e))
+              (fuzz-report nil seed text)
+              (format t "    condition: ~a~%" e))))))
+    bad))
+
+(defparameter *json-damage-bytes*
+  #(#x80 #xBF #xC0 #xC3 #xE2 #xED #xA0 #xEF #xBB #xF0 #x9F #xF4 #x90 #xFE #xFF
+    0 34 92)
+  "What damaged bytes have put into them as often as a byte at random:
+   continuations, the leads of two, three and four bytes, the bytes that
+   open an overlong form, a surrogate and a code point past U+10FFFF, the
+   two no UTF-8 holds, and a NUL, a quote and a backslash.")
+
+(defun gen-damaged-json-bytes ()
+  "A damaged document's UTF-8 with a few edits made to the bytes: one put
+   in, dropped or replaced, or the bytes cut short. One time in eight,
+   bytes at random and nothing else.
+
+   A damaged document is still text, and its encoding is always UTF-8.
+   Bytes stop being UTF-8 by what happens to them afterwards: a lead left
+   without its continuation, a continuation without its lead, a character
+   cut in two where the bytes end."
+  (flet ((damage ()
+           (if (zerop (random 2))
+               (aref *json-damage-bytes* (random (length *json-damage-bytes*)))
+               (random 256)))
+         (joined (&rest pieces)
+           (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) pieces)))
+    (if (zerop (random 8))
+        (gen-bytes (random 24))
+        (let ((bytes (sb-ext:string-to-octets (gen-damaged-json)
+                                              :external-format :utf-8)))
+          (dotimes (edit (random 3) bytes)
+            (declare (ignorable edit))
+            (let ((at (random (1+ (length bytes)))))
+              (setf bytes
+                    (ecase (random 4)
+                      (0 (joined (subseq bytes 0 at) (list (damage))
+                                 (subseq bytes at)))
+                      (1 (if (< at (length bytes))
+                             (joined (subseq bytes 0 at) (subseq bytes (1+ at)))
+                             bytes))
+                      (2 (if (< at (length bytes))
+                             (let ((copy (copy-seq bytes)))
+                               (setf (aref copy at) (damage))
+                               copy)
+                             bytes))
+                      (3 (subseq bytes 0 at))))))))))
+
+(defun prop-json-parse-bytes-total (seed)
+  "JSON-PARSE-BYTES of any bytes either returns a value or signals
+   JSON-PARSE-ERROR, as JSON-PARSE does of any string and for the same
+   caller, who catches that one by name. Bytes that are UTF-8 are read as
+   their text is, to the same value or the same refusal, and bytes that
+   are not are refused."
+  (let ((bad nil))
+    (flet ((outcome (thunk)
+             ;; (:VALUE v), (:REFUSED message), or (:RAISED type) for any
+             ;; condition that is not the parser's own.
+             (handler-case (list :value (funcall thunk))
+               (web-skeleton:json-parse-error (e)
+                 (list :refused (web-skeleton:json-parse-error-message e)))
+               (serious-condition (e) (list :raised (type-of e))))))
+      (dotimes (i *fuzz-iterations*)
+        (declare (ignorable i))
+        (let* ((bytes (gen-damaged-json-bytes))
+               (text (handler-case
+                         (sb-ext:octets-to-string bytes :external-format :utf-8)
+                       (error () nil)))
+               (expected (if text
+                             (outcome (lambda ()
+                                        (web-skeleton:json-parse text)))
+                             (list :refused "the bytes are not UTF-8")))
+               (got (outcome (lambda ()
+                               (web-skeleton:json-parse-bytes bytes)))))
+          (unless (or bad
+                      (and (eq (first got) (first expected))
+                           (if (eq (first got) :value)
+                               (json-equal (second got) (second expected))
+                               (equal (second got) (second expected)))))
+            (setf bad (if (eq (first got) :raised) (second got) :mismatch))
+            (fuzz-report nil seed bytes)
+            (format t "    expected: ~s~%    got:      ~s~%" expected got)))))
+    bad))
+
 (defun prop-chunked-parity (seed)
   "DECODE-CHUNKED-BODY and STREAM-CHUNKED-LINES agree on every framing.
    The codebase repeatedly names parser disagreement as a smuggling
@@ -1508,6 +1663,9 @@
   (setf *tests-passed* 0 *tests-failed* 0 *failed-names* nil)
   (dolist (spec (list (cons "request parser is total" #'prop-request-parser-total)
                       (cons "json round-trips" #'prop-json-roundtrip)
+                      (cons "json parser is total" #'prop-json-parser-total)
+                      (cons "json parser is total on bytes"
+                            #'prop-json-parse-bytes-total)
                       (cons "chunked decoders agree" #'prop-chunked-parity)
                       (cons "chunked encoder round-trips"
                             #'prop-chunked-encoder-roundtrip)

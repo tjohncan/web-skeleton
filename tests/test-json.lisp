@@ -111,8 +111,11 @@
   (format t "~%JSON Parser Errors~%")
 
   (flet ((signals-error-p (thunk)
+           ;; T for the parser's own condition, which a caller catches by
+           ;; name; any other answers its type, and fails the check.
            (handler-case (progn (funcall thunk) nil)
-             (error () t))))
+             (json-parse-error () t)
+             (error (e) (type-of e)))))
     ;; JSON's digits are ASCII. DIGIT-CHAR-P is true of every Unicode
     ;; digit, so dispatching on it sent U+0663 to the number reader, which
     ;; refused it as a number missing its digit.
@@ -307,7 +310,8 @@
   (check "BOM-only input still errors cleanly"
          (handler-case
              (progn (json-parse (string (code-char #xFEFF))) nil)
-           (error () t))
+           (json-parse-error () t)
+           (error (e) (type-of e)))
          t)
 
   ;; *JSON-MAX-STRING-LENGTH* caps the JSON-PARSE-STRING accumulator
@@ -327,9 +331,76 @@
                       (progn (json-parse
                               (concatenate 'string "\"" over-cap "\""))
                              nil)
-                    (error () t))
+                    (json-parse-error () t)
+                    (error (e) (type-of e)))
                   t))
       (setf web-skeleton:*json-max-string-length* saved))))
+
+(defun test-json-parsed-strings-are-simple-and-exact ()
+  "Every string JSON-PARSE returns, key or value, is a simple string of
+   characters with room for its own and no more, whether or not it had
+   an escape in it, and whatever kind of string it was parsed out of.
+
+   A string is read into an accumulator only from its first escape on,
+   and the accumulator is adjustable with room to spare. Handed back as
+   it stands, each string of a parsed document would hold that room for
+   as long as the document was kept, 64 characters at the least for a
+   key of one, and no declared or checked SIMPLE-STRING would take it.
+
+   The two ways a string is read agree as well: what stands before an
+   escape is copied whole, and *JSON-MAX-STRING-LENGTH* is met at the
+   same character on either side of one."
+  (format t "~%JSON: parsed strings are simple strings of their own size~%")
+  (flet ((shape (s)
+           (list (typep s '(simple-array character (*)))
+                 (length s) (array-total-size s))))
+    ;; A base string in is a character string out, as any other is.
+    (check "exact: a string parsed out of a base string"
+           (shape (json-parse (coerce "\"plain\"" 'simple-base-string)))
+           '(t 5 5))
+    (let ((alist (json-object-alist
+                  (json-parse "{\"key\":\"value\",\"k\\u00e9y\":\"v\\nalue\"}"))))
+      (check "exact: a key with no escape" (shape (car (first alist))) '(t 3 3))
+      (check "exact: its value, with none" (shape (cdr (first alist))) '(t 5 5))
+      (check "exact: a key with an escape" (shape (car (second alist))) '(t 3 3))
+      (check "exact: its value, with one" (shape (cdr (second alist))) '(t 6 6)))
+    (check "exact: the empty string" (shape (json-parse "\"\"")) '(t 0 0))
+    (let* ((plain (make-string 200 :initial-element #\a))
+           (parsed (json-parse (concatenate 'string "\"" plain "\\n" plain "\""))))
+      (check "exact: 200 characters, an escape and 200 more, all there in order"
+             (equal parsed (concatenate 'string plain (string #\Newline) plain))
+             t)
+      (check "exact: and a string of just that length" (shape parsed) '(t 401 401)))
+    (let ((parsed (json-parse (with-output-to-string (s)
+                                (write-char #\" s)
+                                (dotimes (i 100) (write-string "\\n" s))
+                                (write-string "\\uD83D\\uDE00" s)
+                                (write-char #\" s)))))
+      (check "exact: a hundred escapes and a surrogate pair, each one character"
+             (list (count #\Newline parsed) (char-code (char parsed 100)))
+             (list 100 #x1F600))
+      (check "exact: in a string of a hundred and one" (shape parsed) '(t 101 101))))
+  (let ((web-skeleton:*json-max-string-length* 32))
+    (flet ((accepted-p (before after)
+             ;; Whether a string of BEFORE plain characters, an escape and
+             ;; AFTER more parses, as its length or NIL.
+             (handler-case
+                 (length (json-parse
+                          (concatenate 'string "\""
+                                       (make-string before :initial-element #\a)
+                                       "\\n"
+                                       (make-string after :initial-element #\a)
+                                       "\"")))
+               (json-parse-error () nil)
+               (error (e) (type-of e)))))
+      (check "cap: 31 characters and an escape make the 32 allowed"
+             (accepted-p 31 0) 32)
+      (check "cap: 32 and an escape are one too many"
+             (accepted-p 32 0) nil)
+      (check "cap: an escape and 31 characters make the 32 allowed"
+             (accepted-p 0 31) 32)
+      (check "cap: an escape and 32 are one too many"
+             (accepted-p 0 32) nil))))
 
 (defun test-json-first-repeated-key ()
   "FIRST-REPEATED-KEY, which JSON-PARSE and multipart's parameters find a
@@ -377,6 +448,129 @@
       (check "repeat: as a reader in order finds it, on 500 random key lists"
              disagreements 0))))
 
+(defun test-json-parse-error-is-a-condition-of-its-own ()
+  "What JSON-PARSE refuses, it refuses with JSON-PARSE-ERROR: a condition a
+   caller can name, so that a catch around a parse takes a malformed
+   document and leaves the caller's own faults to surface.
+
+   It is an ERROR, so a catch of ERROR written against a plain one still
+   takes it, and it prints as the plain one did. The parser's bounds
+   signal it as its grammar does. The serializer's refusals do not: what
+   it is handed is the caller's own data, and a fault there is the
+   caller's."
+  (format t "~%JSON: the parser's own condition~%")
+  (flet ((raised (thunk)
+           (handler-case (progn (funcall thunk) nil)
+             (error (e) e))))
+    (let ((e (raised (lambda () (json-parse "{\"a\" 1}")))))
+      (check "condition: a malformed document signals JSON-PARSE-ERROR"
+             (typep e 'json-parse-error) t)
+      (check "condition: which is an ERROR, as a catch of one expects"
+             (typep e 'error) t)
+      (check "condition: its message says what and where"
+             (and (typep e 'json-parse-error) (json-parse-error-message e))
+             "expected ':' at 5")
+      (check "condition: and it prints under the parser's name"
+             (princ-to-string e) "json: expected ':' at 5"))
+    (check "condition: nesting past *JSON-MAX-DEPTH* signals it"
+           (typep (raised (lambda ()
+                            (json-parse (make-string 300 :initial-element #\[))))
+                  'json-parse-error)
+           t)
+    (check "condition: a number past what a double holds signals it"
+           (typep (raised (lambda () (json-parse "1e9999"))) 'json-parse-error)
+           t)
+    (let ((e (raised (lambda () (json-serialize '(1 . 2))))))
+      (check "condition: the serializer's refusal is an error, and not this one"
+             (list (typep e 'error) (typep e 'json-parse-error))
+             '(t nil)))
+    (check "condition: a caller's own fault passes a catch of it by name"
+           ;; The document is well formed, and LENGTH of its number is not.
+           (handler-case
+               (handler-case (length (json-get (json-parse "{\"n\":1}") "n"))
+                 (json-parse-error () :taken-for-a-malformed-document))
+             (type-error () :left-to-surface))
+           :left-to-surface)
+    (dolist (name '("JSON-PARSE-ERROR" "JSON-PARSE-ERROR-MESSAGE"))
+      (check (format nil "condition: ~a is exported" name)
+             (nth-value 1 (find-symbol name :web-skeleton))
+             :external))))
+
+(defun test-json-parse-bytes-reads-utf-8-and-refuses-the-rest ()
+  "JSON-PARSE-BYTES reads a document from its bytes as JSON-PARSE reads it
+   from its text, and refuses with JSON-PARSE-ERROR both bytes that are
+   not UTF-8 and UTF-8 that is not JSON: one catch by name answers a
+   malformed body, whichever it was.
+
+   A request that carried no body has NIL for one, and NIL is refused as
+   no bytes are, which is as the empty string is. A string is not bytes:
+   that is the caller's mistake, and a TYPE-ERROR."
+  (format t "~%JSON: a document from its bytes~%")
+  (labels ((octets (&rest bytes)
+             (coerce bytes '(simple-array (unsigned-byte 8) (*))))
+           (utf-8 (text)
+             (sb-ext:string-to-octets text :external-format :utf-8))
+           (refusal (bytes)
+             ;; The message BYTES are refused with. Any other condition
+             ;; answers its type, and bytes that parse answer :PARSED.
+             (handler-case (progn (json-parse-bytes bytes) :parsed)
+               (json-parse-error (e) (json-parse-error-message e))
+               (error (e) (type-of e)))))
+    (let ((doc (format nil "{\"name\":\"caf~c\",\"face\":\"~c\",~
+                            \"n\":[1,2.5,true,null]}"
+                       (code-char #xE9) (code-char #x1F600))))
+      (check "bytes: a document reads as its text does"
+             (json-serialize (json-parse-bytes (utf-8 doc)))
+             (json-serialize (json-parse doc))))
+    (check "bytes: two bytes of one character are one character"
+           (map 'list #'char-code (json-parse-bytes (octets 34 #xC3 #xA9 34)))
+           '(#xE9))
+    (check "bytes: a byte order mark before the document is skipped"
+           (json-object-alist
+            (json-parse-bytes (concatenate '(simple-array (unsigned-byte 8) (*))
+                                           (octets #xEF #xBB #xBF)
+                                           (utf-8 "{\"x\":1}"))))
+           '(("x" . 1)))
+    ;; Most sit inside a JSON string's quotes, where the parser would take
+    ;; any character: what refuses them is the decoding.
+    (dolist (case '(("a byte that begins nothing" (34 #xFF 34))
+                    ("a continuation with no lead" (34 #x80 34))
+                    ("a Latin-1 e-acute" (34 #xE9 34))
+                    ("an overlong form" (34 #xC0 #x80 34))
+                    ("an encoded surrogate" (34 #xED #xA0 #x80 34))
+                    ("a code point past U+10FFFF" (34 #xF4 #x90 #x80 #x80 34))
+                    ("a character cut short at the end" (34 #xC3))
+                    ("UTF-16 under its mark" (#xFF #xFE #x7B 0 #x7D 0))))
+      (destructuring-bind (name bytes) case
+        (check (format nil "bytes: ~a is not UTF-8" name)
+               (refusal (apply #'octets bytes))
+               "the bytes are not UTF-8")))
+    (check "bytes: UTF-8 that is not JSON is refused in the parser's words"
+           (refusal (utf-8 "{\"a\" 1}"))
+           "expected ':' at 5")
+    ;; Every byte of it is UTF-8, a NUL after each character, and JSON has
+    ;; no place for a NUL.
+    (check "bytes: UTF-16 with no mark decodes, and is not JSON"
+           (refusal (octets #x7B 0 #x7D 0))
+           "expected string key at 1")
+    (let ((of-the-empty-string (handler-case (progn (json-parse "") :parsed)
+                                 (json-parse-error (e)
+                                   (json-parse-error-message e)))))
+      (check "bytes: the empty string is refused"
+             of-the-empty-string "unexpected end of input")
+      (check "bytes: no bytes are refused as the empty string is"
+             (refusal (octets)) of-the-empty-string)
+      (check "bytes: NIL, the body of a request without one, likewise"
+             (refusal nil) of-the-empty-string))
+    (check "bytes: a string is not bytes, and the caller's TYPE-ERROR"
+           (handler-case (progn (json-parse-bytes "{}") :parsed)
+             (json-parse-error () :taken-for-a-malformed-document)
+             (type-error () :type-error))
+           :type-error)
+    (check "bytes: JSON-PARSE-BYTES is exported"
+           (nth-value 1 (find-symbol "JSON-PARSE-BYTES" :web-skeleton))
+           :external)))
+
 (defun test-json ()
   (setf *tests-passed* 0
         *tests-failed* 0
@@ -384,7 +578,10 @@
   (format t "~%=== JSON Tests ===~%")
   (test-json-parse)
   (test-json-parse-errors)
+  (test-json-parse-error-is-a-condition-of-its-own)
+  (test-json-parse-bytes-reads-utf-8-and-refuses-the-rest)
   (test-json-serialize)
+  (test-json-parsed-strings-are-simple-and-exact)
   (test-json-first-repeated-key)
   (report-suite "JSON")
   (zerop *tests-failed*))

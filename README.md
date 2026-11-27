@@ -123,6 +123,7 @@ run-tests.lisp             Entry point — load test suite and run
 run-pure-lisp-tests.lisp   Entry point — verify pure-Lisp crypto paths
 src/
   package.lisp     Package (namespace) declaration
+  clock.lisp       The monotonic clock intervals and deadlines are measured on
   log.lisp         Logging (DEBUG/INFO/WARN/ERROR, UTC timestamps)
   counters.lisp    Per-worker counts only the framework sees: accepts, responses, frames
   epoll.lisp       Linux epoll + fcntl + read/write FFI bindings
@@ -139,6 +140,7 @@ src/
     sha256.lisp      SHA-256 digest (FIPS 180-4)
     hmac.lisp        HMAC-SHA256 (RFC 2104)
     base64.lisp      Base64 encoder/decoder + URL-safe variant (RFC 4648)
+    siphash.lisp     SipHash-2-4, the keyed hash a store files its keys under
     ecdsa.lisp       ECDSA P-256 signature verification (FIPS 186-4)
   server/
     connection.lisp    Connection state machine, read/write buffers
@@ -164,7 +166,7 @@ tests/
   run.lisp               Test utilities and combined runner
   harness.lisp           Ephemeral-port live server and request/frame builders
   ecdsa-corpus.lisp      P-256 verify cases with OpenSSL's verdicts, for the ECDSA tests
-  test-algorithms.lisp   SHA-1, SHA-256, Base64, ECDSA, HMAC, hex test vectors
+  test-algorithms.lisp   SHA-1, SHA-256, Base64, SipHash, ECDSA, HMAC, hex test vectors
   test-json.lisp         JSON parser and serializer tests
   test-server.lisp       HTTP, URL, query, routing, JWT tests
   test-connections.lisp  Request bodies, a connection's life, the runtime
@@ -178,7 +180,12 @@ tests/
 
 - **Handler abstraction** — `start-server` accepts `:handler` and `:ws-handler`
   functions. The framework handles sockets, HTTP, and WebSocket protocol;
-  the application provides routing and message handling
+  the application provides routing and message handling. A handler that
+  raises costs its request a 500, or its WebSocket the connection, and a
+  log line: the first of a condition type at once, then at most one a
+  minute per worker with a count, so a client that can make a handler raise
+  cannot fill the log with it. `*throttle-handler-errors*` set to `nil`
+  logs every one
 - **Worker thread pool** — one event loop per CPU core, each with its own
   listener socket (`SO_REUSEPORT`), epoll fd, and connection table.
   Kernel distributes accepts across workers. Zero shared state in the hot path
@@ -226,13 +233,21 @@ tests/
 - **Connection lifecycle** — idle timeout for HTTP (slowloris protection),
   server-initiated ping/pong for dead WebSocket detection,
   configurable idle timeout for inactive WebSocket connections
+- **A clock that is never set** — every timeout and deadline is measured on
+  a monotonic clock, so setting the system's clock (NTP after a boot, a
+  hypervisor resyncing its guest, a date set by hand) fires none of them
+  early and holds none back. `monotonic-seconds` reads the same clock for
+  an application's own intervals, a session's idle time or a rate limit's
+  window, and `get-universal-time` is left for what is a date
 - **TCP listener** — binds a socket (IPv4 or IPv6), accepts connections, clean shutdown
 - **HTTP request parser** — method, path, query string, headers, body;
   validates against configurable size limits. A rejection carries the
   status that describes it — 413 over a size cap, 414 for the request
   line, 431 for headers, 501 for an unimplemented method or transfer
   coding, 505 for a version that isn't 1.0 or 1.1 — rather than answering
-  everything with 400
+  everything with 400. Empty lines (CRLF) before a request line are
+  skipped, as RFC 9112 §2.2 asks, up to `*max-request-line-length*` bytes
+  of them
 - **HTTP response builder** — status codes, headers, body serialization.
   Bodies are strings or raw bytes: `make-bytes-response` emits a byte vector
   verbatim, for content a string cannot carry (a generated image, a zip, a
@@ -324,7 +339,12 @@ tests/
   `[["a",1],["b",2]]` as `{"a":[1],"b":[2]}`: well-formed and silently wrong.
   To emit an object from data you built yourself, wrap it:
   `(json-serialize (make-json-object '(("a" . 1))))`.
-  Handles all escape sequences including `\uXXXX` and surrogate pairs
+  Handles all escape sequences including `\uXXXX` and surrogate pairs.
+  `json-parse` reads a document from a string and `json-parse-bytes` from
+  bytes, a request's body, decoded as UTF-8.
+  What is not JSON, or not UTF-8, is refused with `json-parse-error`, a
+  condition of its own, so a handler can answer a malformed body 400 by
+  name and leave its own faults to be 500s
 - **SHA-1** & **SHA-256** — complete implementations per FIPS 180-4
 - **HMAC-SHA256** — RFC 2104 keyed-hash message authentication
 - **Base64** — encoder/decoder, standard and URL-safe alphabets (RFC 4648).
@@ -406,6 +426,8 @@ tests/
   is held in memory twice and a full GET still takes the zero-work path
 - **Concurrent keyed store** — `make-store` returns a thread-safe
   hash-table-backed store for app state (sessions, caches, rate-limit counters).
+  Keys are hashed with SipHash-2-4 under a secret of the process's own, so a
+  store keyed by what a client sends cannot be made to pile its keys into one bucket.
   Optional background reaper sweeps entries on an app-supplied predicate
   and registers its stop via the cleanup hook machinery — no app-side teardown needed;
   `stop-store-reaper` retires one early
@@ -442,7 +464,7 @@ tests/
   libssl-backed implementations via `setf symbol-function`;
   the pure-Lisp versions remain reachable internally and `hmac-sha256` benefits
   transparently because it calls `sha256` through the function cell
-- **Graceful shutdown** — on Ctrl-C or SIGTERM, stops accepting,
+- **Graceful shutdown** — on Ctrl-C or SIGTERM, closes its listeners,
   sends WebSocket close frames, flushes in-progress writes,
   force-closes after drain timeout
 - **Shutdown cleanup hooks** — apps register zero-argument functions via
@@ -454,8 +476,9 @@ tests/
   JSON round-trip tests, HTTP parser tests, JWT validation tests.
   Alongside those, generated-input properties over fixed seeds: the request
   parser signals only `http-parse-error` and never leaks another condition
-  type, JSON and base64 round-trip, base64 accepts only the canonical
-  spelling of the bytes it yields, and byte ranges stay inside the resource.
+  type, the JSON parser only `json-parse-error`, of text and of bytes,
+  JSON and base64 round-trip, base64 accepts only the canonical spelling
+  of the bytes it yields, and byte ranges stay inside the resource.
   Plus parity assertions between paths that must agree — the buffered and
   streaming chunked decoders on the same framing, the same generated
   chunked corpus driven through the request path so the inbound and
@@ -650,6 +673,17 @@ read about here.
   length to forward, so its upload reaches such an upstream a piece at a
   time, each piece a request of its own (DEPLOYMENT.md, "Forms and file
   uploads").
+- **A fetch never reuses a connection.** `http-fetch`, `fetch-into` and
+  `http-fetch-stream` each open a connection for their one request and
+  close it when the response has ended. The request goes out with
+  `Connection: close`, and the connection is closed whatever the
+  upstream answered, so a `keep-alive` passed in `:headers` changes the
+  header and nothing else. Over `https://` that is a full TLS handshake
+  for every fetch as well, with no session to resume. An application
+  that calls an upstream for every request it serves, an auth check or
+  a gateway route, pays for both each time, as latency and as the
+  worker's CPU. `*dns-cache-ttl*` removes the name lookup and nothing
+  more (DEPLOYMENT.md, "One connection a fetch").
 - **`https://` to an IP-literal host is refused.** Certificate hostname
   verification uses `SSL_set1_host`, which does not match IP SANs — that
   needs `X509_VERIFY_PARAM_set1_ip_asc`, which is not wired up. Refusing
@@ -707,7 +741,8 @@ All configurable via `setf` before calling `start-server`.
 |--------------------------------|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `*log-level*`                  | `:info`   | Minimum log level (`:debug`, `:info`, `:warn`, `:error`)                                                                                                                                                                                           |
 | `*log-stream*`                 | `nil`     | Stream for log output (`nil` uses `*standard-output*`)                                                                                                                                                                                             |
-| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes). Validated when the server starts                                                                                                                                                                                    |
+| `*throttle-handler-errors*`    | `t`       | An error that escapes a handler is logged through the throttle: the first of a condition type at once, then at most one a minute per worker with a count. `nil` logs every one, which suits development                                            |
+| `*max-request-line-length*`    | `8192`    | Max HTTP request line (bytes), and the most bytes of empty lines skipped before one. Validated when the server starts                                                                                                                              |
 | `*max-header-count*`           | `100`     | Max number of headers per request. Validated when the server starts                                                                                                                                                                                |
 | `*max-header-line-length*`     | `8192`    | Max single header line (bytes). Validated when the server starts                                                                                                                                                                                   |
 | `*max-total-header-bytes*`     | `65536`   | Max cumulative header bytes per request, default 64 KiB. The per-line and per-count caps alone permit 800 KiB of header-string allocation per request; this is the running total that makes the real bound the stated one. Over it answers 431. Validated when the server starts |
@@ -730,7 +765,7 @@ All configurable via `setf` before calling `start-server`.
 | `*stream-keepalive-interval*`  | `30`      | Seconds of quiet before a streaming connection is sent its keepalive bytes (`0` disables). The bytes come from the `make-stream-response` call, because there is nothing generic to send: a chunked stream's only zero-content emission is the empty chunk, and that is the terminator. An SSE comment line is the usual choice. Validated when the server starts |
 | `*idle-timeout*`               | `10`      | Seconds before an idle HTTP connection is closed. It bounds a connection that *might* still finish; one that cannot does not wait for it — a request still short of its framing when the peer's FIN arrives can never be completed, and is closed on the spot rather than holding a slot for ten seconds with nobody on the other end. It is also the whole budget for one request to arrive, body included — partial reads do not extend it, which is what stops a client dripping a request — so an upload slower than that is cut off: accept the body from a body handler, which then times it by `*body-stall-timeout*` instead, or have the proxy buffer bodies (see DEPLOYMENT.md). Validated when the server starts |
 | `*body-stall-timeout*`         | `30`      | Seconds the body of a request a body handler accepted may go without a byte arriving before the connection is closed. Measured from the last bytes of it, not from the request's start, so an upload is bounded by its stalls and not by its size. The head is still `*idle-timeout*`'s, and so is a body no body handler accepted. Must be positive; validated when the server starts, since it is the only time bound on an accepted body. A client sending a byte per interval is never closed by it — the proxy is where a client that slow belongs |
-| `*linger-timeout*`             | `2`       | Seconds a connection closed after an early error response (a 413 for a body over the cap, a 431, any refusal of a request still arriving) keeps reading and discarding what its client is still sending, so the response is followed by a FIN. Closed at once, Linux sends a reset instead, which discards response bytes not yet sent and reads as a failure to a peer that treats resets as one. `0` closes at once. Validated when the server starts |
+| `*linger-timeout*`             | `2`       | Seconds a connection closed after an early error response (a 413 for a body over the cap, a 431, any refusal of a request still arriving), or a WebSocket closed after its close frame, keeps reading and discarding what its client is still sending, so the response or the close frame is followed by a FIN. Closed at once, Linux sends a reset instead, which discards bytes not yet sent and reads as a failure to a peer that treats resets as one: a WebSocket client whose send fails that way can miss the close code. A WebSocket whose client has closed its end is gone at once; one whose client has not holds its slot until this runs out. Nothing lingers at shutdown: the drain closes each connection once what it was owed has gone out, a WebSocket's `1001` included. `0` closes at once. Validated when the server starts |
 | `*ws-idle-timeout*`            | `86400`   | Seconds before an inactive WebSocket is closed. `0` disables. Validated when the server starts                                                                                                                                                     |
 | `*ws-message-timeout*`         | `30`      | Seconds a WebSocket message may take to arrive, from its first byte to its last. A fragmented message short of its final fragment, or a frame not all here, is closed 1008 once it passes. Not moved by fragments, so it bounds how long an unfinished message holds its buffer, which `*ws-idle-timeout*` does not. `0` disables. Validated when the server starts |
 | `*ws-ping-interval*`           | `30`      | Seconds between server-initiated WebSocket pings. Must be positive; validated when the server starts                                                                                                                                               |
@@ -748,7 +783,7 @@ All configurable via `setf` before calling `start-server`.
 | `*worker-wake-interval*`       | `1`       | Seconds a worker's event loop may sleep before waking to do periodic work, and the interval between shutdown-signal checks in the main thread. The floor under everything periodic: a worker with no I/O is asleep in the kernel, so nothing riding the event loop can happen more often than this. Lowering it is the only way to make periodic work prompt, and the cost is one syscall return per worker per interval. Converted to ms for `epoll_wait`, with a 10ms floor. Lowering it does not speed up maintenance, which is gated separately at 1 Hz; raising it past a second slows maintenance for an idle worker, which checks that gate only when it wakes. Must be positive; validated when the server starts |
 
 The `host`, `port`, `workers`, `handler`, `ws-handler`, `body-handler`,
-`on-listen`, and `on-tick` are passed as keyword arguments:
+`on-listen`, `on-tick`, and `share-port` are passed as keyword arguments:
 
 ```lisp
 (start-server :host #(127 0 0 1)  ; localhost only (default)
@@ -770,12 +805,33 @@ caller need not know which kind it asked for.
 ```
 
 Resolve the port this way rather than binding port 0 yourself, reading the
-number, closing, and passing it in. Every listener sets `SO_REUSEPORT`, so
-a second process handed that number in the gap between your close and the
-server's bind does not fail its bind — both hold the port and the kernel
+number, closing, and passing it in. The port is free between your close
+and the server's bind, and anything may take it. Another web-skeleton
+server handed that number refuses this start, or is refused by it, by the
+claim below; but another program that sets `SO_REUSEPORT`, run by the
+same user, binds it all the same — both hold the port and the kernel
 splits traffic between them, with nothing in either log. `start-server`
 hands its own bound socket to worker 0, so the port is never free between
 being chosen and being served.
+
+It binds that first socket for a port given by number too, before it
+starts a worker. A port that cannot be bound, because another program
+holds it, or it is a privileged one, or the host has no such address, is
+an error from `start-server` that names the address. That refusal and
+the claim's below both come before `start-server` has changed anything,
+so a server already running in the image is left as it was.
+
+A second server on a port is refused as well, though its bind would not
+fail. `start-server` claims the port number and looks at the port before
+it binds, and signals an error when a socket listens where this one would
+bind: a second process started by mistake, or a second call in one image,
+whether or not it holds the claim. A claim held where nothing listens
+refuses nothing: the start says so at WARN, and takes the claim once it
+is free. `:share-port t` starts beside the holder instead, which is how a new
+process takes over from the one it replaces with no gap. With `:port 0`
+nothing is refused, and a claimed number is passed over. DEPLOYMENT.md,
+"One server to a port", has what the claim is, how to see who holds it,
+and what it does not cover.
 
 `:host` accepts a 4-byte IPv4 vector or a 16-byte IPv6 vector
 and dispatches the listener family accordingly.
@@ -785,7 +841,9 @@ On Linux's default (`net.ipv6.bindv6only = 0`) the IPv6 wildcard serves
 IPv4 peers too, as v4-mapped addresses logged as `0:0:0:0:0:ffff:a.b.c.d`,
 so it is the one listener a dual-stack host needs.
 IPv6 loopback is `:host #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)`.
-The number of workers defaults to the number of CPU cores.
+The number of workers defaults to the CPUs the process can use: the
+host's cores, or fewer under a container's or a systemd unit's CPU limit
+(DEPLOYMENT.md, "CPUs and workers").
 Without a handler, the server returns 501 for all requests.
 
 ## Async HTTP fetch

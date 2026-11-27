@@ -156,6 +156,92 @@
           web-skeleton-demo::*fanned* nil
           web-skeleton-demo::*last-tick* nil)))
 
+;;; ---------------------------------------------------------------------------
+;;; One demo to an image. START-DEMO sets up the bulletin and the counters
+;;; before it starts the server, so a second one is refused before it has
+;;; reset the first's. Asked with :WORKERS 0, which START-SERVER refuses, so
+;;; that a START-DEMO that got past its own refusal still returns.
+;;; ---------------------------------------------------------------------------
+
+(format t "~%A second START-DEMO in an image that is serving one~%")
+(let ((bulletin (web-skeleton:make-store :test #'eql)))
+  (setf web-skeleton-demo::*bulletin* bulletin)
+  (unwind-protect
+       (let ((web-skeleton-demo::*serving* t))
+         (owed (handler-case (progn (web-skeleton-demo::start-demo :workers 0)
+                                    :started)
+                 (error (e) (and (search "already serving in this image"
+                                         (princ-to-string e))
+                                 :refused)))
+               :refused "it is refused, by name")
+         (owed (eq web-skeleton-demo::*bulletin* bulletin) t
+               "and the bulletin is still the one the first is using"))
+    (setf web-skeleton-demo::*bulletin* nil)))
+
+;;; ---------------------------------------------------------------------------
+;;; What the demo counts in seconds: each worker's last pass, for /healthz,
+;;; and a connection's post budget. Both read MONOTONIC-SECONDS, which is held
+;;; here and moved by hand, so a second has passed when a check says it has.
+;;; ---------------------------------------------------------------------------
+
+(defvar *held-clock* (web-skeleton:monotonic-seconds)
+  "What MONOTONIC-SECONDS answers while the checks below hold it.")
+
+(sb-int:encapsulate 'web-skeleton:monotonic-seconds 'held
+                    (lambda (real) (declare (ignore real)) *held-clock*))
+
+(format t "~%/healthz, from each worker's last pass~%")
+(flet ((healthz ()
+         (let ((response (web-skeleton-demo::handle-healthz nil)))
+           (list (web-skeleton:http-response-status response)
+                 (string-right-trim '(#\Newline)
+                                    (web-skeleton:http-response-body response))))))
+  (setf web-skeleton-demo::*fanned* (make-array 2 :initial-element 0)
+        web-skeleton-demo::*last-tick* (make-array 2 :initial-element 0))
+  (unwind-protect
+       (progn
+         (web-skeleton-demo::bulletin-tick 0)
+         (owed (healthz) '(503 "wedged worker: 1")
+               "a worker that has never passed its loop is wedged")
+         (web-skeleton-demo::bulletin-tick 1)
+         (owed (healthz) '(200 "ok: 2 workers passing their loops")
+               "both having passed, ok")
+         (incf *held-clock* web-skeleton-demo::*healthz-stale-after*)
+         (web-skeleton-demo::bulletin-tick 0)
+         (owed (healthz) '(200 "ok: 2 workers passing their loops")
+               "one of them last passing five seconds ago is still ok")
+         (incf *held-clock*)
+         (web-skeleton-demo::bulletin-tick 0)
+         (owed (healthz) '(503 "wedged worker: 1")
+               "six seconds ago is wedged"))
+    (setf web-skeleton-demo::*fanned* nil
+          web-skeleton-demo::*last-tick* nil)))
+
+(format t "~%A connection's post budget~%")
+(let ((web-skeleton:*worker-id* 0)
+      (conn (list :a-connection))
+      (burst web-skeleton-demo::*post-burst*))
+  (setf web-skeleton-demo::*post-budgets*
+        (vector (make-hash-table :test 'eq :weakness :key)))
+  (unwind-protect
+       (flet ((post ()
+                (multiple-value-list (web-skeleton-demo::%post-allowed-p conn))))
+         (owed (loop repeat burst collect (post))
+               (make-list burst :initial-element '(t nil))
+               "the burst is allowed back to back")
+         (owed (post) '(nil t) "the next is refused, and its sender told")
+         (owed (post) '(nil nil) "the one after is refused with nothing more said")
+         (incf *held-clock*)
+         (owed (list (post) (post)) '((t nil) (nil t))
+               "a second on, one post has been earned back, and one only")
+         (incf *held-clock* 3600)
+         (owed (loop repeat (1+ burst) collect (first (post)))
+               (append (make-list burst :initial-element t) '(nil))
+               "an hour on, the burst and no more"))
+    (setf web-skeleton-demo::*post-budgets* nil)))
+
+(sb-int:unencapsulate 'web-skeleton:monotonic-seconds 'held)
+
 (when *wrong*
   (error "the demo answered ~d check~:p wrongly: ~{~a~^; ~}"
          (length *wrong*) (reverse *wrong*)))

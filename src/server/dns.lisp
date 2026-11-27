@@ -56,6 +56,27 @@
   "Return the integer file descriptor of PROCESS's stdout stream."
   (sb-sys:fd-stream-fd (sb-ext:process-output process)))
 
+(defun spawn-getent (host)
+  "Start `getent ahosts -- HOST` with its output on a pipe, and return the
+   process without waiting for it, as SB-EXT:RUN-PROGRAM does.
+
+   The one place a lookup's child is started, for the parked path and the
+   blocking one alike, so what is asked of getent is said once.
+
+   The pipe carries getent's standard error along with its output, which
+   is what RUN-PROGRAM gives a child unless told otherwise. A complaint
+   on it is not an address line, and PARSE-GETENT-OUTPUT passes over it;
+   and the pipe ends when getent holds neither, which is when it exits.
+
+   The -- ends getent's option parsing, so a hostname that begins with
+   '-' cannot be read as a flag. Numeric literals never get this far,
+   PARSE-IPV4-LITERAL and PARSE-IPV6-LITERAL taking them first, so it is a
+   habit of care more than a hole closed."
+  (sb-ext:run-program "getent" (list "ahosts" "--" host)
+                      :output :stream
+                      :wait nil
+                      :search t))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Parsing getent ahosts output
 ;;;
@@ -248,7 +269,7 @@
     (let ((entry (gethash host *dns-cache*)))
       (when entry
         (cond
-          ((>= (get-universal-time) (dns-cache-entry-expires-at entry))
+          ((>= (monotonic-seconds) (dns-cache-entry-expires-at entry))
            (remhash host *dns-cache*)
            nil)
           ((not (fetch-address-allowed-p (dns-cache-entry-ip entry)
@@ -277,7 +298,7 @@
    would stretch an outage well past its cause."
   (when (and *dns-cache* (> *dns-cache-ttl* 0))
     (when (>= (hash-table-count *dns-cache*) *dns-cache-max-entries*)
-      (let ((now (get-universal-time))
+      (let ((now (monotonic-seconds))
             (dead nil))
         (maphash (lambda (k v)
                    (when (>= now (dns-cache-entry-expires-at v))
@@ -290,7 +311,7 @@
           (clrhash *dns-cache*))))
     (setf (gethash host *dns-cache*)
           (make-dns-cache-entry ip family
-                                (+ (get-universal-time) *dns-cache-ttl*)
+                                (+ (monotonic-seconds) *dns-cache-ttl*)
                                 fallbacks))
     (log-debug "dns: cached ~a -> ~a for ~ds"
                host (format-ip ip) *dns-cache-ttl*)))
@@ -324,15 +345,7 @@
                                         host port path
                                         cached-ip cached-family
                                         :fallbacks cached-fallbacks))))
-  ;; -- terminates getent's option parsing so a hostname that begins
-  ;; with '-' cannot be misread as a flag. Numeric IP literals never
-  ;; reach this path (parse-ipv4-literal / parse-ipv6-literal catch
-  ;; them earlier) so this is strictly a habit-of-care hardening.
-  (let ((process (sb-ext:run-program "getent"
-                                      (list "ahosts" "--" host)
-                                      :output :stream
-                                      :wait nil
-                                      :search t)))
+  (let ((process (spawn-getent host)))
     (unless process
       (error "dns: failed to spawn getent for ~a" host))
     (let ((dns-conn nil)
@@ -378,8 +391,8 @@
                     ;; :AWAITING sweep over the whole exchange and a
                     ;; detached one has nothing at all, so what matters
                     ;; here is that it is bounded.
-                    :fetch-started-at (get-universal-time)
-                    :fetch-deadline (+ (get-universal-time) *fetch-timeout*)
+                    :fetch-started-at (monotonic-seconds)
+                    :fetch-deadline (+ (monotonic-seconds) *fetch-timeout*)
                     :fetch-continuation fetch-req
                     ;; Carried so HANDLE-DNS-READY can name the host when
                     ;; it runs the getent output past the address filter.
@@ -389,7 +402,7 @@
                                  conn epoll-fd fetch-req
                                  host port path ip family
                                  :fallbacks fallbacks))
-                    :last-active (get-universal-time)))
+                    :last-active (monotonic-seconds)))
              (set-nonblocking out-fd)
              (register-connection dns-conn)
              (epoll-add epoll-fd out-fd (logior +epollin+ +epollet+))
@@ -574,10 +587,52 @@
 ;;; should still share the same resolver so semantics match: /etc/hosts,
 ;;; NSS, Docker's embedded DNS, mDNS — whatever the system knows, both
 ;;; blocking and async fetches inherit automatically. RESOLVE-HOST-BLOCKING
-;;; spawns the same `getent ahosts` subprocess and drains its output
-;;; synchronously via SB-EXT:PROCESS-WAIT. Numeric literals short-circuit
-;;; the subprocess via the same parser as the async path.
+;;; spawns the same `getent ahosts` subprocess and reads its output to
+;;; the end, waiting on the pipe with poll(2) where the async path waits
+;;; on it with epoll. Numeric literals short-circuit the subprocess via
+;;; the same parser as the async path.
 ;;; ---------------------------------------------------------------------------
+
+(defun read-getent-output (process buffer)
+  "Read PROCESS's output into BUFFER until it ends. Returns how many
+   bytes that was, or NIL when the output had not ended by the time
+   BUFFER was full or *FETCH-TIMEOUT* had passed.
+
+   Read as it arrives, with poll(2) to wait on the pipe in between, so
+   the wait ends when the output does. Waiting for the child to exit
+   first, and reading afterwards, has two costs. The exit can only be
+   asked about at intervals, and each lookup then takes an interval
+   longer than getent did. And a pipe holds only so much unread, 64 KiB
+   by default: a child with more than that to say would block writing
+   it, never exit, and be waited on for the whole timeout.
+
+   NIL once BUFFER is full, the end not yet seen, as the parked path's
+   read buffer answers :FULL: whether the end comes next cannot be known
+   without room to read into."
+  (let ((fd (%process-output-fd process))
+        (end 0)
+        (deadline (+ (get-internal-real-time)
+                     (round (* *fetch-timeout*
+                               internal-time-units-per-second)))))
+    (set-nonblocking fd)
+    (loop
+      (when (= end (length buffer))
+        (return nil))
+      (let ((n (nb-read fd buffer end (- (length buffer) end))))
+        (case n
+          (:eof (return end))
+          ;; POLL-READABLE answers NIL for a signal as for a timeout, and
+          ;; the exit of a getent child raises one, SIGCHLD. So what is
+          ;; left of the deadline is worked out again each time round, as
+          ;; BLOCKING-CONNECT does, and a wait cut short only reads again.
+          (:again
+           (let ((remaining-ms
+                   (round (* 1000 (- deadline (get-internal-real-time)))
+                          internal-time-units-per-second)))
+             (when (<= remaining-ms 0)
+               (return nil))
+             (poll-readable fd remaining-ms)))
+          (t (incf end n)))))))
 
 (defun resolve-host-blocking (host)
   "Synchronously resolve HOST via `getent ahosts`.
@@ -589,13 +644,19 @@
    fetch setup paths so there is a single DNS primitive across the
    framework.
 
-   Bounded by *FETCH-TIMEOUT* via a deadline poll: the subprocess is
-   spawned with :WAIT NIL, the caller sleeps in short slices until
-   process exit or deadline, and we SIGKILL the child on expiry. A
-   libc resolver hang (unresponsive nameserver, slow NSS module, hung
-   mDNS responder) cannot pin the worker thread indefinitely, so
-   *FETCH-TIMEOUT* does cover each of DNS, connect, and I/O on the
-   blocking path."
+   The answer is getent's output up to its end, as on the async path,
+   read by READ-GETENT-OUTPUT as it arrives: a lookup takes as long as
+   getent does. Bounded by *FETCH-TIMEOUT* and +GETENT-OUTPUT-LIMIT+.
+   Output that has not ended within both is no answer, and the child is
+   sent SIGKILL. A libc resolver hang (unresponsive nameserver, slow NSS
+   module, hung mDNS responder) cannot pin the worker thread
+   indefinitely, so *FETCH-TIMEOUT* does cover each of DNS, connect, and
+   I/O on the blocking path.
+
+   getent's exit status is not asked for, here or on the async path.
+   Given one name, it prints an address line only when the name
+   resolved, so the output says everything the status would, and a
+   lookup need not wait for the exit to have it."
   ;; Literal fast paths are gated on *FETCH-ADDRESS-FILTER* for the same
   ;; reason INITIATE-HTTP-FETCH's are: they skip DNS, so a resolver-only
   ;; check would let https://169.254.169.254/ straight through. A refused
@@ -622,48 +683,26 @@
       (return-from resolve-host-blocking
         (values cached-ip cached-family cached-fallbacks))))
   (handler-case
-      (let ((process (sb-ext:run-program "getent"
-                                          (list "ahosts" "--" host)
-                                          :output :stream
-                                          :wait nil
-                                          :search t)))
+      (let ((process (spawn-getent host)))
         (unless process
           (return-from resolve-host-blocking nil))
         (unwind-protect
-             (let ((deadline (+ (get-internal-real-time)
-                                (* *fetch-timeout*
-                                   internal-time-units-per-second))))
-               ;; Wait for exit, sliced so shutdown stays responsive.
-               (loop until (or (not (sb-ext:process-alive-p process))
-                               (>= (get-internal-real-time) deadline))
-                     do (sleep 0.05))
-               (cond
-                 ;; Timed out — kill the child and report no result.
-                 ((sb-ext:process-alive-p process)
-                  (ignore-errors (sb-ext:process-kill process 9))
-                  (ignore-errors (sb-ext:process-wait process))
-                  nil)
-                 ;; Exited non-zero — unresolved.
-                 ((not (zerop (sb-ext:process-exit-code process)))
-                  nil)
-                 ;; Exited clean — drain stdout and parse.
-                 (t
-                  (let* ((stream (sb-ext:process-output process))
-                         (buf (make-array 1024
-                                          :element-type '(unsigned-byte 8)
-                                          :fill-pointer 0 :adjustable t)))
-                    (loop for byte = (read-byte stream nil nil)
-                          while byte
-                          do (when (>= (fill-pointer buf) 8192)
-                               (error "dns: getent output exceeds 8KB"))
-                             (vector-push-extend byte buf))
-                    (multiple-value-bind (parsed refused all)
-                        (parse-getent-output buf (length buf) host)
-                      (declare (ignore refused))
-                      (when parsed
-                        (dns-cache-store host (car parsed) (cdr parsed) (rest all))
-                        (values (car parsed) (cdr parsed) (rest all))))))))
-          (ignore-errors (sb-ext:process-close process))))
+             (let* ((buf (make-array +getent-output-limit+
+                                     :element-type '(unsigned-byte 8)))
+                    (end (read-getent-output process buf)))
+               (when end
+                 (multiple-value-bind (parsed refused all)
+                     (parse-getent-output buf end host)
+                   (declare (ignore refused))
+                   (when parsed
+                     (dns-cache-store host (car parsed) (cdr parsed) (rest all))
+                     (values (car parsed) (cdr parsed) (rest all))))))
+          ;; The lookup is over, with an answer or without one, and the
+          ;; child may not have exited: its output ends a moment before it
+          ;; does, and one given up on is still running. RELEASE-DNS-PROCESS
+          ;; ends it and closes it only once it is dead, as it does for the
+          ;; async path's child.
+          (release-dns-process process)))
     (error () nil)))
 
 ;;; ---------------------------------------------------------------------------

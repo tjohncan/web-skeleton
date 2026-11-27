@@ -765,7 +765,7 @@
                          :external-format :ascii))
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
@@ -846,7 +846,7 @@
                                  (make-text-response 200 "ok")))))
                   (total (+ (* 512 1024) (* (1+ rounds) window) 100))
                   (conn (web-skeleton::make-connection
-                         :fd -1 :last-active (get-universal-time)
+                         :fd -1 :last-active (web-skeleton::monotonic-seconds)
                          :read-fn (lambda (buffer start max-bytes)
                                     (let ((n (min max-bytes (- (fill-pointer kernel) taken))))
                                       (if (zerop n)
@@ -1368,7 +1368,7 @@
             (web-skeleton::*connections* (make-hash-table :test #'eql))
             (web-skeleton::*epoll-fd* 999)
             (,conn (web-skeleton::make-connection
-                    :fd ,fd :last-active (get-universal-time)
+                    :fd ,fd :last-active (web-skeleton::monotonic-seconds)
                     :read-fn (lambda (buffer start max-bytes)
                                (let ((n (min max-bytes (- (fill-pointer ,kernel) ,taken))))
                                  (if (zerop n)
@@ -1973,7 +1973,7 @@
            (let ((epfd (web-skeleton::epoll-create))
                  (in-fd (web-skeleton::epoll-create))
                  (out-fd (web-skeleton::epoll-create))
-                 (now (get-universal-time)))
+                 (now (web-skeleton::monotonic-seconds)))
              (unwind-protect
                   (let* ((web-skeleton::*connections* (make-hash-table :test #'eql))
                          (web-skeleton:*log-stream* (make-broadcast-stream))
@@ -2077,7 +2077,7 @@
                           (web-skeleton::*epoll-fd* epfd)
                           (web-skeleton:*log-stream* (make-broadcast-stream)))
                       (multiple-value-bind (result made)
-                          (funcall fn epfd (get-universal-time))
+                          (funcall fn epfd (web-skeleton::monotonic-seconds))
                         (setf conns made)
                         result))
                  (dolist (conn conns)
@@ -2689,11 +2689,11 @@
                           :outbound-p t
                           :fetch-sink :detached
                           :fetch-paused t
-                          :fetch-paused-at (- (get-universal-time) 5)
-                          :fetch-started-at (- (get-universal-time) 10)
-                          :fetch-deadline (+ (get-universal-time) 20)
+                          :fetch-paused-at (- (web-skeleton::monotonic-seconds) 5)
+                          :fetch-started-at (- (web-skeleton::monotonic-seconds) 10)
+                          :fetch-deadline (+ (web-skeleton::monotonic-seconds) 20)
                           :inbound-fd tgt-fd
-                          :last-active (get-universal-time)))
+                          :last-active (web-skeleton::monotonic-seconds)))
                     ;; The target: a streaming connection with the
                     ;; back-link the pause left on it.
                     (tgt (web-skeleton::make-connection
@@ -2701,7 +2701,7 @@
                           :stream-framing (when (eq target-state :streaming)
                                             :chunked)
                           :paused-outbound-fd out-fd
-                          :last-active (get-universal-time))))
+                          :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking out-fd)
                (web-skeleton::set-nonblocking tgt-fd)
                (web-skeleton::register-connection out)
@@ -2833,7 +2833,7 @@
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :streaming
                          :stream-framing :chunked
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (when back-up
                ;; A send buffer as small as the kernel will give.
@@ -3005,12 +3005,12 @@
                               :fd ffd :socket fserver :state :streaming
                               :stream-framing :chunked
                               :stream-on-close on-close
-                              :last-active (get-universal-time)))
+                              :last-active (web-skeleton::monotonic-seconds)))
                     (owned (web-skeleton::make-connection
                             :fd ofd :socket oserver :state :streaming
                             :stream-framing :chunked
                             :stream-on-close on-close
-                            :last-active (get-universal-time))))
+                            :last-active (web-skeleton::monotonic-seconds))))
                (web-skeleton::set-nonblocking ffd)
                (web-skeleton::set-nonblocking ofd)
                ;; On neither the table nor the epoll set.
@@ -3088,7 +3088,7 @@
                   (target (web-skeleton::make-connection
                            :fd tgt-fd :socket server :state :websocket
                            :fetch-outstanding t
-                           :last-active (get-universal-time)))
+                           :last-active (web-skeleton::monotonic-seconds)))
                   (frame (web-skeleton::build-ws-frame
                           web-skeleton::+ws-op-binary+
                           (make-array (* 512 1024)
@@ -3167,7 +3167,7 @@
                   (web-skeleton::*epoll-fd* epfd)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (stream (sb-bsd-sockets:socket-make-stream
                            client :input t :output t
                            :element-type '(unsigned-byte 8)))
@@ -3273,10 +3273,10 @@
                     (web-skeleton::*epoll-fd* epfd)
                     (conn-a (web-skeleton::make-connection
                              :fd a-fd :socket a-server :state :websocket
-                             :last-active (get-universal-time)))
+                             :last-active (web-skeleton::monotonic-seconds)))
                     (conn-b (web-skeleton::make-connection
                              :fd b-fd :socket b-server :state :websocket
-                             :last-active (get-universal-time)))
+                             :last-active (web-skeleton::monotonic-seconds)))
                     (big (web-skeleton::build-ws-frame
                           web-skeleton::+ws-op-binary+
                           (make-array (* 512 1024)
@@ -3799,8 +3799,8 @@
    next client to arrive. The set-up is made to fail here by an epoll fd
    that is not one, which EPOLL-ADD refuses; two clients are queued, and
    the backlog is empty afterwards, with nothing left in the table. The
-   failure is logged once for the two, throttled as a failed accept is,
-   since one that fails for a connection is likely to fail for each."
+   failure is logged once for the two, throttled, since one that fails for
+   a connection is likely to fail for each."
   (format t "~%accept: on past a connection it could not set up~%")
   (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
          (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
@@ -3827,11 +3827,317 @@
            (check "set-up failing: logged once for the two"
                   (let ((text (get-output-stream-string log)))
                     (loop with start = 0
-                          for at = (search "accept failed" text :start2 start)
+                          for at = (search "could not be set up" text
+                                           :start2 start)
                           while at count t do (setf start (1+ at))))
                   1))
       (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
       (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+(defun test-set-up-failures-and-failed-accepts-are-throttled-apart ()
+  "A connection that could not be set up and an accept that failed are
+   logged under a throttle kind each: neither holds the other's line back,
+   and each line counts its own.
+
+   The two have different causes, and a failed accept is the one an
+   operator has to hear about: the process is out of descriptors or
+   memory. Under a shared kind, the first set-up failure would keep that
+   line out of the log for a minute, and the count on whichever line came
+   next would be of both.
+
+   The set-up fails as in the test above, by an epoll fd that is not one;
+   the accept fails on a listener that is closed. Two set-up failures and
+   three failed accepts, then a minute on as far as the throttle can
+   tell, and one more of each. Each kind logs its first at once, and a
+   minute on its count is logged ahead of its next line: one held back
+   for the set-up, two for the accept."
+  (format t "~%accept: set-up failures and failed accepts are throttled apart~%")
+  (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+         (port (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+         (closed (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp))
+         (clients nil)
+         (log (make-string-output-stream))
+         (web-skeleton::*connections* (make-hash-table :test #'eql))
+         (web-skeleton:*log-stream* log)
+         (web-skeleton::*log-throttle* (make-hash-table :test #'eq)))
+    (sb-bsd-sockets:socket-close closed)
+    (flet ((queue-a-client ()
+             (let ((c (make-instance 'sb-bsd-sockets:inet-socket
+                                     :type :stream :protocol :tcp)))
+               (push c clients)
+               (sb-bsd-sockets:socket-connect c #(127 0 0 1) port)))
+           (lines-saying (what text)
+             (loop with start = 0
+                   for at = (search what text :start2 start)
+                   while at
+                   collect (subseq text at (position #\Newline text :start at))
+                   do (setf start (1+ at))))
+           (held-back (kind text)
+             ;; The count in each line that gives KIND's, as
+             ;; "accept-failed: 2 more lines held back in the last ...".
+             (let ((label (format nil "] ~a: " kind)))
+               (loop with start = 0
+                     for at = (search label text :start2 start)
+                     while at
+                     collect (parse-integer text :start (+ at (length label))
+                                                 :junk-allowed t)
+                     do (setf start (1+ at))))))
+      (unwind-protect
+           (progn
+             (queue-a-client)
+             (queue-a-client)
+             (check "throttled apart: two set-ups fail, and the backlog drains"
+                    (web-skeleton::accept-pending listener -1) nil)
+             (check "throttled apart: the closed listener's accept fails"
+                    (web-skeleton::accept-pending closed -1) t)
+             (web-skeleton::accept-pending closed -1)
+             (web-skeleton::accept-pending closed -1)
+             (let ((text (get-output-stream-string log)))
+               (check "throttled apart: the set-up failure is logged once"
+                      (length (lines-saying "could not be set up" text)) 1)
+               (check "throttled apart: and the failed accept behind it, at once"
+                      (length (lines-saying "socket-accept failed" text)) 1))
+             ;; A minute on, as far as the throttle can tell.
+             (loop for entry being the hash-values of web-skeleton::*log-throttle*
+                   do (decf (car entry) 61))
+             (queue-a-client)
+             (web-skeleton::accept-pending listener -1)
+             (web-skeleton::accept-pending closed -1)
+             (let ((text (get-output-stream-string log)))
+               (check "throttled apart: a minute on, the set-up's count is one"
+                      (held-back "accept-setup-failed" text) '(1))
+               (check "throttled apart: and the accept's is two"
+                      (held-back "accept-failed" text) '(2))
+               (check "throttled apart: each kind's next line logs behind it"
+                      (list (length (lines-saying "could not be set up" text))
+                            (length (lines-saying "socket-accept failed" text)))
+                      '(1 1))))
+        (dolist (c clients) (ignore-errors (sb-bsd-sockets:socket-close c)))
+        (ignore-errors (sb-bsd-sockets:socket-close listener))))))
+
+(defun test-handler-errors-are-throttled-by-condition-type ()
+  "LOG-HANDLER-ERROR, which logs what escapes a handler, holds each
+   condition type to the throttle's pace on its own: a flood of one error
+   logs its first and counts the rest, and the first of another type
+   still logs at once. A request handler's and a WebSocket handler's are
+   kinds apart. *THROTTLE-HANDLER-ERRORS* set to NIL logs every one.
+
+   A minute on, the flooded type's count is logged under its name, and a
+   type that held nothing back has none: its second line, a minute after
+   its first, comes with nothing ahead of it.
+
+   Driven directly, under a table as a worker binds one. What a running
+   server logs for a handler that raises is
+   TEST-HARNESS-A-HANDLER-THAT-RAISES-LOGS-A-LINE-NOT-A-FLOOD-E2E's to
+   show."
+  (format t "~%handler errors: throttled by condition type~%")
+  (let ((log (make-string-output-stream))
+        (plain (make-condition 'simple-error
+                               :format-control "the ~a failed"
+                               :format-arguments '("lookup")))
+        (typed (make-condition 'simple-type-error
+                               :format-control "a ~a was expected"
+                               :format-arguments '("string")
+                               :datum 5 :expected-type 'string)))
+    (flet ((lines-saying (what text)
+             (loop with start = 0
+                   for at = (search what text :start2 start)
+                   while at
+                   collect (subseq text at (position #\Newline text :start at))
+                   do (setf start (1+ at))))
+           (request-error (condition fd)
+             (web-skeleton::log-handler-error
+              :handler-error condition "error fd ~d: ~a" fd condition)))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton:*throttle-handler-errors* t)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (fd 4) (request-error plain fd))
+        (request-error typed 9)
+        (web-skeleton::log-handler-error
+         :ws-handler-error plain "ws handler error fd ~d: ~a" 7 plain)
+        (let ((text (get-output-stream-string log)))
+          (check "by type: four of one error log its first, and no more"
+                 (lines-saying "[WARN] error fd" text)
+                 '("[WARN] error fd 0: the lookup failed"
+                   "[WARN] error fd 9: a string was expected"))
+          (check "by type: a WebSocket handler's are a kind apart, and log"
+                 (lines-saying "ws handler error fd" text)
+                 '("ws handler error fd 7: the lookup failed")))
+        ;; A minute on, as far as the throttle can tell.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (decf (car entry) 61))
+        (request-error plain 4)
+        (request-error typed 10)
+        (let ((text (get-output-stream-string log)))
+          (check "by type: a minute on, the flooded type's count is its three"
+                 (mapcar (lambda (line)
+                           (subseq line 0 (search " in the last" line)))
+                         (lines-saying "handler-error (" text))
+                 '("handler-error (simple-error): 3 more lines held back"))
+          (check "by type: the other, which held none back, has no count"
+                 (lines-saying "simple-type-error" text) nil)
+          (check "by type: and both log their next line in full"
+                 (lines-saying "[WARN] error fd" text)
+                 '("[WARN] error fd 4: the lookup failed"
+                   "[WARN] error fd 10: a string was expected")))
+        (setf web-skeleton:*throttle-handler-errors* nil)
+        (dotimes (fd 3) (request-error plain (+ 20 fd)))
+        (check "by type: with the setting off, every one logs"
+               (length (lines-saying "[WARN] error fd 2"
+                                     (get-output-stream-string log)))
+               3)))))
+
+(defun test-flush-log-throttle-logs-a-count-and-forgets-the-kind ()
+  "FLUSH-LOG-THROTTLE, which a worker calls once a second, ends the minute
+   of each kind whose line was logged a minute before: what the kind held
+   back is logged as a count under its name, at the level its lines log
+   at, and the kind is forgotten, so that its next line logs as a first.
+
+   That is what reports a burst that has ended. With the count left to
+   the kind's next line, five lines and then silence are one line in the
+   log for as long as the silence lasts.
+
+   A kind inside its minute is left alone. One that held nothing back is
+   forgotten with nothing said, and so is one whose lines are below
+   *LOG-LEVEL*. Outside a worker, with no table, there is nothing to do.
+
+   Driven directly, under a table as a worker binds one, with each kind's
+   time set by hand and the pass's handed in. That a running worker makes
+   the call is TEST-HARNESS-A-BURST-THAT-ENDS-HAS-ITS-COUNT-LOGGED-E2E's
+   to show."
+  (format t "~%log throttle: the worker's pass ends a kind's minute~%")
+  (let ((log (make-string-output-stream)))
+    (flet ((logged ()
+             ;; The lines logged since the last call, from the level on.
+             (let ((text (get-output-stream-string log)))
+               (loop with start = 0
+                     for end = (position #\Newline text :start start)
+                     while end
+                     collect (subseq text (position #\[ text :start start) end)
+                     do (setf start (1+ end))))))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton::*log-level* :info)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (i 5)
+          (web-skeleton::log-throttled :warn :burst "burst ~d" i))
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :error (list :raised 'type-error)
+                                       "raised ~d" i))
+        (dotimes (i 2)
+          (web-skeleton::log-throttled :warn :pair "pair ~d" i))
+        (web-skeleton::log-throttled :warn :once "once")
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :debug :unheard "unheard ~d" i))
+        (check "pass: each kind's first line is logged, and no other"
+               (logged)
+               '("[WARN] burst 0" "[ERROR] raised 0" "[WARN] pair 0"
+                 "[WARN] once"))
+        ;; Every kind's line logged at second 1000, as far as the table says.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 1000))
+        (web-skeleton::flush-log-throttle 1059)
+        (check "pass: inside the minute nothing is said, and nothing forgotten"
+               (list (logged) (hash-table-count web-skeleton::*log-throttle*))
+               '(nil 5))
+        (web-skeleton::flush-log-throttle 1060)
+        (check "pass: at the minute, each count under its kind's name and level"
+               (sort (logged) #'string<)
+               '("[ERROR] raised (type-error): 2 more lines held back in the last 60 seconds"
+                 "[WARN] burst: 4 more lines held back in the last 60 seconds"
+                 "[WARN] pair: 1 more line held back in the last 60 seconds"))
+        (check "pass: and every kind forgotten, those with nothing to say too"
+               (hash-table-count web-skeleton::*log-throttle*) 0)
+        (web-skeleton::log-throttled :warn :burst "burst ~d" 5)
+        (check "pass: the kind's next line logs as a first, nothing ahead of it"
+               (logged) '("[WARN] burst 5"))
+        (let ((web-skeleton::*log-throttle* nil))
+          (check "pass: outside a worker there is no table, and nothing to do"
+                 (list (web-skeleton::flush-log-throttle 2000) (logged))
+                 '(nil nil)))))))
+
+(defun test-flush-log-throttle-all-ends-every-kinds-minute ()
+  "FLUSH-LOG-THROTTLE with :ALL, which RUN-WORKER's cleanup calls as a
+   worker stops or crashes, ends every kind's minute however young: what
+   each kind held back is logged as a count over the seconds its minute
+   ran, and every kind is forgotten. The same kinds, inside their minute,
+   are left alone by the once-a-second pass.
+
+   Driven directly, under a table as a worker binds one. That a stopping
+   worker makes the call is
+   TEST-HARNESS-A-STOPPING-WORKER-LOGS-WHAT-IT-HELD-BACK-E2E's to show."
+  (format t "~%log throttle: a worker's last minute is counted as it goes~%")
+  (let ((log (make-string-output-stream)))
+    (flet ((logged ()
+             ;; The lines logged since the last call, from the level on.
+             (let ((text (get-output-stream-string log)))
+               (loop with start = 0
+                     for end = (position #\Newline text :start start)
+                     while end
+                     collect (subseq text (position #\[ text :start start) end)
+                     do (setf start (1+ end))))))
+      (let ((web-skeleton:*log-stream* log)
+            (web-skeleton::*log-level* :info)
+            (web-skeleton::*log-throttle* (make-hash-table :test #'equal)))
+        (dotimes (i 3)
+          (web-skeleton::log-throttled :warn :burst "burst ~d" i))
+        (web-skeleton::log-throttled :warn :once "once")
+        (logged)
+        ;; Both kinds' lines logged at second 1000, as far as the table says.
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 1000))
+        (web-skeleton::flush-log-throttle 1010)
+        (check "all: control, the pass leaves kinds inside their minute alone"
+               (list (logged) (hash-table-count web-skeleton::*log-throttle*))
+               '(nil 2))
+        (attempt (web-skeleton::flush-log-throttle 1010 :all t))
+        (check "all: with it, a count over the seconds its minute ran"
+               (logged)
+               '("[WARN] burst: 2 more lines held back in the last 10 seconds"))
+        (check "all: and every kind forgotten"
+               (hash-table-count web-skeleton::*log-throttle*)
+               0)
+        ;; A minute ended in the second it began, as a worker that stops
+        ;; just after a burst ends it.
+        (dotimes (i 2)
+          (web-skeleton::log-throttled :warn :quick "quick ~d" i))
+        (logged)
+        (loop for entry being the hash-values of web-skeleton::*log-throttle*
+              do (setf (car entry) 2000))
+        (web-skeleton::flush-log-throttle 2000 :all t)
+        (check "all: a minute ended in its first second is counted over one"
+               (logged)
+               '("[WARN] quick: 1 more line held back in the last 1 second"))))))
+
+(defun test-monotonic-seconds-reads-high-and-apart-from-the-date ()
+  "MONOTONIC-SECONDS, which every interval is measured on, reads whole
+   seconds, never backwards, from a start so high that a timestamp slot
+   left at 0 is long ago to any timeout; it is not read from the system's
+   clock; and an application can name it.
+
+   The system's clock is ruled out by wrapping GET-UNIVERSAL-TIME to
+   answer a day behind, as after the clock is set back: a reading taken
+   then is no earlier than one taken before. What a step does to a
+   running server is TEST-HARNESS-A-CLOCK-STEP-MOVES-NO-DEADLINE-E2E's
+   to show."
+  (format t "~%monotonic-seconds: high, forward, and apart from the date~%")
+  (let ((first (web-skeleton::monotonic-seconds)))
+    (check "monotonic: a whole number of seconds" (integerp first) t)
+    (check "monotonic: at or past its start, a billion seconds"
+           (>= first web-skeleton::+monotonic-seconds-start+ 1000000000) t)
+    (check "monotonic: so a slot left at 0 is older than a day-long timeout"
+           (> (- first 0) 86400) t)
+    (check "monotonic: a second reading is not before the first"
+           (>= (web-skeleton::monotonic-seconds) first) t)
+    (sb-int:encapsulate 'get-universal-time 'set-back
+                        (lambda (f) (- (funcall f) 86400)))
+    (unwind-protect
+         (check "monotonic: nor is one taken with the system's clock set back a day"
+                (>= (web-skeleton::monotonic-seconds) first) t)
+      (sb-int:unencapsulate 'get-universal-time 'set-back))
+    (check "monotonic: exported, for an application's own intervals"
+           (nth-value 1 (find-symbol "MONOTONIC-SECONDS" :web-skeleton))
+           :external)))
 
 (defun test-on-tick-runs-with-the-workers-bindings ()
   "ON-TICK runs on each worker's own thread with that worker's epoll fd
@@ -4948,13 +5254,17 @@
 
 (defun test-ws-close ()
   "WS-CLOSE ends a WebSocket from the server's side: a close frame with the
-   code asked for, then the connection goes. A peer at *MAX-WRITE-BACKLOG*
-   has no room for the frame and is closed at once. An application whose
-   own events outran a peer has this as its answer, the one DEPLOYMENT.md
-   gives, where before it could only drop frames and keep the socket.
+   code asked for, then a lingering close. The write side is shut down
+   behind the frame, and the connection is kept until its client finishes
+   or *LINGER-TIMEOUT* passes; with *LINGER-TIMEOUT* 0 it goes with the
+   frame. A peer at *MAX-WRITE-BACKLOG* has no room for the frame and is
+   closed at once. An application whose own events outran a peer has this
+   as its answer, the one DEPLOYMENT.md gives.
 
    Driven over a loopback pair, so the client reads the frame off a real
-   socket and the close is the event loop's own write path finishing."
+   socket and the close is the event loop's own write path finishing. What
+   the linger is for, a client still sending when the server closes, is
+   TEST-WS-SERVER-CLOSE-LINGERS-FOR-A-CLIENT-STILL-SENDING-E2E's to show."
   (format t "~%ws-close: closing a WebSocket from the server's side~%")
   (multiple-value-bind (server client) (%loopback-pair)
     (let ((epfd (web-skeleton::epoll-create)))
@@ -4964,7 +5274,7 @@
                   (web-skeleton::*epoll-fd* epfd)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::set-nonblocking fd)
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
@@ -4983,18 +5293,73 @@
                     (handler-case (progn (web-skeleton:ws-close conn) :closed)
                       (error () :refused))
                     :refused)
-             ;; The write path the arming hands it to: the frame goes out
-             ;; and the connection with it.
+             ;; The write path the arming hands it to: the frame goes out,
+             ;; the write side is shut down behind it, and the connection
+             ;; lingers for its client to finish.
              (web-skeleton::handle-client-write conn epfd)
-             (check "ws-close: once written, the connection is gone"
-                    (web-skeleton::lookup-connection fd) nil)
+             (check "ws-close: once written, the close lingers"
+                    (list (eq (web-skeleton::lookup-connection fd) conn)
+                          (web-skeleton::connection-state conn))
+                    (list t :lingering))
              (let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
                (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive client buf nil)
                  (declare (ignore b))
                  (check "ws-close: the client read a close frame with the code"
                         (list n (aref buf 0)
                               (logior (ash (aref buf 2) 8) (aref buf 3)))
-                        (list 4 #x88 1013)))))
+                        (list 4 #x88 1013)))
+               (check "ws-close: and behind it the end of the stream"
+                      (nth-value 1 (sb-bsd-sockets:socket-receive client buf nil))
+                      0))
+             ;; A client that never finishes is the sweep's to close, once
+             ;; *LINGER-TIMEOUT* has passed since the linger began.
+             (let ((began (web-skeleton::connection-last-active conn)))
+               (check "ws-close: the linger is over once *LINGER-TIMEOUT* has passed"
+                      (list (web-skeleton::inbound-overdue
+                             conn (+ began web-skeleton:*linger-timeout*))
+                            (web-skeleton::inbound-overdue
+                             conn (+ began web-skeleton:*linger-timeout* 1)))
+                      (list nil :idle)))
+             ;; And one that finishes ends it there, with its FIN.
+             (check "ws-close: at the client's FIN, the connection is gone"
+                    (and (eq (web-skeleton::lookup-connection fd) conn)
+                         (progn
+                           (sb-bsd-sockets:socket-close client)
+                           (%await-arrival fd :bytes 0 :fin t)
+                           (web-skeleton::handle-client-read conn epfd nil nil)
+                           (list (web-skeleton::lookup-connection fd)
+                                 (web-skeleton::connection-fd conn))))
+                    (list nil -1)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client)))))
+  ;; With no linger allowed, the frame goes out and the connection with it.
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create)))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*linger-timeout* 0)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (web-skeleton::monotonic-seconds))))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (web-skeleton:ws-close conn 1013)
+             (web-skeleton::handle-client-write conn epfd)
+             (check "ws-close with *linger-timeout* 0: once written, the connection is gone"
+                    (list (web-skeleton::lookup-connection fd)
+                          (web-skeleton::connection-fd conn))
+                    (list nil -1))
+             (let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
+               (check "ws-close with *linger-timeout* 0: its close frame sent first"
+                      (list (nth-value 1 (sb-bsd-sockets:socket-receive client buf nil))
+                            (aref buf 0)
+                            (logior (ash (aref buf 2) 8) (aref buf 3)))
+                      (list 4 #x88 1013))))
         (ignore-errors (web-skeleton::%close epfd))
         (ignore-errors (sb-bsd-sockets:socket-close server))
         (ignore-errors (sb-bsd-sockets:socket-close client)))))
@@ -5008,7 +5373,7 @@
                   (web-skeleton:*max-write-backlog* 64)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time))))
+                         :last-active (web-skeleton::monotonic-seconds))))
              (web-skeleton::register-connection conn)
              (web-skeleton::epoll-add epfd fd web-skeleton::+epollet+)
              (web-skeleton::connection-append-write
@@ -5037,7 +5402,7 @@
                   (web-skeleton:*log-stream* log)
                   (conn (web-skeleton::make-connection
                          :fd fd :socket server :state :websocket
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                   (frames (concatenate '(vector (unsigned-byte 8))
                                        (%ws-client-frame 1 "bye")
                                        (%ws-client-frame 1 "after"))))
@@ -5164,6 +5529,219 @@
                (multiple-value-list
                 (exchange (%ws-client-frame 1 "bye, with a reply")))
                '((8) 1000 0 :eof ("bye, with a reply")))))))
+
+(defun test-ws-server-close-lingers-for-a-client-still-sending-e2e ()
+  "A WebSocket the server closes while its client is still sending ends
+   with the close frame and then a FIN, and the client's sends go on
+   succeeding meanwhile: the server shuts down its write side behind the
+   frame and discards what arrives, as BEGIN-LINGERING-CLOSE does after an
+   early error response.
+
+   The client declares a binary frame of 1 MiB, past *MAX-WS-PAYLOAD-SIZE*,
+   which is refused at its header with 1009, and sends the payload all the
+   same, 64 KiB at a time, as a client that had begun the message would.
+   Closed at once instead, the connection is reset by the first of that
+   payload to arrive, the client's next send fails, and a client that
+   takes a failed send for the end of the connection never reads the code
+   that says why.
+
+   The connection is kept until the client finishes, and is gone when it
+   has. *LINGER-TIMEOUT* is 30 for the run, so that only the client's FIN
+   can be what ends the linger inside the wait: SETF rather than LET, as
+   the worker reads it. The :ON-TICK hook reads the worker's connection
+   table, which is bound on the worker."
+  (format t "~%WebSocket: the server's close lingers for a client still sending~%")
+  (let ((saved web-skeleton:*linger-timeout*)
+        (states :unseen))
+    (setf web-skeleton:*linger-timeout* 30)
+    (unwind-protect
+         (with-test-server
+             (:workers 1
+              :handler (lambda (req) (declare (ignore req)) :upgrade)
+              :ws-handler (lambda (conn frame) (declare (ignore conn frame)) nil)
+              ;; The states of the worker's connections, as of its last pass.
+              :on-tick (lambda (worker-id)
+                         (declare (ignore worker-id))
+                         (setf states
+                               (loop for conn being the hash-values
+                                       of web-skeleton::*connections*
+                                     collect (web-skeleton::connection-state
+                                              conn)))))
+           (flet ((within (seconds test)
+                    (loop repeat (ceiling seconds 0.02)
+                          thereis (funcall test)
+                          do (sleep 0.02))))
+             (let* ((sock (connect-to-test-server))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             sock :input t :output t
+                                  :element-type '(unsigned-byte 8)))
+                    (chunk (make-array 65536 :element-type '(unsigned-byte 8)
+                                             :initial-element 0))
+                    (sent 0))
+               (unwind-protect
+                    (progn
+                      (%ws-client-upgrade stream)
+                      ;; The header of a masked binary frame of 1 MiB: FIN
+                      ;; and the opcode, the mask bit with 127 for a 64-bit
+                      ;; length, the length, the mask.
+                      (write-sequence
+                       (coerce #(#x82 #xFF 0 0 0 0 0 #x10 0 0 55 11 202 99)
+                               '(simple-array (unsigned-byte 8) (*)))
+                       stream)
+                      (force-output stream)
+                      (check "ws close lingers: the frame is refused at its header, with 1009"
+                             (coerce (read-until-bounded
+                                      stream :seconds 3
+                                      :until (lambda (b fill)
+                                               (declare (ignore b))
+                                               (>= fill 4)))
+                                     'list)
+                             '(#x88 2 3 #xF1))
+                      ;; The payload the header promised, as a client that
+                      ;; has not read the refusal yet goes on to send it.
+                      (handler-case
+                          (dotimes (i 16)
+                            (write-sequence chunk stream)
+                            (force-output stream)
+                            (incf sent))
+                        (error () nil))
+                      (check "ws close lingers: every send of the payload succeeds"
+                             sent 16)
+                      (multiple-value-bind (more reason)
+                          (read-until-bounded stream :seconds 3)
+                        (check "ws close lingers: behind the close frame is the end of the stream, and no reset"
+                               (list (length more) reason) '(0 :eof)))
+                      (check "ws close lingers: the connection is kept while its client has not finished"
+                             (within 5 (lambda () (equal states '(:lingering))))
+                             t)
+                      (ignore-errors (close stream))
+                      (ignore-errors (sb-bsd-sockets:socket-close sock))
+                      (check "ws close lingers: and is gone once it has"
+                             (within 5 (lambda () (null states)))
+                             t))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+      (setf web-skeleton:*linger-timeout* saved))))
+
+(defun test-ws-backlog-full-is-logged-through-the-throttle ()
+  "A WebSocket closed because a reply met *MAX-WRITE-BACKLOG* is logged
+   through LOG-THROTTLED, under a kind of its own, as the lines for a bad
+   frame are. A client that sends and never reads its replies can have the
+   line once for each connection it opens, and every line holds *LOG-LOCK*
+   across a format and a flush.
+
+   Three connections over loopback pairs, each with its queue at the bound
+   and a message whose handler returns a reply: one line, and two counted.
+   Driven directly, under a table as a worker binds one."
+  (format t "~%ws: a reply refused at the backlog is logged through the throttle~%")
+  (let ((log (make-string-output-stream))
+        (closed 0))
+    (let ((web-skeleton:*log-stream* log)
+          (web-skeleton::*log-level* :info)
+          (web-skeleton::*log-throttle* (make-hash-table :test #'equal))
+          (web-skeleton:*max-write-backlog* 64))
+      (dotimes (i 3)
+        (multiple-value-bind (server client) (%loopback-pair)
+          (let ((epfd (web-skeleton::epoll-create)))
+            (unwind-protect
+                 (let* ((fd (web-skeleton::socket-fd server))
+                        (web-skeleton::*connections* (make-hash-table :test #'eql))
+                        (web-skeleton::*epoll-fd* epfd)
+                        (conn (web-skeleton::make-connection
+                               :fd fd :socket server :state :websocket
+                               :last-active (web-skeleton::monotonic-seconds)))
+                        (frame (%ws-client-frame 1 "hello")))
+                   (web-skeleton::set-nonblocking fd)
+                   (web-skeleton::register-connection conn)
+                   (web-skeleton::epoll-add epfd fd
+                                            (logior web-skeleton::+epollin+
+                                                    web-skeleton::+epollet+))
+                   (web-skeleton::connection-append-write
+                    conn (make-array 64 :element-type '(unsigned-byte 8)
+                                        :initial-element 65))
+                   (let ((out (sb-bsd-sockets:socket-make-stream
+                               client :output t
+                                      :element-type '(unsigned-byte 8))))
+                     (write-sequence frame out)
+                     (finish-output out))
+                   (%await-arrival fd :bytes (length frame))
+                   (web-skeleton::handle-client-read
+                    conn epfd nil
+                    (lambda (c f)
+                      (declare (ignore c f))
+                      (web-skeleton:build-ws-text "reply")))
+                   (when (minusp (web-skeleton::connection-fd conn))
+                     (incf closed)))
+              (ignore-errors (web-skeleton::%close epfd))
+              (ignore-errors (sb-bsd-sockets:socket-close server))
+              (ignore-errors (sb-bsd-sockets:socket-close client))))))
+      (let* ((text (get-output-stream-string log))
+             (lines (loop with start = 0
+                          for at = (search "ws backlog full" text :start2 start)
+                          while at
+                          count t
+                          do (setf start (1+ at))))
+             (entry (gethash :ws-backlog-full web-skeleton::*log-throttle*)))
+        (check "ws backlog: control, each of the three was closed for it"
+               closed 3)
+        (check "ws backlog: one line for the three, and the other two counted"
+               (list lines (and entry (second entry)))
+               '(1 2))))))
+
+(defun test-ws-largest-frame-fills-the-read-buffer-and-is-delivered ()
+  "A frame of exactly *MAX-WS-PAYLOAD-SIZE*, under the longest header a
+   client can send, fills the read buffer to its cap and is delivered.
+
+   The cap is the payload cap and that header, 14 bytes, so the largest
+   frame TRY-PARSE-WS-FRAME accepts is the most the buffer holds, and a
+   buffer that is full holds a whole frame. HANDLE-CLIENT-READ closes a
+   WebSocket whose buffer is full with no frame in it, as a backstop
+   against the two bounds parting: this is the frame that would reach it
+   first if they did."
+  (format t "~%ws: the largest frame fills the read buffer and is delivered~%")
+  (multiple-value-bind (server client) (%loopback-pair)
+    (let ((epfd (web-skeleton::epoll-create))
+          (payloads nil))
+      (unwind-protect
+           (let* ((fd (web-skeleton::socket-fd server))
+                  (web-skeleton::*connections* (make-hash-table :test #'eql))
+                  (web-skeleton::*epoll-fd* epfd)
+                  (web-skeleton:*max-ws-payload-size* 65536)
+                  (conn (web-skeleton::make-connection
+                         :fd fd :socket server :state :websocket
+                         :last-active (web-skeleton::monotonic-seconds)))
+                  ;; A binary frame of 65536 bytes: FIN and the opcode, the
+                  ;; mask bit with 127 for a 64-bit length, the length, a
+                  ;; mask of zeros, which leaves the payload as it is.
+                  (frame (make-array (+ 14 65536) :element-type '(unsigned-byte 8)
+                                                  :initial-element 7)))
+             (replace frame #(#x82 #xFF 0 0 0 0 0 1 0 0 0 0 0 0))
+             (web-skeleton::set-nonblocking fd)
+             (web-skeleton::register-connection conn)
+             (web-skeleton::epoll-add epfd fd (logior web-skeleton::+epollin+
+                                                      web-skeleton::+epollet+))
+             (let ((out (sb-bsd-sockets:socket-make-stream
+                         client :output t :element-type '(unsigned-byte 8))))
+               (write-sequence frame out)
+               (finish-output out))
+             (check "largest frame: control, the frame is as long as the read cap"
+                    (list (length frame) (web-skeleton::connection-read-cap conn))
+                    '(65550 65550))
+             (%await-arrival fd :bytes (length frame))
+             (web-skeleton::handle-client-read
+              conn epfd nil
+              (lambda (c f)
+                (declare (ignore c))
+                (push (length (web-skeleton::ws-frame-payload f)) payloads)
+                nil))
+             (check "largest frame: delivered whole, and the connection kept"
+                    (list payloads
+                          (web-skeleton::connection-state conn)
+                          (web-skeleton::connection-read-pos conn))
+                    '((65536) :websocket 0)))
+        (ignore-errors (web-skeleton::%close epfd))
+        (ignore-errors (sb-bsd-sockets:socket-close server))
+        (ignore-errors (sb-bsd-sockets:socket-close client))))))
 
 (defun test-ws-message-deadline-e2e ()
   "A peer that begins a fragmented message and never finishes it is closed
@@ -5975,6 +6553,124 @@
     (check "cpu-count: answers a positive integer"
            (and (integerp n) (plusp n)) t)))
 
+(defun test-cpu-count-reads-a-quota-where-the-process-is ()
+  "A CPU quota is read in the cgroup the process is in and in each one
+   above it, and the tightest of them is the answer.
+
+   A service systemd starts on a host is in a cgroup of its own, and a
+   CPUQuota= on the unit is that cgroup's cpu.max. The root of the
+   hierarchy has none there, so a quota read at the root alone is missed,
+   and the service starts a worker for every core of the host to share
+   what the quota leaves it. A container sees its own cgroup as the root,
+   which is the one place the root is the right place to read.
+
+   The reading is driven on a tree of files made for the test, laid out
+   as the kernel lays out a hierarchy. Whether this process is itself in
+   a cgroup with a quota is the host's, and CI's is not."
+  (format t "~%cpu-count: a quota is read where the process is~%")
+  ;; /proc/self/cgroup, a line a hierarchy.
+  (flet ((placed (&rest lines)
+           (multiple-value-list (web-skeleton::parse-proc-cgroup lines))))
+    (check "proc cgroup: a service on a v2 host"
+           (placed "0::/system.slice/web.service")
+           '("/system.slice/web.service" nil))
+    (check "proc cgroup: a container, which sees its own cgroup as the root"
+           (placed "0::/")
+           '("/" nil))
+    (check "proc cgroup: v1, the hierarchy with the cpu controller among its own"
+           (placed "12:pids:/docker/abc" "5:cpu,cpuacct:/docker/abc"
+                   "3:cpuset:/" "1:name=systemd:/docker/abc")
+           '(nil "/docker/abc"))
+    (check "proc cgroup: cpuacct and cpuset are not the cpu controller"
+           (placed "5:cpuacct:/a" "3:cpuset:/b" "2:cpuset,cpuacct:/c")
+           '(nil nil))
+    (check "proc cgroup: cpu named last, or alone"
+           (placed "5:cpuacct,cpu:/a")
+           '(nil "/a"))
+    (check "proc cgroup: a hybrid host has both"
+           (placed "4:cpu,cpuacct:/" "0::/user.slice/session-1.scope")
+           '("/user.slice/session-1.scope" "/"))
+    (check "proc cgroup: the path is the rest of the line, a colon in it too"
+           (placed "0::/system.slice/a:b.service")
+           '("/system.slice/a:b.service" nil))
+    (check "proc cgroup: nothing to read, or nothing in the shape, places it nowhere"
+           (list (placed) (placed "" "no colons here" "0:"))
+           '((nil nil) (nil nil))))
+  ;; The cgroups a limit can come from, the process's own first.
+  (check "ancestry: a cgroup, each one above it, and the root"
+         (web-skeleton::cgroup-ancestry "/system.slice/web.service")
+         '("system.slice/web.service/" "system.slice/" ""))
+  (check "ancestry: the root, and no path at all, are the root alone"
+         (list (web-skeleton::cgroup-ancestry "/")
+               (web-skeleton::cgroup-ancestry nil))
+         '(("") ("")))
+  (check "ancestry: a path that climbs out of what is mounted is the root alone"
+         (web-skeleton::cgroup-ancestry "/../../system.slice/web.service")
+         '(""))
+  ;; The reading, on a tree laid out as the kernel lays one out.
+  (let ((root (scratch-path "ws-cgroup" "/")))
+    (flet ((put (file line)
+             ;; By the system's spelling of the name, as it is read: one
+             ;; of these has a backslash in it.
+             (let ((path (sb-ext:parse-native-namestring
+                          (concatenate 'string root file))))
+               (ensure-directories-exist path)
+               (with-open-file (out path :direction :output
+                                         :if-exists :supersede)
+                 (write-line line out)))))
+      (unwind-protect
+           (progn
+             ;; v2: half a core on the unit, nothing above it limited.
+             (put "v2/system.slice/web.service/cpu.max" "50000 100000")
+             (put "v2/system.slice/cpu.max" "max 100000")
+             (check "v2: a unit's own quota is read, though the root has none"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/system.slice/web.service")
+                    1)
+             (check "v2: read at the root alone, as a container reads it, there is none"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/") "/")
+                    nil)
+             ;; A slice of two cores holding a unit allowed eight.
+             (put "v2/tight.slice/wide.service/cpu.max" "800000 100000")
+             (put "v2/tight.slice/cpu.max" "200000 100000")
+             (check "v2: a tighter limit above the process binds it"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/tight.slice/wide.service")
+                    2)
+             ;; A container whose /proc/self/cgroup names the host's path:
+             ;; nothing is mounted under that name, and the root is its own.
+             (put "v2b/cpu.max" "150000 100000")
+             (check "v2: a path with nothing mounted under it still reads the root"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2b/") "/docker/abc")
+                    2)
+             ;; systemd writes a dash in a unit's name as \x2d.
+             (put "v2/system.slice/system-a\\x2db.slice/cpu.max" "300000 100000")
+             (check "v2: a directory named as systemd escapes one is read by that name"
+                    (web-skeleton::cgroup-v2-workers
+                     (concatenate 'string root "v2/")
+                     "/system.slice/system-a\\x2db.slice")
+                    3)
+             ;; v1: the pair of files, in the cpu controller's hierarchy.
+             (put "v1/system.slice/web.service/cpu.cfs_quota_us" "50000")
+             (put "v1/system.slice/web.service/cpu.cfs_period_us" "100000")
+             (put "v1/system.slice/cpu.cfs_quota_us" "-1")
+             (put "v1/system.slice/cpu.cfs_period_us" "100000")
+             (check "v1: a unit's own quota is read the same way"
+                    (list (web-skeleton::cgroup-v1-workers
+                           (concatenate 'string root "v1/")
+                           "/system.slice/web.service")
+                          (web-skeleton::cgroup-v1-workers
+                           (concatenate 'string root "v1/") "/"))
+                    '(1 nil)))
+        (ignore-errors
+         (sb-ext:run-program "/bin/rm" (list "-rf" root) :wait t
+                                                         :output nil
+                                                         :error nil))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Runner
 ;;; ---------------------------------------------------------------------------
@@ -6010,6 +6706,9 @@
   (test-ws-send-refuses-a-closing-websocket)
   (test-ws-close)
   (test-ws-close-from-a-handler-e2e)
+  (test-ws-server-close-lingers-for-a-client-still-sending-e2e)
+  (test-ws-backlog-full-is-logged-through-the-throttle)
+  (test-ws-largest-frame-fills-the-read-buffer-and-is-delivered)
   (test-ws-message-deadline-e2e)
   (test-ws-upgrade-shapes-the-101)
   (test-ws-upgrade-subprotocol-e2e)
@@ -6022,6 +6721,7 @@
   (test-stream-close-arms-the-write-path)
   (test-stream-close-refuses-a-foreign-connection)
   (test-cpu-count-parsers)
+  (test-cpu-count-reads-a-quota-where-the-process-is)
   (test-ws-oversized-frame-close-code)
   (test-ws-fragments-are-held-as-their-bytes)
   (test-small-writes-are-queued-joined)
@@ -6031,6 +6731,11 @@
   (test-numeric-settings-validated-at-boot)
   (test-listen-backlog-reaches-the-listener)
   (test-accept-goes-on-past-a-connection-it-could-not-set-up)
+  (test-set-up-failures-and-failed-accepts-are-throttled-apart)
+  (test-handler-errors-are-throttled-by-condition-type)
+  (test-flush-log-throttle-logs-a-count-and-forgets-the-kind)
+  (test-flush-log-throttle-all-ends-every-kinds-minute)
+  (test-monotonic-seconds-reads-high-and-apart-from-the-date)
   (test-on-tick-runs-with-the-workers-bindings)
   (test-on-tick-survives-a-raising-hook)
   (test-serious-conditions-cost-the-request)

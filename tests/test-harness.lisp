@@ -1254,16 +1254,109 @@
              (check "control: the accept did fail first" failed t))
         (sb-int:unencapsulate 'sb-bsd-sockets:socket-accept 'fail-once)))))
 
+(defun test-harness-a-clock-step-moves-no-deadline-e2e ()
+  "Setting the system's clock neither fires a timeout nor holds one back.
+
+   GET-UNIVERSAL-TIME is wrapped while a server runs, to answer two hours
+   ahead and then two hours behind, as the system's clock reads after it
+   has been stepped. Intervals are measured on MONOTONIC-SECONDS, which
+   the wrap does not reach.
+
+   Ahead: a keep-alive connection that has answered one request sits idle
+   for two seconds, well inside *IDLE-TIMEOUT*, and answers a second.
+   Measured on the system's clock it would be two hours idle at the next
+   sweep, and closed. A response's Date is two hours ahead meanwhile,
+   which is the control: the wrap is in force, and what is a date follows
+   it.
+
+   Behind: *IDLE-TIMEOUT* is 1 for the run, and a connection that sends
+   nothing is closed within a few seconds. Measured on the system's clock
+   the loop's once-a-second work would wait for the clock to make the two
+   hours up, and nothing would be swept until it had.
+
+   SETF rather than LET for *IDLE-TIMEOUT*: the worker reads it, and
+   dynamic bindings do not cross MAKE-THREAD."
+  (format t "~%Harness: a step of the system's clock moves no deadline~%")
+  (let ((offset 0)
+        (saved-idle web-skeleton:*idle-timeout*))
+    (sb-int:encapsulate 'get-universal-time 'stepped
+                        (lambda (f) (+ (funcall f) offset)))
+    (unwind-protect
+         (flet ((answered-p (buf fill)
+                  ;; A head, and the two bytes of body the handler sends.
+                  (let ((head-end (web-skeleton::scan-crlf-crlf buf 0 fill)))
+                    (and head-end (>= fill (+ head-end 4 2)))))
+                (text-of (buf)
+                  (sb-ext:octets-to-string (subseq buf 0 (fill-pointer buf))
+                                           :external-format :latin-1)))
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (flet ((ask ()
+                             ;; The answer to one GET on the connection, or
+                             ;; why there was none.
+                             (handler-case
+                                 (progn
+                                   (%send-raw-get stream "/")
+                                   (text-of (read-until-bounded
+                                             stream :until #'answered-p :seconds 5)))
+                               (error (e) (format nil "no answer: ~a" e)))))
+                      (check "ahead: control, the connection answers a request"
+                             (let ((answer (ask)))
+                               (subseq answer 0 (min 12 (length answer))))
+                             "HTTP/1.1 200")
+                      (setf offset 7200)
+                      ;; On a connection of its own, so that it is answered
+                      ;; whatever becomes of the one being kept.
+                      (let ((headers (nth-value 1 (test-http-request :get "/")))
+                            (real (- (get-universal-time) offset)))
+                        (check "control: a response's Date is the stepped clock's"
+                               (let ((date (cdr (assoc "date" headers
+                                                       :test #'string-equal))))
+                                 (and (loop for slip from -3 to 3
+                                              thereis (equal date
+                                                             (web-skeleton::http-date
+                                                              (+ real 7200 slip))))
+                                      t))
+                               t))
+                      (sleep 2.2)
+                      (check "ahead: idle two seconds, two hours ahead, it answers another"
+                             (let ((answer (ask)))
+                               (subseq answer 0 (min 12 (length answer))))
+                             "HTTP/1.1 200"))
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+           (setf offset 0
+                 web-skeleton:*idle-timeout* 1)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (make-text-response 200 "ok")))
+             (setf offset -7200)
+             (multiple-value-bind (socket stream) (%raw-connect)
+               (unwind-protect
+                    (check "behind: a connection that says nothing is still swept"
+                           (nth-value 1 (read-until-bounded stream :seconds 6))
+                           :eof)
+                 (ignore-errors (close stream))
+                 (ignore-errors (sb-bsd-sockets:socket-close socket))))))
+      (sb-int:unencapsulate 'get-universal-time 'stepped)
+      (setf web-skeleton:*idle-timeout* saved-idle))))
+
 (defun test-harness-client-errors-log-once-a-minute-e2e ()
   "A flood of requests a client gets wrong logs a line, not a flood.
 
    Every log line holds *LOG-LOCK*, the one lock all workers share, across
    a format and a flush, and a malformed request costs a client one write.
    LOG-THROTTLED logs the first of a kind at once and then at most once a
-   minute per worker, with a count of the ones held back. The first half
-   drives it directly; the second sends twenty requests with an unknown
-   method to a real server and counts the lines its worker wrote, and the
-   third twenty plain GETs to a route that upgrades."
+   minute per worker, with a count of the ones held back on a line of its
+   own. The first half drives it directly; the second sends twenty
+   requests with an unknown method to a real server and counts the lines
+   its worker wrote, and the third twenty plain GETs to a route that
+   upgrades."
   (format t "~%Harness: a flood of bad requests logs a line, not a flood~%")
   (let ((out (make-string-output-stream)))
     (let ((web-skeleton::*log-stream* out)
@@ -1282,8 +1375,14 @@
              (search "bad thing 1" text) nil)
       (check "throttle: another kind logs on its own"
              (and (search "other thing" text) t) t)
-      (check "throttle: a minute on, one line carries the count"
-             (and (search "bad thing 5 (and 4 more like it" text) t) t)))
+      ;; Not the number of seconds, which is 61 or, should a second turn
+      ;; between the first line and the last, 62.
+      (check "throttle: a minute on, the kind's next line is behind their count"
+             (let ((count (search "[WARN] test-kind: 4 more lines held back in the last 6"
+                                  text))
+                   (next (search (format nil "[WARN] bad thing 5~%") text)))
+               (and count next (< count next)))
+             t)))
   (let ((out (make-string-output-stream)))
     (let ((web-skeleton::*log-stream* out)
           (web-skeleton::*log-level* :info)
@@ -1337,6 +1436,176 @@
                    while at do (incf n) (setf start (1+ at))
                    finally (return n))
              1))))
+
+(defun test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e ()
+  "Requests whose handler raises are each answered 500, and are logged as
+   a line and a count, not as a line each.
+
+   A handler that raises on what it is sent raises as often as a client
+   sends it, and every log line holds the one lock all workers share. The
+   handler here raises a TYPE-ERROR on one path and a plain error on
+   another. Ten requests to the first log one line, and the first to the
+   second still logs behind them: each condition type is throttled on its
+   own, so a flood of one error does not hide another. With
+   *THROTTLE-HANDLER-ERRORS* off, all twelve log.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a handler that raises logs a line, not a flood~%")
+  (flet ((run (throttle)
+           ;; Ten requests to /typed and two to /plain, with the setting as
+           ;; THROTTLE: their statuses, and how many handler-error lines
+           ;; the worker logged.
+           (let ((saved-stream web-skeleton::*log-stream*)
+                 (saved-setting web-skeleton:*throttle-handler-errors*)
+                 (log (make-string-output-stream))
+                 (statuses nil))
+             (unwind-protect
+                  (progn
+                    (setf web-skeleton::*log-stream* log
+                          web-skeleton:*throttle-handler-errors* throttle)
+                    (with-test-server
+                        (:handler (lambda (req)
+                                    (if (string= (http-request-path req) "/typed")
+                                        (error 'type-error :datum 5
+                                                           :expected-type 'string)
+                                        (error "the lookup failed"))))
+                      (dotimes (i 10)
+                        (push (attempt (values (test-http-request :get "/typed")))
+                              statuses))
+                      (dotimes (i 2)
+                        (push (attempt (values (test-http-request :get "/plain")))
+                              statuses))))
+               (setf web-skeleton::*log-stream* saved-stream
+                     web-skeleton:*throttle-handler-errors* saved-setting))
+             (values statuses
+                     (let ((text (get-output-stream-string log)))
+                       (loop with n = 0 and start = 0
+                             for at = (search "[WARN] error fd" text :start2 start)
+                             while at do (incf n) (setf start (1+ at))
+                             finally (return n)))))))
+    (multiple-value-bind (statuses lines) (run t)
+      (check "control: all twelve requests were answered 500"
+             (list (length statuses) (every (lambda (s) (eql s 500)) statuses))
+             '(12 t))
+      (check "ten of one error and two of another log a line for each error"
+             lines 2))
+    (multiple-value-bind (statuses lines) (run nil)
+      (check "control: and are answered 500 with the throttle off"
+             (list (length statuses) (every (lambda (s) (eql s 500)) statuses))
+             '(12 t))
+      (check "with *throttle-handler-errors* off, all twelve log"
+             lines 12))))
+
+(defun test-harness-a-burst-that-ends-has-its-count-logged-e2e ()
+  "A burst of requests whose handler raises, and then none: the count of
+   the lines held back is logged once the minute is up, by the worker's
+   once-a-second pass, with no further line of that kind to bring it out.
+
+   Five requests raise, which logs the first and holds four back. A sixth
+   is answered by aging the worker's throttle table a minute, from the
+   handler, on whose thread that table is bound. Nothing raises after it.
+   The :ON-TICK hook watches for the table to empty, which is the pass
+   forgetting the kind, and the test waits on that and not on a number of
+   seconds.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a burst that ends has its count logged~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (saved-setting web-skeleton:*throttle-handler-errors*)
+        (log (make-string-output-stream))
+        (statuses nil)
+        (aged nil)
+        (forgotten nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log
+                 web-skeleton:*throttle-handler-errors* t)
+           (with-test-server
+               (:handler
+                (lambda (req)
+                  (cond ((string= (http-request-path req) "/a-minute-on")
+                         (loop for entry being the hash-values
+                                 of web-skeleton::*log-throttle*
+                               do (decf (car entry) 61))
+                         (setf aged t)
+                         (make-text-response 200 "aged"))
+                        (t (error "the lookup failed"))))
+                :on-tick
+                (lambda (worker-id)
+                  (declare (ignore worker-id))
+                  (when (and aged
+                             (zerop (hash-table-count
+                                     web-skeleton::*log-throttle*)))
+                    (setf forgotten t))))
+             (dotimes (i 5)
+               (push (attempt (values (test-http-request :get "/raise")))
+                     statuses))
+             (push (attempt (values (test-http-request :get "/a-minute-on")))
+                   statuses)
+             ;; The pass comes once a second. Ten are room for it on a
+             ;; machine with other things to do.
+             (loop repeat 200
+                   until forgotten
+                   do (sleep 0.05))))
+      (setf web-skeleton::*log-stream* saved-stream
+            web-skeleton:*throttle-handler-errors* saved-setting))
+    (let* ((text (get-output-stream-string log))
+           (line (search "[WARN] error fd" text))
+           (count (search "[WARN] handler-error (simple-error): 4 more lines held back in the last "
+                          text)))
+      (check "control: five requests were answered 500, and the sixth 200"
+             (reverse statuses) '(500 500 500 500 500 200))
+      (check "the pass ended the kind's minute, with no line to prompt it"
+             forgotten t)
+      (check "one line was logged for the five"
+             (and line (null (search "[WARN] error fd" text :start2 (1+ line))))
+             t)
+      (check "and behind it, the count of the other four"
+             (and line count (< line count))
+             t))))
+
+(defun test-harness-a-stopping-worker-logs-what-it-held-back-e2e ()
+  "A worker that stops logs the count of what its throttle held back in
+   its last minute, on its way out. Three requests whose handler raises
+   log one line and hold two back; the server is stopped well inside the
+   minute, so no pass of the worker's has ended it; and the count of the
+   two is in the log behind the line.
+
+   SETF rather than LET for the log stream and the setting: the worker
+   that logs is another thread."
+  (format t "~%Harness: a stopping worker logs what it held back~%")
+  (let ((saved-stream web-skeleton::*log-stream*)
+        (saved-setting web-skeleton:*throttle-handler-errors*)
+        (log (make-string-output-stream))
+        (statuses nil))
+    (unwind-protect
+         (progn
+           (setf web-skeleton::*log-stream* log
+                 web-skeleton:*throttle-handler-errors* t)
+           (with-test-server
+               (:handler (lambda (req)
+                           (declare (ignore req))
+                           (error "the lookup failed")))
+             (dotimes (i 3)
+               (push (attempt (values (test-http-request :get "/raise")))
+                     statuses))))
+      (setf web-skeleton::*log-stream* saved-stream
+            web-skeleton:*throttle-handler-errors* saved-setting))
+    (let* ((text (get-output-stream-string log))
+           (line (search "[WARN] error fd" text))
+           (count (search "[WARN] handler-error (simple-error): 2 more lines held back in the last "
+                          text)))
+      (check "stopping: control, three requests answered 500 and one line logged"
+             (list (reverse statuses)
+                   (and line
+                        (null (search "[WARN] error fd" text :start2 (1+ line)))
+                        t))
+             '((500 500 500) t))
+      (check "stopping: and once the worker has stopped, the count of the other two"
+             (and line count (< line count) t)
+             t))))
 
 (defun %piecemeal-upstream (listener pieces &key (pause 0.005) (hold 6))
   "Accept once, read the request head, write PIECES (strings, one byte per
@@ -1602,7 +1871,7 @@
                       :outbound-p t
                       :inbound-fd -1
                       :fetch-method :GET
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-on-body
                       (lambda (c chunk)
                         (declare (ignore c))
@@ -2440,7 +2709,9 @@
 
    Server A's handler is inside a slow request when shutdown is asked for,
    so A's join gives up on that worker and START-SERVER returns, saying
-   so. Server B starts on the same port. When A's handler returns, its
+   so. Server B starts on the same port, beside A's worker, which still
+   listens there: with :SHARE-PORT, since a plain start beside a listener
+   is refused. When A's handler returns, its
    worker finds *SHUTDOWN* cleared by B and, keyed on the flag alone, went
    back to serving: listener open, old handler, and SO_REUSEPORT splitting
    connections between it and B. Every request made after A's handler
@@ -2471,6 +2742,9 @@
               (lambda ()
                 (start-server
                  :host #(127 0 0 1) :port port* :workers 1
+                 ;; For B, beside A's worker: see the docstring. A's
+                 ;; :PORT 0 has no use for it.
+                 :share-port t
                  :on-listen (lambda (p)
                               (setf port p)
                               (sb-thread:signal-semaphore semaphore))
@@ -3294,6 +3568,1189 @@
             (check "port 0: every worker listens on the reported port"
                    n workers)))))))
 
+(defun test-harness-a-port-that-cannot-be-bound-fails-the-start ()
+  "START-SERVER on a port another program holds signals an error naming
+   the address, and spawns no worker.
+
+   The other program is a listener without SO_REUSEPORT, so this server's
+   bind fails with EADDRINUSE; with the option set on both, the port would
+   be shared and nothing would fail. A start that left the bind to its
+   workers would have each of them failing it in RUN-WORKER's restart
+   loop, once a second, and would never return. So the start runs on a
+   thread joined with a bound, and no error inside the bound is a failed
+   check and not a suite that does not end."
+  (format t "~%Harness: a port that cannot be bound fails the start~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (log (make-string-output-stream))
+        (holder (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp))
+        (message nil))
+    ;; Global SETF: a worker, should one be spawned, reads these from a
+    ;; thread START-SERVER made.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log)
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-bind holder #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen holder 1)
+           (let* ((port (nth-value 1 (sb-bsd-sockets:socket-name holder)))
+                  (start (sb-thread:make-thread
+                          (lambda ()
+                            (handler-case
+                                (start-server
+                                 :host #(127 0 0 1) :port port :workers 2
+                                 :handler (lambda (r) (declare (ignore r))))
+                              (error (e) (setf message (princ-to-string e)))))
+                          :name "unbindable-port-probe")))
+             (handler-case (sb-thread:join-thread start :timeout 3)
+               (error ()
+                 ;; Still serving, or trying to: ask it to stop before
+                 ;; falling back to ending the thread.
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread start :timeout 10)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread start))
+                     (ignore-errors (sb-thread:join-thread start))))))
+             (check "unbindable port: the start signals, naming the address"
+                    (and message
+                         (search (format nil "cannot listen on 127.0.0.1:~d" port)
+                                 message)
+                         (search "EADDRINUSE" message)
+                         t)
+                    t)))
+      (ignore-errors (sb-bsd-sockets:socket-close holder))
+      (setf web-skeleton::*shutdown* t
+            web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll
+            web-skeleton::*log-stream* saved-stream))
+    (check "unbindable port: and no worker was started"
+           (search "worker 0" (get-output-stream-string log))
+           nil)))
+
+(defun test-harness-a-start-refused-at-its-bind-leaves-a-running-server-alone ()
+  "A START-SERVER refused because its port cannot be bound has changed
+   nothing first: no run has begun, the census is still the running
+   server's, and a server already running in the image goes on serving.
+
+   A later START-SERVER stops the workers of an earlier one in the image,
+   by the run it begins. So a refusal that came after the run began
+   would leave the running server's port served by nothing, though its
+   caller was told the start had been refused.
+
+   The running server is one on a kernel-chosen port. The refused start
+   asks for a port held by a listener without SO_REUSEPORT, so that its
+   bind fails, and runs on a thread joined with a bound."
+  (format t "~%Harness: a start refused at its bind leaves a running server alone~%")
+  (%call-with-bare-server 1
+    (lambda (port)
+      (let ((holder (make-instance 'sb-bsd-sockets:inet-socket
+                                   :type :stream :protocol :tcp))
+            (message nil))
+        (unwind-protect
+             (progn
+               (sb-bsd-sockets:socket-bind holder #(127 0 0 1) 0)
+               (sb-bsd-sockets:socket-listen holder 1)
+               (check "refused bind: control, the running server answers"
+                      (%port-answers-with-p port "bare")
+                      t)
+               (let* ((held (%port-of holder))
+                      (generation web-skeleton::*run-generation*)
+                      (census web-skeleton::*connection-census*)
+                      (start (sb-thread:make-thread
+                              (lambda ()
+                                (handler-case
+                                    (start-server
+                                     :host #(127 0 0 1) :port held :workers 1
+                                     :handler (lambda (r) (declare (ignore r))))
+                                  (error (e)
+                                    (setf message (princ-to-string e)))))
+                              :name "refused-bind-probe")))
+                 (handler-case (sb-thread:join-thread start :timeout 5)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread start))
+                     (ignore-errors (sb-thread:join-thread start))))
+                 (check "refused bind: the start was refused, naming the address"
+                        (and message
+                             (search (format nil "cannot listen on 127.0.0.1:~d"
+                                             held)
+                                     message)
+                             t)
+                        t)
+                 (check "refused bind: no run began, and the census is the running server's"
+                        (list (- web-skeleton::*run-generation* generation)
+                              (eq web-skeleton::*connection-census* census))
+                        '(0 t))
+                 ;; Several passes of the running server's loop, each of
+                 ;; which would see a run begun since its own and stop.
+                 (sleep 0.3)
+                 (check "refused bind: and the running server still answers"
+                        (%port-answers-with-p port "bare")
+                        t)))
+          (ignore-errors (sb-bsd-sockets:socket-close holder)))))))
+
+(defun %unix-socket-listed-p (name)
+  "True when /proc/net/unix lists a socket bound to NAME, an abstract name
+   written as the file shows one, with its @."
+  (handler-case
+      (with-open-file (in "/proc/net/unix" :if-does-not-exist nil)
+        (and in
+             (loop for line = (read-line in nil nil)
+                   while line
+                   thereis (let ((at (search name line :from-end t)))
+                             (and at (= (+ at (length name))
+                                        (length line)))))))
+    (error () nil)))
+
+(defun %port-of (socket)
+  (nth-value 1 (sb-bsd-sockets:socket-name socket)))
+
+(defun %log-so-far (log)
+  "What LOG, a string stream a server's lines go to, holds so far, left
+   in it for whoever reads it next: read and written back under
+   *LOG-LOCK*, which every line is written under."
+  (sb-thread:with-mutex (web-skeleton::*log-lock*)
+    (let ((text (get-output-stream-string log)))
+      (write-string text log)
+      text)))
+
+(defun %server-took-claim-p (log port)
+  "True when the server whose lines go to LOG holds PORT's claim within
+   five seconds: the line it logs on taking the claim is looked for every
+   50 ms, and the claim, asked for once after it, is found held.
+
+   Looked for in the log, and not by asking for the claim until it is
+   found held. An asking holds the claim's name for a moment, and a
+   server that asks in that moment is told it is held, and asks again a
+   second later. A test that asks every 50 ms from the moment the server
+   listens keeps step with the server's wait, which wakes every 50 ms
+   from the same moment, and can be holding the name at each of the
+   server's askings."
+  (let ((line (format nil "port ~d: this server holds the claim" port)))
+    (and (loop repeat 100
+               thereis (search line (%log-so-far log))
+               do (sleep 0.05))
+         (let ((got (web-skeleton::claim-port port)))
+           (web-skeleton::release-port-claim got)
+           (eq got :held)))))
+
+(defun test-harness-a-port-claim-has-one-holder ()
+  "CLAIM-PORT gives a port's claim to the first that asks and tells the
+   second it is held, and the claim is there to take again once the first
+   has let go. While it is held it is listed under the name
+   PORT-CLAIM-NAME gives, which is the name an operator looks for.
+
+   The number is one the kernel chose for a listener held open here."
+  (format t "~%Harness: a port's claim has one holder~%")
+  (let ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0)))
+    (unwind-protect
+         (let* ((port (%port-of holder))
+                (name (format nil "@web-skeleton/port/~d" port))
+                (taken (web-skeleton::claim-port port))
+                (asked (web-skeleton::claim-port port)))
+           (unwind-protect
+                (progn
+                  (check "port claim: the first that asks holds it"
+                         (typep taken 'sb-bsd-sockets:socket) t)
+                  (check "port claim: the second is told it is held"
+                         asked :held)
+                  ;; Read again when a read misses it: the file is walked
+                  ;; in pieces, and a walk can skip a row while other
+                  ;; sockets come and go.
+                  (check "port claim: listed under its name while held"
+                         (loop repeat 40
+                               thereis (%unix-socket-listed-p name)
+                               do (sleep 0.025))
+                         t)
+                  (web-skeleton::release-port-claim taken)
+                  (check "port claim: not listed once let go"
+                         (%unix-socket-listed-p name) nil)
+                  (let ((again (web-skeleton::claim-port port)))
+                    (check "port claim: and there to take again"
+                           (typep again 'sb-bsd-sockets:socket) t)
+                    (web-skeleton::release-port-claim again))
+                  ;; A server that joined asks again through
+                  ;; RETAKE-PORT-CLAIM, a second apart. CLAIM-PORT's
+                  ;; answers are scripted for it here: an asking that could
+                  ;; not be made, then a claim another holds, then its own.
+                  (let ((scripted (list nil :held))
+                        (askings 0))
+                    (sb-int:encapsulate
+                     'web-skeleton::claim-port 'scripted
+                     (lambda (real port &rest keys)
+                       (incf askings)
+                       (if scripted
+                           (pop scripted)
+                           (apply real port keys))))
+                    (unwind-protect
+                         (flet ((retake (claim asked-at now)
+                                  ;; CLAIM and ASKED-AT. Whether an asking
+                                  ;; could not be made is checked below,
+                                  ;; where it is logged.
+                                  (subseq (multiple-value-list
+                                           (web-skeleton::retake-port-claim
+                                            claim port asked-at now))
+                                          0 2)))
+                           (check "retake: an asking that could not be made leaves it held, to ask again"
+                                  (retake :held 0 100) '(:held 100))
+                           (check "retake: it is not asked for twice in one second"
+                                  (list (retake :held 100 100) askings)
+                                  '((:held 100) 1))
+                           (check "retake: the second after, it is, and another holds it still"
+                                  (list (retake :held 100 101) askings)
+                                  '((:held 101) 2))
+                           (destructuring-bind (claim asked-at)
+                               (retake :held 101 102)
+                             (check "retake: taken once the other has let go"
+                                    (list (typep claim 'sb-bsd-sockets:socket)
+                                          asked-at askings)
+                                    '(t 102 3))
+                             (check "retake: a claim in hand is not asked for again"
+                                    (list (eq (first (retake claim 102 103)) claim)
+                                          askings)
+                                    '(t 3))
+                             (web-skeleton::release-port-claim claim)))
+                      (sb-int:unencapsulate 'web-skeleton::claim-port
+                                            'scripted))))
+             (web-skeleton::release-port-claim taken)
+             (web-skeleton::release-port-claim asked)))
+      (sb-bsd-sockets:socket-close holder)))
+  ;; A claim that cannot be attempted: that is logged, and is not an answer
+  ;; of :HELD, which would refuse the start. The attempt is made to fail
+  ;; here by PORT-CLAIM-NAME signalling, which CLAIM-PORT meets where it
+  ;; would meet a socket the kernel refused to bind. Nothing of the
+  ;; process is touched to arrange it: a descriptor limit lowered for the
+  ;; call would be lowered for every other thread as well.
+  (let ((log (make-string-output-stream))
+        (refusals 0))
+    (flet ((logged (text)
+             ;; How many times LOG says TEXT so far.
+             (let ((so-far (%log-so-far log)))
+               (loop for at = (search text so-far)
+                       then (search text so-far :start2 (1+ at))
+                     while at
+                     count t))))
+      (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused
+                          (lambda (real port)
+                            (if (plusp refusals)
+                                (progn (decf refusals)
+                                       (error "no name to bind"))
+                                (funcall real port))))
+      (unwind-protect
+           (let ((web-skeleton::*log-stream* log)
+                 (web-skeleton::*log-level* :warn))
+             (setf refusals 1)
+             (check "port claim: one that cannot be attempted is not held, and is logged with what is still refused"
+                    (list (web-skeleton::claim-port 1)
+                          (logged "could not be attempted (no name to bind)")
+                          (logged "a start beside a listening server is still refused"))
+                    '(nil 1 1))
+             (setf refusals 1)
+             (check "port claim: with :WARN NIL it is not logged"
+                    (list (web-skeleton::claim-port 1 :warn nil)
+                          (logged "could not be attempted"))
+                    '(nil 1))
+             ;; RETAKE-PORT-CLAIM asks once a second for as long as a
+             ;; shortage lasts. The name is held here, so an asking that
+             ;; is made answers :HELD.
+             (let ((holder (web-skeleton::claim-port 1)))
+               (unwind-protect
+                    (flet ((retake (asked-at now failing)
+                             (multiple-value-list
+                              (web-skeleton::retake-port-claim
+                               :held 1 asked-at now failing))))
+                      (setf refusals 2)
+                      (check "retake: a run of askings that cannot be made is logged at its first"
+                             (list (retake 0 200 nil) (retake 200 201 t)
+                                   (logged "could not be attempted"))
+                             '((:held 200 t) (:held 201 t) 2))
+                      (check "retake: an asking that is made ends the run"
+                             (retake 201 202 t)
+                             '(:held 202 nil))
+                      (setf refusals 1)
+                      (check "retake: and the next that cannot be made is logged again"
+                             (list (retake 202 203 nil)
+                                   (logged "could not be attempted"))
+                             '((:held 203 t) 3)))
+                 (web-skeleton::release-port-claim holder))))
+        (sb-int:unencapsulate 'web-skeleton::port-claim-name 'refused)))))
+
+(defun test-harness-a-claimed-port-refuses-a-second-server ()
+  "START-SERVER on a port whose claim another holds signals, naming the
+   port, and has begun no run. With :SHARE-PORT it starts and serves,
+   says that it joined, takes the claim once the other lets go, and lets
+   go of it in turn when it returns.
+
+   The other server is a claim taken by hand and a listener on the
+   number, which together are all a second server process is to this
+   one: the kernel does not say whose a name is, and two real servers do
+   not fit in one image, a later START-SERVER stopping the workers of an
+   earlier. The listener is the one the kernel chose the number for. It
+   is open while the second server is refused, and closed before the
+   server that joins starts, so that what reaches the port reaches that
+   server.
+
+   Each start runs on a thread joined with a bound, so a refusal that
+   does not come is a failed check and not a server serving for good."
+  (format t "~%Harness: a claimed port refuses a second server~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (saved-stream web-skeleton::*log-stream*)
+        (saved-level web-skeleton::*log-level*)
+        (log (make-string-output-stream))
+        (logged "")
+        (other nil))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05
+          web-skeleton::*log-stream* log
+          web-skeleton::*log-level* :info)
+    (flet ((start (port up &rest keys)
+             ;; A thread running START-SERVER on PORT; what it signaled,
+             ;; if it did, is the thread's value.
+             (sb-thread:make-thread
+              (lambda ()
+                (handler-case
+                    (progn
+                      (apply #'start-server
+                             :host #(127 0 0 1) :port port :workers 1
+                             :on-listen (lambda (p)
+                                          (declare (ignore p))
+                                          (sb-thread:signal-semaphore up))
+                             :handler (lambda (req)
+                                        (declare (ignore req))
+                                        (make-text-response 200 "joined"))
+                             keys)
+                      nil)
+                  (error (e) (princ-to-string e))))
+              :name "claimed-port-probe"))
+           (finish (thread seconds)
+             ;; THREAD's value once it ends, asking the server to stop if
+             ;; it has not ended by itself in SECONDS.
+             (handler-case (sb-thread:join-thread thread :timeout seconds)
+               (error ()
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread thread :timeout 10)
+                   (error ()
+                     (ignore-errors (sb-thread:terminate-thread thread))
+                     (ignore-errors (sb-thread:join-thread thread))
+                     :never-ended))))))
+      (unwind-protect
+           (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (check "claimed port: control, the claim is taken by hand"
+                    (typep other 'sb-bsd-sockets:socket) t)
+             ;; Refused.
+             (let* ((generation web-skeleton::*run-generation*)
+                    (message (finish (start port (sb-thread:make-semaphore)) 3)))
+               (check "claimed port: a second server is refused, naming the port"
+                      (and (stringp message)
+                           (search (format nil "port ~d is claimed" port) message)
+                           (search ":SHARE-PORT" message)
+                           t)
+                      t)
+               (check "claimed port: and the refused start began no run"
+                      (- web-skeleton::*run-generation* generation) 0))
+             (sb-bsd-sockets:socket-close holder)
+             ;; Joined.
+             (setf web-skeleton::*shutdown* nil)
+             (let* ((up (sb-thread:make-semaphore))
+                    (server (start port up :share-port t)))
+               (unwind-protect
+                    (progn
+                      (check "claimed port: with :share-port the server starts"
+                             (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                             t)
+                      (check "claimed port: and serves"
+                             (%port-answers-with-p port "joined") t)
+                      (web-skeleton::release-port-claim other)
+                      (check "claimed port: it takes the claim once the other lets go"
+                             (%server-took-claim-p log port)
+                             t))
+                 (setf web-skeleton::*shutdown* t)
+                 (finish server 10)))
+             (setf logged (get-output-stream-string log))
+             (let ((free (web-skeleton::claim-port port)))
+               (check "claimed port: and lets go of it when it returns"
+                      (typep free 'sb-bsd-sockets:socket) t)
+               (web-skeleton::release-port-claim free)))
+        (web-skeleton::release-port-claim other)
+        (setf web-skeleton::*shutdown* t
+              web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll
+              web-skeleton::*log-stream* saved-stream
+              web-skeleton::*log-level* saved-level)))
+    (check "claimed port: the log says it joined, and that it took the claim"
+           (list (not (null (search "which this one has joined" logged)))
+                 (not (null (search "this server holds the claim" logged))))
+           '(t t))))
+
+(defun %time-wait-on-port-p (port)
+  "True when /proc/net/tcp lists a connection in TIME_WAIT (state 06)
+   whose local port is PORT. Read a few times, since a walk of the file
+   can skip a row while other sockets come and go."
+  (let ((hex (format nil ":~4,'0X " port)))
+    (loop repeat 20
+          thereis (handler-case
+                      (with-open-file (in "/proc/net/tcp" :if-does-not-exist nil)
+                        (and in
+                             (loop for line = (read-line in nil nil)
+                                   while line
+                                   thereis (let ((at (search hex line)))
+                                             (and at
+                                                  (< at 20)
+                                                  (search " 06 " line)
+                                                  t)))))
+                    (error () nil))
+          do (sleep 0.025))))
+
+(defun %leave-time-wait-on (host)
+  "A port on HOST the kernel chose, with nothing listening on it any more
+   and one connection on it waiting out TIME_WAIT: the server's end,
+   closed first, as an earlier server's is when it closes a connection.
+   Answers the port."
+  (let* ((listener (web-skeleton::make-tcp-listener host 0))
+         (port (%port-of listener))
+         (client (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream :protocol :tcp)))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect client host port)
+           (let ((served (loop repeat 200
+                               for s = (sb-bsd-sockets:socket-accept listener)
+                               when s return s
+                               do (sleep 0.01))))
+             (when served
+               (sb-bsd-sockets:socket-close served)
+               (sleep 0.05))))
+      (sb-bsd-sockets:socket-close client)
+      (sb-bsd-sockets:socket-close listener))
+    port))
+
+(defmacro %with-claim-test-servers ((start finish log) &body body)
+  "Run BODY with START, a function (port host &rest keys) running
+   START-SERVER on a thread and answering it with a semaphore signalled
+   when the server listens, and FINISH, a function (thread seconds)
+   answering the thread's value: what START-SERVER signalled, as text, or
+   NIL. LOG names a string stream the server's lines go to, at :INFO. The
+   settings the workers read are set around BODY and put back after it."
+  (let ((saved (gensym "SAVED")))
+    `(let ((,saved (list web-skeleton::*shutdown-hooks* *drain-timeout*
+                         *worker-wake-interval* web-skeleton::*log-stream*
+                         web-skeleton::*log-level*))
+           (,log (make-string-output-stream)))
+       (declare (ignorable ,log))
+       ;; Global SETF: the workers read these from threads START-SERVER
+       ;; spawns.
+       (setf web-skeleton::*shutdown-hooks* nil
+             web-skeleton::*shutdown* nil
+             *drain-timeout* 1
+             *worker-wake-interval* 0.05
+             web-skeleton::*log-stream* ,log
+             web-skeleton::*log-level* :info)
+       (flet ((,start (port host &rest keys)
+                (let ((up (sb-thread:make-semaphore)))
+                  (values
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (progn
+                            (apply #'start-server
+                                   :host host :port port :workers 1
+                                   :on-listen (lambda (p)
+                                                (declare (ignore p))
+                                                (sb-thread:signal-semaphore up))
+                                   :handler (lambda (req)
+                                              (declare (ignore req))
+                                              (make-text-response 200 "started"))
+                                   keys)
+                            nil)
+                        (error (e) (princ-to-string e))))
+                    :name "claim-test-server")
+                   up)))
+              (,finish (thread seconds)
+                (handler-case (sb-thread:join-thread thread :timeout seconds)
+                  (error ()
+                    (setf web-skeleton::*shutdown* t)
+                    (handler-case (sb-thread:join-thread thread :timeout 10)
+                      (error ()
+                        (ignore-errors (sb-thread:terminate-thread thread))
+                        (ignore-errors (sb-thread:join-thread thread))
+                        :never-ended))))))
+         (unwind-protect (progn ,@body)
+           (setf web-skeleton::*shutdown* t)
+           (destructuring-bind (hooks drain poll stream level) ,saved
+             (setf web-skeleton::*shutdown-hooks* hooks
+                   *drain-timeout* drain
+                   *worker-wake-interval* poll
+                   web-skeleton::*log-stream* stream
+                   web-skeleton::*log-level* level)))))))
+
+(defun test-harness-a-claim-held-where-nothing-listens-refuses-nothing ()
+  "A start that finds its port's claim held, with nothing listening where
+   it would bind, goes on: it starts, says so at WARN, and takes the
+   claim once its holder lets go. The holder is a name bound by hand,
+   which any local process can do whatever user it runs as, and which on
+   a privileged port is all such a process can do.
+
+   Again with a connection an earlier server left on the port, waiting
+   out TIME_WAIT: a look at the port without SO_REUSEADDR meets that as
+   it would a listener, and refuses the start.
+
+   Each start waits out the second a holder is given to begin listening,
+   and runs on a thread joined with a bound."
+  (format t "~%Harness: a claim held where nothing listens refuses nothing~%")
+  (let ((other nil)
+        (logged ""))
+    (%with-claim-test-servers (start finish log)
+      (unwind-protect
+           (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (sb-bsd-sockets:socket-close holder)
+             (multiple-value-bind (server up) (start port #(127 0 0 1))
+               (unwind-protect
+                    (progn
+                      (check "held, nothing listening: the start goes on"
+                             (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                             t)
+                      (check "held, nothing listening: and serves"
+                             (%port-answers-with-p port "started")
+                             t)
+                      (web-skeleton::release-port-claim other)
+                      (setf other nil)
+                      (check "held, nothing listening: it takes the claim once let go"
+                             (%server-took-claim-p log port)
+                             t))
+                 (setf web-skeleton::*shutdown* t)
+                 (finish server 10)
+                 (setf web-skeleton::*shutdown* nil))))
+        (web-skeleton::release-port-claim other)
+        (setf other nil))
+      (setf logged (get-output-stream-string log))
+      (check "held, nothing listening: said at WARN, with how to see the holder"
+             (list (not (null (search "[WARN]" logged)))
+                   (not (null (search "nothing listens where this server binds"
+                                      logged)))
+                   (not (null (search "ss -xap" logged))))
+             '(t t t))
+      ;; With an earlier server's connection still on the port.
+      (unwind-protect
+           (let ((port (%leave-time-wait-on #(127 0 0 1))))
+             (setf other (web-skeleton::claim-port port))
+             (check "held, TIME_WAIT: control, a connection waits out TIME_WAIT on the port"
+                    (%time-wait-on-port-p port)
+                    t)
+             (multiple-value-bind (server up) (start port #(127 0 0 1))
+               (check "held, TIME_WAIT: the start goes on all the same"
+                      (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                      t)
+               (setf web-skeleton::*shutdown* t)
+               (check "held, TIME_WAIT: and was not refused"
+                      (finish server 10)
+                      nil)
+               (setf web-skeleton::*shutdown* nil)))
+        (web-skeleton::release-port-claim other)))))
+
+(defun test-harness-a-held-claim-refuses-by-what-listens ()
+  "A start that finds its port's claim held is refused when a socket
+   listens where its own listener would share connections with it, and
+   only then: on the wildcard address when this server binds one address
+   of it, but not on another address of the host. And a socket that
+   begins listening after the start has found the claim held, within the
+   second a holder is given, refuses it too: that is a second server
+   between its claim and its bind.
+
+   The other server is a claim taken by hand and a listener that sets
+   SO_REUSEPORT, as a server's does. 127.0.0.2 is an address of the
+   loopback interface, which on Linux holds all of 127.0.0.0/8."
+  (format t "~%Harness: a held claim refuses by what listens~%")
+  (%with-claim-test-servers (start finish log)
+    (flet ((with-other (host fn &key (late nil))
+             ;; FN called with a port whose claim is held by hand and on
+             ;; which a listener on HOST listens, or will, LATE seconds
+             ;; after FN is called.
+             (let* ((chosen (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                    (port (%port-of chosen))
+                    (other (web-skeleton::claim-port port))
+                    (listener nil)
+                    (opener nil))
+               (sb-bsd-sockets:socket-close chosen)
+               (unwind-protect
+                    (progn
+                      (if late
+                          (setf opener
+                                (sb-thread:make-thread
+                                 (lambda ()
+                                   (sleep late)
+                                   (web-skeleton::make-tcp-listener host port))
+                                 :name "late-listener"))
+                          (setf listener (web-skeleton::make-tcp-listener host port)))
+                      (funcall fn port))
+                 (web-skeleton::release-port-claim other)
+                 (when opener
+                   (setf listener (ignore-errors (sb-thread:join-thread opener))))
+                 (when listener
+                   (ignore-errors (sb-bsd-sockets:socket-close listener)))))))
+      (with-other #(0 0 0 0)
+        (lambda (port)
+          (multiple-value-bind (server up) (start port #(127 0 0 1))
+            (declare (ignore up))
+            (let ((message (finish server 5)))
+              (check "held: a listener on the wildcard refuses a start on one address"
+                     (and (stringp message)
+                          (search (format nil "port ~d is claimed" port) message)
+                          t)
+                     t)))))
+      (with-other #(127 0 0 1)
+        (lambda (port)
+          (multiple-value-bind (server up) (start port #(127 0 0 2))
+            (check "held: a listener on another address refuses nothing"
+                   (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                   t)
+            (setf web-skeleton::*shutdown* t)
+            (finish server 10)
+            (setf web-skeleton::*shutdown* nil))))
+      (with-other #(127 0 0 1)
+        (lambda (port)
+          (multiple-value-bind (server up) (start port #(127 0 0 1))
+            (declare (ignore up))
+            (let ((message (finish server 5)))
+              (check "held: a listener that begins within the second refuses it"
+                     (and (stringp message)
+                          (search (format nil "port ~d is claimed" port) message)
+                          t)
+                     t))))
+        :late 0.2))))
+
+(defun %connect-refused-p (port)
+  "T when a connect to 127.0.0.1:PORT is refused, NIL when it is made.
+
+   Made includes made and then reset before the connect returned. The
+   connection is completed into the listener's queue, and its arrival is
+   what wakes an idle worker that has been told to stop. That worker
+   accepts nothing more and closes the listener as its drain begins, and
+   the kernel resets the connection still in the queue. The listener was
+   open when the connection arrived, so it was not refused.
+   SB-BSD-SOCKETS signals that reset as a plain SOCKET-ERROR."
+  (let ((socket (make-instance 'sb-bsd-sockets:inet-socket
+                               :type :stream :protocol :tcp)))
+    (unwind-protect
+         (handler-case
+             (progn (sb-bsd-sockets:socket-connect socket #(127 0 0 1) port)
+                    nil)
+           (sb-bsd-sockets:connection-refused-error () t)
+           (sb-bsd-sockets:socket-error (e)
+             ;; 104 is ECONNRESET on Linux.
+             (if (eql (sb-bsd-sockets::socket-error-errno e) 104)
+                 nil
+                 (error e))))
+      (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+
+(defun test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim ()
+  "A start that finds its port's claim held asks for it again on each pass
+   of its look; an asking that could not be made at all, for want of a
+   descriptor say, answers NIL. That is no claim: the start goes on as
+   past any held claim, saying so at WARN, and takes the claim once its
+   holder lets go. Taken for the claim, the start would run with none
+   and never ask again, leaving the name free for a second server to
+   take and join it with no look at the port.
+
+   The holder is a name bound by hand, with nothing listening. The
+   start's first asking is made, and the next two, which fall in the
+   look, fail as a bind the kernel refuses does, by PORT-CLAIM-NAME
+   signalling. The look logs neither: an asking that cannot be made says
+   nothing of the holder, and the start logs how its look ended."
+  (format t "~%Harness: a claim asking that fails in the look is not the claim~%")
+  (let ((other nil)
+        (askings 0))
+    (%with-claim-test-servers (start finish log)
+      (sb-int:encapsulate 'web-skeleton::port-claim-name 'refused-in-the-look
+                          (lambda (real port)
+                            (if (<= 2 (incf askings) 3)
+                                (error "no name to bind")
+                                (funcall real port))))
+      (unwind-protect
+           (let* ((holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+                  (port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (setf askings 0)
+             (sb-bsd-sockets:socket-close holder)
+             (multiple-value-bind (server up) (start port #(127 0 0 1))
+               (check "failed asking: control, the start goes on"
+                      (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                      t)
+               (sb-int:unencapsulate 'web-skeleton::port-claim-name
+                                     'refused-in-the-look)
+               (web-skeleton::release-port-claim other)
+               (setf other nil)
+               (check "failed asking: it takes the claim once let go"
+                      (%server-took-claim-p log port)
+                      t)
+               (setf web-skeleton::*shutdown* t)
+               (finish server 10)
+               (setf web-skeleton::*shutdown* nil)))
+        (sb-int:unencapsulate 'web-skeleton::port-claim-name 'refused-in-the-look)
+        (web-skeleton::release-port-claim other))
+      (let ((logged (get-output-stream-string log)))
+        (check "failed asking: and said at WARN that it went on past a held claim"
+               (not (null (search "nothing listens where this server binds" logged)))
+               t)
+        (check "failed asking: and logged neither asking that could not be made"
+               (search "could not be attempted" logged)
+               nil)))))
+
+(defun test-harness-a-listener-with-no-claim-refuses-a-start ()
+  "A start that finds its port's claim free, and takes it, looks at the
+   port all the same: a socket listening where it would bind holds no
+   claim, a server between holders in a handover, one built without the
+   claim, or another program, and the start is refused, letting go of
+   the claim it took. With :SHARE-PORT it starts beside it, as asked.
+
+   The listener sets SO_REUSEPORT, as a server's does, so that a start
+   that did not look would bind beside it without error and serve."
+  (format t "~%Harness: a listener with no claim refuses a start~%")
+  (%with-claim-test-servers (start finish log)
+    (let* ((listener (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+           (port (%port-of listener)))
+      (flet ((claim-free-p ()
+               (let ((got (web-skeleton::claim-port port)))
+                 (web-skeleton::release-port-claim got)
+                 (typep got 'sb-bsd-sockets:socket))))
+        (unwind-protect
+             (progn
+               (check "no claim: control, a socket listens and the name is free"
+                      (list (eq (web-skeleton::port-listened-p #(127 0 0 1) port) t)
+                            (claim-free-p))
+                      '(t t))
+               (let ((message (finish (start port #(127 0 0 1)) 5)))
+                 (check "no claim: a start beside the listener is refused, naming the address"
+                        (and (stringp message)
+                             (search (format nil "cannot listen on 127.0.0.1:~d" port)
+                                     message)
+                             (search ":SHARE-PORT" message)
+                             t)
+                        t))
+               (check "no claim: and lets go of the claim it took"
+                      (claim-free-p)
+                      t)
+               (multiple-value-bind (server up)
+                   (start port #(127 0 0 1) :share-port t)
+                 (check "no claim: control, with :share-port it starts beside it"
+                        (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                        t)
+                 (setf web-skeleton::*shutdown* t)
+                 (finish server 10)
+                 (setf web-skeleton::*shutdown* nil)))
+          (sb-bsd-sockets:socket-close listener))))))
+
+(defun test-harness-starts-past-a-held-claim-go-one-at-a-time ()
+  "Two starts that go on past a held claim, where nothing listens, look
+   at the port and bind one at a time, so the second meets the first's
+   listener and is refused. Made together without that, each would find
+   nothing listening through its look, and both would bind.
+
+   The first start is stood in for by hand: its lock, PORT-START-NAME,
+   held while the second start waits for it, and then its listener,
+   opened 1.3 s on, later than the second start's own look would end,
+   with the lock let go. The claim is held by hand with nothing
+   listening, as a draining server holds it."
+  (format t "~%Harness: starts past a held claim go one at a time~%")
+  (%with-claim-test-servers (start finish log)
+    (let* ((chosen (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+           (port (%port-of chosen))
+           (other (web-skeleton::claim-port port))
+           (lock (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                :type :stream))
+           (listener nil))
+      (sb-bsd-sockets:socket-close chosen)
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind lock (web-skeleton::port-start-name port))
+             (let ((second (start port #(127 0 0 1))))
+               (sleep 1.3)
+               (setf listener (web-skeleton::make-tcp-listener #(127 0 0 1) port))
+               (sb-bsd-sockets:socket-close lock)
+               (let ((message (finish second 5)))
+                 (check "one at a time: the second start looks once the first has bound, and is refused"
+                        (and (stringp message)
+                             (search (format nil "port ~d is claimed" port) message)
+                             t)
+                        t))))
+        (ignore-errors (sb-bsd-sockets:socket-close lock))
+        (web-skeleton::release-port-claim other)
+        (when listener
+          (ignore-errors (sb-bsd-sockets:socket-close listener)))))))
+
+(defun test-harness-a-stopped-server-puts-sbcls-sigterm-handler-back ()
+  "START-SERVER's run, once it has ended, puts back SBCL's own SIGTERM
+   handler, which ends the process, in place of the one the run
+   installed, which only sets *SHUTDOWN*. SB-SYS:ENABLE-INTERRUPT answers
+   NIL whatever a signal's handler is, and NIL cannot be installed, so a
+   run that put back what it was answered left its own handler in place
+   for good: SIGTERM then set a flag nothing read, and the process went
+   on.
+
+   What the run installs is recorded by wrapping ENABLE-INTERRUPT, since
+   a handler read back is NIL whichever it is."
+  (format t "~%Harness: a stopped server puts SBCL's SIGTERM handler back~%")
+  (let ((installed nil))
+    (sb-int:encapsulate 'sb-sys:enable-interrupt 'recorded
+                        (lambda (real signal handler &rest more)
+                          (push (cons signal handler) installed)
+                          (apply real signal handler more)))
+    (unwind-protect
+         (%call-with-bare-server 1 (lambda (port) (declare (ignore port))))
+      (sb-int:unencapsulate 'sb-sys:enable-interrupt 'recorded))
+    (let ((sigterm (remove sb-unix:sigterm installed :key #'car :test-not #'eql)))
+      (check "sigterm: control, the run installed a handler of its own"
+             (and (= (length sigterm) 2) (functionp (cdr (second sigterm))))
+             t)
+      (check "sigterm: and its end put SBCL's own back"
+             (cdr (first sigterm))
+             (symbol-function (find-symbol "SIGTERM-HANDLER" "SB-UNIX")))
+      (check "sigterm: and nothing tried to install NIL, which SBCL refuses"
+             (find nil installed :key #'cdr)
+             nil))))
+
+(defun test-harness-a-replaced-run-returns-and-leaves-the-later-run-its-own ()
+  "A START-SERVER replaced by a later one in the image returns once its
+   workers have stopped, and leaves *SHUTDOWN*, the shutdown hooks and
+   SIGTERM's handler to the later run. The later run serves on; a hook
+   registered for it runs once, at its end; and SBCL's SIGTERM handler
+   goes back only once the later run has ended too. Left waiting for
+   *SHUTDOWN*, the replaced call woke when the later run was stopped and
+   ran that run's hooks on its own thread, before that run had drained.
+
+   Two real runs, each on a kernel-chosen port, the second started while
+   the first serves. What is installed for SIGTERM is recorded by wrapping
+   ENABLE-INTERRUPT, since a handler read back is NIL whichever it is."
+  (format t "~%Harness: a replaced run returns, and leaves the later run its own~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (installed nil)
+        (hooks 0)
+        (sbcl (symbol-function (find-symbol "SIGTERM-HANDLER" "SB-UNIX"))))
+    ;; Global SETF: the workers read these from threads START-SERVER spawns.
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 1
+          *worker-wake-interval* 0.05)
+    (sb-int:encapsulate 'sb-sys:enable-interrupt 'recorded
+                        (lambda (real signal handler &rest more)
+                          (when (eql signal sb-unix:sigterm)
+                            (push handler installed))
+                          (apply real signal handler more)))
+    (flet ((run (name)
+             ;; A thread running START-SERVER, and a function answering
+             ;; the port it listens on once it does.
+             (let ((up (sb-thread:make-semaphore))
+                   (port nil))
+               (values (sb-thread:make-thread
+                        (lambda ()
+                          (start-server
+                           :host #(127 0 0 1) :port 0 :workers 1
+                           :on-listen (lambda (p)
+                                        (setf port p)
+                                        (sb-thread:signal-semaphore up))
+                           :handler (lambda (req)
+                                      (declare (ignore req))
+                                      (make-text-response 200 name))))
+                        :name name)
+                       (lambda ()
+                         (and (sb-thread:wait-on-semaphore up :timeout 10)
+                              port))))))
+      (unwind-protect
+           (multiple-value-bind (earlier earlier-port) (run "earlier")
+             (funcall earlier-port)
+             (multiple-value-bind (later later-port) (run "later")
+               (let ((port (funcall later-port)))
+                 (web-skeleton:register-cleanup (lambda () (incf hooks)))
+                 (check "replaced: the earlier call returns, with *SHUTDOWN* left clear"
+                        (list (handler-case
+                                  (progn (sb-thread:join-thread earlier :timeout 5) t)
+                                (error () nil))
+                              web-skeleton::*shutdown*)
+                        '(t nil))
+                 (check "replaced: the later run serves on, its hook not run, SBCL's handler not back"
+                        (list (%port-answers-with-p port "later")
+                              hooks
+                              (not (null (find sbcl installed))))
+                        '(t 0 nil))
+                 (setf web-skeleton::*shutdown* t)
+                 (handler-case (sb-thread:join-thread later :timeout 15)
+                   (error () nil))
+                 (check "replaced: the later run's end runs its hook once, and puts SBCL's handler back"
+                        (list hooks (eq (first installed) sbcl))
+                        '(1 t)))))
+        (setf web-skeleton::*shutdown* t)
+        (sb-int:unencapsulate 'sb-sys:enable-interrupt 'recorded)
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll)))))
+
+(defun test-harness-a-drain-closes-its-listener-first ()
+  "A worker that begins its drain closes its listener then, not once the
+   drain has ended. Open, the listener stays in the port's SO_REUSEPORT
+   group, and the kernel goes on completing connections into its queue
+   that nothing will accept, which the close at the end of the drain
+   resets: in a handover, a share of the new connections for as long as
+   the old server drains, with a server beside it that would have served
+   them.
+
+   A client asks for a 32 MiB response and reads none of it, which holds
+   the drain until *DRAIN-TIMEOUT*, three seconds here. Shutdown is asked
+   for, and a connect to the port is tried until it is refused: within a
+   second and a half, the drain still going, and not only once it has
+   run out.
+
+   Started by hand rather than through WITH-TEST-SERVER, to choose the
+   drain's length and to ask for shutdown while the server is serving."
+  (format t "~%Harness: a drain closes its listener first~%")
+  (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+        (saved-drain *drain-timeout*)
+        (saved-poll *worker-wake-interval*)
+        (big (make-string (* 32 1024 1024) :initial-element #\x))
+        (up (sb-thread:make-semaphore))
+        (bound nil)
+        (server nil)
+        (stuck nil))
+    (setf web-skeleton::*shutdown-hooks* nil
+          web-skeleton::*shutdown* nil
+          *drain-timeout* 3
+          *worker-wake-interval* 0.05)
+    (unwind-protect
+         (progn
+           (setf server
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (start-server
+                     :host #(127 0 0 1) :port 0 :workers 1
+                     :on-listen (lambda (p)
+                                  (setf bound p)
+                                  (sb-thread:signal-semaphore up))
+                     :handler (lambda (req)
+                                (declare (ignore req))
+                                (make-text-response 200 big))))
+                  :name "drain-listener-server"))
+           (check "drain listener: control, the server started"
+                  (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                  t)
+           (setf stuck (make-instance 'sb-bsd-sockets:inet-socket
+                                      :type :stream :protocol :tcp))
+           (sb-bsd-sockets:socket-connect stuck #(127 0 0 1) bound)
+           (let ((stream (sb-bsd-sockets:socket-make-stream
+                          stuck :output t :element-type '(unsigned-byte 8))))
+             (write-sequence (%ascii (format nil "GET /big HTTP/1.1~aHost: localhost~a~a"
+                                             *crlf* *crlf* *crlf*))
+                             stream)
+             (force-output stream))
+           ;; The response begun, and stuck behind the unread window.
+           (sleep 0.3)
+           (check "drain listener: control, a connect is made while it serves"
+                  (%connect-refused-p bound)
+                  nil)
+           (let ((asked (get-internal-real-time)))
+             (setf web-skeleton::*shutdown* t)
+             (let ((refused (loop repeat 100
+                                  thereis (%connect-refused-p bound)
+                                  do (sleep 0.05))))
+               (check "drain listener: refused while the drain still has its connection"
+                      (list refused
+                            (< (- (get-internal-real-time) asked)
+                               (* 1.5 internal-time-units-per-second)))
+                      '(t t)))))
+      (setf web-skeleton::*shutdown* t)
+      (when stuck (ignore-errors (sb-bsd-sockets:socket-close stuck)))
+      (when server
+        (handler-case (sb-thread:join-thread server :timeout 15)
+          (error ()
+            (ignore-errors (sb-thread:terminate-thread server))
+            (ignore-errors (sb-thread:join-thread server)))))
+      (setf web-skeleton::*shutdown-hooks* saved-hooks
+            *drain-timeout* saved-drain
+            *worker-wake-interval* saved-poll))))
+
+(defun test-harness-a-superseded-run-lets-go-of-its-claim ()
+  "A START-SERVER whose run a later one in the image has replaced lets go
+   of its port's claim, and stops asking for a claim it was waiting on.
+
+   Its workers stop for the later run, so nothing of it serves the port.
+   A claim it kept would have the next server started there refused, for
+   a server that is not serving; one it went on asking for would be taken
+   once its holder let go, with the same result. Its call still waits for
+   shutdown, since returning through its cleanup would stop the later run
+   as well.
+
+   The later run is stood in for by moving *RUN-GENERATION* on by hand,
+   which is all a later START-SERVER is to the wait of an earlier one.
+   Who holds a claim is asked of CLAIM-PORT, its answer given straight
+   back: a claim that is free is taken, and let go again."
+  (format t "~%Harness: a superseded run lets go of its port's claim~%")
+  (flet ((free-p (port)
+           (let ((got (web-skeleton::claim-port port)))
+             (web-skeleton::release-port-claim got)
+             (typep got 'sb-bsd-sockets:socket))))
+    ;; A claim it holds: its own, on the port the kernel chose for it.
+    (%call-with-bare-server 1
+      (lambda (port)
+        (check "superseded: control, the serving run holds its port's claim"
+               (free-p port)
+               nil)
+        (incf web-skeleton::*run-generation*)
+        (check "superseded: the claim it held is let go"
+               (loop repeat 40
+                     thereis (free-p port)
+                     do (sleep 0.05))
+               t)))
+    ;; A claim it was waiting on, having joined a port with :SHARE-PORT.
+    (let ((saved-hooks web-skeleton::*shutdown-hooks*)
+          (saved-drain *drain-timeout*)
+          (saved-poll *worker-wake-interval*)
+          (holder (web-skeleton::make-tcp-listener #(127 0 0 1) 0))
+          (up (sb-thread:make-semaphore))
+          (other nil)
+          (server nil))
+      ;; Global SETF: the workers read these from threads START-SERVER
+      ;; spawns.
+      (setf web-skeleton::*shutdown-hooks* nil
+            web-skeleton::*shutdown* nil
+            *drain-timeout* 1
+            *worker-wake-interval* 0.05)
+      (unwind-protect
+           (let ((port (%port-of holder)))
+             (setf other (web-skeleton::claim-port port))
+             (sb-bsd-sockets:socket-close holder)
+             (setf server
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (start-server
+                       :host #(127 0 0 1) :port port :workers 1 :share-port t
+                       :on-listen (lambda (p)
+                                    (declare (ignore p))
+                                    (sb-thread:signal-semaphore up))
+                       :handler (lambda (req)
+                                  (declare (ignore req))
+                                  (make-text-response 200 "joined"))))
+                    :name "superseded-joiner"))
+             (check "superseded: control, a server joined a port whose claim another holds"
+                    (not (null (sb-thread:wait-on-semaphore up :timeout 10)))
+                    t)
+             (incf web-skeleton::*run-generation*)
+             ;; Passes enough for its wait to have seen the run move on.
+             (sleep 0.3)
+             (web-skeleton::release-port-claim other)
+             (setf other nil)
+             ;; Past the second in which it would have asked again.
+             (sleep 1.5)
+             (check "superseded: and a claim it was waiting on is not taken once free"
+                    (free-p port)
+                    t))
+        (web-skeleton::release-port-claim other)
+        (ignore-errors (sb-bsd-sockets:socket-close holder))
+        (setf web-skeleton::*shutdown* t)
+        (when server
+          (handler-case (sb-thread:join-thread server :timeout 10)
+            (error ()
+              (ignore-errors (sb-thread:terminate-thread server))
+              (ignore-errors (sb-thread:join-thread server)))))
+        (setf web-skeleton::*shutdown-hooks* saved-hooks
+              *drain-timeout* saved-drain
+              *worker-wake-interval* saved-poll)))))
+
+(defun test-harness-a-kernel-chosen-port-is-claimed-too ()
+  "A server on a port the kernel chose holds that port's claim while it
+   serves and has let go when it returns, and a number another server has
+   claimed is passed over for the next the kernel offers.
+
+   The passing over is asked of MAKE-CLAIMED-LISTENER with CLAIM-PORT
+   answering :HELD for the first number, since which number the kernel
+   offers is not this test's to choose. The listeners it made are
+   collected, to see the one passed over closed."
+  (format t "~%Harness: a port the kernel chose is claimed too~%")
+  (let ((served nil))
+    (%call-with-bare-server 1
+      (lambda (port)
+        (setf served port)
+        (let ((got (and port (web-skeleton::claim-port port))))
+          (check "kernel-chosen port: its claim is held while the server serves"
+                 got :held)
+          (web-skeleton::release-port-claim got))))
+    (let ((free (and served (web-skeleton::claim-port served))))
+      (check "kernel-chosen port: and let go when the server has returned"
+             (typep free 'sb-bsd-sockets:socket) t)
+      (web-skeleton::release-port-claim free)))
+  (let ((asked nil)
+        (made nil)
+        (always nil))
+    (sb-int:encapsulate
+     'web-skeleton::claim-port 'held-at-first
+     (lambda (real port)
+       (push port asked)
+       (if (or always (null (cdr asked)))
+           :held
+           (funcall real port))))
+    (sb-int:encapsulate
+     'web-skeleton::make-tcp-listener 'collected
+     (lambda (real host port)
+       (let ((listener (funcall real host port)))
+         (push listener made)
+         listener)))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (listener claim)
+               (web-skeleton::make-claimed-listener #(127 0 0 1))
+             (unwind-protect
+                  (progn
+                    (check "passed over: the kernel was asked twice"
+                           (length asked) 2)
+                    (check "passed over: the first listener is closed, the second kept"
+                           (mapcar #'sb-bsd-sockets:socket-open-p (reverse made))
+                           '(nil t))
+                    (check "passed over: the listener is on the number it claimed"
+                           (list (= (%port-of listener) (first asked))
+                                 (typep claim 'sb-bsd-sockets:socket))
+                           '(t t)))
+               (web-skeleton::release-port-claim claim)
+               (ignore-errors (sb-bsd-sockets:socket-close listener))))
+           ;; Every number claimed: the start says so, with no listener
+           ;; left open behind it.
+           (setf asked nil made nil always t)
+           (check "passed over: sixteen claimed numbers end the start, by name"
+                  (handler-case
+                      (progn (web-skeleton::make-claimed-listener #(127 0 0 1))
+                             :returned)
+                    (error (e)
+                      (and (search "sixteen ports" (princ-to-string e)) t)))
+                  t)
+           (check "passed over: and each of the sixteen listeners was closed"
+                  (list (length made)
+                        (count-if #'sb-bsd-sockets:socket-open-p made))
+                  '(16 0)))
+      (sb-int:unencapsulate 'web-skeleton::claim-port 'held-at-first)
+      (sb-int:unencapsulate 'web-skeleton::make-tcp-listener 'collected)
+      (dolist (listener made)
+        (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+  (check "start-server: a :port that is no port number is refused by name"
+         (handler-case (progn (start-server :port 70000 :workers 1) :returned)
+           (error (e)
+             (and (search ":port must be an integer from 0 to 65535"
+                          (princ-to-string e))
+                  t)))
+         t))
+
 (defun %raw-connect ()
   "A raw socket to the live test server, plus its byte stream.
 
@@ -4058,6 +5515,60 @@
     (check "control: the log names the crash"
            (not (null (search "crashed" (get-output-stream-string log))))
            t)))
+
+(defun test-harness-empty-lines-before-a-request-line-e2e ()
+  "Empty lines before a request line are skipped: between two requests
+   on a kept-alive connection, after a POST's body, and at the start of a
+   connection. RFC 9112 §2.2 asks this of a server, for the CRLF some
+   clients send after a body, which is otherwise the next request's first
+   line, an empty one, answered 400 with the connection closed.
+
+   A CRLF and nothing else is an empty line: a lone LF in front of a
+   request is refused, as it is anywhere in a head. And the empty lines
+   in front of one request are counted against *MAX-REQUEST-LINE-LENGTH*,
+   so a request behind more of them than that is refused with 400."
+  (format t "~%Harness: empty lines before a request line~%")
+  (with-test-server
+      (:handler (lambda (req)
+                  (make-text-response
+                   200 (format nil "path=~a" (http-request-path req)))))
+    (flet ((exchange (&rest parts)
+             (%raw-exchange (%ascii (apply #'concatenate 'string parts))))
+           (get-line (path &optional close)
+             (format nil "GET ~a HTTP/1.1~aHost: localhost~a~@[Connection: close~a~]~a"
+                     path *crlf* *crlf* (and close *crlf*) *crlf*)))
+      (let ((between (exchange (get-line "/one") *crlf* (get-line "/two" t)))
+            (after-body (exchange "POST /form HTTP/1.1" *crlf*
+                                  "Host: localhost" *crlf*
+                                  "Content-Length: 5" *crlf* *crlf*
+                                  "HELLO" *crlf*
+                                  (get-line "/after" t)))
+            (opening (exchange *crlf* *crlf* (get-line "/fresh" t)))
+            (lone-lf (exchange (string #\Newline) (get-line "/lf" t)))
+            (too-many (exchange (with-output-to-string (s)
+                                  (loop repeat (1+ (floor *max-request-line-length* 2))
+                                        do (write-string *crlf* s)))
+                                (get-line "/far" t))))
+        (check "empty lines: a CRLF between kept-alive requests is skipped"
+               (list (not (null (search "path=/one" between)))
+                     (not (null (search "path=/two" between)))
+                     (search "HTTP/1.1 400" between))
+               '(t t nil))
+        (check "empty lines: and one after a POST's body"
+               (list (not (null (search "path=/form" after-body)))
+                     (not (null (search "path=/after" after-body))))
+               '(t t))
+        (check "empty lines: and two at the start of a connection"
+               (not (null (search "path=/fresh" opening)))
+               t)
+        (check "empty lines: a lone LF in front of a request is refused"
+               (list (not (null (search "HTTP/1.1 400" lone-lf)))
+                     (search "path=/lf" lone-lf))
+               '(t nil))
+        (check "empty lines: more of them than a request line may be is refused"
+               (list (not (null (search "HTTP/1.1 400" too-many)))
+                     (search "path=/far" too-many))
+               '(t nil))))))
 
 (defun test-harness-pipelined-after-body-e2e ()
   "A request carrying a Content-Length body, with a second request
@@ -5493,7 +7004,7 @@
                          :fd (web-skeleton::socket-fd target-sock)
                          :socket target-sock
                          :state :streaming
-                         :last-active (get-universal-time)))
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (out (web-skeleton::make-connection
                       :fd (web-skeleton::socket-fd out-sock)
                       :socket out-sock
@@ -5503,14 +7014,14 @@
                       :fetch-method :GET
                       ;; Paused, and therefore subscribed to nothing.
                       :fetch-paused t
-                      :fetch-paused-at (get-universal-time)
+                      :fetch-paused-at (web-skeleton::monotonic-seconds)
                       ;; Already past its deadline: the sweeper's test is
                       ;; (> now deadline), so this is the state a real one
                       ;; reaches after *FETCH-TIMEOUT* of no progress.
-                      :fetch-started-at (- (get-universal-time) 600)
-                      :fetch-deadline (- (get-universal-time) 300)
+                      :fetch-started-at (- (web-skeleton::monotonic-seconds) 600)
+                      :fetch-deadline (- (web-skeleton::monotonic-seconds) 300)
                       :inbound-fd (web-skeleton::socket-fd target-sock)
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-callback
                       (lambda (status headers body)
                         (declare (ignore headers body))
@@ -5524,7 +7035,7 @@
                         (web-skeleton::connection-fd out))
                        t)
                   t)
-           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           (web-skeleton::sweep-idle-connections epfd (web-skeleton::monotonic-seconds))
            ;; The three the arm exists for.
            (check "detached sweep: the expired outbound was reaped"
                   (web-skeleton::lookup-connection
@@ -5576,8 +7087,8 @@
                          :stream-framing :chunked
                          ;; Produced nothing for an hour: only the moving
                          ;; queue keeps this stream from being idle.
-                         :stream-produced-at (- (get-universal-time) 3600)
-                         :last-active (get-universal-time)))
+                         :stream-produced-at (- (web-skeleton::monotonic-seconds) 3600)
+                         :last-active (web-skeleton::monotonic-seconds)))
                 (out (web-skeleton::make-connection
                       :fd (web-skeleton::socket-fd out-sock)
                       :socket out-sock
@@ -5586,11 +7097,11 @@
                       :fetch-sink :detached
                       :fetch-method :GET
                       :fetch-paused t
-                      :fetch-paused-at (- (get-universal-time) 120)
-                      :fetch-started-at (- (get-universal-time) 600)
-                      :fetch-deadline (- (get-universal-time) 300)
+                      :fetch-paused-at (- (web-skeleton::monotonic-seconds) 120)
+                      :fetch-started-at (- (web-skeleton::monotonic-seconds) 600)
+                      :fetch-deadline (- (web-skeleton::monotonic-seconds) 300)
                       :inbound-fd (web-skeleton::socket-fd target-sock)
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-callback
                       (lambda (status headers body)
                         (declare (ignore status headers body))
@@ -5603,7 +7114,7 @@
             target (sb-ext:string-to-octets "draining" :external-format :ascii))
            (check "draining pause: the target has a backlog"
                   (plusp (web-skeleton::connection-write-pending target)) t)
-           (web-skeleton::sweep-idle-connections epfd (get-universal-time))
+           (web-skeleton::sweep-idle-connections epfd (web-skeleton::monotonic-seconds))
            (check "draining pause: the outbound is still registered"
                   (and (web-skeleton::lookup-connection
                         (web-skeleton::connection-fd out))
@@ -7512,20 +9023,43 @@
    a run of the file and is resumed by the upload draining, and the field
    after the file is read only after that. A file with no content still
    makes its request, started at :ON-PART-END: the upstream gets an empty
-   body, and the client its answer."
+   body, and the client its answer.
+
+   A check that fails says what it saw in place of what it wanted. The
+   client's answer is printed as it came, the upstream's side as how much
+   of a request it read, and the last two checks hold what FETCH-SEND
+   answered when it took no bytes and what each upload's :THEN heard. An
+   upload that ended before the file had gone shows in all of them, and
+   between them they say where it ended."
   (format t "~%Harness: a form's file forwarded upstream as it arrives~%")
   (let* ((lock (sb-thread:make-mutex :name "form-forward-e2e"))
          (fields nil)
          (pauses 0)
          (aborts nil)
+         (refused nil)
+         (heard nil)
          (upstream-port (list nil))
          (boundary "----FormBoundaryForwardQ3x")
          (file (%pseudo-random-bytes (* 2 1024 1024) 71)))
-    (labels ((then (status headers b)
-               (declare (ignore headers))
-               (if (eql status 200)
-                   (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
-                   (make-error-response 502)))
+    (labels ((then-for (path)
+               (lambda (status headers b)
+                 (declare (ignore headers))
+                 (sb-thread:with-mutex (lock) (push (cons path status) heard))
+                 (if (eql status 200)
+                     (make-text-response 200 (sb-ext:octets-to-string b :external-format :latin-1))
+                     (make-error-response 502))))
+             (or-what-arrived (seen wanted)
+               ;; T when the upstream read a request whose body is WANTED,
+               ;; and otherwise how much of one it did read, for the check
+               ;; to print.
+               (cond ((null seen) "the upstream read no request")
+                     ((null (second seen)) "the upstream read a head, and no whole body")
+                     ((equalp (second seen) wanted) t)
+                     (t (format nil "the upstream read another body, of ~d bytes"
+                                (length (second seen))))))
+             (or-the-answer (text answer)
+               ;; T when ANSWER has TEXT in it, and otherwise ANSWER.
+               (if (search text answer) t answer))
              (through (request &rest upstream-args)
                (multiple-value-bind (port thread) (apply #'%upload-upstream upstream-args)
                  (setf (first upstream-port) port)
@@ -7543,9 +9077,9 @@
           (:handler (lambda (req) (declare (ignore req)) (make-error-response 404))
            :body-handler
            (lambda (req)
-             (let ((path (http-request-path req))
-                   (put (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
-                                    :body :stream :then #'then)))
+             (let* ((path (http-request-path req))
+                    (put (http-fetch :put (format nil "http://127.0.0.1:~d/up" (first upstream-port))
+                                     :body :stream :then (then-for path))))
                (receive-multipart
                 req
                 :max-size nil
@@ -7561,7 +9095,10 @@
                                         ((null sent)
                                          (sb-thread:with-mutex (lock) (incf pauses))
                                          :pause)
-                                        (t (make-error-response 502)))))
+                                        (t
+                                         (sb-thread:with-mutex (lock)
+                                           (push (cons path sent) refused))
+                                         (make-error-response 502)))))
                 :on-part-end (lambda (conn part)
                                ;; A file with no content never started it.
                                (when (and (form-part-filename part)
@@ -7583,10 +9120,10 @@
                  (sb-thread:with-mutex (lock) (cdr (assoc path fields :test #'string=)))))
           (multiple-value-bind (answer seen) (through (form "/file" file) :pace 0.002)
             (check "file: the upstream received the file, and only the file, whole"
-                   (and seen (equalp (second seen) file)) t)
+                   (or-what-arrived seen file) t)
             (check "file: the client heard the upstream's answer"
-                   (and (search (format nil "got:~d:~a" (length file) (sha256-hex file)) answer)
-                        t)
+                   (or-the-answer (format nil "got:~d:~a" (length file) (sha256-hex file))
+                                  answer)
                    t)
             (check "file: the fields either side of it reached :on-end"
                    (fields-of "/file") '(("title" . "before") ("note" . "after")))
@@ -7594,12 +9131,17 @@
           (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
             (multiple-value-bind (answer seen) (through (form "/empty" empty))
               (check "empty: the upstream got a request with an empty body"
-                     (and seen (equalp (second seen) empty)) t)
+                     (or-what-arrived seen empty) t)
               (check "empty: and the client its answer"
-                     (and (search (format nil "got:0:~a" (sha256-hex empty)) answer) t) t)
+                     (or-the-answer (format nil "got:0:~a" (sha256-hex empty)) answer) t)
               (check "empty: the fields reached :on-end"
                      (fields-of "/empty") '(("title" . "before") ("note" . "after")))))
-          (check "nothing aborted either form" aborts nil))))))
+          (check "nothing aborted either form" aborts nil)
+          (check "FETCH-SEND took every run of the file, or held it"
+                 (sb-thread:with-mutex (lock) (reverse refused)) nil)
+          (check "each upload's :then heard the upstream's 200, once"
+                 (sb-thread:with-mutex (lock) (reverse heard))
+                 '(("/file" . 200) ("/empty" . 200))))))))
 
 (defun test-harness-streamed-request-body-timing-e2e ()
   "A streamed request body is timed on its progress: *FETCH-TIMEOUT*
@@ -8936,7 +10478,7 @@
                              :state :websocket
                              :fetch-outstanding t
                              :fetch-failure-disposition target-disposition
-                             :last-active (get-universal-time))))
+                             :last-active (web-skeleton::monotonic-seconds))))
                      (web-skeleton::register-connection c)
                      c))))
     (unwind-protect
@@ -8952,7 +10494,7 @@
                       :fetch-sink :detached
                       :inbound-fd (if target (web-skeleton::connection-fd target) -1)
                       :fetch-method :GET
-                      :last-active (get-universal-time)
+                      :last-active (web-skeleton::monotonic-seconds)
                       :fetch-on-body
                       (lambda (c chunk)
                         (declare (ignore c))
@@ -9046,7 +10588,7 @@
                         :state :websocket
                         :fetch-outstanding t
                         :fetch-failure-disposition disposition
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::deliver-detached
             4242 epfd
@@ -9100,7 +10642,7 @@
                 (let ((target (web-skeleton::make-connection
                                :fd 4242
                                :state :websocket
-                               :last-active (get-universal-time))))
+                               :last-active (web-skeleton::monotonic-seconds))))
                   (web-skeleton::register-connection target)
                   (fetch-into target
                               (http-fetch :get "http://127.0.0.1:1/x"
@@ -9168,7 +10710,7 @@
                 (conn (web-skeleton::make-connection
                        :fd 4242
                        :state :streaming
-                       :last-active (get-universal-time))))
+                       :last-active (web-skeleton::monotonic-seconds))))
            ;; Not registered: what a connection owned by another worker
            ;; looks like from here.
            (check "fetch-into: a connection this worker does not own is refused"
@@ -9263,7 +10805,7 @@
                         :state :websocket
                         :fetch-outstanding t
                         :fetch-failure-disposition :close
-                        :last-active (get-universal-time))))
+                        :last-active (web-skeleton::monotonic-seconds))))
            (web-skeleton::register-connection target)
            (web-skeleton::connection-append-write
             target (make-array 8 :element-type '(unsigned-byte 8)
@@ -9577,6 +11119,7 @@
   (test-connection-serial-does-not-repeat-when-an-fd-does)
   (test-connection-serial-survives-a-worker-restart)
   (test-harness-pipelined-after-body-e2e)
+  (test-harness-empty-lines-before-a-request-line-e2e)
   (test-harness-chunked-keepalive-e2e)
   (test-harness-chunked-trailer-smuggle-e2e)
   (test-harness-chunked-body-cap-e2e)
@@ -9597,7 +11140,11 @@
   (test-harness-close-delimited-fetch-e2e)
   (test-harness-fetch-latin-1-header-e2e)
   (test-harness-accept-failure-is-retried-e2e)
+  (test-harness-a-clock-step-moves-no-deadline-e2e)
   (test-harness-client-errors-log-once-a-minute-e2e)
+  (test-harness-a-handler-that-raises-logs-a-line-not-a-flood-e2e)
+  (test-harness-a-burst-that-ends-has-its-count-logged-e2e)
+  (test-harness-a-stopping-worker-logs-what-it-held-back-e2e)
   (test-harness-outbound-head-budget-and-search-e2e)
   (test-harness-dns-all-addresses-refused-e2e)
   (test-harness-address-filter-asked-once-e2e)
@@ -9622,6 +11169,20 @@
   (test-harness-drain-closes-a-keep-alive-response-it-let-finish)
   (test-harness-port-zero-reported)
   (test-harness-port-zero-workers-share-one-port)
+  (test-harness-a-port-that-cannot-be-bound-fails-the-start)
+  (test-harness-a-start-refused-at-its-bind-leaves-a-running-server-alone)
+  (test-harness-a-port-claim-has-one-holder)
+  (test-harness-a-claimed-port-refuses-a-second-server)
+  (test-harness-a-claim-held-where-nothing-listens-refuses-nothing)
+  (test-harness-a-held-claim-refuses-by-what-listens)
+  (test-harness-a-claim-asking-that-fails-in-the-look-is-not-the-claim)
+  (test-harness-a-listener-with-no-claim-refuses-a-start)
+  (test-harness-starts-past-a-held-claim-go-one-at-a-time)
+  (test-harness-a-stopped-server-puts-sbcls-sigterm-handler-back)
+  (test-harness-a-replaced-run-returns-and-leaves-the-later-run-its-own)
+  (test-harness-a-superseded-run-lets-go-of-its-claim)
+  (test-harness-a-drain-closes-its-listener-first)
+  (test-harness-a-kernel-chosen-port-is-claimed-too)
   (test-harness-streaming-e2e)
   (test-harness-sse-e2e)
   (test-harness-sse-keepalive-framed-e2e)

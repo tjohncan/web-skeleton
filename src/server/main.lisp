@@ -39,13 +39,21 @@
                                     'sb-bsd-sockets:inet6-socket)
                                 :type :stream
                                 :protocol :tcp)))
-    (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
-    (set-socket-option-int (socket-fd socket)
-                           +sol-socket+ +so-reuseport+ 1)
-    (sb-bsd-sockets:socket-bind socket host port)
-    (sb-bsd-sockets:socket-listen socket *listen-backlog*)
-    (set-nonblocking (socket-fd socket))
-    socket))
+    ;; A socket whose bind or listen the kernel refuses is closed here. Left
+    ;; to its finalizer it would hold a descriptor until a collection ran:
+    ;; one for each try of a worker whose port is not to be had.
+    (handler-case
+        (progn
+          (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
+          (set-socket-option-int (socket-fd socket)
+                                 +sol-socket+ +so-reuseport+ 1)
+          (sb-bsd-sockets:socket-bind socket host port)
+          (sb-bsd-sockets:socket-listen socket *listen-backlog*)
+          (set-nonblocking (socket-fd socket))
+          socket)
+      (error (e)
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        (error e)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Per-worker connection table
@@ -395,18 +403,27 @@
    as activity.")
 
 (defparameter *linger-timeout* 2
-  "Seconds a connection closed after an early error response may go on
-   reading — and discarding — what its client is still sending, before it
-   is closed. 0 closes at once.
+  "Seconds a connection closed after an early error response, or a
+   WebSocket closed after its close frame, may go on reading — and
+   discarding — what its client is still sending, before it is closed.
+   0 closes at once.
 
    An answer given before the request has been read in full — a 413 for a
    body over the cap, a 431, any refusal of the request line or head —
-   leaves the client mid-send. Closing then, with its bytes unread, makes
-   Linux answer RST rather than FIN, which discards response bytes not yet
-   sent and tells the peer the connection failed. See
-   BEGIN-LINGERING-CLOSE. Bounded by time alone: the bytes are the
-   client's to send, so draining them costs what receiving them would
-   have.")
+   leaves the client mid-send. So does a close frame the server sends
+   first: behind it come the payload of a frame refused at its header as
+   too large, the rest of a message a protocol error or
+   *WS-MESSAGE-TIMEOUT* cut off, the frames an application's WS-CLOSE met
+   on their way. Closing then, with the client's bytes unread, makes Linux
+   answer RST rather than FIN, which discards bytes not yet sent and tells
+   the peer the connection failed. See BEGIN-LINGERING-CLOSE. Bounded by
+   time alone: the bytes are the client's to send, so draining them costs
+   what receiving them would have.
+
+   Not at shutdown. The drain closes a connection once what it was owed
+   has gone out, the 1001 it sends each WebSocket included, and waits on
+   no client for the rest: see DRAIN-PENDING-WRITES. A client in the
+   middle of a send when the server stops can meet a reset there.")
 
 (defparameter *ws-idle-timeout* 86400
   "Seconds before an inactive WebSocket connection is closed. 0 to disable.
@@ -468,7 +485,7 @@
                 conn)))
     (connection-queue-write conn bytes)
     (setf (connection-state conn) :write-response
-          (connection-last-active conn) (get-universal-time))
+          (connection-last-active conn) (monotonic-seconds))
     (epoll-modify epoll-fd (connection-fd conn)
                   (logior +epollout+ +epollet+))))
 
@@ -954,7 +971,9 @@
 
    A hook runs once, at the end of the run it was registered before or
    during: the run that fires the hooks consumes them, so a second
-   START-SERVER in the same image runs only the hooks registered since."
+   START-SERVER in the same image runs only the hooks registered since.
+   A run that a later START-SERVER replaces fires none: its hooks run at
+   the end of the run that replaced it."
   (sb-thread:with-mutex (*shutdown-hooks-lock*)
     (push fn *shutdown-hooks*))
   fn)
@@ -1241,10 +1260,13 @@
               (unregister-connection conn)))
           t)
       (error (e)
-        ;; Throttled with a failed accept: ACCEPT-PENDING goes on to the
-        ;; next queued connection, and a set-up failing for one is likely
-        ;; to fail for each.
-        (log-throttled :error :accept-failed "accept failed: ~a" e)
+        ;; Throttled: ACCEPT-PENDING goes on to the next queued connection,
+        ;; and a set-up failing for one is likely to fail for each. Under a
+        ;; kind of its own, apart from the failed accept above: sharing one,
+        ;; either line would hold the other back for a minute, and the
+        ;; count on the line that did log would be of both causes.
+        (log-throttled :error :accept-setup-failed
+                       "accepted connection could not be set up, closed: ~a" e)
         (ignore-errors (sb-bsd-sockets:socket-close client-socket))
         t))))
 
@@ -1253,11 +1275,12 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun begin-lingering-close (conn epoll-fd)
-  "Close CONN after an early error response the way RFC 9112 §9.6 asks of
-   a server that answers before it has read the request: shut down the
-   write side, so the response is followed by a FIN, then read and discard
-   whatever the client is still sending until it stops or *LINGER-TIMEOUT*
-   runs out, and only then close.
+  "Close CONN the way RFC 9112 §9.6 asks of a server that answers before
+   it has read the request, and RFC 6455 §7.1.1 gives for a WebSocket
+   whose close frame has gone out: shut down the write side, so what was
+   sent is followed by a FIN, then read and discard whatever the client is
+   still sending until it stops or *LINGER-TIMEOUT* runs out, and only
+   then close.
 
    Closing at once, with the client's bytes unread in the kernel, makes
    Linux abort the connection with RST rather than end it with FIN: any
@@ -1266,6 +1289,9 @@
    a small response read promptly survives. What survives elsewhere
    depends on the peer — a proxy or client stack that treats a reset as a
    failure may not pass the answer on — and the FIN removes the question.
+   For a WebSocket the answer is the close frame, and the code in it is
+   all that tells the client why. A client whose send fails on a reset
+   may report an abnormal closure and never read it.
 
    What the linger can promise has two limits. A client still sending
    when *LINGER-TIMEOUT* runs out is closed with bytes unread, so it gets
@@ -1282,7 +1308,7 @@
     (close-connection conn epoll-fd)
     (return-from begin-lingering-close))
   (setf (connection-state conn) :lingering
-        (connection-last-active conn) (get-universal-time))
+        (connection-last-active conn) (monotonic-seconds))
   (epoll-modify epoll-fd (connection-fd conn) (logior +epollin+ +epollet+))
   ;; Edge-triggered: what the client sent before this moment raises no new
   ;; edge, so the first drain is now.
@@ -1392,10 +1418,21 @@
 
 (defun drain-connections (listener-socket epoll-fd event-buf)
   "Gracefully drain all active connections during shutdown.
-   Stops accepting, sends WebSocket close frames, lets writes flush,
+   Closes the listener, sends WebSocket close frames, lets writes flush,
    force-closes anything remaining after *drain-timeout*."
-  ;; Stop accepting new connections
+  ;; Stop accepting new connections, by closing the listener and not only
+  ;; taking it out of epoll. Left open, it stays in the port's SO_REUSEPORT
+  ;; group: the kernel goes on handing it new connections and completing
+  ;; them into its queue, which nothing accepts, and they are reset when it
+  ;; closes after the drain. Closed, the connections go to the listeners
+  ;; left on the port, a server started beside this one with :SHARE-PORT
+  ;; to take over from it among them. What its queue holds as it closes is
+  ;; reset all the same, unless net.ipv4.tcp_migrate_req hands it to
+  ;; another listener on the port. RUN-WORKER closes the listener again on
+  ;; its way out, which SOCKET-CLOSE makes nothing: the socket's
+  ;; descriptor is -1 once closed.
   (ignore-errors (epoll-remove epoll-fd (socket-fd listener-socket)))
+  (ignore-errors (sb-bsd-sockets:socket-close listener-socket))
   (let ((count (hash-table-count *connections*)))
     (when (zerop count)
       (return-from drain-connections))
@@ -1419,6 +1456,11 @@
              ;; reads a truncated chunked body, which is exactly what
              ;; happened, and a terminator would claim a complete response
              ;; the app never finished sending. The app hears :SHUTDOWN.
+             ;;
+             ;; A lingering close is cut short the same way. What that
+             ;; connection was owed has gone out, and the linger is a wait
+             ;; for its client to finish sending, which a server that is
+             ;; stopping does not make.
              ((:read-http :read-body :sending-100-continue :awaiting :streaming
                :lingering)
               (close-connection conn epoll-fd :shutdown))
@@ -1488,13 +1530,18 @@
    a 101 becomes :WEBSOCKET, which clears the close-after mark the drain
    set on it. A connection that lands in a state phase 1 would have
    handled is handed to WIND-DOWN as it lands, so the WebSocket gets its
-   1001 like every other, rather than sitting until the deadline."
-  (let ((deadline (+ (get-universal-time) *drain-timeout*)))
+   1001 like every other, rather than sitting until the deadline.
+
+   One that lands in :LINGERING, its response or its close frame gone
+   out, is closed there and then. Only writes are dispatched here, so
+   nothing would read and discard what its client still sends, and the
+   drain does not wait on a client for that."
+  (let ((deadline (+ (monotonic-seconds) *drain-timeout*)))
     (loop
       (when (zerop (hash-table-count *connections*))
         (log-info "all connections drained")
         (return))
-      (when (> (get-universal-time) deadline)
+      (when (> (monotonic-seconds) deadline)
         (log-warn "drain timeout — force-closing ~d connection~:p"
                   (hash-table-count *connections*))
         (return))
@@ -1556,8 +1603,8 @@
              (connection-stream-on-close conn) (stream-response-on-close sresp)
              (connection-stream-keepalive conn) (stream-response-keepalive sresp)
              (connection-state conn) :streaming
-             (connection-last-active conn) (get-universal-time)
-             (connection-stream-produced-at conn) (get-universal-time))
+             (connection-last-active conn) (monotonic-seconds)
+             (connection-stream-produced-at conn) (monotonic-seconds))
        (let ((on-open (stream-response-on-open sresp)))
          (when on-open
            (funcall on-open conn)))
@@ -1719,7 +1766,7 @@
 (defun answer-request (conn epoll-fd handler)
   "CONN's request is complete: parse it, hand it to HANDLER, and set out
    whatever HANDLER answers."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (let ((request (connection-parse-request conn)))
     (log-debug "~a ~a~@[?~a~] HTTP/~a ~a"
                (http-request-method request)
@@ -1742,7 +1789,7 @@
    and the raise goes on to HANDLE-CLIENT-READ's catch, which answers 500.
    :UPGRADE is refused here by name, since a request with a body has had
    it read and is no handshake."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (let ((plan (claim-body-receiver conn))
         (request (connection-request conn)))
     (log-debug "~a ~a: body received (~d bytes)"
@@ -1865,6 +1912,35 @@
               (type-of decision))))
     (connection-begin-body conn peer-finished)))
 
+(defparameter *throttle-handler-errors* t
+  "Whether the line logged for an error that escapes a handler goes
+   through LOG-THROTTLED: the first of a condition type logged at once,
+   and after it at most one a minute on each worker, with a count of the
+   ones held back. NIL logs every one.
+
+   On, because a handler that raises on what a client sends is a handler
+   a client can make raise at will, one line a request, each of them
+   through the one lock every worker logs under. Each such request is
+   still answered 500 and counted in the census whatever this is.
+
+   Off suits development, where the same error raised again ten seconds
+   after a change is the line being looked for.")
+
+(defun log-handler-error (kind condition format-string &rest args)
+  "Log CONDITION, which escaped application code, at WARN.
+
+   Throttled by KIND and the condition's type together, so that a flood of
+   one error leaves the first of another to be logged: a client that can
+   make a handler raise chooses how often, and should not get to choose
+   what else the log shows. By its type and not its text, because the
+   text can be the client's to vary, and a table keyed by it would grow
+   as a client pleased. Errors signalled with a bare format string are all
+   SIMPLE-ERROR, and throttle as one."
+  (if *throttle-handler-errors*
+      (apply #'log-throttled :warn (list kind (type-of condition))
+             format-string args)
+      (apply #'log-warn format-string args)))
+
 (defun handle-client-read (conn epoll-fd handler ws-handler)
   "Handle EPOLLIN on a client connection.
    State dispatch is permissive: a stale EPOLLIN for a connection
@@ -1965,8 +2041,9 @@
                       ;; the queue; appending a close frame instead would
                       ;; land it where the peer is still reading payload
                       ;; and be taken as continuation of the partial one.
-                      (log-warn "ws handler error fd ~d: ~a"
-                                (connection-fd conn) e)
+                      (log-handler-error :ws-handler-error e
+                                         "ws handler error fd ~d: ~a"
+                                         (connection-fd conn) e)
                       (close-connection conn epoll-fd)
                       (return-from handle-client-read)))
                 ;; The replies are queued already, by WEBSOCKET-ON-READ, in
@@ -1985,11 +2062,15 @@
                    ;; Mark as closing so on-write knows to disconnect
                    (setf (connection-state conn) :closing))
                   ;; A reply met *MAX-WRITE-BACKLOG*; WEBSOCKET-ON-READ's
-                  ;; QUEUE-REPLY has why the connection goes.
+                  ;; QUEUE-REPLY has why the connection goes. Logged
+                  ;; through the throttle, as the lines for a bad frame
+                  ;; are: a client that sends and never reads its replies
+                  ;; has this one for each connection it opens.
                   ((eq response :backlog-full)
-                   (log-warn "ws backlog full fd ~d (~d bytes pending) — closing"
-                             (connection-fd conn)
-                             (connection-write-pending conn))
+                   (log-throttled
+                    :warn :ws-backlog-full
+                    "ws backlog full fd ~d (~d bytes pending) — closing"
+                    (connection-fd conn) (connection-write-pending conn))
                    (close-connection conn epoll-fd)
                    (return-from handle-client-read))
                   ;; The ws-handler closed the connection outright, as
@@ -2001,6 +2082,14 @@
                   ;; consuming one shifts the rest down — so a partial
                   ;; frame exceeds our limit: close with 1009 to prevent a
                   ;; spin loop.
+                  ;;
+                  ;; A backstop, which no client reaches while the two
+                  ;; bounds agree. CONNECTION-READ-CAP is the payload cap
+                  ;; and the largest header, and TRY-PARSE-WS-FRAME refuses
+                  ;; a frame declaring more than the payload cap at its
+                  ;; header, so a buffer that is full holds a whole first
+                  ;; frame. The line is the server's own inconsistency if
+                  ;; it is ever logged, and is not throttled.
                   (t
                    (when (>= (connection-read-pos conn)
                              (length (connection-read-buf conn)))
@@ -2076,8 +2165,9 @@
              ;; spurious wake-up, or a transport that wants to write before
              ;; it can read. Nothing to do for either.
              (t nil))))
-        ;; Closing after an early error answer: discard what the client is
-        ;; still sending, and close at its FIN. See BEGIN-LINGERING-CLOSE.
+        ;; Closing after an early error answer, or after a WebSocket's close
+        ;; frame: discard what the client is still sending, and close at
+        ;; its FIN. See BEGIN-LINGERING-CLOSE.
         (:lingering (linger-discard conn epoll-fd))
         ;; Parked for outbound fetch — ignore reads, data stays in kernel buffer
         (:awaiting nil)
@@ -2152,7 +2242,8 @@
                    (connection-fd conn) e)
         (close-connection conn epoll-fd :disconnected)
         (return-from handle-client-read nil))
-      (log-warn "error fd ~d: ~a" (connection-fd conn) e)
+      (log-handler-error :handler-error e
+                         "error fd ~d: ~a" (connection-fd conn) e)
       ;; A body still being received hears :ERROR: its ON-DATA, or the
       ;; body handler, is what raised.
       (notify-body-aborted conn :error)
@@ -2179,7 +2270,7 @@
    activity is the correct semantics for a slow-pipe client, and
    dispatch-time + keep-alive-reset bumps alone would not survive
    a response that takes longer than *IDLE-TIMEOUT* to flush."
-  (setf (connection-last-active conn) (get-universal-time))
+  (setf (connection-last-active conn) (monotonic-seconds))
   (handler-case
       (let* ((backlog (plusp (connection-write-pending conn)))
              (result (connection-on-write conn)))
@@ -2204,7 +2295,8 @@
               (if (connection-close-after-p conn)
                   ;; An early error answer lingers, so the response is
                   ;; followed by a FIN and not a reset; see
-                  ;; BEGIN-LINGERING-CLOSE. Every other close is at once.
+                  ;; BEGIN-LINGERING-CLOSE. Every other response's close is
+                  ;; at once.
                   (if (and (connection-linger conn) (plusp *linger-timeout*))
                       (begin-lingering-close conn epoll-fd)
                       (close-connection conn epoll-fd))
@@ -2248,7 +2340,7 @@
                           ;; that holds whoever sets it next.
                           (connection-linger conn) nil
                           (connection-state conn) :read-http
-                          (connection-last-active conn) (get-universal-time))
+                          (connection-last-active conn) (monotonic-seconds))
                     (epoll-modify epoll-fd (connection-fd conn)
                                  (logior +epollin+ +epollet+))
                     ;; Edge-triggered: data may already be waiting from a
@@ -2310,8 +2402,18 @@
               (epoll-modify epoll-fd (connection-fd conn)
                             (logior +epollin+ +epollet+)))
              (:closing
-              ;; Close frame sent — disconnect
-              (close-connection conn epoll-fd))
+              ;; What was queued has gone out, a close frame last wherever
+              ;; one was queued. When the server is the one closing, its
+              ;; peer is usually still sending: the payload of a frame
+              ;; refused at its header, the rest of a message cut off.
+              ;; Closed with those bytes unread, the connection is reset,
+              ;; which can cost the peer the close frame and the code in
+              ;; it. So the close lingers; see BEGIN-LINGERING-CLOSE. A
+              ;; peer that closed first has nothing left to send, and the
+              ;; linger ends at its FIN, which it may have sent already.
+              (if (plusp *linger-timeout*)
+                  (begin-lingering-close conn epoll-fd)
+                  (close-connection conn epoll-fd)))
              (:sending-100-continue
               ;; 100 Continue flushed — switch to reading the body.
               ;; Returning :keep-alive tells the main loop to re-enter
@@ -2419,8 +2521,8 @@
    later START-SERVER has begun. Either way it drains first, so a response
    a handler finished after its run was told to stop still goes out."
   (let ((listener-fd    (socket-fd listener-socket))
-        (last-ping-time  (get-universal-time))
-        (last-sweep-time (get-universal-time))
+        (last-ping-time  (monotonic-seconds))
+        (last-sweep-time (monotonic-seconds))
         ;; T while an accept has failed with the backlog possibly not
         ;; drained; the maintenance tick retries. See ACCEPT-PENDING.
         (accept-retry    nil)
@@ -2442,8 +2544,16 @@
                 (flags (epoll-event-flags event-buf i)))
             (if (= fd listener-fd)
                 ;; Edge-triggered: accept until none pending, or until an
-                ;; accept fails and the tick has to retry.
-                (setf accept-retry (accept-pending listener-socket epoll-fd))
+                ;; accept fails and the tick has to retry. Not once this
+                ;; worker is stopping: a connection accepted then has its
+                ;; request unread when the drain begins, and the drain
+                ;; closes it, which resets it. Left in the queue, it goes
+                ;; to another listener on the port when the drain closes
+                ;; this one, where net.ipv4.tcp_migrate_req allows; see
+                ;; DRAIN-CONNECTIONS.
+                (unless (worker-stopping-p)
+                  (setf accept-retry
+                        (accept-pending listener-socket epoll-fd)))
                 (dispatch-connection-event fd flags (svref owners i)
                                            epoll-fd handler ws-handler))))
         ;; Held past the batch, a closed connection would wait here for the
@@ -2454,7 +2564,7 @@
       ;; table multiple times per second. 1 s is fine: idle
       ;; timeouts are measured in 10 s+ units, so sub-second sweep
       ;; granularity is pure waste.
-      (let ((now (get-universal-time)))
+      (let ((now (monotonic-seconds)))
         (when (>= (- now last-sweep-time) 1)
           (sweep-idle-connections epoll-fd now)
           ;; Rides the same 1 s gate rather than taking a third timer.
@@ -2474,9 +2584,15 @@
           (reap-dns-children)
           ;; And so does retrying a backlog an accept failure left
           ;; queued: no edge will report it, and a second is soon
-          ;; enough for a server that has run out of descriptors.
-          (when accept-retry
+          ;; enough for a server that has run out of descriptors. Not
+          ;; once the worker is stopping, as for the listener's event.
+          (when (and accept-retry (not (worker-stopping-p)))
             (setf accept-retry (accept-pending listener-socket epoll-fd)))
+          ;; And so does ending a throttled log line's minute, which logs
+          ;; the count of what its kind held back. A burst that has ended
+          ;; sends no further line to end it, and a second is as fine as
+          ;; a count over a minute needs.
+          (flush-log-throttle now)
           (setf last-sweep-time now))
         (when (>= (- now last-ping-time) *ws-ping-interval*)
           (ping-ws-connections epoll-fd)
@@ -2525,10 +2641,11 @@
    why.
 
    LISTENER, when supplied, is an already-bound socket this worker
-   adopts instead of binding one of its own. START-SERVER hands one to
-   worker 0 when :PORT was 0, so that the kernel-assigned port is held
-   by a real listener from the first instant it is knowable — see
-   START-SERVER for why closing it and rebinding is not survivable.
+   adopts instead of binding one of its own. START-SERVER binds the first
+   listener itself and hands it to worker 0: a port that cannot be bound
+   then fails the start, and a kernel-assigned port is held by a real
+   listener from the first instant it is knowable — see START-SERVER for
+   both, and for why closing it and rebinding is not survivable.
 
    Adopted for the first pass only. A restart after a crash binds
    normally, and lands on the right port because by then PORT is the
@@ -2573,7 +2690,8 @@
               (*refusal-drain-buf*
                 (make-array +refusal-drain-size+
                             :element-type '(unsigned-byte 8)))
-              (*log-throttle* (make-hash-table :test #'eq))
+              ;; EQUAL, for the kinds that are a list: see LOG-THROTTLED.
+              (*log-throttle* (make-hash-table :test #'equal))
               (*stream-drain-buf*
                 (make-array 4096 :element-type '(unsigned-byte 8)))
               ;; CAR is the second the string was built for. 0 can never
@@ -2674,6 +2792,13 @@
                      ;; child that would not die would hold the worker's
                      ;; exit.
                      (reap-dns-children)
+                     ;; What the throttle held back in this pass's last
+                     ;; minute, logged as the worker goes, from a stop or a
+                     ;; crash alike: the table is this pass's and goes with
+                     ;; it. IGNORE-ERRORS, since the log stream may be what
+                     ;; failed.
+                     (ignore-errors
+                      (flush-log-throttle (monotonic-seconds) :all t))
                      ;; Drop this worker's published counts on the way out,
                      ;; or a torn down server leaves totals a later reader
                      ;; would sum into a fresh one's.
@@ -2713,13 +2838,23 @@
 ;;;
 ;;; The answer nearest the truth is asked for first:
 ;;;
-;;;   cgroup v2   /sys/fs/cgroup/cpu.max          "QUOTA PERIOD" or "max PERIOD"
+;;;   cgroup v2   cpu.max                            "QUOTA PERIOD" or "max PERIOD"
 ;;;   cgroup v1   cpu.cfs_quota_us / cfs_period_us   quota -1 means unlimited
 ;;;   affinity    sched_getaffinity(2)               cpuset, and nothing else
 ;;;   topology    /sys/devices/system/cpu/online     the host's cores
 ;;;
 ;;; Each source answers NIL when it has nothing to say — no file, an unlimited
 ;;; quota, a shape it cannot parse — and the smallest of what remains wins.
+;;;
+;;; A quota is read where the process is, and in every cgroup above that,
+;;; since a limit on a parent binds its children. /proc/self/cgroup says
+;;; where. A container sees its own cgroup as the root of the hierarchy, so
+;;; there the root is all there is to read. A service systemd starts on a
+;;; host is not at the root: it is in /system.slice/NAME.service, where a
+;;; CPUQuota= puts its cpu.max, and the root has none. Read at the root
+;;; alone, that limit is missed, and the half a core in the first paragraph
+;;; is shared between a worker for every core of the host by the other
+;;; route.
 ;;;
 ;;; The smallest, not the first, because the sources answer different
 ;;; questions. A quota says how much CPU time may be consumed; an affinity
@@ -2742,12 +2877,25 @@
 ;;; reach.
 ;;; ---------------------------------------------------------------------------
 
+(defun %read-lines (path)
+  "The lines of PATH, or NIL if it cannot be read.
+
+   PATH is the system's spelling of the name and is parsed as that. A
+   cgroup's holds whatever its unit was called, and systemd writes a dash
+   in a unit's name as \\x2d: read as a Lisp namestring, that backslash
+   would be an escape and a * or a [ a wildcard."
+  (handler-case
+      (with-open-file (s (sb-ext:parse-native-namestring path)
+                         :if-does-not-exist nil)
+        (when s
+          (loop for line = (read-line s nil nil)
+                while line
+                collect line)))
+    (error () nil)))
+
 (defun %read-first-line (path)
   "First line of PATH, or NIL if it cannot be read."
-  (handler-case
-      (with-open-file (s path :if-does-not-exist nil)
-        (when s (read-line s nil nil)))
-    (error () nil)))
+  (first (%read-lines path)))
 
 (defun quota-to-workers (quota period)
   "Workers implied by a CPU quota of QUOTA per PERIOD, or NIL if either is
@@ -2859,27 +3007,418 @@
                                counts)))
     (when usable (reduce #'min usable))))
 
+(defun parse-proc-cgroup (lines)
+  "Where /proc/self/cgroup's LINES put this process, as (VALUES UNIFIED
+   CPU): its path in the cgroup v2 hierarchy, and its path in the v1
+   hierarchy that carries the cpu controller. Each is NIL when no line
+   gives it.
+
+   A line is ID:CONTROLLERS:PATH. The v2 hierarchy's is 0 with no
+   controllers. A v1 line names its controllers with commas between them,
+   and cpu has to be one of them whole: cpuacct and cpuset are other
+   controllers. The path is the rest of the line, colons and all."
+  (let ((unified nil)
+        (cpu nil))
+    (dolist (line lines (values unified cpu))
+      (let* ((first (position #\: line))
+             (second (and first (position #\: line :start (1+ first)))))
+        (when second
+          (let ((path (string-right-trim '(#\Return) (subseq line (1+ second)))))
+            (cond
+              ((and (string= line "0" :end1 first) (= second (1+ first)))
+               (setf unified path))
+              ((loop with start = (1+ first)
+                     for comma = (position #\, line :start start :end second)
+                     thereis (string= line "cpu" :start1 start
+                                                 :end1 (or comma second))
+                     while comma
+                     do (setf start (1+ comma)))
+               (setf cpu path)))))))))
+
+(defun cgroup-ancestry (path)
+  "The cgroups that limit one at PATH, itself first and the root of its
+   hierarchy last: each as a directory under that root, ending in a slash,
+   the root itself being the empty string. \"/a/b\" is (\"a/b/\" \"a/\" \"\").
+
+   NIL and \"/\" are the root alone. So is a path that climbs with \"..\",
+   which is how /proc/self/cgroup writes a cgroup outside the part of the
+   hierarchy this process can see: nothing under the root answers for it."
+  (let ((names (loop with start = 0
+                     for slash = (position #\/ path :start start)
+                     for end = (or slash (length path))
+                     when (< start end)
+                       collect (subseq path start end)
+                     while slash
+                     do (setf start (1+ slash)))))
+    (when (member ".." names :test #'string=)
+      (setf names nil))
+    (loop for depth from (length names) downto 0
+          collect (format nil "~{~a/~}" (subseq names 0 depth)))))
+
+(defun cgroup-v2-workers (root path)
+  "The fewest workers a cpu.max allows the cgroup at PATH, read there and
+   in each cgroup above it up to ROOT, where the v2 hierarchy is mounted.
+   NIL when none of them sets a limit."
+  (apply #'fewest-cpus
+         (mapcar (lambda (directory)
+                   (parse-cpu-max
+                    (%read-first-line
+                     (concatenate 'string root directory "cpu.max"))))
+                 (cgroup-ancestry path))))
+
+(defun cgroup-v1-workers (root path)
+  "CGROUP-V2-WORKERS for the v1 hierarchy that carries the cpu controller,
+   mounted at ROOT, where a limit is the pair of files PARSE-CFS-QUOTA
+   reads."
+  (flet ((line (directory file)
+           (%read-first-line (concatenate 'string root directory file))))
+    (apply #'fewest-cpus
+           (mapcar (lambda (directory)
+                     (parse-cfs-quota (line directory "cpu.cfs_quota_us")
+                                      (line directory "cpu.cfs_period_us")))
+                   (cgroup-ancestry path)))))
+
 (defun cpu-count ()
   "Workers this process can usefully run. See the section banner for the
-   sources and why the least of them wins."
-  (or (fewest-cpus
-       (parse-cpu-max (%read-first-line "/sys/fs/cgroup/cpu.max"))
-       (parse-cfs-quota
-        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-        (%read-first-line "/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
-       (affinity-cpu-count)
-       (parse-cpu-list (%read-first-line "/sys/devices/system/cpu/online")))
-      (progn
-        (log-warn "cpu-count: no CPU information available, ~
-                   defaulting to 1 worker")
-        1)))
+   sources, where a quota is read, and why the least of them wins."
+  (multiple-value-bind (unified cpu)
+      (parse-proc-cgroup (%read-lines "/proc/self/cgroup"))
+    (or (fewest-cpus
+         (cgroup-v2-workers "/sys/fs/cgroup/" unified)
+         (cgroup-v1-workers "/sys/fs/cgroup/cpu/" cpu)
+         (affinity-cpu-count)
+         (parse-cpu-list (%read-first-line "/sys/devices/system/cpu/online")))
+        (progn
+          (log-warn "cpu-count: no CPU information available, ~
+                     defaulting to 1 worker")
+          1))))
+
+;;; ---------------------------------------------------------------------------
+;;; The port claim
+;;;
+;;; Every listener sets SO_REUSEPORT, which is what lets each worker hold
+;;; the port. It also lets a second server bind it: that bind does not
+;;; fail, the kernel divides arriving connections between the two servers,
+;;; each answering its share from its own state, and nothing in either log
+;;; says so. So a server claims its port number before it binds, and a
+;;; second one finds the claim held.
+;;;
+;;; The claim is a Unix socket bound in the abstract namespace, under a
+;;; name made from the port number. Such a name is not a file: nothing is
+;;; left behind to clean up, and the kernel frees it when the socket is
+;;; closed or its process ends, however it ends. Binding a name that is
+;;; held fails at once with EADDRINUSE: looking and taking are one step,
+;;; with no gap between them for a second server to start in. Connecting
+;;; to the port, to see whether anything answers there, has that gap. The
+;;; abstract namespace belongs to a network namespace, as ports do: two
+;;; containers that cannot share a port do not see each other's claims.
+;;;
+;;; A held name is not enough to refuse a start. Any local process can bind
+;;; one, whatever user it runs as, since the abstract namespace has no
+;;; permissions: a process that could not bind a privileged port can still
+;;; hold its name. And a START-SERVER this image has replaced, or a server
+;;; on another address of the host, holds the name of a port it does not
+;;; serve where this one would. So a start that finds the claim held looks
+;;; at the port as well (PORT-LISTENED-P). A socket listening where this
+;;; server would bind is a second server's, and the start is refused.
+;;; Nothing listening is a holder that does not serve there, and the start
+;;; goes on without the claim and takes it once it is free. The look is
+;;; given a second (HELD-CLAIM-STANDING): a server takes its claim a moment
+;;; before it binds, and a second server started in that moment would
+;;; otherwise find nothing listening yet and go on beside it. A start that
+;;; takes the claim, or can take none, looks once: a socket listening
+;;; there holds no claim, a server between holders in a handover, one
+;;; whose claim could not be attempted or that was built without it, or
+;;; another program, and the start is refused all the same. Two starts
+;;; going on past a held claim at once would each find nothing listening,
+;;; so they look and bind one at a time, under a second name
+;;; (TAKE-PORT-START), and the second meets the first's listener.
+;;;
+;;; The look is a bind, so it asks the kernel's own question: whether a
+;;; socket listens at an address that would share connections with this
+;;; server's. A listener on one address and a wildcard listener on the same
+;;; port meet, since the kernel gives each connection to the more specific
+;;; of the two, and those two servers would each take part of the other's
+;;; traffic. Listeners on two addresses of one host do not meet, and two
+;;; servers there start side by side, the second without the claim.
+;;;
+;;; What starts after a server is not seen by it: another program that sets
+;;; SO_REUSEPORT, under the same user, binds beside a running server all
+;;; the same.
+;;; ---------------------------------------------------------------------------
+
+(defun port-claim-name (port)
+  "The abstract socket name that is the claim on PORT. /proc/net/unix and
+   `ss -xa` list it, after an @, for as long as a server holds it."
+  (format nil "web-skeleton/port/~d" port))
+
+(defun claim-port (port &key (warn t))
+  "Take the claim on PORT: see the banner above. Answers the socket that
+   holds it, for RELEASE-PORT-CLAIM to close; :HELD when it is held, by
+   another server in this process or another, or by any process that has
+   bound the name; or NIL when no claim could be attempted, which leaves
+   the port without one and is logged when WARN is true.
+
+   A claim that cannot be attempted does not stop a server. The socket
+   fails where the process is allowed no Unix sockets, under a systemd
+   unit's RestrictAddressFamilies= without AF_UNIX say, or has no
+   descriptor to spare, and neither is a second server on the port. The
+   look at the port still refuses a start beside a listening server.
+   What goes unguarded is two starts at the same moment, which both look
+   before either has bound.
+
+   WARN false is for a caller that asks again and again:
+   HELD-CLAIM-STANDING, every 50 ms of its look, and RETAKE-PORT-CLAIM,
+   which passes it true only for the first of a run of askings that
+   cannot be made.
+
+   Always a stream socket: the kernel keeps abstract names by socket type,
+   so a claim of another type would not meet this one."
+  (let ((socket nil))
+    (handler-case
+        (progn
+          (setf socket (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                      :type :stream))
+          (sb-bsd-sockets:socket-bind socket (port-claim-name port))
+          socket)
+      (sb-bsd-sockets:address-in-use-error ()
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        :held)
+      (error (e)
+        (when socket
+          (ignore-errors (sb-bsd-sockets:socket-close socket)))
+        (when warn
+          (log-warn "port ~d: its claim could not be attempted (~a), so ~
+                     this server has none: a start beside a listening ~
+                     server is still refused, but two starts at the same ~
+                     moment would not see each other"
+                    port e))
+        nil))))
+
+(defun release-port-claim (claim)
+  "Close CLAIM when it is a claim held: CLAIM-PORT's other answers hold
+   nothing."
+  (when (typep claim 'sb-bsd-sockets:socket)
+    (ignore-errors (sb-bsd-sockets:socket-close claim))))
+
+(defun port-listened-p (host port)
+  "Whether a socket listens where a listener on HOST at PORT would share
+   its connections: at HOST, at the wildcard address of HOST's family or,
+   for a wildcard HOST, at any one address of it, and across the two
+   families where an IPv6 wildcard serves IPv4 too. T, NIL, or :UNKNOWN
+   when the look could not be made.
+
+   The look is a bind, closed at once, so the answer is the kernel's own.
+   It is the first listener's bind without SO_REUSEPORT, which would let
+   it join a listener rather than meet one, and with SO_REUSEADDR, without
+   which the connections an earlier server left on the port, waiting out
+   TIME_WAIT, would meet it as a listener does. IPV6_V6ONLY is left as the
+   host sets it, as MAKE-TCP-LISTENER leaves it. EADDRINUSE is a listener.
+   Any other refusal, of a privileged port or of an address the host does
+   not have, is :UNKNOWN, and the bind that follows names it."
+  (let ((probe nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (setf probe (make-instance (if (= (length host) 16)
+                                              'sb-bsd-sockets:inet6-socket
+                                              'sb-bsd-sockets:inet-socket)
+                                          :type :stream :protocol :tcp))
+               (setf (sb-bsd-sockets:sockopt-reuse-address probe) t)
+               (sb-bsd-sockets:socket-bind probe host port)
+               nil)
+           (sb-bsd-sockets:address-in-use-error () t)
+           (error () :unknown))
+      (when probe
+        (ignore-errors (sb-bsd-sockets:socket-close probe))))))
+
+(defun held-claim-standing (host port)
+  "For a start that found PORT's claim held, and did not ask to join its
+   holder: what stands where it would bind, at HOST. Looked at every 50
+   ms for up to a second, since a server takes its claim a moment before
+   it binds:
+
+     :LISTENING      a socket listens there, and the start is refused
+     :TAKEN, CLAIM   the claim came free meanwhile and is this start's,
+                     CLAIM being the socket that holds it
+     :ABSENT         still held when the second is up, and nothing
+                     listening, or no way to look; an asking that could
+                     not be made counts as held
+
+   A second server is listening well within the second: START-SERVER
+   binds straight after it claims. A holder that is not listening by then
+   does not serve where this server would; see the banner above."
+  (let ((deadline (+ (get-internal-real-time) internal-time-units-per-second)))
+    (loop
+      (case (port-listened-p host port)
+        ((t) (return :listening))
+        (:unknown (return :absent)))
+      ;; Taken only when the answer is a socket. An asking that could not
+      ;; be made, NIL, says nothing of the holder, and the look goes on,
+      ;; ending held as RETAKE-PORT-CLAIM stays held after one: a start
+      ;; that took NIL for the claim would never ask for it again. Nor is
+      ;; such an asking logged, up to twenty times in the second: the
+      ;; start logs how its look ended, and the wait logs the first of its
+      ;; own askings that cannot be made.
+      (let ((claim (claim-port port :warn nil)))
+        (when (typep claim 'sb-bsd-sockets:socket)
+          (return (values :taken claim))))
+      (when (>= (get-internal-real-time) deadline)
+        (return :absent))
+      (sleep 0.05))))
+
+(defun port-start-name (port)
+  "The abstract socket name held by a start going on past PORT's claim
+   held: see TAKE-PORT-START."
+  (format nil "web-skeleton/port/~d/starting" port))
+
+(defun take-port-start (port)
+  "For a start that found PORT's claim held: the lock that has such
+   starts look at the port and bind one at a time, a name bound as the
+   claim is, under PORT-START-NAME. Without it, two starts made together
+   past a holder that does not listen, a squatter or an old server
+   draining, would each find nothing listening and both bind. One at a
+   time, the second looks once the first has bound, and meets its
+   listener.
+
+   Asked for every 50 ms for up to two seconds, which outlasts another
+   start's look and bind. Answers the socket that holds it, to be let go
+   of with RELEASE-PORT-CLAIM once the start has bound or been refused;
+   or NIL when the two seconds ran out, the name held by a process that
+   is not starting, or when it could not be attempted. The start then
+   goes on without it, as past any held name."
+  (let ((name (port-start-name port))
+        (deadline (+ (get-internal-real-time)
+                     (* 2 internal-time-units-per-second))))
+    (loop
+      (let ((socket nil))
+        (handler-case
+            (progn
+              (setf socket (make-instance 'sb-bsd-sockets:local-abstract-socket
+                                          :type :stream))
+              (sb-bsd-sockets:socket-bind socket name)
+              (return socket))
+          (sb-bsd-sockets:address-in-use-error ()
+            (ignore-errors (sb-bsd-sockets:socket-close socket)))
+          (error ()
+            (when socket
+              (ignore-errors (sb-bsd-sockets:socket-close socket)))
+            (return nil))))
+      (when (>= (get-internal-real-time) deadline)
+        (return nil))
+      (sleep 0.05))))
+
+(defun retake-port-claim (claim port asked-at now &optional failing)
+  "For a server started while another held its port's claim, beside it
+   with :SHARE-PORT or past a holder that does not serve where it binds:
+   ask for the claim on PORT again when CLAIM is :HELD and it was last
+   asked for at another second than NOW. Returns (VALUES CLAIM ASKED-AT
+   FAILING) as they stand afterwards. ASKED-AT and NOW are
+   MONOTONIC-SECONDS readings, and FAILING is true when the last asking
+   could not be made.
+
+   START-SERVER calls this from its wait, so a server so started holds
+   the claim within a second or so of the other letting go, and a third
+   server is refused as a second would be. Once a second and not once a
+   pass: the wait's interval is the application's to shorten, and two
+   servers that share a port for good, on two addresses, would otherwise
+   make a socket and fail to bind it at every pass for as long as they
+   ran.
+
+   Still :HELD when the asking could not be made at all. An attempt that
+   failed for want of a descriptor says nothing of the next one, and a
+   server that stopped asking would leave its port unclaimed for good.
+   CLAIM-PORT logs the first asking of such a run, made with FAILING
+   false, and not the ones after it, a second apart for as long as the
+   shortage lasts. An asking that is made ends the run."
+  (if (and (eq claim :held) (/= now asked-at))
+      (let ((taken (claim-port port :warn (not failing))))
+        (values (cond ((typep taken 'sb-bsd-sockets:socket)
+                       (log-info "port ~d: this server holds the claim, its ~
+                                  holder having let go of it"
+                                 port)
+                       taken)
+                      (t :held))
+                now
+                (null taken)))
+      (values claim asked-at failing)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Server entry point
 ;;; ---------------------------------------------------------------------------
 
+(defun sbcl-sigterm-handler ()
+  "The SIGTERM handler SBCL installs at startup, which ends the process,
+   for START-SERVER to put back when its run ends: SB-UNIX::SIGTERM-HANDLER,
+   an internal function present on every SBCL this supports. Looked up by
+   name, so that an SBCL without it is handed :DEFAULT instead, which ends
+   the process too, without SBCL's exit hooks."
+  (let ((name (find-symbol "SIGTERM-HANDLER" "SB-UNIX")))
+    (if (and name (fboundp name))
+        (symbol-function name)
+        :default)))
+
+(sb-ext:defglobal *runs-holding-sigterm* 0
+  "How many START-SERVER runs in this image hold SIGTERM: see
+   RELEASE-RUN-SIGNALS. Changed under *SIGNALS-LOCK*.")
+
+(sb-ext:defglobal *signals-lock* (sb-thread:make-mutex :name "start-server signals")
+  "Held while a run takes SIGTERM or gives it back.")
+
+(defun hold-run-signals ()
+  "Install the run's SIGTERM handler, which sets *SHUTDOWN* as Ctrl-C
+   does, and count the run among those holding it. Counted only once it
+   is installed, so a raise from the install leaves the count as it was."
+  (sb-thread:with-mutex (*signals-lock*)
+    (sb-sys:enable-interrupt sb-unix:sigterm
+                             (lambda (signal info context)
+                               (declare (ignore signal info context))
+                               (setf *shutdown* t)))
+    (incf *runs-holding-sigterm*)))
+
+(defun release-run-signals ()
+  "Count the run out of those holding SIGTERM, and when it was the last,
+   put SBCL's own handler back (SBCL-SIGTERM-HANDLER). Only then: a run a
+   later one in this image has replaced ends while the later one runs,
+   and SBCL's handler back at that moment would have SIGTERM end the
+   process under the later run, undrained."
+  (sb-thread:with-mutex (*signals-lock*)
+    (when (zerop (decf *runs-holding-sigterm*))
+      (sb-sys:enable-interrupt sb-unix:sigterm (sbcl-sigterm-handler)))))
+
+(defun make-first-listener (host port)
+  "MAKE-TCP-LISTENER for the listener START-SERVER binds itself, with a
+   bind or a listen the kernel refuses turned into an error that names the
+   address, as START-SERVER's other refusals name what they refuse."
+  (handler-case (make-tcp-listener host port)
+    (sb-bsd-sockets:socket-error (e)
+      (error "start-server: cannot listen on ~a: ~a"
+             (format-peer-addr host port) e))))
+
+(defun make-claimed-listener (host)
+  "The first listener for a port the kernel chooses, on HOST, and the
+   claim on that port: two values, the second as CLAIM-PORT answers.
+
+   The kernel does not choose a port a listener on HOST holds, but the
+   number may be one another server has claimed: a server on another
+   address, or one between taking its claim and binding. That listener is
+   closed and the kernel asked again, so a server on a port of the
+   kernel's choosing shares it with no other and is not refused either."
+  (loop repeat 16
+        do (let* ((listener (make-first-listener host 0))
+                  (claim (claim-port
+                          (nth-value 1 (sb-bsd-sockets:socket-name
+                                        listener)))))
+             (if (eq claim :held)
+                 (sb-bsd-sockets:socket-close listener)
+                 (return (values listener claim))))
+        finally (error "start-server: each of sixteen ports the kernel ~
+                        chose was claimed by another web-skeleton server.")))
+
 (defun start-server (&key (host #(127 0 0 1)) (port 8081) (workers (cpu-count))
-                          handler ws-handler body-handler on-listen on-tick)
+                          handler ws-handler body-handler on-listen on-tick
+                          share-port
+                     &aux claim listener0 replaced)
   "Start the server with WORKERS event loops on HOST:PORT.
    HOST is a 4-byte IPv4 vector or a 16-byte IPv6 vector, and
    MAKE-TCP-LISTENER dispatches the socket family on its length. Default
@@ -2896,6 +3435,8 @@
      see src/server/body.lisp, and src/server/multipart.lisp for a form
      received as it arrives.
    ON-TICK: function (worker-id), a symbol naming one, or NIL.
+   SHARE-PORT: true to start beside a server that has claimed PORT, where
+     this one would otherwise be refused; see the end of this docstring.
    Each worker gets its own listener socket (SO_REUSEPORT), epoll fd,
    and connection table. Ctrl-C shuts down all workers.
 
@@ -2946,14 +3487,52 @@
    shutdown, so a callback is the only way to answer the question.
 
    A caller that binds port 0 itself, closes, and passes the number here
-   has a race. Every listener sets SO_REUSEPORT, so a second process
-   handed that number in the gap does not fail its bind: both hold the
-   port and the kernel splits traffic between them, silently, with
-   nothing in either log. Resolving here means the port is never free
-   between being chosen and being served."
+   has a race: the port is free between the close and this function's
+   bind, and anything may take it. Another web-skeleton server handed
+   that number refuses this start, or is refused by it, by the claim
+   below. Another program that sets SO_REUSEPORT, run by the same user,
+   is not refused by anything: both hold the port and the kernel splits
+   traffic between them, silently, with nothing in either log. Resolving
+   here means the port is never free between being chosen and being
+   served.
+
+   The first listener is bound on the calling thread, before a worker is
+   spawned, whichever kind of port was asked for. A port that cannot be
+   bound — one another program holds, a privileged one, an address the
+   host does not have — is therefore an error from this function, naming
+   the address, and not each worker failing its bind once a second. The
+   bind, like the claim below, comes before this call has changed
+   anything: a start refused by either leaves a server already running in
+   this image as it was.
+
+   A second server on PORT is refused. Its bind would not fail, every
+   listener setting SO_REUSEPORT, so before it binds this function takes a
+   claim on the port number, holds it until it returns, and signals an
+   error when a socket listens where this server would bind: a server in
+   another process, or another call of this function in this one, whether
+   or not it holds the claim. A claim held where nothing listens, by a
+   process that does not serve there, refuses nothing: the start logs
+   that at WARN, goes on without the claim, and takes it once it is free.
+   The section above CLAIM-PORT says what the claim is and what it does
+   not cover. SHARE-PORT true starts beside the holder instead, which is
+   how a new process takes over from the one it replaces with no gap
+   between them: it logs that it joined, and takes the claim itself once
+   the other lets go. With :PORT 0 there is nothing to refuse: a number
+   another server has claimed is passed over for the next the kernel
+   offers.
+
+   A later call of this function in this image replaces a running one:
+   that run's workers stop, and its call lets go of its claim and
+   returns. It leaves *SHUTDOWN*, the shutdown hooks and SIGTERM's
+   handler to the later run, whose end runs the hooks after its own drain
+   and, once no run is left, puts SBCL's SIGTERM handler back."
   (unless (and (integerp workers) (plusp workers))
     (error "start-server: :workers must be a positive integer, got ~a"
            workers))
+  ;; Read as a number below, for the claim's name and for the bind.
+  (unless (typep port '(integer 0 65535))
+    (error "start-server: :port must be an integer from 0 to 65535, got ~s"
+           port))
   ;; WS-SEND checks this too, but only WS-SEND does, and a handler that
   ;; returns a frame instead of pushing one never goes through it — that
   ;; path appends directly. A zero here would therefore leave the primary
@@ -2998,7 +3577,7 @@
   ;; keeps fresh. Checked at boot rather than at the first parked request,
   ;; for the reason the two above give: a misconfiguration should not wait
   ;; for the shape that reveals it. Whole seconds, since the fetch path adds
-  ;; it to GET-UNIVERSAL-TIME; the eleventh says why that rules out a
+  ;; it to MONOTONIC-SECONDS; the eleventh says why that rules out a
   ;; fraction.
   (unless (and (integerp *fetch-timeout*) (plusp *fetch-timeout*))
     (error "start-server: *fetch-timeout* is ~s; it must be a positive whole ~
@@ -3094,9 +3673,9 @@
   ;; body, no limit on connections, no interim response.
   ;;
   ;; A fraction is fine for a setting held against a difference of two
-  ;; clock readings. One added to GET-UNIVERSAL-TIME takes whole seconds:
-  ;; the deadline lands in an integer slot, and a float at the clock's
-  ;; magnitude would resolve only to 256 seconds besides.
+  ;; clock readings. One added to MONOTONIC-SECONDS takes whole seconds:
+  ;; the deadline lands in an integer slot, and a single float at the
+  ;; clock's magnitude would resolve only to a minute or two besides.
   (loop for (name kind) in '((*idle-timeout* :seconds)
                              (*ws-idle-timeout* :seconds)
                              (*ws-message-timeout* :seconds)
@@ -3139,6 +3718,106 @@
                       (:positive-whole-seconds "a positive whole number of seconds")
                       (:count "an integer, 0 or more")
                       (:positive-count "a positive integer"))))
+  ;; Twelfth and last, and the two that take something: the claim on PORT
+  ;; and the first listener. Both come before anything changes, so a start
+  ;; refused by either leaves everything as it was: an earlier run's
+  ;; workers, and a server running in this image, are not touched by it.
+  ;;
+  ;; The first listener is bound here, on the calling thread, and not by a
+  ;; worker, for two reasons. A port that cannot be bound fails the start:
+  ;; a worker whose bind fails restarts and tries again, once a second, so
+  ;; left to the workers, a port another program holds would have every
+  ;; one of them doing that for as long as the process ran, with this
+  ;; function in its wait below and its caller told nothing. And port 0 is
+  ;; resolved here, once, rather than by the workers each passing it to
+  ;; bind(2). Two things break if they do: N workers on port 0 land on N
+  ;; *different* ephemeral ports, and RUN-WORKER's restart loop rebinds,
+  ;; so a crashed worker would come back somewhere its siblings are not.
+  ;; Neither shows up as an error — the server keeps serving on whichever
+  ;; port the caller happens to have been told about.
+  ;;
+  ;; The socket bound here is handed to worker 0 rather than closed and
+  ;; rebound: a port that is closed and rebound is free for an instant, and
+  ;; the docstring above is about what gets into that instant. A port given
+  ;; by number is claimed before it is bound; one the kernel chooses is
+  ;; claimed as it is bound, when there is a number to claim.
+  ;;
+  ;; CLAIM and LISTENER0 are the lambda list's &AUX: the cleanup that lets
+  ;; go of them is this function's last, and has them in scope without one
+  ;; more level around everything between here and there. Between here and
+  ;; that cleanup's UNWIND-PROTECT are four assignments and nothing that
+  ;; waits. A thread ended in the middle of them leaves the claim and the
+  ;; listener to their sockets' finalizers, which close them at a
+  ;; collection.
+  (cond
+    ((zerop port)
+     (multiple-value-setq (listener0 claim) (make-claimed-listener host)))
+    (t
+     (setf claim (claim-port port))
+     ;; Held only by a start that goes on past a held claim, from its look
+     ;; through its bind: see TAKE-PORT-START.
+     (let ((starting nil))
+       (unwind-protect
+            (progn
+              ;; A socket listening where this server would bind refuses
+              ;; the start, whoever holds the claim; held where nothing
+              ;; listens, the claim refuses nothing, and the start goes on
+              ;; to take it once it is free. See the banner above
+              ;; CLAIM-PORT.
+              (cond
+                (share-port)
+                ((eq claim :held)
+                 (setf starting (take-port-start port))
+                 (multiple-value-bind (standing taken)
+                     (held-claim-standing host port)
+                   (case standing
+                     (:listening
+                      (error "start-server: port ~d is claimed by another ~
+                              web-skeleton server, in this process or ~
+                              another, and a socket listens where this one ~
+                              would bind, ~a. This one's bind would not ~
+                              fail, every listener setting SO_REUSEPORT: ~
+                              both would serve, the kernel dividing ~
+                              connections between them, with nothing in ~
+                              either log. Stop the other first, or pass ~
+                              :SHARE-PORT T to start beside it, as a process ~
+                              taking over from the one it replaces does."
+                             port (format-peer-addr host port)))
+                     (:taken
+                      (setf claim taken)))))
+                ;; The claim is this start's, or none could be had. A
+                ;; socket listening all the same takes no claim: a server
+                ;; between holders in a handover, one whose claim could
+                ;; not be attempted or that was built without it, or
+                ;; another program that sets SO_REUSEPORT.
+                ((eq (port-listened-p host port) t)
+                 (release-port-claim claim)
+                 (setf claim nil)
+                 (error "start-server: cannot listen on ~a: a socket already ~
+                         listens there (EADDRINUSE, to a bind without ~
+                         SO_REUSEPORT), and no web-skeleton server holds the ~
+                         port's claim: a server between holders, one that ~
+                         could not take the claim or was built without it, ~
+                         or another program. If it sets SO_REUSEPORT as this ~
+                         user, this one's bind would not fail, and both would ~
+                         serve the port, the kernel dividing connections ~
+                         between them. Stop it first, or pass :SHARE-PORT T ~
+                         to start beside it."
+                        (format-peer-addr host port))))
+              ;; A bind that is refused lets go of the claim on its way
+              ;; out, since the cleanup that otherwise would is not
+              ;; reached yet.
+              (let ((bound nil))
+                (unwind-protect
+                     (setf listener0 (make-first-listener host port)
+                           bound t)
+                  (unless bound
+                    (release-port-claim claim)))))
+         ;; Bound or refused, this start has decided, and the next such
+         ;; start may look.
+         (release-port-claim starting)))))
+  ;; From here the start changes things, and nothing below refuses it.
+  ;;
   ;; A new run before *SHUTDOWN* is cleared, so no worker of an earlier run
   ;; ever sees the flag clear while its run is still the current one: see
   ;; *RUN-GENERATION*.
@@ -3149,46 +3828,52 @@
   ;; Replaced rather than cleared, so a second START-SERVER in one image
   ;; cannot inherit a previous run's counts.
   (setf *connection-census* (make-array workers :initial-element nil))
-  ;; Save the previous SIGPIPE and SIGTERM handlers so start-server can
-  ;; be called from inside a host SBCL image (a REPL, a test runner, an
-  ;; orchestrator) without permanently stealing the signals.
-  ;;   SIGPIPE -> :ignore so writes to a broken peer return EPIPE
-  ;;   SIGTERM -> set *shutdown*, matching Ctrl-C's path
+  ;; For the run, SIGPIPE is ignored, so that a write to a peer that has
+  ;; gone returns EPIPE, and SIGTERM sets *SHUTDOWN*, as Ctrl-C does.
   ;;
-  ;; Two nested unwind-protects, one per signal: SIGPIPE in the
-  ;; outer, SIGTERM in the inner. If SIGTERM install raises, the
-  ;; outer cleanup still restores SIGPIPE. If both succeed and the
-  ;; body raises (MAKE-THREAD exhaustion, etc.), both cleanups run.
-  ;; A single parallel let would leak SIGPIPE if the SIGTERM init
-  ;; form raised before the body was entered.
-  (let ((prev-sigpipe (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)))
+  ;; SBCL does not say what a signal's handler was: ENABLE-INTERRUPT
+  ;; answers NIL whatever is installed, its own handlers included, and
+  ;; NIL cannot be installed back. So when the last run in the image ends,
+  ;; SBCL's own SIGTERM handler goes back (RELEASE-RUN-SIGNALS), which ends
+  ;; the process, and SIGPIPE stays ignored, which is what SBCL's handling of
+  ;; it comes to for the process: a write to a closed peer fails with
+  ;; EPIPE either way. A SIGTERM handler an application installed before
+  ;; START-SERVER is not put back; see DEPLOYMENT.md, "Signals".
+  ;;
+  ;; SIGTERM's in an UNWIND-PROTECT of its own, inside the one for the
+  ;; claim and the first listener, so that a raise anywhere after it is
+  ;; installed still puts SBCL's back.
+  (progn
+    (sb-sys:enable-interrupt sb-unix:sigpipe :ignore)
     (unwind-protect
-         (let ((prev-sigterm (sb-sys:enable-interrupt sb-unix:sigterm
-                               (lambda (signal info context)
-                                 (declare (ignore signal info context))
-                                 (setf *shutdown* t)))))
+         (progn
+           (hold-run-signals)
            (unwind-protect
-                ;; Resolve port 0 here, once, rather than letting the
-                ;; workers each pass it to bind(2). Two things break if
-                ;; they do: N workers on port 0 land on N *different*
-                ;; ephemeral ports, and RUN-WORKER's restart loop rebinds,
-                ;; so a crashed worker would come back somewhere its
-                ;; siblings are not. Neither shows up as an error — the
-                ;; server keeps serving on whichever port the caller
-                ;; happens to have been told about.
-                ;;
-                ;; The socket bound here is handed to worker 0 rather than
-                ;; closed and rebound: a port that is closed and rebound is
-                ;; free for an instant, and the docstring above is about
-                ;; what gets into that instant.
-                (let* ((listener0 (when (zerop port)
-                                    (make-tcp-listener host port)))
-                       (port (if listener0
-                                 (nth-value 1 (sb-bsd-sockets:socket-name
-                                               listener0))
-                                 port)))
+                (progn
+                  ;; The number the kernel chose, when it was asked to.
+                  (setf port (nth-value 1 (sb-bsd-sockets:socket-name
+                                           listener0)))
                   (log-info "starting ~d worker~:p on ~a"
                             workers (format-peer-addr host port))
+                  ;; At WARN either way. Joined, though it was asked for:
+                  ;; two servers on one port is what the claim is there to
+                  ;; prevent, and a log that shows only warnings should
+                  ;; show it. Gone past a holder that does not serve here:
+                  ;; a name held where nothing listens is for an operator
+                  ;; to look into.
+                  (when (eq claim :held)
+                    (if share-port
+                        (log-warn "port ~d is claimed by another web-skeleton ~
+                                   server, which this one has joined ~
+                                   (:share-port): connections are divided ~
+                                   between the two until one of them stops"
+                                  port)
+                        (log-warn "port ~d's claim is held, and nothing ~
+                                   listens where this server binds, ~a: ~
+                                   starting without the claim, and taking ~
+                                   it once it is free. `ss -xap | grep ~
+                                   web-skeleton/port/~d` names its holder"
+                                  port (format-peer-addr host port) port)))
                   ;; Before the workers, which read it at every accept.
                   (let ((wanted (descriptors-wanted workers)))
                     (multiple-value-bind (limit before) (raise-descriptor-limit wanted)
@@ -3215,7 +3900,12 @@
                   ;; the drain cleanup can signal and join them.
                   (let ((threads nil)
                         (generation *run-generation*)
-                        (census *connection-census*))
+                        (census *connection-census*)
+                        ;; When the claim was last asked for again, and
+                        ;; whether that asking could not be made: see
+                        ;; RETAKE-PORT-CLAIM.
+                        (claim-asked-at 0)
+                        (claim-failing nil))
                     (unwind-protect
                          (progn
                            (dotimes (i workers)
@@ -3259,6 +3949,35 @@
                            (handler-case
                                ;; Main thread waits for interrupt or SIGTERM
                                (loop (sleep *worker-wake-interval*)
+                                     ;; A later START-SERVER in this image
+                                     ;; has begun a run, and this run's
+                                     ;; workers stop for it. Nothing of
+                                     ;; this run serves the port, so its
+                                     ;; claim is let go, or no longer
+                                     ;; asked for, and the run ends
+                                     ;; through a cleanup that leaves
+                                     ;; *SHUTDOWN*, the shutdown hooks
+                                     ;; and SIGTERM's handler to the
+                                     ;; later run: see REPLACED.
+                                     (when (/= generation *run-generation*)
+                                       (log-info "port ~d: this run ends, ~
+                                                  a later start-server in ~
+                                                  this image having begun ~
+                                                  one"
+                                                 port)
+                                       (release-port-claim claim)
+                                       (setf claim nil
+                                             replaced t)
+                                       (return))
+                                     ;; Joined to another server's port,
+                                     ;; this one takes the claim when that
+                                     ;; one lets go.
+                                     (when (eq claim :held)
+                                       (multiple-value-setq
+                                           (claim claim-asked-at claim-failing)
+                                         (retake-port-claim
+                                          claim port claim-asked-at
+                                          (monotonic-seconds) claim-failing)))
                                      (when *shutdown*
                                        (log-info "shutting down")
                                        (return)))
@@ -3267,14 +3986,11 @@
                                (log-info "interrupted — shutting down"))))
                       ;; Signal workers to drain and stop. Runs on normal
                       ;; exit, interactive-interrupt, AND a MAKE-THREAD
-                      ;; raise partway through the spawn loop.
-                      (setf *shutdown* t)
-                      ;; Non-NIL only if MAKE-THREAD raised before worker 0
-                      ;; adopted it, in which case nothing else will ever
-                      ;; close it.
-                      (when listener0
-                        (ignore-errors
-                         (sb-bsd-sockets:socket-close listener0)))
+                      ;; raise partway through the spawn loop. Not for a
+                      ;; replaced run: *SHUTDOWN* is the later run's, and
+                      ;; this run's workers stop for that run already.
+                      (unless replaced
+                        (setf *shutdown* t))
                       ;; A worker still inside a handler or a callback when
                       ;; its join gives up is still running, and is said to
                       ;; be, by name, rather than this returning under a
@@ -3301,15 +4017,26 @@
                         ;; cleanup before returning. Hooks own their own error
                         ;; handling — one raising hook cannot block the rest,
                         ;; cannot block the "stopped" log, and cannot prevent
-                        ;; START-SERVER from returning to its caller.
-                        (run-shutdown-hooks)
+                        ;; START-SERVER from returning to its caller. A
+                        ;; replaced run leaves them to the later run, whose
+                        ;; own end runs them once its workers have drained.
+                        (unless replaced
+                          (run-shutdown-hooks))
                         (if (zerop still-running)
                             (log-info "stopped")
                             (log-warn "stopped, with ~d worker~:p still running"
                                       still-running))))))
-             ;; Inner cleanup: restore SIGTERM
-             (ignore-errors
-              (sb-sys:enable-interrupt sb-unix:sigterm prev-sigterm))))
-      ;; Outer cleanup: restore SIGPIPE (runs even if SIGTERM install raised)
-      (ignore-errors
-       (sb-sys:enable-interrupt sb-unix:sigpipe prev-sigpipe)))))
+             ;; Inner cleanup: SBCL's own SIGTERM handler back, once no
+             ;; run holds SIGTERM any more.
+             (ignore-errors (release-run-signals))))
+      ;; The first listener, when worker 0 never adopted it: MAKE-THREAD
+      ;; raised before worker 0's thread existed, or something raised
+      ;; between the bind and the spawn. Nothing else will ever close it.
+      (when listener0
+        (ignore-errors (sb-bsd-sockets:socket-close listener0)))
+      ;; And let go of the port's claim, whether or not every worker
+      ;; stopped. The claim stands for a START-SERVER that is running, so a
+      ;; later one in this image, on the same port, is not refused by its
+      ;; own process; *RUN-GENERATION* has what becomes of a worker still
+      ;; running then.
+      (release-port-claim claim))))

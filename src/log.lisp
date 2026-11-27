@@ -20,8 +20,9 @@
    At the :INFO default that costs nothing measurable: a request that
    parses and dispatches cleanly logs nothing at all, and neither does a
    WebSocket's upgrade or close. What a client can cause at will, such as
-   a malformed request or a bad frame, goes through LOG-THROTTLED, which
-   logs once a minute per worker. At :DEBUG it is several acquisitions
+   a malformed request, a bad frame, or an error a handler raises on what
+   it was sent, goes through LOG-THROTTLED, which logs once a minute per
+   worker. At :DEBUG it is several acquisitions
    per request, with every worker serialized behind them.
 
    Two consequences worth knowing before building on it. An access log
@@ -141,13 +142,17 @@
 
 (defvar *log-throttle* nil
   "This worker's throttled log lines, a hash table from a kind to
-   (LAST-LOGGED-AT . HELD-BACK). Bound per worker by RUN-WORKER; NIL
-   outside one, where LOG-THROTTLED logs every line.")
+   (LOGGED-AT HELD-BACK LEVEL): when the kind's line was logged, how many
+   of its kind have been held back since, and the level they log at.
+   Bound per worker by RUN-WORKER; NIL outside one, where LOG-THROTTLED
+   logs every line.")
 
 (defun log-throttled (level kind format-string &rest args)
   "Log a line a client can cause at will — a malformed request, a bad
-   WebSocket frame. The first of KIND logs at once, and after it at most
-   one a minute per worker, carrying a count of the lines held back.
+   WebSocket frame. The first of KIND logs at once, and the ones that
+   follow it within a minute are counted and not logged. When the minute
+   is up their count is logged, in a line of its own that names the kind,
+   and the kind is forgotten: its next line is a first again.
 
    Every line holds *LOG-LOCK*, the one lock every worker contends for,
    across a format and a flush, and these cost a client one write each. A
@@ -155,24 +160,80 @@
    logging, and a stalled log pipe would stop them all. The census already
    counts each refusal, so the log need only say they are happening.
 
+   A kind's minute is ended by whichever comes first: its next line,
+   here, or the worker's once-a-second pass, in FLUSH-LOG-THROTTLE. The
+   pass is what reports a burst that has ended: left to the kind's next
+   line, the count would wait however long that line took to come. And a
+   worker that stops or crashes ends every kind's minute as it goes, so
+   what the kind held back in the worker's last minute is reported too.
+
    The one throttle the framework's logging has: REPORT-REFUSAL's
    connection-limit line and RUN-EVENT-LOOP's :ON-TICK error report come
-   through here too, each under its own KIND."
+   through here too, each under its own KIND.
+
+   KIND is a keyword, or a list of one and what tells its lines apart, as
+   LOG-HANDLER-ERROR's is of a keyword and a condition's type. A worker's
+   table compares them with EQUAL. What a list holds has to be something
+   there are few of: the table keeps an entry for each kind with a line
+   in the last minute."
   (let ((table *log-throttle*))
     (if (null table)
         (apply #'log-msg level format-string args)
         (let ((entry (gethash kind table))
-              (now (get-universal-time)))
+              (now (monotonic-seconds)))
           (cond
-            ((null entry)
-             (setf (gethash kind table) (cons now 0))
-             (apply #'log-msg level format-string args))
-            ((>= (- now (car entry)) 60)
-             (log-msg level "~? (and ~d more like it in the last ~d seconds)"
-                      format-string args (cdr entry) (- now (car entry)))
-             (setf (car entry) now
-                   (cdr entry) 0))
-            (t (incf (cdr entry))))))))
+            ((and entry (< (- now (first entry)) 60))
+             (incf (second entry)))
+            (t
+             ;; The first of its kind, or the first since a minute that the
+             ;; worker's pass has not come round to end.
+             (when entry
+               (end-throttled-minute kind entry now))
+             (setf (gethash kind table) (list now 0 level))
+             (apply #'log-msg level format-string args)))))))
+
+(defun end-throttled-minute (kind entry now)
+  "Log how many lines of KIND were held back since its line was logged,
+   when any were: a kind that held nothing back says nothing, or one
+   error a day would be followed by a count of none. ENTRY is KIND's in
+   *LOG-THROTTLE*, which the caller then replaces or removes.
+
+   The line names the kind in lower case, a list's first element with the
+   rest in parentheses after it: \"parse-error: 3 more lines held back in
+   the last 60 seconds\", or \"handler-error (type-error): ...\" for an
+   error that escaped a handler. The seconds are whole ones and never
+   fewer than one: a minute ended early, as a worker stops, can end in
+   the second it began, and its count is then \"in the last 1 second\"."
+  (destructuring-bind (logged-at held-back level) entry
+    (when (plusp held-back)
+      (log-msg level "~a: ~d more line~:p held back in the last ~d second~:p"
+               (if (consp kind)
+                   (format nil "~(~a (~{~a~^ ~})~)" (first kind) (rest kind))
+                   (format nil "~(~a~)" kind))
+               held-back (max 1 (- now logged-at))))))
+
+(defun flush-log-throttle (now &key all)
+  "End the minute of each kind in this worker's *LOG-THROTTLE* whose line
+   was logged a minute or more before NOW, a MONOTONIC-SECONDS reading,
+   or of every kind when ALL is true: its count is logged if it held any
+   lines back, and the kind is forgotten. Nothing to do outside a worker.
+
+   Called from the worker's once-a-second pass, so a count is logged
+   within a second or so of its minute being up, whether or not another
+   line of that kind ever comes. Forgetting the kind is also what keeps
+   the table to the kinds seen in the last minute. And with ALL from
+   RUN-WORKER's cleanup, which runs as the worker stops or crashes and
+   whose table goes with it: a count of the worker's last minute is
+   logged then, over the seconds that minute ran."
+  (let ((table *log-throttle*))
+    (when table
+      ;; MAPHASH allows the entry it is visiting to be removed from the
+      ;; table under it, and no entry but that one.
+      (maphash (lambda (kind entry)
+                 (when (or all (>= (- now (first entry)) 60))
+                   (end-throttled-minute kind entry now)
+                   (remhash kind table)))
+               table))))
 
 (defun log-debug (format-string &rest args)
   (apply #'log-msg :debug format-string args))
